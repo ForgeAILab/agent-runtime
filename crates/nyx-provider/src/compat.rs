@@ -1,9 +1,13 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use crate::openai::OpenAiProvider;
-use crate::{CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError};
+use crate::{
+    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
+    ToolCallParser,
+};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiCompatProvider {
     inner: OpenAiProvider,
 }
@@ -13,6 +17,11 @@ impl OpenAiCompatProvider {
         Self {
             inner: OpenAiProvider::new(api_key).with_base_url(base_url),
         }
+    }
+
+    pub fn with_tool_call_parser(mut self, parser: Arc<dyn ToolCallParser>) -> Self {
+        self.inner = self.inner.with_tool_call_parser(parser);
+        self
     }
 }
 

@@ -1,15 +1,21 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError};
+use crate::{
+    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
+    ProviderRole, ToolCallParser,
+};
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    tool_call_parser: Option<Arc<dyn ToolCallParser>>,
 }
 
 impl OpenAiProvider {
@@ -18,11 +24,17 @@ impl OpenAiProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: OPENAI_BASE_URL.to_string(),
+            tool_call_parser: None,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_tool_call_parser(mut self, parser: Arc<dyn ToolCallParser>) -> Self {
+        self.tool_call_parser = Some(parser);
         self
     }
 
@@ -34,10 +46,28 @@ impl OpenAiProvider {
 
         let payload = OpenAiCompletionRequest {
             model: req.model,
-            messages: vec![OpenAiMessage {
-                role: "user".to_string(),
-                content: req.prompt,
-            }],
+            messages: req
+                .messages
+                .into_iter()
+                .map(|message| match message.role {
+                    ProviderRole::System => OpenAiMessage {
+                        role: "system".to_string(),
+                        content: message.content,
+                    },
+                    ProviderRole::User => OpenAiMessage {
+                        role: "user".to_string(),
+                        content: message.content,
+                    },
+                    ProviderRole::Assistant => OpenAiMessage {
+                        role: "assistant".to_string(),
+                        content: message.content,
+                    },
+                    ProviderRole::Tool => OpenAiMessage {
+                        role: "user".to_string(),
+                        content: format!("[Tool Result]\n{}", message.content),
+                    },
+                })
+                .collect(),
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             stream: Some(false),
@@ -66,10 +96,16 @@ impl OpenAiProvider {
             .ok_or(ProviderError::InvalidResponse(
                 "missing choices[0].message.content",
             ))?;
+        let tool_calls = self
+            .tool_call_parser
+            .as_ref()
+            .map(|parser| parser.parse(&content))
+            .unwrap_or_default();
 
         Ok(CompletionResponse {
             content,
             model: parsed.model,
+            tool_calls,
         })
     }
 }
@@ -132,14 +168,22 @@ mod tests {
         let server = MockServer::start().await;
         let req = CompletionRequest {
             model: "gpt-4o".to_string(),
-            prompt: "hi".to_string(),
+            messages: vec![
+                crate::ProviderMessage::system("sys"),
+                crate::ProviderMessage::tool("42"),
+                crate::ProviderMessage::user("hi"),
+            ],
             max_tokens: Some(32),
             temperature: Some(0.1),
         };
 
         let expected = serde_json::json!({
             "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "hi"}],
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "[Tool Result]\n42"},
+                {"role": "user", "content": "hi"}
+            ],
             "max_tokens": 32,
             "temperature": 0.1,
             "stream": false
@@ -163,5 +207,6 @@ mod tests {
 
         assert_eq!(response.model, "gpt-4o");
         assert_eq!(response.content, "hello");
+        assert!(response.tool_calls.is_empty());
     }
 }

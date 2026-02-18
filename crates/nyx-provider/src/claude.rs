@@ -1,15 +1,21 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError};
+use crate::{
+    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
+    ProviderRole, ToolCallParser,
+};
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClaudeProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    tool_call_parser: Option<Arc<dyn ToolCallParser>>,
 }
 
 impl ClaudeProvider {
@@ -18,6 +24,7 @@ impl ClaudeProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: CLAUDE_BASE_URL.to_string(),
+            tool_call_parser: None,
         }
     }
 
@@ -26,18 +33,44 @@ impl ClaudeProvider {
         self
     }
 
+    pub fn with_tool_call_parser(mut self, parser: Arc<dyn ToolCallParser>) -> Self {
+        self.tool_call_parser = Some(parser);
+        self
+    }
+
     async fn complete_via_api(
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
         let endpoint = format!("{}/messages", self.base_url.trim_end_matches('/'));
+        let mut system_chunks = Vec::new();
+        let mut messages = Vec::new();
+        for message in req.messages {
+            match message.role {
+                ProviderRole::System => system_chunks.push(message.content),
+                ProviderRole::User => messages.push(ClaudeInputMessage {
+                    role: "user".to_string(),
+                    content: message.content,
+                }),
+                ProviderRole::Assistant => messages.push(ClaudeInputMessage {
+                    role: "assistant".to_string(),
+                    content: message.content,
+                }),
+                ProviderRole::Tool => messages.push(ClaudeInputMessage {
+                    role: "user".to_string(),
+                    content: message.content,
+                }),
+            }
+        }
         let payload = ClaudeMessagesRequest {
             model: req.model,
             max_tokens: req.max_tokens.unwrap_or(512),
-            messages: vec![ClaudeInputMessage {
-                role: "user".to_string(),
-                content: req.prompt,
-            }],
+            system: if system_chunks.is_empty() {
+                None
+            } else {
+                Some(system_chunks.join("\n\n"))
+            },
+            messages,
             temperature: req.temperature,
         };
 
@@ -63,10 +96,16 @@ impl ClaudeProvider {
             .find(|item| item.kind == "text")
             .map(|item| item.text)
             .ok_or(ProviderError::InvalidResponse("missing text content"))?;
+        let tool_calls = self
+            .tool_call_parser
+            .as_ref()
+            .map(|parser| parser.parse(&content))
+            .unwrap_or_default();
 
         Ok(CompletionResponse {
             content,
             model: parsed.model,
+            tool_calls,
         })
     }
 }
@@ -88,6 +127,8 @@ impl LlmProvider for ClaudeProvider {
 struct ClaudeMessagesRequest {
     model: String,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
     messages: Vec<ClaudeInputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,

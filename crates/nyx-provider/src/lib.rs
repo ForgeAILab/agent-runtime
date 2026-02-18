@@ -4,6 +4,9 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use thiserror::Error;
 
+mod tool_call;
+pub use tool_call::{JsonDirectiveParser, ToolCall, ToolCallParser, XmlDirectiveParser};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderRole {
     System,
@@ -20,19 +23,31 @@ pub struct ProviderMessage {
 
 impl ProviderMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::System, content: content.into() }
+        Self {
+            role: ProviderRole::System,
+            content: content.into(),
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::User, content: content.into() }
+        Self {
+            role: ProviderRole::User,
+            content: content.into(),
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::Assistant, content: content.into() }
+        Self {
+            role: ProviderRole::Assistant,
+            content: content.into(),
+        }
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::Tool, content: content.into() }
+        Self {
+            role: ProviderRole::Tool,
+            content: content.into(),
+        }
     }
 }
 
@@ -48,6 +63,7 @@ pub struct CompletionRequest {
 pub struct CompletionResponse {
     pub content: String,
     pub model: String,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -82,15 +98,25 @@ pub mod testing {
             &self,
             req: CompletionRequest,
         ) -> Result<CompletionResponse, ProviderError> {
+            let content = req
+                .messages
+                .last()
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
             Ok(CompletionResponse {
-                content: req.prompt,
+                content,
                 model: req.model,
+                tool_calls: vec![],
             })
         }
 
         async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
             let model = req.model;
-            let token = req.prompt;
+            let token = req
+                .messages
+                .last()
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
             let stream = tokio_stream::iter(vec![Ok(token)]);
             let _ = model;
             Ok(Box::pin(stream))
@@ -113,11 +139,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn echo_provider_returns_prompt_as_content() {
+    async fn echo_provider_returns_last_message_content() {
         let provider = EchoProvider;
         let request = CompletionRequest {
             model: "echo-1".to_string(),
-            prompt: "hello provider".to_string(),
+            messages: vec![
+                ProviderMessage::system("system"),
+                ProviderMessage::user("hello provider"),
+            ],
             max_tokens: Some(16),
             temperature: Some(0.2),
         };
@@ -127,7 +156,8 @@ mod tests {
             .await
             .expect("completion succeeds");
 
-        assert_eq!(response.content, request.prompt);
+        assert_eq!(response.content, "hello provider");
         assert_eq!(response.model, request.model);
+        assert!(response.tool_calls.is_empty());
     }
 }
