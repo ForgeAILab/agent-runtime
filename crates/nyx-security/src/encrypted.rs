@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
@@ -16,16 +17,18 @@ const KEYRING_SERVICE: &str = "nyx.security.master_key";
 #[cfg(feature = "keyring")]
 const KEYRING_USER: &str = "nyx";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EncryptedSecret {
-    nonce: [u8; 12],
-    ciphertext: Vec<u8>,
+    nonce: String,      // hex-encoded 12 bytes
+    ciphertext: String, // hex-encoded
 }
 
 #[derive(Debug)]
 pub struct EncryptedSecretStore {
     key: [u8; 32],
     entries: RwLock<HashMap<String, EncryptedSecret>>,
+    /// When `Some`, encrypted entries are loaded from and persisted to this file.
+    storage_path: Option<PathBuf>,
 }
 
 impl EncryptedSecretStore {
@@ -44,21 +47,28 @@ impl EncryptedSecretStore {
         }
 
         let key = load_or_create_file_key(key_path)?;
-        Ok(Self::from_key(key))
+        let storage_path = key_path
+            .parent()
+            .map(|p| p.join(".secrets"))
+            .unwrap_or_else(|| PathBuf::from(".secrets"));
+        let entries = load_entries(&storage_path).unwrap_or_default();
+        Ok(Self {
+            key,
+            entries: RwLock::new(entries),
+            storage_path: Some(storage_path),
+        })
     }
 
     /// Build from a passphrase by deriving a 32-byte key with SHA-256.
+    /// Entries are kept in memory only (no persistent storage).
     pub fn from_passphrase(passphrase: &[u8]) -> Self {
         let digest = Sha256::digest(passphrase);
         let mut key = [0u8; 32];
         key.copy_from_slice(&digest);
-        Self::from_key(key)
-    }
-
-    fn from_key(key: [u8; 32]) -> Self {
         Self {
             key,
             entries: RwLock::new(HashMap::new()),
+            storage_path: None,
         }
     }
 
@@ -68,21 +78,29 @@ impl EncryptedSecretStore {
     }
 
     fn encrypt(&self, secret: &Secret) -> Result<EncryptedSecret, SecretError> {
-        let mut nonce = [0_u8; 12];
-        OsRng.fill_bytes(&mut nonce);
+        let mut nonce_bytes = [0_u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
 
         let cipher = self.cipher()?;
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), secret.expose())
+            .encrypt(Nonce::from_slice(&nonce_bytes), secret.expose())
             .map_err(|err| SecretError::Crypto(format!("encrypt failed: {err}")))?;
 
-        Ok(EncryptedSecret { nonce, ciphertext })
+        Ok(EncryptedSecret {
+            nonce: hex_encode(&nonce_bytes),
+            ciphertext: hex_encode(&ciphertext),
+        })
     }
 
     fn decrypt(&self, secret: &EncryptedSecret) -> Result<Secret, SecretError> {
+        let nonce_bytes = hex_decode(&secret.nonce)
+            .map_err(|_| SecretError::Crypto("corrupt nonce in secrets file".into()))?;
+        let ciphertext = hex_decode(&secret.ciphertext)
+            .map_err(|_| SecretError::Crypto("corrupt ciphertext in secrets file".into()))?;
+
         let cipher = self.cipher()?;
         let plaintext = cipher
-            .decrypt(Nonce::from_slice(&secret.nonce), secret.ciphertext.as_ref())
+            .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .map_err(|err| SecretError::Crypto(format!("decrypt failed: {err}")))?;
         Ok(Secret::from_bytes(plaintext))
     }
@@ -103,8 +121,42 @@ impl SecretStore for EncryptedSecretStore {
         let encrypted = self.encrypt(&value)?;
         let mut guard = self.entries.write().await;
         guard.insert(key.to_string(), encrypted);
+
+        if let Some(ref path) = self.storage_path {
+            persist_entries(&guard, path)?;
+        }
+
         Ok(())
     }
+}
+
+fn load_entries(path: &Path) -> Result<HashMap<String, EncryptedSecret>, SecretError> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let contents = std::fs::read_to_string(path)?;
+    serde_json::from_str(&contents)
+        .map_err(|err| SecretError::Crypto(format!("secrets file is corrupt: {err}")))
+}
+
+fn persist_entries(
+    entries: &HashMap<String, EncryptedSecret>,
+    path: &Path,
+) -> Result<(), SecretError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string(entries)
+        .map_err(|err| SecretError::Crypto(format!("failed to serialize secrets: {err}")))?;
+    std::fs::write(path, json)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
 }
 
 /// Load a 32-byte key from `path` (hex-encoded), or generate and persist a
@@ -207,18 +259,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuses_existing_key_file() {
+    async fn secrets_survive_process_restart() {
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
 
-        let store1 = EncryptedSecretStore::from_env_or_file(&key_path).unwrap();
-        store1
-            .set("k", Secret::from_string("v"))
-            .await
-            .unwrap();
-        // A second store pointing at the same file should share the key
-        // (keys match, but entries are per-instance — just verify no panic)
-        let _store2 = EncryptedSecretStore::from_env_or_file(&key_path).unwrap();
+        // First "process": write a secret
+        {
+            let store = EncryptedSecretStore::from_env_or_file(&key_path).unwrap();
+            store
+                .set("provider.api_key", Secret::from_string("sk-test-123"))
+                .await
+                .unwrap();
+        }
+
+        // Second "process": re-open and read back
+        {
+            let store = EncryptedSecretStore::from_env_or_file(&key_path).unwrap();
+            let secret = store.get("provider.api_key").await.unwrap();
+            assert_eq!(secret.expose(), b"sk-test-123");
+        }
     }
 
     #[test]

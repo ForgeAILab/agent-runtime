@@ -11,6 +11,8 @@ pub struct ProviderConfig {
     #[serde(default = "default_provider_model")]
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -21,6 +23,7 @@ impl Default for ProviderConfig {
         Self {
             kind: default_provider_kind(),
             model: default_provider_model(),
+            api_key: None,
             api_key_env: None,
             base_url: None,
         }
@@ -36,6 +39,10 @@ fn default_provider_model() -> String {
 }
 
 fn resolve_api_key(cfg: &ProviderConfig, default_env: &str) -> Result<String, ProviderError> {
+    if let Some(api_key) = cfg.api_key.clone() {
+        return Ok(api_key);
+    }
+
     let env_name = cfg
         .api_key_env
         .clone()
