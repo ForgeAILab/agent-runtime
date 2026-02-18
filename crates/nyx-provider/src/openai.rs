@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-    ProviderRole, ToolCallParser,
+    ProviderRole, ToolCallParser, UsageMetadata,
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -106,6 +106,7 @@ impl OpenAiProvider {
             content,
             model: parsed.model,
             tool_calls,
+            usage: parsed.usage.map(UsageMetadata::from),
         })
     }
 }
@@ -145,6 +146,7 @@ struct OpenAiMessage {
 struct OpenAiCompletionResponse {
     model: String,
     choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +157,23 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiResponseMessage {
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+impl From<OpenAiUsage> for UsageMetadata {
+    fn from(value: OpenAiUsage) -> Self {
+        Self {
+            input_tokens: value.prompt_tokens,
+            output_tokens: value.completion_tokens,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,7 +213,11 @@ mod tests {
             .and(body_json(expected))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "gpt-4o",
-                "choices": [{"message": {"content": "hello"}}]
+                "choices": [{"message": {"content": "hello"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5
+                }
             })))
             .mount(&server)
             .await;
@@ -208,5 +231,14 @@ mod tests {
         assert_eq!(response.model, "gpt-4o");
         assert_eq!(response.content, "hello");
         assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            response.usage,
+            Some(UsageMetadata {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            })
+        );
     }
 }

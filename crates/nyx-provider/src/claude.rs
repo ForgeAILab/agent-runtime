@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-    ProviderRole, ToolCallParser,
+    ProviderRole, ToolCallParser, UsageMetadata,
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -106,6 +106,7 @@ impl ClaudeProvider {
             content,
             model: parsed.model,
             tool_calls,
+            usage: parsed.usage.map(UsageMetadata::from),
         })
     }
 }
@@ -144,6 +145,7 @@ struct ClaudeInputMessage {
 struct ClaudeMessagesResponse {
     model: String,
     content: Vec<ClaudeContentItem>,
+    usage: Option<ClaudeUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,4 +153,25 @@ struct ClaudeContentItem {
     #[serde(rename = "type")]
     kind: String,
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+}
+
+impl From<ClaudeUsage> for UsageMetadata {
+    fn from(value: ClaudeUsage) -> Self {
+        Self {
+            input_tokens: value.input_tokens,
+            output_tokens: value.output_tokens,
+            cache_read_tokens: value.cache_read_input_tokens,
+            cache_write_tokens: value.cache_creation_input_tokens,
+        }
+    }
 }

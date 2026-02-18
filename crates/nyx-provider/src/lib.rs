@@ -6,6 +6,7 @@ use thiserror::Error;
 
 mod tool_call;
 pub use tool_call::{JsonDirectiveParser, ToolCall, ToolCallParser, XmlDirectiveParser};
+pub mod config;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderRole {
@@ -64,6 +65,15 @@ pub struct CompletionResponse {
     pub content: String,
     pub model: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<UsageMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageMetadata {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
 }
 
 pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
@@ -107,6 +117,7 @@ pub mod testing {
                 content,
                 model: req.model,
                 tool_calls: vec![],
+                usage: None,
             })
         }
 
@@ -159,5 +170,6 @@ mod tests {
         assert_eq!(response.content, "hello provider");
         assert_eq!(response.model, request.model);
         assert!(response.tool_calls.is_empty());
+        assert!(response.usage.is_none());
     }
 }
