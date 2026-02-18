@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nyx_security::{Sandbox, SandboxError, SandboxedCommand, SandboxedOutput, testing::NoopSandbox};
+use nyx_security::{
+    Sandbox, SandboxError, SandboxedCommand, SandboxedOutput, testing::NoopSandbox,
+};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 

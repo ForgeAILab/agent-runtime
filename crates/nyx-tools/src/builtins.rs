@@ -6,8 +6,8 @@ use nyx_security::{Sandbox, SandboxedCommand};
 use serde_json::{Value, json};
 
 use crate::{
-    RegistryError, SubAgentError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult,
-    TerminalError, TerminalStatus,
+    RegistryError, SubAgentError, TerminalError, TerminalStatus, Tool, ToolContext, ToolError,
+    ToolRegistry, ToolResult,
 };
 
 pub fn register_builtins(

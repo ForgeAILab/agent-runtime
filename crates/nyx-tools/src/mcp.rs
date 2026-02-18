@@ -54,7 +54,12 @@ impl Tool for McpTool {
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let resp = self.client.post(&self.invoke_url).json(&input).send().await?;
+        let resp = self
+            .client
+            .post(&self.invoke_url)
+            .json(&input)
+            .send()
+            .await?;
         Ok(ToolResult::json(resp.json::<Value>().await?))
     }
 }

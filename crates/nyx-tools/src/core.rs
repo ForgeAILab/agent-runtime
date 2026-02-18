@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nyx_security::{Sandbox, SandboxError};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -13,7 +14,7 @@ pub struct ToolCall {
     pub input: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub value: Value,
 }
@@ -39,6 +40,17 @@ pub struct ToolContext {
     pub sub_agent_runner: Option<Arc<dyn SubAgentRunner>>,
     pub terminal_registry: Arc<TerminalRegistry>,
     pub available_tools: Vec<Arc<dyn Tool>>,
+}
+
+impl Default for ToolContext {
+    fn default() -> Self {
+        Self {
+            sandbox: Arc::new(nyx_security::testing::NoopSandbox),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            available_tools: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
