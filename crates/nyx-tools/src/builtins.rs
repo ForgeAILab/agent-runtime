@@ -304,7 +304,7 @@ impl Tool for TerminalSpawnTool {
             })
             .unwrap_or_default();
 
-        ctx.terminal_registry.spawn(id, command, env).await?;
+        ctx.terminal_registry.spawn(id, command, ctx, env).await?;
         Ok(ToolResult::empty())
     }
 }

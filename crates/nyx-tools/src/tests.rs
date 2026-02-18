@@ -236,8 +236,9 @@ async fn sub_agent_tool_returns_not_available_when_runner_missing() {
 #[tokio::test]
 async fn terminal_registry_spawn_write_read_round_trip() {
     let registry = TerminalRegistry::new();
+    let tool_ctx = ToolContext::default();
     registry
-        .spawn("echo", "cat", HashMap::new())
+        .spawn("echo", "cat", &tool_ctx, HashMap::new())
         .await
         .expect("spawn cat");
     registry.write("echo", "hello\n").await.expect("write cat");
@@ -252,13 +253,14 @@ async fn terminal_registry_spawn_write_read_round_trip() {
 #[tokio::test]
 async fn terminal_registry_spawn_rejects_duplicate_id() {
     let registry = TerminalRegistry::new();
+    let tool_ctx = ToolContext::default();
     registry
-        .spawn("dup", "cat", HashMap::new())
+        .spawn("dup", "cat", &tool_ctx, HashMap::new())
         .await
         .expect("spawn first");
 
     let err = registry
-        .spawn("dup", "cat", HashMap::new())
+        .spawn("dup", "cat", &tool_ctx, HashMap::new())
         .await
         .expect_err("duplicate should fail");
     assert!(matches!(err, TerminalError::IdConflict { .. }));
@@ -270,8 +272,9 @@ async fn terminal_registry_spawn_rejects_duplicate_id() {
 #[tokio::test]
 async fn terminal_registry_status_reports_exited() {
     let registry = TerminalRegistry::new();
+    let tool_ctx = ToolContext::default();
     registry
-        .spawn("done", "echo done", HashMap::new())
+        .spawn("done", "echo done", &tool_ctx, HashMap::new())
         .await
         .expect("spawn echo");
 

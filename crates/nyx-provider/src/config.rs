@@ -5,6 +5,35 @@ use serde::{Deserialize, Serialize};
 use crate::{LlmProvider, ProviderError};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            initial_backoff_ms: default_initial_backoff_ms(),
+        }
+    }
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+fn default_initial_backoff_ms() -> u64 {
+    500
+}
+
+fn is_default_retry(r: &RetryConfig) -> bool {
+    r.max_attempts == default_max_attempts() && r.initial_backoff_ms == default_initial_backoff_ms()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     #[serde(default = "default_provider_kind")]
     pub kind: String,
@@ -16,6 +45,8 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_retry")]
+    pub retry: RetryConfig,
 }
 
 impl Default for ProviderConfig {
@@ -26,6 +57,7 @@ impl Default for ProviderConfig {
             api_key: None,
             api_key_env: None,
             base_url: None,
+            retry: RetryConfig::default(),
         }
     }
 }
@@ -240,7 +272,7 @@ pub fn build_provider(
         #[cfg(feature = "compat")]
         "qianfan" | "baidu" => make_compat(cfg, "QIANFAN_API_KEY", "https://aip.baidubce.com"),
         #[cfg(feature = "compat")]
-        "zai" | "z.ai" => make_compat(cfg, "ZAI_API_KEY", "https://api.z.ai/api/v1"),
+        "zai" | "z.ai" => make_compat(cfg, "ZAI_API_KEY", "https://api.z.ai/api/coding/paas/v4"),
         #[cfg(feature = "compat")]
         "bedrock" | "aws-bedrock" => make_compat(
             cfg,
@@ -294,10 +326,7 @@ base_url = "http://localhost:11434/v1"
         };
 
         let encoded = toml::to_string(&cfg).expect("provider config should serialize");
-        assert_eq!(
-            encoded.trim(),
-            "kind = \"zai\"\nmodel = \"glm-5\"",
-        );
+        assert_eq!(encoded.trim(), "kind = \"zai\"\nmodel = \"glm-5\"",);
     }
 
     #[test]

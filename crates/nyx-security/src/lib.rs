@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,14 @@ pub struct SandboxedOutput {
     pub stderr: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub struct SandboxedChild {
+    pub child: Child,
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+    pub stderr: ChildStderr,
+}
+
 impl SandboxedOutput {
     pub fn empty_success() -> Self {
         Self {
@@ -79,6 +88,8 @@ pub enum SandboxError {
     PathViolation { path: PathBuf, root: PathBuf },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("interactive spawn is not supported by this sandbox")]
+    UnsupportedInteractiveSpawn,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -125,6 +136,10 @@ pub enum SecretError {
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     async fn execute(&self, cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError>;
+
+    async fn spawn_piped(&self, _cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
+        Err(SandboxError::UnsupportedInteractiveSpawn)
+    }
 }
 
 #[async_trait]
@@ -143,6 +158,38 @@ pub mod testing {
     impl Sandbox for NoopSandbox {
         async fn execute(&self, _cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError> {
             Ok(SandboxedOutput::empty_success())
+        }
+
+        async fn spawn_piped(&self, cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
+            let mut command = tokio::process::Command::new(&cmd.program);
+            command.args(&cmd.args);
+            command.current_dir(&cmd.working_dir);
+            command.envs(&cmd.env);
+            command.stdin(std::process::Stdio::piped());
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::piped());
+            command.kill_on_drop(true);
+
+            let mut child = command.spawn()?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+
+            Ok(SandboxedChild {
+                child,
+                stdin,
+                stdout,
+                stderr,
+            })
         }
     }
 

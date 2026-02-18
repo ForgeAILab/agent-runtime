@@ -7,6 +7,8 @@ use thiserror::Error;
 mod tool_call;
 pub use tool_call::{JsonDirectiveParser, ToolCall, ToolCallParser, XmlDirectiveParser};
 pub mod config;
+mod retry;
+pub use retry::RetryProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderRole {

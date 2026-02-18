@@ -227,8 +227,7 @@ mod tests {
 
     fn store_in(tmp: &TempDir) -> EncryptedSecretStore {
         let key_path = tmp.path().join(".secret_key");
-        EncryptedSecretStore::from_env_or_file(&key_path)
-            .expect("from_env_or_file should succeed")
+        EncryptedSecretStore::from_env_or_file(&key_path).expect("from_env_or_file should succeed")
     }
 
     #[tokio::test]

@@ -3,10 +3,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use nyx_security::{SandboxedChild, SandboxedCommand};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::time::timeout;
+
+use crate::ToolContext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalOutput {
@@ -57,27 +60,32 @@ impl TerminalRegistry {
         &self,
         id: &str,
         command: &str,
+        ctx: &ToolContext,
         env: HashMap<String, String>,
     ) -> Result<(), TerminalError> {
         if self.sessions.contains_key(id) {
             return Err(TerminalError::IdConflict { id: id.to_string() });
         }
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-lc").arg(command);
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-        cmd.envs(env);
+        let mut sandboxed = SandboxedCommand::new("sh")
+            .arg("-lc")
+            .arg(command.to_string());
+        for (k, v) in env {
+            sandboxed = sandboxed.env(k, v);
+        }
 
-        let mut child = cmd
-            .spawn()
+        let spawned = ctx
+            .sandbox
+            .spawn_piped(sandboxed)
+            .await
             .map_err(|err| TerminalError::SpawnFailed(err.to_string()))?;
 
-        let stdin = child.stdin.take().ok_or(TerminalError::SessionExited)?;
-        let stdout = child.stdout.take().ok_or(TerminalError::SessionExited)?;
-        let stderr = child.stderr.take().ok_or(TerminalError::SessionExited)?;
+        let SandboxedChild {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        } = spawned;
 
         let session = Arc::new(TerminalSession {
             child: tokio::sync::Mutex::new(child),

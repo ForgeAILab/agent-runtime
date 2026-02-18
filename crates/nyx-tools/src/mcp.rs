@@ -6,8 +6,9 @@ use serde_json::Value;
 
 use crate::{RegistryError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct McpConfig {
+    #[serde(default)]
     pub servers: Vec<McpServerConfig>,
 }
 
@@ -39,6 +40,46 @@ struct McpTool {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct McpBridge {
+    client: reqwest::Client,
+}
+
+impl McpBridge {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn discover_tools(
+        &self,
+        server: &McpServerConfig,
+    ) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+        let discovery = self
+            .client
+            .get(format!("{}/tools", server.url.trim_end_matches('/')))
+            .send()
+            .await?
+            .json::<McpDiscoveryResponse>()
+            .await?;
+
+        Ok(discovery
+            .tools
+            .into_iter()
+            .map(|tool| {
+                Arc::new(McpTool {
+                    name: tool.name,
+                    description: tool.description,
+                    schema: tool.schema,
+                    invoke_url: tool.invoke_url,
+                    client: self.client.clone(),
+                }) as Arc<dyn Tool>
+            })
+            .collect())
+    }
+}
+
 #[async_trait]
 impl Tool for McpTool {
     fn name(&self) -> &str {
@@ -65,30 +106,11 @@ impl Tool for McpTool {
 }
 
 pub async fn register_mcp(registry: &mut ToolRegistry, cfg: &McpConfig) -> Result<(), ToolError> {
-    let client = reqwest::Client::new();
+    let bridge = McpBridge::new();
 
     for server in &cfg.servers {
         let _ = &server.name;
-        let discovery = client
-            .get(format!("{}/tools", server.url.trim_end_matches('/')))
-            .send()
-            .await?
-            .json::<McpDiscoveryResponse>()
-            .await?;
-
-        let tools = discovery
-            .tools
-            .into_iter()
-            .map(|tool| {
-                Arc::new(McpTool {
-                    name: tool.name,
-                    description: tool.description,
-                    schema: tool.schema,
-                    invoke_url: tool.invoke_url,
-                    client: client.clone(),
-                }) as Arc<dyn Tool>
-            })
-            .collect::<Vec<_>>();
+        let tools = bridge.discover_tools(server).await?;
 
         registry.register_all(tools).map_err(|err| match err {
             RegistryError::NameConflict { name } => {

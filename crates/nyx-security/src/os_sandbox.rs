@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use crate::{Sandbox, SandboxError, SandboxedCommand, SandboxedOutput};
+use crate::{Sandbox, SandboxError, SandboxedChild, SandboxedCommand, SandboxedOutput};
 
 #[derive(Debug, Clone)]
 pub struct OsSandbox {
@@ -68,6 +68,43 @@ impl Sandbox for OsSandbox {
             status: output.status.code().unwrap_or_default(),
             stdout: output.stdout,
             stderr: output.stderr,
+        })
+    }
+
+    async fn spawn_piped(&self, cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
+        let working_dir = self.ensure_within_root(&cmd.working_dir, &self.root_dir)?;
+        for tracked in &cmd.tracked_paths {
+            self.ensure_within_root(tracked, &working_dir)?;
+        }
+
+        let mut command = Command::new(&cmd.program);
+        command.args(&cmd.args);
+        command.current_dir(working_dir);
+        command.envs(&cmd.env);
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
+
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+
+        Ok(SandboxedChild {
+            child,
+            stdin,
+            stdout,
+            stderr,
         })
     }
 }
