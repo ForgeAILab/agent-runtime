@@ -61,6 +61,8 @@ pub enum ToolError {
     NotAvailable(String),
     #[error("sub-agent failed: {reason}")]
     SubAgentFailed { reason: String },
+    #[error("tool execution failed: {reason}")]
+    ExecutionFailed { reason: String },
     #[error("terminal session not found: {id}")]
     TerminalNotFound { id: String },
     #[error("sandbox execution failed: {0}")]
