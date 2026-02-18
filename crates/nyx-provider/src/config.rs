@@ -10,7 +10,9 @@ pub struct ProviderConfig {
     pub kind: String,
     #[serde(default = "default_provider_model")]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
 
@@ -274,6 +276,21 @@ base_url = "http://localhost:11434/v1"
         assert_eq!(cfg.model, "llama3");
         assert_eq!(cfg.base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert_eq!(cfg.api_key_env, None);
+    }
+
+    #[test]
+    fn provider_config_serializes_without_none_fields() {
+        let cfg = ProviderConfig {
+            kind: "zai".to_string(),
+            model: "glm-5".to_string(),
+            ..Default::default()
+        };
+
+        let encoded = toml::to_string(&cfg).expect("provider config should serialize");
+        assert_eq!(
+            encoded.trim(),
+            "kind = \"zai\"\nmodel = \"glm-5\"",
+        );
     }
 
     #[test]
