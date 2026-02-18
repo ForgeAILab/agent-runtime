@@ -43,3 +43,42 @@ impl ToolRegistry {
         self.tools
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{RegistryError, ToolRegistry};
+    use crate::testing;
+
+    #[tokio::test]
+    async fn tool_registry_name_conflict() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(testing::NoopTool::named("same")))
+            .expect("first register");
+
+        let err = registry
+            .register(Arc::new(testing::NoopTool::named("same")))
+            .expect_err("duplicate should fail");
+        assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn tool_registry_seal_preserves_order() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(testing::NoopTool::named("first")))
+            .expect("register first");
+        registry
+            .register(Arc::new(testing::NoopTool::named("second")))
+            .expect("register second");
+
+        let names = registry
+            .seal()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["first", "second"]);
+    }
+}

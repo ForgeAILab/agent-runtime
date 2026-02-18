@@ -201,3 +201,175 @@ async fn read_buffered<R: AsyncRead + Unpin>(
 
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use nyx_security::testing::NoopSandbox;
+    #[cfg(feature = "terminal")]
+    use serde_json::json;
+
+    use super::{TerminalError, TerminalRegistry, TerminalStatus};
+    use crate::ToolContext;
+    #[cfg(feature = "terminal")]
+    use crate::{
+        TerminalKillTool, TerminalReadTool, TerminalSpawnTool, TerminalStatusTool,
+        TerminalWriteTool, Tool, ToolError,
+    };
+
+    #[tokio::test]
+    async fn terminal_registry_spawn_write_read_round_trip() {
+        let registry = TerminalRegistry::new();
+        let tool_ctx = ToolContext::default();
+        registry
+            .spawn("echo", "cat", &tool_ctx, HashMap::new())
+            .await
+            .expect("spawn cat");
+        registry.write("echo", "hello\n").await.expect("write cat");
+
+        let output = registry.read("echo", 500).await.expect("read output");
+        assert!(output.stdout.contains("hello"));
+
+        registry.kill("echo").await.expect("kill session");
+    }
+
+    #[tokio::test]
+    async fn terminal_registry_spawn_rejects_duplicate_id() {
+        let registry = TerminalRegistry::new();
+        let tool_ctx = ToolContext::default();
+        registry
+            .spawn("dup", "cat", &tool_ctx, HashMap::new())
+            .await
+            .expect("spawn first");
+
+        let err = registry
+            .spawn("dup", "cat", &tool_ctx, HashMap::new())
+            .await
+            .expect_err("duplicate should fail");
+        assert!(matches!(err, TerminalError::IdConflict { .. }));
+
+        registry.kill("dup").await.expect("kill session");
+    }
+
+    #[tokio::test]
+    async fn terminal_registry_status_reports_exited() {
+        let registry = TerminalRegistry::new();
+        let tool_ctx = ToolContext::default();
+        registry
+            .spawn("done", "echo done", &tool_ctx, HashMap::new())
+            .await
+            .expect("spawn echo");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let status = registry.status("done").await.expect("status works");
+        assert!(matches!(status, TerminalStatus::Exited { .. }));
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn terminal_tools_spawn_write_read_status_and_kill() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: None,
+            terminal_registry: registry,
+            available_tools: vec![],
+        };
+
+        TerminalSpawnTool
+            .invoke(
+                json!({
+                    "id": "toolflow",
+                    "command": "printf '%s\\n' \"$NYX_TOOLS_TEST_ENV\"; cat",
+                    "env": { "NYX_TOOLS_TEST_ENV": "tool-env-ok" }
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("spawn works");
+
+        let initial = TerminalReadTool
+            .invoke(json!({ "id": "toolflow", "timeout_ms": 500 }), &tool_ctx)
+            .await
+            .expect("initial read works");
+        let initial_stdout = initial.value["stdout"]
+            .as_str()
+            .expect("stdout should be string");
+        assert!(initial_stdout.contains("tool-env-ok"));
+
+        TerminalWriteTool
+            .invoke(
+                json!({ "id": "toolflow", "input": "hello-from-write\\n" }),
+                &tool_ctx,
+            )
+            .await
+            .expect("write works");
+
+        let echoed = TerminalReadTool
+            .invoke(json!({ "id": "toolflow", "timeout_ms": 500 }), &tool_ctx)
+            .await
+            .expect("echoed read works");
+        assert!(
+            echoed.value["stdout"]
+                .as_str()
+                .expect("stdout should be string")
+                .contains("hello-from-write")
+        );
+
+        let status = TerminalStatusTool
+            .invoke(json!({ "id": "toolflow" }), &tool_ctx)
+            .await
+            .expect("status works");
+        assert_eq!(status.value["status"], "running");
+
+        TerminalKillTool
+            .invoke(json!({ "id": "toolflow" }), &tool_ctx)
+            .await
+            .expect("kill works");
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn terminal_read_tool_returns_not_found_for_unknown_id() {
+        let err = TerminalReadTool
+            .invoke(json!({ "id": "missing" }), &ToolContext::default())
+            .await
+            .expect_err("missing session should fail");
+        assert!(matches!(err, ToolError::TerminalNotFound { .. }));
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn terminal_kill_then_write_returns_session_exited() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: None,
+            terminal_registry: registry,
+            available_tools: vec![],
+        };
+
+        TerminalSpawnTool
+            .invoke(json!({ "id": "killme", "command": "cat" }), &tool_ctx)
+            .await
+            .expect("spawn works");
+        TerminalKillTool
+            .invoke(json!({ "id": "killme" }), &tool_ctx)
+            .await
+            .expect("kill works");
+
+        let err = TerminalWriteTool
+            .invoke(json!({ "id": "killme", "input": "hello" }), &tool_ctx)
+            .await
+            .expect_err("write after kill should fail");
+
+        assert!(matches!(
+            err,
+            ToolError::Terminal(TerminalError::SessionExited)
+        ));
+    }
+}

@@ -92,7 +92,10 @@ impl Tool for ShellTool {
         json!({
             "type": "object",
             "required": ["command"],
-            "properties": { "command": { "type": "string" } }
+            "properties": {
+                "command": { "type": "string" },
+                "pwd": { "type": "string" }
+            }
         })
     }
 
@@ -101,10 +104,14 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing command".to_string()))?;
+        let pwd = input.get("pwd").and_then(Value::as_str);
 
-        let command = SandboxedCommand::new("sh")
+        let mut command = SandboxedCommand::new("sh")
             .arg("-lc")
             .arg(command_text.to_string());
+        if let Some(pwd) = pwd {
+            command = command.working_dir(pwd);
+        }
         let output = ctx.sandbox.execute(command).await?;
 
         Ok(ToolResult::json(json!({
@@ -476,5 +483,180 @@ impl Tool for TerminalStatusTool {
         };
 
         Ok(ToolResult::json(payload))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use nyx_security::{
+        Sandbox, SandboxError, SandboxedCommand, SandboxedOutput, testing::NoopSandbox,
+    };
+    use serde_json::{Value, json};
+    use tempfile::NamedTempFile;
+
+    use crate::{SubAgentTool, TerminalRegistry, Tool, ToolContext, ToolError, testing};
+    #[cfg(feature = "file")]
+    use crate::FileReadTool;
+    #[cfg(feature = "shell")]
+    use crate::ShellTool;
+
+    #[derive(Default)]
+    struct SpySandbox {
+        calls: Arc<Mutex<Vec<SandboxedCommand>>>,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Sandbox for SpySandbox {
+        async fn execute(&self, cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError> {
+            self.calls.lock().expect("calls mutex poisoned").push(cmd);
+            self.executions.fetch_add(1, Ordering::Relaxed);
+            Ok(SandboxedOutput {
+                status: 0,
+                stdout: b"ok".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn ctx(tools: Vec<Arc<dyn Tool>>) -> ToolContext {
+        ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            available_tools: tools,
+        }
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_tool_reads_temp_file() {
+        let file = NamedTempFile::new().expect("create temp file");
+        std::fs::write(file.path(), "hello file").expect("write temp content");
+
+        let output = FileReadTool
+            .invoke(json!({ "path": file.path() }), &ctx(vec![]))
+            .await
+            .expect("file read works");
+
+        assert_eq!(output.value, Value::String("hello file".to_string()));
+    }
+
+    #[cfg(feature = "shell")]
+    #[tokio::test]
+    async fn shell_tool_calls_sandbox_execute() {
+        let spy = Arc::new(SpySandbox::default());
+        let tool_ctx = ToolContext {
+            sandbox: spy.clone(),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            available_tools: vec![],
+        };
+
+        let output = ShellTool
+            .invoke(json!({ "command": "echo hi" }), &tool_ctx)
+            .await
+            .expect("shell invoke works");
+
+        assert_eq!(output.value["stdout"], "ok");
+        assert_eq!(spy.executions.load(Ordering::Relaxed), 1);
+        let calls = spy.calls.lock().expect("calls mutex poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, "sh");
+    }
+
+    #[cfg(feature = "shell")]
+    #[tokio::test]
+    async fn shell_tool_passes_pwd_to_sandbox_command_working_dir() {
+        let spy = Arc::new(SpySandbox::default());
+        let tool_ctx = ToolContext {
+            sandbox: spy.clone(),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            available_tools: vec![],
+        };
+
+        ShellTool
+            .invoke(json!({ "command": "pwd", "pwd": "/tmp" }), &tool_ctx)
+            .await
+            .expect("shell invoke works");
+
+        let calls = spy.calls.lock().expect("calls mutex poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].working_dir, std::path::PathBuf::from("/tmp"));
+    }
+
+    #[cfg(feature = "sub-agent")]
+    #[tokio::test]
+    async fn sub_agent_tool_invokes_runner_with_selected_tools() {
+        let runner = Arc::new(testing::RecordingSubAgentRunner::default());
+        let available = vec![
+            Arc::new(testing::NoopTool::named("file_read")) as Arc<dyn Tool>,
+            Arc::new(testing::SpyTool::named("spy")) as Arc<dyn Tool>,
+            Arc::new(SubAgentTool) as Arc<dyn Tool>,
+        ];
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: Some(runner.clone()),
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            available_tools: available,
+        };
+
+        let out = SubAgentTool
+            .invoke(
+                json!({ "prompt": "do thing", "tools": ["spy"], "max_turns": 3 }),
+                &tool_ctx,
+            )
+            .await
+            .expect("sub-agent invoke works");
+
+        assert_eq!(out.value, Value::String("recorded".to_string()));
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].prompt, "do thing");
+        assert_eq!(calls[0].tool_names, vec!["spy".to_string()]);
+        assert_eq!(calls[0].max_turns, 3);
+    }
+
+    #[cfg(feature = "sub-agent")]
+    #[tokio::test]
+    async fn sub_agent_tool_defaults_to_all_except_self() {
+        let runner = Arc::new(testing::RecordingSubAgentRunner::default());
+        let available = vec![
+            Arc::new(testing::NoopTool::named("file_read")) as Arc<dyn Tool>,
+            Arc::new(testing::SpyTool::named("spy")) as Arc<dyn Tool>,
+            Arc::new(SubAgentTool) as Arc<dyn Tool>,
+        ];
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: Some(runner.clone()),
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            available_tools: available,
+        };
+
+        SubAgentTool
+            .invoke(json!({ "prompt": "do thing" }), &tool_ctx)
+            .await
+            .expect("sub-agent invoke works");
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].tool_names.contains(&"sub_agent".to_string()));
+        assert!(calls[0].tool_names.contains(&"file_read".to_string()));
+    }
+
+    #[cfg(feature = "sub-agent")]
+    #[tokio::test]
+    async fn sub_agent_tool_returns_not_available_when_runner_missing() {
+        let err = SubAgentTool
+            .invoke(json!({ "prompt": "do thing" }), &ctx(vec![]))
+            .await
+            .expect_err("missing runner should fail");
+
+        assert!(matches!(err, ToolError::NotAvailable(_)));
     }
 }

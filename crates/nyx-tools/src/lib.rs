@@ -13,5 +13,3 @@ pub use mcp::*;
 pub use registry::*;
 pub use terminal::*;
 
-#[cfg(test)]
-mod tests;

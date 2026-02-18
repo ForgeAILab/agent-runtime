@@ -121,3 +121,64 @@ pub async fn register_mcp(registry: &mut ToolRegistry, cfg: &McpConfig) -> Resul
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{McpConfig, McpServerConfig, register_mcp};
+    use crate::{ToolContext, ToolRegistry};
+
+    #[tokio::test]
+    async fn mcp_bridge_registers_tools_from_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [
+                    {
+                        "name": "mcp_echo",
+                        "description": "Echo tool",
+                        "schema": { "type": "object" },
+                        "invoke_url": format!("{}/invoke/echo", server.uri())
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/invoke/echo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mut registry = ToolRegistry::new();
+        let cfg = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "test".to_string(),
+                url: server.uri(),
+            }],
+        };
+
+        register_mcp(&mut registry, &cfg)
+            .await
+            .expect("register mcp tools");
+
+        let tools = registry.seal();
+        let mcp_tool = tools
+            .into_iter()
+            .find(|tool| tool.name() == "mcp_echo")
+            .expect("mcp tool exists");
+
+        let output = mcp_tool
+            .invoke(json!({ "message": "hi" }), &ToolContext::default())
+            .await
+            .expect("invoke mcp tool");
+        assert_eq!(output.value, json!({ "ok": true }));
+    }
+}
