@@ -28,19 +28,35 @@ pub struct ProviderMessage {
 
 impl ProviderMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::System, content: content.into(), tool_call_id: None }
+        Self {
+            role: ProviderRole::System,
+            content: content.into(),
+            tool_call_id: None,
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::User, content: content.into(), tool_call_id: None }
+        Self {
+            role: ProviderRole::User,
+            content: content.into(),
+            tool_call_id: None,
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::Assistant, content: content.into(), tool_call_id: None }
+        Self {
+            role: ProviderRole::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+        }
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
-        Self { role: ProviderRole::Tool, content: content.into(), tool_call_id: None }
+        Self {
+            role: ProviderRole::Tool,
+            content: content.into(),
+            tool_call_id: None,
+        }
     }
 
     pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {

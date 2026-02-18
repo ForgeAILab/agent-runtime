@@ -49,15 +49,18 @@ impl OpenAiProvider {
         for message in req.messages {
             match message.role {
                 ProviderRole::System => {
-                    messages.push(OpenAiRequestMessage::System { content: message.content });
+                    messages.push(OpenAiRequestMessage::System {
+                        content: message.content,
+                    });
                 }
                 ProviderRole::User => {
-                    messages.push(OpenAiRequestMessage::User { content: message.content });
+                    messages.push(OpenAiRequestMessage::User {
+                        content: message.content,
+                    });
                 }
                 ProviderRole::Assistant => {
                     // Decode JSON content blocks (set by react agent for tool_use round-tripping).
-                    let (text, tool_calls) =
-                        decode_assistant_blocks(&message.content);
+                    let (text, tool_calls) = decode_assistant_blocks(&message.content);
                     messages.push(OpenAiRequestMessage::Assistant {
                         content: if text.is_empty() { None } else { Some(text) },
                         tool_calls,
@@ -358,7 +361,10 @@ mod tests {
             .await;
 
         let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
-        let response = provider.complete(req).await.expect("request should succeed");
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
 
         assert_eq!(response.model, "gpt-4o");
         assert_eq!(response.content, "hello");
@@ -424,13 +430,19 @@ mod tests {
             .await;
 
         let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
-        let response = provider.complete(req).await.expect("request should succeed");
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
 
         assert_eq!(response.content, "");
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].id, Some("call_abc".to_string()));
         assert_eq!(response.tool_calls[0].name, "get_weather");
-        assert_eq!(response.tool_calls[0].input, serde_json::json!({"city": "London"}));
+        assert_eq!(
+            response.tool_calls[0].input,
+            serde_json::json!({"city": "London"})
+        );
     }
 
     #[tokio::test]
@@ -473,7 +485,10 @@ mod tests {
             .await;
 
         let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
-        let response = provider.complete(req).await.expect("request should succeed");
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
         assert_eq!(response.content, "It is sunny in London.");
     }
 }

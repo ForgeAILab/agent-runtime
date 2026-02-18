@@ -57,31 +57,31 @@ impl ClaudeProvider {
                 ProviderRole::Assistant => {
                     // Try to decode as JSON content blocks (set by the agent for tool_use
                     // round-tripping). Falls back to plain text if it's a normal response.
-                    let content =
-                        if let Ok(blocks) = serde_json::from_str::<Vec<Value>>(&message.content) {
-                            if !blocks.is_empty() && blocks.iter().all(|b| b.get("type").is_some())
-                            {
-                                let request_blocks: Vec<ClaudeRequestBlock> = blocks
-                                    .into_iter()
-                                    .filter_map(|b| match b["type"].as_str()? {
-                                        "tool_use" => Some(ClaudeRequestBlock::ToolUse {
-                                            id: b["id"].as_str().unwrap_or("").to_string(),
-                                            name: b["name"].as_str().unwrap_or("").to_string(),
-                                            input: b["input"].clone(),
-                                        }),
-                                        "text" => Some(ClaudeRequestBlock::Text {
-                                            text: b["text"].as_str().unwrap_or("").to_string(),
-                                        }),
-                                        _ => None,
-                                    })
-                                    .collect();
-                                ClaudeRequestContent::Blocks(request_blocks)
-                            } else {
-                                ClaudeRequestContent::Text(message.content)
-                            }
+                    let content = if let Ok(blocks) =
+                        serde_json::from_str::<Vec<Value>>(&message.content)
+                    {
+                        if !blocks.is_empty() && blocks.iter().all(|b| b.get("type").is_some()) {
+                            let request_blocks: Vec<ClaudeRequestBlock> = blocks
+                                .into_iter()
+                                .filter_map(|b| match b["type"].as_str()? {
+                                    "tool_use" => Some(ClaudeRequestBlock::ToolUse {
+                                        id: b["id"].as_str().unwrap_or("").to_string(),
+                                        name: b["name"].as_str().unwrap_or("").to_string(),
+                                        input: b["input"].clone(),
+                                    }),
+                                    "text" => Some(ClaudeRequestBlock::Text {
+                                        text: b["text"].as_str().unwrap_or("").to_string(),
+                                    }),
+                                    _ => None,
+                                })
+                                .collect();
+                            ClaudeRequestContent::Blocks(request_blocks)
                         } else {
                             ClaudeRequestContent::Text(message.content)
-                        };
+                        }
+                    } else {
+                        ClaudeRequestContent::Text(message.content)
+                    };
                     messages.push(ClaudeMessage {
                         role: "assistant".to_string(),
                         content,
@@ -160,10 +160,12 @@ impl ClaudeProvider {
                     }
                 }
                 "tool_use" => {
-                    if let (Some(id), Some(name), Some(input)) =
-                        (item.id, item.name, item.input)
-                    {
-                        tool_calls.push(ToolCall { id: Some(id), name, input });
+                    if let (Some(id), Some(name), Some(input)) = (item.id, item.name, item.input) {
+                        tool_calls.push(ToolCall {
+                            id: Some(id),
+                            name,
+                            input,
+                        });
                     }
                 }
                 _ => {}
@@ -236,9 +238,18 @@ enum ClaudeRequestContent {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClaudeRequestBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
-    ToolResult { tool_use_id: String, content: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
