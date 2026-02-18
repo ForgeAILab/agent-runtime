@@ -1,0 +1,24 @@
+[package]
+name = "nyx-provider"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["compat"]
+openai = []
+claude = []
+compat = ["openai"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = "0.1"
+futures-core = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
