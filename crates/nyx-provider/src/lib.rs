@@ -4,10 +4,42 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use thiserror::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderMessage {
+    pub role: ProviderRole,
+    pub content: String,
+}
+
+impl ProviderMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: ProviderRole::System, content: content.into() }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: ProviderRole::User, content: content.into() }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: ProviderRole::Assistant, content: content.into() }
+    }
+
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self { role: ProviderRole::Tool, content: content.into() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionRequest {
     pub model: String,
-    pub prompt: String,
+    pub messages: Vec<ProviderMessage>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
