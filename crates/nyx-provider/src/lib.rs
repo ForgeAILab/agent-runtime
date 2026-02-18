@@ -22,42 +22,50 @@ pub enum ProviderRole {
 pub struct ProviderMessage {
     pub role: ProviderRole,
     pub content: String,
+    /// Tool use ID for `Tool` role messages — correlates with the assistant `tool_use` block.
+    pub tool_call_id: Option<String>,
 }
 
 impl ProviderMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: ProviderRole::System,
-            content: content.into(),
-        }
+        Self { role: ProviderRole::System, content: content.into(), tool_call_id: None }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: ProviderRole::User,
-            content: content.into(),
-        }
+        Self { role: ProviderRole::User, content: content.into(), tool_call_id: None }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: ProviderRole::Assistant,
-            content: content.into(),
-        }
+        Self { role: ProviderRole::Assistant, content: content.into(), tool_call_id: None }
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
+        Self { role: ProviderRole::Tool, content: content.into(), tool_call_id: None }
+    }
+
+    pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: ProviderRole::Tool,
             content: content.into(),
+            tool_call_id: Some(id.into()),
         }
     }
+}
+
+/// A tool definition forwarded to the LLM so it knows what tools are available.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionRequest {
     pub model: String,
     pub messages: Vec<ProviderMessage>,
+    /// Tool definitions advertised to the LLM. Empty means no tools.
+    pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
@@ -160,6 +168,7 @@ mod tests {
                 ProviderMessage::system("system"),
                 ProviderMessage::user("hello provider"),
             ],
+            tools: vec![],
             max_tokens: Some(16),
             temperature: Some(0.2),
         };

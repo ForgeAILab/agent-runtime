@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-    ProviderRole, ToolCallParser, UsageMetadata,
+    ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -44,30 +45,58 @@ impl OpenAiProvider {
     ) -> Result<CompletionResponse, ProviderError> {
         let endpoint = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
+        let mut messages: Vec<OpenAiRequestMessage> = Vec::new();
+        for message in req.messages {
+            match message.role {
+                ProviderRole::System => {
+                    messages.push(OpenAiRequestMessage::System { content: message.content });
+                }
+                ProviderRole::User => {
+                    messages.push(OpenAiRequestMessage::User { content: message.content });
+                }
+                ProviderRole::Assistant => {
+                    // Decode JSON content blocks (set by react agent for tool_use round-tripping).
+                    let (text, tool_calls) =
+                        decode_assistant_blocks(&message.content);
+                    messages.push(OpenAiRequestMessage::Assistant {
+                        content: if text.is_empty() { None } else { Some(text) },
+                        tool_calls,
+                    });
+                }
+                ProviderRole::Tool => {
+                    if let Some(tool_call_id) = message.tool_call_id {
+                        // Native tool result.
+                        messages.push(OpenAiRequestMessage::ToolResult {
+                            tool_call_id,
+                            content: message.content,
+                        });
+                    } else {
+                        // Fallback: legacy plain-text tool message.
+                        messages.push(OpenAiRequestMessage::User {
+                            content: format!("[Tool Result]\n{}", message.content),
+                        });
+                    }
+                }
+            }
+        }
+
+        let tools: Vec<OpenAiFunctionTool> = req
+            .tools
+            .into_iter()
+            .map(|t| OpenAiFunctionTool {
+                kind: "function".to_string(),
+                function: OpenAiFunctionDefinition {
+                    name: t.name,
+                    description: t.description,
+                    parameters: t.input_schema,
+                },
+            })
+            .collect();
+
         let payload = OpenAiCompletionRequest {
             model: req.model,
-            messages: req
-                .messages
-                .into_iter()
-                .map(|message| match message.role {
-                    ProviderRole::System => OpenAiMessage {
-                        role: "system".to_string(),
-                        content: message.content,
-                    },
-                    ProviderRole::User => OpenAiMessage {
-                        role: "user".to_string(),
-                        content: message.content,
-                    },
-                    ProviderRole::Assistant => OpenAiMessage {
-                        role: "assistant".to_string(),
-                        content: message.content,
-                    },
-                    ProviderRole::Tool => OpenAiMessage {
-                        role: "user".to_string(),
-                        content: format!("[Tool Result]\n{}", message.content),
-                    },
-                })
-                .collect(),
+            messages,
+            tools,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             stream: Some(false),
@@ -88,19 +117,32 @@ impl OpenAiProvider {
         }
 
         let parsed: OpenAiCompletionResponse = response.json().await?;
-        let content = parsed
+        let choice = parsed
             .choices
             .into_iter()
             .next()
-            .and_then(|choice| choice.message.content)
-            .ok_or(ProviderError::InvalidResponse(
-                "missing choices[0].message.content",
-            ))?;
-        let tool_calls = self
-            .tool_call_parser
-            .as_ref()
-            .map(|parser| parser.parse(&content))
-            .unwrap_or_default();
+            .ok_or(ProviderError::InvalidResponse("empty choices"))?;
+
+        let content = choice.message.content.unwrap_or_default();
+        let mut tool_calls: Vec<ToolCall> = choice
+            .message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| ToolCall {
+                id: Some(tc.id),
+                name: tc.function.name,
+                input: serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or(Value::Object(Default::default())),
+            })
+            .collect();
+
+        // Fall back to text-based parser when no native tool calls were returned.
+        if tool_calls.is_empty() {
+            if let Some(parser) = &self.tool_call_parser {
+                tool_calls = parser.parse(&content);
+            }
+        }
 
         Ok(CompletionResponse {
             content,
@@ -109,6 +151,38 @@ impl OpenAiProvider {
             usage: parsed.usage.map(UsageMetadata::from),
         })
     }
+}
+
+/// Decode a content string that may be a JSON-encoded array of content blocks (produced by
+/// `build_assistant_content` in `react.rs`). Returns the extracted text and OpenAI tool calls.
+fn decode_assistant_blocks(content: &str) -> (String, Vec<OpenAiToolCallRequest>) {
+    let Ok(blocks) = serde_json::from_str::<Vec<Value>>(content) else {
+        return (content.to_string(), vec![]);
+    };
+    if blocks.is_empty() || !blocks.iter().all(|b| b.get("type").is_some()) {
+        return (content.to_string(), vec![]);
+    }
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for block in &blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                text = block["text"].as_str().unwrap_or("").to_string();
+            }
+            Some("tool_use") => {
+                let id = block["id"].as_str().unwrap_or("").to_string();
+                let name = block["name"].as_str().unwrap_or("").to_string();
+                let arguments = serde_json::to_string(&block["input"]).unwrap_or_default();
+                tool_calls.push(OpenAiToolCallRequest {
+                    id,
+                    kind: "function".to_string(),
+                    function: OpenAiToolCallFunction { name, arguments },
+                });
+            }
+            _ => {}
+        }
+    }
+    (text, tool_calls)
 }
 
 #[async_trait]
@@ -124,10 +198,14 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+// --- Request types ---
+
 #[derive(Debug, Serialize)]
 struct OpenAiCompletionRequest {
     model: String,
-    messages: Vec<OpenAiMessage>,
+    messages: Vec<OpenAiRequestMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<OpenAiFunctionTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,10 +215,56 @@ struct OpenAiCompletionRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAiMessage {
-    role: String,
-    content: String,
+#[serde(tag = "role", rename_all = "lowercase")]
+enum OpenAiRequestMessage {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<OpenAiToolCallRequest>,
+    },
+    #[serde(rename = "tool")]
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+    },
 }
+
+#[derive(Debug, Serialize)]
+struct OpenAiToolCallRequest {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: OpenAiToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiFunctionTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OpenAiFunctionDefinition,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiFunctionDefinition {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+// --- Response types ---
 
 #[derive(Debug, Deserialize)]
 struct OpenAiCompletionResponse {
@@ -157,6 +281,19 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiResponseMessage {
     content: Option<String>,
+    tool_calls: Option<Vec<OpenAiToolCallResponse>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolCallResponse {
+    id: String,
+    function: OpenAiFunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,15 +320,16 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn openai_provider_serializes_model_field() {
+    async fn openai_plain_text_response() {
         let server = MockServer::start().await;
         let req = CompletionRequest {
             model: "gpt-4o".to_string(),
             messages: vec![
                 crate::ProviderMessage::system("sys"),
-                crate::ProviderMessage::tool("42"),
+                crate::ProviderMessage::tool("42"), // no tool_call_id → legacy fallback
                 crate::ProviderMessage::user("hi"),
             ],
+            tools: vec![],
             max_tokens: Some(32),
             temperature: Some(0.1),
         };
@@ -214,19 +352,13 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "gpt-4o",
                 "choices": [{"message": {"content": "hello"}}],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5
-                }
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
             })))
             .mount(&server)
             .await;
 
         let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
-        let response = provider
-            .complete(req)
-            .await
-            .expect("request should succeed");
+        let response = provider.complete(req).await.expect("request should succeed");
 
         assert_eq!(response.model, "gpt-4o");
         assert_eq!(response.content, "hello");
@@ -240,5 +372,108 @@ mod tests {
                 cache_write_tokens: None,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn openai_native_tool_call_request_and_response() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![crate::ProviderMessage::user("what's the weather?")],
+            tools: vec![crate::ToolDefinition {
+                name: "get_weather".to_string(),
+                description: "Returns current weather".to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            }],
+            max_tokens: None,
+            temperature: None,
+        };
+
+        let expected_body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "what's the weather?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Returns current weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                }
+            }],
+            "stream": false
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-4o",
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": "{\"city\":\"London\"}"}
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 10}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
+        let response = provider.complete(req).await.expect("request should succeed");
+
+        assert_eq!(response.content, "");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, Some("call_abc".to_string()));
+        assert_eq!(response.tool_calls[0].name, "get_weather");
+        assert_eq!(response.tool_calls[0].input, serde_json::json!({"city": "London"}));
+    }
+
+    #[tokio::test]
+    async fn openai_tool_result_message_uses_tool_role() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                crate::ProviderMessage::user("check weather"),
+                // Assistant turn with encoded tool_use block
+                crate::ProviderMessage::assistant(
+                    serde_json::json!([{"type":"tool_use","id":"call_abc","name":"get_weather","input":{"city":"London"}}]).to_string()
+                ),
+                crate::ProviderMessage::tool_result("call_abc", "sunny, 22°C"),
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+        };
+
+        let expected_body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "check weather"},
+                {"role": "assistant", "tool_calls": [{"id": "call_abc", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"London\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_abc", "content": "sunny, 22°C"}
+            ],
+            "stream": false
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-4o",
+                "choices": [{"message": {"content": "It is sunny in London."}}],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 8}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
+        let response = provider.complete(req).await.expect("request should succeed");
+        assert_eq!(response.content, "It is sunny in London.");
     }
 }

@@ -141,6 +141,7 @@ mod tests {
         CompletionRequest {
             model: "m".to_string(),
             messages: vec![ProviderMessage::user("hi")],
+            tools: vec![],
             max_tokens: None,
             temperature: None,
         }
