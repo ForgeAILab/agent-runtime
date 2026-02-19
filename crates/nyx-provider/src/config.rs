@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LlmProvider, ProviderError};
+use crate::{FallbackProvider, LlmProvider, ProviderError, RetryProvider};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
@@ -59,6 +59,16 @@ impl Default for ProviderConfig {
             base_url: None,
             retry: RetryConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct ProvidersConfig(pub Vec<ProviderConfig>);
+
+impl ProvidersConfig {
+    pub fn into_vec(self) -> Vec<ProviderConfig> {
+        self.0
     }
 }
 
@@ -296,9 +306,27 @@ pub fn build_provider(
     }
 }
 
+pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider, ProviderError> {
+    if cfgs.is_empty() {
+        return Err(ProviderError::Rejected(
+            "provider chain must not be empty".to_string(),
+        ));
+    }
+
+    let mut chain = Vec::with_capacity(cfgs.len());
+    for cfg in cfgs {
+        let (provider, model) = build_provider(cfg)?;
+        let provider: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(provider, &cfg.retry));
+        chain.push((provider, model));
+    }
+
+    Ok(FallbackProvider::new(chain))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProviderConfig, build_provider};
+    use super::{ProviderConfig, ProvidersConfig, build_provider, build_provider_chain};
+    use serde::Deserialize;
 
     #[test]
     fn provider_config_deserializes_from_toml() {
@@ -352,5 +380,52 @@ base_url = "http://localhost:11434/v1"
             Ok(_) => panic!("unknown provider should fail"),
             Err(err) => assert!(err.to_string().contains("unknown-provider")),
         }
+    }
+
+    #[test]
+    fn providers_config_deserializes_from_toml_array() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            providers: ProvidersConfig,
+        }
+
+        let cfgs: Wrapper = toml::from_str(
+            r#"
+[[providers]]
+kind = "echo"
+model = "m1"
+
+[[providers]]
+kind = "echo"
+model = "m2"
+"#,
+        )
+        .expect("providers config should deserialize");
+
+        assert_eq!(cfgs.providers.0.len(), 2);
+        assert_eq!(cfgs.providers.0[0].model, "m1");
+        assert_eq!(cfgs.providers.0[1].model, "m2");
+    }
+
+    #[test]
+    fn build_provider_chain_rejects_empty_slice() {
+        let err = match build_provider_chain(&[]) {
+            Ok(_) => panic!("empty chain must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::ProviderError::Rejected(msg) if msg == "provider chain must not be empty")
+        );
+    }
+
+    #[test]
+    fn build_provider_chain_single_entry_behaves_like_single_provider() {
+        let cfg = ProviderConfig {
+            kind: "echo".to_string(),
+            model: "echo-default".to_string(),
+            ..Default::default()
+        };
+        let chain = build_provider_chain(&[cfg]).expect("single-entry chain should build");
+        assert_eq!(chain.len(), 1);
     }
 }
