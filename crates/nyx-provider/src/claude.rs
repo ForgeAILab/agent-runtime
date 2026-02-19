@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-    ProviderContent, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
+    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
+    ProviderError, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -371,6 +371,7 @@ mod tests {
             tools: vec![],
             max_tokens: Some(256),
             temperature: None,
+            thinking_tokens: None,
         };
 
         let expected = serde_json::json!({

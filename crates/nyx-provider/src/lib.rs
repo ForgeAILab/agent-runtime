@@ -97,6 +97,7 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub thinking_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,6 +213,7 @@ mod tests {
             tools: vec![],
             max_tokens: Some(16),
             temperature: Some(0.2),
+            thinking_tokens: None,
         };
 
         let response = provider

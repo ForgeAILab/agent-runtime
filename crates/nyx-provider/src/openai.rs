@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-    ProviderContent, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
+    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
+    ProviderError, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -60,7 +60,8 @@ impl OpenAiProvider {
                 }
                 ProviderRole::Assistant => {
                     // Decode JSON content blocks (set by react agent for tool_use round-tripping).
-                    let (text, tool_calls) = decode_assistant_blocks(&concat_text(&message.content));
+                    let (text, tool_calls) =
+                        decode_assistant_blocks(&concat_text(&message.content));
                     messages.push(OpenAiRequestMessage::Assistant {
                         content: if text.is_empty() { None } else { Some(text) },
                         tool_calls,
@@ -283,12 +284,8 @@ enum OpenAiMessageContent {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenAiContentBlock {
-    Text {
-        text: String,
-    },
-    ImageUrl {
-        image_url: OpenAiImageUrl,
-    },
+    Text { text: String },
+    ImageUrl { image_url: OpenAiImageUrl },
 }
 
 #[derive(Debug, Serialize)]
@@ -394,6 +391,7 @@ mod tests {
             tools: vec![],
             max_tokens: Some(32),
             temperature: Some(0.1),
+            thinking_tokens: None,
         };
 
         let expected = serde_json::json!({
@@ -452,6 +450,7 @@ mod tests {
             }],
             max_tokens: None,
             temperature: None,
+            thinking_tokens: None,
         };
 
         let expected_body = serde_json::json!({
@@ -520,6 +519,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            thinking_tokens: None,
         };
 
         let expected_body = serde_json::json!({
@@ -572,6 +572,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            thinking_tokens: None,
         };
 
         let expected_body = serde_json::json!({
