@@ -141,10 +141,10 @@ impl OpenAiProvider {
             .collect();
 
         // Fall back to text-based parser when no native tool calls were returned.
-        if tool_calls.is_empty() {
-            if let Some(parser) = &self.tool_call_parser {
-                tool_calls = parser.parse(&content);
-            }
+        if tool_calls.is_empty()
+            && let Some(parser) = &self.tool_call_parser
+        {
+            tool_calls = parser.parse(&content);
         }
 
         Ok(CompletionResponse {

@@ -498,11 +498,11 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::NamedTempFile;
 
-    use crate::{SubAgentTool, TerminalRegistry, Tool, ToolContext, ToolError, testing};
     #[cfg(feature = "file")]
     use crate::FileReadTool;
     #[cfg(feature = "shell")]
     use crate::ShellTool;
+    use crate::{SubAgentTool, TerminalRegistry, Tool, ToolContext, ToolError, testing};
 
     #[derive(Default)]
     struct SpySandbox {
