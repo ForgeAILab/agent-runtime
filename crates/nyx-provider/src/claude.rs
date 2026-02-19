@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-    ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
+    ProviderContent, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -49,16 +49,22 @@ impl ClaudeProvider {
 
         for message in req.messages {
             match message.role {
-                ProviderRole::System => system_chunks.push(message.content),
+                ProviderRole::System => {
+                    let text = concat_text(&message.content);
+                    if !text.is_empty() {
+                        system_chunks.push(text);
+                    }
+                }
                 ProviderRole::User => messages.push(ClaudeMessage {
                     role: "user".to_string(),
-                    content: ClaudeRequestContent::Text(message.content),
+                    content: provider_content_to_claude(message.content),
                 }),
                 ProviderRole::Assistant => {
                     // Try to decode as JSON content blocks (set by the agent for tool_use
                     // round-tripping). Falls back to plain text if it's a normal response.
+                    let assistant_text = concat_text(&message.content);
                     let content = if let Ok(blocks) =
-                        serde_json::from_str::<Vec<Value>>(&message.content)
+                        serde_json::from_str::<Vec<Value>>(&assistant_text)
                     {
                         if !blocks.is_empty() && blocks.iter().all(|b| b.get("type").is_some()) {
                             let request_blocks: Vec<ClaudeRequestBlock> = blocks
@@ -77,10 +83,10 @@ impl ClaudeProvider {
                                 .collect();
                             ClaudeRequestContent::Blocks(request_blocks)
                         } else {
-                            ClaudeRequestContent::Text(message.content)
+                            provider_content_to_claude(message.content)
                         }
                     } else {
-                        ClaudeRequestContent::Text(message.content)
+                        provider_content_to_claude(message.content)
                     };
                     messages.push(ClaudeMessage {
                         role: "assistant".to_string(),
@@ -95,7 +101,7 @@ impl ClaudeProvider {
                             content: ClaudeRequestContent::Blocks(vec![
                                 ClaudeRequestBlock::ToolResult {
                                     tool_use_id,
-                                    content: message.content,
+                                    content: concat_text(&message.content),
                                 },
                             ]),
                         });
@@ -103,7 +109,7 @@ impl ClaudeProvider {
                         // Fallback for plain tool messages (text-based parser flow).
                         messages.push(ClaudeMessage {
                             role: "user".to_string(),
-                            content: ClaudeRequestContent::Text(message.content),
+                            content: ClaudeRequestContent::Text(concat_text(&message.content)),
                         });
                     }
                 }
@@ -188,6 +194,42 @@ impl ClaudeProvider {
     }
 }
 
+fn concat_text(content: &[ProviderContent]) -> String {
+    content
+        .iter()
+        .filter_map(ProviderContent::as_text)
+        .collect::<String>()
+}
+
+fn provider_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestContent {
+    let mut blocks = Vec::new();
+    for block in content {
+        match block {
+            ProviderContent::Text { text } => {
+                if !text.is_empty() {
+                    blocks.push(ClaudeRequestBlock::Text { text });
+                }
+            }
+            ProviderContent::Image { url, .. } => {
+                blocks.push(ClaudeRequestBlock::Image {
+                    source: ClaudeImageSource {
+                        kind: "url".to_string(),
+                        url,
+                    },
+                });
+            }
+        }
+    }
+
+    if blocks.len() == 1 {
+        if let ClaudeRequestBlock::Text { text } = &blocks[0] {
+            return ClaudeRequestContent::Text(text.clone());
+        }
+    }
+
+    ClaudeRequestContent::Blocks(blocks)
+}
+
 #[async_trait]
 impl LlmProvider for ClaudeProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
@@ -241,6 +283,9 @@ enum ClaudeRequestBlock {
     Text {
         text: String,
     },
+    Image {
+        source: ClaudeImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -250,6 +295,13 @@ enum ClaudeRequestBlock {
         tool_use_id: String,
         content: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudeImageSource {
+    #[serde(rename = "type")]
+    kind: String,
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,5 +341,75 @@ impl From<ClaudeUsage> for UsageMetadata {
             cache_read_tokens: value.cache_read_input_tokens,
             cache_write_tokens: value.cache_creation_input_tokens,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn claude_serializes_image_content_blocks() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "claude-3-5-sonnet".to_string(),
+            messages: vec![crate::ProviderMessage {
+                role: crate::ProviderRole::User,
+                content: vec![
+                    crate::ProviderContent::Image {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: Some("auto".to_string()),
+                    },
+                    crate::ProviderContent::Text {
+                        text: "What is in this image?".to_string(),
+                    },
+                ],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            max_tokens: Some(256),
+            temperature: None,
+        };
+
+        let expected = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 256,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/image.png"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "What is in this image?"
+                    }
+                ]
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(body_json(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "claude-3-5-sonnet",
+                "content": [{"type": "text", "text": "A cat."}],
+                "usage": {"input_tokens": 10, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = ClaudeProvider::new("test-key").with_base_url(server.uri());
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.content, "A cat.");
     }
 }

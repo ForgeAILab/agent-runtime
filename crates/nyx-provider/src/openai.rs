@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-    ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
+    ProviderContent, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -50,17 +50,17 @@ impl OpenAiProvider {
             match message.role {
                 ProviderRole::System => {
                     messages.push(OpenAiRequestMessage::System {
-                        content: message.content,
+                        content: OpenAiMessageContent::Text(concat_text(&message.content)),
                     });
                 }
                 ProviderRole::User => {
                     messages.push(OpenAiRequestMessage::User {
-                        content: message.content,
+                        content: provider_content_to_openai(message.content),
                     });
                 }
                 ProviderRole::Assistant => {
                     // Decode JSON content blocks (set by react agent for tool_use round-tripping).
-                    let (text, tool_calls) = decode_assistant_blocks(&message.content);
+                    let (text, tool_calls) = decode_assistant_blocks(&concat_text(&message.content));
                     messages.push(OpenAiRequestMessage::Assistant {
                         content: if text.is_empty() { None } else { Some(text) },
                         tool_calls,
@@ -71,12 +71,15 @@ impl OpenAiProvider {
                         // Native tool result.
                         messages.push(OpenAiRequestMessage::ToolResult {
                             tool_call_id,
-                            content: message.content,
+                            content: concat_text(&message.content),
                         });
                     } else {
                         // Fallback: legacy plain-text tool message.
                         messages.push(OpenAiRequestMessage::User {
-                            content: format!("[Tool Result]\n{}", message.content),
+                            content: OpenAiMessageContent::Text(format!(
+                                "[Tool Result]\n{}",
+                                concat_text(&message.content)
+                            )),
                         });
                     }
                 }
@@ -188,6 +191,37 @@ fn decode_assistant_blocks(content: &str) -> (String, Vec<OpenAiToolCallRequest>
     (text, tool_calls)
 }
 
+fn concat_text(content: &[ProviderContent]) -> String {
+    content
+        .iter()
+        .filter_map(ProviderContent::as_text)
+        .collect::<String>()
+}
+
+fn provider_content_to_openai(content: Vec<ProviderContent>) -> OpenAiMessageContent {
+    let mut blocks = Vec::new();
+    for block in content {
+        match block {
+            ProviderContent::Text { text } => {
+                if !text.is_empty() {
+                    blocks.push(OpenAiContentBlock::Text { text });
+                }
+            }
+            ProviderContent::Image { url, detail } => {
+                blocks.push(OpenAiContentBlock::ImageUrl {
+                    image_url: OpenAiImageUrl { url, detail },
+                });
+            }
+        }
+    }
+    if blocks.len() == 1 {
+        if let OpenAiContentBlock::Text { text } = &blocks[0] {
+            return OpenAiMessageContent::Text(text.clone());
+        }
+    }
+    OpenAiMessageContent::Blocks(blocks)
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
@@ -221,10 +255,10 @@ struct OpenAiCompletionRequest {
 #[serde(tag = "role", rename_all = "lowercase")]
 enum OpenAiRequestMessage {
     System {
-        content: String,
+        content: OpenAiMessageContent,
     },
     User {
-        content: String,
+        content: OpenAiMessageContent,
     },
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +271,31 @@ enum OpenAiRequestMessage {
         tool_call_id: String,
         content: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum OpenAiMessageContent {
+    Text(String),
+    Blocks(Vec<OpenAiContentBlock>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAiContentBlock {
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: OpenAiImageUrl,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiImageUrl {
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -490,5 +549,59 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(response.content, "It is sunny in London.");
+    }
+
+    #[tokio::test]
+    async fn openai_serializes_image_url_content_blocks() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![crate::ProviderMessage {
+                role: crate::ProviderRole::User,
+                content: vec![
+                    crate::ProviderContent::Image {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: Some("auto".to_string()),
+                    },
+                    crate::ProviderContent::Text {
+                        text: "What is in this image?".to_string(),
+                    },
+                ],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+        };
+
+        let expected_body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png", "detail": "auto"}},
+                    {"type": "text", "text": "What is in this image?"}
+                ]
+            }],
+            "stream": false
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gpt-4o",
+                "choices": [{"message": {"content": "A tree"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 4}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.content, "A tree");
     }
 }

@@ -20,51 +20,62 @@ pub enum ProviderRole {
     Tool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderContent {
+    Text { text: String },
+    Image { url: String, detail: Option<String> },
+}
+
+impl ProviderContent {
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text { text: s.into() }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text.as_str()),
+            Self::Image { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderMessage {
     pub role: ProviderRole,
-    pub content: String,
+    pub content: Vec<ProviderContent>,
     /// Tool use ID for `Tool` role messages — correlates with the assistant `tool_use` block.
     pub tool_call_id: Option<String>,
 }
 
 impl ProviderMessage {
-    pub fn system(content: impl Into<String>) -> Self {
+    pub fn text(role: ProviderRole, content: impl Into<String>) -> Self {
         Self {
-            role: ProviderRole::System,
-            content: content.into(),
+            role,
+            content: vec![ProviderContent::text(content)],
             tool_call_id: None,
         }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::text(ProviderRole::System, content)
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: ProviderRole::User,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Self::text(ProviderRole::User, content)
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: ProviderRole::Assistant,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Self::text(ProviderRole::Assistant, content)
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
-        Self {
-            role: ProviderRole::Tool,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Self::text(ProviderRole::Tool, content)
     }
 
     pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: ProviderRole::Tool,
-            content: content.into(),
+            content: vec![ProviderContent::text(content)],
             tool_call_id: Some(id.into()),
         }
     }
@@ -139,7 +150,13 @@ pub mod testing {
             let content = req
                 .messages
                 .last()
-                .map(|message| message.content.clone())
+                .map(|message| {
+                    message
+                        .content
+                        .iter()
+                        .filter_map(ProviderContent::as_text)
+                        .collect::<String>()
+                })
                 .unwrap_or_default();
             Ok(CompletionResponse {
                 content,
@@ -154,7 +171,13 @@ pub mod testing {
             let token = req
                 .messages
                 .last()
-                .map(|message| message.content.clone())
+                .map(|message| {
+                    message
+                        .content
+                        .iter()
+                        .filter_map(ProviderContent::as_text)
+                        .collect::<String>()
+                })
                 .unwrap_or_default();
             let stream = tokio_stream::iter(vec![Ok(token)]);
             let _ = model;
