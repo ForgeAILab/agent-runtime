@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Display};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use aes_gcm::aead::rand_core::RngCore;
@@ -22,6 +23,7 @@ const ENC_PREFIX: &str = "enc:";
 const ENV_PREFIX: &str = "env:";
 const VAULT_PREFIX: &str = "vault:";
 const MASTER_KEY_ENV: &str = "NYX_MASTER_KEY";
+const MASTER_KEY_FILE_ENV: &str = "NYX_MASTER_KEY_FILE";
 const KEY_DERIVATION_SALT: &[u8] = b"nyx.config.secret.v1";
 const NONCE_LEN: usize = 12;
 
@@ -40,6 +42,15 @@ impl<T> Secret<T> {
 
     pub fn reveal(&self) -> &T {
         &self.0
+    }
+}
+
+impl<T> Default for Secret<T>
+where
+    T: Default,
+{
+    fn default() -> Self {
+        Self(T::default())
     }
 }
 
@@ -147,7 +158,7 @@ pub fn derive_master_key() -> Result<[u8; 32], SecurityError> {
                     }
                 }
             }
-            return Err(SecurityError::MasterKeyNotFound);
+            return load_or_create_legacy_file_key();
         }
     };
 
@@ -163,6 +174,73 @@ fn derive_key_from_passphrase(passphrase: &[u8]) -> Result<[u8; 32], SecurityErr
         .hash_password_into(passphrase, KEY_DERIVATION_SALT, &mut key)
         .map_err(|err| SecurityError::KeyDerivationFailed(err.to_string()))?;
     Ok(key)
+}
+
+fn load_or_create_legacy_file_key() -> Result<[u8; 32], SecurityError> {
+    let path = default_master_key_file_path();
+    if path.exists() {
+        let hex = std::fs::read_to_string(&path)
+            .map_err(|err| SecurityError::KeyDerivationFailed(err.to_string()))?;
+        let bytes = hex_decode(hex.trim()).ok_or_else(|| {
+            SecurityError::KeyDerivationFailed("master key file is corrupt (bad hex)".to_string())
+        })?;
+        if bytes.len() != 32 {
+            return Err(SecurityError::KeyDerivationFailed(format!(
+                "master key file has wrong length: expected 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+
+    let mut key = [0_u8; 32];
+    OsRng.fill_bytes(&mut key);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| SecurityError::KeyDerivationFailed(err.to_string()))?;
+    }
+    std::fs::write(&path, hex_encode(&key))
+        .map_err(|err| SecurityError::KeyDerivationFailed(err.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(key)
+}
+
+fn default_master_key_file_path() -> PathBuf {
+    if let Ok(path) = std::env::var(MASTER_KEY_FILE_ENV) {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".nyx").join(".secret_key");
+    }
+    PathBuf::from(".nyx").join(".secret_key")
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+        out.push(byte);
+    }
+    Some(out)
 }
 
 fn resolve_vault_secret(key_name: &str) -> Result<String, SecurityError> {
