@@ -8,8 +8,10 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
 
 mod config;
+mod secret;
 
 pub use config::{SecurityConfig, build_sandbox, build_secret_store};
+pub use secret::{Secret, decrypt, derive_master_key, encrypt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxedCommand {
@@ -96,35 +98,6 @@ pub enum SandboxError {
     UnsupportedInteractiveSpawn,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret {
-    value: Vec<u8>,
-}
-
-impl std::fmt::Debug for Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Secret(**redacted**)")
-    }
-}
-
-impl Secret {
-    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
-        Self {
-            value: bytes.into(),
-        }
-    }
-
-    pub fn from_string(value: impl Into<String>) -> Self {
-        Self {
-            value: value.into().into_bytes(),
-        }
-    }
-
-    pub fn expose(&self) -> &[u8] {
-        &self.value
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum SecretError {
     #[error("secret key not found: {0}")]
@@ -141,6 +114,22 @@ pub enum SecretError {
 pub enum SecurityError {
     #[error("unknown security kind: {0}")]
     UnknownKind(String),
+    #[error("invalid encrypted secret format")]
+    InvalidSecretFormat,
+    #[error("secret decryption failed")]
+    DecryptionFailed,
+    #[error("secret encryption failed: {0}")]
+    EncryptionFailed(String),
+    #[error("secret is not valid UTF-8")]
+    InvalidUtf8Secret,
+    #[error("master key not found; set NYX_MASTER_KEY or configure OS keyring entry ai.nyx/master_key")]
+    MasterKeyNotFound,
+    #[error("master key derivation failed: {0}")]
+    KeyDerivationFailed(String),
+    #[error("vault is not available")]
+    VaultNotAvailable,
+    #[error("vault key not found: {0}")]
+    VaultKeyNotFound(String),
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
     #[error(transparent)]

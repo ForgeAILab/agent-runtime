@@ -72,6 +72,30 @@ impl EncryptedSecretStore {
         }
     }
 
+    pub fn from_derived_key_with_storage(
+        key: [u8; 32],
+        storage_path: impl Into<PathBuf>,
+    ) -> Result<Self, SecretError> {
+        let storage_path = storage_path.into();
+        let entries = load_entries(&storage_path).unwrap_or_default();
+        Ok(Self {
+            key,
+            entries: RwLock::new(entries),
+            storage_path: Some(storage_path),
+        })
+    }
+
+    pub fn default_storage_path() -> PathBuf {
+        if let Ok(path) = std::env::var("NYX_VAULT_PATH") {
+            return PathBuf::from(path);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join(".nyx").join(".secrets")
+        } else {
+            PathBuf::from(".nyx").join(".secrets")
+        }
+    }
+
     fn cipher(&self) -> Result<Aes256Gcm, SecretError> {
         Aes256Gcm::new_from_slice(&self.key)
             .map_err(|err| SecretError::Crypto(format!("invalid key material: {err}")))
@@ -103,6 +127,22 @@ impl EncryptedSecretStore {
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .map_err(|err| SecretError::Crypto(format!("decrypt failed: {err}")))?;
         Ok(Secret::from_bytes(plaintext))
+    }
+
+    pub async fn list_keys(&self) -> Vec<String> {
+        let guard = self.entries.read().await;
+        let mut keys = guard.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<bool, SecretError> {
+        let mut guard = self.entries.write().await;
+        let removed = guard.remove(key).is_some();
+        if removed && let Some(ref path) = self.storage_path {
+            persist_entries(&guard, path)?;
+        }
+        Ok(removed)
     }
 }
 
