@@ -7,6 +7,10 @@ use thiserror::Error;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
 
+mod config;
+
+pub use config::{SecurityConfig, build_sandbox, build_secret_store};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxedCommand {
     pub program: String,
@@ -131,6 +135,16 @@ pub enum SecretError {
     Crypto(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum SecurityError {
+    #[error("unknown security kind: {0}")]
+    UnknownKind(String),
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
+    #[error(transparent)]
+    Secret(#[from] SecretError),
 }
 
 #[async_trait]
