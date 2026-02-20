@@ -122,7 +122,9 @@ pub enum SecurityError {
     EncryptionFailed(String),
     #[error("secret is not valid UTF-8")]
     InvalidUtf8Secret,
-    #[error("master key not found; set NYX_MASTER_KEY or configure OS keyring entry ai.nyx/master_key")]
+    #[error(
+        "master key not found; set NYX_MASTER_KEY or configure OS keyring entry ai.nyx/master_key"
+    )]
     MasterKeyNotFound,
     #[error("master key derivation failed: {0}")]
     KeyDerivationFailed(String),

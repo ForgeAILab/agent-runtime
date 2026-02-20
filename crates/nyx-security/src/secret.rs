@@ -12,12 +12,12 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer};
 
 #[cfg(feature = "encrypted")]
+use crate::SecretError;
+#[cfg(feature = "encrypted")]
 use crate::SecretStore;
 use crate::SecurityError;
 #[cfg(feature = "encrypted")]
 use crate::encrypted::EncryptedSecretStore;
-#[cfg(feature = "encrypted")]
-use crate::SecretError;
 
 const ENC_PREFIX: &str = "enc:";
 const ENV_PREFIX: &str = "env:";
@@ -253,9 +253,11 @@ fn resolve_vault_secret(key_name: &str) -> Result<String, SecurityError> {
     #[cfg(feature = "encrypted")]
     {
         let key = derive_master_key().map_err(|_| SecurityError::VaultNotAvailable)?;
-        let store =
-            EncryptedSecretStore::from_derived_key_with_storage(key, EncryptedSecretStore::default_storage_path())
-                .map_err(|_| SecurityError::VaultNotAvailable)?;
+        let store = EncryptedSecretStore::from_derived_key_with_storage(
+            key,
+            EncryptedSecretStore::default_storage_path(),
+        )
+        .map_err(|_| SecurityError::VaultNotAvailable)?;
         let secret = futures::executor::block_on(store.get(key_name)).map_err(|err| match err {
             SecretError::NotFound(_) => SecurityError::VaultKeyNotFound(key_name.to_string()),
             _ => SecurityError::VaultNotAvailable,
