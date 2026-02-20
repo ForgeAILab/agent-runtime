@@ -5,6 +5,8 @@ mod mcp;
 mod registry;
 mod terminal;
 pub mod testing;
+#[cfg(feature = "workflow")]
+mod workflow;
 
 pub use builtins::*;
 pub use core::*;
@@ -12,3 +14,5 @@ pub use core::*;
 pub use mcp::*;
 pub use registry::*;
 pub use terminal::*;
+#[cfg(feature = "workflow")]
+pub use workflow::*;

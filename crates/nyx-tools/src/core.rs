@@ -59,6 +59,12 @@ pub enum ToolError {
     InvalidInput(String),
     #[error("tool not available: {0}")]
     NotAvailable(String),
+    #[error("resource not found: {0}")]
+    NotFound(String),
+    #[error("invalid state: {0}")]
+    InvalidState(String),
+    #[error("tool must run inside workflow")]
+    NotInWorkflow,
     #[error("sub-agent failed: {reason}")]
     SubAgentFailed { reason: String },
     #[error("tool execution failed: {reason}")]
