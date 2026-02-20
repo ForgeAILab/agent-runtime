@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,12 +34,19 @@ impl ToolResult {
     pub fn empty() -> Self {
         Self { value: Value::Null }
     }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            value: serde_json::json!({ "error": message.into() }),
+        }
+    }
 }
 
 pub struct ToolContext {
     pub sandbox: Arc<dyn Sandbox>,
     pub sub_agent_runner: Option<Arc<dyn SubAgentRunner>>,
     pub terminal_registry: Arc<TerminalRegistry>,
+    pub workspace_dir: PathBuf,
     pub available_tools: Vec<Arc<dyn Tool>>,
 }
 
@@ -48,6 +56,7 @@ impl Default for ToolContext {
             sandbox: Arc::new(nyx_security::testing::NoopSandbox),
             sub_agent_runner: None,
             terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: PathBuf::from("."),
             available_tools: Vec::new(),
         }
     }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use nyx_security::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::{FallbackProvider, LlmProvider, ProviderError, RetryProvider};
@@ -39,8 +40,8 @@ pub struct ProviderConfig {
     pub kind: String,
     #[serde(default = "default_provider_model")]
     pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<Secret<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,8 +82,8 @@ fn default_provider_model() -> String {
 }
 
 fn resolve_api_key(cfg: &ProviderConfig, default_env: &str) -> Result<String, ProviderError> {
-    if let Some(api_key) = cfg.api_key.clone() {
-        return Ok(api_key);
+    if let Some(api_key) = &cfg.api_key {
+        return Ok(api_key.reveal().clone());
     }
 
     let env_name = cfg
@@ -95,6 +96,10 @@ fn resolve_api_key(cfg: &ProviderConfig, default_env: &str) -> Result<String, Pr
 
 #[cfg(feature = "compat")]
 fn resolve_optional_key(cfg: &ProviderConfig, default_env: &str) -> String {
+    if let Some(api_key) = &cfg.api_key {
+        return api_key.reveal().clone();
+    }
+
     let env_name = cfg
         .api_key_env
         .clone()

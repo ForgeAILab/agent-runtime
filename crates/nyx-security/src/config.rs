@@ -34,7 +34,7 @@ pub fn default_secret_store_kind() -> String {
 }
 
 pub fn default_operators() -> Vec<String> {
-    vec!["cli-user".to_string()]
+    vec!["local".to_string()]
 }
 
 pub fn build_sandbox(cfg: &SecurityConfig) -> Result<Arc<dyn Sandbox>, SecurityError> {

@@ -502,6 +502,7 @@ mod tests {
             sandbox: Arc::new(NoopSandbox),
             sub_agent_runner: None,
             terminal_registry: Arc::new(crate::TerminalRegistry::new()),
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: Vec::new(),
         }
     }

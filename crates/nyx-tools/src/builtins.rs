@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -71,12 +72,18 @@ impl Tool for FileReadTool {
         })
     }
 
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let path = input
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing path".to_string()))?;
-        let content = tokio::fs::read_to_string(path).await?;
+        let path = Path::new(path);
+        let resolved_path = if path.is_relative() {
+            ctx.workspace_dir.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        let content = tokio::fs::read_to_string(resolved_path).await?;
         Ok(ToolResult::text(content))
     }
 }
@@ -112,14 +119,16 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing command".to_string()))?;
-        let pwd = input.get("pwd").and_then(Value::as_str);
+        let default_pwd = ctx.workspace_dir.to_str().unwrap_or(".");
+        let pwd = input
+            .get("pwd")
+            .and_then(Value::as_str)
+            .unwrap_or(default_pwd);
 
         let mut command = SandboxedCommand::new("sh")
             .arg("-lc")
             .arg(command_text.to_string());
-        if let Some(pwd) = pwd {
-            command = command.working_dir(pwd);
-        }
+        command = command.working_dir(pwd);
         let output = ctx.sandbox.execute(command).await?;
 
         Ok(ToolResult::json(json!({
@@ -536,6 +545,7 @@ mod tests {
             sandbox: Arc::new(NoopSandbox),
             sub_agent_runner: None,
             terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: tools,
         }
     }
@@ -554,6 +564,50 @@ mod tests {
         assert_eq!(output.value, Value::String("hello file".to_string()));
     }
 
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_tool_resolves_relative_path_from_workspace_dir() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("test.txt");
+        std::fs::write(&file_path, "workspace file").expect("write workspace file");
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: temp_dir.path().to_path_buf(),
+            available_tools: vec![],
+        };
+
+        let output = FileReadTool
+            .invoke(json!({ "path": "test.txt" }), &tool_ctx)
+            .await
+            .expect("file read works");
+
+        assert_eq!(output.value, Value::String("workspace file".to_string()));
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_tool_uses_absolute_path_directly() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let file = NamedTempFile::new().expect("create temp file");
+        std::fs::write(file.path(), "absolute file").expect("write temp file");
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: temp_dir.path().to_path_buf(),
+            available_tools: vec![],
+        };
+
+        let output = FileReadTool
+            .invoke(json!({ "path": file.path() }), &tool_ctx)
+            .await
+            .expect("file read works");
+
+        assert_eq!(output.value, Value::String("absolute file".to_string()));
+    }
+
     #[cfg(feature = "shell")]
     #[tokio::test]
     async fn shell_tool_calls_sandbox_execute() {
@@ -562,6 +616,7 @@ mod tests {
             sandbox: spy.clone(),
             sub_agent_runner: None,
             terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: vec![],
         };
 
@@ -585,6 +640,7 @@ mod tests {
             sandbox: spy.clone(),
             sub_agent_runner: None,
             terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: vec![],
         };
 
@@ -596,6 +652,31 @@ mod tests {
         let calls = spy.calls.lock().expect("calls mutex poisoned");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].working_dir, std::path::PathBuf::from("/tmp"));
+    }
+
+    #[cfg(feature = "shell")]
+    #[tokio::test]
+    async fn shell_tool_defaults_pwd_to_workspace_dir() {
+        let spy = Arc::new(SpySandbox::default());
+        let tool_ctx = ToolContext {
+            sandbox: spy.clone(),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: std::path::PathBuf::from("/custom/workspace"),
+            available_tools: vec![],
+        };
+
+        ShellTool
+            .invoke(json!({ "command": "pwd" }), &tool_ctx)
+            .await
+            .expect("shell invoke works");
+
+        let calls = spy.calls.lock().expect("calls mutex poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].working_dir,
+            std::path::PathBuf::from("/custom/workspace")
+        );
     }
 
     #[cfg(feature = "sub-agent")]
@@ -611,6 +692,7 @@ mod tests {
             sandbox: Arc::new(NoopSandbox),
             sub_agent_runner: Some(runner.clone()),
             terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: available,
         };
 
@@ -643,6 +725,7 @@ mod tests {
             sandbox: Arc::new(NoopSandbox),
             sub_agent_runner: Some(runner.clone()),
             terminal_registry: Arc::new(TerminalRegistry::new()),
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: available,
         };
 

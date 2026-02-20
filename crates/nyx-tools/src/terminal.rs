@@ -277,6 +277,7 @@ mod tests {
             sandbox: Arc::new(NoopSandbox),
             sub_agent_runner: None,
             terminal_registry: registry,
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: vec![],
         };
 
@@ -350,6 +351,7 @@ mod tests {
             sandbox: Arc::new(NoopSandbox),
             sub_agent_runner: None,
             terminal_registry: registry,
+            workspace_dir: std::path::PathBuf::from("."),
             available_tools: vec![],
         };
 

@@ -11,6 +11,7 @@ use crate::{
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
+const CLAUDE_COMPLETION_TIMEOUT_SECS: u64 = 90;
 
 #[derive(Clone)]
 pub struct ClaudeProvider {
@@ -146,6 +147,7 @@ impl ClaudeProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
+            .timeout(Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS))
             .send()
             .await?;
 

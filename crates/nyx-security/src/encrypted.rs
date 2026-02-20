@@ -110,10 +110,17 @@ impl EncryptedSecretStore {
             .encrypt(Nonce::from_slice(&nonce_bytes), secret.expose())
             .map_err(|err| SecretError::Crypto(format!("encrypt failed: {err}")))?;
 
-        Ok(EncryptedSecret {
+        let encrypted = EncryptedSecret {
             nonce: hex_encode(&nonce_bytes),
             ciphertext: hex_encode(&ciphertext),
-        })
+        };
+        tracing::info!(
+            plaintext = %String::from_utf8_lossy(secret.expose()),
+            nonce = %encrypted.nonce,
+            ciphertext = %encrypted.ciphertext,
+            "nyx-security encrypted store encrypt"
+        );
+        Ok(encrypted)
     }
 
     fn decrypt(&self, secret: &EncryptedSecret) -> Result<Secret, SecretError> {
@@ -126,6 +133,12 @@ impl EncryptedSecretStore {
         let plaintext = cipher
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .map_err(|err| SecretError::Crypto(format!("decrypt failed: {err}")))?;
+        tracing::info!(
+            nonce = %secret.nonce,
+            ciphertext = %secret.ciphertext,
+            plaintext = %String::from_utf8_lossy(&plaintext),
+            "nyx-security encrypted store decrypt"
+        );
         Ok(Secret::from_bytes(plaintext))
     }
 
@@ -153,12 +166,24 @@ impl SecretStore for EncryptedSecretStore {
         let encrypted = guard
             .get(key)
             .ok_or_else(|| SecretError::NotFound(key.to_string()))?;
-
+        tracing::info!(
+            key,
+            nonce = %encrypted.nonce,
+            ciphertext = %encrypted.ciphertext,
+            "nyx-security encrypted store get"
+        );
         self.decrypt(encrypted)
     }
 
     async fn set(&self, key: &str, value: Secret) -> Result<(), SecretError> {
         let encrypted = self.encrypt(&value)?;
+        tracing::info!(
+            key,
+            plaintext = %String::from_utf8_lossy(value.expose()),
+            nonce = %encrypted.nonce,
+            ciphertext = %encrypted.ciphertext,
+            "nyx-security encrypted store set"
+        );
         let mut guard = self.entries.write().await;
         guard.insert(key.to_string(), encrypted);
 
