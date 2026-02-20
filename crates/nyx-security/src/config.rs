@@ -11,7 +11,7 @@ pub struct SecurityConfig {
     pub sandbox: String,
     #[serde(default = "default_secret_store_kind")]
     pub secret_store: String,
-    #[serde(default)]
+    #[serde(default = "default_operators")]
     pub operators: Vec<String>,
 }
 
@@ -20,7 +20,7 @@ impl Default for SecurityConfig {
         Self {
             sandbox: default_sandbox_kind(),
             secret_store: default_secret_store_kind(),
-            operators: Vec::new(),
+            operators: default_operators(),
         }
     }
 }
@@ -31,6 +31,10 @@ pub fn default_sandbox_kind() -> String {
 
 pub fn default_secret_store_kind() -> String {
     "encrypted".to_string()
+}
+
+pub fn default_operators() -> Vec<String> {
+    vec!["cli-user".to_string()]
 }
 
 pub fn build_sandbox(cfg: &SecurityConfig) -> Result<Arc<dyn Sandbox>, SecurityError> {
