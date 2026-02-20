@@ -16,6 +16,10 @@ impl FallbackProvider {
     pub fn len(&self) -> usize {
         self.chain.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.chain.is_empty()
+    }
 }
 
 #[async_trait]

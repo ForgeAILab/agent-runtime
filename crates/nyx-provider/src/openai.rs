@@ -216,10 +216,10 @@ fn provider_content_to_openai(content: Vec<ProviderContent>) -> OpenAiMessageCon
             }
         }
     }
-    if blocks.len() == 1 {
-        if let OpenAiContentBlock::Text { text } = &blocks[0] {
-            return OpenAiMessageContent::Text(text.clone());
-        }
+    if blocks.len() == 1
+        && let OpenAiContentBlock::Text { text } = &blocks[0]
+    {
+        return OpenAiMessageContent::Text(text.clone());
     }
     OpenAiMessageContent::Blocks(blocks)
 }

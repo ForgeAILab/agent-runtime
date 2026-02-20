@@ -367,3 +367,236 @@ fn map_workflow_error(err: WorkflowError) -> ToolError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use nyx_security::testing::NoopSandbox;
+    use nyx_workflow::{
+        ErrorHandling, ExecutionStatus, ExecutionSummary, StepResult, StepType, WorkflowDefinition,
+        WorkflowExecutionContext, WorkflowStep, WorkflowStore, WorkflowSummary,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::{Tool, ToolContext};
+
+    use super::{WorkflowApproveTool, WorkflowCancelTool, WorkflowStatusTool, WorkflowTool};
+
+    #[derive(Default)]
+    struct InMemoryWorkflowStore {
+        definition: Mutex<Option<WorkflowDefinition>>,
+        executions: Mutex<HashMap<Uuid, WorkflowExecutionContext>>,
+    }
+
+    #[async_trait]
+    impl WorkflowStore for InMemoryWorkflowStore {
+        async fn save_definition(
+            &self,
+            def: &WorkflowDefinition,
+        ) -> Result<(), nyx_workflow::WorkflowError> {
+            *self.definition.lock().expect("definition lock") = Some(def.clone());
+            Ok(())
+        }
+        async fn load_definition(
+            &self,
+            _name: &str,
+        ) -> Result<WorkflowDefinition, nyx_workflow::WorkflowError> {
+            self.definition
+                .lock()
+                .expect("definition lock")
+                .clone()
+                .ok_or_else(|| nyx_workflow::WorkflowError::NotFound {
+                    name: "missing".to_string(),
+                })
+        }
+        async fn list_definitions(
+            &self,
+        ) -> Result<Vec<WorkflowSummary>, nyx_workflow::WorkflowError> {
+            Ok(Vec::new())
+        }
+        async fn save_execution_state(
+            &self,
+            state: &WorkflowExecutionContext,
+        ) -> Result<(), nyx_workflow::WorkflowError> {
+            self.executions
+                .lock()
+                .expect("executions lock")
+                .insert(state.execution_id, state.clone());
+            Ok(())
+        }
+        async fn load_execution_state(
+            &self,
+            execution_id: &Uuid,
+        ) -> Result<WorkflowExecutionContext, nyx_workflow::WorkflowError> {
+            self.executions
+                .lock()
+                .expect("executions lock")
+                .get(execution_id)
+                .cloned()
+                .ok_or_else(|| nyx_workflow::WorkflowError::ExecutionNotFound {
+                    id: execution_id.to_string(),
+                })
+        }
+        async fn load_execution_by_token(
+            &self,
+            token: &str,
+        ) -> Result<WorkflowExecutionContext, nyx_workflow::WorkflowError> {
+            self.executions
+                .lock()
+                .expect("executions lock")
+                .values()
+                .find(|state| state.resume_token.as_deref() == Some(token))
+                .cloned()
+                .ok_or_else(|| nyx_workflow::WorkflowError::ExecutionNotFound {
+                    id: token.to_string(),
+                })
+        }
+        async fn list_executions(
+            &self,
+            _workflow_name: Option<&str>,
+        ) -> Result<Vec<ExecutionSummary>, nyx_workflow::WorkflowError> {
+            Ok(Vec::new())
+        }
+        async fn get_step_history(
+            &self,
+            execution_id: &Uuid,
+        ) -> Result<Vec<StepResult>, nyx_workflow::WorkflowError> {
+            Ok(self
+                .executions
+                .lock()
+                .expect("executions lock")
+                .get(execution_id)
+                .map(|state| state.step_history.clone())
+                .unwrap_or_default())
+        }
+    }
+
+    fn workflow_definition() -> WorkflowDefinition {
+        WorkflowDefinition {
+            name: "demo".to_string(),
+            description: String::new(),
+            version: "1.0.0".to_string(),
+            parameters: Vec::new(),
+            variables: HashMap::new(),
+            steps: vec![WorkflowStep {
+                id: "shell".to_string(),
+                name: String::new(),
+                step_type: StepType::Shell {
+                    command: "echo hi".to_string(),
+                },
+                condition: None,
+                retry: None,
+                timeout_secs: None,
+            }],
+            timeout_secs: None,
+            on_error: ErrorHandling::Abort,
+        }
+    }
+
+    fn tool_ctx() -> ToolContext {
+        ToolContext {
+            sandbox: Arc::new(NoopSandbox),
+            sub_agent_runner: None,
+            terminal_registry: Arc::new(crate::TerminalRegistry::new()),
+            available_tools: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_run_and_status_and_cancel() {
+        let store = Arc::new(InMemoryWorkflowStore::default());
+        store
+            .save_definition(&workflow_definition())
+            .await
+            .expect("save definition");
+        let store_dyn: Arc<dyn WorkflowStore> = store.clone();
+        let engine = Arc::new(nyx_workflow::WorkflowEngine::new(Arc::clone(&store_dyn)));
+        let run_tool = WorkflowTool::new(Arc::clone(&engine), Arc::clone(&store_dyn));
+
+        let run = run_tool
+            .invoke(json!({"workflow_name":"demo"}), &tool_ctx())
+            .await
+            .expect("run");
+        assert_eq!(
+            run.value.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+
+        let execution_id = store
+            .executions
+            .lock()
+            .expect("executions lock")
+            .keys()
+            .next()
+            .copied()
+            .expect("execution id");
+
+        let status_tool = WorkflowStatusTool::new(Arc::clone(&store_dyn));
+        let status = status_tool
+            .invoke(
+                json!({"execution_id": execution_id.to_string()}),
+                &tool_ctx(),
+            )
+            .await
+            .expect("status");
+        assert_eq!(
+            status
+                .value
+                .get("execution_id")
+                .and_then(|v| v.as_str())
+                .expect("execution id"),
+            execution_id.to_string()
+        );
+
+        let cancel_tool = WorkflowCancelTool::new(Arc::clone(&store_dyn));
+        let err = cancel_tool
+            .invoke(
+                json!({"execution_id": execution_id.to_string()}),
+                &tool_ctx(),
+            )
+            .await
+            .expect_err("completed execution cannot cancel");
+        assert!(matches!(err, crate::ToolError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn workflow_approve_rejects_pending_token() {
+        let store = Arc::new(InMemoryWorkflowStore::default());
+        let execution_id = Uuid::new_v4();
+        let pending = WorkflowExecutionContext {
+            execution_id,
+            workflow_name: "demo".to_string(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            status: ExecutionStatus::WaitingApproval {
+                step_id: "approve".to_string(),
+                message: "ok?".to_string(),
+            },
+            parameters: json!({}),
+            variables: HashMap::new(),
+            step_history: Vec::new(),
+            next_step_index: 1,
+            resume_token: Some("tok".to_string()),
+        };
+        store
+            .save_execution_state(&pending)
+            .await
+            .expect("save pending");
+
+        let store_dyn: Arc<dyn WorkflowStore> = store.clone();
+        let engine = Arc::new(nyx_workflow::WorkflowEngine::new(Arc::clone(&store_dyn)));
+        let approve_tool = WorkflowApproveTool::new(engine, Arc::clone(&store_dyn));
+        let res = approve_tool
+            .invoke(json!({"resume_token":"tok","approved":false}), &tool_ctx())
+            .await
+            .expect("reject");
+        assert_eq!(
+            res.value.get("status").and_then(|v| v.as_str()),
+            Some("cancelled")
+        );
+    }
+}

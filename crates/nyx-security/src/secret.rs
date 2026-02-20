@@ -150,12 +150,11 @@ pub fn derive_master_key() -> Result<[u8; 32], SecurityError> {
         _ => {
             #[cfg(feature = "keyring")]
             {
-                if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
-                    if let Ok(value) = entry.get_password() {
-                        if !value.is_empty() {
-                            return derive_key_from_passphrase(value.as_bytes());
-                        }
-                    }
+                if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+                    && let Ok(value) = entry.get_password()
+                    && !value.is_empty()
+                {
+                    return derive_key_from_passphrase(value.as_bytes());
                 }
             }
             return load_or_create_legacy_file_key();

@@ -222,10 +222,10 @@ fn provider_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestCon
         }
     }
 
-    if blocks.len() == 1 {
-        if let ClaudeRequestBlock::Text { text } = &blocks[0] {
-            return ClaudeRequestContent::Text(text.clone());
-        }
+    if blocks.len() == 1
+        && let ClaudeRequestBlock::Text { text } = &blocks[0]
+    {
+        return ClaudeRequestContent::Text(text.clone());
     }
 
     ClaudeRequestContent::Blocks(blocks)

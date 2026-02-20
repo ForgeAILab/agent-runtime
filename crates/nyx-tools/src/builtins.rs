@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nyx_security::{Sandbox, SandboxedCommand};
+#[cfg(feature = "workflow")]
+use nyx_workflow::{WorkflowEngine, WorkflowStore};
 use serde_json::{Value, json};
 
 use crate::{
@@ -13,6 +15,7 @@ use crate::{
 pub fn register_builtins(
     registry: &mut ToolRegistry,
     sandbox: Arc<dyn Sandbox>,
+    #[cfg(feature = "workflow")] workflow: Option<(Arc<WorkflowEngine>, Arc<dyn WorkflowStore>)>,
 ) -> Result<(), RegistryError> {
     let _ = sandbox;
 
@@ -35,6 +38,11 @@ pub fn register_builtins(
         registry.register(Arc::new(TerminalWriteTool))?;
         registry.register(Arc::new(TerminalKillTool))?;
         registry.register(Arc::new(TerminalStatusTool))?;
+    }
+
+    #[cfg(feature = "workflow")]
+    if let Some((engine, store)) = workflow {
+        crate::register_workflow_tools(registry, engine, store)?;
     }
 
     Ok(())
