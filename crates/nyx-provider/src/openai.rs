@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -233,6 +234,22 @@ impl LlmProvider for OpenAiProvider {
         let response = self.complete_via_api(req).await?;
         let stream = tokio_stream::iter(vec![Ok(response.content)]);
         Ok(Box::pin(stream))
+    }
+
+    async fn health_check(&self) -> bool {
+        let endpoint = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(endpoint)
+            .bearer_auth(&self.api_key)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -604,5 +621,31 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(response.content, "A tree");
+    }
+
+    #[tokio::test]
+    async fn openai_health_check_returns_true_for_successful_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
+        assert!(provider.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn openai_health_check_returns_false_for_auth_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new("bad-key").with_base_url(server.uri());
+        assert!(!provider.health_check().await);
     }
 }

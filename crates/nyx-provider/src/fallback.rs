@@ -56,6 +56,15 @@ impl LlmProvider for FallbackProvider {
             ProviderError::Rejected("provider chain must not be empty".to_string())
         }))
     }
+
+    async fn health_check(&self) -> bool {
+        for (provider, _) in &self.chain {
+            if provider.health_check().await {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -74,18 +83,22 @@ mod tests {
     struct StubProvider {
         complete_calls: AtomicUsize,
         stream_calls: AtomicUsize,
+        health_calls: AtomicUsize,
         complete_ok: bool,
         stream_ok: bool,
+        health_ok: bool,
         payload: &'static str,
     }
 
     impl StubProvider {
-        fn new(complete_ok: bool, stream_ok: bool, payload: &'static str) -> Self {
+        fn new(complete_ok: bool, stream_ok: bool, health_ok: bool, payload: &'static str) -> Self {
             Self {
                 complete_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
+                health_calls: AtomicUsize::new(0),
                 complete_ok,
                 stream_ok,
+                health_ok,
                 payload,
             }
         }
@@ -118,6 +131,11 @@ mod tests {
                 .payload
                 .to_string())])))
         }
+
+        async fn health_check(&self) -> bool {
+            self.health_calls.fetch_add(1, Ordering::SeqCst);
+            self.health_ok
+        }
     }
 
     fn request() -> CompletionRequest {
@@ -133,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_entry_chain_returns_first_response_without_fallback() {
-        let only = Arc::new(StubProvider::new(true, true, "primary"));
+        let only = Arc::new(StubProvider::new(true, true, true, "primary"));
         let provider = FallbackProvider::new(vec![(
             Arc::clone(&only) as Arc<dyn LlmProvider>,
             "model-primary".to_string(),
@@ -150,8 +168,8 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_when_first_provider_fails() {
-        let first = Arc::new(StubProvider::new(false, true, "first-fail"));
-        let second = Arc::new(StubProvider::new(true, true, "second-ok"));
+        let first = Arc::new(StubProvider::new(false, true, false, "first-fail"));
+        let second = Arc::new(StubProvider::new(true, true, true, "second-ok"));
         let provider = FallbackProvider::new(vec![
             (
                 Arc::clone(&first) as Arc<dyn LlmProvider>,
@@ -175,8 +193,8 @@ mod tests {
 
     #[tokio::test]
     async fn stops_when_first_provider_succeeds() {
-        let first = Arc::new(StubProvider::new(true, true, "first-ok"));
-        let second = Arc::new(StubProvider::new(true, true, "second-unused"));
+        let first = Arc::new(StubProvider::new(true, true, true, "first-ok"));
+        let second = Arc::new(StubProvider::new(true, true, true, "second-unused"));
         let provider = FallbackProvider::new(vec![
             (
                 Arc::clone(&first) as Arc<dyn LlmProvider>,
@@ -197,8 +215,8 @@ mod tests {
 
     #[tokio::test]
     async fn returns_last_error_when_all_entries_fail() {
-        let first = Arc::new(StubProvider::new(false, false, "first-fail"));
-        let second = Arc::new(StubProvider::new(false, false, "second-fail"));
+        let first = Arc::new(StubProvider::new(false, false, false, "first-fail"));
+        let second = Arc::new(StubProvider::new(false, false, false, "second-fail"));
         let provider = FallbackProvider::new(vec![
             (
                 Arc::clone(&first) as Arc<dyn LlmProvider>,
@@ -216,8 +234,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_falls_back_on_error() {
-        let first = Arc::new(StubProvider::new(true, false, "first"));
-        let second = Arc::new(StubProvider::new(true, true, "second"));
+        let first = Arc::new(StubProvider::new(true, false, false, "first"));
+        let second = Arc::new(StubProvider::new(true, true, true, "second"));
         let provider = FallbackProvider::new(vec![
             (
                 Arc::clone(&first) as Arc<dyn LlmProvider>,
@@ -242,5 +260,25 @@ mod tests {
         assert_eq!(out, vec!["second".to_string()]);
         assert_eq!(first.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second.stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_true_when_any_provider_is_healthy() {
+        let first = Arc::new(StubProvider::new(false, false, false, "first"));
+        let second = Arc::new(StubProvider::new(false, false, true, "second"));
+        let provider = FallbackProvider::new(vec![
+            (
+                Arc::clone(&first) as Arc<dyn LlmProvider>,
+                "model-first".to_string(),
+            ),
+            (
+                Arc::clone(&second) as Arc<dyn LlmProvider>,
+                "model-second".to_string(),
+            ),
+        ]);
+
+        assert!(provider.health_check().await);
+        assert_eq!(first.health_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.health_calls.load(Ordering::SeqCst), 1);
     }
 }

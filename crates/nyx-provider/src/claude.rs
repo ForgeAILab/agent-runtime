@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -241,6 +242,23 @@ impl LlmProvider for ClaudeProvider {
         let stream = tokio_stream::iter(vec![Ok(response.content)]);
         Ok(Box::pin(stream))
     }
+
+    async fn health_check(&self) -> bool {
+        let endpoint = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(endpoint)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -412,5 +430,31 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(response.content, "A cat.");
+    }
+
+    #[tokio::test]
+    async fn claude_health_check_returns_true_for_successful_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = ClaudeProvider::new("test-key").with_base_url(server.uri());
+        assert!(provider.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn claude_health_check_returns_false_for_auth_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let provider = ClaudeProvider::new("bad-key").with_base_url(server.uri());
+        assert!(!provider.health_check().await);
     }
 }

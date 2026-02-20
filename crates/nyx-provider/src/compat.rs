@@ -34,4 +34,8 @@ impl LlmProvider for OpenAiCompatProvider {
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
         self.inner.stream(req).await
     }
+
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
 }

@@ -89,6 +89,10 @@ impl LlmProvider for RetryProvider {
             }
         }
     }
+
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +138,10 @@ mod tests {
 
         async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
             self.then.stream(req).await
+        }
+
+        async fn health_check(&self) -> bool {
+            self.then.health_check().await
         }
     }
 
@@ -198,5 +206,41 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(err, ProviderError::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn health_check_delegates_to_inner_provider() {
+        struct AlwaysUnhealthy;
+
+        #[async_trait]
+        impl LlmProvider for AlwaysUnhealthy {
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                Err(ProviderError::Rejected("not used".to_string()))
+            }
+
+            async fn stream(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionStream, ProviderError> {
+                Err(ProviderError::StreamingUnsupported)
+            }
+
+            async fn health_check(&self) -> bool {
+                false
+            }
+        }
+
+        let provider = RetryProvider::new(
+            Arc::new(AlwaysUnhealthy),
+            &RetryConfig {
+                max_attempts: 3,
+                initial_backoff_ms: 0,
+            },
+        );
+
+        assert!(!provider.health_check().await);
     }
 }

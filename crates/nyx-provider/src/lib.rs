@@ -132,8 +132,22 @@ pub enum ProviderError {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// Execute a completion request.
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
+    /// Stream a completion response.
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError>;
+    /// Run a lightweight provider health probe.
+    ///
+    /// Implementations should return quickly (ideally within 5 seconds), avoid expensive
+    /// operations, and return `false` on auth/network failures.
+    ///
+    /// ```ignore
+    /// let healthy = provider.health_check().await;
+    /// if healthy {
+    ///     let response = provider.complete(request).await?;
+    /// }
+    /// ```
+    async fn health_check(&self) -> bool;
 }
 
 pub mod testing {
@@ -184,6 +198,10 @@ pub mod testing {
             let _ = model;
             Ok(Box::pin(stream))
         }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
     }
 }
 
@@ -225,5 +243,11 @@ mod tests {
         assert_eq!(response.model, request.model);
         assert!(response.tool_calls.is_empty());
         assert!(response.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn echo_provider_health_check_is_true() {
+        let provider = EchoProvider;
+        assert!(provider.health_check().await);
     }
 }
