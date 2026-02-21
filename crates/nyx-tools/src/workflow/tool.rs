@@ -64,31 +64,63 @@ impl WorkflowTool {
 #[async_trait]
 impl Tool for WorkflowTool {
     fn name(&self) -> &str {
-        "workflow_run"
+        "workflow"
     }
 
     fn description(&self) -> &str {
-        "Run a named workflow with optional parameters"
+        "Manage workflow executions with action-based commands"
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "required": ["workflow_name"],
+            "required": ["action"],
             "properties": {
+                "action": { "type": "string", "enum": ["run", "status", "list", "stop"] },
+                "workflow": { "type": "string" },
                 "workflow_name": { "type": "string" },
-                "parameters": { "type": "object" }
+                "params": { "type": "object" },
+                "parameters": { "type": "object" },
+                "run_id": { "type": "string" },
+                "execution_id": { "type": "string" },
+                "include_steps": { "type": "boolean", "default": false },
+                "status": {
+                    "type": "string",
+                    "enum": ["running", "waiting_approval", "completed", "failed", "cancelled"]
+                },
+                "limit": { "type": "integer", "minimum": 0, "default": 50 }
             }
         })
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let workflow_name = input
-            .get("workflow_name")
+        let action = input
+            .get("action")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing workflow_name".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidInput("missing action".to_string()))?;
+
+        match action {
+            "run" => self.invoke_run(input, ctx).await,
+            "status" => self.invoke_status(input).await,
+            "list" => self.invoke_list(input).await,
+            "stop" => self.invoke_stop(input).await,
+            _ => Err(ToolError::InvalidInput(format!(
+                "invalid action `{action}`; expected one of: run, status, list, stop"
+            ))),
+        }
+    }
+}
+
+impl WorkflowTool {
+    async fn invoke_run(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let workflow_name = input
+            .get("workflow")
+            .or_else(|| input.get("workflow_name"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("missing workflow".to_string()))?;
         let params = input
-            .get("parameters")
+            .get("params")
+            .or_else(|| input.get("parameters"))
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
@@ -106,121 +138,14 @@ impl Tool for WorkflowTool {
 
         Ok(ToolResult::json(workflow_result_to_json(result)))
     }
-}
 
-pub struct WorkflowApproveTool {
-    engine: Arc<WorkflowEngine>,
-    store: Arc<dyn WorkflowStore>,
-}
-
-impl WorkflowApproveTool {
-    pub fn new(engine: Arc<WorkflowEngine>, store: Arc<dyn WorkflowStore>) -> Self {
-        Self { engine, store }
-    }
-}
-
-#[async_trait]
-impl Tool for WorkflowApproveTool {
-    fn name(&self) -> &str {
-        "workflow_approve"
-    }
-
-    fn description(&self) -> &str {
-        "Approve or reject a paused workflow by resume token"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["resume_token"],
-            "properties": {
-                "resume_token": { "type": "string" },
-                "approved": { "type": "boolean", "default": true }
-            }
-        })
-    }
-
-    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let resume_token = input
-            .get("resume_token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing resume_token".to_string()))?;
-        let approved = input
-            .get("approved")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-
-        if !approved {
-            let mut state = self
-                .store
-                .load_execution_by_token(resume_token)
-                .await
-                .map_err(map_workflow_error)?;
-            state.status = ExecutionStatus::Cancelled;
-            state.finished_at = Some(chrono::Utc::now());
-            state.resume_token = None;
-            self.store
-                .save_execution_state(&state)
-                .await
-                .map_err(map_workflow_error)?;
-            return Ok(ToolResult::json(
-                json!({ "status": "cancelled", "reason": "user rejected approval" }),
-            ));
-        }
-
-        let runtime = ToolRuntime { ctx };
-        let result = self
-            .engine
-            .resume(resume_token, &runtime)
-            .await
-            .map_err(map_workflow_error)?;
-        Ok(ToolResult::json(workflow_result_to_json(result)))
-    }
-}
-
-pub struct WorkflowStatusTool {
-    store: Arc<dyn WorkflowStore>,
-}
-
-impl WorkflowStatusTool {
-    pub fn new(store: Arc<dyn WorkflowStore>) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait]
-impl Tool for WorkflowStatusTool {
-    fn name(&self) -> &str {
-        "workflow_status"
-    }
-
-    fn description(&self) -> &str {
-        "Get workflow execution status by execution_id"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["execution_id"],
-            "properties": {
-                "execution_id": { "type": "string" },
-                "include_steps": { "type": "boolean", "default": false }
-            }
-        })
-    }
-
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let execution_id = input
-            .get("execution_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing execution_id".to_string()))?;
+    async fn invoke_status(&self, input: Value) -> Result<ToolResult, ToolError> {
+        let execution_id = get_execution_id(&self.store, &input).await?;
         let include_steps = input
             .get("include_steps")
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let execution_id = uuid::Uuid::parse_str(execution_id)
-            .map_err(|err| ToolError::InvalidInput(format!("invalid execution_id: {err}")))?;
         let mut state = self
             .store
             .load_execution_state(&execution_id)
@@ -230,49 +155,42 @@ impl Tool for WorkflowStatusTool {
         if !include_steps {
             state.step_history.clear();
         }
+
         Ok(ToolResult::json(
             serde_json::to_value(state).map_err(ToolError::Json)?,
         ))
     }
-}
 
-pub struct WorkflowCancelTool {
-    store: Arc<dyn WorkflowStore>,
-}
+    async fn invoke_list(&self, input: Value) -> Result<ToolResult, ToolError> {
+        let workflow_name = input
+            .get("workflow")
+            .or_else(|| input.get("workflow_name"))
+            .and_then(Value::as_str);
+        let status = parse_status_filter(input.get("status").and_then(Value::as_str))?;
+        let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
 
-impl WorkflowCancelTool {
-    pub fn new(store: Arc<dyn WorkflowStore>) -> Self {
-        Self { store }
-    }
-}
+        let mut executions = self
+            .store
+            .list_executions(workflow_name)
+            .await
+            .map_err(map_workflow_error)?;
 
-#[async_trait]
-impl Tool for WorkflowCancelTool {
-    fn name(&self) -> &str {
-        "workflow_cancel"
-    }
+        if let Some(status) = status {
+            executions.retain(|entry| entry.status == status);
+        }
 
-    fn description(&self) -> &str {
-        "Cancel a running or paused workflow"
-    }
+        executions.sort_by(|lhs, rhs| rhs.started_at.cmp(&lhs.started_at));
+        if executions.len() > limit {
+            executions.truncate(limit);
+        }
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["execution_id"],
-            "properties": {
-                "execution_id": { "type": "string" }
-            }
-        })
+        Ok(ToolResult::json(
+            serde_json::to_value(executions).map_err(ToolError::Json)?,
+        ))
     }
 
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let execution_id = input
-            .get("execution_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing execution_id".to_string()))?;
-        let execution_id = uuid::Uuid::parse_str(execution_id)
-            .map_err(|err| ToolError::InvalidInput(format!("invalid execution_id: {err}")))?;
+    async fn invoke_stop(&self, input: Value) -> Result<ToolResult, ToolError> {
+        let execution_id = get_execution_id(&self.store, &input).await?;
 
         let mut state = self
             .store
@@ -295,7 +213,10 @@ impl Tool for WorkflowCancelTool {
             .await
             .map_err(map_workflow_error)?;
 
-        Ok(ToolResult::json(json!({ "status": "cancelled" })))
+        Ok(ToolResult::json(json!({
+            "run_id": execution_id,
+            "status": "stopped"
+        })))
     }
 }
 
@@ -304,16 +225,7 @@ pub fn register_workflow_tools(
     engine: Arc<WorkflowEngine>,
     store: Arc<dyn WorkflowStore>,
 ) -> Result<(), RegistryError> {
-    registry.register(Arc::new(WorkflowTool::new(
-        Arc::clone(&engine),
-        Arc::clone(&store),
-    )))?;
-    registry.register(Arc::new(WorkflowApproveTool::new(
-        Arc::clone(&engine),
-        Arc::clone(&store),
-    )))?;
-    registry.register(Arc::new(WorkflowStatusTool::new(Arc::clone(&store))))?;
-    registry.register(Arc::new(WorkflowCancelTool::new(store)))?;
+    registry.register(Arc::new(WorkflowTool::new(engine, store)))?;
     Ok(())
 }
 
@@ -333,6 +245,63 @@ fn workflow_result_to_json(result: nyx_workflow::WorkflowResult) -> Value {
         }
         nyx_workflow::WorkflowResult::Cancelled => {
             json!({ "status": "cancelled" })
+        }
+    }
+}
+
+fn parse_status_filter(raw_status: Option<&str>) -> Result<Option<&'static str>, ToolError> {
+    let status = match raw_status {
+        None => return Ok(None),
+        Some(status) => status.trim(),
+    };
+    let normalized = match status {
+        "running" => "running",
+        "waiting_approval" => "waiting_approval",
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => {
+            return Err(ToolError::InvalidInput(format!(
+                "invalid status `{status}`; expected one of: running, waiting_approval, completed, failed, cancelled"
+            )));
+        }
+    };
+    Ok(Some(normalized))
+}
+
+async fn get_execution_id(
+    store: &Arc<dyn WorkflowStore>,
+    input: &Value,
+) -> Result<uuid::Uuid, ToolError> {
+    let raw = input
+        .get("run_id")
+        .or_else(|| input.get("execution_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidInput("missing run_id".to_string()))?;
+    parse_execution_id(store, raw).await
+}
+
+async fn parse_execution_id(
+    store: &Arc<dyn WorkflowStore>,
+    raw_execution_id: &str,
+) -> Result<uuid::Uuid, ToolError> {
+    let execution_id = raw_execution_id.trim();
+    match uuid::Uuid::parse_str(execution_id) {
+        Ok(id) => Ok(id),
+        Err(err) => {
+            let mut message = format!("invalid run_id: {err}; expected UUID from workflow run");
+            if let Ok(entries) = store.list_executions(None).await
+                && !entries.is_empty()
+            {
+                let ids = entries
+                    .into_iter()
+                    .take(3)
+                    .map(|entry| entry.execution_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                message.push_str(&format!("; recent run_ids: {ids}"));
+            }
+            Err(ToolError::InvalidInput(message))
         }
     }
 }
@@ -374,6 +343,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use chrono::{Duration, Utc};
     use nyx_security::testing::NoopSandbox;
     use nyx_workflow::{
         ErrorHandling, ExecutionStatus, ExecutionSummary, StepResult, StepType, WorkflowDefinition,
@@ -382,13 +352,13 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::{Tool, ToolContext};
+    use crate::{Tool, ToolContext, ToolRegistry};
 
-    use super::{WorkflowApproveTool, WorkflowCancelTool, WorkflowStatusTool, WorkflowTool};
+    use super::{WorkflowTool, register_workflow_tools};
 
     #[derive(Default)]
     struct InMemoryWorkflowStore {
-        definition: Mutex<Option<WorkflowDefinition>>,
+        definitions: Mutex<HashMap<String, WorkflowDefinition>>,
         executions: Mutex<HashMap<Uuid, WorkflowExecutionContext>>,
     }
 
@@ -398,26 +368,33 @@ mod tests {
             &self,
             def: &WorkflowDefinition,
         ) -> Result<(), nyx_workflow::WorkflowError> {
-            *self.definition.lock().expect("definition lock") = Some(def.clone());
+            self.definitions
+                .lock()
+                .expect("definitions lock")
+                .insert(def.name.clone(), def.clone());
             Ok(())
         }
+
         async fn load_definition(
             &self,
-            _name: &str,
+            name: &str,
         ) -> Result<WorkflowDefinition, nyx_workflow::WorkflowError> {
-            self.definition
+            self.definitions
                 .lock()
-                .expect("definition lock")
-                .clone()
+                .expect("definitions lock")
+                .get(name)
+                .cloned()
                 .ok_or_else(|| nyx_workflow::WorkflowError::NotFound {
-                    name: "missing".to_string(),
+                    name: name.to_string(),
                 })
         }
+
         async fn list_definitions(
             &self,
         ) -> Result<Vec<WorkflowSummary>, nyx_workflow::WorkflowError> {
             Ok(Vec::new())
         }
+
         async fn save_execution_state(
             &self,
             state: &WorkflowExecutionContext,
@@ -428,6 +405,7 @@ mod tests {
                 .insert(state.execution_id, state.clone());
             Ok(())
         }
+
         async fn load_execution_state(
             &self,
             execution_id: &Uuid,
@@ -441,6 +419,7 @@ mod tests {
                     id: execution_id.to_string(),
                 })
         }
+
         async fn load_execution_by_token(
             &self,
             token: &str,
@@ -455,12 +434,40 @@ mod tests {
                     id: token.to_string(),
                 })
         }
+
         async fn list_executions(
             &self,
-            _workflow_name: Option<&str>,
+            workflow_name: Option<&str>,
         ) -> Result<Vec<ExecutionSummary>, nyx_workflow::WorkflowError> {
-            Ok(Vec::new())
+            let mut executions = self
+                .executions
+                .lock()
+                .expect("executions lock")
+                .values()
+                .filter(|state| {
+                    workflow_name
+                        .map(|name| state.workflow_name == name)
+                        .unwrap_or(true)
+                })
+                .map(|state| ExecutionSummary {
+                    execution_id: state.execution_id,
+                    workflow_name: state.workflow_name.clone(),
+                    status: match &state.status {
+                        ExecutionStatus::Running => "running".to_string(),
+                        ExecutionStatus::WaitingApproval { .. } => "waiting_approval".to_string(),
+                        ExecutionStatus::Completed { .. } => "completed".to_string(),
+                        ExecutionStatus::Failed { .. } => "failed".to_string(),
+                        ExecutionStatus::Cancelled => "cancelled".to_string(),
+                    },
+                    started_at: state.started_at,
+                    finished_at: state.finished_at,
+                    resume_token: state.resume_token.clone(),
+                })
+                .collect::<Vec<_>>();
+            executions.sort_by(|lhs, rhs| rhs.started_at.cmp(&lhs.started_at));
+            Ok(executions)
         }
+
         async fn get_step_history(
             &self,
             execution_id: &Uuid,
@@ -478,7 +485,7 @@ mod tests {
     fn workflow_definition() -> WorkflowDefinition {
         WorkflowDefinition {
             name: "demo".to_string(),
-            description: String::new(),
+            description: "Demo workflow".to_string(),
             version: "1.0.0".to_string(),
             parameters: Vec::new(),
             variables: HashMap::new(),
@@ -502,13 +509,15 @@ mod tests {
             sandbox: Arc::new(NoopSandbox),
             sub_agent_runner: None,
             terminal_registry: Arc::new(crate::TerminalRegistry::new()),
+            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: std::path::PathBuf::from("."),
             available_tools: Vec::new(),
+            dispatch_sender: None,
         }
     }
 
     #[tokio::test]
-    async fn workflow_run_and_status_and_cancel() {
+    async fn workflow_tool_runs_and_lists_and_stops() {
         let store = Arc::new(InMemoryWorkflowStore::default());
         store
             .save_definition(&workflow_definition())
@@ -516,72 +525,127 @@ mod tests {
             .expect("save definition");
         let store_dyn: Arc<dyn WorkflowStore> = store.clone();
         let engine = Arc::new(nyx_workflow::WorkflowEngine::new(Arc::clone(&store_dyn)));
-        let run_tool = WorkflowTool::new(Arc::clone(&engine), Arc::clone(&store_dyn));
+        let tool = WorkflowTool::new(Arc::clone(&engine), Arc::clone(&store_dyn));
 
-        let run = run_tool
-            .invoke(json!({"workflow_name":"demo"}), &tool_ctx())
+        let run = tool
+            .invoke(json!({"action":"run","workflow":"demo"}), &tool_ctx())
             .await
             .expect("run");
-        assert_eq!(
-            run.value.get("status").and_then(|v| v.as_str()),
-            Some("completed")
-        );
+        assert_eq!(run.value["status"], "completed");
 
-        let execution_id = store
-            .executions
-            .lock()
-            .expect("executions lock")
-            .keys()
-            .next()
-            .copied()
+        let list = tool
+            .invoke(json!({"action":"list","workflow":"demo"}), &tool_ctx())
+            .await
+            .expect("list");
+        assert_eq!(list.value.as_array().expect("array").len(), 1);
+
+        let execution_id = list.value[0]["execution_id"]
+            .as_str()
             .expect("execution id");
 
-        let status_tool = WorkflowStatusTool::new(Arc::clone(&store_dyn));
-        let status = status_tool
+        let status = tool
             .invoke(
-                json!({"execution_id": execution_id.to_string()}),
+                json!({"action":"status","run_id": execution_id, "include_steps": true}),
                 &tool_ctx(),
             )
             .await
             .expect("status");
-        assert_eq!(
-            status
-                .value
-                .get("execution_id")
-                .and_then(|v| v.as_str())
-                .expect("execution id"),
-            execution_id.to_string()
-        );
+        assert_eq!(status.value["workflow_name"], "demo");
 
-        let cancel_tool = WorkflowCancelTool::new(Arc::clone(&store_dyn));
-        let err = cancel_tool
-            .invoke(
-                json!({"execution_id": execution_id.to_string()}),
-                &tool_ctx(),
-            )
+        let err = tool
+            .invoke(json!({"action":"stop","run_id": execution_id}), &tool_ctx())
             .await
-            .expect_err("completed execution cannot cancel");
+            .expect_err("completed run cannot be stopped");
         assert!(matches!(err, crate::ToolError::InvalidState(_)));
     }
 
     #[tokio::test]
-    async fn workflow_approve_rejects_pending_token() {
+    async fn workflow_tool_list_filters_status_and_limit() {
+        let store = Arc::new(InMemoryWorkflowStore::default());
+        let now = Utc::now();
+
+        let failed = WorkflowExecutionContext {
+            execution_id: Uuid::new_v4(),
+            workflow_name: "demo".to_string(),
+            started_at: now - Duration::minutes(1),
+            finished_at: None,
+            status: ExecutionStatus::Failed {
+                error: "boom".to_string(),
+                step_id: "s1".to_string(),
+            },
+            parameters: json!({}),
+            variables: HashMap::new(),
+            step_history: Vec::new(),
+            next_step_index: 0,
+            resume_token: None,
+        };
+        let completed = WorkflowExecutionContext {
+            execution_id: Uuid::new_v4(),
+            workflow_name: "demo".to_string(),
+            started_at: now - Duration::minutes(2),
+            finished_at: None,
+            status: ExecutionStatus::Completed {
+                result: json!({"ok":true}),
+            },
+            parameters: json!({}),
+            variables: HashMap::new(),
+            step_history: Vec::new(),
+            next_step_index: 0,
+            resume_token: None,
+        };
+        store
+            .save_execution_state(&failed)
+            .await
+            .expect("save failed");
+        store
+            .save_execution_state(&completed)
+            .await
+            .expect("save completed");
+
+        let store_dyn: Arc<dyn WorkflowStore> = store.clone();
+        let engine = Arc::new(nyx_workflow::WorkflowEngine::new(Arc::clone(&store_dyn)));
+        let tool = WorkflowTool::new(engine, Arc::clone(&store_dyn));
+
+        let list = tool
+            .invoke(
+                json!({"action":"list","workflow":"demo","status":"failed","limit":1}),
+                &tool_ctx(),
+            )
+            .await
+            .expect("list");
+        let items = list.value.as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn register_tools_registers_single_workflow_tool() {
+        let store = Arc::new(InMemoryWorkflowStore::default());
+        let store_dyn: Arc<dyn WorkflowStore> = store.clone();
+        let engine = Arc::new(nyx_workflow::WorkflowEngine::new(Arc::clone(&store_dyn)));
+
+        let mut registry = ToolRegistry::new();
+        register_workflow_tools(&mut registry, engine, store_dyn).expect("register workflow tool");
+        let tools = registry.seal();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "workflow");
+    }
+
+    #[tokio::test]
+    async fn workflow_status_invalid_run_id_includes_recent_ids_hint() {
         let store = Arc::new(InMemoryWorkflowStore::default());
         let execution_id = Uuid::new_v4();
         let pending = WorkflowExecutionContext {
             execution_id,
             workflow_name: "demo".to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: Utc::now(),
             finished_at: None,
-            status: ExecutionStatus::WaitingApproval {
-                step_id: "approve".to_string(),
-                message: "ok?".to_string(),
-            },
+            status: ExecutionStatus::Running,
             parameters: json!({}),
             variables: HashMap::new(),
             step_history: Vec::new(),
-            next_step_index: 1,
-            resume_token: Some("tok".to_string()),
+            next_step_index: 0,
+            resume_token: None,
         };
         store
             .save_execution_state(&pending)
@@ -590,14 +654,20 @@ mod tests {
 
         let store_dyn: Arc<dyn WorkflowStore> = store.clone();
         let engine = Arc::new(nyx_workflow::WorkflowEngine::new(Arc::clone(&store_dyn)));
-        let approve_tool = WorkflowApproveTool::new(engine, Arc::clone(&store_dyn));
-        let res = approve_tool
-            .invoke(json!({"resume_token":"tok","approved":false}), &tool_ctx())
+        let tool = WorkflowTool::new(engine, store_dyn);
+
+        let err = tool
+            .invoke(
+                json!({"action":"status","run_id":"not-a-uuid"}),
+                &tool_ctx(),
+            )
             .await
-            .expect("reject");
-        assert_eq!(
-            res.value.get("status").and_then(|v| v.as_str()),
-            Some("cancelled")
-        );
+            .expect_err("invalid run id should fail");
+
+        let crate::ToolError::InvalidInput(message) = err else {
+            panic!("unexpected error type");
+        };
+        assert!(message.contains("recent run_ids:"));
+        assert!(message.contains(&execution_id.to_string()));
     }
 }

@@ -40,7 +40,7 @@ pub struct ProviderConfig {
     pub kind: String,
     #[serde(default = "default_provider_model")]
     pub model: String,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<Secret<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,

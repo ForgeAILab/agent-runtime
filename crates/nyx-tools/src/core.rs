@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use nyx_security::{Sandbox, SandboxError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 use crate::terminal::{TerminalError, TerminalRegistry};
 
@@ -42,12 +44,56 @@ impl ToolResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerIdentity {
+    pub user_id: String,
+    pub adapter_id: String,
+}
+
+impl SchedulerIdentity {
+    pub fn new() -> Self {
+        Self {
+            user_id: "scheduler".to_string(),
+            adapter_id: "scheduler".to_string(),
+        }
+    }
+}
+
+impl Default for SchedulerIdentity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchRequest {
+    Isolated {
+        job_id: String,
+        prompt: String,
+        linked_channel_id: Option<String>,
+        announce: bool,
+    },
+    Queued {
+        channel_id: String,
+        prompt: String,
+        sender: SchedulerIdentity,
+    },
+    Heartbeat {
+        session_key: Option<String>,
+        prompt: String,
+        internal_only: bool,
+        dedupe_window_secs: u64,
+    },
+}
+
 pub struct ToolContext {
     pub sandbox: Arc<dyn Sandbox>,
     pub sub_agent_runner: Option<Arc<dyn SubAgentRunner>>,
     pub terminal_registry: Arc<TerminalRegistry>,
+    pub async_agent_registry: Arc<dyn AsyncAgentRegistry>,
     pub workspace_dir: PathBuf,
     pub available_tools: Vec<Arc<dyn Tool>>,
+    pub dispatch_sender: Option<mpsc::Sender<DispatchRequest>>,
 }
 
 impl Default for ToolContext {
@@ -56,8 +102,10 @@ impl Default for ToolContext {
             sandbox: Arc::new(nyx_security::testing::NoopSandbox),
             sub_agent_runner: None,
             terminal_registry: Arc::new(TerminalRegistry::new()),
+            async_agent_registry: Arc::new(NoopAsyncAgentRegistry),
             workspace_dir: PathBuf::from("."),
             available_tools: Vec::new(),
+            dispatch_sender: None,
         }
     }
 }
@@ -72,6 +120,8 @@ pub enum ToolError {
     NotFound(String),
     #[error("invalid state: {0}")]
     InvalidState(String),
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimitExceeded(String),
     #[error("tool must run inside workflow")]
     NotInWorkflow,
     #[error("sub-agent failed: {reason}")]
@@ -90,6 +140,10 @@ pub enum ToolError {
     Json(#[from] serde_json::Error),
     #[error("terminal error: {0}")]
     Terminal(#[from] TerminalError),
+    #[error("invalid patch: {0}")]
+    InvalidPatch(String),
+    #[error("patch conflict: {0}")]
+    PatchConflict(String),
 }
 
 impl From<SandboxError> for ToolError {
@@ -124,4 +178,89 @@ pub trait SubAgentRunner: Send + Sync {
         tools: Vec<Arc<dyn Tool>>,
         max_turns: usize,
     ) -> Result<String, SubAgentError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AsyncAgentStatus {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AsyncAgentInfo {
+    pub id: String,
+    pub status: AsyncAgentStatus,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AsyncAgentFetchResult {
+    pub id: String,
+    pub status: AsyncAgentStatus,
+    pub text: String,
+    pub error: Option<String>,
+    pub message_count: usize,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AsyncAgentSpawnRequest {
+    pub id: String,
+    pub prompt: String,
+    pub tools: Option<Vec<String>>,
+    pub max_turns: usize,
+    pub agent_kind: String,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum AsyncAgentError {
+    #[error("async agent `{id}` not found")]
+    NotFound { id: String },
+    #[error("async agent `{id}` already exists")]
+    IdConflict { id: String },
+    #[error("max concurrent async agents reached (limit: {limit})")]
+    MaxConcurrentReached { limit: usize },
+    #[error("cannot stop async agent `{id}` in status {status:?}")]
+    CannotStop {
+        id: String,
+        status: AsyncAgentStatus,
+    },
+    #[error("async agent execution failed: {reason}")]
+    Failed { reason: String },
+}
+
+#[async_trait]
+pub trait AsyncAgentRegistry: Send + Sync {
+    async fn spawn(&self, request: AsyncAgentSpawnRequest) -> Result<(), AsyncAgentError>;
+    async fn list(&self) -> Vec<AsyncAgentInfo>;
+    async fn fetch(&self, id: &str) -> Result<AsyncAgentFetchResult, AsyncAgentError>;
+    async fn stop(&self, id: &str) -> Result<(), AsyncAgentError>;
+}
+
+#[derive(Debug, Default)]
+pub struct NoopAsyncAgentRegistry;
+
+#[async_trait]
+impl AsyncAgentRegistry for NoopAsyncAgentRegistry {
+    async fn spawn(&self, request: AsyncAgentSpawnRequest) -> Result<(), AsyncAgentError> {
+        Err(AsyncAgentError::Failed {
+            reason: format!("async agent runtime unavailable for `{}`", request.id),
+        })
+    }
+
+    async fn list(&self) -> Vec<AsyncAgentInfo> {
+        Vec::new()
+    }
+
+    async fn fetch(&self, id: &str) -> Result<AsyncAgentFetchResult, AsyncAgentError> {
+        Err(AsyncAgentError::NotFound { id: id.to_string() })
+    }
+
+    async fn stop(&self, id: &str) -> Result<(), AsyncAgentError> {
+        Err(AsyncAgentError::NotFound { id: id.to_string() })
+    }
 }

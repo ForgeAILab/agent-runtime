@@ -9,7 +9,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::de::Error as DeError;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(feature = "encrypted")]
 use crate::SecretError;
@@ -104,6 +104,18 @@ where
 
         let parsed = plaintext.parse::<T>().map_err(D::Error::custom)?;
         Ok(Self(parsed))
+    }
+}
+
+impl<T> Serialize for Secret<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
     }
 }
 
