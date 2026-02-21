@@ -55,7 +55,7 @@ pub struct FileReadTool;
 #[async_trait]
 impl Tool for FileReadTool {
     fn name(&self) -> &str {
-        "file_read"
+        "read"
     }
 
     fn description(&self) -> &str {
@@ -94,7 +94,7 @@ pub struct FileWriteTool;
 #[async_trait]
 impl Tool for FileWriteTool {
     fn name(&self) -> &str {
-        "file_write"
+        "write"
     }
 
     fn description(&self) -> &str {
@@ -149,7 +149,7 @@ pub struct FileApplyPatchTool;
 #[async_trait]
 impl Tool for FileApplyPatchTool {
     fn name(&self) -> &str {
-        "file_apply_patch"
+        "apply_patch"
     }
 
     fn description(&self) -> &str {
@@ -1055,7 +1055,7 @@ mod tests {
     async fn sub_agent_blocking_spawn_invokes_runner_with_selected_tools() {
         let runner = Arc::new(testing::RecordingSubAgentRunner::default());
         let available = vec![
-            Arc::new(testing::NoopTool::named("file_read")) as Arc<dyn Tool>,
+            Arc::new(testing::NoopTool::named("read")) as Arc<dyn Tool>,
             Arc::new(testing::SpyTool::named("spy")) as Arc<dyn Tool>,
             Arc::new(SubAgentTool) as Arc<dyn Tool>,
         ];

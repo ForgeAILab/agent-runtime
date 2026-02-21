@@ -133,7 +133,7 @@ pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> String {
     payload.extend_from_slice(&ciphertext);
 
     let encrypted = format!("{ENC_PREFIX}{}", BASE64.encode(payload));
-    tracing::info!(plaintext, encrypted = %encrypted, "nyx-security secret::encrypt");
+    // tracing::info!(plaintext, encrypted = %encrypted, "nyx-security secret::encrypt");
     encrypted
 }
 
@@ -156,7 +156,7 @@ pub fn decrypt(ciphertext: &str, key: &[u8; 32]) -> Result<String, SecurityError
         .map_err(|_| SecurityError::DecryptionFailed)?;
 
     let plaintext = String::from_utf8(plaintext).map_err(|_| SecurityError::InvalidUtf8Secret)?;
-    tracing::info!(ciphertext, plaintext = %plaintext, "nyx-security secret::decrypt");
+    // tracing::info!(ciphertext, plaintext = %plaintext, "nyx-security secret::decrypt");
     Ok(plaintext)
 }
 
