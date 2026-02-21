@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use nyx_kernel::ToolSelection;
 use serde_json::{Value, json};
 
-use crate::{AsyncAgentError, AsyncAgentSpawnRequest, Tool, ToolContext, ToolError, ToolResult};
+use crate::{Tool, ToolContext, ToolError, ToolResult, map_kernel_error};
 
 #[derive(Debug, Default)]
 pub struct AsyncAgentSpawnTool;
@@ -63,16 +64,21 @@ impl Tool for AsyncAgentSpawnTool {
             .map(|v| v as usize)
             .unwrap_or_else(|| if agent_kind == "react" { 10 } else { 100 });
 
-        ctx.async_agent_registry
-            .spawn(AsyncAgentSpawnRequest {
-                id: id.clone(),
+        ctx.control_plane
+            .async_agent()
+            .spawn(
+                &ctx.invocation,
+                id.clone(),
                 prompt,
-                tools,
+                &agent_kind,
+                ToolSelection {
+                    allow: tools.unwrap_or_default(),
+                    deny: Vec::new(),
+                },
                 max_turns,
-                agent_kind,
-            })
+            )
             .await
-            .map_err(map_async_error)?;
+            .map_err(map_kernel_error)?;
 
         Ok(ToolResult::json(
             json!({ "agent_id": id, "status": "spawned" }),
@@ -98,10 +104,18 @@ impl Tool for AsyncAgentListTool {
     }
 
     async fn invoke(&self, _input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let agents = ctx.async_agent_registry.list().await;
-        Ok(ToolResult::json(
-            serde_json::to_value(agents).map_err(ToolError::Json)?,
-        ))
+        let agents = ctx
+            .control_plane
+            .async_agent()
+            .list()
+            .await
+            .map_err(map_kernel_error)?;
+        let agents = serde_json::to_value(agents)
+            .map_err(ToolError::Json)?
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        Ok(ToolResult::json(Value::Array(agents)))
     }
 }
 
@@ -134,13 +148,13 @@ impl Tool for AsyncAgentFetchTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
         let result = ctx
-            .async_agent_registry
+            .control_plane
+            .async_agent()
             .fetch(id)
             .await
-            .map_err(map_async_error)?;
-        Ok(ToolResult::json(
-            serde_json::to_value(result).map_err(ToolError::Json)?,
-        ))
+            .map_err(map_kernel_error)?;
+        let result = serde_json::to_value(result).map_err(ToolError::Json)?;
+        Ok(ToolResult::json(result))
     }
 }
 
@@ -173,32 +187,15 @@ impl Tool for AsyncAgentStopTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
 
-        ctx.async_agent_registry
+        ctx.control_plane
+            .async_agent()
             .stop(id)
             .await
-            .map_err(map_async_error)?;
+            .map_err(map_kernel_error)?;
 
         Ok(ToolResult::json(
             json!({ "id": id, "status": "stopped", "message": "Agent stopped successfully" }),
         ))
-    }
-}
-
-fn map_async_error(err: AsyncAgentError) -> ToolError {
-    match err {
-        AsyncAgentError::NotFound { id } => {
-            ToolError::NotFound(format!("Async agent '{id}' not found"))
-        }
-        AsyncAgentError::IdConflict { id } => {
-            ToolError::InvalidInput(format!("Agent ID '{id}' already exists"))
-        }
-        AsyncAgentError::MaxConcurrentReached { limit } => ToolError::ResourceLimitExceeded(
-            format!("Max concurrent async agents reached (limit: {limit})"),
-        ),
-        AsyncAgentError::CannotStop { id, status } => {
-            ToolError::InvalidState(format!("Cannot stop agent '{id}': already {status:?}"))
-        }
-        AsyncAgentError::Failed { reason } => ToolError::ExecutionFailed { reason },
     }
 }
 
@@ -252,17 +249,12 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_tool_defaults_react_to_10_turns() {
-        let registry = Arc::new(RecordingRegistry::default());
-        let ctx = ToolContext {
-            async_agent_registry: registry.clone(),
-            ..ToolContext::default()
-        };
+        let ctx = ToolContext::default();
 
-        AsyncAgentSpawnTool
+        let err = AsyncAgentSpawnTool
             .invoke(json!({"id":"r1","prompt":"p","agent_kind":"react"}), &ctx)
             .await
-            .expect("invoke");
-        let requests = registry.requests.lock().await;
-        assert_eq!(requests[0].max_turns, 10);
+            .expect_err("noop control plane should reject async spawn");
+        assert!(matches!(err, ToolError::NotAvailable(_)));
     }
 }

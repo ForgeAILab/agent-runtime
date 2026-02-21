@@ -34,19 +34,13 @@ impl WorkflowRuntime for ToolRuntime<'_> {
     }
 
     async fn invoke_tool(&self, name: &str, args: Value) -> Result<Value, WorkflowError> {
-        let tool = self
+        self
             .ctx
-            .available_tools
-            .iter()
-            .find(|tool| tool.name() == name)
-            .ok_or_else(|| WorkflowError::NotFound {
-                name: format!("tool:{name}"),
-            })?;
-        let result = tool
-            .invoke(args, self.ctx)
+            .control_plane
+            .tool_runtime()
+            .invoke(&self.ctx.invocation, name, args)
             .await
-            .map_err(|err| WorkflowError::Runtime(err.to_string()))?;
-        Ok(result.value)
+            .map_err(|err| WorkflowError::Runtime(err.to_string()))
     }
 }
 
@@ -507,12 +501,9 @@ mod tests {
     fn tool_ctx() -> ToolContext {
         ToolContext {
             sandbox: Arc::new(NoopSandbox),
-            sub_agent_runner: None,
-            terminal_registry: Arc::new(crate::TerminalRegistry::new()),
-            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: std::path::PathBuf::from("."),
-            available_tools: Vec::new(),
-            dispatch_sender: None,
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
         }
     }
 

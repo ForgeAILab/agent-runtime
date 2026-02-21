@@ -3,13 +3,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use nyx_kernel::{
+    AgentDispatchService, AsyncAgentService, AuthService, BotEnvService, ConfigService,
+    ControlPlane, CronService, ExtensionRegistry, InvocationContext, KernelError, ProcessService,
+    Service, ServiceId, SubAgentService, ToolRuntimeService,
+};
 use nyx_security::{Sandbox, SandboxError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::mpsc;
 
-use crate::terminal::{TerminalError, TerminalRegistry};
+use crate::terminal::TerminalError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -88,25 +92,329 @@ pub enum DispatchRequest {
 
 pub struct ToolContext {
     pub sandbox: Arc<dyn Sandbox>,
-    pub sub_agent_runner: Option<Arc<dyn SubAgentRunner>>,
-    pub terminal_registry: Arc<TerminalRegistry>,
-    pub async_agent_registry: Arc<dyn AsyncAgentRegistry>,
     pub workspace_dir: PathBuf,
-    pub available_tools: Vec<Arc<dyn Tool>>,
-    pub dispatch_sender: Option<mpsc::Sender<DispatchRequest>>,
+    pub control_plane: Arc<dyn ControlPlane>,
+    pub invocation: InvocationContext,
 }
 
 impl Default for ToolContext {
     fn default() -> Self {
         Self {
             sandbox: Arc::new(nyx_security::testing::NoopSandbox),
-            sub_agent_runner: None,
-            terminal_registry: Arc::new(TerminalRegistry::new()),
-            async_agent_registry: Arc::new(NoopAsyncAgentRegistry),
             workspace_dir: PathBuf::from("."),
-            available_tools: Vec::new(),
-            dispatch_sender: None,
+            control_plane: Arc::new(NoopControlPlane),
+            invocation: InvocationContext::default(),
         }
+    }
+}
+
+#[derive(Default)]
+pub struct ToolContextBuilder {
+    sandbox: Option<Arc<dyn Sandbox>>,
+    workspace_dir: Option<PathBuf>,
+    control_plane: Option<Arc<dyn ControlPlane>>,
+    invocation: Option<InvocationContext>,
+}
+
+impl ToolContextBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    pub fn workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
+        self.workspace_dir = Some(workspace_dir);
+        self
+    }
+
+    pub fn control_plane(mut self, control_plane: Arc<dyn ControlPlane>) -> Self {
+        self.control_plane = Some(control_plane);
+        self
+    }
+
+    pub fn invocation(mut self, invocation: InvocationContext) -> Self {
+        self.invocation = Some(invocation);
+        self
+    }
+
+    pub fn build(self) -> ToolContext {
+        ToolContext {
+            sandbox: self
+                .sandbox
+                .unwrap_or_else(|| Arc::new(nyx_security::testing::NoopSandbox)),
+            workspace_dir: self.workspace_dir.unwrap_or_else(|| PathBuf::from(".")),
+            control_plane: self.control_plane.unwrap_or_else(|| Arc::new(NoopControlPlane)),
+            invocation: self.invocation.unwrap_or_default(),
+        }
+    }
+}
+
+struct NoopService;
+
+#[async_trait]
+impl Service for NoopService {
+    fn service_id(&self) -> ServiceId {
+        ServiceId::new("noop")
+    }
+}
+
+#[async_trait]
+impl AgentDispatchService for NoopService {
+    async fn dispatch(
+        &self,
+        _ctx: &InvocationContext,
+        _request: nyx_kernel::DispatchRequest,
+    ) -> Result<nyx_kernel::DispatchResponse, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl SubAgentService for NoopService {
+    async fn spawn_sub_agent(
+        &self,
+        _ctx: &InvocationContext,
+        _prompt: String,
+        _tool_selection: nyx_kernel::ToolSelection,
+        _max_turns: usize,
+    ) -> Result<String, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl AsyncAgentService for NoopService {
+    async fn spawn(
+        &self,
+        _ctx: &InvocationContext,
+        _id: String,
+        _prompt: String,
+        _agent_kind: &str,
+        _tool_selection: nyx_kernel::ToolSelection,
+        _max_turns: usize,
+    ) -> Result<String, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn list(&self) -> Result<Vec<nyx_kernel::AgentInfo>, KernelError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch(&self, _id: &str) -> Result<nyx_kernel::AsyncAgentResult, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn stop(&self, _id: &str) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl ProcessService for NoopService {
+    async fn spawn(
+        &self,
+        _ctx: &InvocationContext,
+        _id: &str,
+        _command: &str,
+        _interactive: bool,
+    ) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn read(
+        &self,
+        _ctx: &InvocationContext,
+        _id: &str,
+        _timeout_ms: u64,
+    ) -> Result<nyx_kernel::ProcessOutput, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn write(
+        &self,
+        _ctx: &InvocationContext,
+        _id: &str,
+        _input: &str,
+    ) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn kill(&self, _ctx: &InvocationContext, _id: &str) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl CronService for NoopService {
+    async fn add_job(
+        &self,
+        _ctx: &InvocationContext,
+        _spec: nyx_kernel::JobSpec,
+    ) -> Result<nyx_kernel::JobId, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn remove_job(
+        &self,
+        _ctx: &InvocationContext,
+        _job_id: &nyx_kernel::JobId,
+    ) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn list_jobs(
+        &self,
+        _ctx: &InvocationContext,
+    ) -> Result<Vec<nyx_kernel::JobInfo>, KernelError> {
+        Ok(Vec::new())
+    }
+
+    async fn run_job_now(
+        &self,
+        _ctx: &InvocationContext,
+        _job_id: &nyx_kernel::JobId,
+    ) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl ToolRuntimeService for NoopService {
+    async fn invoke(
+        &self,
+        _ctx: &InvocationContext,
+        _tool_name: &str,
+        _input: Value,
+    ) -> Result<Value, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl BotEnvService for NoopService {
+    async fn sandbox_for(&self, _ctx: &InvocationContext) -> Result<Arc<dyn Sandbox>, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+
+    async fn workspace_dir_for(&self, _bot_id: &str) -> Result<PathBuf, KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl AuthService for NoopService {
+    async fn authorize(
+        &self,
+        _ctx: &InvocationContext,
+        _capability: &str,
+    ) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl ConfigService for NoopService {
+    async fn get(&self, _key: &str) -> Result<Option<Value>, KernelError> {
+        Ok(None)
+    }
+
+    async fn set(&self, _key: &str, _value: Value) -> Result<(), KernelError> {
+        Err(KernelError::ServiceUnavailable(
+            "control plane unavailable".to_string(),
+        ))
+    }
+}
+
+struct NoopExtensionRegistry;
+
+impl ExtensionRegistry for NoopExtensionRegistry {
+    fn get_job_executor(&self, _kind: &str) -> Option<Arc<dyn nyx_kernel::JobExecutor>> {
+        None
+    }
+
+    fn get_hook(&self, _name: &str) -> Option<Arc<dyn nyx_kernel::Hook>> {
+        None
+    }
+}
+
+pub struct NoopControlPlane;
+
+impl ControlPlane for NoopControlPlane {
+    fn agent_dispatch(&self) -> Arc<dyn AgentDispatchService> {
+        Arc::new(NoopService)
+    }
+
+    fn sub_agent(&self) -> Arc<dyn SubAgentService> {
+        Arc::new(NoopService)
+    }
+
+    fn async_agent(&self) -> Arc<dyn AsyncAgentService> {
+        Arc::new(NoopService)
+    }
+
+    fn process(&self) -> Arc<dyn ProcessService> {
+        Arc::new(NoopService)
+    }
+
+    fn cron(&self) -> Arc<dyn CronService> {
+        Arc::new(NoopService)
+    }
+
+    fn tool_runtime(&self) -> Arc<dyn ToolRuntimeService> {
+        Arc::new(NoopService)
+    }
+
+    fn bot_env(&self) -> Arc<dyn BotEnvService> {
+        Arc::new(NoopService)
+    }
+
+    fn auth(&self) -> Arc<dyn AuthService> {
+        Arc::new(NoopService)
+    }
+
+    fn config(&self) -> Arc<dyn ConfigService> {
+        Arc::new(NoopService)
+    }
+
+    fn extension_registry(&self) -> &dyn ExtensionRegistry {
+        static REGISTRY: NoopExtensionRegistry = NoopExtensionRegistry;
+        &REGISTRY
     }
 }
 
@@ -149,6 +457,15 @@ pub enum ToolError {
 impl From<SandboxError> for ToolError {
     fn from(value: SandboxError) -> Self {
         Self::Sandbox(value.to_string())
+    }
+}
+
+pub fn map_kernel_error(err: KernelError) -> ToolError {
+    match err {
+        KernelError::ServiceUnavailable(msg) => ToolError::NotAvailable(msg),
+        other => ToolError::ExecutionFailed {
+            reason: other.to_string(),
+        },
     }
 }
 

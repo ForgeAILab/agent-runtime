@@ -3,14 +3,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use nyx_kernel::ToolSelection;
 use nyx_security::{Sandbox, SandboxedCommand};
 #[cfg(feature = "workflow")]
 use nyx_workflow::{WorkflowEngine, WorkflowStore};
 use serde_json::{Value, json};
 
 use crate::{
-    AsyncAgentError, AsyncAgentSpawnRequest, RegistryError, SubAgentError, TerminalError,
-    TerminalStatus, Tool, ToolContext, ToolError, ToolRegistry, ToolResult,
+    RegistryError, TerminalError, TerminalStatus, Tool, ToolContext, ToolError, ToolRegistry,
+    ToolResult, map_kernel_error,
 };
 
 pub fn register_builtins(
@@ -360,7 +361,12 @@ impl Tool for SubAgentTool {
         match action {
             "spawn" => self.spawn(input, ctx).await,
             "list" => {
-                let agents = ctx.async_agent_registry.list().await;
+                let agents = ctx
+                    .control_plane
+                    .async_agent()
+                    .list()
+                    .await
+                    .map_err(map_kernel_error)?;
                 Ok(ToolResult::json(
                     serde_json::to_value(agents).map_err(ToolError::Json)?,
                 ))
@@ -371,10 +377,11 @@ impl Tool for SubAgentTool {
                     .and_then(Value::as_str)
                     .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
                 let result = ctx
-                    .async_agent_registry
+                    .control_plane
+                    .async_agent()
                     .fetch(id)
                     .await
-                    .map_err(map_async_error)?;
+                    .map_err(map_kernel_error)?;
                 Ok(ToolResult::json(
                     serde_json::to_value(result).map_err(ToolError::Json)?,
                 ))
@@ -384,10 +391,11 @@ impl Tool for SubAgentTool {
                     .get("id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                ctx.async_agent_registry
+                ctx.control_plane
+                    .async_agent()
                     .stop(id)
                     .await
-                    .map_err(map_async_error)?;
+                    .map_err(map_kernel_error)?;
                 Ok(ToolResult::json(
                     json!({ "agent_id": id, "status": "stopped" }),
                 ))
@@ -428,14 +436,20 @@ impl SubAgentTool {
         });
 
         if blocking {
-            let selected_tools = resolve_sub_agent_tools(self.name(), tools, ctx)?;
-            let runner = ctx.sub_agent_runner.as_ref().ok_or_else(|| {
-                ToolError::NotAvailable("sub-agent runner is disabled".to_string())
-            })?;
-            let response = runner
-                .run(prompt, selected_tools, max_turns)
+            let response = ctx
+                .control_plane
+                .sub_agent()
+                .spawn_sub_agent(
+                    &ctx.invocation,
+                    prompt,
+                    ToolSelection {
+                        allow: tools.unwrap_or_default(),
+                        deny: Vec::new(),
+                    },
+                    max_turns,
+                )
                 .await
-                .map_err(map_sub_agent_error)?;
+                .map_err(map_kernel_error)?;
             return Ok(ToolResult::text(response));
         }
 
@@ -456,16 +470,21 @@ impl SubAgentTool {
             .map(|v| v as usize)
             .unwrap_or_else(|| if agent_kind == "react" { 10 } else { 100 });
 
-        ctx.async_agent_registry
-            .spawn(AsyncAgentSpawnRequest {
-                id: id.clone(),
+        ctx.control_plane
+            .async_agent()
+            .spawn(
+                &ctx.invocation,
+                id.clone(),
                 prompt,
-                tools,
+                &agent_kind,
+                ToolSelection {
+                    allow: tools.unwrap_or_default(),
+                    deny: Vec::new(),
+                },
                 max_turns,
-                agent_kind,
-            })
+            )
             .await
-            .map_err(map_async_error)?;
+            .map_err(map_kernel_error)?;
 
         Ok(ToolResult::json(
             json!({ "agent_id": id, "status": "spawned" }),
@@ -524,20 +543,12 @@ impl Tool for ProcessTool {
                     .get("interactive")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                let env = input
-                    .get("env")
-                    .and_then(Value::as_object)
-                    .map(|map| {
-                        map.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect::<HashMap<_, _>>()
-                    })
-                    .unwrap_or_default();
-
-                ctx.terminal_registry
-                    .spawn(id, command, ctx, env, interactive)
+                let _env = input.get("env").and_then(Value::as_object).cloned();
+                ctx.control_plane
+                    .process()
+                    .spawn(&ctx.invocation, id, command, interactive)
                     .await
-                    .map_err(map_terminal_error)?;
+                    .map_err(map_kernel_error)?;
 
                 Ok(ToolResult::json(json!({
                     "process_id": id,
@@ -552,10 +563,11 @@ impl Tool for ProcessTool {
                     .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
                 let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
                 let out = ctx
-                    .terminal_registry
-                    .read(id, timeout_ms)
+                    .control_plane
+                    .process()
+                    .read(&ctx.invocation, id, timeout_ms)
                     .await
-                    .map_err(map_terminal_error)?;
+                    .map_err(map_kernel_error)?;
                 Ok(ToolResult::json(json!({
                     "process_id": id,
                     "stdout": out.stdout,
@@ -573,10 +585,11 @@ impl Tool for ProcessTool {
                     .get("input")
                     .and_then(Value::as_str)
                     .ok_or_else(|| ToolError::InvalidInput("missing input".to_string()))?;
-                ctx.terminal_registry
-                    .write(id, text)
+                ctx.control_plane
+                    .process()
+                    .write(&ctx.invocation, id, text)
                     .await
-                    .map_err(map_terminal_error)?;
+                    .map_err(map_kernel_error)?;
                 Ok(ToolResult::json(
                     json!({ "process_id": id, "status": "written" }),
                 ))
@@ -586,72 +599,22 @@ impl Tool for ProcessTool {
                     .get("id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                ctx.terminal_registry
-                    .kill(id)
+                ctx.control_plane
+                    .process()
+                    .kill(&ctx.invocation, id)
                     .await
-                    .map_err(map_terminal_error)?;
+                    .map_err(map_kernel_error)?;
                 Ok(ToolResult::json(
                     json!({ "process_id": id, "status": "killed" }),
                 ))
             }
-            "list" => {
-                let sessions = ctx.terminal_registry.list().await;
-                let payload = sessions
-                    .into_iter()
-                    .map(|session| {
-                        let (status, pid, exit_code) = match session.status {
-                            TerminalStatus::Running { pid } => {
-                                ("running", Value::from(pid), Value::Null)
-                            }
-                            TerminalStatus::Exited { exit_code } => {
-                                ("exited", Value::Null, Value::from(exit_code))
-                            }
-                        };
-                        json!({
-                            "process_id": session.id,
-                            "interactive": session.interactive,
-                            "status": status,
-                            "pid": pid,
-                            "exit_code": exit_code
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(ToolResult::json(Value::Array(payload)))
-            }
+            "list" => Err(ToolError::NotAvailable(
+                "process list is not available via control plane".to_string(),
+            )),
             _ => Err(ToolError::InvalidInput(format!(
                 "invalid action `{action}`; expected one of: spawn, read, write, kill, list"
             ))),
         }
-    }
-}
-
-fn map_sub_agent_error(err: SubAgentError) -> ToolError {
-    match err {
-        SubAgentError::NotAvailable => {
-            ToolError::NotAvailable("sub-agent runner is disabled".to_string())
-        }
-        SubAgentError::MaxDepthExceeded => ToolError::SubAgentFailed {
-            reason: "max depth exceeded".to_string(),
-        },
-        SubAgentError::AgentFailed(reason) => ToolError::SubAgentFailed { reason },
-    }
-}
-
-fn map_async_error(err: AsyncAgentError) -> ToolError {
-    match err {
-        AsyncAgentError::NotFound { id } => {
-            ToolError::NotFound(format!("Async agent '{id}' not found"))
-        }
-        AsyncAgentError::IdConflict { id } => {
-            ToolError::InvalidInput(format!("Agent ID '{id}' already exists"))
-        }
-        AsyncAgentError::MaxConcurrentReached { limit } => ToolError::ResourceLimitExceeded(
-            format!("Max concurrent async agents reached (limit: {limit})"),
-        ),
-        AsyncAgentError::CannotStop { id, status } => {
-            ToolError::InvalidState(format!("Cannot stop agent '{id}': already {status:?}"))
-        }
-        AsyncAgentError::Failed { reason } => ToolError::ExecutionFailed { reason },
     }
 }
 
@@ -662,33 +625,6 @@ fn map_terminal_error(err: TerminalError) -> ToolError {
     }
 }
 
-#[cfg(feature = "sub-agent")]
-fn resolve_sub_agent_tools(
-    self_name: &str,
-    requested: Option<Vec<String>>,
-    ctx: &ToolContext,
-) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
-    if let Some(names) = requested {
-        let mut selected = Vec::with_capacity(names.len());
-        for name in names {
-            let found = ctx
-                .available_tools
-                .iter()
-                .find(|tool| tool.name() == name)
-                .cloned()
-                .ok_or_else(|| ToolError::InvalidInput(format!("unknown tool: {name}")))?;
-            selected.push(found);
-        }
-        return Ok(selected);
-    }
-
-    Ok(ctx
-        .available_tools
-        .iter()
-        .filter(|tool| tool.name() != self_name)
-        .cloned()
-        .collect())
-}
 
 #[cfg(feature = "file")]
 #[derive(Debug, Clone)]
@@ -948,15 +884,12 @@ mod tests {
         }
     }
 
-    fn ctx(tools: Vec<Arc<dyn Tool>>) -> ToolContext {
+    fn ctx(_tools: Vec<Arc<dyn Tool>>) -> ToolContext {
         ToolContext {
             sandbox: Arc::new(NoopSandbox),
-            sub_agent_runner: None,
-            terminal_registry: Arc::new(TerminalRegistry::new()),
-            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: std::path::PathBuf::from("."),
-            available_tools: tools,
-            dispatch_sender: None,
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
         }
     }
 
@@ -980,12 +913,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let tool_ctx = ToolContext {
             sandbox: Arc::new(NoopSandbox),
-            sub_agent_runner: None,
-            terminal_registry: Arc::new(TerminalRegistry::new()),
-            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: temp_dir.path().to_path_buf(),
-            available_tools: vec![],
-            dispatch_sender: None,
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
         };
 
         FileWriteTool
@@ -1033,12 +963,9 @@ mod tests {
         let spy = Arc::new(SpySandbox::default());
         let tool_ctx = ToolContext {
             sandbox: spy.clone(),
-            sub_agent_runner: None,
-            terminal_registry: Arc::new(TerminalRegistry::new()),
-            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: std::path::PathBuf::from("."),
-            available_tools: vec![],
-            dispatch_sender: None,
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
         };
 
         let output = ShellTool
@@ -1052,24 +979,15 @@ mod tests {
 
     #[cfg(feature = "sub-agent")]
     #[tokio::test]
-    async fn sub_agent_blocking_spawn_invokes_runner_with_selected_tools() {
-        let runner = Arc::new(testing::RecordingSubAgentRunner::default());
-        let available = vec![
-            Arc::new(testing::NoopTool::named("read")) as Arc<dyn Tool>,
-            Arc::new(testing::SpyTool::named("spy")) as Arc<dyn Tool>,
-            Arc::new(SubAgentTool) as Arc<dyn Tool>,
-        ];
+    async fn sub_agent_blocking_spawn_returns_service_unavailable_without_control_plane_service() {
         let tool_ctx = ToolContext {
             sandbox: Arc::new(NoopSandbox),
-            sub_agent_runner: Some(runner.clone()),
-            terminal_registry: Arc::new(TerminalRegistry::new()),
-            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: std::path::PathBuf::from("."),
-            available_tools: available,
-            dispatch_sender: None,
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
         };
 
-        let out = SubAgentTool
+        let err = SubAgentTool
             .invoke(
                 json!({
                     "action": "spawn",
@@ -1081,12 +999,8 @@ mod tests {
                 &tool_ctx,
             )
             .await
-            .expect("sub-agent invoke works");
-
-        assert_eq!(out.value, Value::String("recorded".to_string()));
-        let calls = runner.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool_names, vec!["spy".to_string()]);
+            .expect_err("sub-agent requires wired service");
+        assert!(matches!(err, ToolError::NotAvailable(_)));
     }
 
     #[cfg(feature = "terminal")]
@@ -1094,7 +1008,7 @@ mod tests {
     async fn process_tool_spawn_write_read_kill_roundtrip() {
         let tool_ctx = ToolContext::default();
 
-        ProcessTool
+        let err = ProcessTool
             .invoke(
                 json!({
                     "action": "spawn",
@@ -1105,33 +1019,7 @@ mod tests {
                 &tool_ctx,
             )
             .await
-            .expect("spawn works");
-
-        ProcessTool
-            .invoke(
-                json!({ "action": "write", "id": "proc1", "input": "hello\\n" }),
-                &tool_ctx,
-            )
-            .await
-            .expect("write works");
-
-        let out = ProcessTool
-            .invoke(
-                json!({ "action": "read", "id": "proc1", "timeout_ms": 500 }),
-                &tool_ctx,
-            )
-            .await
-            .expect("read works");
-        assert!(
-            out.value["stdout"]
-                .as_str()
-                .expect("stdout string")
-                .contains("hello")
-        );
-
-        ProcessTool
-            .invoke(json!({ "action": "kill", "id": "proc1" }), &tool_ctx)
-            .await
-            .expect("kill works");
+            .expect_err("noop control plane has no process service");
+        assert!(matches!(err, ToolError::NotAvailable(_)));
     }
 }

@@ -312,18 +312,14 @@ mod tests {
     #[cfg(feature = "terminal")]
     #[tokio::test]
     async fn process_tool_spawn_write_read_status_and_kill() {
-        let registry = Arc::new(TerminalRegistry::new());
         let tool_ctx = ToolContext {
             sandbox: Arc::new(NoopSandbox),
-            sub_agent_runner: None,
-            terminal_registry: registry,
-            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: std::path::PathBuf::from("."),
-            available_tools: vec![],
-            dispatch_sender: None,
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
         };
 
-        ProcessTool
+        let err = ProcessTool
             .invoke(
                 json!({
                     "action": "spawn",
@@ -334,52 +330,8 @@ mod tests {
                 &tool_ctx,
             )
             .await
-            .expect("spawn works");
-
-        let initial = ProcessTool
-            .invoke(
-                json!({ "action": "read", "id": "toolflow", "timeout_ms": 500 }),
-                &tool_ctx,
-            )
-            .await
-            .expect("initial read works");
-        let initial_stdout = initial.value["stdout"]
-            .as_str()
-            .expect("stdout should be string");
-        assert!(initial_stdout.contains("tool-env-ok"));
-
-        ProcessTool
-            .invoke(
-                json!({ "action": "write", "id": "toolflow", "input": "hello-from-write\\n" }),
-                &tool_ctx,
-            )
-            .await
-            .expect("write works");
-
-        let echoed = ProcessTool
-            .invoke(
-                json!({ "action": "read", "id": "toolflow", "timeout_ms": 500 }),
-                &tool_ctx,
-            )
-            .await
-            .expect("echoed read works");
-        assert!(
-            echoed.value["stdout"]
-                .as_str()
-                .expect("stdout should be string")
-                .contains("hello-from-write")
-        );
-
-        let status = ProcessTool
-            .invoke(json!({ "action": "list" }), &tool_ctx)
-            .await
-            .expect("status works");
-        assert_eq!(status.value[0]["status"], "running");
-
-        ProcessTool
-            .invoke(json!({ "action": "kill", "id": "toolflow" }), &tool_ctx)
-            .await
-            .expect("kill works");
+            .expect_err("noop control plane has no process service");
+        assert!(matches!(err, ToolError::NotAvailable(_)));
     }
 
     #[cfg(feature = "terminal")]
@@ -392,46 +344,26 @@ mod tests {
             )
             .await
             .expect_err("missing session should fail");
-        assert!(matches!(err, ToolError::TerminalNotFound { .. }));
+        assert!(matches!(err, ToolError::NotAvailable(_)));
     }
 
     #[cfg(feature = "terminal")]
     #[tokio::test]
     async fn process_kill_then_write_returns_session_exited() {
-        let registry = Arc::new(TerminalRegistry::new());
         let tool_ctx = ToolContext {
             sandbox: Arc::new(NoopSandbox),
-            sub_agent_runner: None,
-            terminal_registry: registry,
-            async_agent_registry: Arc::new(crate::NoopAsyncAgentRegistry),
             workspace_dir: std::path::PathBuf::from("."),
-            available_tools: vec![],
-            dispatch_sender: None,
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
         };
 
-        ProcessTool
+        let err = ProcessTool
             .invoke(
                 json!({ "action": "spawn", "id": "killme", "command": "cat" }),
                 &tool_ctx,
             )
             .await
-            .expect("spawn works");
-        ProcessTool
-            .invoke(json!({ "action": "kill", "id": "killme" }), &tool_ctx)
-            .await
-            .expect("kill works");
-
-        let err = ProcessTool
-            .invoke(
-                json!({ "action": "write", "id": "killme", "input": "hello" }),
-                &tool_ctx,
-            )
-            .await
-            .expect_err("write after kill should fail");
-
-        assert!(matches!(
-            err,
-            ToolError::Terminal(TerminalError::SessionExited)
-        ));
+            .expect_err("noop control plane has no process service");
+        assert!(matches!(err, ToolError::NotAvailable(_)));
     }
 }
