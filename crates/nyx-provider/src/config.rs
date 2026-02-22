@@ -150,6 +150,12 @@ fn make_compat_no_key(
 pub fn build_provider(
     cfg: &ProviderConfig,
 ) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
+    tracing::debug!(
+        kind = cfg.kind.as_str(),
+        model = cfg.model.as_str(),
+        "building provider"
+    );
+
     match cfg.kind.as_str() {
         "echo" => Ok((Arc::new(crate::testing::EchoProvider), cfg.model.clone())),
 
