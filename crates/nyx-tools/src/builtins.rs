@@ -7,8 +7,7 @@ use nyx_security::{Sandbox, SandboxedCommand};
 use serde_json::{Value, json};
 
 use crate::{
-    RegistryError, TerminalError, TerminalStatus, Tool, ToolContext, ToolError, ToolRegistry,
-    ToolResult, map_kernel_error,
+    RegistryError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult, map_kernel_error,
 };
 
 pub fn register_builtins(
@@ -609,13 +608,6 @@ impl Tool for ProcessTool {
     }
 }
 
-fn map_terminal_error(err: TerminalError) -> ToolError {
-    match err {
-        TerminalError::NotFound { id } => ToolError::TerminalNotFound { id },
-        other => ToolError::Terminal(other),
-    }
-}
-
 #[cfg(feature = "file")]
 #[derive(Debug, Clone)]
 struct PatchHunk {
@@ -853,7 +845,7 @@ mod tests {
     use crate::ShellTool;
     #[cfg(feature = "file")]
     use crate::{FileApplyPatchTool, FileReadTool, FileWriteTool};
-    use crate::{SubAgentTool, TerminalRegistry, Tool, ToolContext, ToolError, testing};
+    use crate::{SubAgentTool, Tool, ToolContext, ToolError};
 
     #[derive(Default)]
     struct SpySandbox {
