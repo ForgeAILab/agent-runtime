@@ -5,9 +5,8 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nyx_core::{
-    AgentDispatchService, AsyncAgentService, AuthService, ConfigService, ControlPlane, CronService,
-    ExtensionRegistry, InvocationContext, KernelError, ProcessService, Service, ServiceId,
-    SubAgentService, ToolCatalogService, ToolRuntimeService,
+    AgentDispatchService, ControlPlane, CronService, ExtensionRegistry, InvocationContext,
+    KernelError, Service, ServiceId, ToolCatalogService, ToolRuntimeService,
 };
 use nyx_security::{Sandbox, SandboxError};
 use serde::{Deserialize, Serialize};
@@ -179,97 +178,6 @@ impl AgentDispatchService for NoopService {
 }
 
 #[async_trait]
-impl SubAgentService for NoopService {
-    async fn spawn_sub_agent(
-        &self,
-        _ctx: &InvocationContext,
-        _prompt: String,
-        _tool_selection: nyx_core::ToolSelection,
-        _max_turns: usize,
-    ) -> Result<String, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl AsyncAgentService for NoopService {
-    async fn spawn(
-        &self,
-        _ctx: &InvocationContext,
-        _id: String,
-        _prompt: String,
-        _agent_kind: &str,
-        _tool_selection: nyx_core::ToolSelection,
-        _max_turns: usize,
-    ) -> Result<String, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-
-    async fn list(&self) -> Result<Vec<nyx_core::AgentInfo>, KernelError> {
-        Ok(Vec::new())
-    }
-
-    async fn fetch(&self, _id: &str) -> Result<nyx_core::AsyncAgentResult, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-
-    async fn stop(&self, _id: &str) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl ProcessService for NoopService {
-    async fn spawn(
-        &self,
-        _ctx: &InvocationContext,
-        _id: &str,
-        _command: &str,
-        _interactive: bool,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-
-    async fn read(
-        &self,
-        _ctx: &InvocationContext,
-        _id: &str,
-        _timeout_ms: u64,
-    ) -> Result<nyx_core::ProcessOutput, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-
-    async fn write(
-        &self,
-        _ctx: &InvocationContext,
-        _id: &str,
-        _input: &str,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-
-    async fn kill(&self, _ctx: &InvocationContext, _id: &str) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
 impl CronService for NoopService {
     async fn add_job(
         &self,
@@ -342,32 +250,6 @@ impl ToolCatalogService for NoopService {
     }
 }
 
-#[async_trait]
-impl AuthService for NoopService {
-    async fn authorize(
-        &self,
-        _ctx: &InvocationContext,
-        _capability: &str,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl ConfigService for NoopService {
-    async fn get(&self, _key: &str) -> Result<Option<Value>, KernelError> {
-        Ok(None)
-    }
-
-    async fn set(&self, _key: &str, _value: Value) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
 struct NoopExtensionRegistry;
 
 impl ExtensionRegistry for NoopExtensionRegistry {
@@ -387,18 +269,6 @@ impl ControlPlane for NoopControlPlane {
         Arc::new(NoopService)
     }
 
-    fn sub_agent(&self) -> Arc<dyn SubAgentService> {
-        Arc::new(NoopService)
-    }
-
-    fn async_agent(&self) -> Arc<dyn AsyncAgentService> {
-        Arc::new(NoopService)
-    }
-
-    fn process(&self) -> Arc<dyn ProcessService> {
-        Arc::new(NoopService)
-    }
-
     fn cron(&self) -> Arc<dyn CronService> {
         Arc::new(NoopService)
     }
@@ -408,14 +278,6 @@ impl ControlPlane for NoopControlPlane {
     }
 
     fn tool_catalog(&self) -> Arc<dyn ToolCatalogService> {
-        Arc::new(NoopService)
-    }
-
-    fn auth(&self) -> Arc<dyn AuthService> {
-        Arc::new(NoopService)
-    }
-
-    fn config(&self) -> Arc<dyn ConfigService> {
         Arc::new(NoopService)
     }
 

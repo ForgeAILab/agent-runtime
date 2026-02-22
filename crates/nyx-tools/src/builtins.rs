@@ -2,13 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nyx_core::ToolSelection;
 use nyx_security::{Sandbox, SandboxedCommand};
 use serde_json::{Value, json};
 
-use crate::{
-    RegistryError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult, map_kernel_error,
-};
+use crate::{RegistryError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 pub fn register_builtins(
     registry: &mut ToolRegistry,
@@ -28,12 +25,6 @@ pub fn register_builtins(
 
     #[cfg(feature = "http")]
     registry.register(Arc::new(HttpTool::default()))?;
-
-    #[cfg(feature = "sub-agent")]
-    registry.register(Arc::new(SubAgentTool))?;
-
-    #[cfg(feature = "terminal")]
-    registry.register(Arc::new(ProcessTool))?;
 
     Ok(())
 }
@@ -311,303 +302,6 @@ impl Tool for HttpTool {
     }
 }
 
-#[cfg(feature = "sub-agent")]
-#[derive(Debug, Default)]
-pub struct SubAgentTool;
-
-#[cfg(feature = "sub-agent")]
-#[async_trait]
-impl Tool for SubAgentTool {
-    fn name(&self) -> &str {
-        "sub_agent"
-    }
-
-    fn description(&self) -> &str {
-        "Manage sub-agent lifecycle with action-based commands"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["action"],
-            "properties": {
-                "action": { "type": "string", "enum": ["spawn", "list", "get", "kill"] },
-                "id": { "type": "string" },
-                "prompt": { "type": "string" },
-                "tools": { "type": "array", "items": { "type": "string" } },
-                "max_turns": { "type": "integer", "minimum": 1, "default": 10 },
-                "blocking": { "type": "boolean", "default": false },
-                "agent_kind": { "type": "string", "default": "background" }
-            }
-        })
-    }
-
-    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing action".to_string()))?;
-
-        match action {
-            "spawn" => self.spawn(input, ctx).await,
-            "list" => {
-                let agents = ctx
-                    .control_plane
-                    .async_agent()
-                    .list()
-                    .await
-                    .map_err(map_kernel_error)?;
-                Ok(ToolResult::json(
-                    serde_json::to_value(agents).map_err(ToolError::Json)?,
-                ))
-            }
-            "get" => {
-                let id = input
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                let result = ctx
-                    .control_plane
-                    .async_agent()
-                    .fetch(id)
-                    .await
-                    .map_err(map_kernel_error)?;
-                Ok(ToolResult::json(
-                    serde_json::to_value(result).map_err(ToolError::Json)?,
-                ))
-            }
-            "kill" => {
-                let id = input
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                ctx.control_plane
-                    .async_agent()
-                    .stop(id)
-                    .await
-                    .map_err(map_kernel_error)?;
-                Ok(ToolResult::json(
-                    json!({ "agent_id": id, "status": "stopped" }),
-                ))
-            }
-            _ => Err(ToolError::InvalidInput(format!(
-                "invalid action `{action}`; expected one of: spawn, list, get, kill"
-            ))),
-        }
-    }
-}
-
-#[cfg(feature = "sub-agent")]
-impl SubAgentTool {
-    async fn spawn(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let blocking = input
-            .get("blocking")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        let id = input
-            .get("id")
-            .and_then(Value::as_str)
-            .map(|v| v.trim().to_string())
-            .unwrap_or_default();
-        let prompt = input
-            .get("prompt")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing prompt".to_string()))?
-            .to_string();
-        let max_turns = input.get("max_turns").and_then(Value::as_u64).unwrap_or(10) as usize;
-
-        let tools = input.get("tools").and_then(Value::as_array).map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|name| name.to_string())
-                .collect::<Vec<_>>()
-        });
-
-        if blocking {
-            let response = ctx
-                .control_plane
-                .sub_agent()
-                .spawn_sub_agent(
-                    &ctx.invocation,
-                    prompt,
-                    ToolSelection {
-                        allow: tools.unwrap_or_default(),
-                        deny: Vec::new(),
-                    },
-                    max_turns,
-                )
-                .await
-                .map_err(map_kernel_error)?;
-            return Ok(ToolResult::text(response));
-        }
-
-        if id.is_empty() {
-            return Err(ToolError::InvalidInput(
-                "missing id for async sub-agent spawn".to_string(),
-            ));
-        }
-
-        let agent_kind = input
-            .get("agent_kind")
-            .and_then(Value::as_str)
-            .unwrap_or("background")
-            .to_string();
-        let max_turns = input
-            .get("max_turns")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or_else(|| if agent_kind == "react" { 10 } else { 100 });
-
-        ctx.control_plane
-            .async_agent()
-            .spawn(
-                &ctx.invocation,
-                id.clone(),
-                prompt,
-                &agent_kind,
-                ToolSelection {
-                    allow: tools.unwrap_or_default(),
-                    deny: Vec::new(),
-                },
-                max_turns,
-            )
-            .await
-            .map_err(map_kernel_error)?;
-
-        Ok(ToolResult::json(
-            json!({ "agent_id": id, "status": "spawned" }),
-        ))
-    }
-}
-
-#[cfg(feature = "terminal")]
-#[derive(Debug, Default)]
-pub struct ProcessTool;
-
-#[cfg(feature = "terminal")]
-#[async_trait]
-impl Tool for ProcessTool {
-    fn name(&self) -> &str {
-        "process"
-    }
-
-    fn description(&self) -> &str {
-        "Manage interactive and background processes with action-based commands"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["action"],
-            "properties": {
-                "action": { "type": "string", "enum": ["spawn", "read", "write", "kill", "list"] },
-                "id": { "type": "string" },
-                "command": { "type": "string" },
-                "interactive": { "type": "boolean", "default": true },
-                "env": { "type": "object", "additionalProperties": { "type": "string" } },
-                "timeout_ms": { "type": "integer", "minimum": 0, "default": 0 },
-                "input": { "type": "string" }
-            }
-        })
-    }
-
-    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing action".to_string()))?;
-
-        match action {
-            "spawn" => {
-                let id = input
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                let command = input
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing command".to_string()))?;
-                let interactive = input
-                    .get("interactive")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                let _env = input.get("env").and_then(Value::as_object).cloned();
-                ctx.control_plane
-                    .process()
-                    .spawn(&ctx.invocation, id, command, interactive)
-                    .await
-                    .map_err(map_kernel_error)?;
-
-                Ok(ToolResult::json(json!({
-                    "process_id": id,
-                    "status": "running",
-                    "interactive": interactive
-                })))
-            }
-            "read" => {
-                let id = input
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
-                let out = ctx
-                    .control_plane
-                    .process()
-                    .read(&ctx.invocation, id, timeout_ms)
-                    .await
-                    .map_err(map_kernel_error)?;
-                Ok(ToolResult::json(json!({
-                    "process_id": id,
-                    "stdout": out.stdout,
-                    "stderr": out.stderr,
-                    "output": format!("{}{}", out.stdout, out.stderr),
-                    "has_more": false
-                })))
-            }
-            "write" => {
-                let id = input
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                let text = input
-                    .get("input")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing input".to_string()))?;
-                ctx.control_plane
-                    .process()
-                    .write(&ctx.invocation, id, text)
-                    .await
-                    .map_err(map_kernel_error)?;
-                Ok(ToolResult::json(
-                    json!({ "process_id": id, "status": "written" }),
-                ))
-            }
-            "kill" => {
-                let id = input
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-                ctx.control_plane
-                    .process()
-                    .kill(&ctx.invocation, id)
-                    .await
-                    .map_err(map_kernel_error)?;
-                Ok(ToolResult::json(
-                    json!({ "process_id": id, "status": "killed" }),
-                ))
-            }
-            "list" => Err(ToolError::NotAvailable(
-                "process list is not available via control plane".to_string(),
-            )),
-            _ => Err(ToolError::InvalidInput(format!(
-                "invalid action `{action}`; expected one of: spawn, read, write, kill, list"
-            ))),
-        }
-    }
-}
-
 #[cfg(feature = "file")]
 #[derive(Debug, Clone)]
 struct PatchHunk {
@@ -839,13 +533,11 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::NamedTempFile;
 
-    #[cfg(feature = "terminal")]
-    use crate::ProcessTool;
     #[cfg(feature = "shell")]
     use crate::ShellTool;
     #[cfg(feature = "file")]
     use crate::{FileApplyPatchTool, FileReadTool, FileWriteTool};
-    use crate::{SubAgentTool, Tool, ToolContext, ToolError};
+    use crate::{Tool, ToolContext, ToolError};
 
     #[derive(Default)]
     struct SpySandbox {
@@ -959,49 +651,4 @@ mod tests {
         assert_eq!(spy.executions.load(Ordering::Relaxed), 1);
     }
 
-    #[cfg(feature = "sub-agent")]
-    #[tokio::test]
-    async fn sub_agent_blocking_spawn_returns_service_unavailable_without_control_plane_service() {
-        let tool_ctx = ToolContext {
-            sandbox: Arc::new(NoopSandbox),
-            workspace_dir: std::path::PathBuf::from("."),
-            control_plane: Arc::new(crate::NoopControlPlane),
-            invocation: Default::default(),
-        };
-
-        let err = SubAgentTool
-            .invoke(
-                json!({
-                    "action": "spawn",
-                    "prompt": "do thing",
-                    "tools": ["spy"],
-                    "max_turns": 3,
-                    "blocking": true
-                }),
-                &tool_ctx,
-            )
-            .await
-            .expect_err("sub-agent requires wired service");
-        assert!(matches!(err, ToolError::NotAvailable(_)));
-    }
-
-    #[cfg(feature = "terminal")]
-    #[tokio::test]
-    async fn process_tool_spawn_write_read_kill_roundtrip() {
-        let tool_ctx = ToolContext::default();
-
-        let err = ProcessTool
-            .invoke(
-                json!({
-                    "action": "spawn",
-                    "id": "proc1",
-                    "command": "cat",
-                    "interactive": true
-                }),
-                &tool_ctx,
-            )
-            .await
-            .expect_err("noop control plane has no process service");
-        assert!(matches!(err, ToolError::NotAvailable(_)));
-    }
 }

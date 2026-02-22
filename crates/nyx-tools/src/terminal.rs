@@ -248,17 +248,10 @@ async fn read_buffered<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::time::Duration;
-
-    use nyx_security::testing::NoopSandbox;
-    #[cfg(feature = "terminal")]
-    use serde_json::json;
 
     use super::{TerminalError, TerminalRegistry, TerminalStatus};
     use crate::ToolContext;
-    #[cfg(feature = "terminal")]
-    use crate::{ProcessTool, Tool, ToolError};
 
     #[tokio::test]
     async fn terminal_registry_spawn_write_read_round_trip() {
@@ -309,61 +302,4 @@ mod tests {
         assert!(matches!(status, TerminalStatus::Exited { .. }));
     }
 
-    #[cfg(feature = "terminal")]
-    #[tokio::test]
-    async fn process_tool_spawn_write_read_status_and_kill() {
-        let tool_ctx = ToolContext {
-            sandbox: Arc::new(NoopSandbox),
-            workspace_dir: std::path::PathBuf::from("."),
-            control_plane: Arc::new(crate::NoopControlPlane),
-            invocation: Default::default(),
-        };
-
-        let err = ProcessTool
-            .invoke(
-                json!({
-                    "action": "spawn",
-                    "id": "toolflow",
-                    "command": "printf '%s\\n' \"$NYX_TOOLS_TEST_ENV\"; cat",
-                    "env": { "NYX_TOOLS_TEST_ENV": "tool-env-ok" }
-                }),
-                &tool_ctx,
-            )
-            .await
-            .expect_err("noop control plane has no process service");
-        assert!(matches!(err, ToolError::NotAvailable(_)));
-    }
-
-    #[cfg(feature = "terminal")]
-    #[tokio::test]
-    async fn process_read_returns_not_found_for_unknown_id() {
-        let err = ProcessTool
-            .invoke(
-                json!({ "action": "read", "id": "missing" }),
-                &ToolContext::default(),
-            )
-            .await
-            .expect_err("missing session should fail");
-        assert!(matches!(err, ToolError::NotAvailable(_)));
-    }
-
-    #[cfg(feature = "terminal")]
-    #[tokio::test]
-    async fn process_kill_then_write_returns_session_exited() {
-        let tool_ctx = ToolContext {
-            sandbox: Arc::new(NoopSandbox),
-            workspace_dir: std::path::PathBuf::from("."),
-            control_plane: Arc::new(crate::NoopControlPlane),
-            invocation: Default::default(),
-        };
-
-        let err = ProcessTool
-            .invoke(
-                json!({ "action": "spawn", "id": "killme", "command": "cat" }),
-                &tool_ctx,
-            )
-            .await
-            .expect_err("noop control plane has no process service");
-        assert!(matches!(err, ToolError::NotAvailable(_)));
-    }
 }
