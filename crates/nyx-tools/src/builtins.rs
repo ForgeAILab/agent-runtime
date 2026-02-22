@@ -625,7 +625,6 @@ fn map_terminal_error(err: TerminalError) -> ToolError {
     }
 }
 
-
 #[cfg(feature = "file")]
 #[derive(Debug, Clone)]
 struct PatchHunk {

@@ -34,8 +34,7 @@ impl WorkflowRuntime for ToolRuntime<'_> {
     }
 
     async fn invoke_tool(&self, name: &str, args: Value) -> Result<Value, WorkflowError> {
-        self
-            .ctx
+        self.ctx
             .control_plane
             .tool_runtime()
             .invoke(&self.ctx.invocation, name, args)

@@ -1,12 +1,13 @@
+use std::any::{Any, TypeId};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nyx_kernel::{
-    AgentDispatchService, AsyncAgentService, AuthService, BotEnvService, ConfigService,
-    ControlPlane, CronService, ExtensionRegistry, InvocationContext, KernelError, ProcessService,
-    Service, ServiceId, SubAgentService, ToolRuntimeService,
+    AgentDispatchService, AsyncAgentService, AuthService, ConfigService, ControlPlane, CronService,
+    ExtensionRegistry, InvocationContext, KernelError, ProcessService, Service, ServiceId,
+    SubAgentService, ToolCatalogService, ToolRuntimeService,
 };
 use nyx_security::{Sandbox, SandboxError};
 use serde::{Deserialize, Serialize};
@@ -147,7 +148,9 @@ impl ToolContextBuilder {
                 .sandbox
                 .unwrap_or_else(|| Arc::new(nyx_security::testing::NoopSandbox)),
             workspace_dir: self.workspace_dir.unwrap_or_else(|| PathBuf::from(".")),
-            control_plane: self.control_plane.unwrap_or_else(|| Arc::new(NoopControlPlane)),
+            control_plane: self
+                .control_plane
+                .unwrap_or_else(|| Arc::new(NoopControlPlane)),
             invocation: self.invocation.unwrap_or_default(),
         }
     }
@@ -321,17 +324,21 @@ impl ToolRuntimeService for NoopService {
 }
 
 #[async_trait]
-impl BotEnvService for NoopService {
-    async fn sandbox_for(&self, _ctx: &InvocationContext) -> Result<Arc<dyn Sandbox>, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
+impl ToolCatalogService for NoopService {
+    async fn list_specs(
+        &self,
+        _ctx: &InvocationContext,
+        _selection: &nyx_kernel::ToolSelection,
+    ) -> Result<Vec<nyx_core::ToolSpec>, KernelError> {
+        Ok(Vec::new())
     }
 
-    async fn workspace_dir_for(&self, _bot_id: &str) -> Result<PathBuf, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
+    async fn get_spec(
+        &self,
+        _ctx: &InvocationContext,
+        _name: &str,
+    ) -> Result<Option<nyx_core::ToolSpec>, KernelError> {
+        Ok(None)
     }
 }
 
@@ -400,7 +407,7 @@ impl ControlPlane for NoopControlPlane {
         Arc::new(NoopService)
     }
 
-    fn bot_env(&self) -> Arc<dyn BotEnvService> {
+    fn tool_catalog(&self) -> Arc<dyn ToolCatalogService> {
         Arc::new(NoopService)
     }
 
@@ -415,6 +422,23 @@ impl ControlPlane for NoopControlPlane {
     fn extension_registry(&self) -> &dyn ExtensionRegistry {
         static REGISTRY: NoopExtensionRegistry = NoopExtensionRegistry;
         &REGISTRY
+    }
+
+    fn list_services(&self) -> Vec<ServiceId> {
+        Vec::new()
+    }
+
+    fn get_by_id(&self, _id: &ServiceId) -> Option<Arc<dyn Service>> {
+        None
+    }
+
+    fn downgrade(&self) -> Weak<dyn ControlPlane> {
+        let cp: Arc<dyn ControlPlane> = Arc::new(NoopControlPlane);
+        Arc::downgrade(&cp)
+    }
+
+    fn get_erased_by_type(&self, _type_id: TypeId) -> Option<&(dyn Any + Send + Sync)> {
+        None
     }
 }
 

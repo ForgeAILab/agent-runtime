@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use nyx_core::BotId;
 use thiserror::Error;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
@@ -171,6 +172,11 @@ pub trait Sandbox: Send + Sync {
     async fn spawn_piped(&self, _cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
         Err(SandboxError::UnsupportedInteractiveSpawn)
     }
+}
+
+pub trait BotEnvProvider: Send + Sync {
+    fn sandbox_for(&self, bot_id: &BotId) -> Arc<dyn Sandbox>;
+    fn workspace_dir_for(&self, bot_id: &BotId) -> PathBuf;
 }
 
 #[async_trait]

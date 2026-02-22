@@ -1,4 +1,5 @@
 mod builtins;
+mod catalog_service;
 mod core;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -9,6 +10,7 @@ pub mod testing;
 mod workflow;
 
 pub use builtins::*;
+pub use catalog_service::*;
 pub use core::*;
 #[cfg(feature = "mcp")]
 pub use mcp::*;
