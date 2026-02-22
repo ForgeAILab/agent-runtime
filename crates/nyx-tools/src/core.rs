@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nyx_kernel::{
+use nyx_core::{
     AgentDispatchService, AsyncAgentService, AuthService, ConfigService, ControlPlane, CronService,
     ExtensionRegistry, InvocationContext, KernelError, ProcessService, Service, ServiceId,
     SubAgentService, ToolCatalogService, ToolRuntimeService,
@@ -170,8 +170,8 @@ impl AgentDispatchService for NoopService {
     async fn dispatch(
         &self,
         _ctx: &InvocationContext,
-        _request: nyx_kernel::DispatchRequest,
-    ) -> Result<nyx_kernel::DispatchResponse, KernelError> {
+        _request: nyx_core::DispatchRequest,
+    ) -> Result<nyx_core::DispatchResponse, KernelError> {
         Err(KernelError::ServiceUnavailable(
             "control plane unavailable".to_string(),
         ))
@@ -184,7 +184,7 @@ impl SubAgentService for NoopService {
         &self,
         _ctx: &InvocationContext,
         _prompt: String,
-        _tool_selection: nyx_kernel::ToolSelection,
+        _tool_selection: nyx_core::ToolSelection,
         _max_turns: usize,
     ) -> Result<String, KernelError> {
         Err(KernelError::ServiceUnavailable(
@@ -201,7 +201,7 @@ impl AsyncAgentService for NoopService {
         _id: String,
         _prompt: String,
         _agent_kind: &str,
-        _tool_selection: nyx_kernel::ToolSelection,
+        _tool_selection: nyx_core::ToolSelection,
         _max_turns: usize,
     ) -> Result<String, KernelError> {
         Err(KernelError::ServiceUnavailable(
@@ -209,11 +209,11 @@ impl AsyncAgentService for NoopService {
         ))
     }
 
-    async fn list(&self) -> Result<Vec<nyx_kernel::AgentInfo>, KernelError> {
+    async fn list(&self) -> Result<Vec<nyx_core::AgentInfo>, KernelError> {
         Ok(Vec::new())
     }
 
-    async fn fetch(&self, _id: &str) -> Result<nyx_kernel::AsyncAgentResult, KernelError> {
+    async fn fetch(&self, _id: &str) -> Result<nyx_core::AsyncAgentResult, KernelError> {
         Err(KernelError::ServiceUnavailable(
             "control plane unavailable".to_string(),
         ))
@@ -245,7 +245,7 @@ impl ProcessService for NoopService {
         _ctx: &InvocationContext,
         _id: &str,
         _timeout_ms: u64,
-    ) -> Result<nyx_kernel::ProcessOutput, KernelError> {
+    ) -> Result<nyx_core::ProcessOutput, KernelError> {
         Err(KernelError::ServiceUnavailable(
             "control plane unavailable".to_string(),
         ))
@@ -274,8 +274,8 @@ impl CronService for NoopService {
     async fn add_job(
         &self,
         _ctx: &InvocationContext,
-        _spec: nyx_kernel::JobSpec,
-    ) -> Result<nyx_kernel::JobId, KernelError> {
+        _spec: nyx_core::JobSpec,
+    ) -> Result<nyx_core::JobId, KernelError> {
         Err(KernelError::ServiceUnavailable(
             "control plane unavailable".to_string(),
         ))
@@ -284,7 +284,7 @@ impl CronService for NoopService {
     async fn remove_job(
         &self,
         _ctx: &InvocationContext,
-        _job_id: &nyx_kernel::JobId,
+        _job_id: &nyx_core::JobId,
     ) -> Result<(), KernelError> {
         Err(KernelError::ServiceUnavailable(
             "control plane unavailable".to_string(),
@@ -294,14 +294,14 @@ impl CronService for NoopService {
     async fn list_jobs(
         &self,
         _ctx: &InvocationContext,
-    ) -> Result<Vec<nyx_kernel::JobInfo>, KernelError> {
+    ) -> Result<Vec<nyx_core::JobInfo>, KernelError> {
         Ok(Vec::new())
     }
 
     async fn run_job_now(
         &self,
         _ctx: &InvocationContext,
-        _job_id: &nyx_kernel::JobId,
+        _job_id: &nyx_core::JobId,
     ) -> Result<(), KernelError> {
         Err(KernelError::ServiceUnavailable(
             "control plane unavailable".to_string(),
@@ -328,7 +328,7 @@ impl ToolCatalogService for NoopService {
     async fn list_specs(
         &self,
         _ctx: &InvocationContext,
-        _selection: &nyx_kernel::ToolSelection,
+        _selection: &nyx_core::ToolSelection,
     ) -> Result<Vec<nyx_core::ToolSpec>, KernelError> {
         Ok(Vec::new())
     }
@@ -371,11 +371,11 @@ impl ConfigService for NoopService {
 struct NoopExtensionRegistry;
 
 impl ExtensionRegistry for NoopExtensionRegistry {
-    fn get_job_executor(&self, _kind: &str) -> Option<Arc<dyn nyx_kernel::JobExecutor>> {
+    fn get_job_executor(&self, _kind: &str) -> Option<Arc<dyn nyx_core::JobExecutor>> {
         None
     }
 
-    fn get_hook(&self, _name: &str) -> Option<Arc<dyn nyx_kernel::Hook>> {
+    fn get_hook(&self, _name: &str) -> Option<Arc<dyn nyx_core::Hook>> {
         None
     }
 }

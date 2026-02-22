@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nyx_kernel::ToolSelection;
+use nyx_core::ToolSelection;
 use nyx_security::{Sandbox, SandboxedCommand};
 use serde_json::{Value, json};
 

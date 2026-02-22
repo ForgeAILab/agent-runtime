@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nyx_core::ToolSpec;
-use nyx_kernel::{
+use nyx_core::{
     InvocationContext, KernelError, Service, ServiceDescription, ServiceHealth, ServiceId,
     ToolCatalogService, ToolSelection,
 };

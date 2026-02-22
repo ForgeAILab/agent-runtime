@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use nyx_kernel::ToolSelection;
+use nyx_core::ToolSelection;
 use serde_json::{Value, json};
 
 use crate::{Tool, ToolContext, ToolError, ToolResult, map_kernel_error};
