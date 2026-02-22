@@ -5,8 +5,7 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nyx_core::{
-    AgentDispatchService, ControlPlane, CronService, ExtensionRegistry, InvocationContext,
-    KernelError, Service, ServiceId, ToolCatalogService, ToolRuntimeService,
+    ControlPlane, ExtensionRegistry, InvocationContext, KernelError, Service, ServiceId,
 };
 use nyx_security::{Sandbox, SandboxError};
 use serde::{Deserialize, Serialize};
@@ -155,101 +154,6 @@ impl ToolContextBuilder {
     }
 }
 
-struct NoopService;
-
-#[async_trait]
-impl Service for NoopService {
-    fn service_id(&self) -> ServiceId {
-        ServiceId::new("noop")
-    }
-}
-
-#[async_trait]
-impl AgentDispatchService for NoopService {
-    async fn dispatch(
-        &self,
-        _ctx: &InvocationContext,
-        _request: nyx_core::DispatchRequest,
-    ) -> Result<nyx_core::DispatchResponse, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl CronService for NoopService {
-    async fn add_job(
-        &self,
-        _ctx: &InvocationContext,
-        _spec: nyx_core::JobSpec,
-    ) -> Result<nyx_core::JobId, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-
-    async fn remove_job(
-        &self,
-        _ctx: &InvocationContext,
-        _job_id: &nyx_core::JobId,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-
-    async fn list_jobs(
-        &self,
-        _ctx: &InvocationContext,
-    ) -> Result<Vec<nyx_core::JobInfo>, KernelError> {
-        Ok(Vec::new())
-    }
-
-    async fn run_job_now(
-        &self,
-        _ctx: &InvocationContext,
-        _job_id: &nyx_core::JobId,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl ToolRuntimeService for NoopService {
-    async fn invoke(
-        &self,
-        _ctx: &InvocationContext,
-        _tool_name: &str,
-        _input: Value,
-    ) -> Result<Value, KernelError> {
-        Err(KernelError::ServiceUnavailable(
-            "control plane unavailable".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl ToolCatalogService for NoopService {
-    async fn list_specs(
-        &self,
-        _ctx: &InvocationContext,
-        _selection: &nyx_core::ToolSelection,
-    ) -> Result<Vec<nyx_core::ToolSpec>, KernelError> {
-        Ok(Vec::new())
-    }
-
-    async fn get_spec(
-        &self,
-        _ctx: &InvocationContext,
-        _name: &str,
-    ) -> Result<Option<nyx_core::ToolSpec>, KernelError> {
-        Ok(None)
-    }
-}
-
 struct NoopExtensionRegistry;
 
 impl ExtensionRegistry for NoopExtensionRegistry {
@@ -265,22 +169,6 @@ impl ExtensionRegistry for NoopExtensionRegistry {
 pub struct NoopControlPlane;
 
 impl ControlPlane for NoopControlPlane {
-    fn agent_dispatch(&self) -> Arc<dyn AgentDispatchService> {
-        Arc::new(NoopService)
-    }
-
-    fn cron(&self) -> Arc<dyn CronService> {
-        Arc::new(NoopService)
-    }
-
-    fn tool_runtime(&self) -> Arc<dyn ToolRuntimeService> {
-        Arc::new(NoopService)
-    }
-
-    fn tool_catalog(&self) -> Arc<dyn ToolCatalogService> {
-        Arc::new(NoopService)
-    }
-
     fn extension_registry(&self) -> &dyn ExtensionRegistry {
         static REGISTRY: NoopExtensionRegistry = NoopExtensionRegistry;
         &REGISTRY

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use nyx_core::{ControlPlaneExt, ToolRuntimeService};
 use nyx_security::SandboxedCommand;
 use nyx_workflow::{
     ExecutionStatus, WorkflowEngine, WorkflowError, WorkflowRuntime, WorkflowStore,
@@ -36,7 +37,8 @@ impl WorkflowRuntime for ToolRuntime<'_> {
     async fn invoke_tool(&self, name: &str, args: Value) -> Result<Value, WorkflowError> {
         self.ctx
             .control_plane
-            .tool_runtime()
+            .require_service::<dyn ToolRuntimeService>()
+            .map_err(|err| WorkflowError::Runtime(err.to_string()))?
             .invoke(&self.ctx.invocation, name, args)
             .await
             .map_err(|err| WorkflowError::Runtime(err.to_string()))
