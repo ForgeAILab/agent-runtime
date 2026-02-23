@@ -376,13 +376,27 @@ pub fn cleanup_temp_media(path: &Path) -> Result<(), SecurityError> {
 
 pub mod testing {
     use super::*;
+    use std::sync::Once;
+
+    static NOOP_EXEC_WARNING: Once = Once::new();
 
     #[derive(Debug, Default)]
     pub struct NoopSandbox;
 
     #[async_trait]
     impl Sandbox for NoopSandbox {
-        async fn execute(&self, _cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError> {
+        async fn execute(&self, cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError> {
+            NOOP_EXEC_WARNING.call_once(|| {
+                tracing::warn!(
+                    "NoopSandbox is active: command execution is stubbed and returns empty stdout/stderr"
+                );
+            });
+            tracing::debug!(
+                program = %cmd.program,
+                args = ?cmd.args,
+                cwd = %cmd.working_dir.display(),
+                "NoopSandbox.execute called"
+            );
             Ok(SandboxedOutput::empty_success())
         }
 
