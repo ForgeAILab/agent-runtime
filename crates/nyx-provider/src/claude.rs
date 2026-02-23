@@ -11,7 +11,7 @@ use crate::{
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
-const CLAUDE_COMPLETION_TIMEOUT_SECS: u64 = 90;
+const CLAUDE_COMPLETION_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub struct ClaudeProvider {

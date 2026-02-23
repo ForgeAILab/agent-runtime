@@ -11,6 +11,7 @@ use crate::{
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_COMPLETION_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -115,6 +116,7 @@ impl OpenAiProvider {
             .post(endpoint)
             .bearer_auth(&self.api_key)
             .json(&payload)
+            .timeout(Duration::from_secs(OPENAI_COMPLETION_TIMEOUT_SECS))
             .send()
             .await?;
 
