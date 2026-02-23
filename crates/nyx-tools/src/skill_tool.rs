@@ -92,7 +92,7 @@ impl Tool for SkillTool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use async_trait::async_trait;
     use nyx_core::{
@@ -108,8 +108,9 @@ mod tests {
 
     #[async_trait]
     impl Service for MockSkillService {
-        fn service_id(&self) -> ServiceId {
-            ServiceId::new("skills")
+        fn service_id(&self) -> &ServiceId {
+            static ID: LazyLock<ServiceId> = LazyLock::new(|| ServiceId::new("skills"));
+            &ID
         }
     }
 
