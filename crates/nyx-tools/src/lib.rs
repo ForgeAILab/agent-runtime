@@ -4,6 +4,7 @@ mod core;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod registry;
+mod skill_tool;
 mod terminal;
 pub mod testing;
 #[cfg(feature = "workflow")]
@@ -19,6 +20,7 @@ pub use core::*;
 #[cfg(feature = "mcp")]
 pub use mcp::*;
 pub use registry::*;
+pub use skill_tool::*;
 pub use terminal::*;
 #[cfg(feature = "workflow")]
 pub use workflow::*;
@@ -57,5 +59,6 @@ mod tests {
         assert!(names.contains("shell"), "missing shell tool");
         #[cfg(feature = "http")]
         assert!(names.contains("http"), "missing http tool");
+        assert!(names.contains("skill"), "missing skill tool");
     }
 }

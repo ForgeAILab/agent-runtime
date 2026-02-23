@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use nyx_security::{Sandbox, SandboxedCommand};
 use serde_json::{Value, json};
 
-use crate::{RegistryError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
+use crate::{RegistryError, SkillTool, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 pub fn register_builtins(
     registry: &mut ToolRegistry,
@@ -25,6 +25,8 @@ pub fn register_builtins(
 
     #[cfg(feature = "http")]
     registry.register(Arc::new(HttpTool::default()))?;
+
+    registry.register(Arc::new(SkillTool))?;
 
     Ok(())
 }
@@ -63,6 +65,7 @@ impl Tool for FileReadTool {
         } else {
             path.to_path_buf()
         };
+        let resolved_path = ctx.sandbox.validate_read_path(&resolved_path)?;
         let content = tokio::fs::read_to_string(resolved_path).await?;
         Ok(ToolResult::text(content))
     }
@@ -110,6 +113,7 @@ impl Tool for FileWriteTool {
         } else {
             path.to_path_buf()
         };
+        let resolved_path = ctx.sandbox.validate_write_path(&resolved_path)?;
 
         if let Some(parent) = resolved_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -165,6 +169,7 @@ impl Tool for FileApplyPatchTool {
         } else {
             file_path.to_path_buf()
         };
+        let resolved_path = ctx.sandbox.validate_write_path(&resolved_path)?;
 
         let current = if tokio::fs::try_exists(&resolved_path).await? {
             tokio::fs::read_to_string(&resolved_path).await?
@@ -528,7 +533,8 @@ mod tests {
 
     use async_trait::async_trait;
     use nyx_security::{
-        Sandbox, SandboxError, SandboxedCommand, SandboxedOutput, testing::NoopSandbox,
+        Sandbox, SandboxError, SandboxPolicy, SandboxedCommand, SandboxedOutput,
+        testing::NoopSandbox,
     };
     use serde_json::{Value, json};
     use tempfile::NamedTempFile;
@@ -616,6 +622,65 @@ mod tests {
             .await
             .expect("read works");
         assert_eq!(output.value, Value::String("hello\nnyx\n".to_string()));
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_tool_is_blocked_by_sandbox_policy() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let blocked = outside.path().join("blocked.txt");
+        std::fs::write(&blocked, "secret").expect("write blocked file");
+
+        let policy = SandboxPolicy {
+            allowed_read_paths: vec![],
+            allowed_write_paths: vec![],
+            ..SandboxPolicy::default()
+        };
+        let sandbox =
+            nyx_security::os_sandbox::OsSandbox::new(workspace.path(), policy).expect("sandbox");
+
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(sandbox),
+            workspace_dir: workspace.path().to_path_buf(),
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
+        };
+
+        let err = FileReadTool
+            .invoke(json!({ "path": blocked }), &tool_ctx)
+            .await
+            .expect_err("read should be denied");
+        assert!(matches!(err, ToolError::Sandbox(_)));
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_write_tool_is_blocked_by_sandbox_policy() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let blocked = outside.path().join("blocked.txt");
+
+        let policy = SandboxPolicy {
+            allowed_read_paths: vec![],
+            allowed_write_paths: vec![],
+            ..SandboxPolicy::default()
+        };
+        let sandbox =
+            nyx_security::os_sandbox::OsSandbox::new(workspace.path(), policy).expect("sandbox");
+
+        let tool_ctx = ToolContext {
+            sandbox: Arc::new(sandbox),
+            workspace_dir: workspace.path().to_path_buf(),
+            control_plane: Arc::new(crate::NoopControlPlane),
+            invocation: Default::default(),
+        };
+
+        let err = FileWriteTool
+            .invoke(json!({ "path": blocked, "content": "data" }), &tool_ctx)
+            .await
+            .expect_err("write should be denied");
+        assert!(matches!(err, ToolError::Sandbox(_)));
     }
 
     #[cfg(feature = "file")]

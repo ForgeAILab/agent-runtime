@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nyx_core::BotId;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
@@ -96,10 +97,51 @@ impl SandboxedOutput {
 pub enum SandboxError {
     #[error("path violation for {path:?}; root is {root:?}")]
     PathViolation { path: PathBuf, root: PathBuf },
+    #[error("command denied: {command} ({reason})")]
+    CommandDenied { command: String, reason: String },
+    #[error("command timed out after {limit_secs}s")]
+    Timeout { limit_secs: u64 },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("interactive spawn is not supported by this sandbox")]
     UnsupportedInteractiveSpawn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxPolicy {
+    #[serde(default)]
+    pub command_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub command_denylist: Vec<String>,
+    #[serde(default = "default_allowed_paths")]
+    pub allowed_read_paths: Vec<PathBuf>,
+    #[serde(default = "default_allowed_paths")]
+    pub allowed_write_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+    #[serde(default = "default_max_execution_secs")]
+    pub max_execution_secs: u64,
+}
+
+fn default_allowed_paths() -> Vec<PathBuf> {
+    vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+}
+
+fn default_max_execution_secs() -> u64 {
+    120
+}
+
+impl Default for SandboxPolicy {
+    fn default() -> Self {
+        Self {
+            command_allowlist: None,
+            command_denylist: Vec::new(),
+            allowed_read_paths: default_allowed_paths(),
+            allowed_write_paths: default_allowed_paths(),
+            env_passthrough: Vec::new(),
+            max_execution_secs: default_max_execution_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +213,14 @@ pub trait Sandbox: Send + Sync {
 
     async fn spawn_piped(&self, _cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
         Err(SandboxError::UnsupportedInteractiveSpawn)
+    }
+
+    fn validate_read_path(&self, path: &Path) -> Result<PathBuf, SandboxError> {
+        Ok(path.to_path_buf())
+    }
+
+    fn validate_write_path(&self, path: &Path) -> Result<PathBuf, SandboxError> {
+        Ok(path.to_path_buf())
     }
 }
 

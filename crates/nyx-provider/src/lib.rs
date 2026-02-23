@@ -205,6 +205,9 @@ pub mod testing {
     }
 }
 
+#[cfg(feature = "cost")]
+pub mod cost;
+
 #[cfg(feature = "openai")]
 pub mod openai;
 

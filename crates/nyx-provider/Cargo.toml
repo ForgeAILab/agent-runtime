@@ -8,6 +8,8 @@ default = ["compat"]
 openai = []
 claude = []
 compat = ["openai"]
+cost = ["dep:nyx-obs", "dep:nyx-tools", "dep:time"]
+cost-sqlite = ["cost", "dep:rusqlite", "dep:nyx-store"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -20,8 +22,14 @@ tokio = { workspace = true, features = ["sync"] }
 tokio-stream = "0.1"
 futures-core = "0.3"
 tracing = { workspace = true }
+rusqlite = { version = "0.33", features = ["bundled"], optional = true }
+nyx-store = { path = "../nyx-store", default-features = false, features = ["sqlite"], optional = true }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"], optional = true }
+nyx-obs = { path = "../nyx-obs", optional = true }
+nyx-tools = { path = "../nyx-tools", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
 toml = "0.8"
+tempfile = "3"

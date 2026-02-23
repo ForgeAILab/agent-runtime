@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Sandbox, SecretStore, SecurityError};
+use crate::{Sandbox, SandboxPolicy, SecretStore, SecurityError};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
@@ -13,6 +13,8 @@ pub struct SecurityConfig {
     pub secret_store: String,
     #[serde(default = "default_operators")]
     pub operators: Vec<String>,
+    #[serde(default)]
+    pub policy: SandboxPolicy,
 }
 
 impl Default for SecurityConfig {
@@ -21,6 +23,7 @@ impl Default for SecurityConfig {
             sandbox: default_sandbox_kind(),
             secret_store: default_secret_store_kind(),
             operators: default_operators(),
+            policy: SandboxPolicy::default(),
         }
     }
 }
@@ -43,7 +46,7 @@ pub fn build_sandbox(cfg: &SecurityConfig) -> Result<Arc<dyn Sandbox>, SecurityE
         #[cfg(feature = "os-sandbox")]
         "os" => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            Arc::new(crate::os_sandbox::OsSandbox::new(root)?)
+            Arc::new(crate::os_sandbox::OsSandbox::new(root, cfg.policy.clone())?)
         }
         other => return Err(SecurityError::UnknownKind(other.to_string())),
     };
@@ -69,4 +72,65 @@ pub fn build_secret_store(cfg: &SecurityConfig) -> Result<Arc<dyn SecretStore>, 
 
     tracing::debug!(kind = cfg.secret_store.as_str(), "building secret store");
     Ok(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SecurityConfig;
+
+    #[test]
+    fn deserializes_security_policy_section() {
+        let raw = r#"
+            [security]
+            sandbox = "os"
+            secret_store = "encrypted"
+
+            [security.policy]
+            command_allowlist = ["git", "cargo", "python3"]
+            command_denylist = ["rm", "curl"]
+            allowed_read_paths = ["/usr/share", "/tmp"]
+            allowed_write_paths = ["/tmp/nyx-output"]
+            env_passthrough = ["PATH", "HOME", "RUST_LOG"]
+            max_execution_secs = 60
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Root {
+            security: SecurityConfig,
+        }
+
+        let cfg: Root = toml::from_str(raw).expect("security section should deserialize");
+        assert_eq!(
+            cfg.security.policy.command_allowlist,
+            Some(vec![
+                "git".to_string(),
+                "cargo".to_string(),
+                "python3".to_string()
+            ])
+        );
+        assert_eq!(
+            cfg.security.policy.command_denylist,
+            vec!["rm".to_string(), "curl".to_string()]
+        );
+        assert_eq!(cfg.security.policy.max_execution_secs, 60);
+    }
+
+    #[test]
+    fn missing_policy_uses_defaults() {
+        let raw = r#"
+            [security]
+            sandbox = "os"
+            secret_store = "encrypted"
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Root {
+            security: SecurityConfig,
+        }
+
+        let cfg: Root = toml::from_str(raw).expect("security section should deserialize");
+        assert_eq!(cfg.security.policy.command_allowlist, None);
+        assert!(cfg.security.policy.command_denylist.is_empty());
+        assert_eq!(cfg.security.policy.max_execution_secs, 120);
+    }
 }
