@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -32,7 +33,8 @@ struct McpDiscoveredTool {
 }
 
 #[derive(Debug)]
-struct McpTool {
+pub struct McpTool {
+    server_name: String,
     name: String,
     description: String,
     schema: Value,
@@ -40,43 +42,82 @@ struct McpTool {
     client: reqwest::Client,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct McpBridge {
     client: reqwest::Client,
+    tools_by_server: Arc<DashMap<String, Vec<Arc<dyn Tool>>>>,
+}
+
+impl std::fmt::Debug for McpBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpBridge")
+            .field("servers", &self.tools_by_server.len())
+            .finish()
+    }
 }
 
 impl McpBridge {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
+            tools_by_server: Arc::new(DashMap::new()),
         }
     }
 
-    pub async fn discover_tools(
-        &self,
-        server: &McpServerConfig,
-    ) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+    pub async fn connect(&self, server_name: &str, server_url: &str) -> Result<usize, ToolError> {
         let discovery = self
             .client
-            .get(format!("{}/tools", server.url.trim_end_matches('/')))
+            .get(format!("{}/tools", server_url.trim_end_matches('/')))
             .send()
             .await?
             .json::<McpDiscoveryResponse>()
             .await?;
 
-        Ok(discovery
+        let tools = discovery
             .tools
             .into_iter()
             .map(|tool| {
+                let prefixed_name = format!("mcp__{server_name}__{}", tool.name);
                 Arc::new(McpTool {
-                    name: tool.name,
+                    server_name: server_name.to_string(),
+                    name: prefixed_name,
                     description: tool.description,
                     schema: tool.schema,
                     invoke_url: tool.invoke_url,
                     client: self.client.clone(),
                 }) as Arc<dyn Tool>
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let count = tools.len();
+        self.tools_by_server.insert(server_name.to_string(), tools);
+        Ok(count)
+    }
+
+    pub async fn discover_tools(
+        &self,
+        server: &McpServerConfig,
+    ) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+        self.connect(&server.name, &server.url).await?;
+        Ok(self.tools_for_server(&server.name))
+    }
+
+    pub fn disconnect(&self, server_name: &str) -> bool {
+        self.tools_by_server.remove(server_name).is_some()
+    }
+
+    pub fn tools_for_server(&self, server_name: &str) -> Vec<Arc<dyn Tool>> {
+        self.tools_by_server
+            .get(server_name)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
+    pub fn active_tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut all = Vec::new();
+        for entry in &*self.tools_by_server {
+            all.extend(entry.value().clone());
+        }
+        all
     }
 }
 
@@ -95,6 +136,7 @@ impl Tool for McpTool {
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let _server_name = &self.server_name;
         let resp = self
             .client
             .post(&self.invoke_url)
@@ -109,7 +151,6 @@ pub async fn register_mcp(registry: &mut ToolRegistry, cfg: &McpConfig) -> Resul
     let bridge = McpBridge::new();
 
     for server in &cfg.servers {
-        let _ = &server.name;
         let tools = bridge.discover_tools(server).await?;
 
         registry.register_all(tools).map_err(|err| match err {
@@ -127,7 +168,7 @@ mod tests {
     use serde_json::json;
 
     use super::{McpConfig, McpServerConfig, register_mcp};
-    use crate::{ToolContext, ToolRegistry};
+    use crate::{McpBridge, ToolContext, ToolRegistry};
 
     #[tokio::test]
     async fn mcp_bridge_registers_tools_from_server() {
@@ -172,7 +213,7 @@ mod tests {
         let tools = registry.seal();
         let mcp_tool = tools
             .into_iter()
-            .find(|tool| tool.name() == "mcp_echo")
+            .find(|tool| tool.name() == "mcp__test__mcp_echo")
             .expect("mcp tool exists");
 
         let output = mcp_tool
@@ -180,5 +221,86 @@ mod tests {
             .await
             .expect("invoke mcp tool");
         assert_eq!(output.value, json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_disconnect_removes_server_tools() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo",
+                    "schema": {"type": "object"},
+                    "invoke_url": format!("{}/invoke/echo", server.uri())
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = McpBridge::new();
+        bridge
+            .connect("alpha", &server.uri())
+            .await
+            .expect("connect alpha");
+        assert_eq!(bridge.active_tools().len(), 1);
+        assert!(bridge.disconnect("alpha"));
+        assert!(bridge.active_tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_active_tools_include_all_connected_servers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server_a = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo",
+                    "schema": {"type": "object"},
+                    "invoke_url": format!("{}/invoke/echo", server_a.uri())
+                }]
+            })))
+            .mount(&server_a)
+            .await;
+
+        let server_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [{
+                    "name": "analyze",
+                    "description": "Analyze",
+                    "schema": {"type": "object"},
+                    "invoke_url": format!("{}/invoke/analyze", server_b.uri())
+                }]
+            })))
+            .mount(&server_b)
+            .await;
+
+        let bridge = McpBridge::new();
+        bridge
+            .connect("alpha", &server_a.uri())
+            .await
+            .expect("connect alpha");
+        bridge
+            .connect("beta", &server_b.uri())
+            .await
+            .expect("connect beta");
+
+        let names = bridge
+            .active_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "mcp__alpha__echo"));
+        assert!(names.iter().any(|name| name == "mcp__beta__analyze"));
     }
 }

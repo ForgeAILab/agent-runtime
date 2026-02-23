@@ -41,9 +41,19 @@ fn is_retryable(err: &ProviderError) -> bool {
             true
         }
         ProviderError::InvalidResponse(_) => false,
-        ProviderError::Rejected(_) => false,
+        ProviderError::Rejected(msg) => {
+            // Some providers map non-2xx into Rejected("<status> <body>"), e.g.
+            // "500 Internal Server Error ...". Treat 429/5xx as transient.
+            parse_status_code(msg)
+                .map(|code| code == 429 || code >= 500)
+                .unwrap_or(false)
+        }
         ProviderError::StreamingUnsupported => false,
     }
+}
+
+fn parse_status_code(msg: &str) -> Option<u16> {
+    msg.split_whitespace().next()?.parse().ok()
 }
 
 #[async_trait]
@@ -189,6 +199,60 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(err, ProviderError::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn rejected_500_is_retried() {
+        struct Rejected500ThenOk {
+            calls: AtomicU32,
+            then: Arc<dyn LlmProvider>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for Rejected500ThenOk {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                let call_no = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_no == 0 {
+                    Err(ProviderError::Rejected(
+                        "500 Internal Server Error".to_string(),
+                    ))
+                } else {
+                    self.then.complete(req).await
+                }
+            }
+
+            async fn stream(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionStream, ProviderError> {
+                self.then.stream(req).await
+            }
+
+            async fn health_check(&self) -> bool {
+                self.then.health_check().await
+            }
+        }
+
+        let inner = Rejected500ThenOk {
+            calls: AtomicU32::new(0),
+            then: Arc::new(EchoProvider),
+        };
+        let provider = RetryProvider::new(
+            Arc::new(inner),
+            &RetryConfig {
+                max_attempts: 2,
+                initial_backoff_ms: 0,
+            },
+        );
+
+        let resp = provider
+            .complete(simple_req())
+            .await
+            .expect("retry should succeed");
+        assert_eq!(resp.content, "hi");
     }
 
     #[tokio::test]
