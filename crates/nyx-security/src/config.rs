@@ -42,7 +42,12 @@ pub fn default_operators() -> Vec<String> {
 
 pub fn build_sandbox(cfg: &SecurityConfig) -> Result<Arc<dyn Sandbox>, SecurityError> {
     let sandbox: Arc<dyn Sandbox> = match cfg.sandbox.as_str() {
-        "noop" => Arc::new(crate::testing::NoopSandbox),
+        "noop" => {
+            tracing::warn!(
+                "security.sandbox=noop configured; shell/file tools will report empty outputs"
+            );
+            Arc::new(crate::testing::NoopSandbox)
+        }
         #[cfg(feature = "os-sandbox")]
         "os" => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
