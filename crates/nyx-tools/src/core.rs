@@ -47,48 +47,6 @@ impl ToolResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SchedulerIdentity {
-    pub user_id: String,
-    pub adapter_id: String,
-}
-
-impl SchedulerIdentity {
-    pub fn new() -> Self {
-        Self {
-            user_id: "scheduler".to_string(),
-            adapter_id: "scheduler".to_string(),
-        }
-    }
-}
-
-impl Default for SchedulerIdentity {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DispatchRequest {
-    Isolated {
-        job_id: String,
-        prompt: String,
-        linked_channel_id: Option<String>,
-        announce: bool,
-    },
-    Queued {
-        channel_id: String,
-        prompt: String,
-        sender: SchedulerIdentity,
-    },
-    Heartbeat {
-        session_key: Option<String>,
-        prompt: String,
-        internal_only: bool,
-        dedupe_window_secs: u64,
-    },
-}
-
 pub struct ToolContext {
     pub sandbox: Arc<dyn Sandbox>,
     pub workspace_dir: PathBuf,
