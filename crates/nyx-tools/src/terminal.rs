@@ -301,5 +301,4 @@ mod tests {
         let status = registry.status("done").await.expect("status works");
         assert!(matches!(status, TerminalStatus::Exited { .. }));
     }
-
 }

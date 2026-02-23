@@ -650,5 +650,4 @@ mod tests {
         assert_eq!(output.value["stdout"], "ok");
         assert_eq!(spy.executions.load(Ordering::Relaxed), 1);
     }
-
 }
