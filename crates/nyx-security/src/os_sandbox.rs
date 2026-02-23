@@ -23,26 +23,6 @@ impl OsSandbox {
         Ok(Self { root_dir, policy })
     }
 
-    fn ensure_within_root(&self, path: &Path, base_dir: &Path) -> Result<PathBuf, SandboxError> {
-        let resolved = if path.is_absolute() {
-            normalize(path)
-        } else {
-            normalize(base_dir.join(path))
-        };
-
-        // Canonicalize to resolve symlinks (e.g. /var -> /private/var on macOS)
-        let canonical = std::fs::canonicalize(&resolved).unwrap_or(resolved);
-
-        if canonical.starts_with(&self.root_dir) {
-            Ok(canonical)
-        } else {
-            Err(SandboxError::PathViolation {
-                path: canonical,
-                root: self.root_dir.clone(),
-            })
-        }
-    }
-
     fn policy_roots<'a>(&'a self, configured: &'a [PathBuf]) -> Vec<PathBuf> {
         let mut roots = Vec::with_capacity(configured.len() + 1);
         roots.push(self.root_dir.clone());
@@ -118,6 +98,21 @@ impl OsSandbox {
                 root: self.root_dir.clone(),
             })
         }
+    }
+
+    fn merged_allowed_paths(&self) -> Vec<PathBuf> {
+        let mut merged = self.policy.allowed_read_paths.clone();
+        merged.extend(self.policy.allowed_write_paths.clone());
+        merged
+    }
+
+    fn validate_command_path(&self, path: &Path, base_dir: &Path) -> Result<PathBuf, SandboxError> {
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        };
+        self.validate_policy_path(&resolved, &self.merged_allowed_paths())
     }
 
     fn program_basename(program: &str) -> String {
@@ -248,9 +243,9 @@ impl Sandbox for OsSandbox {
     async fn execute(&self, cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError> {
         self.enforce_command_policy(&cmd)?;
 
-        let working_dir = self.ensure_within_root(&cmd.working_dir, &self.root_dir)?;
+        let working_dir = self.validate_command_path(&cmd.working_dir, &self.root_dir)?;
         for tracked in &cmd.tracked_paths {
-            self.ensure_within_root(tracked, &working_dir)?;
+            self.validate_command_path(tracked, &working_dir)?;
         }
 
         let mut command = self.build_command(&cmd, working_dir);
@@ -286,9 +281,9 @@ impl Sandbox for OsSandbox {
     async fn spawn_piped(&self, cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
         self.enforce_command_policy(&cmd)?;
 
-        let working_dir = self.ensure_within_root(&cmd.working_dir, &self.root_dir)?;
+        let working_dir = self.validate_command_path(&cmd.working_dir, &self.root_dir)?;
         for tracked in &cmd.tracked_paths {
-            self.ensure_within_root(tracked, &working_dir)?;
+            self.validate_command_path(tracked, &working_dir)?;
         }
 
         let mut command = self.build_command(&cmd, working_dir);
@@ -499,5 +494,29 @@ mod tests {
             .expect_err("command should time out");
 
         assert!(matches!(err, SandboxError::Timeout { limit_secs: 1 }));
+    }
+
+    #[tokio::test]
+    async fn working_directory_can_be_outside_root_when_allowed_by_policy() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let allowed = tempfile::tempdir().expect("allowed temp dir");
+        let policy = SandboxPolicy {
+            allowed_read_paths: vec![allowed.path().to_path_buf()],
+            allowed_write_paths: vec![allowed.path().to_path_buf()],
+            ..SandboxPolicy::default()
+        };
+        let sandbox = sandbox_with_policy(root.path(), policy);
+
+        let output = sandbox
+            .execute(
+                SandboxedCommand::new("sh")
+                    .arg("-lc")
+                    .arg("pwd")
+                    .working_dir(allowed.path()),
+            )
+            .await
+            .expect("allowed working directory should execute");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&allowed.path().display().to_string()));
     }
 }

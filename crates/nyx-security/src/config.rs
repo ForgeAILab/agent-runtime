@@ -1,9 +1,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
-use crate::{Sandbox, SandboxPolicy, SecretStore, SecurityError};
+use crate::{
+    Sandbox, SandboxError, SandboxPolicy, SandboxedChild, SandboxedCommand, SandboxedOutput,
+    SecretStore, SecurityError,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
@@ -42,6 +47,10 @@ pub fn default_operators() -> Vec<String> {
 
 pub fn build_sandbox(cfg: &SecurityConfig) -> Result<Arc<dyn Sandbox>, SecurityError> {
     let sandbox: Arc<dyn Sandbox> = match cfg.sandbox.as_str() {
+        "none" => {
+            tracing::warn!("security.sandbox=none configured; sandbox protections are disabled");
+            Arc::new(NoSandbox)
+        }
         "noop" => {
             tracing::warn!(
                 "security.sandbox=noop configured; shell/file tools will report empty outputs"
@@ -77,6 +86,56 @@ pub fn build_secret_store(cfg: &SecurityConfig) -> Result<Arc<dyn SecretStore>, 
 
     tracing::debug!(kind = cfg.secret_store.as_str(), "building secret store");
     Ok(store)
+}
+
+#[derive(Debug, Default)]
+struct NoSandbox;
+
+#[async_trait]
+impl Sandbox for NoSandbox {
+    async fn execute(&self, cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError> {
+        let mut command = Command::new(&cmd.program);
+        command.args(&cmd.args);
+        command.current_dir(&cmd.working_dir);
+        command.envs(&cmd.env);
+        let output = command.output().await?;
+        Ok(SandboxedOutput {
+            status: output.status.code().unwrap_or_default(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    async fn spawn_piped(&self, cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
+        let mut command = Command::new(&cmd.program);
+        command.args(&cmd.args);
+        command.current_dir(&cmd.working_dir);
+        command.envs(&cmd.env);
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(SandboxError::UnsupportedInteractiveSpawn)?;
+
+        Ok(SandboxedChild {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +196,22 @@ mod tests {
         assert_eq!(cfg.security.policy.command_allowlist, None);
         assert!(cfg.security.policy.command_denylist.is_empty());
         assert_eq!(cfg.security.policy.max_execution_secs, 120);
+    }
+
+    #[test]
+    fn accepts_none_sandbox_kind() {
+        let raw = r#"
+            [security]
+            sandbox = "none"
+            secret_store = "encrypted"
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Root {
+            security: SecurityConfig,
+        }
+
+        let cfg: Root = toml::from_str(raw).expect("security section should deserialize");
+        assert_eq!(cfg.security.sandbox, "none");
     }
 }
