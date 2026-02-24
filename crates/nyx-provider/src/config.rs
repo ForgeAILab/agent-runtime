@@ -40,8 +40,6 @@ pub struct ProviderConfig {
     pub kind: String,
     #[serde(default = "default_provider_model")]
     pub model: String,
-    #[serde(default)]
-    pub default: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<Secret<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,31 +55,11 @@ impl Default for ProviderConfig {
         Self {
             kind: default_provider_kind(),
             model: default_provider_model(),
-            default: false,
             api_key: None,
             api_key_env: None,
             base_url: None,
             retry: RetryConfig::default(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct ProvidersConfig(pub Vec<ProviderConfig>);
-
-impl ProvidersConfig {
-    pub fn into_vec(self) -> Vec<ProviderConfig> {
-        self.0
-    }
-
-    pub fn default_model(&self) -> &str {
-        self.0
-            .iter()
-            .find(|cfg| cfg.default)
-            .or_else(|| self.0.first())
-            .map(|cfg| cfg.model.as_str())
-            .unwrap_or("echo-default")
     }
 }
 
@@ -348,8 +326,7 @@ pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider,
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderConfig, ProvidersConfig, build_provider, build_provider_chain};
-    use serde::Deserialize;
+    use super::{ProviderConfig, build_provider, build_provider_chain};
 
     #[test]
     fn provider_config_deserializes_from_toml() {
@@ -377,10 +354,7 @@ base_url = "http://localhost:11434/v1"
         };
 
         let encoded = toml::to_string(&cfg).expect("provider config should serialize");
-        assert_eq!(
-            encoded.trim(),
-            "kind = \"zai\"\nmodel = \"glm-5\"\ndefault = false",
-        );
+        assert_eq!(encoded.trim(), "kind = \"zai\"\nmodel = \"glm-5\"",);
     }
 
     #[test]
@@ -409,31 +383,6 @@ base_url = "http://localhost:11434/v1"
     }
 
     #[test]
-    fn providers_config_deserializes_from_toml_array() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            providers: ProvidersConfig,
-        }
-
-        let cfgs: Wrapper = toml::from_str(
-            r#"
-[[providers]]
-kind = "echo"
-model = "m1"
-
-[[providers]]
-kind = "echo"
-model = "m2"
-"#,
-        )
-        .expect("providers config should deserialize");
-
-        assert_eq!(cfgs.providers.0.len(), 2);
-        assert_eq!(cfgs.providers.0[0].model, "m1");
-        assert_eq!(cfgs.providers.0[1].model, "m2");
-    }
-
-    #[test]
     fn build_provider_chain_rejects_empty_slice() {
         let err = match build_provider_chain(&[]) {
             Ok(_) => panic!("empty chain must fail"),
@@ -453,38 +402,5 @@ model = "m2"
         };
         let chain = build_provider_chain(&[cfg]).expect("single-entry chain should build");
         assert_eq!(chain.len(), 1);
-    }
-
-    #[test]
-    fn providers_config_default_model_prefers_marked_default() {
-        let cfgs = ProvidersConfig(vec![
-            ProviderConfig {
-                model: "m1".to_string(),
-                ..Default::default()
-            },
-            ProviderConfig {
-                model: "m2".to_string(),
-                default: true,
-                ..Default::default()
-            },
-        ]);
-
-        assert_eq!(cfgs.default_model(), "m2");
-    }
-
-    #[test]
-    fn providers_config_default_model_falls_back_to_first() {
-        let cfgs = ProvidersConfig(vec![
-            ProviderConfig {
-                model: "m1".to_string(),
-                ..Default::default()
-            },
-            ProviderConfig {
-                model: "m2".to_string(),
-                ..Default::default()
-            },
-        ]);
-
-        assert_eq!(cfgs.default_model(), "m1");
     }
 }
