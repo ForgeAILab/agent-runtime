@@ -125,6 +125,7 @@ mod tests {
                 description: "Scaffold and author plugin tools".to_string(),
                 version: "0.1.0".to_string(),
                 eligible: true,
+                location: "/skills/nyx-plugin/SKILL.md".to_string(),
             }])
         }
 
