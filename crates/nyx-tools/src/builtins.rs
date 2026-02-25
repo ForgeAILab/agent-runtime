@@ -1,17 +1,26 @@
+#[cfg(feature = "terminal")]
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "shell")]
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nyx_security::{Sandbox, SandboxedCommand};
 use serde_json::{Value, json};
 
+#[cfg(feature = "terminal")]
+use crate::TerminalRegistry;
 use crate::{RegistryError, SkillTool, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 pub fn register_builtins(
     registry: &mut ToolRegistry,
     sandbox: Arc<dyn Sandbox>,
+    #[cfg(feature = "terminal")] terminal_registry: Arc<TerminalRegistry>,
 ) -> Result<(), RegistryError> {
     let _ = sandbox;
+    #[cfg(feature = "terminal")]
+    let _ = terminal_registry;
 
     #[cfg(feature = "file")]
     {
@@ -22,6 +31,20 @@ pub fn register_builtins(
 
     #[cfg(feature = "shell")]
     registry.register(Arc::new(ShellTool))?;
+
+    #[cfg(feature = "terminal")]
+    {
+        registry.register(Arc::new(ProcessStartTool::new(Arc::clone(
+            &terminal_registry,
+        ))))?;
+        registry.register(Arc::new(ProcessReadTool::new(Arc::clone(
+            &terminal_registry,
+        ))))?;
+        registry.register(Arc::new(ProcessKillTool::new(Arc::clone(
+            &terminal_registry,
+        ))))?;
+        registry.register(Arc::new(ProcessListTool::new(terminal_registry)))?;
+    }
 
     #[cfg(feature = "http")]
     registry.register(Arc::new(HttpTool::default()))?;
@@ -203,7 +226,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command inside sandbox"
+        "Execute a short shell command (15s limit). Use process_start for long-running tasks."
     }
 
     fn schema(&self) -> Value {
@@ -232,13 +255,258 @@ impl Tool for ShellTool {
             .arg("-lc")
             .arg(command_text.to_string());
         command = command.working_dir(pwd);
-        let output = ctx.sandbox.execute(command).await?;
+        let output = match tokio::time::timeout(
+            Duration::from_secs(15),
+            ctx.sandbox.execute(command),
+        )
+        .await
+        {
+            Ok(output) => output?,
+            Err(_) => {
+                return Ok(ToolResult::error(
+                    "shell command timed out after 15 seconds; use process_start for long-running tasks",
+                ));
+            }
+        };
 
         Ok(ToolResult::json(json!({
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr),
             "exit_code": output.status,
         })))
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[derive(Debug, Clone)]
+pub struct ProcessStartTool {
+    terminal_registry: Arc<TerminalRegistry>,
+}
+
+#[cfg(feature = "terminal")]
+impl ProcessStartTool {
+    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
+        Self { terminal_registry }
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[async_trait]
+impl Tool for ProcessStartTool {
+    fn name(&self) -> &str {
+        "process_start"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn a background process"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["id", "command"],
+            "properties": {
+                "id": { "type": "string" },
+                "command": { "type": "string" },
+                "interactive": { "type": "boolean", "default": false }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let id = input
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+        let command = input
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("missing command".to_string()))?;
+        let interactive = input
+            .get("interactive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        self.terminal_registry
+            .spawn(id, command, ctx, HashMap::new(), interactive)
+            .await?;
+
+        Ok(ToolResult::json(json!({
+            "id": id,
+            "status": "started",
+            "interactive": interactive,
+        })))
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[derive(Debug, Clone)]
+pub struct ProcessReadTool {
+    terminal_registry: Arc<TerminalRegistry>,
+}
+
+#[cfg(feature = "terminal")]
+impl ProcessReadTool {
+    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
+        Self { terminal_registry }
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[async_trait]
+impl Tool for ProcessReadTool {
+    fn name(&self) -> &str {
+        "process_read"
+    }
+
+    fn description(&self) -> &str {
+        "Read stdout/stderr from a running process"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string" },
+                "timeout_ms": { "type": "integer", "minimum": 0 }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let id = input
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+        let timeout_ms = input
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(250);
+
+        let output = self.terminal_registry.read(id, timeout_ms).await?;
+        let status = self.terminal_registry.status(id).await?;
+
+        Ok(ToolResult::json(json!({
+            "id": id,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "status": terminal_status_json(status),
+        })))
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[derive(Debug, Clone)]
+pub struct ProcessKillTool {
+    terminal_registry: Arc<TerminalRegistry>,
+}
+
+#[cfg(feature = "terminal")]
+impl ProcessKillTool {
+    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
+        Self { terminal_registry }
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[async_trait]
+impl Tool for ProcessKillTool {
+    fn name(&self) -> &str {
+        "process_kill"
+    }
+
+    fn description(&self) -> &str {
+        "Terminate a process"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string" }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let id = input
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+        self.terminal_registry.kill(id).await?;
+
+        Ok(ToolResult::json(json!({
+            "id": id,
+            "status": "killed",
+        })))
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[derive(Debug, Clone)]
+pub struct ProcessListTool {
+    terminal_registry: Arc<TerminalRegistry>,
+}
+
+#[cfg(feature = "terminal")]
+impl ProcessListTool {
+    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
+        Self { terminal_registry }
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[async_trait]
+impl Tool for ProcessListTool {
+    fn name(&self) -> &str {
+        "process_list"
+    }
+
+    fn description(&self) -> &str {
+        "List all processes with status"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let sessions = self
+            .terminal_registry
+            .list()
+            .await
+            .into_iter()
+            .map(|session| {
+                json!({
+                    "id": session.id,
+                    "interactive": session.interactive,
+                    "status": terminal_status_json(session.status),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ToolResult::json(json!({
+            "processes": sessions,
+        })))
+    }
+}
+
+#[cfg(feature = "terminal")]
+fn terminal_status_json(status: crate::TerminalStatus) -> Value {
+    match status {
+        crate::TerminalStatus::Running { pid } => json!({
+            "state": "running",
+            "pid": pid,
+        }),
+        crate::TerminalStatus::Exited { exit_code } => json!({
+            "state": "exited",
+            "exit_code": exit_code,
+        }),
     }
 }
 
@@ -543,6 +811,10 @@ mod tests {
     use crate::ShellTool;
     #[cfg(feature = "file")]
     use crate::{FileApplyPatchTool, FileReadTool, FileWriteTool};
+    #[cfg(feature = "terminal")]
+    use crate::{
+        ProcessKillTool, ProcessListTool, ProcessReadTool, ProcessStartTool, TerminalRegistry,
+    };
     use crate::{Tool, ToolContext, ToolError};
 
     #[derive(Default)]
@@ -571,6 +843,12 @@ mod tests {
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
         }
+    }
+
+    fn unique_id(prefix: &str) -> String {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{n}")
     }
 
     #[cfg(feature = "file")]
@@ -714,5 +992,141 @@ mod tests {
 
         assert_eq!(output.value["stdout"], "ok");
         assert_eq!(spy.executions.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn process_start_tool_spawns_process() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let tool = ProcessStartTool::new(Arc::clone(&registry));
+        let tool_ctx = ToolContext::default();
+        let id = unique_id("proc-start");
+
+        let output = tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "command": "cat",
+                    "interactive": true
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("process_start should succeed");
+
+        assert_eq!(output.value["status"], "started");
+        registry
+            .kill(output.value["id"].as_str().expect("string id"))
+            .await
+            .expect("kill process");
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn process_read_tool_reads_output() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
+        let read_tool = ProcessReadTool::new(Arc::clone(&registry));
+        let tool_ctx = ToolContext::default();
+        let id = unique_id("proc-read");
+
+        start_tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "command": "printf 'hello-process\\n'"
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("start process");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let output = read_tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "timeout_ms": 500
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("read process output");
+
+        assert!(
+            output.value["stdout"]
+                .as_str()
+                .expect("stdout string")
+                .contains("hello-process")
+        );
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn process_kill_tool_stops_process() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
+        let kill_tool = ProcessKillTool::new(Arc::clone(&registry));
+        let tool_ctx = ToolContext::default();
+        let id = unique_id("proc-kill");
+
+        start_tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "command": "cat",
+                    "interactive": true
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("start process");
+
+        kill_tool
+            .invoke(json!({ "id": id }), &tool_ctx)
+            .await
+            .expect("kill process");
+
+        let status = registry.status(&id).await.expect("status after kill");
+        assert!(matches!(status, crate::TerminalStatus::Exited { .. }));
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn process_list_tool_returns_active_processes() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
+        let list_tool = ProcessListTool::new(Arc::clone(&registry));
+        let tool_ctx = ToolContext::default();
+        let id = unique_id("proc-list");
+
+        start_tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "command": "cat",
+                    "interactive": true
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("start process");
+
+        let output = list_tool
+            .invoke(json!({}), &tool_ctx)
+            .await
+            .expect("list processes");
+
+        let processes = output.value["processes"]
+            .as_array()
+            .expect("process list array");
+        assert!(
+            processes
+                .iter()
+                .any(|entry| entry["id"].as_str() == Some(id.as_str()))
+        );
+
+        registry.kill(&id).await.expect("kill process");
     }
 }

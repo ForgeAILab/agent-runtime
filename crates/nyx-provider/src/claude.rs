@@ -214,12 +214,15 @@ fn provider_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestCon
                 }
             }
             ProviderContent::Image { url, .. } => {
-                blocks.push(ClaudeRequestBlock::Image {
-                    source: ClaudeImageSource {
-                        kind: "url".to_string(),
-                        url,
-                    },
-                });
+                if let Some((media_type, data)) = parse_data_uri(&url) {
+                    blocks.push(ClaudeRequestBlock::Image {
+                        source: ClaudeImageSource::Base64 { media_type, data },
+                    });
+                } else {
+                    blocks.push(ClaudeRequestBlock::Image {
+                        source: ClaudeImageSource::Url { url },
+                    });
+                }
             }
         }
     }
@@ -231,6 +234,16 @@ fn provider_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestCon
     }
 
     ClaudeRequestContent::Blocks(blocks)
+}
+
+fn parse_data_uri(value: &str) -> Option<(String, String)> {
+    let encoded = value.strip_prefix("data:")?;
+    let (meta, data) = encoded.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type.to_string(), data.to_string()))
 }
 
 #[async_trait]
@@ -318,10 +331,10 @@ enum ClaudeRequestBlock {
 }
 
 #[derive(Debug, Serialize)]
-struct ClaudeImageSource {
-    #[serde(rename = "type")]
-    kind: String,
-    url: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClaudeImageSource {
+    Url { url: String },
+    Base64 { media_type: String, data: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -432,6 +445,60 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(response.content, "A cat.");
+    }
+
+    #[tokio::test]
+    async fn claude_serializes_data_uri_as_base64_image_block() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "claude-3-5-sonnet".to_string(),
+            messages: vec![crate::ProviderMessage {
+                role: crate::ProviderRole::User,
+                content: vec![crate::ProviderContent::Image {
+                    url: "data:image/png;base64,QUJD".to_string(),
+                    detail: None,
+                }],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            max_tokens: Some(256),
+            temperature: None,
+            thinking_tokens: None,
+        };
+
+        let expected = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 256,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "QUJD"
+                    }
+                }]
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(body_json(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "claude-3-5-sonnet",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = ClaudeProvider::new("test-key").with_base_url(server.uri());
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.content, "ok");
     }
 
     #[tokio::test]

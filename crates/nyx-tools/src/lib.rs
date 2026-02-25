@@ -27,6 +27,9 @@ pub use workflow::*;
 
 pub fn build_tools(sandbox: Arc<dyn Sandbox>) -> Result<Vec<Arc<dyn Tool>>, RegistryError> {
     let mut registry = ToolRegistry::new();
+    #[cfg(feature = "terminal")]
+    register_builtins(&mut registry, sandbox, Arc::new(TerminalRegistry::new()))?;
+    #[cfg(not(feature = "terminal"))]
     register_builtins(&mut registry, sandbox)?;
     Ok(registry.seal())
 }
@@ -57,6 +60,11 @@ mod tests {
         assert!(names.contains("read"), "missing read tool");
         #[cfg(feature = "shell")]
         assert!(names.contains("shell"), "missing shell tool");
+        #[cfg(feature = "terminal")]
+        assert!(
+            names.contains("process_start"),
+            "missing process_start tool"
+        );
         #[cfg(feature = "http")]
         assert!(names.contains("http"), "missing http tool");
         assert!(names.contains("skill"), "missing skill tool");
