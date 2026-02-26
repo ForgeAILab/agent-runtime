@@ -26,7 +26,7 @@ impl Tool for SubAgentTool {
                 "action": { "type": "string", "enum": ["spawn", "list", "get", "kill"] },
                 "id": { "type": "string" },
                 "prompt": { "type": "string" },
-                "blocking": { "type": "boolean", "default": true },
+                "blocking": { "type": "boolean", "default": false },
                 "tools": { "type": "array", "items": { "type": "string" } },
                 "max_turns": { "type": "integer", "default": 10 },
                 "agent_kind": { "type": "string", "default": "react" },
@@ -88,7 +88,7 @@ async fn invoke_spawn(
     let blocking = input
         .get("blocking")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
     let max_turns = parse_max_turns(&input)?;
     let tools = parse_tools(&input)?;
     let agent_kind = input
