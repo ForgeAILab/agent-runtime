@@ -40,6 +40,9 @@ pub fn register_builtins(
         registry.register(Arc::new(ProcessReadTool::new(Arc::clone(
             &terminal_registry,
         ))))?;
+        registry.register(Arc::new(ProcessWaitTool::new(Arc::clone(
+            &terminal_registry,
+        ))))?;
         registry.register(Arc::new(ProcessKillTool::new(Arc::clone(
             &terminal_registry,
         ))))?;
@@ -360,7 +363,7 @@ impl Tool for ProcessReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read stdout/stderr from a running process"
+        "Read currently available stdout/stderr and status from a process (non-blocking)"
     }
 
     fn schema(&self) -> Value {
@@ -369,7 +372,64 @@ impl Tool for ProcessReadTool {
             "required": ["id"],
             "properties": {
                 "id": { "type": "string" },
-                "timeout_ms": { "type": "integer", "minimum": 0 }
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Deprecated: process_read is non-blocking. Use process_wait to block."
+                }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let id = input
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+        let _ = input.get("timeout_ms");
+        let output = self.terminal_registry.read(id, 0).await?;
+        let status = self.terminal_registry.status(id).await?;
+
+        Ok(ToolResult::json(json!({
+            "id": id,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "status": terminal_status_json(status),
+        })))
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[derive(Debug, Clone)]
+pub struct ProcessWaitTool {
+    terminal_registry: Arc<TerminalRegistry>,
+}
+
+#[cfg(feature = "terminal")]
+impl ProcessWaitTool {
+    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
+        Self { terminal_registry }
+    }
+}
+
+#[cfg(feature = "terminal")]
+#[async_trait]
+impl Tool for ProcessWaitTool {
+    fn name(&self) -> &str {
+        "process_wait"
+    }
+
+    fn description(&self) -> &str {
+        "Wait for a process to exit (or timeout), then return output and status"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string" },
+                "timeout_ms": { "type": "integer", "minimum": 0, "default": 30000 }
             }
         })
     }
@@ -382,16 +442,19 @@ impl Tool for ProcessReadTool {
         let timeout_ms = input
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(250);
+            .unwrap_or(30_000);
 
-        let output = self.terminal_registry.read(id, timeout_ms).await?;
-        let status = self.terminal_registry.status(id).await?;
+        let (status, timed_out) = self.terminal_registry.wait(id, timeout_ms).await?;
+        let output = self.terminal_registry.read(id, 0).await?;
+        let completed = matches!(status, crate::TerminalStatus::Exited { .. });
 
         Ok(ToolResult::json(json!({
             "id": id,
             "stdout": output.stdout,
             "stderr": output.stderr,
             "status": terminal_status_json(status),
+            "completed": completed,
+            "timed_out": timed_out,
         })))
     }
 }
@@ -813,7 +876,8 @@ mod tests {
     use crate::{FileApplyPatchTool, FileReadTool, FileWriteTool};
     #[cfg(feature = "terminal")]
     use crate::{
-        ProcessKillTool, ProcessListTool, ProcessReadTool, ProcessStartTool, TerminalRegistry,
+        ProcessKillTool, ProcessListTool, ProcessReadTool, ProcessStartTool, ProcessWaitTool,
+        TerminalRegistry,
     };
     use crate::{Tool, ToolContext, ToolError};
 
@@ -1090,6 +1154,48 @@ mod tests {
 
         let status = registry.status(&id).await.expect("status after kill");
         assert!(matches!(status, crate::TerminalStatus::Exited { .. }));
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn process_wait_tool_waits_for_completion() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
+        let wait_tool = ProcessWaitTool::new(Arc::clone(&registry));
+        let tool_ctx = ToolContext::default();
+        let id = unique_id("proc-wait");
+
+        start_tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "command": "sleep 0.05; printf done"
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("start process");
+
+        let output = wait_tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "timeout_ms": 500
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("wait should succeed");
+
+        assert_eq!(output.value["completed"], true);
+        assert_eq!(output.value["timed_out"], false);
+        assert_eq!(output.value["status"]["state"], "exited");
+        assert!(
+            output.value["stdout"]
+                .as_str()
+                .expect("stdout string")
+                .contains("done")
+        );
     }
 
     #[cfg(feature = "terminal")]

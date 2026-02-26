@@ -177,6 +177,57 @@ impl TerminalRegistry {
         }
     }
 
+    pub async fn wait(
+        &self,
+        id: &str,
+        timeout_ms: u64,
+    ) -> Result<(TerminalStatus, bool), TerminalError> {
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| TerminalError::NotFound { id: id.to_string() })?
+            .clone();
+
+        let mut child = session.child.lock().await;
+        if timeout_ms == 0 {
+            return match child.try_wait()? {
+                Some(status) => Ok((
+                    TerminalStatus::Exited {
+                        exit_code: status.code().unwrap_or(-1),
+                    },
+                    false,
+                )),
+                None => Ok((
+                    TerminalStatus::Running {
+                        pid: child.id().unwrap_or_default(),
+                    },
+                    true,
+                )),
+            };
+        }
+
+        match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+            Ok(Ok(status)) => Ok((
+                TerminalStatus::Exited {
+                    exit_code: status.code().unwrap_or(-1),
+                },
+                false,
+            )),
+            Ok(Err(err)) => Err(TerminalError::Io(err)),
+            Err(_) => {
+                let status = match child.try_wait()? {
+                    Some(status) => TerminalStatus::Exited {
+                        exit_code: status.code().unwrap_or(-1),
+                    },
+                    None => TerminalStatus::Running {
+                        pid: child.id().unwrap_or_default(),
+                    },
+                };
+                Ok((status, true))
+            }
+        }
+    }
+
     pub async fn list(&self) -> Vec<TerminalInfo> {
         let ids = self
             .sessions

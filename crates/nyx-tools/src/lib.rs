@@ -65,6 +65,8 @@ mod tests {
             names.contains("process_start"),
             "missing process_start tool"
         );
+        #[cfg(feature = "terminal")]
+        assert!(names.contains("process_wait"), "missing process_wait tool");
         #[cfg(feature = "http")]
         assert!(names.contains("http"), "missing http tool");
         assert!(names.contains("skill"), "missing skill tool");
