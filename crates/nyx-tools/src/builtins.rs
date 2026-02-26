@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use nyx_security::{Sandbox, SandboxedCommand};
 use serde_json::{Value, json};
 
+#[cfg(feature = "sub-agent")]
+use crate::SubAgentTool;
 #[cfg(feature = "terminal")]
 use crate::TerminalRegistry;
 use crate::{RegistryError, SkillTool, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
@@ -53,6 +55,8 @@ pub fn register_builtins(
     registry.register(Arc::new(HttpTool::default()))?;
 
     registry.register(Arc::new(SkillTool))?;
+    #[cfg(feature = "sub-agent")]
+    registry.register(Arc::new(SubAgentTool))?;
 
     Ok(())
 }

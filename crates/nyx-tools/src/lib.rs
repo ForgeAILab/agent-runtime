@@ -5,6 +5,8 @@ mod core;
 mod mcp;
 mod registry;
 mod skill_tool;
+#[cfg(feature = "sub-agent")]
+mod sub_agent_tool;
 mod terminal;
 pub mod testing;
 #[cfg(feature = "workflow")]
@@ -21,6 +23,8 @@ pub use core::*;
 pub use mcp::*;
 pub use registry::*;
 pub use skill_tool::*;
+#[cfg(feature = "sub-agent")]
+pub use sub_agent_tool::*;
 pub use terminal::*;
 #[cfg(feature = "workflow")]
 pub use workflow::*;
@@ -70,5 +74,7 @@ mod tests {
         #[cfg(feature = "http")]
         assert!(names.contains("http"), "missing http tool");
         assert!(names.contains("skill"), "missing skill tool");
+        #[cfg(feature = "sub-agent")]
+        assert!(names.contains("sub_agent"), "missing sub_agent tool");
     }
 }
