@@ -263,6 +263,7 @@ pub struct AsyncAgentSpawnRequest {
     pub tools: Option<Vec<String>>,
     pub max_turns: usize,
     pub agent_kind: String,
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

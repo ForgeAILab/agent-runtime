@@ -29,7 +29,8 @@ impl Tool for SubAgentTool {
                 "blocking": { "type": "boolean", "default": true },
                 "tools": { "type": "array", "items": { "type": "string" } },
                 "max_turns": { "type": "integer", "default": 10 },
-                "agent_kind": { "type": "string", "default": "react" }
+                "agent_kind": { "type": "string", "default": "react" },
+                "provider": { "type": "string", "description": "Named provider from config (e.g. 'main', 'backup'). Defaults to the parent agent's provider." }
             }
         })
     }
@@ -95,10 +96,14 @@ async fn invoke_spawn(
         .and_then(Value::as_str)
         .unwrap_or("react")
         .to_string();
+    let provider = input
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
 
     if blocking {
         return match agent_service
-            .spawn_sub_agent(&ctx.invocation, prompt, tools, max_turns)
+            .spawn_sub_agent(&ctx.invocation, prompt, tools, max_turns, provider)
             .await
         {
             Ok(text) => Ok(ToolResult::text(text)),
@@ -120,6 +125,7 @@ async fn invoke_spawn(
             tools,
             agent_kind,
             max_turns,
+            provider,
         )
         .await
     {
@@ -177,8 +183,8 @@ mod tests {
 
     #[derive(Default)]
     struct MockAgentService {
-        spawn_sub_calls: Mutex<Vec<(String, Option<Vec<String>>, usize)>>,
-        spawn_async_calls: Mutex<Vec<(String, String, Option<Vec<String>>, String, usize)>>,
+        spawn_sub_calls: Mutex<Vec<(String, Option<Vec<String>>, usize, Option<String>)>>,
+        spawn_async_calls: Mutex<Vec<(String, String, Option<Vec<String>>, String, usize, Option<String>)>>,
         stop_calls: Mutex<Vec<String>>,
     }
 
@@ -198,11 +204,12 @@ mod tests {
             prompt: String,
             tool_names: Option<Vec<String>>,
             max_turns: usize,
+            provider: Option<String>,
         ) -> Result<String, KernelError> {
             self.spawn_sub_calls
                 .lock()
                 .expect("spawn_sub_calls lock")
-                .push((prompt, tool_names, max_turns));
+                .push((prompt, tool_names, max_turns, provider));
             Ok("blocking-ok".to_string())
         }
 
@@ -214,11 +221,12 @@ mod tests {
             tool_names: Option<Vec<String>>,
             agent_kind: String,
             max_turns: usize,
+            provider: Option<String>,
         ) -> Result<(), KernelError> {
             self.spawn_async_calls
                 .lock()
                 .expect("spawn_async_calls lock")
-                .push((id, prompt, tool_names, agent_kind, max_turns));
+                .push((id, prompt, tool_names, agent_kind, max_turns, provider));
             Ok(())
         }
 
@@ -313,7 +321,7 @@ mod tests {
                 .lock()
                 .expect("spawn_sub_calls lock")
                 .as_slice(),
-            [("hello".to_string(), Some(vec!["read".to_string()]), 7)].as_slice()
+            [("hello".to_string(), Some(vec!["read".to_string()]), 7, None)].as_slice()
         );
     }
 
@@ -354,7 +362,8 @@ mod tests {
                 "research".to_string(),
                 None,
                 "background".to_string(),
-                12
+                12,
+                None,
             )]
             .as_slice()
         );
