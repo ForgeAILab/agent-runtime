@@ -46,6 +46,8 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "is_default_retry")]
     pub retry: RetryConfig,
 }
@@ -58,6 +60,7 @@ impl Default for ProviderConfig {
             api_key: None,
             api_key_env: None,
             base_url: None,
+            context_window: None,
             retry: RetryConfig::default(),
         }
     }
@@ -69,6 +72,34 @@ fn default_provider_kind() -> String {
 
 fn default_provider_model() -> String {
     "echo-default".to_string()
+}
+
+const MODEL_CONTEXT_WINDOW_PREFIXES: &[(&str, usize)] = &[
+    ("gpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-3.5-turbo", 16_385),
+    ("claude-sonnet-4", 200_000),
+    ("claude-opus-4", 200_000),
+    ("claude-haiku-3.5", 200_000),
+    ("deepseek-chat", 65_536),
+    ("deepseek-reasoner", 65_536),
+];
+
+fn model_context_window(model: &str) -> Option<usize> {
+    if model == "gpt-4" {
+        return Some(8_192);
+    }
+
+    MODEL_CONTEXT_WINDOW_PREFIXES
+        .iter()
+        .find_map(|(prefix, context_window)| model.starts_with(prefix).then_some(*context_window))
+}
+
+impl ProviderConfig {
+    pub fn resolved_context_window(&self) -> Option<usize> {
+        self.context_window
+            .or_else(|| model_context_window(self.model.as_str()))
+    }
 }
 
 fn resolve_api_key(cfg: &ProviderConfig, default_env: &str) -> Result<String, ProviderError> {
@@ -343,6 +374,7 @@ base_url = "http://localhost:11434/v1"
         assert_eq!(cfg.model, "llama3");
         assert_eq!(cfg.base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert_eq!(cfg.api_key_env, None);
+        assert_eq!(cfg.context_window, None);
     }
 
     #[test]
@@ -402,5 +434,51 @@ base_url = "http://localhost:11434/v1"
         };
         let chain = build_provider_chain(&[cfg]).expect("single-entry chain should build");
         assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn resolved_context_window_prefers_explicit_value() {
+        let cfg = ProviderConfig {
+            model: "gpt-4o".to_string(),
+            context_window: Some(64_000),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.resolved_context_window(), Some(64_000));
+    }
+
+    #[test]
+    fn resolved_context_window_uses_model_prefix_registry() {
+        let cfg = ProviderConfig {
+            model: "claude-sonnet-4-20250514".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.resolved_context_window(), Some(200_000));
+    }
+
+    #[test]
+    fn resolved_context_window_returns_none_for_unknown_model() {
+        let cfg = ProviderConfig {
+            model: "my-custom-llm".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.resolved_context_window(), None);
+    }
+
+    #[test]
+    fn provider_config_deserializes_context_window_from_toml() {
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+kind = "openai"
+model = "gpt-4o"
+context_window = 100000
+"#,
+        )
+        .expect("toml deserializes");
+
+        assert_eq!(cfg.context_window, Some(100_000));
+        assert_eq!(cfg.resolved_context_window(), Some(100_000));
     }
 }
