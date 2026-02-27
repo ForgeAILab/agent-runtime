@@ -66,6 +66,16 @@ pub fn register_builtins(
 pub struct FileReadTool;
 
 #[cfg(feature = "file")]
+impl FileReadTool {
+    /// Maximum number of lines returned in a single read (without explicit range).
+    const MAX_LINES: usize = 500;
+    /// Maximum characters per line before truncation.
+    const MAX_LINE_LEN: usize = 2000;
+    /// Maximum total characters returned.
+    const MAX_TOTAL_CHARS: usize = 100_000;
+}
+
+#[cfg(feature = "file")]
 #[async_trait]
 impl Tool for FileReadTool {
     fn name(&self) -> &str {
@@ -73,14 +83,28 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file content from disk"
+        "Read file content from disk. Supports optional line range to avoid flooding context. \
+         Returns at most 500 lines per call. Use offset/limit to paginate large files."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "required": ["path"],
-            "properties": { "path": { "type": "string" } }
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path (relative to workspace or absolute)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based starting line number (default: 1)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return (default/max: 500)"
+                }
+            }
         })
     }
 
@@ -96,8 +120,75 @@ impl Tool for FileReadTool {
             path.to_path_buf()
         };
         let resolved_path = ctx.sandbox.validate_read_path(&resolved_path)?;
-        let content = tokio::fs::read_to_string(resolved_path).await?;
-        Ok(ToolResult::text(content))
+        let content = tokio::fs::read_to_string(&resolved_path).await?;
+
+        let offset = input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map(|v| v.max(1) as usize)
+            .unwrap_or(1);
+
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| (v as usize).min(Self::MAX_LINES))
+            .unwrap_or(Self::MAX_LINES);
+
+        let all_lines: Vec<&str> = content.lines().collect();
+        let total_lines = all_lines.len();
+
+        // Select the requested range (offset is 1-based).
+        let start = (offset - 1).min(total_lines);
+        let end = (start + limit).min(total_lines);
+        let selected = &all_lines[start..end];
+
+        // Build output with line numbers and per-line truncation.
+        let mut out = String::new();
+        let mut total_chars: usize = 0;
+        let mut lines_included: usize = 0;
+
+        for (i, line) in selected.iter().enumerate() {
+            let line_num = start + i + 1; // 1-based
+            let truncated = if line.len() > Self::MAX_LINE_LEN {
+                format!(
+                    "{}… [truncated, {} chars total]",
+                    &line[..Self::MAX_LINE_LEN],
+                    line.len()
+                )
+            } else {
+                line.to_string()
+            };
+
+            let formatted = format!("{line_num}\t{truncated}\n");
+            total_chars += formatted.len();
+            if total_chars > Self::MAX_TOTAL_CHARS {
+                out.push_str(&format!(
+                    "… [output truncated at {lines_included} lines due to size limit]\n"
+                ));
+                break;
+            }
+            out.push_str(&formatted);
+            lines_included += 1;
+        }
+
+        // Append a summary so the agent knows what it got vs what exists.
+        let showing_end = start + lines_included;
+        let truncated = showing_end < total_lines;
+        out.push_str(&format!(
+            "\n--- showing lines {}-{} of {} total",
+            start + 1,
+            showing_end,
+            total_lines
+        ));
+        if truncated {
+            out.push_str(&format!(
+                " (use offset={} to see more)",
+                showing_end + 1
+            ));
+        }
+        out.push_str(" ---\n");
+
+        Ok(ToolResult::text(out))
     }
 }
 
@@ -873,7 +964,7 @@ mod tests {
         Sandbox, SandboxError, SandboxPolicy, SandboxedCommand, SandboxedOutput,
         testing::NoopSandbox,
     };
-    use serde_json::{Value, json};
+    use serde_json::json;
     use tempfile::NamedTempFile;
 
     #[cfg(feature = "shell")]
@@ -935,7 +1026,9 @@ mod tests {
             .await
             .expect("file read works");
 
-        assert_eq!(output.value, Value::String("hello file".to_string()));
+        let text = output.value.as_str().expect("text output");
+        assert!(text.contains("hello file"), "should contain file content");
+        assert!(text.contains("showing lines 1-1 of 1 total"), "should contain summary");
     }
 
     #[cfg(feature = "file")]
@@ -975,7 +1068,10 @@ mod tests {
             .invoke(json!({ "path": "demo.txt" }), &tool_ctx)
             .await
             .expect("read works");
-        assert_eq!(output.value, Value::String("hello\nnyx\n".to_string()));
+        let text = output.value.as_str().expect("text output");
+        assert!(text.contains("hello"), "should contain first line");
+        assert!(text.contains("nyx"), "should contain patched line");
+        assert!(text.contains("showing lines 1-2 of 2 total"), "should contain summary");
     }
 
     #[cfg(feature = "file")]
@@ -1009,6 +1105,62 @@ mod tests {
             .await
             .expect_err("read should be denied");
         assert!(matches!(err, ToolError::Sandbox(_)));
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_tool_supports_offset_and_limit() {
+        let file = NamedTempFile::new().expect("create temp file");
+        // Write 10 lines
+        let content: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(file.path(), &content).expect("write temp content");
+
+        // Read lines 3-5 using offset and limit
+        let output = FileReadTool
+            .invoke(
+                json!({ "path": file.path(), "offset": 3, "limit": 3 }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect("file read with range works");
+
+        let text = output.value.as_str().expect("text output");
+        assert!(text.contains("3\tline 3"), "should start at line 3");
+        assert!(text.contains("4\tline 4"), "should include line 4");
+        assert!(text.contains("5\tline 5"), "should include line 5");
+        assert!(!text.contains("line 6"), "should not include line 6");
+        assert!(
+            text.contains("showing lines 3-5 of 10 total"),
+            "should show correct range summary"
+        );
+        assert!(
+            text.contains("use offset=6 to see more"),
+            "should hint at next page"
+        );
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_tool_truncates_long_lines() {
+        let file = NamedTempFile::new().expect("create temp file");
+        let long_line = "x".repeat(3000);
+        std::fs::write(file.path(), &long_line).expect("write long content");
+
+        let output = FileReadTool
+            .invoke(json!({ "path": file.path() }), &ctx(vec![]))
+            .await
+            .expect("file read works");
+
+        let text = output.value.as_str().expect("text output");
+        assert!(
+            text.contains("truncated, 3000 chars total"),
+            "should indicate line was truncated"
+        );
+        // The output should be much shorter than 3000 chars for the line content
+        assert!(
+            text.len() < 2500,
+            "total output should be bounded"
+        );
     }
 
     #[cfg(feature = "file")]
