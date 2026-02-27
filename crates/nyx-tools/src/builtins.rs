@@ -315,6 +315,7 @@ impl Tool for ProcessStartTool {
             "properties": {
                 "id": { "type": "string" },
                 "command": { "type": "string" },
+                "pwd": { "type": "string" },
                 "interactive": { "type": "boolean", "default": false }
             }
         })
@@ -329,13 +330,14 @@ impl Tool for ProcessStartTool {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing command".to_string()))?;
+        let pwd = input.get("pwd").and_then(Value::as_str).map(str::to_string);
         let interactive = input
             .get("interactive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
         self.terminal_registry
-            .spawn(id, command, ctx, HashMap::new(), interactive)
+            .spawn(id, command, ctx, HashMap::new(), interactive, pwd)
             .await?;
 
         Ok(ToolResult::json(json!({
@@ -1215,6 +1217,32 @@ mod tests {
                 .expect("stdout string")
                 .contains("done")
         );
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn process_start_tool_uses_pwd_when_provided() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
+        let tool_ctx = ToolContext::default();
+        let id = unique_id("proc-pwd");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        start_tool
+            .invoke(
+                json!({
+                    "id": id,
+                    "command": "pwd",
+                    "pwd": temp_dir.path().display().to_string()
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("start process");
+
+        let _ = registry.wait(&id, 500).await.expect("wait for process");
+        let output = registry.read(&id, 50).await.expect("read output");
+        assert_eq!(output.stdout.trim(), temp_dir.path().display().to_string());
     }
 
     #[cfg(feature = "terminal")]

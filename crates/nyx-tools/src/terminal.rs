@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,14 +72,19 @@ impl TerminalRegistry {
         ctx: &ToolContext,
         env: HashMap<String, String>,
         interactive: bool,
+        pwd: Option<String>,
     ) -> Result<(), TerminalError> {
         if self.sessions.contains_key(id) {
             return Err(TerminalError::IdConflict { id: id.to_string() });
         }
 
+        let working_dir = pwd
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ctx.workspace_dir.clone());
         let mut sandboxed = SandboxedCommand::new("sh")
             .arg("-lc")
-            .arg(command.to_string());
+            .arg(command.to_string())
+            .working_dir(working_dir);
         for (k, v) in env {
             sandboxed = sandboxed.env(k, v);
         }
@@ -309,7 +315,7 @@ mod tests {
         let registry = TerminalRegistry::new();
         let tool_ctx = ToolContext::default();
         registry
-            .spawn("echo", "cat", &tool_ctx, HashMap::new(), true)
+            .spawn("echo", "cat", &tool_ctx, HashMap::new(), true, None)
             .await
             .expect("spawn cat");
         registry.write("echo", "hello\n").await.expect("write cat");
@@ -325,12 +331,12 @@ mod tests {
         let registry = TerminalRegistry::new();
         let tool_ctx = ToolContext::default();
         registry
-            .spawn("dup", "cat", &tool_ctx, HashMap::new(), true)
+            .spawn("dup", "cat", &tool_ctx, HashMap::new(), true, None)
             .await
             .expect("spawn first");
 
         let err = registry
-            .spawn("dup", "cat", &tool_ctx, HashMap::new(), true)
+            .spawn("dup", "cat", &tool_ctx, HashMap::new(), true, None)
             .await
             .expect_err("duplicate should fail");
         assert!(matches!(err, TerminalError::IdConflict { .. }));
@@ -343,7 +349,7 @@ mod tests {
         let registry = TerminalRegistry::new();
         let tool_ctx = ToolContext::default();
         registry
-            .spawn("done", "echo done", &tool_ctx, HashMap::new(), true)
+            .spawn("done", "echo done", &tool_ctx, HashMap::new(), true, None)
             .await
             .expect("spawn echo");
 
@@ -351,5 +357,23 @@ mod tests {
 
         let status = registry.status("done").await.expect("status works");
         assert!(matches!(status, TerminalStatus::Exited { .. }));
+    }
+
+    #[tokio::test]
+    async fn terminal_registry_spawn_defaults_to_workspace_dir() {
+        let registry = TerminalRegistry::new();
+        let workspace = tempfile::tempdir().expect("workspace temp dir");
+        let tool_ctx = ToolContext {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..ToolContext::default()
+        };
+        registry
+            .spawn("pwd", "pwd", &tool_ctx, HashMap::new(), false, None)
+            .await
+            .expect("spawn pwd");
+
+        let _ = registry.wait("pwd", 500).await.expect("wait for pwd");
+        let output = registry.read("pwd", 50).await.expect("read output");
+        assert_eq!(output.stdout.trim(), workspace.path().display().to_string());
     }
 }
