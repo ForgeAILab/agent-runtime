@@ -15,7 +15,7 @@ impl Tool for SubAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn, list, inspect, and stop sub-agents"
+        "Spawn, list, inspect, and stop sub-agents. Non-blocking spawns deliver results via heartbeat — do not poll."
     }
 
     fn schema(&self) -> Value {
@@ -126,12 +126,14 @@ async fn invoke_spawn(
             agent_kind,
             max_turns,
             provider,
+            ctx.channel_id.clone(),
         )
         .await
     {
         Ok(()) => Ok(ToolResult::json(json!({
             "id": id,
-            "status": "spawned"
+            "status": "spawned",
+            "notify": "Result will be delivered to you via heartbeat when the sub-agent completes. Do not poll."
         }))),
         Err(err) => Ok(ToolResult::error(err.to_string())),
     }
@@ -231,6 +233,7 @@ mod tests {
             agent_kind: String,
             max_turns: usize,
             provider: Option<String>,
+            _channel_id: Option<String>,
         ) -> Result<(), KernelError> {
             self.spawn_async_calls
                 .lock()
@@ -357,9 +360,11 @@ mod tests {
             .await
             .expect("invoke spawn");
 
-        assert_eq!(
-            result.value,
-            json!({ "id": "researcher-1", "status": "spawned" })
+        assert_eq!(result.value["id"], "researcher-1");
+        assert_eq!(result.value["status"], "spawned");
+        assert!(
+            result.value["notify"].as_str().is_some(),
+            "async spawn should include notify field"
         );
         assert_eq!(
             mock.spawn_async_calls

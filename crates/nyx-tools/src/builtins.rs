@@ -305,7 +305,7 @@ impl Tool for ProcessStartTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a background process"
+        "Spawn a background process. Use process_wait or process_read to check results when needed."
     }
 
     fn schema(&self) -> Value {
