@@ -910,6 +910,9 @@ mod tests {
             workspace_dir: std::path::PathBuf::from("."),
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
+            channel_id: None,
+            agent_kind: None,
+            auto_approve: false,
         }
     }
 
@@ -942,6 +945,9 @@ mod tests {
             workspace_dir: temp_dir.path().to_path_buf(),
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
+            channel_id: None,
+            agent_kind: None,
+            auto_approve: false,
         };
 
         FileWriteTool
@@ -991,6 +997,9 @@ mod tests {
             workspace_dir: workspace.path().to_path_buf(),
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
+            channel_id: None,
+            agent_kind: None,
+            auto_approve: false,
         };
 
         let err = FileReadTool
@@ -1020,6 +1029,9 @@ mod tests {
             workspace_dir: workspace.path().to_path_buf(),
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
+            channel_id: None,
+            agent_kind: None,
+            auto_approve: false,
         };
 
         let err = FileWriteTool
@@ -1051,6 +1063,9 @@ mod tests {
             workspace_dir: std::path::PathBuf::from("."),
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
+            channel_id: None,
+            agent_kind: None,
+            auto_approve: false,
         };
 
         let output = ShellTool

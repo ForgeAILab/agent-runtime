@@ -505,6 +505,9 @@ mod tests {
             workspace_dir: std::path::PathBuf::from("."),
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
+            channel_id: None,
+            agent_kind: None,
+            auto_approve: false,
         }
     }
 

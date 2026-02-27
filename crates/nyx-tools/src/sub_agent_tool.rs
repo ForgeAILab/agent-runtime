@@ -184,7 +184,16 @@ mod tests {
     #[derive(Default)]
     struct MockAgentService {
         spawn_sub_calls: Mutex<Vec<(String, Option<Vec<String>>, usize, Option<String>)>>,
-        spawn_async_calls: Mutex<Vec<(String, String, Option<Vec<String>>, String, usize, Option<String>)>>,
+        spawn_async_calls: Mutex<
+            Vec<(
+                String,
+                String,
+                Option<Vec<String>>,
+                String,
+                usize,
+                Option<String>,
+            )>,
+        >,
         stop_calls: Mutex<Vec<String>>,
     }
 

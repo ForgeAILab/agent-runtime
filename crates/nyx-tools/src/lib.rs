@@ -4,6 +4,8 @@ mod core;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod registry;
+#[cfg(feature = "permission")]
+mod request_permission;
 mod skill_tool;
 #[cfg(feature = "sub-agent")]
 mod sub_agent_tool;
@@ -22,6 +24,8 @@ pub use core::*;
 #[cfg(feature = "mcp")]
 pub use mcp::*;
 pub use registry::*;
+#[cfg(feature = "permission")]
+pub use request_permission::*;
 pub use skill_tool::*;
 #[cfg(feature = "sub-agent")]
 pub use sub_agent_tool::*;
@@ -35,6 +39,8 @@ pub fn build_tools(sandbox: Arc<dyn Sandbox>) -> Result<Vec<Arc<dyn Tool>>, Regi
     register_builtins(&mut registry, sandbox, Arc::new(TerminalRegistry::new()))?;
     #[cfg(not(feature = "terminal"))]
     register_builtins(&mut registry, sandbox)?;
+    #[cfg(feature = "permission")]
+    registry.register(Arc::new(RequestPermissionTool::default()))?;
     Ok(registry.seal())
 }
 
@@ -76,5 +82,10 @@ mod tests {
         assert!(names.contains("skill"), "missing skill tool");
         #[cfg(feature = "sub-agent")]
         assert!(names.contains("sub_agent"), "missing sub_agent tool");
+        #[cfg(feature = "permission")]
+        assert!(
+            names.contains("request_permission"),
+            "missing request_permission tool"
+        );
     }
 }

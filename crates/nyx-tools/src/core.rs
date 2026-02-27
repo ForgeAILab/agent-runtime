@@ -52,6 +52,9 @@ pub struct ToolContext {
     pub workspace_dir: PathBuf,
     pub control_plane: Arc<dyn ControlPlane>,
     pub invocation: InvocationContext,
+    pub channel_id: Option<String>,
+    pub agent_kind: Option<String>,
+    pub auto_approve: bool,
 }
 
 impl Default for ToolContext {
@@ -61,6 +64,9 @@ impl Default for ToolContext {
             workspace_dir: PathBuf::from("."),
             control_plane: Arc::new(NoopControlPlane),
             invocation: InvocationContext::default(),
+            channel_id: None,
+            agent_kind: None,
+            auto_approve: false,
         }
     }
 }
@@ -71,6 +77,9 @@ pub struct ToolContextBuilder {
     workspace_dir: Option<PathBuf>,
     control_plane: Option<Arc<dyn ControlPlane>>,
     invocation: Option<InvocationContext>,
+    channel_id: Option<String>,
+    agent_kind: Option<String>,
+    auto_approve: Option<bool>,
 }
 
 impl ToolContextBuilder {
@@ -98,6 +107,21 @@ impl ToolContextBuilder {
         self
     }
 
+    pub fn channel_id(mut self, channel_id: Option<String>) -> Self {
+        self.channel_id = channel_id;
+        self
+    }
+
+    pub fn agent_kind(mut self, agent_kind: Option<String>) -> Self {
+        self.agent_kind = agent_kind;
+        self
+    }
+
+    pub fn auto_approve(mut self, auto_approve: bool) -> Self {
+        self.auto_approve = Some(auto_approve);
+        self
+    }
+
     pub fn build(self) -> ToolContext {
         ToolContext {
             sandbox: self
@@ -108,6 +132,9 @@ impl ToolContextBuilder {
                 .control_plane
                 .unwrap_or_else(|| Arc::new(NoopControlPlane)),
             invocation: self.invocation.unwrap_or_default(),
+            channel_id: self.channel_id,
+            agent_kind: self.agent_kind,
+            auto_approve: self.auto_approve.unwrap_or(false),
         }
     }
 }
