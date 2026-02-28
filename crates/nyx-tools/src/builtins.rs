@@ -321,7 +321,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a short shell command (15s limit). Use process_start for long-running tasks."
+        "Execute a shell command (30s limit). Use process_start for long-running tasks."
     }
 
     fn schema(&self) -> Value {
@@ -351,7 +351,7 @@ impl Tool for ShellTool {
             .arg(command_text.to_string());
         command = command.working_dir(pwd);
         let output = match tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(30),
             ctx.sandbox.execute(command),
         )
         .await
@@ -359,7 +359,7 @@ impl Tool for ShellTool {
             Ok(output) => output?,
             Err(_) => {
                 return Ok(ToolResult::error(
-                    "shell command timed out after 15 seconds; use process_start for long-running tasks",
+                    "shell command timed out after 30 seconds; use process_start for long-running tasks",
                 ));
             }
         };
