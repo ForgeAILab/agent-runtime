@@ -181,10 +181,7 @@ impl Tool for FileReadTool {
             total_lines
         ));
         if truncated {
-            out.push_str(&format!(
-                " (use offset={} to see more)",
-                showing_end + 1
-            ));
+            out.push_str(&format!(" (use offset={} to see more)", showing_end + 1));
         }
         out.push_str(" ---\n");
 
@@ -1028,7 +1025,10 @@ mod tests {
 
         let text = output.value.as_str().expect("text output");
         assert!(text.contains("hello file"), "should contain file content");
-        assert!(text.contains("showing lines 1-1 of 1 total"), "should contain summary");
+        assert!(
+            text.contains("showing lines 1-1 of 1 total"),
+            "should contain summary"
+        );
     }
 
     #[cfg(feature = "file")]
@@ -1071,7 +1071,10 @@ mod tests {
         let text = output.value.as_str().expect("text output");
         assert!(text.contains("hello"), "should contain first line");
         assert!(text.contains("nyx"), "should contain patched line");
-        assert!(text.contains("showing lines 1-2 of 2 total"), "should contain summary");
+        assert!(
+            text.contains("showing lines 1-2 of 2 total"),
+            "should contain summary"
+        );
     }
 
     #[cfg(feature = "file")]
@@ -1157,10 +1160,7 @@ mod tests {
             "should indicate line was truncated"
         );
         // The output should be much shorter than 3000 chars for the line content
-        assert!(
-            text.len() < 2500,
-            "total output should be bounded"
-        );
+        assert!(text.len() < 2500, "total output should be bounded");
     }
 
     #[cfg(feature = "file")]
