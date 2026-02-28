@@ -150,8 +150,7 @@ impl ToolLoopEngine {
                 && !is_final_turn
                 && !text.is_empty()
                 && !ctx.suppress_progressive
-            {
-                if let Err(err) = ctx
+                && let Err(err) = ctx
                     .sink
                     .emit(Event::agent_progressive_message(
                         "nyx-agent",
@@ -160,20 +159,24 @@ impl ToolLoopEngine {
                         turn,
                     ))
                     .await
-                {
-                    tracing::warn!(
-                        error = %err,
-                        step = turn,
-                        "failed to emit intermediate message"
-                    );
-                }
+            {
+                tracing::warn!(
+                    error = %err,
+                    step = turn,
+                    "failed to emit intermediate message"
+                );
             }
 
             if !has_tool_calls {
                 if is_final_turn {
                     tracing::info!(max_steps_reached = true, final_response_truncated = false);
                 }
-                return Ok(AgentResponse::new(completion.content.trim().to_string()));
+                return Ok(AgentResponse {
+                    text: completion.content.trim().to_string(),
+                    attachments: vec![],
+                    interactive: None,
+                    history: history.clone(),
+                });
             }
 
             if is_final_turn {
@@ -208,7 +211,12 @@ impl ToolLoopEngine {
                     }
                 }
                 tracing::info!(max_steps_reached = true, final_response_truncated = true);
-                return Ok(AgentResponse::new(completion.content.trim().to_string()));
+                return Ok(AgentResponse {
+                    text: completion.content.trim().to_string(),
+                    attachments: vec![],
+                    interactive: None,
+                    history: history.clone(),
+                });
             }
 
             history.push(Message::assistant(build_assistant_content(&completion)));
