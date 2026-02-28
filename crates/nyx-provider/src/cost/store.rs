@@ -9,6 +9,33 @@ use super::types::{
     ChannelUsage, ModelUsage, UsageFilter, UsageGroupBy, UsageRecord, UsageSummary,
 };
 
+#[cfg(feature = "cost-sqlite")]
+const NYX_PROVIDER_NAMESPACE: &str = "nyx-provider";
+#[cfg(feature = "cost-sqlite")]
+const NYX_PROVIDER_MIGRATIONS: &[(u32, &str, &str)] = &[(
+    1,
+    "create cost records table",
+    r#"
+    CREATE TABLE IF NOT EXISTS cost_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        estimated_cost_usd REAL,
+        timestamp_ms INTEGER NOT NULL
+    );
+    "#,
+)];
+
+#[cfg(feature = "cost-sqlite")]
+pub fn cost_migrations() -> (&'static str, &'static [(u32, &'static str, &'static str)]) {
+    (NYX_PROVIDER_NAMESPACE, NYX_PROVIDER_MIGRATIONS)
+}
+
 #[async_trait]
 pub trait CostStore: Send + Sync {
     async fn record(&self, r: UsageRecord) -> Result<(), CostError>;
@@ -66,27 +93,6 @@ pub struct SqliteCostStore {
 #[cfg(feature = "cost-sqlite")]
 impl SqliteCostStore {
     pub fn new(connection: Arc<std::sync::Mutex<rusqlite::Connection>>) -> Result<Self, CostError> {
-        {
-            let conn = connection.lock().map_err(|err| {
-                CostError::Store(format!("sqlite connection mutex poisoned: {err}"))
-            })?;
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS cost_records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source TEXT NOT NULL,
-                    channel_id TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    input_tokens INTEGER NOT NULL,
-                    output_tokens INTEGER NOT NULL,
-                    cache_read_tokens INTEGER,
-                    cache_write_tokens INTEGER,
-                    estimated_cost_usd REAL,
-                    timestamp_ms INTEGER NOT NULL
-                )",
-                [],
-            )?;
-        }
-
         Ok(Self { connection })
     }
 }
@@ -350,6 +356,13 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "cost-sqlite")]
+    fn apply_sqlite_migrations(connection: &mut rusqlite::Connection) {
+        nyx_store::MigrationRunner::new(connection)
+            .run_all(&[cost_migrations()])
+            .expect("run cost migrations");
+    }
+
     #[tokio::test]
     async fn in_memory_store_records_and_summarizes() {
         let store = InMemoryCostStore::new(2);
@@ -430,6 +443,10 @@ mod tests {
         let conn = Arc::new(std::sync::Mutex::new(
             rusqlite::Connection::open(path).expect("open sqlite"),
         ));
+        {
+            let mut guard = conn.lock().expect("lock sqlite");
+            apply_sqlite_migrations(&mut guard);
+        }
 
         let store = SqliteCostStore::new(Arc::clone(&conn)).expect("create sqlite cost store");
         store
@@ -485,6 +502,10 @@ mod tests {
         let conn = Arc::new(std::sync::Mutex::new(
             rusqlite::Connection::open(&path).expect("open sqlite"),
         ));
+        {
+            let mut guard = conn.lock().expect("lock sqlite");
+            apply_sqlite_migrations(&mut guard);
+        }
         let store = SqliteCostStore::new(conn).expect("create sqlite cost store");
         store
             .record(UsageRecord {
@@ -505,6 +526,10 @@ mod tests {
         let conn = Arc::new(std::sync::Mutex::new(
             rusqlite::Connection::open(path).expect("reopen sqlite"),
         ));
+        {
+            let mut guard = conn.lock().expect("lock sqlite");
+            apply_sqlite_migrations(&mut guard);
+        }
         let store = SqliteCostStore::new(conn).expect("recreate sqlite cost store");
         let summary = store
             .summary(UsageFilter::default())

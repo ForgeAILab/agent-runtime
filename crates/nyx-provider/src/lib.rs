@@ -207,6 +207,8 @@ pub mod testing {
 
 #[cfg(feature = "cost")]
 pub mod cost;
+#[cfg(feature = "cost-sqlite")]
+pub use cost::cost_migrations;
 
 #[cfg(feature = "openai")]
 pub mod openai;

@@ -9,6 +9,8 @@ pub use error::CostError;
 pub use price::{PriceOverride, PriceTable};
 #[cfg(feature = "cost-sqlite")]
 pub use store::SqliteCostStore;
+#[cfg(feature = "cost-sqlite")]
+pub use store::cost_migrations;
 pub use store::{CostStore, InMemoryCostStore, SharedCostStore};
 pub use tool::{UsageTool, parse_group_by, parse_window_filter};
 pub use tracker::CostTracker;
