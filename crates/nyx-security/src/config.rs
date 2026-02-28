@@ -46,6 +46,17 @@ pub fn default_operators() -> Vec<String> {
 }
 
 pub fn build_sandbox(cfg: &SecurityConfig) -> Result<Arc<dyn Sandbox>, SecurityError> {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    build_sandbox_at_root(cfg, root)
+}
+
+pub fn build_sandbox_at_root(
+    cfg: &SecurityConfig,
+    root_dir: impl Into<PathBuf>,
+) -> Result<Arc<dyn Sandbox>, SecurityError> {
+    let root_dir = root_dir.into();
+    #[cfg(not(feature = "os-sandbox"))]
+    let _ = &root_dir;
     let sandbox: Arc<dyn Sandbox> = match cfg.sandbox.as_str() {
         "none" => {
             tracing::warn!("security.sandbox=none configured; sandbox protections are disabled");
@@ -59,8 +70,7 @@ pub fn build_sandbox(cfg: &SecurityConfig) -> Result<Arc<dyn Sandbox>, SecurityE
         }
         #[cfg(feature = "os-sandbox")]
         "os" => {
-            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            Arc::new(crate::os_sandbox::OsSandbox::new(root, cfg.policy.clone())?)
+            Arc::new(crate::os_sandbox::OsSandbox::new(root_dir, cfg.policy.clone())?)
         }
         other => return Err(SecurityError::UnknownKind(other.to_string())),
     };
