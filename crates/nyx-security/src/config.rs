@@ -69,9 +69,10 @@ pub fn build_sandbox_at_root(
             Arc::new(crate::testing::NoopSandbox)
         }
         #[cfg(feature = "os-sandbox")]
-        "os" => {
-            Arc::new(crate::os_sandbox::OsSandbox::new(root_dir, cfg.policy.clone())?)
-        }
+        "os" => Arc::new(crate::os_sandbox::OsSandbox::new(
+            root_dir,
+            cfg.policy.clone(),
+        )?),
         other => return Err(SecurityError::UnknownKind(other.to_string())),
     };
 
