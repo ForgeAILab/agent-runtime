@@ -503,6 +503,7 @@ mod tests {
         ToolContext {
             sandbox: Arc::new(NoopSandbox),
             workspace_dir: std::path::PathBuf::from("."),
+            kernel_handle: None,
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
             channel_id: None,

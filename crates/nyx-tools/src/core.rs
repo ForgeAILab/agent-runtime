@@ -5,7 +5,8 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nyx_core::{
-    ControlPlane, ExtensionRegistry, InvocationContext, KernelError, Service, ServiceId,
+    ControlPlane, ExtensionRegistry, InvocationContext, KernelError, KernelHandle, Service,
+    ServiceId,
 };
 use nyx_security::{Sandbox, SandboxError};
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ impl ToolResult {
 pub struct ToolContext {
     pub sandbox: Arc<dyn Sandbox>,
     pub workspace_dir: PathBuf,
+    pub kernel_handle: Option<Arc<dyn KernelHandle>>,
     pub control_plane: Arc<dyn ControlPlane>,
     pub invocation: InvocationContext,
     pub channel_id: Option<String>,
@@ -62,6 +64,7 @@ impl Default for ToolContext {
         Self {
             sandbox: Arc::new(nyx_security::testing::NoopSandbox),
             workspace_dir: PathBuf::from("."),
+            kernel_handle: None,
             control_plane: Arc::new(NoopControlPlane),
             invocation: InvocationContext::default(),
             channel_id: None,
@@ -75,6 +78,7 @@ impl Default for ToolContext {
 pub struct ToolContextBuilder {
     sandbox: Option<Arc<dyn Sandbox>>,
     workspace_dir: Option<PathBuf>,
+    kernel_handle: Option<Arc<dyn KernelHandle>>,
     control_plane: Option<Arc<dyn ControlPlane>>,
     invocation: Option<InvocationContext>,
     channel_id: Option<String>,
@@ -99,6 +103,11 @@ impl ToolContextBuilder {
 
     pub fn control_plane(mut self, control_plane: Arc<dyn ControlPlane>) -> Self {
         self.control_plane = Some(control_plane);
+        self
+    }
+
+    pub fn kernel_handle(mut self, kernel_handle: Option<Arc<dyn KernelHandle>>) -> Self {
+        self.kernel_handle = kernel_handle;
         self
     }
 
@@ -128,6 +137,7 @@ impl ToolContextBuilder {
                 .sandbox
                 .unwrap_or_else(|| Arc::new(nyx_security::testing::NoopSandbox)),
             workspace_dir: self.workspace_dir.unwrap_or_else(|| PathBuf::from(".")),
+            kernel_handle: self.kernel_handle,
             control_plane: self
                 .control_plane
                 .unwrap_or_else(|| Arc::new(NoopControlPlane)),

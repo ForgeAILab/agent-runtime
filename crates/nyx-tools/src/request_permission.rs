@@ -65,19 +65,22 @@ impl Tool for RequestPermissionTool {
             })));
         }
 
-        let permission = ctx
-            .control_plane
-            .require_service::<dyn PermissionService>()
-            .map_err(crate::map_kernel_error)?;
-
-        let decision = permission
-            .await_confirmation(
-                action_id,
-                format!("Plan request\n\n{}\n\nPlan file: {}", proposal, plan_file),
-                timeout,
-            )
-            .await
-            .map_err(crate::map_kernel_error)?;
+        let description = format!("Plan request\n\n{}\n\nPlan file: {}", proposal, plan_file);
+        let decision = if let Some(handle) = ctx.kernel_handle.as_ref() {
+            handle
+                .await_permission(action_id, description, timeout)
+                .await
+                .map_err(crate::map_kernel_error)?
+        } else {
+            let permission = ctx
+                .control_plane
+                .require_service::<dyn PermissionService>()
+                .map_err(crate::map_kernel_error)?;
+            permission
+                .await_confirmation(action_id, description, timeout)
+                .await
+                .map_err(crate::map_kernel_error)?
+        };
 
         match decision {
             PermissionDecision::Approved => Ok(ToolResult::json(json!({
@@ -223,6 +226,7 @@ mod tests {
         let tool = RequestPermissionTool::default();
         let ctx = ToolContext {
             workspace_dir: dir.path().to_path_buf(),
+            kernel_handle: None,
             control_plane: cp_with_permission(service),
             auto_approve: false,
             ..ToolContext::default()
@@ -242,6 +246,7 @@ mod tests {
         let tool = RequestPermissionTool::default();
         let ctx = ToolContext {
             workspace_dir: dir.path().to_path_buf(),
+            kernel_handle: None,
             control_plane: cp_with_permission(service),
             auto_approve: false,
             ..ToolContext::default()
@@ -261,6 +266,7 @@ mod tests {
         let tool = RequestPermissionTool::default();
         let ctx = ToolContext {
             workspace_dir: dir.path().to_path_buf(),
+            kernel_handle: None,
             control_plane: cp_with_permission(service),
             auto_approve: false,
             ..ToolContext::default()

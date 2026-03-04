@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use nyx_core::{AgentService, ControlPlaneExt};
+use nyx_core::{AgentService, ControlPlaneExt, KernelHandle};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -46,7 +46,7 @@ impl Tool for SubAgentTool {
         };
 
         match action {
-            "spawn" => invoke_spawn(input, ctx, &agent_service).await,
+            "spawn" => invoke_spawn(input, ctx, ctx.kernel_handle.as_ref(), &agent_service).await,
             "list" => {
                 let entries = agent_service.list_async_agents().await;
                 Ok(ToolResult::json(
@@ -82,6 +82,7 @@ impl Tool for SubAgentTool {
 async fn invoke_spawn(
     input: Value,
     ctx: &ToolContext,
+    kernel_handle: Option<&std::sync::Arc<dyn KernelHandle>>,
     agent_service: &std::sync::Arc<dyn AgentService>,
 ) -> Result<ToolResult, ToolError> {
     let prompt = required_str(&input, "prompt")?.to_string();
@@ -102,10 +103,19 @@ async fn invoke_spawn(
         .map(ToString::to_string);
 
     if blocking {
-        return match agent_service
-            .spawn_sub_agent(&ctx.invocation, prompt, tools, max_turns, provider)
-            .await
-        {
+        let result = match kernel_handle {
+            Some(handle) => {
+                handle
+                    .spawn_sub_agent(&ctx.invocation, prompt, tools, max_turns, provider)
+                    .await
+            }
+            None => {
+                agent_service
+                    .spawn_sub_agent(&ctx.invocation, prompt, tools, max_turns, provider)
+                    .await
+            }
+        };
+        return match result {
             Ok(text) => Ok(ToolResult::text(text)),
             Err(err) => Ok(ToolResult::error(err.to_string())),
         };
@@ -117,19 +127,38 @@ async fn invoke_spawn(
         .map(ToString::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    match agent_service
-        .spawn_async_agent(
-            &ctx.invocation,
-            id.clone(),
-            prompt,
-            tools,
-            agent_kind,
-            max_turns,
-            provider,
-            ctx.channel_id.clone(),
-        )
-        .await
-    {
+    let result = match kernel_handle {
+        Some(handle) => {
+            handle
+                .spawn_async_agent(
+                    &ctx.invocation,
+                    id.clone(),
+                    prompt,
+                    tools,
+                    agent_kind,
+                    max_turns,
+                    provider,
+                    ctx.channel_id.clone(),
+                )
+                .await
+        }
+        None => {
+            agent_service
+                .spawn_async_agent(
+                    &ctx.invocation,
+                    id.clone(),
+                    prompt,
+                    tools,
+                    agent_kind,
+                    max_turns,
+                    provider,
+                    ctx.channel_id.clone(),
+                )
+                .await
+        }
+    };
+
+    match result {
         Ok(()) => Ok(ToolResult::json(json!({
             "id": id,
             "status": "spawned",

@@ -998,6 +998,7 @@ mod tests {
         ToolContext {
             sandbox: Arc::new(NoopSandbox),
             workspace_dir: std::path::PathBuf::from("."),
+            kernel_handle: None,
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
             channel_id: None,
@@ -1038,6 +1039,7 @@ mod tests {
         let tool_ctx = ToolContext {
             sandbox: Arc::new(NoopSandbox),
             workspace_dir: temp_dir.path().to_path_buf(),
+            kernel_handle: None,
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
             channel_id: None,
@@ -1096,6 +1098,7 @@ mod tests {
         let tool_ctx = ToolContext {
             sandbox: Arc::new(sandbox),
             workspace_dir: workspace.path().to_path_buf(),
+            kernel_handle: None,
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
             channel_id: None,
@@ -1181,6 +1184,7 @@ mod tests {
         let tool_ctx = ToolContext {
             sandbox: Arc::new(sandbox),
             workspace_dir: workspace.path().to_path_buf(),
+            kernel_handle: None,
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
             channel_id: None,
@@ -1215,6 +1219,7 @@ mod tests {
         let tool_ctx = ToolContext {
             sandbox: spy.clone(),
             workspace_dir: std::path::PathBuf::from("."),
+            kernel_handle: None,
             control_plane: Arc::new(crate::NoopControlPlane),
             invocation: Default::default(),
             channel_id: None,
@@ -1394,7 +1399,9 @@ mod tests {
 
         let _ = registry.wait(&id, 500).await.expect("wait for process");
         let output = registry.read(&id, 50).await.expect("read output");
-        assert_eq!(output.stdout.trim(), temp_dir.path().display().to_string());
+        let expected = std::fs::canonicalize(temp_dir.path()).expect("canonicalize temp dir");
+        let actual = std::fs::canonicalize(output.stdout.trim()).expect("canonicalize output dir");
+        assert_eq!(actual, expected);
     }
 
     #[cfg(feature = "terminal")]

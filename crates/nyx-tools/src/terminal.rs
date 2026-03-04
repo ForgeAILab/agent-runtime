@@ -374,6 +374,8 @@ mod tests {
 
         let _ = registry.wait("pwd", 500).await.expect("wait for pwd");
         let output = registry.read("pwd", 50).await.expect("read output");
-        assert_eq!(output.stdout.trim(), workspace.path().display().to_string());
+        let expected = std::fs::canonicalize(workspace.path()).expect("canonicalize workspace");
+        let actual = std::fs::canonicalize(output.stdout.trim()).expect("canonicalize output");
+        assert_eq!(actual, expected);
     }
 }
