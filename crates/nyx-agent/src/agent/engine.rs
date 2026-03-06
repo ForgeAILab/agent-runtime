@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::{
     AfterToolContext, AgentContext, AgentError, AgentResponse, BeforeToolContext,
     CharBasedEstimator, HookAction, Message, MessageContent, MessageRole, TokenEstimator,
+    render::render_tool_result_for_provider,
 };
 
 #[derive(Debug, Clone)]
@@ -139,9 +140,55 @@ impl ToolLoopEngine {
                 request_messages.push(final_turn_system_message(turn, self.max_steps));
             }
 
-            let completion = self
+            let completion = match self
                 .call_provider(ctx, request_messages, !is_final_turn, config)
-                .await?;
+                .await
+            {
+                Ok(completion) => completion,
+                Err(err) if is_context_overflow(&err) => {
+                    let (Some(compressor), Some(token_budget)) =
+                        (&ctx.compressor, ctx.token_budget)
+                    else {
+                        return Err(err);
+                    };
+
+                    let forced_budget = (token_budget.saturating_mul(4) / 5).max(1);
+                    let estimator = CharBasedEstimator;
+                    let original_tokens = estimator.count_messages(&history);
+                    let compressed = compressor
+                        .compress(history.clone(), forced_budget, &estimator)
+                        .await?;
+                    let compressed_tokens = estimator.count_messages(&compressed);
+                    history = compressed;
+                    if let Err(emit_err) = ctx
+                        .sink
+                        .emit(Event::context_compressed(
+                            "nyx-agent",
+                            &ctx.channel_id,
+                            original_tokens,
+                            compressed_tokens,
+                            turn,
+                        ))
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %emit_err,
+                            step = turn,
+                            channel_id = %ctx.channel_id,
+                            "failed to emit context compressed event"
+                        );
+                    }
+
+                    let mut retry_messages =
+                        to_provider_messages(&history, config.convert_file_urls);
+                    if is_final_turn {
+                        retry_messages.push(final_turn_system_message(turn, self.max_steps));
+                    }
+                    self.call_provider(ctx, retry_messages, !is_final_turn, config)
+                        .await?
+                }
+                Err(err) => return Err(err),
+            };
             let text = completion.content.trim();
             let has_tool_calls = !completion.tool_calls.is_empty();
 
@@ -364,13 +411,6 @@ pub(crate) fn build_assistant_content(completion: &CompletionResponse) -> String
     serde_json::to_string(&blocks).unwrap_or_else(|_| completion.content.clone())
 }
 
-pub(crate) fn render_tool_result_for_provider(value: &Value) -> Result<String, AgentError> {
-    match value {
-        Value::String(text) => Ok(text.clone()),
-        _ => serde_json::to_string(value).map_err(|err| AgentError::Tool(err.to_string())),
-    }
-}
-
 pub(crate) fn render_tool_result_for_observer(value: &Value) -> String {
     fn scalar_text(value: &Value) -> Option<String> {
         match value {
@@ -443,6 +483,23 @@ pub(crate) fn render_tool_result_for_observer(value: &Value) -> String {
     }
 }
 
+fn is_context_overflow(err: &AgentError) -> bool {
+    let AgentError::Provider(message) = err else {
+        return false;
+    };
+    let text = message.to_ascii_lowercase();
+    [
+        "maximum context length",
+        "context length",
+        "context window",
+        "input tokens exceeds",
+        "too many tokens",
+        "prompt is too long",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 fn final_turn_system_message(turn: usize, max_steps: usize) -> ProviderMessage {
     ProviderMessage {
         role: ProviderRole::System,
@@ -454,5 +511,184 @@ fn final_turn_system_message(turn: usize, max_steps: usize) -> ProviderMessage {
             ),
         }],
         tool_call_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use nyx_obs::testing::CaptureSink;
+    use nyx_provider::{
+        CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
+    };
+    use tokio::sync::Mutex;
+
+    use super::{ToolLoopConfig, ToolLoopEngine};
+    use crate::{
+        AgentContext, AgentError, ContextCompressor, Message, MessageRole, TokenEstimator,
+    };
+
+    #[derive(Default)]
+    struct RecordingCompressor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContextCompressor for RecordingCompressor {
+        async fn compress(
+            &self,
+            mut history: Vec<Message>,
+            _token_budget: usize,
+            _estimator: &dyn TokenEstimator,
+        ) -> Result<Vec<Message>, AgentError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if history.len() > 1 {
+                history.truncate(1);
+            }
+            Ok(history)
+        }
+    }
+
+    struct OverflowThenSuccessProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for OverflowThenSuccessProvider {
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let call_idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_idx == 0 {
+                return Err(ProviderError::Rejected(
+                    "Request input tokens exceeds the model's maximum context length".to_string(),
+                ));
+            }
+            Ok(CompletionResponse {
+                content: "done".to_string(),
+                model: req.model,
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+
+        async fn stream(&self, _req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
+            Err(ProviderError::StreamingUnsupported)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct AlwaysOverflowProvider {
+        calls: Mutex<Vec<CompletionRequest>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AlwaysOverflowProvider {
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.calls.lock().await.push(req);
+            Err(ProviderError::Rejected(
+                "Request input tokens exceeds the model's maximum context length".to_string(),
+            ))
+        }
+
+        async fn stream(&self, _req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
+            Err(ProviderError::StreamingUnsupported)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn context_overflow_triggers_compression_and_retry() {
+        let provider = Arc::new(OverflowThenSuccessProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let compressor = Arc::new(RecordingCompressor::default());
+        let sink = CaptureSink::new();
+        let engine = ToolLoopEngine::new("test-model", 1);
+
+        let response = engine
+            .run(
+                &AgentContext {
+                    provider: provider.clone(),
+                    tools: Vec::new(),
+                    sink: Arc::new(sink),
+                    tool_ctx: nyx_tools::ToolContext::default(),
+                    history: vec![
+                        Message::text(MessageRole::System, "system"),
+                        Message::user("x".repeat(50_000)),
+                    ],
+                    hooks: Vec::new(),
+                    channel_id: "test:channel".to_string(),
+                    poll_client: None,
+                    compressor: Some(compressor.clone()),
+                    token_budget: Some(100_000),
+                    suppress_progressive: false,
+                    auto_approve: false,
+                },
+                &ToolLoopConfig {
+                    emit_progressive: true,
+                    use_tool_catalog: true,
+                    convert_file_urls: true,
+                },
+            )
+            .await
+            .expect("overflow should be recovered via forced compression retry");
+
+        assert_eq!(response.text, "done");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(compressor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_without_compressor_surfaces_error() {
+        let provider = Arc::new(AlwaysOverflowProvider {
+            calls: Mutex::new(Vec::new()),
+        });
+        let sink = CaptureSink::new();
+        let engine = ToolLoopEngine::new("test-model", 1);
+
+        let err = engine
+            .run(
+                &AgentContext {
+                    provider: provider.clone(),
+                    tools: Vec::new(),
+                    sink: Arc::new(sink),
+                    tool_ctx: nyx_tools::ToolContext::default(),
+                    history: vec![
+                        Message::text(MessageRole::System, "system"),
+                        Message::user("hello"),
+                    ],
+                    hooks: Vec::new(),
+                    channel_id: "test:channel".to_string(),
+                    poll_client: None,
+                    compressor: None,
+                    token_budget: Some(10_000),
+                    suppress_progressive: false,
+                    auto_approve: false,
+                },
+                &ToolLoopConfig {
+                    emit_progressive: true,
+                    use_tool_catalog: true,
+                    convert_file_urls: true,
+                },
+            )
+            .await
+            .expect_err("overflow should bubble up without compressor");
+
+        assert!(matches!(err, AgentError::Provider(_)));
+        assert_eq!(provider.calls.lock().await.len(), 1);
     }
 }
