@@ -52,13 +52,13 @@ fn strip_image_content(req: CompletionRequest) -> CompletionRequest {
                 let content = msg
                     .content
                     .into_iter()
-                    .filter_map(|c| match c {
+                    .map(|c| match c {
                         ProviderContent::Image { .. } => {
-                            Some(ProviderContent::Text {
+                            ProviderContent::Text {
                                 text: "[image omitted — not supported by this provider]".to_string(),
-                            })
+                            }
                         }
-                        other => Some(other),
+                        other => other,
                     })
                     .collect();
                 ProviderMessage {
