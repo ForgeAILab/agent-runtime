@@ -84,7 +84,7 @@ impl ToolLoopEngine {
                 tools,
                 max_tokens: None,
                 temperature: None,
-                thinking_tokens: None,
+                thinking_tokens: ctx.thinking_tokens,
             })
             .await
             .map_err(Into::into)
@@ -635,6 +635,7 @@ mod tests {
                     poll_client: None,
                     compressor: Some(compressor.clone()),
                     token_budget: Some(100_000),
+                    thinking_tokens: None,
                     suppress_progressive: false,
                     auto_approve: false,
                 },
@@ -676,6 +677,7 @@ mod tests {
                     poll_client: None,
                     compressor: None,
                     token_budget: Some(10_000),
+                    thinking_tokens: None,
                     suppress_progressive: false,
                     auto_approve: false,
                 },
