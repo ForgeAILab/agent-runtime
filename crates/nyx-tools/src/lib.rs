@@ -6,6 +6,8 @@ mod mcp;
 mod registry;
 #[cfg(feature = "permission")]
 mod request_permission;
+#[cfg(feature = "session")]
+mod session;
 mod skill_tool;
 #[cfg(feature = "sub-agent")]
 mod sub_agent_tool;
@@ -26,6 +28,8 @@ pub use mcp::*;
 pub use registry::*;
 #[cfg(feature = "permission")]
 pub use request_permission::*;
+#[cfg(feature = "session")]
+pub use session::*;
 pub use skill_tool::*;
 #[cfg(feature = "sub-agent")]
 pub use sub_agent_tool::*;
@@ -41,6 +45,8 @@ pub fn build_tools(sandbox: Arc<dyn Sandbox>) -> Result<Vec<Arc<dyn Tool>>, Regi
     register_builtins(&mut registry, sandbox)?;
     #[cfg(feature = "permission")]
     registry.register(Arc::new(RequestPermissionTool::default()))?;
+    #[cfg(feature = "session")]
+    registry.register(Arc::new(SessionTool::default()))?;
     Ok(registry.seal())
 }
 
@@ -87,5 +93,7 @@ mod tests {
             names.contains("request_permission"),
             "missing request_permission tool"
         );
+        #[cfg(feature = "session")]
+        assert!(names.contains("session"), "missing session tool");
     }
 }
