@@ -30,10 +30,11 @@ impl OpenAiCompatProvider {
 /// `image_url` content block and will reject the request (e.g. ZhipuAI error
 /// 1210).  Stripping images here keeps the native OpenAI provider untouched.
 fn strip_image_content(req: CompletionRequest) -> CompletionRequest {
-    let has_images = req
-        .messages
-        .iter()
-        .any(|m| m.content.iter().any(|c| matches!(c, ProviderContent::Image { .. })));
+    let has_images = req.messages.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|c| matches!(c, ProviderContent::Image { .. }))
+    });
     if !has_images {
         return req;
     }
@@ -53,18 +54,13 @@ fn strip_image_content(req: CompletionRequest) -> CompletionRequest {
                     .content
                     .into_iter()
                     .map(|c| match c {
-                        ProviderContent::Image { .. } => {
-                            ProviderContent::Text {
-                                text: "[image omitted — not supported by this provider]".to_string(),
-                            }
-                        }
+                        ProviderContent::Image { .. } => ProviderContent::Text {
+                            text: "[image omitted — not supported by this provider]".to_string(),
+                        },
                         other => other,
                     })
                     .collect();
-                ProviderMessage {
-                    content,
-                    ..msg
-                }
+                ProviderMessage { content, ..msg }
             })
             .collect(),
         ..req
