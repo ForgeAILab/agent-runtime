@@ -46,7 +46,7 @@ pub fn build_tools(sandbox: Arc<dyn Sandbox>) -> Result<Vec<Arc<dyn Tool>>, Regi
     #[cfg(feature = "permission")]
     registry.register(Arc::new(RequestPermissionTool::default()))?;
     #[cfg(feature = "session")]
-    registry.register(Arc::new(SessionTool::default()))?;
+    registry.register(Arc::new(SessionTool))?;
     Ok(registry.seal())
 }
 
