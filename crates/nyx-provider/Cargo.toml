@@ -2,6 +2,10 @@
 name = "nyx-provider"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
+description = "LLM provider traits and implementations for Nyx"
+license.workspace = true
+repository.workspace = true
 
 [features]
 default = ["compat"]
