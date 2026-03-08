@@ -147,6 +147,15 @@ fn build_payload(req: CompletionRequest, stream: bool) -> serde_json::Value {
     if let Some(temperature) = req.temperature {
         payload["temperature"] = json!(temperature);
     }
+    if let Some(budget) = req.thinking_tokens {
+        let effort = match budget {
+            0 => "low",
+            1..=1024 => "low",
+            1025..=8192 => "medium",
+            _ => "high",
+        };
+        payload["reasoning"] = json!({"effort": effort});
+    }
 
     payload
 }

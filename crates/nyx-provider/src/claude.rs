@@ -128,6 +128,11 @@ impl ClaudeProvider {
             })
             .collect();
 
+        let thinking = req.thinking_tokens.map(|budget| ClaudeThinking {
+            kind: "enabled".to_string(),
+            budget_tokens: budget,
+        });
+
         let payload = ClaudeMessagesRequest {
             model: req.model,
             max_tokens: req.max_tokens.unwrap_or(1024),
@@ -139,6 +144,7 @@ impl ClaudeProvider {
             messages,
             temperature: req.temperature,
             tools,
+            thinking,
         };
 
         let response = self
@@ -284,6 +290,13 @@ struct ClaudeToolDefinition {
 }
 
 #[derive(Debug, Serialize)]
+struct ClaudeThinking {
+    #[serde(rename = "type")]
+    kind: String,
+    budget_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
 struct ClaudeMessagesRequest {
     model: String,
     max_tokens: u32,
@@ -294,6 +307,8 @@ struct ClaudeMessagesRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ClaudeToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ClaudeThinking>,
 }
 
 #[derive(Debug, Serialize)]

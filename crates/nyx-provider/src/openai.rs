@@ -102,13 +102,29 @@ impl OpenAiProvider {
             })
             .collect();
 
+        let (max_tokens, reasoning_effort) = if let Some(budget) = req.thinking_tokens {
+            // Reasoning models use max_completion_tokens (which includes
+            // reasoning tokens) instead of max_tokens, and accept a
+            // reasoning_effort hint.
+            let effort = match budget {
+                0 => None,
+                1..=1024 => Some("low"),
+                1025..=8192 => Some("medium"),
+                _ => Some("high"),
+            };
+            (req.max_tokens, effort)
+        } else {
+            (req.max_tokens, None)
+        };
+
         let payload = OpenAiCompletionRequest {
             model: req.model,
             messages,
             tools,
-            max_tokens: req.max_tokens,
+            max_tokens,
             temperature: req.temperature,
             stream: Some(false),
+            reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         };
 
         let response = self
@@ -269,6 +285,8 @@ struct OpenAiCompletionRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
