@@ -1,9 +1,13 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nyx_security::Secret;
 use serde::{Deserialize, Serialize};
 
-use crate::{CircuitBreakerProvider, FallbackProvider, LlmProvider, ProviderError, RetryProvider};
+use crate::{
+    BearerTokenSource, CircuitBreakerProvider, FallbackProvider, LlmProvider, ProviderError,
+    RetryProvider,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
@@ -86,6 +90,8 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
     #[serde(default, skip_serializing_if = "is_default_retry")]
     pub retry: RetryConfig,
     #[serde(default, skip_serializing_if = "is_default_circuit_breaker")]
@@ -101,6 +107,7 @@ impl Default for ProviderConfig {
             api_key_env: None,
             base_url: None,
             context_window: None,
+            auth_profile: None,
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
         }
@@ -209,8 +216,9 @@ fn make_compat_no_key(
     )
 }
 
-pub fn build_provider(
+pub fn build_provider_with_token_sources(
     cfg: &ProviderConfig,
+    _token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
 ) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
     tracing::debug!(
         kind = cfg.kind.as_str(),
@@ -249,6 +257,30 @@ pub fn build_provider(
         #[cfg(not(feature = "claude"))]
         "claude" | "anthropic" => Err(ProviderError::Rejected(
             "provider `claude` is not compiled in this build".to_string(),
+        )),
+
+        #[cfg(feature = "codex")]
+        "openai-codex" | "openai_codex" | "codex" => {
+            let token_source = if let Some(source) =
+                crate::codex::resolve_token_source(_token_sources, cfg.auth_profile.as_deref())
+            {
+                source
+            } else if cfg.api_key.is_some() {
+                Arc::new(crate::codex::FailingTokenSource::new(
+                    "oauth profile not configured",
+                ))
+            } else {
+                return Err(ProviderError::Rejected(
+                    "missing oauth token source for `openai-codex` provider".to_string(),
+                ));
+            };
+
+            let provider = crate::codex::OpenAiCodexProvider::new(token_source, cfg);
+            Ok((Arc::new(provider), cfg.model.clone()))
+        }
+        #[cfg(not(feature = "codex"))]
+        "openai-codex" | "openai_codex" | "codex" => Err(ProviderError::Rejected(
+            "provider `openai-codex` requires `codex` feature in this build".to_string(),
         )),
 
         #[cfg(feature = "compat")]
@@ -379,7 +411,14 @@ pub fn build_provider(
     }
 }
 
-pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider, ProviderError> {
+pub fn build_provider(cfg: &ProviderConfig) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
+    build_provider_with_token_sources(cfg, &HashMap::new())
+}
+
+pub fn build_provider_chain_with_token_sources(
+    cfgs: &[ProviderConfig],
+    token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
+) -> Result<FallbackProvider, ProviderError> {
     if cfgs.is_empty() {
         return Err(ProviderError::Rejected(
             "provider chain must not be empty".to_string(),
@@ -388,7 +427,7 @@ pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider,
 
     let mut chain = Vec::with_capacity(cfgs.len());
     for cfg in cfgs {
-        let (provider, model) = build_provider(cfg)?;
+        let (provider, model) = build_provider_with_token_sources(cfg, token_sources)?;
         let retried: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(provider, &cfg.retry));
         let provider: Arc<dyn LlmProvider> =
             Arc::new(CircuitBreakerProvider::new(retried, &cfg.circuit_breaker));
@@ -396,6 +435,10 @@ pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider,
     }
 
     Ok(FallbackProvider::new(chain))
+}
+
+pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider, ProviderError> {
+    build_provider_chain_with_token_sources(cfgs, &HashMap::new())
 }
 
 #[cfg(test)]

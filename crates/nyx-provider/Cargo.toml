@@ -8,6 +8,7 @@ default = ["compat"]
 openai = []
 claude = []
 compat = ["openai"]
+codex = []
 cost = ["dep:nyx-obs", "dep:nyx-tools", "dep:time"]
 cost-sqlite = ["cost", "dep:rusqlite", "dep:nyx-store"]
 
@@ -17,10 +18,11 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 nyx-security = { path = "../nyx-security" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tokio = { workspace = true, features = ["sync"] }
 tokio-stream = "0.1"
 futures-core = "0.3"
+futures-util = "0.3"
 tracing = { workspace = true }
 rusqlite = { version = "0.33", features = ["bundled"], optional = true }
 nyx-store = { path = "../nyx-store", default-features = false, features = ["sqlite"], optional = true }

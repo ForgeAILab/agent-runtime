@@ -133,6 +133,11 @@ pub enum ProviderError {
 }
 
 #[async_trait]
+pub trait BearerTokenSource: Send + Sync {
+    async fn get_token(&self) -> Result<String, ProviderError>;
+}
+
+#[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Execute a completion request.
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError>;
@@ -217,6 +222,9 @@ pub mod openai;
 
 #[cfg(feature = "claude")]
 pub mod claude;
+
+#[cfg(feature = "codex")]
+pub mod codex;
 
 #[cfg(feature = "compat")]
 pub mod compat;
