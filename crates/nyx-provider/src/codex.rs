@@ -383,10 +383,8 @@ mod tests {
             model: "codex".to_string(),
             ..Default::default()
         };
-        let provider = OpenAiCodexProvider::new(
-            Arc::new(FailingTokenSource::new("oauth unavailable")),
-            &cfg,
-        );
+        let provider =
+            OpenAiCodexProvider::new(Arc::new(FailingTokenSource::new("oauth unavailable")), &cfg);
 
         let resp = provider
             .complete(CompletionRequest {

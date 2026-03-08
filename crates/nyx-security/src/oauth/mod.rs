@@ -105,7 +105,8 @@ pub fn build_authorize_url(
     pkce: &PkceState,
     extra_params: Option<&HashMap<String, String>>,
 ) -> Result<String, SecurityError> {
-    let mut url = Url::parse(endpoint).map_err(|err| SecurityError::InvalidPath(err.to_string()))?;
+    let mut url =
+        Url::parse(endpoint).map_err(|err| SecurityError::InvalidPath(err.to_string()))?;
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("response_type", "code");
@@ -152,7 +153,8 @@ pub async fn receive_loopback_code(
         .ok_or_else(|| SecurityError::InvalidPath("invalid oauth callback request".to_string()))?;
 
     let fake_url = format!("http://localhost{path}");
-    let parsed = Url::parse(&fake_url).map_err(|err| SecurityError::InvalidPath(err.to_string()))?;
+    let parsed =
+        Url::parse(&fake_url).map_err(|err| SecurityError::InvalidPath(err.to_string()))?;
     let mut code = None;
     let mut state = None;
     for (k, v) in parsed.query_pairs() {
@@ -174,7 +176,9 @@ pub async fn receive_loopback_code(
         .map_err(|err| SecurityError::InvalidPath(err.to_string()))?;
 
     if state.as_deref() != Some(expected_state) {
-        return Err(SecurityError::InvalidPath("oauth state mismatch".to_string()));
+        return Err(SecurityError::InvalidPath(
+            "oauth state mismatch".to_string(),
+        ));
     }
 
     code.ok_or_else(|| SecurityError::InvalidPath("missing oauth authorization code".to_string()))
@@ -280,10 +284,13 @@ pub async fn poll_device_code(
             return Ok(wire.into_token_set());
         }
 
-        let parsed = response.json::<OAuthErrorBody>().await.unwrap_or(OAuthErrorBody {
-            error: "unknown_error".to_string(),
-            error_description: None,
-        });
+        let parsed = response
+            .json::<OAuthErrorBody>()
+            .await
+            .unwrap_or(OAuthErrorBody {
+                error: "unknown_error".to_string(),
+                error_description: None,
+            });
         match parsed.error.as_str() {
             "authorization_pending" => {
                 tokio::time::sleep(Duration::from_secs(current_interval)).await;
@@ -488,9 +495,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let token = refresh_access_token(&format!("{}/token", server.uri()), "client", "old-refresh")
-            .await
-            .expect("refresh");
+        let token =
+            refresh_access_token(&format!("{}/token", server.uri()), "client", "old-refresh")
+                .await
+                .expect("refresh");
         assert_eq!(token.access_token, "new-access");
         assert_eq!(token.refresh_token.as_deref(), Some("old-refresh"));
     }

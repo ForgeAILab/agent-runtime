@@ -13,9 +13,9 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
 
 mod config;
-mod secret;
 #[cfg(feature = "oauth")]
 pub mod oauth;
+mod secret;
 
 pub use config::{SecurityConfig, build_sandbox, build_sandbox_at_root, build_secret_store};
 pub use secret::{Secret, decrypt, derive_master_key, encrypt};

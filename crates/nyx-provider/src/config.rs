@@ -411,7 +411,9 @@ pub fn build_provider_with_token_sources(
     }
 }
 
-pub fn build_provider(cfg: &ProviderConfig) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
+pub fn build_provider(
+    cfg: &ProviderConfig,
+) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
     build_provider_with_token_sources(cfg, &HashMap::new())
 }
 

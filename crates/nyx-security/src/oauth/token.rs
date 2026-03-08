@@ -51,7 +51,12 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
 
     ["account_id", "accountId", "acct", "sub"]
         .iter()
-        .find_map(|key| value.get(key).and_then(Value::as_str).map(ToString::to_string))
+        .find_map(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 #[cfg(test)]

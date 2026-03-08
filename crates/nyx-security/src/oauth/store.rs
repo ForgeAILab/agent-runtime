@@ -21,7 +21,10 @@ pub trait OAuthProfileStore: Send + Sync {
 
     async fn store_profile(&self, profile: OAuthProfile) -> Result<(), SecurityError>;
 
-    async fn list_profiles(&self, provider: Option<&str>) -> Result<Vec<OAuthProfile>, SecurityError>;
+    async fn list_profiles(
+        &self,
+        provider: Option<&str>,
+    ) -> Result<Vec<OAuthProfile>, SecurityError>;
 
     async fn delete_profile(&self, provider: &str, name: &str) -> Result<bool, SecurityError>;
 
@@ -105,7 +108,10 @@ impl FileOAuthProfileStore {
         save_profiles_file(&self.path, data)
     }
 
-    async fn hydrate_profile(&self, mut profile: OAuthProfile) -> Result<OAuthProfile, SecurityError> {
+    async fn hydrate_profile(
+        &self,
+        mut profile: OAuthProfile,
+    ) -> Result<OAuthProfile, SecurityError> {
         let Some(store) = &self.secret_store else {
             return Ok(profile);
         };
@@ -134,7 +140,10 @@ impl FileOAuthProfileStore {
         Ok(profile)
     }
 
-    async fn dehydrate_profile(&self, mut profile: OAuthProfile) -> Result<OAuthProfile, SecurityError> {
+    async fn dehydrate_profile(
+        &self,
+        mut profile: OAuthProfile,
+    ) -> Result<OAuthProfile, SecurityError> {
         let Some(store) = &self.secret_store else {
             return Ok(profile);
         };
@@ -144,7 +153,10 @@ impl FileOAuthProfileStore {
             profile.provider, profile.profile_name
         );
         store
-            .set(&access_key, Secret::from_string(profile.token_set.access_token.clone()))
+            .set(
+                &access_key,
+                Secret::from_string(profile.token_set.access_token.clone()),
+            )
             .await
             .map_err(SecurityError::from)?;
         profile.token_set.access_token = format!("vault:{access_key}");
@@ -162,7 +174,10 @@ impl FileOAuthProfileStore {
         }
 
         if let Some(id_token) = profile.token_set.id_token.clone() {
-            let id_key = format!("oauth:{}:{}:id_token", profile.provider, profile.profile_name);
+            let id_key = format!(
+                "oauth:{}:{}:id_token",
+                profile.provider, profile.profile_name
+            );
             store
                 .set(&id_key, Secret::from_string(id_token))
                 .await
@@ -198,15 +213,19 @@ impl OAuthProfileStore for FileOAuthProfileStore {
     async fn store_profile(&self, profile: OAuthProfile) -> Result<(), SecurityError> {
         self.with_lock(|| async move {
             let mut data = self.load_raw().await?;
-            data.profiles
-                .retain(|p| !(p.provider == profile.provider && p.profile_name == profile.profile_name));
+            data.profiles.retain(|p| {
+                !(p.provider == profile.provider && p.profile_name == profile.profile_name)
+            });
             data.profiles.push(self.dehydrate_profile(profile).await?);
             self.save_raw(&data).await
         })
         .await
     }
 
-    async fn list_profiles(&self, provider: Option<&str>) -> Result<Vec<OAuthProfile>, SecurityError> {
+    async fn list_profiles(
+        &self,
+        provider: Option<&str>,
+    ) -> Result<Vec<OAuthProfile>, SecurityError> {
         self.with_lock(|| async move {
             let data = self.load_raw().await?;
             let mut out = Vec::new();
@@ -226,7 +245,11 @@ impl OAuthProfileStore for FileOAuthProfileStore {
             let before = data.profiles.len();
             data.profiles
                 .retain(|p| !(p.provider == provider && p.profile_name == name));
-            if data.active.get(provider).is_some_and(|active| active == name) {
+            if data
+                .active
+                .get(provider)
+                .is_some_and(|active| active == name)
+            {
                 data.active.remove(provider);
             }
             let removed = data.profiles.len() != before;
@@ -267,18 +290,21 @@ fn load_profiles_file(path: &Path) -> Result<StoredProfiles, SecurityError> {
     if !path.exists() {
         return Ok(StoredProfiles::default());
     }
-    let raw = std::fs::read_to_string(path).map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
     serde_json::from_str(&raw).map_err(|err| SecurityError::EncryptionFailed(err.to_string()))
 }
 
 fn save_profiles_file(path: &Path, data: &StoredProfiles) -> Result<(), SecurityError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
     }
     let tmp = path.with_extension("json.tmp");
-    let encoded =
-        serde_json::to_string_pretty(data).map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
-    std::fs::write(&tmp, encoded).map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
+    let encoded = serde_json::to_string_pretty(data)
+        .map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
+    std::fs::write(&tmp, encoded)
+        .map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
     std::fs::rename(tmp, path).map_err(|err| SecurityError::EncryptionFailed(err.to_string()))
 }
 
@@ -307,12 +333,17 @@ pub mod testing {
 
         async fn store_profile(&self, profile: OAuthProfile) -> Result<(), SecurityError> {
             let mut guard = self.profiles.write().await;
-            guard.retain(|p| !(p.provider == profile.provider && p.profile_name == profile.profile_name));
+            guard.retain(|p| {
+                !(p.provider == profile.provider && p.profile_name == profile.profile_name)
+            });
             guard.push(profile);
             Ok(())
         }
 
-        async fn list_profiles(&self, provider: Option<&str>) -> Result<Vec<OAuthProfile>, SecurityError> {
+        async fn list_profiles(
+            &self,
+            provider: Option<&str>,
+        ) -> Result<Vec<OAuthProfile>, SecurityError> {
             let guard = self.profiles.read().await;
             Ok(guard
                 .iter()
@@ -328,7 +359,10 @@ pub mod testing {
             let removed = before != guard.len();
             if removed {
                 let mut active = self.active.write().await;
-                if active.get(provider).is_some_and(|candidate| candidate == name) {
+                if active
+                    .get(provider)
+                    .is_some_and(|candidate| candidate == name)
+                {
                     active.remove(provider);
                 }
             }
@@ -410,15 +444,19 @@ mod tests {
             Some("default".to_string())
         );
 
-        assert!(store
-            .delete_profile("openai-codex", "default")
-            .await
-            .expect("delete"));
-        assert!(store
-            .get_profile("openai-codex", "default")
-            .await
-            .expect("get")
-            .is_none());
+        assert!(
+            store
+                .delete_profile("openai-codex", "default")
+                .await
+                .expect("delete")
+        );
+        assert!(
+            store
+                .get_profile("openai-codex", "default")
+                .await
+                .expect("get")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -439,6 +477,9 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(fetched.token_set.access_token, "access-plain");
-        assert_eq!(fetched.token_set.refresh_token.as_deref(), Some("refresh-plain"));
+        assert_eq!(
+            fetched.token_set.refresh_token.as_deref(),
+            Some("refresh-plain")
+        );
     }
 }
