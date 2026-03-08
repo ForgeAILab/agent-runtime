@@ -90,6 +90,19 @@ impl ToolLoopEngine {
             .map_err(Into::into)
     }
 
+    async fn call_provider_cancellable(
+        &self,
+        ctx: &AgentContext,
+        messages: Vec<ProviderMessage>,
+        include_tools: bool,
+        config: &ToolLoopConfig,
+    ) -> Result<CompletionResponse, AgentError> {
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => Err(AgentError::Cancelled),
+            response = self.call_provider(ctx, messages, include_tools, config) => response,
+        }
+    }
+
     pub async fn run(
         &self,
         ctx: &AgentContext,
@@ -104,6 +117,10 @@ impl ToolLoopEngine {
         }
 
         for turn in 0..self.max_steps {
+            if ctx.cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+
             if let (Some(compressor), Some(token_budget)) = (&ctx.compressor, ctx.token_budget) {
                 let estimator = CharBasedEstimator;
                 let original_tokens = estimator.count_messages(&history);
@@ -141,7 +158,7 @@ impl ToolLoopEngine {
             }
 
             let completion = match self
-                .call_provider(ctx, request_messages, !is_final_turn, config)
+                .call_provider_cancellable(ctx, request_messages, !is_final_turn, config)
                 .await
             {
                 Ok(completion) => completion,
@@ -184,7 +201,7 @@ impl ToolLoopEngine {
                     if is_final_turn {
                         retry_messages.push(final_turn_system_message(turn, self.max_steps));
                     }
-                    self.call_provider(ctx, retry_messages, !is_final_turn, config)
+                    self.call_provider_cancellable(ctx, retry_messages, !is_final_turn, config)
                         .await?
                 }
                 Err(err) => return Err(err),
@@ -337,6 +354,10 @@ impl ToolLoopEngine {
                     .map_err(|err| AgentError::Observability(err.to_string()))?;
 
                 history.push(Message::tool_result(tool_call.id.clone(), tool_result_text));
+
+                if ctx.cancel.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
             }
         }
 
@@ -636,6 +657,7 @@ mod tests {
                     compressor: Some(compressor.clone()),
                     token_budget: Some(100_000),
                     thinking_tokens: None,
+                    cancel: tokio_util::sync::CancellationToken::new(),
                     suppress_progressive: false,
                     auto_approve: false,
                 },
@@ -678,6 +700,7 @@ mod tests {
                     compressor: None,
                     token_budget: Some(10_000),
                     thinking_tokens: None,
+                    cancel: tokio_util::sync::CancellationToken::new(),
                     suppress_progressive: false,
                     auto_approve: false,
                 },
