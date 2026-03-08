@@ -27,7 +27,7 @@ impl RetryProvider {
     }
 }
 
-fn is_retryable(err: &ProviderError) -> bool {
+pub(crate) fn is_retryable(err: &ProviderError) -> bool {
     match err {
         ProviderError::Http(e) => {
             if e.is_connect() || e.is_timeout() {

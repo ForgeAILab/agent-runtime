@@ -6,9 +6,11 @@ use thiserror::Error;
 
 mod tool_call;
 pub use tool_call::{JsonDirectiveParser, ToolCall, ToolCallParser, XmlDirectiveParser};
+mod circuit_breaker;
 pub mod config;
 mod fallback;
 mod retry;
+pub use circuit_breaker::CircuitBreakerProvider;
 pub use fallback::FallbackProvider;
 pub use retry::RetryProvider;
 

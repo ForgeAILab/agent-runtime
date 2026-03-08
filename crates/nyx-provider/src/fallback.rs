@@ -285,4 +285,52 @@ mod tests {
         assert_eq!(first.health_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second.health_calls.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn circuit_broken_first_leg_skips_to_second_immediately() {
+        use crate::CircuitBreakerProvider;
+        use crate::config::CircuitBreakerConfig;
+
+        // First provider always fails (transient 500)
+        let first = Arc::new(StubProvider::new(false, false, false, "500 Server Error"));
+        let second = Arc::new(StubProvider::new(true, true, true, "second-ok"));
+
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown_secs: 300, // long cooldown so it stays open
+            half_open_successes: 1,
+        };
+
+        // Wrap first leg in a circuit breaker
+        let first_cb: Arc<dyn LlmProvider> = Arc::new(CircuitBreakerProvider::new(
+            Arc::clone(&first) as Arc<dyn LlmProvider>,
+            &cb_config,
+        ));
+
+        let provider = FallbackProvider::new(vec![
+            (first_cb, "model-first".to_string()),
+            (
+                Arc::clone(&second) as Arc<dyn LlmProvider>,
+                "model-second".to_string(),
+            ),
+        ]);
+
+        // First call: hits first provider (fails, trips circuit), falls back to second
+        let resp = provider
+            .complete(request())
+            .await
+            .expect("fallback succeeds");
+        assert_eq!(resp.content, "second-ok");
+        assert_eq!(first.complete_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.complete_calls.load(Ordering::SeqCst), 1);
+
+        // Second call: circuit is open, first leg is skipped entirely, goes straight to second
+        let resp = provider
+            .complete(request())
+            .await
+            .expect("fallback succeeds");
+        assert_eq!(resp.content, "second-ok");
+        assert_eq!(first.complete_calls.load(Ordering::SeqCst), 1); // NOT called again
+        assert_eq!(second.complete_calls.load(Ordering::SeqCst), 2);
+    }
 }

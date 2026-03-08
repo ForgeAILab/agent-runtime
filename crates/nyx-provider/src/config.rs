@@ -3,7 +3,7 @@ use std::sync::Arc;
 use nyx_security::Secret;
 use serde::{Deserialize, Serialize};
 
-use crate::{FallbackProvider, LlmProvider, ProviderError, RetryProvider};
+use crate::{CircuitBreakerProvider, FallbackProvider, LlmProvider, ProviderError, RetryProvider};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetryConfig {
@@ -35,6 +35,44 @@ fn is_default_retry(r: &RetryConfig) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default = "default_half_open_successes")]
+    pub half_open_successes: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_failure_threshold(),
+            cooldown_secs: default_cooldown_secs(),
+            half_open_successes: default_half_open_successes(),
+        }
+    }
+}
+
+fn default_failure_threshold() -> u32 {
+    5
+}
+
+fn default_cooldown_secs() -> u64 {
+    60
+}
+
+fn default_half_open_successes() -> u32 {
+    1
+}
+
+fn is_default_circuit_breaker(cb: &CircuitBreakerConfig) -> bool {
+    cb.failure_threshold == default_failure_threshold()
+        && cb.cooldown_secs == default_cooldown_secs()
+        && cb.half_open_successes == default_half_open_successes()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     #[serde(default = "default_provider_kind")]
     pub kind: String,
@@ -50,6 +88,8 @@ pub struct ProviderConfig {
     pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "is_default_retry")]
     pub retry: RetryConfig,
+    #[serde(default, skip_serializing_if = "is_default_circuit_breaker")]
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 impl Default for ProviderConfig {
@@ -62,6 +102,7 @@ impl Default for ProviderConfig {
             base_url: None,
             context_window: None,
             retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 }
@@ -348,7 +389,9 @@ pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider,
     let mut chain = Vec::with_capacity(cfgs.len());
     for cfg in cfgs {
         let (provider, model) = build_provider(cfg)?;
-        let provider: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(provider, &cfg.retry));
+        let retried: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(provider, &cfg.retry));
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(CircuitBreakerProvider::new(retried, &cfg.circuit_breaker));
         chain.push((provider, model));
     }
 
