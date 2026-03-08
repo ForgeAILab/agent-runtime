@@ -49,12 +49,25 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let value: Value = serde_json::from_slice(&decoded).ok()?;
 
+    // OpenAI stores the account ID under a namespaced claim:
+    // { "https://api.openai.com/auth": { "chatgpt_account_id": "acct_xxx" } }
+    if let Some(acct) = value
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(acct.to_string());
+    }
+
+    // Fallback to generic claims for non-OpenAI providers
     ["account_id", "accountId", "acct", "sub"]
         .iter()
         .find_map(|key| {
             value
                 .get(key)
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
         })
 }
@@ -89,6 +102,23 @@ mod tests {
         };
         assert!(soon.expires_within(Duration::from_secs(60)));
         assert!(!soon.expires_within(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn extracts_account_id_from_openai_namespaced_claim() {
+        let mk = |json: &str| -> String {
+            let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+            let payload = URL_SAFE_NO_PAD.encode(json.as_bytes());
+            format!("{header}.{payload}.")
+        };
+
+        // OpenAI-style namespaced claim takes priority
+        assert_eq!(
+            extract_account_id_from_jwt(&mk(
+                r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-openai"},"sub":"acct-sub"}"#
+            )),
+            Some("acct-openai".to_string())
+        );
     }
 
     #[test]
