@@ -92,12 +92,12 @@ impl Tool for SkillTool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, LazyLock};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use nyx_core::{
-        ControlPlane, InvocationContext, KernelError, Service, ServiceId, ServiceRegistryBuilder,
-        SkillDetail, SkillInfo, SkillService,
+        ControlPlane, InvocationContext, KernelError, ServiceRegistryBuilder, SkillDetail,
+        SkillInfo, SkillService,
     };
     use serde_json::json;
 
@@ -105,14 +105,6 @@ mod tests {
     use crate::{Tool, ToolContext};
 
     struct MockSkillService;
-
-    #[async_trait]
-    impl Service for MockSkillService {
-        fn service_id(&self) -> &ServiceId {
-            static ID: LazyLock<ServiceId> = LazyLock::new(|| ServiceId::new("skills"));
-            &ID
-        }
-    }
 
     #[async_trait]
     impl SkillService for MockSkillService {
@@ -156,11 +148,7 @@ mod tests {
         let mut builder = ServiceRegistryBuilder::new();
         let service: Arc<dyn SkillService> = Arc::new(MockSkillService);
         builder
-            .register_service::<dyn SkillService>(
-                ServiceId::new("skills"),
-                Arc::clone(&service),
-                service as Arc<dyn Service>,
-            )
+            .register_type::<dyn SkillService>(service)
             .expect("register skill service");
         builder.seal().expect("seal control plane")
     }

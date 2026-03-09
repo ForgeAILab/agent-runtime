@@ -199,13 +199,13 @@ fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use chrono::Utc;
     use nyx_core::{
         AgentService, AsyncAgentFetchResult, AsyncAgentInfo, AsyncAgentStatus, ControlPlane,
-        InvocationContext, KernelError, Service, ServiceId, ServiceRegistryBuilder,
+        InvocationContext, KernelError, ServiceRegistryBuilder,
     };
     use serde_json::json;
 
@@ -226,14 +226,6 @@ mod tests {
             )>,
         >,
         stop_calls: Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl Service for MockAgentService {
-        fn service_id(&self) -> &ServiceId {
-            static ID: LazyLock<ServiceId> = LazyLock::new(|| ServiceId::new("agent"));
-            &ID
-        }
     }
 
     #[async_trait]
@@ -303,11 +295,7 @@ mod tests {
     fn cp_with_agent_service(service: Arc<dyn AgentService>) -> Arc<dyn ControlPlane> {
         let mut builder = ServiceRegistryBuilder::new();
         builder
-            .register_service::<dyn AgentService>(
-                ServiceId::new("agent"),
-                Arc::clone(&service),
-                service as Arc<dyn Service>,
-            )
+            .register_type::<dyn AgentService>(service)
             .expect("register agent service");
         builder.seal().expect("seal control plane")
     }

@@ -342,12 +342,12 @@ fn now_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use nyx_core::{
-        KernelError, ResolvedSessionConfig, Service, ServiceId, ServiceRegistryBuilder,
-        SessionMetadata, SessionMetadataService, ToolSelection,
+        KernelError, ResolvedSessionConfig, ServiceRegistryBuilder, SessionMetadata,
+        SessionMetadataService, ToolSelection,
     };
     use serde_json::json;
 
@@ -359,14 +359,6 @@ mod tests {
         items: Mutex<Vec<SessionMetadata>>,
         merge_calls: Mutex<Vec<(String, String)>>,
         delete_calls: Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl Service for MockSessionMetadataService {
-        fn service_id(&self) -> &ServiceId {
-            static ID: LazyLock<ServiceId> = LazyLock::new(|| ServiceId::new("session_metadata"));
-            &ID
-        }
     }
 
     #[async_trait]
@@ -448,11 +440,7 @@ mod tests {
     ) -> Arc<dyn nyx_core::ControlPlane> {
         let mut builder = ServiceRegistryBuilder::new();
         builder
-            .register_service::<dyn SessionMetadataService>(
-                ServiceId::new("session_metadata"),
-                Arc::clone(&service),
-                service as Arc<dyn Service>,
-            )
+            .register_type::<dyn SessionMetadataService>(service)
             .expect("register session metadata service");
         builder.seal().expect("seal cp")
     }

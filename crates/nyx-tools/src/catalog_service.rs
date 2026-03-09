@@ -1,26 +1,18 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use nyx_core::ToolSpec;
-use nyx_core::{
-    InvocationContext, KernelError, Service, ServiceDescription, ServiceHealth, ServiceId,
-    ToolCatalogService, ToolSelection,
-};
+use nyx_core::{InvocationContext, KernelError, ToolCatalogService, ToolSelection};
 
 use crate::Tool;
 
 pub struct ToolCatalogServiceImpl {
-    id: ServiceId,
     tools: Vec<Arc<dyn Tool>>,
 }
 
 impl ToolCatalogServiceImpl {
     pub fn new(tools: Vec<Arc<dyn Tool>>) -> Self {
-        Self {
-            id: ServiceId::new("tool_catalog"),
-            tools,
-        }
+        Self { tools }
     }
 
     fn allowed(selection: &ToolSelection, name: &str) -> bool {
@@ -44,25 +36,6 @@ impl ToolCatalogServiceImpl {
             schema: tool.schema(),
             meta: serde_json::Map::new(),
         }
-    }
-}
-
-#[async_trait]
-impl Service for ToolCatalogServiceImpl {
-    fn service_id(&self) -> &ServiceId {
-        &self.id
-    }
-
-    fn describe(&self) -> ServiceDescription {
-        ServiceDescription {
-            name: self.service_id().clone(),
-            version: Cow::Borrowed(env!("CARGO_PKG_VERSION")),
-            dependencies: self.depends_on(),
-        }
-    }
-
-    fn health(&self) -> ServiceHealth {
-        ServiceHealth::Healthy
     }
 }
 

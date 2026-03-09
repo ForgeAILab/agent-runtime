@@ -4,10 +4,7 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nyx_core::{
-    ControlPlane, ExtensionRegistry, InvocationContext, KernelError, KernelHandle, Service,
-    ServiceId,
-};
+use nyx_core::{ControlPlane, ExtensionRegistry, InvocationContext, KernelError, KernelHandle};
 use nyx_security::{Sandbox, SandboxError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -169,12 +166,8 @@ impl ControlPlane for NoopControlPlane {
         &REGISTRY
     }
 
-    fn list_services(&self) -> Vec<ServiceId> {
+    fn list_types(&self) -> Vec<&str> {
         Vec::new()
-    }
-
-    fn get_by_id(&self, _id: &ServiceId) -> Option<Arc<dyn Service>> {
-        None
     }
 
     fn downgrade(&self) -> Weak<dyn ControlPlane> {

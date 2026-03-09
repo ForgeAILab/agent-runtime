@@ -135,13 +135,12 @@ async fn write_plan_file(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, LazyLock, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use nyx_core::{
-        ControlPlane, KernelError, PermissionDecision, PermissionService, Service, ServiceId,
-        ServiceRegistryBuilder,
+        ControlPlane, KernelError, PermissionDecision, PermissionService, ServiceRegistryBuilder,
     };
     use serde_json::json;
 
@@ -159,14 +158,6 @@ mod tests {
                 decision,
                 calls: Mutex::new(Vec::new()),
             }
-        }
-    }
-
-    #[async_trait]
-    impl Service for MockPermissionService {
-        fn service_id(&self) -> &ServiceId {
-            static ID: LazyLock<ServiceId> = LazyLock::new(|| ServiceId::new("permission"));
-            &ID
         }
     }
 
@@ -189,11 +180,7 @@ mod tests {
     fn cp_with_permission(service: Arc<dyn PermissionService>) -> Arc<dyn ControlPlane> {
         let mut builder = ServiceRegistryBuilder::new();
         builder
-            .register_service::<dyn PermissionService>(
-                ServiceId::new("permission"),
-                Arc::clone(&service),
-                service as Arc<dyn Service>,
-            )
+            .register_type::<dyn PermissionService>(service)
             .expect("register permission service");
         builder.seal().expect("seal control plane")
     }
