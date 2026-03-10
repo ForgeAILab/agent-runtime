@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -143,7 +144,84 @@ impl Tool for McpTool {
             .json(&input)
             .send()
             .await?;
-        Ok(ToolResult::json(resp.json::<Value>().await?))
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = resp.bytes().await?;
+        decode_mcp_tool_response(&body, content_type.as_deref())
+    }
+}
+
+fn decode_mcp_tool_response(
+    body: &[u8],
+    _content_type: Option<&str>,
+) -> Result<ToolResult, ToolError> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        return Ok(normalize_mcp_tool_value(value));
+    }
+
+    match std::str::from_utf8(body) {
+        Ok(text) => Ok(ToolResult::text(text.to_string())),
+        Err(err) => Err(ToolError::ExecutionFailed {
+            reason: format!("unsupported non-text MCP response: {err}"),
+        }),
+    }
+}
+
+fn normalize_mcp_tool_value(value: Value) -> ToolResult {
+    extract_mcp_text(&value)
+        .map(ToolResult::text)
+        .unwrap_or_else(|| ToolResult::json(value))
+}
+
+fn extract_mcp_text(value: &Value) -> Option<String> {
+    let content = value.as_object()?.get("content")?;
+    extract_mcp_content_text(content)
+}
+
+fn extract_mcp_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| text.clone())
+        }
+        Value::Array(items) => {
+            let blocks = items
+                .iter()
+                .filter_map(extract_mcp_content_block_text)
+                .collect::<Vec<_>>();
+            (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+        }
+        _ => None,
+    }
+}
+
+fn extract_mcp_content_block_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| text.clone())
+        }
+        Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+
+            if let Some(markdown) = obj.get("markdown").and_then(Value::as_str) {
+                let trimmed = markdown.trim();
+                if !trimmed.is_empty() {
+                    return Some(markdown.to_string());
+                }
+            }
+
+            None
+        }
+        _ => None,
     }
 }
 
@@ -165,16 +243,15 @@ pub async fn register_mcp(registry: &mut ToolRegistry, cfg: &McpConfig) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{McpConfig, McpServerConfig, register_mcp};
     use crate::{McpBridge, ToolContext, ToolRegistry};
 
     #[tokio::test]
     async fn mcp_bridge_registers_tools_from_server() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -225,9 +302,6 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bridge_disconnect_removes_server_tools() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/tools"))
@@ -254,9 +328,6 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bridge_active_tools_include_all_connected_servers() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
         let server_a = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/tools"))
@@ -302,5 +373,122 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "mcp__alpha__echo"));
         assert!(names.iter().any(|name| name == "mcp__beta__analyze"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_unwraps_content_blocks_to_text() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [{
+                    "name": "fetch",
+                    "description": "Fetch page",
+                    "schema": {"type": "object"},
+                    "invoke_url": format!("{}/invoke/fetch", server.uri())
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/invoke/fetch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [
+                    { "type": "text", "text": "# Title" },
+                    { "type": "text", "text": "Paragraph" }
+                ],
+                "structuredContent": {
+                    "url": "https://example.com"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut registry = ToolRegistry::new();
+        let cfg = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "browser".to_string(),
+                url: server.uri(),
+            }],
+        };
+
+        register_mcp(&mut registry, &cfg)
+            .await
+            .expect("register mcp tools");
+
+        let tools = registry.seal();
+        let fetch_tool = tools
+            .into_iter()
+            .find(|tool| tool.name() == "mcp__browser__fetch")
+            .expect("fetch tool exists");
+
+        let output = fetch_tool
+            .invoke(
+                json!({ "url": "https://example.com" }),
+                &ToolContext::default(),
+            )
+            .await
+            .expect("invoke fetch tool");
+
+        assert_eq!(
+            output.value,
+            Value::String("# Title\n\nParagraph".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_allows_raw_markdown_text_responses() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [{
+                    "name": "fetch",
+                    "description": "Fetch page",
+                    "schema": {"type": "object"},
+                    "invoke_url": format!("{}/invoke/fetch", server.uri())
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/invoke/fetch"))
+            .and(header("content-type", "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/markdown; charset=utf-8")
+                    .set_body_string("# Page\n\nConverted markdown"),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = McpBridge::new();
+        bridge
+            .connect("browser", &server.uri())
+            .await
+            .expect("connect browser");
+
+        let fetch_tool = bridge
+            .tools_for_server("browser")
+            .into_iter()
+            .find(|tool| tool.name() == "mcp__browser__fetch")
+            .expect("fetch tool exists");
+
+        let output = fetch_tool
+            .invoke(
+                json!({ "url": "https://example.com", "format": "markdown" }),
+                &ToolContext::default(),
+            )
+            .await
+            .expect("invoke fetch tool");
+
+        assert_eq!(
+            output.value,
+            Value::String("# Page\n\nConverted markdown".to_string())
+        );
     }
 }

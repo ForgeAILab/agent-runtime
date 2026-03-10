@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::config::ProviderConfig;
+use crate::config::{HtmlOutputFormat, ProviderConfig};
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
     ProviderContent, ProviderError, ProviderRole, UsageMetadata,
@@ -20,6 +20,7 @@ pub struct OpenAiCodexProvider {
     account_id: Option<String>,
     responses_url: String,
     gateway_api_key: Option<String>,
+    html_output_format: HtmlOutputFormat,
     client: reqwest::Client,
     model: String,
 }
@@ -31,6 +32,7 @@ impl OpenAiCodexProvider {
             account_id: None,
             responses_url: resolve_responses_url(cfg.base_url.as_deref()),
             gateway_api_key: cfg.api_key.as_ref().map(|s| s.reveal().clone()),
+            html_output_format: cfg.html_output_format,
             client: reqwest::Client::new(),
             model: cfg.model.clone(),
         }
@@ -216,6 +218,329 @@ fn extract_text(parsed: &ResponsesResponse) -> String {
         .collect::<String>()
 }
 
+fn normalize_response_text(text: &str, format: HtmlOutputFormat) -> String {
+    if matches!(format, HtmlOutputFormat::Raw) || !looks_like_html(text) {
+        return text.to_string();
+    }
+
+    match format {
+        HtmlOutputFormat::Raw => text.to_string(),
+        HtmlOutputFormat::Plain => html_to_plain(text),
+        HtmlOutputFormat::Markdown => html_to_markdown(text),
+    }
+}
+
+fn looks_like_html(text: &str) -> bool {
+    let mut tag_count = 0usize;
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'<' {
+            let next = bytes[i + 1];
+            let alpha = (next as char).is_ascii_alphabetic();
+            let closing = next == b'/' && (bytes[i + 2] as char).is_ascii_alphabetic();
+            if alpha || closing {
+                tag_count += 1;
+                if tag_count >= 2 {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn html_to_plain(input: &str) -> String {
+    render_html(input, HtmlOutputFormat::Plain)
+}
+
+fn html_to_markdown(input: &str) -> String {
+    render_html(input, HtmlOutputFormat::Markdown)
+}
+
+#[derive(Clone)]
+struct AnchorState {
+    href: String,
+    start: usize,
+}
+
+fn render_html(input: &str, format: HtmlOutputFormat) -> String {
+    let mut out = String::new();
+    let mut text = String::new();
+    let mut chars = input.chars().peekable();
+    let mut anchors: Vec<AnchorState> = Vec::new();
+    let mut skip_depth = 0usize;
+    let mut pre_depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        if ch != '<' {
+            if skip_depth == 0 {
+                text.push(ch);
+            }
+            continue;
+        }
+
+        let mut tag = String::new();
+        let mut found_end = false;
+        for next in chars.by_ref() {
+            if next == '>' {
+                found_end = true;
+                break;
+            }
+            tag.push(next);
+        }
+        if !found_end {
+            if skip_depth == 0 {
+                text.push('<');
+                text.push_str(&tag);
+            }
+            break;
+        }
+
+        if skip_depth == 0 {
+            flush_text(&mut out, &mut text, pre_depth > 0);
+        }
+
+        let raw = tag.trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        let closing = raw.starts_with('/');
+        let self_closing = raw.ends_with('/');
+        let tag_body = raw.trim_start_matches('/').trim_end_matches('/').trim();
+        let tag_name = tag_body
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if closing {
+            match tag_name.as_str() {
+                "script" | "style" => skip_depth = skip_depth.saturating_sub(1),
+                "pre" => {
+                    pre_depth = pre_depth.saturating_sub(1);
+                    if matches!(format, HtmlOutputFormat::Markdown) {
+                        ensure_block_break(&mut out);
+                        out.push_str("```\n");
+                    } else {
+                        ensure_line_break(&mut out);
+                    }
+                }
+                "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
+                | "table" | "tr" | "ul" | "ol" | "blockquote" => ensure_block_break(&mut out),
+                "li" => ensure_line_break(&mut out),
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => ensure_block_break(&mut out),
+                "a" => {
+                    if matches!(format, HtmlOutputFormat::Markdown)
+                        && let Some(anchor) = anchors.pop()
+                    {
+                        append_markdown_link(&mut out, anchor);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match tag_name.as_str() {
+            "script" | "style" => skip_depth += 1,
+            "br" => ensure_line_break(&mut out),
+            "hr" => {
+                ensure_block_break(&mut out);
+                if matches!(format, HtmlOutputFormat::Markdown) {
+                    out.push_str("---");
+                }
+                ensure_block_break(&mut out);
+            }
+            "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
+            | "table" | "tr" | "ul" | "ol" | "blockquote" => ensure_block_break(&mut out),
+            "li" => {
+                ensure_line_break(&mut out);
+                out.push_str("- ");
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                ensure_block_break(&mut out);
+                if matches!(format, HtmlOutputFormat::Markdown) {
+                    let level = tag_name[1..].parse::<usize>().unwrap_or(1).clamp(1, 6);
+                    out.push_str(&"#".repeat(level));
+                    out.push(' ');
+                }
+            }
+            "pre" => {
+                ensure_block_break(&mut out);
+                pre_depth += 1;
+                if matches!(format, HtmlOutputFormat::Markdown) {
+                    out.push_str("```\n");
+                }
+            }
+            "a" => {
+                if matches!(format, HtmlOutputFormat::Markdown) {
+                    anchors.push(AnchorState {
+                        href: extract_attr(tag_body, "href").unwrap_or_default(),
+                        start: out.len(),
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        if self_closing {
+            match tag_name.as_str() {
+                "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
+                | "tr" | "li" => ensure_block_break(&mut out),
+                _ => {}
+            }
+        }
+    }
+
+    if skip_depth == 0 {
+        flush_text(&mut out, &mut text, pre_depth > 0);
+    }
+    cleanup_rendered_text(&out, pre_depth > 0)
+}
+
+fn append_markdown_link(out: &mut String, anchor: AnchorState) {
+    if anchor.href.trim().is_empty() || anchor.start >= out.len() {
+        return;
+    }
+
+    let label = out[anchor.start..].trim().to_string();
+    if label.is_empty() {
+        return;
+    }
+
+    out.replace_range(
+        anchor.start..,
+        &format!("[{label}]({})", anchor.href.trim()),
+    );
+}
+
+fn flush_text(out: &mut String, text: &mut String, preserve_whitespace: bool) {
+    if text.is_empty() {
+        return;
+    }
+
+    let decoded = decode_html_entities(text);
+    if preserve_whitespace {
+        out.push_str(&decoded);
+    } else {
+        out.push_str(&collapse_whitespace(&decoded));
+    }
+    text.clear();
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_space = false;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+
+    out
+}
+
+fn ensure_line_break(out: &mut String) {
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn ensure_block_break(out: &mut String) {
+    let trimmed = out.trim_end_matches([' ', '\t']);
+    let newline_count = trimmed.chars().rev().take_while(|ch| *ch == '\n').count();
+    if newline_count >= 2 {
+        return;
+    }
+    if newline_count == 1 {
+        out.push('\n');
+    } else if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+}
+
+fn cleanup_rendered_text(text: &str, preserve_whitespace: bool) -> String {
+    if preserve_whitespace {
+        return text.trim().to_string();
+    }
+
+    text.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split("\n\n\n")
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_string()
+}
+
+fn extract_attr(tag_body: &str, attr: &str) -> Option<String> {
+    let lower = tag_body.to_ascii_lowercase();
+    let needle = format!("{attr}=");
+    let start = lower.find(&needle)?;
+    let value = &tag_body[start + needle.len()..];
+    let value = value.trim_start();
+    let first = value.chars().next()?;
+
+    if first == '"' || first == '\'' {
+        let end = value[1..].find(first)?;
+        return Some(value[1..1 + end].to_string());
+    }
+
+    let end = value.find(char::is_whitespace).unwrap_or(value.len());
+    Some(value[..end].to_string())
+}
+
+fn decode_html_entities(text: &str) -> String {
+    let mut out = text
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+
+    out = decode_numeric_entities(&out, "&#x", 16);
+    decode_numeric_entities(&out, "&#", 10)
+}
+
+fn decode_numeric_entities(text: &str, prefix: &str, radix: u32) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+
+    while let Some(idx) = rest.find(prefix) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + prefix.len()..];
+        if let Some(end) = after.find(';') {
+            let number = &after[..end];
+            if let Ok(codepoint) = u32::from_str_radix(number, radix)
+                && let Some(ch) = char::from_u32(codepoint)
+            {
+                out.push(ch);
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+
+        out.push_str(prefix);
+        rest = after;
+    }
+
+    out.push_str(rest);
+    out
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiCodexProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
@@ -225,9 +550,10 @@ impl LlmProvider for OpenAiCodexProvider {
             .json()
             .await
             .map_err(|_| ProviderError::InvalidResponse("invalid responses payload"))?;
+        let content = normalize_response_text(&extract_text(&parsed), self.html_output_format);
 
         Ok(CompletionResponse {
-            content: extract_text(&parsed),
+            content,
             model: parsed.model.unwrap_or(fallback_model),
             tool_calls: Vec::new(),
             usage: parsed.usage.map(UsageMetadata::from),
@@ -399,5 +725,80 @@ mod tests {
             .expect("complete");
 
         assert_eq!(resp.content, "fallback");
+    }
+
+    #[tokio::test]
+    async fn complete_can_normalize_html_to_plain_text() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "codex",
+                "output_text": "<html><body><h1>Title</h1><p>Hello <strong>world</strong>.</p><ul><li>One</li><li>Two</li></ul></body></html>"
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = ProviderConfig {
+            base_url: Some(format!("{}/responses", server.uri())),
+            model: "codex".to_string(),
+            html_output_format: HtmlOutputFormat::Plain,
+            ..Default::default()
+        };
+        let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
+
+        let resp = provider
+            .complete(CompletionRequest {
+                model: "codex".to_string(),
+                messages: vec![crate::ProviderMessage::user("hello")],
+                tools: vec![],
+                max_tokens: None,
+                temperature: None,
+                thinking_tokens: None,
+            })
+            .await
+            .expect("complete");
+
+        assert_eq!(resp.content, "Title\n\nHello world.\n\n- One\n- Two");
+    }
+
+    #[tokio::test]
+    async fn complete_can_normalize_html_to_markdown() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "codex",
+                "output_text": "<html><body><h2>Links</h2><p>Visit <a href=\"https://example.com\">Example</a></p></body></html>"
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = ProviderConfig {
+            base_url: Some(format!("{}/responses", server.uri())),
+            model: "codex".to_string(),
+            html_output_format: HtmlOutputFormat::Markdown,
+            ..Default::default()
+        };
+        let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
+
+        let resp = provider
+            .complete(CompletionRequest {
+                model: "codex".to_string(),
+                messages: vec![crate::ProviderMessage::user("hello")],
+                tools: vec![],
+                max_tokens: None,
+                temperature: None,
+                thinking_tokens: None,
+            })
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            resp.content,
+            "## Links\n\nVisit [Example](https://example.com)"
+        );
     }
 }

@@ -76,6 +76,19 @@ fn is_default_circuit_breaker(cb: &CircuitBreakerConfig) -> bool {
         && cb.half_open_successes == default_half_open_successes()
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HtmlOutputFormat {
+    #[default]
+    Raw,
+    Plain,
+    Markdown,
+}
+
+fn is_default_html_output_format(format: &HtmlOutputFormat) -> bool {
+    matches!(format, HtmlOutputFormat::Raw)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     #[serde(default = "default_provider_kind")]
@@ -92,6 +105,8 @@ pub struct ProviderConfig {
     pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_html_output_format")]
+    pub html_output_format: HtmlOutputFormat,
     #[serde(default, skip_serializing_if = "is_default_retry")]
     pub retry: RetryConfig,
     #[serde(default, skip_serializing_if = "is_default_circuit_breaker")]
@@ -108,6 +123,7 @@ impl Default for ProviderConfig {
             base_url: None,
             context_window: None,
             auth_profile: None,
+            html_output_format: HtmlOutputFormat::Raw,
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
         }
@@ -445,7 +461,7 @@ pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider,
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderConfig, build_provider, build_provider_chain};
+    use super::{HtmlOutputFormat, ProviderConfig, build_provider, build_provider_chain};
 
     #[test]
     fn provider_config_deserializes_from_toml() {
@@ -463,6 +479,21 @@ base_url = "http://localhost:11434/v1"
         assert_eq!(cfg.base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert_eq!(cfg.api_key_env, None);
         assert_eq!(cfg.context_window, None);
+        assert_eq!(cfg.html_output_format, HtmlOutputFormat::Raw);
+    }
+
+    #[test]
+    fn provider_config_deserializes_html_output_format() {
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+kind = "codex"
+model = "codex"
+html_output_format = "markdown"
+"#,
+        )
+        .expect("toml deserializes");
+
+        assert_eq!(cfg.html_output_format, HtmlOutputFormat::Markdown);
     }
 
     #[test]
