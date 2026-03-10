@@ -393,7 +393,7 @@ impl Tool for ProcessStartTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a background process. Use process_wait or process_read to check results when needed."
+        "Spawn a background process. Set tty=true for programs that need a terminal (e.g. interactive CLIs, TUI apps). Use process_wait or process_read to check results."
     }
 
     fn schema(&self) -> Value {
@@ -404,7 +404,10 @@ impl Tool for ProcessStartTool {
                 "id": { "type": "string" },
                 "command": { "type": "string" },
                 "pwd": { "type": "string" },
-                "interactive": { "type": "boolean", "default": false }
+                "interactive": { "type": "boolean", "default": false },
+                "tty": { "type": "boolean", "default": false, "description": "Allocate a pseudo-terminal (PTY) for the process" },
+                "cols": { "type": "integer", "default": 80, "description": "Terminal width in columns (only used when tty=true)" },
+                "rows": { "type": "integer", "default": 24, "description": "Terminal height in rows (only used when tty=true)" }
             }
         })
     }
@@ -423,16 +426,34 @@ impl Tool for ProcessStartTool {
             .get("interactive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let tty = input.get("tty").and_then(Value::as_bool).unwrap_or(false);
 
-        self.terminal_registry
-            .spawn(id, command, ctx, HashMap::new(), interactive, pwd)
-            .await?;
+        if tty {
+            let cols = input.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+            let rows = input.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
 
-        Ok(ToolResult::json(json!({
-            "id": id,
-            "status": "started",
-            "interactive": interactive,
-        })))
+            self.terminal_registry
+                .spawn_pty(id, command, ctx, HashMap::new(), pwd, cols, rows)
+                .await?;
+
+            Ok(ToolResult::json(json!({
+                "id": id,
+                "status": "started",
+                "interactive": true,
+                "tty": true,
+            })))
+        } else {
+            self.terminal_registry
+                .spawn(id, command, ctx, HashMap::new(), interactive, pwd)
+                .await?;
+
+            Ok(ToolResult::json(json!({
+                "id": id,
+                "status": "started",
+                "interactive": interactive,
+                "tty": false,
+            })))
+        }
     }
 }
 
@@ -457,7 +478,8 @@ impl Tool for ProcessReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read currently available stdout/stderr and status from a process (non-blocking)"
+        "Read process output. Returns only new content since the last read by default. \
+         Use offset to re-read from a specific line, and limit to cap the number of lines."
     }
 
     fn schema(&self) -> Value {
@@ -469,7 +491,18 @@ impl Tool for ProcessReadTool {
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Deprecated: process_read is non-blocking. Use process_wait to block."
+                    "default": 0,
+                    "description": "Wait up to this many ms for new output to appear (0 = return immediately)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Read from this line number (0-based). Omit to read only new content since the last read."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of lines to return. Omit to return all available."
                 }
             }
         })
@@ -480,8 +513,14 @@ impl Tool for ProcessReadTool {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-        let _ = input.get("timeout_ms");
-        let output = self.terminal_registry.read(id, 0).await?;
+        let timeout_ms = input
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let offset = input.get("offset").and_then(Value::as_u64).map(|v| v as usize);
+        let limit = input.get("limit").and_then(Value::as_u64).map(|v| v as usize);
+
+        let output = self.terminal_registry.read(id, timeout_ms, offset, limit).await?;
         let status = self.terminal_registry.status(id).await?;
 
         Ok(ToolResult::json(json!({
@@ -489,6 +528,8 @@ impl Tool for ProcessReadTool {
             "stdout": output.stdout,
             "stderr": output.stderr,
             "status": terminal_status_json(status),
+            "cursor": output.stdout_cursor,
+            "total_lines": output.stdout_total_lines,
         })))
     }
 }
@@ -539,7 +580,7 @@ impl Tool for ProcessWaitTool {
             .unwrap_or(30_000);
 
         let (status, timed_out) = self.terminal_registry.wait(id, timeout_ms).await?;
-        let output = self.terminal_registry.read(id, 0).await?;
+        let output = self.terminal_registry.read(id, 0, None, None).await?;
         let completed = matches!(status, crate::TerminalStatus::Exited { .. });
 
         Ok(ToolResult::json(json!({
@@ -1398,7 +1439,7 @@ mod tests {
             .expect("start process");
 
         let _ = registry.wait(&id, 500).await.expect("wait for process");
-        let output = registry.read(&id, 50).await.expect("read output");
+        let output = registry.read(&id, 50, None, None).await.expect("read output");
         let expected = std::fs::canonicalize(temp_dir.path()).expect("canonicalize temp dir");
         let actual = std::fs::canonicalize(output.stdout.trim()).expect("canonicalize output dir");
         assert_eq!(actual, expected);

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::os::unix::io::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
@@ -6,6 +7,7 @@ use tokio::process::Command;
 
 use crate::{
     Sandbox, SandboxError, SandboxPolicy, SandboxedChild, SandboxedCommand, SandboxedOutput,
+    SandboxedPtyChild,
 };
 
 const SHELL_PROGRAMS: &[&str] = &["sh", "bash", "zsh"];
@@ -314,6 +316,48 @@ impl Sandbox for OsSandbox {
         })
     }
 
+    async fn spawn_pty(
+        &self,
+        cmd: SandboxedCommand,
+        cols: u16,
+        rows: u16,
+    ) -> Result<SandboxedPtyChild, SandboxError> {
+        self.enforce_command_policy(&cmd)?;
+
+        let working_dir = self.validate_command_path(&cmd.working_dir, &self.root_dir)?;
+        for tracked in &cmd.tracked_paths {
+            self.validate_command_path(tracked, &working_dir)?;
+        }
+
+        let (master_fd, slave_fd) = open_pty(cols, rows)?;
+
+        let mut command = self.build_command(&cmd, working_dir);
+
+        // Safety: we configure the child process to create a new session and set
+        // the slave side of the PTY as the controlling terminal.
+        unsafe {
+            let slave_raw = std::os::unix::io::AsRawFd::as_raw_fd(&slave_fd);
+            command.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(slave_raw, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        command.stdin(std::process::Stdio::from(slave_fd.try_clone()?));
+        command.stdout(std::process::Stdio::from(slave_fd.try_clone()?));
+        command.stderr(std::process::Stdio::from(slave_fd));
+        command.kill_on_drop(true);
+
+        let child = command.spawn()?;
+
+        Ok(SandboxedPtyChild { child, master_fd })
+    }
+
     fn validate_read_path(&self, path: &Path) -> Result<PathBuf, SandboxError> {
         self.validate_policy_path(path, &self.policy.allowed_read_paths)
     }
@@ -321,6 +365,43 @@ impl Sandbox for OsSandbox {
     fn validate_write_path(&self, path: &Path) -> Result<PathBuf, SandboxError> {
         self.validate_policy_path(path, &self.policy.allowed_write_paths)
     }
+}
+
+/// Opens a pseudo-terminal pair and sets the initial window size.
+fn open_pty(cols: u16, rows: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::unix::io::FromRawFd;
+
+    let mut master_raw: libc::c_int = 0;
+    let mut slave_raw: libc::c_int = 0;
+
+    let mut ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    // Safety: openpty populates master_raw/slave_raw with valid fds on success.
+    let ret = unsafe {
+        libc::openpty(
+            &mut master_raw,
+            &mut slave_raw,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut ws,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Safety: fds were just created by openpty.
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(master_raw),
+            OwnedFd::from_raw_fd(slave_raw),
+        )
+    })
 }
 
 #[cfg(test)]

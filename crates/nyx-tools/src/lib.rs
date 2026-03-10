@@ -3,6 +3,8 @@ mod catalog_service;
 mod core;
 #[cfg(feature = "mcp")]
 mod mcp;
+#[cfg(unix)]
+mod pty;
 mod registry;
 #[cfg(feature = "permission")]
 mod request_permission;

@@ -85,6 +85,13 @@ pub struct SandboxedChild {
     pub stderr: ChildStderr,
 }
 
+#[derive(Debug)]
+pub struct SandboxedPtyChild {
+    pub child: Child,
+    #[cfg(unix)]
+    pub master_fd: std::os::unix::io::OwnedFd,
+}
+
 impl SandboxedOutput {
     pub fn empty_success() -> Self {
         Self {
@@ -107,6 +114,8 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
     #[error("interactive spawn is not supported by this sandbox")]
     UnsupportedInteractiveSpawn,
+    #[error("PTY spawn is not supported by this sandbox")]
+    UnsupportedPtySpawn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +224,15 @@ pub trait Sandbox: Send + Sync {
 
     async fn spawn_piped(&self, _cmd: SandboxedCommand) -> Result<SandboxedChild, SandboxError> {
         Err(SandboxError::UnsupportedInteractiveSpawn)
+    }
+
+    async fn spawn_pty(
+        &self,
+        _cmd: SandboxedCommand,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<SandboxedPtyChild, SandboxError> {
+        Err(SandboxError::UnsupportedPtySpawn)
     }
 
     fn validate_read_path(&self, path: &Path) -> Result<PathBuf, SandboxError> {
@@ -432,6 +450,65 @@ pub mod testing {
                 stdout,
                 stderr,
             })
+        }
+
+        #[cfg(unix)]
+        async fn spawn_pty(
+            &self,
+            cmd: SandboxedCommand,
+            cols: u16,
+            rows: u16,
+        ) -> Result<SandboxedPtyChild, SandboxError> {
+            use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+            let mut master_raw: libc::c_int = 0;
+            let mut slave_raw: libc::c_int = 0;
+            let mut ws = libc::winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let ret = unsafe {
+                libc::openpty(
+                    &mut master_raw,
+                    &mut slave_raw,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut ws,
+                )
+            };
+            if ret != 0 {
+                return Err(SandboxError::Io(std::io::Error::last_os_error()));
+            }
+            let master_fd = unsafe { OwnedFd::from_raw_fd(master_raw) };
+            let slave_fd = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+
+            let mut command = tokio::process::Command::new(&cmd.program);
+            command.args(&cmd.args);
+            command.current_dir(&cmd.working_dir);
+            command.envs(&cmd.env);
+
+            unsafe {
+                let slave = slave_fd.as_raw_fd();
+                command.pre_exec(move || {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            command.stdin(std::process::Stdio::from(slave_fd.try_clone()?));
+            command.stdout(std::process::Stdio::from(slave_fd.try_clone()?));
+            command.stderr(std::process::Stdio::from(slave_fd));
+            command.kill_on_drop(true);
+
+            let child = command.spawn()?;
+            Ok(SandboxedPtyChild { child, master_fd })
         }
     }
 
