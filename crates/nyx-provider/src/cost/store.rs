@@ -98,13 +98,25 @@ impl SqliteCostStore {
 }
 
 #[cfg(feature = "cost-sqlite")]
+fn store_error(message: impl Into<String>) -> CostError {
+    CostError::Store {
+        message: message.into(),
+    }
+}
+
+#[cfg(feature = "cost-sqlite")]
+fn sqlite_error(err: rusqlite::Error) -> CostError {
+    store_error(err.to_string())
+}
+
+#[cfg(feature = "cost-sqlite")]
 #[async_trait]
 impl CostStore for SqliteCostStore {
     async fn record(&self, r: UsageRecord) -> Result<(), CostError> {
         let conn = self
             .connection
             .lock()
-            .map_err(|err| CostError::Store(format!("sqlite connection mutex poisoned: {err}")))?;
+            .map_err(|err| store_error(format!("sqlite connection mutex poisoned: {err}")))?;
         conn.execute(
             "INSERT INTO cost_records (
                 source, channel_id, model, input_tokens, output_tokens,
@@ -121,7 +133,8 @@ impl CostStore for SqliteCostStore {
                 r.estimated_cost_usd,
                 r.timestamp_ms as i64
             ],
-        )?;
+        )
+        .map_err(sqlite_error)?;
         Ok(())
     }
 
@@ -129,7 +142,7 @@ impl CostStore for SqliteCostStore {
         let conn = self
             .connection
             .lock()
-            .map_err(|err| CostError::Store(format!("sqlite connection mutex poisoned: {err}")))?;
+            .map_err(|err| store_error(format!("sqlite connection mutex poisoned: {err}")))?;
 
         let (where_clause, params) = sqlite_where_clause(&filter);
 
@@ -142,7 +155,7 @@ impl CostStore for SqliteCostStore {
              FROM cost_records
              {where_clause}"
         );
-        let mut totals_stmt = conn.prepare(&totals_sql)?;
+        let mut totals_stmt = conn.prepare(&totals_sql).map_err(sqlite_error)?;
         let (total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cost_usd) =
             totals_stmt.query_row(rusqlite::params_from_iter(params.iter()), |row| {
                 Ok((
@@ -151,7 +164,7 @@ impl CostStore for SqliteCostStore {
                     row.get::<_, i64>(2)? as u64,
                     row.get::<_, f64>(3)?,
                 ))
-            })?;
+            }).map_err(sqlite_error)?;
 
         let breakdown_by_model = match filter.group_by {
             Some(UsageGroupBy::Channel) => Vec::new(),
@@ -218,7 +231,7 @@ fn sqlite_group_by_model(
          GROUP BY model
          ORDER BY model"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(ModelUsage {
             model: row.get(0)?,
@@ -227,9 +240,9 @@ fn sqlite_group_by_model(
             cache_read_tokens: row.get::<_, i64>(3)? as u64,
             total_cost_usd: row.get(4)?,
         })
-    })?;
+    }).map_err(sqlite_error)?;
 
-    rows.collect::<Result<Vec<_>, _>>().map_err(CostError::from)
+    rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
 }
 
 #[cfg(feature = "cost-sqlite")]
@@ -250,7 +263,7 @@ fn sqlite_group_by_channel(
          GROUP BY channel_id
          ORDER BY channel_id"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(ChannelUsage {
             channel_id: row.get(0)?,
@@ -259,9 +272,9 @@ fn sqlite_group_by_channel(
             cache_read_tokens: row.get::<_, i64>(3)? as u64,
             total_cost_usd: row.get(4)?,
         })
-    })?;
+    }).map_err(sqlite_error)?;
 
-    rows.collect::<Result<Vec<_>, _>>().map_err(CostError::from)
+    rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
 }
 
 fn summarize_records<'a>(

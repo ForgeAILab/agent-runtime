@@ -13,7 +13,7 @@ openai = []
 claude = []
 compat = ["openai"]
 codex = []
-cost = ["dep:nyx-obs", "dep:nyx-tools", "dep:time"]
+cost = ["dep:nyx-obs", "dep:time"]
 cost-sqlite = ["cost", "dep:rusqlite", "dep:nyx-store"]
 
 [dependencies]
@@ -32,7 +32,7 @@ rusqlite = { version = "0.33", features = ["bundled"], optional = true }
 nyx-store = { path = "../nyx-store", default-features = false, features = ["sqlite"], optional = true }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"], optional = true }
 nyx-obs = { path = "../nyx-obs", optional = true }
-nyx-tools = { path = "../nyx-tools", optional = true }
+nyx-core = { path = "../nyx-core", features = ["cost"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

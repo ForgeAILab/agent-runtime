@@ -117,7 +117,9 @@ impl CostTracker {
                     self.budget.window.as_str(),
                 ))
                 .await
-                .map_err(|err| CostError::Store(err.to_string()))?;
+                .map_err(|err| CostError::Store {
+                    message: err.to_string(),
+                })?;
                 *warned = window_start;
             }
         } else if *warned == window_start {

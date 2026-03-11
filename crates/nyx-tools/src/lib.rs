@@ -1,5 +1,7 @@
 mod builtins;
 mod catalog_service;
+#[cfg(feature = "cost")]
+mod cost;
 mod core;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -17,8 +19,6 @@ mod terminal;
 pub mod testing;
 #[cfg(any(feature = "web-search-brave", feature = "web-search-tavily"))]
 mod web_search;
-#[cfg(feature = "workflow")]
-mod workflow;
 
 use std::sync::Arc;
 
@@ -26,6 +26,8 @@ use nyx_security::Sandbox;
 
 pub use builtins::*;
 pub use catalog_service::*;
+#[cfg(feature = "cost")]
+pub use cost::*;
 pub use core::*;
 #[cfg(feature = "mcp")]
 pub use mcp::*;
@@ -40,8 +42,6 @@ pub use sub_agent_tool::*;
 pub use terminal::*;
 #[cfg(any(feature = "web-search-brave", feature = "web-search-tavily"))]
 pub use web_search::*;
-#[cfg(feature = "workflow")]
-pub use workflow::*;
 
 pub fn build_tools(sandbox: Arc<dyn Sandbox>) -> Result<Vec<Arc<dyn Tool>>, RegistryError> {
     let mut registry = ToolRegistry::new();
