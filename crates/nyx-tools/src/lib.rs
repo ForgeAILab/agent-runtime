@@ -15,6 +15,8 @@ mod skill_tool;
 mod sub_agent_tool;
 mod terminal;
 pub mod testing;
+#[cfg(any(feature = "web-search-brave", feature = "web-search-tavily"))]
+mod web_search;
 #[cfg(feature = "workflow")]
 mod workflow;
 
@@ -36,6 +38,8 @@ pub use skill_tool::*;
 #[cfg(feature = "sub-agent")]
 pub use sub_agent_tool::*;
 pub use terminal::*;
+#[cfg(any(feature = "web-search-brave", feature = "web-search-tavily"))]
+pub use web_search::*;
 #[cfg(feature = "workflow")]
 pub use workflow::*;
 

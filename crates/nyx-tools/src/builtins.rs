@@ -513,14 +513,20 @@ impl Tool for ProcessReadTool {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
-        let timeout_ms = input
-            .get("timeout_ms")
+        let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
+        let offset = input
+            .get("offset")
             .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let offset = input.get("offset").and_then(Value::as_u64).map(|v| v as usize);
-        let limit = input.get("limit").and_then(Value::as_u64).map(|v| v as usize);
+            .map(|v| v as usize);
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
 
-        let output = self.terminal_registry.read(id, timeout_ms, offset, limit).await?;
+        let output = self
+            .terminal_registry
+            .read(id, timeout_ms, offset, limit)
+            .await?;
         let status = self.terminal_registry.status(id).await?;
 
         Ok(ToolResult::json(json!({
@@ -1439,7 +1445,10 @@ mod tests {
             .expect("start process");
 
         let _ = registry.wait(&id, 500).await.expect("wait for process");
-        let output = registry.read(&id, 50, None, None).await.expect("read output");
+        let output = registry
+            .read(&id, 50, None, None)
+            .await
+            .expect("read output");
         let expected = std::fs::canonicalize(temp_dir.path()).expect("canonicalize temp dir");
         let actual = std::fs::canonicalize(output.stdout.trim()).expect("canonicalize output dir");
         assert_eq!(actual, expected);
