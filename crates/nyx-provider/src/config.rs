@@ -5,8 +5,8 @@ use nyx_security::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BearerTokenSource, CircuitBreakerProvider, FallbackProvider, LlmProvider, ProviderError,
-    RetryProvider,
+    BearerTokenSource, CircuitBreakerProvider, FallbackProvider, LlmProvider, ModelInfo,
+    ModelRegistry, ProviderError, RetryProvider,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -91,6 +91,8 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_profile: Option<String>,
     #[serde(default, skip_serializing_if = "is_default_retry")]
     pub retry: RetryConfig,
@@ -107,6 +109,7 @@ impl Default for ProviderConfig {
             api_key_env: None,
             base_url: None,
             context_window: None,
+            supports_vision: None,
             auth_profile: None,
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -122,31 +125,25 @@ fn default_provider_model() -> String {
     "echo-default".to_string()
 }
 
-const MODEL_CONTEXT_WINDOW_PREFIXES: &[(&str, usize)] = &[
-    ("gpt-4o", 128_000),
-    ("gpt-4-turbo", 128_000),
-    ("gpt-3.5-turbo", 16_385),
-    ("claude-sonnet-4", 200_000),
-    ("claude-opus-4", 200_000),
-    ("claude-haiku-3.5", 200_000),
-    ("deepseek-chat", 65_536),
-    ("deepseek-reasoner", 65_536),
-];
-
-fn model_context_window(model: &str) -> Option<usize> {
-    if model == "gpt-4" {
-        return Some(8_192);
+impl ProviderConfig {
+    pub fn resolved_model_info(&self, registry: &ModelRegistry) -> ModelInfo {
+        let mut info = registry
+            .resolve(self.model.as_str())
+            .unwrap_or_else(|| ModelInfo::unknown(self.model.clone()));
+        info.model_id = self.model.clone();
+        if let Some(context_window) = self.context_window {
+            info.context_window = context_window;
+        }
+        if let Some(supports_vision) = self.supports_vision {
+            info.supports_vision = supports_vision;
+        }
+        info
     }
 
-    MODEL_CONTEXT_WINDOW_PREFIXES
-        .iter()
-        .find_map(|(prefix, context_window)| model.starts_with(prefix).then_some(*context_window))
-}
-
-impl ProviderConfig {
     pub fn resolved_context_window(&self) -> Option<usize> {
-        self.context_window
-            .or_else(|| model_context_window(self.model.as_str()))
+        let registry = ModelRegistry::new();
+        let context_window = self.resolved_model_info(&registry).context_window;
+        (context_window > 0).then_some(context_window)
     }
 }
 
@@ -187,8 +184,13 @@ fn make_compat(
         .base_url
         .clone()
         .unwrap_or_else(|| default_url.to_string());
+    let registry = ModelRegistry::new();
     Ok((
-        Arc::new(crate::compat::OpenAiCompatProvider::new(base_url, api_key)),
+        Arc::new(crate::compat::OpenAiCompatProvider::new(
+            base_url,
+            api_key,
+            Some(cfg.resolved_model_info(&registry)),
+        )),
         cfg.model.clone(),
     ))
 }
@@ -210,8 +212,13 @@ fn make_compat_no_key(
         .base_url
         .clone()
         .unwrap_or_else(|| default_url.to_string());
+    let registry = ModelRegistry::new();
     (
-        Arc::new(crate::compat::OpenAiCompatProvider::new(base_url, api_key)),
+        Arc::new(crate::compat::OpenAiCompatProvider::new(
+            base_url,
+            api_key,
+            Some(cfg.resolved_model_info(&registry)),
+        )),
         cfg.model.clone(),
     )
 }
@@ -289,8 +296,13 @@ pub fn build_provider_with_token_sources(
             let base_url = cfg.base_url.clone().ok_or_else(|| {
                 ProviderError::Rejected("provider.base_url is required for compat".to_string())
             })?;
+            let registry = ModelRegistry::new();
             Ok((
-                Arc::new(crate::compat::OpenAiCompatProvider::new(base_url, api_key)),
+                Arc::new(crate::compat::OpenAiCompatProvider::new(
+                    base_url,
+                    api_key,
+                    Some(cfg.resolved_model_info(&registry)),
+                )),
                 cfg.model.clone(),
             ))
         }
@@ -446,6 +458,7 @@ pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider,
 #[cfg(test)]
 mod tests {
     use super::{ProviderConfig, build_provider, build_provider_chain};
+    use crate::ModelRegistry;
 
     #[test]
     fn provider_config_deserializes_from_toml() {
@@ -463,6 +476,7 @@ base_url = "http://localhost:11434/v1"
         assert_eq!(cfg.base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert_eq!(cfg.api_key_env, None);
         assert_eq!(cfg.context_window, None);
+        assert_eq!(cfg.supports_vision, None);
     }
 
     #[test]
@@ -562,11 +576,55 @@ base_url = "http://localhost:11434/v1"
 kind = "openai"
 model = "gpt-4o"
 context_window = 100000
+supports_vision = false
 "#,
         )
         .expect("toml deserializes");
 
         assert_eq!(cfg.context_window, Some(100_000));
+        assert_eq!(cfg.supports_vision, Some(false));
         assert_eq!(cfg.resolved_context_window(), Some(100_000));
+    }
+
+    #[test]
+    fn resolved_model_info_prefers_explicit_overrides() {
+        let registry = ModelRegistry::new();
+        let cfg = ProviderConfig {
+            model: "gpt-4o".to_string(),
+            context_window: Some(64_000),
+            supports_vision: Some(false),
+            ..Default::default()
+        };
+
+        let info = cfg.resolved_model_info(&registry);
+        assert_eq!(info.context_window, 64_000);
+        assert!(!info.supports_vision);
+    }
+
+    #[test]
+    fn resolved_model_info_uses_registry_when_config_is_unset() {
+        let registry = ModelRegistry::new();
+        let cfg = ProviderConfig {
+            model: "claude-sonnet-4-20250514".to_string(),
+            ..Default::default()
+        };
+
+        let info = cfg.resolved_model_info(&registry);
+        assert_eq!(info.context_window, 200_000);
+        assert!(info.supports_vision);
+    }
+
+    #[test]
+    fn resolved_model_info_returns_conservative_defaults_for_unknown_model() {
+        let registry = ModelRegistry::new();
+        let cfg = ProviderConfig {
+            model: "my-custom-llm".to_string(),
+            ..Default::default()
+        };
+
+        let info = cfg.resolved_model_info(&registry);
+        assert_eq!(info.context_window, 0);
+        assert!(!info.supports_vision);
+        assert!(info.supports_tool_use);
     }
 }

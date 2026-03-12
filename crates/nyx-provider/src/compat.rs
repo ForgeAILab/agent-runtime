@@ -4,18 +4,24 @@ use std::sync::Arc;
 use crate::openai::OpenAiProvider;
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
-    ProviderError, ProviderMessage, ToolCallParser,
+    ProviderError, ProviderMessage, ToolCallParser, model_info::ModelInfo,
 };
 
 #[derive(Clone)]
 pub struct OpenAiCompatProvider {
     inner: OpenAiProvider,
+    model_info: Option<ModelInfo>,
 }
 
 impl OpenAiCompatProvider {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model_info: Option<ModelInfo>,
+    ) -> Self {
         Self {
             inner: OpenAiProvider::new(api_key).with_base_url(base_url),
+            model_info,
         }
     }
 
@@ -26,10 +32,15 @@ impl OpenAiCompatProvider {
 }
 
 /// Strip image content blocks from messages, replacing them with a text
-/// placeholder.  Most OpenAI-compatible third-party APIs do not support the
-/// `image_url` content block and will reject the request (e.g. ZhipuAI error
-/// 1210).  Stripping images here keeps the native OpenAI provider untouched.
-fn strip_image_content(req: CompletionRequest) -> CompletionRequest {
+/// placeholder when the target model is not known to support vision.
+fn strip_image_content(
+    req: CompletionRequest,
+    model_info: Option<&ModelInfo>,
+) -> CompletionRequest {
+    if model_info.is_some_and(|info| info.supports_vision) {
+        return req;
+    }
+
     let has_images = req.messages.iter().any(|m| {
         m.content
             .iter()
@@ -70,11 +81,15 @@ fn strip_image_content(req: CompletionRequest) -> CompletionRequest {
 #[async_trait]
 impl LlmProvider for OpenAiCompatProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
-        self.inner.complete(strip_image_content(req)).await
+        self.inner
+            .complete(strip_image_content(req, self.model_info.as_ref()))
+            .await
     }
 
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
-        self.inner.stream(strip_image_content(req)).await
+        self.inner
+            .stream(strip_image_content(req, self.model_info.as_ref()))
+            .await
     }
 
     async fn health_check(&self) -> bool {
@@ -88,7 +103,7 @@ mod tests {
     use crate::ProviderRole;
 
     #[test]
-    fn strip_image_content_replaces_image_blocks() {
+    fn strip_image_content_replaces_image_blocks_for_non_vision_models() {
         let req = CompletionRequest {
             model: "test".to_string(),
             messages: vec![ProviderMessage {
@@ -110,7 +125,17 @@ mod tests {
             thinking_tokens: None,
         };
 
-        let stripped = strip_image_content(req);
+        let stripped = strip_image_content(
+            req,
+            Some(&ModelInfo {
+                model_id: "test".to_string(),
+                context_window: 8_192,
+                max_output_tokens: None,
+                supports_vision: false,
+                supports_tool_use: true,
+                supports_streaming: true,
+            }),
+        );
         assert_eq!(stripped.messages[0].content.len(), 2);
         assert_eq!(
             stripped.messages[0].content[0].as_text().unwrap(),
@@ -120,6 +145,43 @@ mod tests {
             stripped.messages[0].content[1].as_text().unwrap(),
             "describe this"
         );
+    }
+
+    #[test]
+    fn strip_image_content_preserves_images_for_vision_models() {
+        let req = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: vec![
+                    ProviderContent::Image {
+                        url: "data:image/png;base64,abc".to_string(),
+                        detail: None,
+                    },
+                    ProviderContent::Text {
+                        text: "describe this".to_string(),
+                    },
+                ],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+
+        let stripped = strip_image_content(
+            req.clone(),
+            Some(&ModelInfo {
+                model_id: "test".to_string(),
+                context_window: 128_000,
+                max_output_tokens: Some(16_384),
+                supports_vision: true,
+                supports_tool_use: true,
+                supports_streaming: true,
+            }),
+        );
+        assert_eq!(stripped.messages, req.messages);
     }
 
     #[test]
@@ -133,7 +195,7 @@ mod tests {
             thinking_tokens: None,
         };
 
-        let stripped = strip_image_content(req.clone());
+        let stripped = strip_image_content(req.clone(), None);
         assert_eq!(stripped.messages, req.messages);
     }
 }

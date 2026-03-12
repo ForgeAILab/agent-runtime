@@ -682,6 +682,82 @@ fn looks_like_html(body: &str) -> bool {
         || (trimmed.starts_with('<') && (trimmed.contains("</") || trimmed.contains("/>")))
 }
 
+/// Strip non-content elements from HTML before markdown conversion.
+///
+/// Removes `<script>`, `<style>`, `<noscript>`, `<svg>`, `<nav>`, `<footer>`,
+/// `<header>`, and Next.js / React hydration artifacts.  When a `<main>`,
+/// `<article>`, or `[role="main"]` element exists the output is scoped to that
+/// subtree so sidebar / boilerplate content is dropped automatically.
+#[cfg(feature = "http")]
+fn sanitize_html(raw: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    // Extract content region: try <article>, then <main>, then <body>.
+    static ARTICLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<article\b[^>]*>(.*)</article>").expect("static regex"));
+    static MAIN_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<main\b[^>]*>(.*)</main>").expect("static regex"));
+    static BODY_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<body\b[^>]*>(.*)</body>").expect("static regex"));
+
+    let scoped = ARTICLE_RE
+        .captures(raw)
+        .or_else(|| MAIN_RE.captures(raw))
+        .or_else(|| BODY_RE.captures(raw))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+        .unwrap_or(raw);
+
+    // Strip tags whose content is never readable text.
+    // Each tag needs its own pattern since regex crate has no backreferences.
+    static STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?is)",
+            r"<script\b[^>]*>.*?</script>|",
+            r"<style\b[^>]*>.*?</style>|",
+            r"<noscript\b[^>]*>.*?</noscript>|",
+            r"<svg\b[^>]*>.*?</svg>|",
+            r"<nav\b[^>]*>.*?</nav>|",
+            r"<footer\b[^>]*>.*?</footer>|",
+            r"<header\b[^>]*>.*?</header>|",
+            r"<iframe\b[^>]*>.*?</iframe>|",
+            r"<object\b[^>]*>.*?</object>|",
+            r"<embed\b[^>]*>.*?</embed>|",
+            // Void / self-closing tags
+            r"<(?:link|meta)\b[^>]*/?>",
+        ))
+        .expect("static regex")
+    });
+
+    let cleaned = STRIP_RE.replace_all(scoped, "");
+
+    let md = html2md::parse_html(&cleaned);
+
+    collapse_blank_lines(&md)
+}
+
+/// Collapse runs of 3+ newlines into exactly 2 (one blank line).
+#[cfg(feature = "http")]
+fn collapse_blank_lines(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut blank_count = 0u32;
+    for line in s.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                result.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    let trimmed = result.trim_end();
+    trimmed.to_owned()
+}
+
 #[cfg(feature = "http")]
 #[async_trait]
 impl Tool for HttpTool {
@@ -756,7 +832,7 @@ impl Tool for HttpTool {
             HttpResponseFormat::Markdown => {
                 let output =
                     if is_html_content_type(content_type.as_deref()) || looks_like_html(&body) {
-                        html2md::parse_html(&body)
+                        sanitize_html(&body)
                     } else {
                         body
                     };
@@ -1376,6 +1452,129 @@ mod tests {
             .expect_err("invalid format should fail");
 
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_tool_strips_scripts_and_styles() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bloated"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(concat!(
+                        "<!DOCTYPE html><html><head>",
+                        "<style>body { color: red; }</style>",
+                        "<script>console.log('hi')</script>",
+                        "</head><body>",
+                        "<script>window.__NEXT_DATA__={\"props\":{}}</script>",
+                        "<h1>Title</h1>",
+                        "<p>Readable content here.</p>",
+                        "<noscript>Enable JS</noscript>",
+                        "</body></html>",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let output = HttpTool::default()
+            .invoke(
+                json!({ "url": format!("{}/bloated", server.uri()) }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect("http invoke works");
+
+        let text = output.value.as_str().expect("markdown text");
+        assert!(text.contains("Title"), "should keep heading");
+        assert!(text.contains("Readable content"), "should keep body text");
+        assert!(!text.contains("console.log"), "should strip script content");
+        assert!(!text.contains("color: red"), "should strip style content");
+        assert!(!text.contains("NEXT_DATA"), "should strip hydration data");
+        assert!(!text.contains("Enable JS"), "should strip noscript");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_tool_extracts_article_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/article"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(concat!(
+                        "<html><body>",
+                        "<nav><a href='/'>Home</a><a href='/about'>About</a></nav>",
+                        "<article>",
+                        "<h1>Article Title</h1>",
+                        "<p>Article body text.</p>",
+                        "</article>",
+                        "<footer>Copyright 2026</footer>",
+                        "</body></html>",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let output = HttpTool::default()
+            .invoke(
+                json!({ "url": format!("{}/article", server.uri()) }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect("http invoke works");
+
+        let text = output.value.as_str().expect("markdown text");
+        assert!(
+            text.contains("Article Title"),
+            "should keep article heading"
+        );
+        assert!(text.contains("Article body"), "should keep article body");
+        assert!(!text.contains("Home"), "should strip nav links");
+        assert!(!text.contains("Copyright"), "should strip footer");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_tool_handles_nextjs_hydration_bloat() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nextjs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(concat!(
+                        "<!DOCTYPE html><html><head>",
+                        "<script id=\"__NEXT_DATA__\" type=\"application/json\">",
+                        "{\"props\":{\"pageProps\":{\"data\":[1,2,3]}}}",
+                        "</script>",
+                        "<style data-next-hide-fouc=\"true\">body{display:none}</style>",
+                        "</head><body>",
+                        "<main>",
+                        "<h1>Documentation</h1>",
+                        "<p>This is the actual content.</p>",
+                        "</main>",
+                        "</body></html>",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let output = HttpTool::default()
+            .invoke(
+                json!({ "url": format!("{}/nextjs", server.uri()) }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect("http invoke works");
+
+        let text = output.value.as_str().expect("markdown text");
+        assert!(text.contains("Documentation"), "should keep main content");
+        assert!(text.contains("actual content"), "should keep body text");
+        assert!(!text.contains("pageProps"), "should strip __NEXT_DATA__");
+        assert!(!text.contains("display:none"), "should strip FOUC style");
     }
 
     #[cfg(feature = "terminal")]

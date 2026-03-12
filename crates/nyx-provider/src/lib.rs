@@ -9,9 +9,11 @@ pub use tool_call::{JsonDirectiveParser, ToolCall, ToolCallParser, XmlDirectiveP
 mod circuit_breaker;
 pub mod config;
 mod fallback;
+pub mod model_info;
 mod retry;
 pub use circuit_breaker::CircuitBreakerProvider;
 pub use fallback::FallbackProvider;
+pub use model_info::{ModelInfo, ModelRegistry};
 pub use retry::RetryProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
