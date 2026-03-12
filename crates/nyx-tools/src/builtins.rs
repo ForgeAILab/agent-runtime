@@ -682,35 +682,37 @@ fn looks_like_html(body: &str) -> bool {
         || (trimmed.starts_with('<') && (trimmed.contains("</") || trimmed.contains("/>")))
 }
 
-/// Strip non-content elements from HTML before markdown conversion.
+/// Extract readable content from an HTML page.
 ///
-/// Removes `<script>`, `<style>`, `<noscript>`, `<svg>`, `<nav>`, `<footer>`,
-/// `<header>`, and Next.js / React hydration artifacts.  When a `<main>`,
-/// `<article>`, or `[role="main"]` element exists the output is scoped to that
-/// subtree so sidebar / boilerplate content is dropped automatically.
+/// 1. Grab `<title>` as a heading.
+/// 2. Extract `<body>` content (fallback to raw input).
+/// 3. Strip all non-content elements (scripts, styles, nav, SVG, hidden, …).
+/// 4. Convert the cleaned HTML to markdown via `html2md`.
 #[cfg(feature = "http")]
 fn sanitize_html(raw: &str) -> String {
     use regex::Regex;
     use std::sync::LazyLock;
 
-    // Extract content region: try <article>, then <main>, then <body>.
-    static ARTICLE_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<article\b[^>]*>(.*)</article>").expect("static regex"));
-    static MAIN_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<main\b[^>]*>(.*)</main>").expect("static regex"));
+    // --- title ---
+    static TITLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("static regex"));
+
+    let title = TITLE_RE
+        .captures(raw)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().trim().to_owned());
+
+    // --- body ---
     static BODY_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?is)<body\b[^>]*>(.*)</body>").expect("static regex"));
 
-    let scoped = ARTICLE_RE
+    let body = BODY_RE
         .captures(raw)
-        .or_else(|| MAIN_RE.captures(raw))
-        .or_else(|| BODY_RE.captures(raw))
         .and_then(|c| c.get(1))
         .map(|m| m.as_str())
         .unwrap_or(raw);
 
-    // Strip tags whose content is never readable text.
-    // Each tag needs its own pattern since regex crate has no backreferences.
+    // --- strip non-content tags with their children ---
     static STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
             r"(?is)",
@@ -720,21 +722,37 @@ fn sanitize_html(raw: &str) -> String {
             r"<svg\b[^>]*>.*?</svg>|",
             r"<nav\b[^>]*>.*?</nav>|",
             r"<footer\b[^>]*>.*?</footer>|",
-            r"<header\b[^>]*>.*?</header>|",
+            r"<aside\b[^>]*>.*?</aside>|",
             r"<iframe\b[^>]*>.*?</iframe>|",
             r"<object\b[^>]*>.*?</object>|",
             r"<embed\b[^>]*>.*?</embed>|",
+            r"<form\b[^>]*>.*?</form>|",
             // Void / self-closing tags
-            r"<(?:link|meta)\b[^>]*/?>",
+            r"<(?:link|meta|img|br|hr|input|button)\b[^>]*/?>|",
+            // Elements with hidden attribute
+            r"<\w+\b[^>]*\bhidden\b[^>]*>.*?</\w+>|",
+            // HTML comments (React boundaries, etc.)
+            r"<!--.*?-->",
         ))
         .expect("static regex")
     });
 
-    let cleaned = STRIP_RE.replace_all(scoped, "");
+    let cleaned = STRIP_RE.replace_all(body, "");
 
+    // --- convert to markdown ---
     let md = html2md::parse_html(&cleaned);
 
-    collapse_blank_lines(&md)
+    // --- assemble: title + body ---
+    let mut out = String::new();
+    if let Some(t) = title {
+        if !t.is_empty() {
+            out.push_str("# ");
+            out.push_str(&t);
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str(&collapse_blank_lines(&md));
+    out
 }
 
 /// Collapse runs of 3+ newlines into exactly 2 (one blank line).
@@ -1465,6 +1483,7 @@ mod tests {
                     .insert_header("content-type", "text/html; charset=utf-8")
                     .set_body_string(concat!(
                         "<!DOCTYPE html><html><head>",
+                        "<title>Test Page</title>",
                         "<style>body { color: red; }</style>",
                         "<script>console.log('hi')</script>",
                         "</head><body>",
@@ -1487,6 +1506,7 @@ mod tests {
             .expect("http invoke works");
 
         let text = output.value.as_str().expect("markdown text");
+        assert!(text.starts_with("# Test Page"), "should start with title");
         assert!(text.contains("Title"), "should keep heading");
         assert!(text.contains("Readable content"), "should keep body text");
         assert!(!text.contains("console.log"), "should strip script content");
@@ -1497,20 +1517,19 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[tokio::test]
-    async fn http_tool_extracts_article_content() {
+    async fn http_tool_strips_nav_and_footer() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/article"))
+            .and(path("/page"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/html; charset=utf-8")
                     .set_body_string(concat!(
-                        "<html><body>",
+                        "<html><head><title>My Page</title></head><body>",
                         "<nav><a href='/'>Home</a><a href='/about'>About</a></nav>",
-                        "<article>",
                         "<h1>Article Title</h1>",
                         "<p>Article body text.</p>",
-                        "</article>",
+                        "<aside>Sidebar stuff</aside>",
                         "<footer>Copyright 2026</footer>",
                         "</body></html>",
                     )),
@@ -1520,20 +1539,18 @@ mod tests {
 
         let output = HttpTool::default()
             .invoke(
-                json!({ "url": format!("{}/article", server.uri()) }),
+                json!({ "url": format!("{}/page", server.uri()) }),
                 &ctx(vec![]),
             )
             .await
             .expect("http invoke works");
 
         let text = output.value.as_str().expect("markdown text");
-        assert!(
-            text.contains("Article Title"),
-            "should keep article heading"
-        );
-        assert!(text.contains("Article body"), "should keep article body");
+        assert!(text.contains("Article Title"), "should keep heading");
+        assert!(text.contains("Article body"), "should keep body text");
         assert!(!text.contains("Home"), "should strip nav links");
         assert!(!text.contains("Copyright"), "should strip footer");
+        assert!(!text.contains("Sidebar"), "should strip aside");
     }
 
     #[cfg(feature = "http")]
@@ -1547,15 +1564,18 @@ mod tests {
                     .insert_header("content-type", "text/html; charset=utf-8")
                     .set_body_string(concat!(
                         "<!DOCTYPE html><html><head>",
+                        "<title>Docs - Tool Use</title>",
                         "<script id=\"__NEXT_DATA__\" type=\"application/json\">",
                         "{\"props\":{\"pageProps\":{\"data\":[1,2,3]}}}",
                         "</script>",
                         "<style data-next-hide-fouc=\"true\">body{display:none}</style>",
                         "</head><body>",
+                        "<div hidden>fallback content</div>",
                         "<main>",
                         "<h1>Documentation</h1>",
                         "<p>This is the actual content.</p>",
                         "</main>",
+                        "<!--$--><!-- react boundary --><!--/$-->",
                         "</body></html>",
                     )),
             )
@@ -1571,10 +1591,12 @@ mod tests {
             .expect("http invoke works");
 
         let text = output.value.as_str().expect("markdown text");
+        assert!(text.starts_with("# Docs - Tool Use"), "should start with title");
         assert!(text.contains("Documentation"), "should keep main content");
         assert!(text.contains("actual content"), "should keep body text");
         assert!(!text.contains("pageProps"), "should strip __NEXT_DATA__");
         assert!(!text.contains("display:none"), "should strip FOUC style");
+        assert!(!text.contains("fallback"), "should strip hidden divs");
     }
 
     #[cfg(feature = "terminal")]

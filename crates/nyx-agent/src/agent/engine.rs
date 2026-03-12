@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nyx_core::{ControlPlaneExt, ToolCatalogService, ToolSelection};
 use nyx_obs::Event;
@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use crate::{
     AfterToolContext, AgentContext, AgentError, AgentResponse, BeforeToolContext,
-    CharBasedEstimator, HookAction, Message, MessageContent, MessageRole, TokenEstimator,
-    render::render_tool_result_for_provider,
+    CharBasedEstimator, HookAction, Message, MessageContent, MessageRole, PollConfig, PollOption,
+    TokenEstimator, render::render_tool_result_for_provider,
 };
 
 #[derive(Debug, Clone)]
@@ -206,7 +206,7 @@ impl ToolLoopEngine {
                 }
                 Err(err) => return Err(err),
             };
-            let text = completion.content.trim();
+            let text = completion.content.trim().trim_end_matches(':');
             let has_tool_calls = !completion.tool_calls.is_empty();
 
             if config.emit_progressive
@@ -322,12 +322,27 @@ impl ToolLoopEngine {
                     .map_err(|err| AgentError::Observability(err.to_string()))?;
 
                 let started = Instant::now();
-                let invoked = tool.invoke(tool_call.input.clone(), &ctx.tool_ctx).await;
+
+                // Route send_poll through PollClient so the interactive payload
+                // is delivered to the chat adapter (e.g. Telegram), not just
+                // registered in the internal poll registry.
+                let (tool_result, success) =
+                    if tool.name() == "send_poll" && ctx.poll_client.is_some() {
+                        match try_poll_via_client(ctx, &tool_call.input).await {
+                            Ok(poll_id) => (
+                                nyx_tools::ToolResult::json(json!({ "poll_id": poll_id })),
+                                true,
+                            ),
+                            Err(err) => (nyx_tools::ToolResult::error(err.to_string()), false),
+                        }
+                    } else {
+                        match tool.invoke(tool_call.input.clone(), &ctx.tool_ctx).await {
+                            Ok(tool_result) => (tool_result, true),
+                            Err(err) => (nyx_tools::ToolResult::error(err.to_string()), false),
+                        }
+                    };
+
                 let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                let (tool_result, success) = match invoked {
-                    Ok(tool_result) => (tool_result, true),
-                    Err(err) => (nyx_tools::ToolResult::error(err.to_string()), false),
-                };
                 let tool_result_text = render_tool_result_for_provider(&tool_result.value)?;
                 let observer_result_text = render_tool_result_for_observer(&tool_result.value);
 
@@ -502,6 +517,34 @@ pub(crate) fn render_tool_result_for_observer(value: &Value) -> String {
         Value::String(text) => text.clone(),
         _ => value.to_string(),
     }
+}
+
+/// Parse the LLM's `send_poll` tool input and delegate to [`AgentContext::send_poll`]
+/// so that the interactive payload reaches the chat adapter.
+async fn try_poll_via_client(ctx: &AgentContext, input: &Value) -> Result<String, AgentError> {
+    let question = input
+        .get("question")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AgentError::ToolNotFound("send_poll: missing question".into()))?
+        .to_string();
+    let options: Vec<PollOption> = serde_json::from_value(
+        input
+            .get("options")
+            .cloned()
+            .unwrap_or(Value::Array(vec![])),
+    )
+    .map_err(|err| AgentError::ToolNotFound(format!("send_poll: bad options: {err}")))?;
+    let timeout = input
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_secs);
+    let config = PollConfig {
+        question,
+        options,
+        allow_multiple: false,
+        timeout,
+    };
+    ctx.send_poll(config).await
 }
 
 fn is_context_overflow(err: &AgentError) -> bool {
