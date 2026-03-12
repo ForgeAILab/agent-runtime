@@ -158,9 +158,7 @@ impl ClaudeProvider {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Rejected(format!("{} {}", status, text)));
+            return Err(crate::error_for_response(response).await);
         }
 
         let parsed: ClaudeMessagesResponse = response.json().await?;

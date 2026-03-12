@@ -82,9 +82,7 @@ impl OpenAiCodexProvider {
 
         let response = request.send().await?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Rejected(format!("{status} {body}")));
+            return Err(crate::error_for_response(response).await);
         }
         Ok(response)
     }

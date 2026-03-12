@@ -48,7 +48,29 @@ pub(crate) fn is_retryable(err: &ProviderError) -> bool {
                 .map(|code| code == 429 || code >= 500)
                 .unwrap_or(false)
         }
+        ProviderError::RateLimited { .. } => true,
         ProviderError::StreamingUnsupported => false,
+    }
+}
+
+/// Choose the delay before retrying.
+///
+/// For rate-limit errors, honour the provider's `Retry-After` hint when
+/// available, otherwise apply a 2 s floor so we don't hammer the API during
+/// a rate-limit window.  For other transient errors (5xx, timeouts) we fall
+/// back to the normal exponential backoff.
+fn pick_delay(err: &ProviderError, exponential_backoff_ms: u64) -> u64 {
+    const RATE_LIMIT_FLOOR_MS: u64 = 2_000;
+    match err {
+        ProviderError::RateLimited {
+            retry_after_ms: Some(hint),
+            ..
+        } => (*hint).max(RATE_LIMIT_FLOOR_MS),
+        ProviderError::RateLimited {
+            retry_after_ms: None,
+            ..
+        } => exponential_backoff_ms.max(RATE_LIMIT_FLOOR_MS),
+        _ => exponential_backoff_ms,
     }
 }
 
@@ -60,7 +82,6 @@ fn parse_status_code(msg: &str) -> Option<u16> {
 impl LlmProvider for RetryProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let mut backoff_ms = self.initial_backoff_ms;
-        let mut last_err;
         let mut attempt = 0u32;
 
         loop {
@@ -71,13 +92,17 @@ impl LlmProvider for RetryProvider {
                     if attempt >= self.max_attempts || !is_retryable(&err) {
                         return Err(err);
                     }
-                    last_err = err;
+                    let delay = pick_delay(&err, backoff_ms);
+                    tracing::warn!(
+                        attempt,
+                        max = self.max_attempts,
+                        delay_ms = delay,
+                        "retrying provider request"
+                    );
+                    sleep(Duration::from_millis(delay)).await;
+                    backoff_ms = backoff_ms.saturating_mul(2);
                 }
             }
-
-            sleep(Duration::from_millis(backoff_ms)).await;
-            backoff_ms = backoff_ms.saturating_mul(2);
-            let _ = last_err; // keep borrow checker happy; loop continues
         }
     }
 
@@ -93,7 +118,14 @@ impl LlmProvider for RetryProvider {
                     if attempt >= self.max_attempts || !is_retryable(&err) {
                         return Err(err);
                     }
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    let delay = pick_delay(&err, backoff_ms);
+                    tracing::warn!(
+                        attempt,
+                        max = self.max_attempts,
+                        delay_ms = delay,
+                        "retrying provider stream"
+                    );
+                    sleep(Duration::from_millis(delay)).await;
                     backoff_ms = backoff_ms.saturating_mul(2);
                 }
             }
@@ -270,6 +302,86 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(err, ProviderError::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_is_retried() {
+        struct RateLimitedThenOk {
+            calls: AtomicU32,
+            then: Arc<dyn LlmProvider>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for RateLimitedThenOk {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, ProviderError> {
+                let call_no = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_no == 0 {
+                    Err(ProviderError::RateLimited {
+                        retry_after_ms: None,
+                        message: "429 Too Many Requests".to_string(),
+                    })
+                } else {
+                    self.then.complete(req).await
+                }
+            }
+
+            async fn stream(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionStream, ProviderError> {
+                self.then.stream(req).await
+            }
+
+            async fn health_check(&self) -> bool {
+                self.then.health_check().await
+            }
+        }
+
+        let inner = RateLimitedThenOk {
+            calls: AtomicU32::new(0),
+            then: Arc::new(EchoProvider),
+        };
+        let provider = RetryProvider::new(
+            Arc::new(inner),
+            &RetryConfig {
+                max_attempts: 3,
+                initial_backoff_ms: 0, // zero for test speed
+            },
+        );
+
+        let resp = provider
+            .complete(simple_req())
+            .await
+            .expect("rate-limited retry should succeed");
+        assert_eq!(resp.content, "hi");
+    }
+
+    #[test]
+    fn pick_delay_uses_retry_after_hint() {
+        let err = ProviderError::RateLimited {
+            retry_after_ms: Some(5_000),
+            message: String::new(),
+        };
+        assert_eq!(pick_delay(&err, 100), 5_000);
+    }
+
+    #[test]
+    fn pick_delay_applies_floor_without_hint() {
+        let err = ProviderError::RateLimited {
+            retry_after_ms: None,
+            message: String::new(),
+        };
+        // With a low exponential backoff, the 2 s floor should kick in
+        assert_eq!(pick_delay(&err, 100), 2_000);
+    }
+
+    #[test]
+    fn pick_delay_falls_back_for_non_rate_limit() {
+        let err = ProviderError::Rejected("500 Internal Server Error".to_string());
+        assert_eq!(pick_delay(&err, 750), 750);
     }
 
     #[tokio::test]

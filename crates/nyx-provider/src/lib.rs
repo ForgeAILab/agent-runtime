@@ -130,8 +130,38 @@ pub enum ProviderError {
     InvalidResponse(&'static str),
     #[error("provider rejected request: {0}")]
     Rejected(String),
+    #[error("rate limited: {message}")]
+    RateLimited {
+        retry_after_ms: Option<u64>,
+        message: String,
+    },
     #[error("streaming is not supported by provider")]
     StreamingUnsupported,
+}
+
+/// Build a [`ProviderError`] from a non-success HTTP response, distinguishing
+/// 429 (rate-limited) from other rejections and extracting `Retry-After`.
+pub async fn error_for_response(response: reqwest::Response) -> ProviderError {
+    let status = response.status();
+    let retry_after_ms = if status.as_u16() == 429 {
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|secs| (secs * 1000.0) as u64)
+    } else {
+        None
+    };
+    let body = response.text().await.unwrap_or_default();
+    if status.as_u16() == 429 {
+        ProviderError::RateLimited {
+            retry_after_ms,
+            message: format!("{status} {body}"),
+        }
+    } else {
+        ProviderError::Rejected(format!("{status} {body}"))
+    }
 }
 
 #[async_trait]

@@ -27,16 +27,17 @@ impl Default for RetryConfig {
 }
 
 fn default_max_attempts() -> u32 {
-    3
+    5
 }
 
 fn default_initial_backoff_ms() -> u64 {
-    500
+    1_000
 }
 
 fn is_default_retry(r: &RetryConfig) -> bool {
     r.max_attempts == default_max_attempts() && r.initial_backoff_ms == default_initial_backoff_ms()
 }
+
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CircuitBreakerConfig {

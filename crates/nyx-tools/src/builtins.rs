@@ -384,7 +384,9 @@ impl Tool for ProcessTool {
 
     fn description(&self) -> &str {
         "Manage background processes. Actions: start (spawn a process, tty=true for terminal programs), \
-         read (get output, incremental by default), write (send input/keystrokes to stdin or tty), \
+         read (get new output since last read — just pass id, no other params needed; \
+         offset and limit are optional and only for re-reading or paging earlier output), \
+         write (send input to stdin/tty, newline appended automatically), \
          wait (block until exit or timeout), kill (terminate), list (show all processes)."
     }
 
@@ -432,7 +434,12 @@ impl Tool for ProcessTool {
                 },
                 "input": {
                     "type": "string",
-                    "description": "Data to send to the process stdin/tty (write only). Use \\n for Enter, \\t for Tab, etc."
+                    "description": "Data to send to the process stdin/tty (write only). A newline is appended automatically unless no_newline=true."
+                },
+                "no_newline": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, do not append a trailing newline to input (write only). Useful for sending raw control sequences."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -442,12 +449,12 @@ impl Tool for ProcessTool {
                 "offset": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Read from this line (0-based). Omit for incremental read (read only)."
+                    "description": "OPTIONAL (read only). Re-read from this line number (0-based). Do NOT set this for normal use — by default read returns only new content since the last read, which is almost always what you want."
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Max lines to return (read only)"
+                    "description": "OPTIONAL (read only). Max lines to return. Usually not needed — omit to get all new output."
                 }
             }
         })
@@ -557,12 +564,22 @@ impl ProcessTool {
 
     async fn action_write(&self, input: &Value) -> Result<ToolResult, ToolError> {
         let id = Self::require_id(input)?;
-        let data = input
+        let raw = input
             .get("input")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("missing input".to_string()))?;
+        let no_newline = input
+            .get("no_newline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        self.terminal_registry.write(id, data).await?;
+        let data = if no_newline || raw.ends_with('\n') {
+            raw.to_string()
+        } else {
+            format!("{raw}\n")
+        };
+
+        self.terminal_registry.write(id, &data).await?;
 
         Ok(ToolResult::json(json!({
             "id": id,
@@ -712,7 +729,9 @@ fn sanitize_html(raw: &str) -> String {
         .map(|m| m.as_str())
         .unwrap_or(raw);
 
-    // --- strip non-content tags with their children ---
+    // --- strip non-content tags BEFORE content scoping ---
+    // This must happen first so that stray </script> etc. don't confuse
+    // the greedy content-region regex.
     static STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
             r"(?is)",
@@ -720,27 +739,64 @@ fn sanitize_html(raw: &str) -> String {
             r"<style\b[^>]*>.*?</style>|",
             r"<noscript\b[^>]*>.*?</noscript>|",
             r"<svg\b[^>]*>.*?</svg>|",
-            r"<nav\b[^>]*>.*?</nav>|",
-            r"<footer\b[^>]*>.*?</footer>|",
-            r"<aside\b[^>]*>.*?</aside>|",
             r"<iframe\b[^>]*>.*?</iframe>|",
             r"<object\b[^>]*>.*?</object>|",
             r"<embed\b[^>]*>.*?</embed>|",
-            r"<form\b[^>]*>.*?</form>|",
             // Void / self-closing tags
             r"<(?:link|meta|img|br|hr|input|button)\b[^>]*/?>|",
-            // Elements with hidden attribute
-            r"<\w+\b[^>]*\bhidden\b[^>]*>.*?</\w+>|",
+            // Elements with the `hidden` HTML attribute (bare or `hidden=""`)
+            r#"<\w+\b[^>]*\shidden[\s=">].*?</\w+>|"#,
             // HTML comments (React boundaries, etc.)
             r"<!--.*?-->",
         ))
         .expect("static regex")
     });
 
-    let cleaned = STRIP_RE.replace_all(body, "");
+    let stripped = STRIP_RE.replace_all(body, "");
+
+    // --- narrow to content region (after scripts are gone) ---
+    // Try each selector independently (not as alternations) to avoid
+    // a broader <main> overshadowing a narrower <article>.
+    static ARTICLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<article\b[^>]*>(.*)</article>").expect("static regex"));
+    static MAIN_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<main\b[^>]*>(.*)</main>").expect("static regex"));
+    static ROLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<\w+\b[^>]*\brole\s*=\s*"main"[^>]*>(.*)</\w+>"#).expect("static regex")
+    });
+    static CONTENT_AREA_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<\w+\b[^>]*\bid\s*=\s*"content-area"[^>]*>(.*)</\w+>"#)
+            .expect("static regex")
+    });
+
+    let scoped = ARTICLE_RE
+        .captures(&stripped)
+        .or_else(|| MAIN_RE.captures(&stripped))
+        .or_else(|| ROLE_RE.captures(&stripped))
+        .or_else(|| CONTENT_AREA_RE.captures(&stripped))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| stripped.into_owned());
+
+    // --- strip chrome tags (only needed after scoping) ---
+    static CHROME_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?is)",
+            r"<nav\b[^>]*>.*?</nav>|",
+            r"<footer\b[^>]*>.*?</footer>|",
+            r"<aside\b[^>]*>.*?</aside>|",
+            r"<form\b[^>]*>.*?</form>",
+        ))
+        .expect("static regex")
+    });
+
+    let cleaned = CHROME_RE.replace_all(&scoped, "");
 
     // --- convert to markdown ---
     let md = html2md::parse_html(&cleaned);
+
+    // --- post-process: clean up markdown artifacts ---
+    let md = clean_markdown(&md);
 
     // --- assemble: title + body ---
     let mut out = String::new();
@@ -753,6 +809,26 @@ fn sanitize_html(raw: &str) -> String {
     }
     out.push_str(&collapse_blank_lines(&md));
     out
+}
+
+/// Remove markdown artifacts that don't carry readable content.
+#[cfg(feature = "http")]
+fn clean_markdown(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    // Links whose visible text is empty or only zero-width/whitespace chars,
+    // e.g. `[​](#webhooks)` or `[\u{200b}](#foo)`.
+    static EMPTY_LINK_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\[[\s\u{200b}\u{200c}\u{feff}]*\]\([^)]*\)").expect("static regex"));
+
+    // "Loading..." skeleton lines left by React Suspense shimmer divs.
+    static LOADING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*Loading\.{3}\s*$").expect("static regex"));
+
+    let out = EMPTY_LINK_RE.replace_all(s, "");
+    let out = LOADING_RE.replace_all(&out, "");
+    out.into_owned()
 }
 
 /// Collapse runs of 3+ newlines into exactly 2 (one blank line).
@@ -1591,7 +1667,10 @@ mod tests {
             .expect("http invoke works");
 
         let text = output.value.as_str().expect("markdown text");
-        assert!(text.starts_with("# Docs - Tool Use"), "should start with title");
+        assert!(
+            text.starts_with("# Docs - Tool Use"),
+            "should start with title"
+        );
         assert!(text.contains("Documentation"), "should keep main content");
         assert!(text.contains("actual content"), "should keep body text");
         assert!(!text.contains("pageProps"), "should strip __NEXT_DATA__");
@@ -1690,7 +1769,7 @@ mod tests {
                 json!({
                     "action": "write",
                     "id": id,
-                    "input": "hello from write\n"
+                    "input": "hello from write"
                 }),
                 &tool_ctx,
             )
