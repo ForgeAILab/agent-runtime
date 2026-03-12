@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nyx_security::{Sandbox, SandboxedCommand};
+#[cfg(feature = "http")]
+use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 
 #[cfg(feature = "sub-agent")]
@@ -36,19 +38,7 @@ pub fn register_builtins(
 
     #[cfg(feature = "terminal")]
     {
-        registry.register(Arc::new(ProcessStartTool::new(Arc::clone(
-            &terminal_registry,
-        ))))?;
-        registry.register(Arc::new(ProcessReadTool::new(Arc::clone(
-            &terminal_registry,
-        ))))?;
-        registry.register(Arc::new(ProcessWaitTool::new(Arc::clone(
-            &terminal_registry,
-        ))))?;
-        registry.register(Arc::new(ProcessKillTool::new(Arc::clone(
-            &terminal_registry,
-        ))))?;
-        registry.register(Arc::new(ProcessListTool::new(terminal_registry)))?;
+        registry.register(Arc::new(ProcessTool::new(terminal_registry)))?;
     }
 
     #[cfg(feature = "http")]
@@ -374,12 +364,12 @@ impl Tool for ShellTool {
 
 #[cfg(feature = "terminal")]
 #[derive(Debug, Clone)]
-pub struct ProcessStartTool {
+pub struct ProcessTool {
     terminal_registry: Arc<TerminalRegistry>,
 }
 
 #[cfg(feature = "terminal")]
-impl ProcessStartTool {
+impl ProcessTool {
     pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
         Self { terminal_registry }
     }
@@ -387,36 +377,117 @@ impl ProcessStartTool {
 
 #[cfg(feature = "terminal")]
 #[async_trait]
-impl Tool for ProcessStartTool {
+impl Tool for ProcessTool {
     fn name(&self) -> &str {
-        "process_start"
+        "process"
     }
 
     fn description(&self) -> &str {
-        "Spawn a background process. Set tty=true for programs that need a terminal (e.g. interactive CLIs, TUI apps). Use process_wait or process_read to check results."
+        "Manage background processes. Actions: start (spawn a process, tty=true for terminal programs), \
+         read (get output, incremental by default), write (send input/keystrokes to stdin or tty), \
+         wait (block until exit or timeout), kill (terminate), list (show all processes)."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "required": ["id", "command"],
+            "required": ["action"],
             "properties": {
-                "id": { "type": "string" },
-                "command": { "type": "string" },
-                "pwd": { "type": "string" },
-                "interactive": { "type": "boolean", "default": false },
-                "tty": { "type": "boolean", "default": false, "description": "Allocate a pseudo-terminal (PTY) for the process" },
-                "cols": { "type": "integer", "default": 80, "description": "Terminal width in columns (only used when tty=true)" },
-                "rows": { "type": "integer", "default": 24, "description": "Terminal height in rows (only used when tty=true)" }
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "read", "write", "wait", "kill", "list"],
+                    "description": "The action to perform"
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Process identifier (required for all actions except list)"
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run (start only)"
+                },
+                "pwd": {
+                    "type": "string",
+                    "description": "Working directory (start only)"
+                },
+                "interactive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Allow writing to stdin (start only, implied by tty)"
+                },
+                "tty": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Allocate a pseudo-terminal / PTY (start only)"
+                },
+                "cols": {
+                    "type": "integer",
+                    "default": 80,
+                    "description": "Terminal width (start + tty only)"
+                },
+                "rows": {
+                    "type": "integer",
+                    "default": 24,
+                    "description": "Terminal height (start + tty only)"
+                },
+                "input": {
+                    "type": "string",
+                    "description": "Data to send to the process stdin/tty (write only). Use \\n for Enter, \\t for Tab, etc."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Timeout in ms. For read: wait for new output (default 0). For wait: max wait time (default 30000)."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Read from this line (0-based). Omit for incremental read (read only)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Max lines to return (read only)"
+                }
             }
         })
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let id = input
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("missing action".to_string()))?;
+
+        match action {
+            "start" => self.action_start(&input, ctx).await,
+            "read" => self.action_read(&input).await,
+            "write" => self.action_write(&input).await,
+            "wait" => self.action_wait(&input).await,
+            "kill" => self.action_kill(&input).await,
+            "list" => self.action_list().await,
+            _ => Err(ToolError::InvalidInput(format!(
+                "unknown action: {action}. Expected one of: start, read, write, wait, kill, list"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "terminal")]
+impl ProcessTool {
+    fn require_id(input: &Value) -> Result<&str, ToolError> {
+        input
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))
+    }
+
+    async fn action_start(
+        &self,
+        input: &Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let id = Self::require_id(input)?;
         let command = input
             .get("command")
             .and_then(Value::as_str)
@@ -455,64 +526,9 @@ impl Tool for ProcessStartTool {
             })))
         }
     }
-}
 
-#[cfg(feature = "terminal")]
-#[derive(Debug, Clone)]
-pub struct ProcessReadTool {
-    terminal_registry: Arc<TerminalRegistry>,
-}
-
-#[cfg(feature = "terminal")]
-impl ProcessReadTool {
-    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
-        Self { terminal_registry }
-    }
-}
-
-#[cfg(feature = "terminal")]
-#[async_trait]
-impl Tool for ProcessReadTool {
-    fn name(&self) -> &str {
-        "process_read"
-    }
-
-    fn description(&self) -> &str {
-        "Read process output. Returns only new content since the last read by default. \
-         Use offset to re-read from a specific line, and limit to cap the number of lines."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["id"],
-            "properties": {
-                "id": { "type": "string" },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "default": 0,
-                    "description": "Wait up to this many ms for new output to appear (0 = return immediately)"
-                },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Read from this line number (0-based). Omit to read only new content since the last read."
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Maximum number of lines to return. Omit to return all available."
-                }
-            }
-        })
-    }
-
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let id = input
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+    async fn action_read(&self, input: &Value) -> Result<ToolResult, ToolError> {
+        let id = Self::require_id(input)?;
         let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
         let offset = input
             .get("offset")
@@ -538,48 +554,25 @@ impl Tool for ProcessReadTool {
             "total_lines": output.stdout_total_lines,
         })))
     }
-}
 
-#[cfg(feature = "terminal")]
-#[derive(Debug, Clone)]
-pub struct ProcessWaitTool {
-    terminal_registry: Arc<TerminalRegistry>,
-}
-
-#[cfg(feature = "terminal")]
-impl ProcessWaitTool {
-    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
-        Self { terminal_registry }
-    }
-}
-
-#[cfg(feature = "terminal")]
-#[async_trait]
-impl Tool for ProcessWaitTool {
-    fn name(&self) -> &str {
-        "process_wait"
-    }
-
-    fn description(&self) -> &str {
-        "Wait for a process to exit (or timeout), then return output and status"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["id"],
-            "properties": {
-                "id": { "type": "string" },
-                "timeout_ms": { "type": "integer", "minimum": 0, "default": 30000 }
-            }
-        })
-    }
-
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let id = input
-            .get("id")
+    async fn action_write(&self, input: &Value) -> Result<ToolResult, ToolError> {
+        let id = Self::require_id(input)?;
+        let data = input
+            .get("input")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidInput("missing input".to_string()))?;
+
+        self.terminal_registry.write(id, data).await?;
+
+        Ok(ToolResult::json(json!({
+            "id": id,
+            "status": "written",
+            "bytes": data.len(),
+        })))
+    }
+
+    async fn action_wait(&self, input: &Value) -> Result<ToolResult, ToolError> {
+        let id = Self::require_id(input)?;
         let timeout_ms = input
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -598,47 +591,9 @@ impl Tool for ProcessWaitTool {
             "timed_out": timed_out,
         })))
     }
-}
 
-#[cfg(feature = "terminal")]
-#[derive(Debug, Clone)]
-pub struct ProcessKillTool {
-    terminal_registry: Arc<TerminalRegistry>,
-}
-
-#[cfg(feature = "terminal")]
-impl ProcessKillTool {
-    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
-        Self { terminal_registry }
-    }
-}
-
-#[cfg(feature = "terminal")]
-#[async_trait]
-impl Tool for ProcessKillTool {
-    fn name(&self) -> &str {
-        "process_kill"
-    }
-
-    fn description(&self) -> &str {
-        "Terminate a process"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["id"],
-            "properties": {
-                "id": { "type": "string" }
-            }
-        })
-    }
-
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let id = input
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))?;
+    async fn action_kill(&self, input: &Value) -> Result<ToolResult, ToolError> {
+        let id = Self::require_id(input)?;
         self.terminal_registry.kill(id).await?;
 
         Ok(ToolResult::json(json!({
@@ -646,40 +601,8 @@ impl Tool for ProcessKillTool {
             "status": "killed",
         })))
     }
-}
 
-#[cfg(feature = "terminal")]
-#[derive(Debug, Clone)]
-pub struct ProcessListTool {
-    terminal_registry: Arc<TerminalRegistry>,
-}
-
-#[cfg(feature = "terminal")]
-impl ProcessListTool {
-    pub fn new(terminal_registry: Arc<TerminalRegistry>) -> Self {
-        Self { terminal_registry }
-    }
-}
-
-#[cfg(feature = "terminal")]
-#[async_trait]
-impl Tool for ProcessListTool {
-    fn name(&self) -> &str {
-        "process_list"
-    }
-
-    fn description(&self) -> &str {
-        "List all processes with status"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-
-    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn action_list(&self) -> Result<ToolResult, ToolError> {
         let sessions = self
             .terminal_registry
             .list()
@@ -721,6 +644,45 @@ pub struct HttpTool {
 }
 
 #[cfg(feature = "http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpResponseFormat {
+    Json,
+    Text,
+    Markdown,
+}
+
+#[cfg(feature = "http")]
+impl HttpResponseFormat {
+    fn parse(input: Option<&str>) -> Result<Self, ToolError> {
+        match input.unwrap_or("markdown") {
+            "markdown" => Ok(Self::Markdown),
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(ToolError::InvalidInput(format!(
+                "unsupported response_format `{other}`; expected one of: json, text, markdown"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+fn is_html_content_type(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|value| {
+        let mime = value.split(';').next().unwrap_or(value).trim();
+        mime.eq_ignore_ascii_case("text/html") || mime.eq_ignore_ascii_case("application/xhtml+xml")
+    })
+}
+
+#[cfg(feature = "http")]
+fn looks_like_html(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    trimmed.starts_with("<!doctype html")
+        || trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<html")
+        || (trimmed.starts_with('<') && (trimmed.contains("</") || trimmed.contains("/>")))
+}
+
+#[cfg(feature = "http")]
 #[async_trait]
 impl Tool for HttpTool {
     fn name(&self) -> &str {
@@ -739,12 +701,20 @@ impl Tool for HttpTool {
                 "method": { "type": "string", "default": "GET" },
                 "url": { "type": "string" },
                 "headers": { "type": "object" },
-                "body": {}
+                "body": {},
+                "response_format": {
+                    "type": "string",
+                    "enum": ["json", "text", "markdown"],
+                    "default": "markdown",
+                    "description": "How the response is returned. `markdown` is the default and converts HTML responses to Markdown, otherwise returning text as-is. `text` returns the raw response body. `json` preserves the {status, body} wrapper for callers that want raw data."
+                }
             }
         })
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        let response_format =
+            HttpResponseFormat::parse(input.get("response_format").and_then(Value::as_str))?;
         let method = input
             .get("method")
             .and_then(Value::as_str)
@@ -770,12 +740,29 @@ impl Tool for HttpTool {
 
         let resp = req.send().await?;
         let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body = resp.text().await?;
 
-        Ok(ToolResult::json(json!({
-            "status": status,
-            "body": body,
-        })))
+        match response_format {
+            HttpResponseFormat::Json => Ok(ToolResult::json(json!({
+                "status": status,
+                "body": body,
+            }))),
+            HttpResponseFormat::Text => Ok(ToolResult::text(body)),
+            HttpResponseFormat::Markdown => {
+                let output =
+                    if is_html_content_type(content_type.as_deref()) || looks_like_html(&body) {
+                        html2md::parse_html(&body)
+                    } else {
+                        body
+                    };
+                Ok(ToolResult::text(output))
+            }
+        }
     }
 }
 
@@ -1010,16 +997,19 @@ mod tests {
     };
     use serde_json::json;
     use tempfile::NamedTempFile;
+    #[cfg(feature = "http")]
+    use wiremock::matchers::{method, path};
+    #[cfg(feature = "http")]
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[cfg(feature = "http")]
+    use crate::HttpTool;
     #[cfg(feature = "shell")]
     use crate::ShellTool;
     #[cfg(feature = "file")]
     use crate::{FileApplyPatchTool, FileReadTool, FileWriteTool};
     #[cfg(feature = "terminal")]
-    use crate::{
-        ProcessKillTool, ProcessListTool, ProcessReadTool, ProcessStartTool, ProcessWaitTool,
-        TerminalRegistry,
-    };
+    use crate::{ProcessTool, TerminalRegistry};
     use crate::{Tool, ToolContext, ToolError};
 
     #[derive(Default)]
@@ -1283,17 +1273,123 @@ mod tests {
         assert_eq!(spy.executions.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_tool_converts_html_to_markdown_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(
+                        "<html><body><h1>Page</h1><p>Hello <strong>markdown</strong></p></body></html>",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let output = HttpTool::default()
+            .invoke(
+                json!({ "url": format!("{}/doc", server.uri()) }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect("http invoke works");
+
+        let text = output.value.as_str().expect("markdown text");
+        assert!(text.contains("Page"));
+        assert!(text.contains("Hello"));
+        assert!(text.contains("markdown"));
+        assert!(!text.contains("<h1>"));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_tool_can_still_return_json_when_requested() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/markdown; charset=utf-8")
+                    .set_body_string("# Page\n\nHello markdown"),
+            )
+            .mount(&server)
+            .await;
+
+        let output = HttpTool::default()
+            .invoke(
+                json!({
+                    "url": format!("{}/doc", server.uri()),
+                    "response_format": "json"
+                }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect("http invoke works");
+
+        assert_eq!(output.value["status"], 200);
+        assert_eq!(output.value["body"], "# Page\n\nHello markdown");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_tool_markdown_mode_passthroughs_non_html_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/markdown; charset=utf-8")
+                    .set_body_string("# Page\n\nHello markdown"),
+            )
+            .mount(&server)
+            .await;
+
+        let output = HttpTool::default()
+            .invoke(
+                json!({
+                    "url": format!("{}/doc", server.uri()),
+                    "response_format": "markdown"
+                }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect("http invoke works");
+
+        assert_eq!(output.value, json!("# Page\n\nHello markdown"));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn http_tool_rejects_unknown_response_format() {
+        let err = HttpTool::default()
+            .invoke(
+                json!({
+                    "url": "https://example.com",
+                    "response_format": "html"
+                }),
+                &ctx(vec![]),
+            )
+            .await
+            .expect_err("invalid format should fail");
+
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
     #[cfg(feature = "terminal")]
     #[tokio::test]
-    async fn process_start_tool_spawns_process() {
+    async fn process_action_start_spawns_process() {
         let registry = Arc::new(TerminalRegistry::new());
-        let tool = ProcessStartTool::new(Arc::clone(&registry));
+        let tool = ProcessTool::new(Arc::clone(&registry));
         let tool_ctx = ToolContext::default();
         let id = unique_id("proc-start");
 
         let output = tool
             .invoke(
                 json!({
+                    "action": "start",
                     "id": id,
                     "command": "cat",
                     "interactive": true
@@ -1301,40 +1397,37 @@ mod tests {
                 &tool_ctx,
             )
             .await
-            .expect("process_start should succeed");
+            .expect("start should succeed");
 
         assert_eq!(output.value["status"], "started");
-        registry
-            .kill(output.value["id"].as_str().expect("string id"))
-            .await
-            .expect("kill process");
+        registry.kill(&id).await.expect("kill process");
     }
 
     #[cfg(feature = "terminal")]
     #[tokio::test]
-    async fn process_read_tool_reads_output() {
+    async fn process_action_read_reads_output() {
         let registry = Arc::new(TerminalRegistry::new());
-        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
-        let read_tool = ProcessReadTool::new(Arc::clone(&registry));
+        let tool = ProcessTool::new(Arc::clone(&registry));
         let tool_ctx = ToolContext::default();
         let id = unique_id("proc-read");
 
-        start_tool
-            .invoke(
-                json!({
-                    "id": id,
-                    "command": "printf 'hello-process\\n'"
-                }),
-                &tool_ctx,
-            )
-            .await
-            .expect("start process");
+        tool.invoke(
+            json!({
+                "action": "start",
+                "id": id,
+                "command": "printf 'hello-process\\n'"
+            }),
+            &tool_ctx,
+        )
+        .await
+        .expect("start process");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let output = read_tool
+        let output = tool
             .invoke(
                 json!({
+                    "action": "read",
                     "id": id,
                     "timeout_ms": 500
                 }),
@@ -1353,27 +1446,81 @@ mod tests {
 
     #[cfg(feature = "terminal")]
     #[tokio::test]
-    async fn process_kill_tool_stops_process() {
+    async fn process_action_write_sends_input() {
         let registry = Arc::new(TerminalRegistry::new());
-        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
-        let kill_tool = ProcessKillTool::new(Arc::clone(&registry));
+        let tool = ProcessTool::new(Arc::clone(&registry));
         let tool_ctx = ToolContext::default();
-        let id = unique_id("proc-kill");
+        let id = unique_id("proc-write");
 
-        start_tool
+        tool.invoke(
+            json!({
+                "action": "start",
+                "id": id,
+                "command": "cat",
+                "interactive": true
+            }),
+            &tool_ctx,
+        )
+        .await
+        .expect("start cat");
+
+        let write_output = tool
             .invoke(
                 json!({
+                    "action": "write",
                     "id": id,
-                    "command": "cat",
-                    "interactive": true
+                    "input": "hello from write\n"
                 }),
                 &tool_ctx,
             )
             .await
-            .expect("start process");
+            .expect("write should succeed");
 
-        kill_tool
-            .invoke(json!({ "id": id }), &tool_ctx)
+        assert_eq!(write_output.value["status"], "written");
+
+        let read_output = tool
+            .invoke(
+                json!({
+                    "action": "read",
+                    "id": id,
+                    "timeout_ms": 500
+                }),
+                &tool_ctx,
+            )
+            .await
+            .expect("read after write");
+
+        assert!(
+            read_output.value["stdout"]
+                .as_str()
+                .expect("stdout")
+                .contains("hello from write")
+        );
+
+        registry.kill(&id).await.expect("kill process");
+    }
+
+    #[cfg(feature = "terminal")]
+    #[tokio::test]
+    async fn process_action_kill_stops_process() {
+        let registry = Arc::new(TerminalRegistry::new());
+        let tool = ProcessTool::new(Arc::clone(&registry));
+        let tool_ctx = ToolContext::default();
+        let id = unique_id("proc-kill");
+
+        tool.invoke(
+            json!({
+                "action": "start",
+                "id": id,
+                "command": "cat",
+                "interactive": true
+            }),
+            &tool_ctx,
+        )
+        .await
+        .expect("start process");
+
+        tool.invoke(json!({ "action": "kill", "id": id }), &tool_ctx)
             .await
             .expect("kill process");
 
@@ -1383,27 +1530,27 @@ mod tests {
 
     #[cfg(feature = "terminal")]
     #[tokio::test]
-    async fn process_wait_tool_waits_for_completion() {
+    async fn process_action_wait_waits_for_completion() {
         let registry = Arc::new(TerminalRegistry::new());
-        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
-        let wait_tool = ProcessWaitTool::new(Arc::clone(&registry));
+        let tool = ProcessTool::new(Arc::clone(&registry));
         let tool_ctx = ToolContext::default();
         let id = unique_id("proc-wait");
 
-        start_tool
-            .invoke(
-                json!({
-                    "id": id,
-                    "command": "sleep 0.05; printf done"
-                }),
-                &tool_ctx,
-            )
-            .await
-            .expect("start process");
+        tool.invoke(
+            json!({
+                "action": "start",
+                "id": id,
+                "command": "sleep 0.05; printf done"
+            }),
+            &tool_ctx,
+        )
+        .await
+        .expect("start process");
 
-        let output = wait_tool
+        let output = tool
             .invoke(
                 json!({
+                    "action": "wait",
                     "id": id,
                     "timeout_ms": 500
                 }),
@@ -1425,24 +1572,24 @@ mod tests {
 
     #[cfg(feature = "terminal")]
     #[tokio::test]
-    async fn process_start_tool_uses_pwd_when_provided() {
+    async fn process_action_start_uses_pwd() {
         let registry = Arc::new(TerminalRegistry::new());
-        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
+        let tool = ProcessTool::new(Arc::clone(&registry));
         let tool_ctx = ToolContext::default();
         let id = unique_id("proc-pwd");
         let temp_dir = tempfile::tempdir().expect("temp dir");
 
-        start_tool
-            .invoke(
-                json!({
-                    "id": id,
-                    "command": "pwd",
-                    "pwd": temp_dir.path().display().to_string()
-                }),
-                &tool_ctx,
-            )
-            .await
-            .expect("start process");
+        tool.invoke(
+            json!({
+                "action": "start",
+                "id": id,
+                "command": "pwd",
+                "pwd": temp_dir.path().display().to_string()
+            }),
+            &tool_ctx,
+        )
+        .await
+        .expect("start process");
 
         let _ = registry.wait(&id, 500).await.expect("wait for process");
         let output = registry
@@ -1456,27 +1603,26 @@ mod tests {
 
     #[cfg(feature = "terminal")]
     #[tokio::test]
-    async fn process_list_tool_returns_active_processes() {
+    async fn process_action_list_returns_active_processes() {
         let registry = Arc::new(TerminalRegistry::new());
-        let start_tool = ProcessStartTool::new(Arc::clone(&registry));
-        let list_tool = ProcessListTool::new(Arc::clone(&registry));
+        let tool = ProcessTool::new(Arc::clone(&registry));
         let tool_ctx = ToolContext::default();
         let id = unique_id("proc-list");
 
-        start_tool
-            .invoke(
-                json!({
-                    "id": id,
-                    "command": "cat",
-                    "interactive": true
-                }),
-                &tool_ctx,
-            )
-            .await
-            .expect("start process");
+        tool.invoke(
+            json!({
+                "action": "start",
+                "id": id,
+                "command": "cat",
+                "interactive": true
+            }),
+            &tool_ctx,
+        )
+        .await
+        .expect("start process");
 
-        let output = list_tool
-            .invoke(json!({}), &tool_ctx)
+        let output = tool
+            .invoke(json!({ "action": "list" }), &tool_ctx)
             .await
             .expect("list processes");
 
