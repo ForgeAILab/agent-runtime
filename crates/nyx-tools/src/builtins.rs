@@ -819,8 +819,9 @@ fn clean_markdown(s: &str) -> String {
 
     // Links whose visible text is empty or only zero-width/whitespace chars,
     // e.g. `[​](#webhooks)` or `[\u{200b}](#foo)`.
-    static EMPTY_LINK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\[[\s\u{200b}\u{200c}\u{feff}]*\]\([^)]*\)").expect("static regex"));
+    static EMPTY_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\[[\s\u{200b}\u{200c}\u{feff}]*\]\([^)]*\)").expect("static regex")
+    });
 
     // "Loading..." skeleton lines left by React Suspense shimmer divs.
     static LOADING_RE: LazyLock<Regex> =

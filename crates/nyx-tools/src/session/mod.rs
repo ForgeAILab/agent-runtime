@@ -106,6 +106,7 @@ async fn create_session(
             .get("timezone")
             .and_then(Value::as_str)
             .map(ToString::to_string),
+        provider: None,
         group_mode: None,
         respond_to_mention: None,
         tool_allow: array_of_strings(input.get("tool_allow"))?,
@@ -371,6 +372,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 workspace_dir: PathBuf::from("/workspace/resolved"),
                 timezone: "UTC".to_string(),
+                provider: Some("main/gpt-4o".to_string()),
                 group_mode: nyx_core::GroupMode::Listen,
                 respond_to_mention: false,
                 tool_selection: ToolSelection {
@@ -460,6 +462,7 @@ mod tests {
             label: Some("Sample".to_string()),
             workspace_dir: None,
             timezone: Some("UTC".to_string()),
+            provider: None,
             group_mode: None,
             respond_to_mention: None,
             tool_allow: None,

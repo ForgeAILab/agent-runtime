@@ -38,7 +38,6 @@ fn is_default_retry(r: &RetryConfig) -> bool {
     r.max_attempts == default_max_attempts() && r.initial_backoff_ms == default_initial_backoff_ms()
 }
 
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CircuitBreakerConfig {
     #[serde(default = "default_failure_threshold")]
@@ -83,6 +82,8 @@ pub struct ProviderConfig {
     pub kind: String,
     #[serde(default = "default_provider_model")]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<Secret<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +107,7 @@ impl Default for ProviderConfig {
         Self {
             kind: default_provider_kind(),
             model: default_provider_model(),
+            models: Vec::new(),
             api_key: None,
             api_key_env: None,
             base_url: None,
@@ -159,6 +161,18 @@ fn resolve_api_key(cfg: &ProviderConfig, default_env: &str) -> Result<String, Pr
         .unwrap_or_else(|| default_env.to_string());
     std::env::var(&env_name)
         .map_err(|_| ProviderError::Rejected(format!("missing env var `{env_name}`")))
+}
+
+pub fn resolve_claude_token_source(
+    token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
+    auth_profile: Option<&str>,
+) -> Option<Arc<dyn BearerTokenSource>> {
+    let profile = auth_profile.unwrap_or("default");
+    let key = format!("anthropic:{profile}");
+    token_sources
+        .get(&key)
+        .cloned()
+        .or_else(|| token_sources.get("anthropic:default").cloned())
 }
 
 #[cfg(feature = "compat")]
@@ -254,13 +268,24 @@ pub fn build_provider_with_token_sources(
 
         #[cfg(feature = "claude")]
         "claude" | "anthropic" => {
-            let api_key = resolve_api_key(cfg, "ANTHROPIC_API_KEY")?;
-            let provider = if let Some(base_url) = &cfg.base_url {
-                crate::claude::ClaudeProvider::new(api_key).with_base_url(base_url.clone())
+            if let Some(token_source) =
+                resolve_claude_token_source(_token_sources, cfg.auth_profile.as_deref())
+            {
+                let mut provider =
+                    crate::claude::ClaudeProvider::new_with_token_source(token_source);
+                if let Some(base_url) = &cfg.base_url {
+                    provider = provider.with_base_url(base_url.clone());
+                }
+                Ok((Arc::new(provider), cfg.model.clone()))
             } else {
-                crate::claude::ClaudeProvider::new(api_key)
-            };
-            Ok((Arc::new(provider), cfg.model.clone()))
+                let api_key = resolve_api_key(cfg, "ANTHROPIC_API_KEY")?;
+                let provider = if let Some(base_url) = &cfg.base_url {
+                    crate::claude::ClaudeProvider::new(api_key).with_base_url(base_url.clone())
+                } else {
+                    crate::claude::ClaudeProvider::new(api_key)
+                };
+                Ok((Arc::new(provider), cfg.model.clone()))
+            }
         }
         #[cfg(not(feature = "claude"))]
         "claude" | "anthropic" => Err(ProviderError::Rejected(

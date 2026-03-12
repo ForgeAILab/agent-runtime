@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
-    ProviderError, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
+    BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
+    ProviderContent, ProviderError, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -19,6 +19,7 @@ pub struct ClaudeProvider {
     api_key: String,
     base_url: String,
     tool_call_parser: Option<Arc<dyn ToolCallParser>>,
+    token_source: Option<Arc<dyn BearerTokenSource>>,
 }
 
 impl ClaudeProvider {
@@ -28,6 +29,17 @@ impl ClaudeProvider {
             api_key: api_key.into(),
             base_url: CLAUDE_BASE_URL.to_string(),
             tool_call_parser: None,
+            token_source: None,
+        }
+    }
+
+    pub fn new_with_token_source(token_source: Arc<dyn BearerTokenSource>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key: String::new(),
+            base_url: CLAUDE_BASE_URL.to_string(),
+            tool_call_parser: None,
+            token_source: Some(token_source),
         }
     }
 
@@ -147,15 +159,23 @@ impl ClaudeProvider {
             thinking,
         };
 
-        let response = self
+        let mut request = self
             .client
             .post(endpoint)
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
-            .timeout(Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS))
-            .send()
-            .await?;
+            .timeout(Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS));
+
+        if let Some(token_source) = &self.token_source {
+            let token = token_source.get_token().await?;
+            request = request
+                .bearer_auth(token)
+                .header("anthropic-beta", "oauth-2025-04-20");
+        } else {
+            request = request.header("x-api-key", &self.api_key);
+        }
+
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             return Err(crate::error_for_response(response).await);
@@ -264,16 +284,26 @@ impl LlmProvider for ClaudeProvider {
 
     async fn health_check(&self) -> bool {
         let endpoint = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let response = self
+        let mut request = self
             .client
             .get(endpoint)
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await;
+            .timeout(Duration::from_secs(5));
 
-        match response {
+        if let Some(token_source) = &self.token_source {
+            match token_source.get_token().await {
+                Ok(token) => {
+                    request = request
+                        .bearer_auth(token)
+                        .header("anthropic-beta", "oauth-2025-04-20");
+                }
+                Err(_) => return false,
+            }
+        } else {
+            request = request.header("x-api-key", &self.api_key);
+        }
+
+        match request.send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }
@@ -393,8 +423,17 @@ impl From<ClaudeUsage> for UsageMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct StaticTokenSource(String);
+
+    #[async_trait]
+    impl BearerTokenSource for StaticTokenSource {
+        async fn get_token(&self) -> Result<String, ProviderError> {
+            Ok(self.0.clone())
+        }
+    }
 
     #[tokio::test]
     async fn claude_serializes_image_content_blocks() {
@@ -538,5 +577,58 @@ mod tests {
 
         let provider = ClaudeProvider::new("bad-key").with_base_url(server.uri());
         assert!(!provider.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn claude_bearer_auth_sends_authorization_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(header("authorization", "Bearer sk-ant-oat01-test-token"))
+            .and(header("anthropic-beta", "oauth-2025-04-20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "claude-sonnet-4",
+                "content": [{"type": "text", "text": "hello from bearer"}],
+                "usage": {"input_tokens": 5, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+
+        let token_source = Arc::new(StaticTokenSource("sk-ant-oat01-test-token".to_string()));
+        let provider =
+            ClaudeProvider::new_with_token_source(token_source).with_base_url(server.uri());
+
+        let req = CompletionRequest {
+            model: "claude-sonnet-4".to_string(),
+            messages: vec![crate::ProviderMessage::user("hello")],
+            tools: vec![],
+            max_tokens: Some(256),
+            temperature: None,
+            thinking_tokens: None,
+        };
+
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.content, "hello from bearer");
+    }
+
+    #[tokio::test]
+    async fn claude_bearer_auth_health_check() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer test-bearer"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let token_source = Arc::new(StaticTokenSource("test-bearer".to_string()));
+        let provider =
+            ClaudeProvider::new_with_token_source(token_source).with_base_url(server.uri());
+        assert!(provider.health_check().await);
     }
 }
