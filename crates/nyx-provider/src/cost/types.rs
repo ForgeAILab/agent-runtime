@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use super::price::PriceOverride;
 
-pub use nyx_core::{ChannelUsage, ModelUsage, UsageFilter, UsageGroupBy, UsageRecord, UsageSummary};
+pub use nyx_core::{
+    ChannelUsage, ModelUsage, UsageFilter, UsageGroupBy, UsageRecord, UsageSummary,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

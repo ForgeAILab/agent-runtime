@@ -157,14 +157,16 @@ impl CostStore for SqliteCostStore {
         );
         let mut totals_stmt = conn.prepare(&totals_sql).map_err(sqlite_error)?;
         let (total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cost_usd) =
-            totals_stmt.query_row(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                    row.get::<_, f64>(3)?,
-                ))
-            }).map_err(sqlite_error)?;
+            totals_stmt
+                .query_row(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, f64>(3)?,
+                    ))
+                })
+                .map_err(sqlite_error)?;
 
         let breakdown_by_model = match filter.group_by {
             Some(UsageGroupBy::Channel) => Vec::new(),
@@ -232,15 +234,17 @@ fn sqlite_group_by_model(
          ORDER BY model"
     );
     let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-        Ok(ModelUsage {
-            model: row.get(0)?,
-            input_tokens: row.get::<_, i64>(1)? as u64,
-            output_tokens: row.get::<_, i64>(2)? as u64,
-            cache_read_tokens: row.get::<_, i64>(3)? as u64,
-            total_cost_usd: row.get(4)?,
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(ModelUsage {
+                model: row.get(0)?,
+                input_tokens: row.get::<_, i64>(1)? as u64,
+                output_tokens: row.get::<_, i64>(2)? as u64,
+                cache_read_tokens: row.get::<_, i64>(3)? as u64,
+                total_cost_usd: row.get(4)?,
+            })
         })
-    }).map_err(sqlite_error)?;
+        .map_err(sqlite_error)?;
 
     rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
 }
@@ -264,15 +268,17 @@ fn sqlite_group_by_channel(
          ORDER BY channel_id"
     );
     let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-        Ok(ChannelUsage {
-            channel_id: row.get(0)?,
-            input_tokens: row.get::<_, i64>(1)? as u64,
-            output_tokens: row.get::<_, i64>(2)? as u64,
-            cache_read_tokens: row.get::<_, i64>(3)? as u64,
-            total_cost_usd: row.get(4)?,
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(ChannelUsage {
+                channel_id: row.get(0)?,
+                input_tokens: row.get::<_, i64>(1)? as u64,
+                output_tokens: row.get::<_, i64>(2)? as u64,
+                cache_read_tokens: row.get::<_, i64>(3)? as u64,
+                total_cost_usd: row.get(4)?,
+            })
         })
-    }).map_err(sqlite_error)?;
+        .map_err(sqlite_error)?;
 
     rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
 }

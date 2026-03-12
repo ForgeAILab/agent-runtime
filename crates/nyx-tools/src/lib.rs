@@ -1,8 +1,8 @@
 mod builtins;
 mod catalog_service;
+mod core;
 #[cfg(feature = "cost")]
 mod cost;
-mod core;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(unix)]
@@ -26,9 +26,9 @@ use nyx_security::Sandbox;
 
 pub use builtins::*;
 pub use catalog_service::*;
+pub use core::*;
 #[cfg(feature = "cost")]
 pub use cost::*;
-pub use core::*;
 #[cfg(feature = "mcp")]
 pub use mcp::*;
 pub use registry::*;

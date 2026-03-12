@@ -41,8 +41,8 @@ pub fn parse_window_filter(window: Option<&str>) -> Result<UsageFilter, String> 
             let (start_raw, end_raw) = value
                 .split_once('/')
                 .ok_or_else(|| WINDOW_PARSE_ERROR.to_string())?;
-            let format =
-                &time::format_description::parse("[year]-[month]-[day]").map_err(|err| err.to_string())?;
+            let format = &time::format_description::parse("[year]-[month]-[day]")
+                .map_err(|err| err.to_string())?;
             let start_date = Date::parse(start_raw, format).map_err(|err| err.to_string())?;
             let end_date = Date::parse(end_raw, format).map_err(|err| err.to_string())?;
             let start = PrimitiveDateTime::new(start_date, Time::MIDNIGHT).assume_utc();
