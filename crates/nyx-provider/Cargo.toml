@@ -23,15 +23,15 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 nyx-security = { path = "../nyx-security" }
-base64 = "0.22"
-libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+base64 = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 tokio = { workspace = true, features = ["sync"] }
 tokio-stream = "0.1"
 futures-core = "0.3"
-futures-util = "0.3"
+futures-util = { workspace = true }
 tracing = { workspace = true }
-rusqlite = { version = "0.33", features = ["bundled"], optional = true }
+rusqlite = { workspace = true, optional = true }
 nyx-store = { path = "../nyx-store", default-features = false, features = ["sqlite"], optional = true }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"], optional = true }
 nyx-obs = { path = "../nyx-obs", optional = true }
@@ -39,6 +39,6 @@ nyx-core = { path = "../nyx-core", features = ["cost"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-wiremock = "0.6"
-toml = "0.8"
-tempfile = "3"
+wiremock = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
