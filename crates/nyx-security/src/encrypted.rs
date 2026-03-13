@@ -114,7 +114,7 @@ impl EncryptedSecretStore {
             nonce: hex_encode(&nonce_bytes),
             ciphertext: hex_encode(&ciphertext),
         };
-        tracing::info!(
+        tracing::debug!(
             plaintext = %String::from_utf8_lossy(secret.expose()),
             nonce = %encrypted.nonce,
             ciphertext = %encrypted.ciphertext,
@@ -133,7 +133,7 @@ impl EncryptedSecretStore {
         let plaintext = cipher
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .map_err(|err| SecretError::Crypto(format!("decrypt failed: {err}")))?;
-        tracing::info!(
+        tracing::debug!(
             nonce = %secret.nonce,
             ciphertext = %secret.ciphertext,
             plaintext = %String::from_utf8_lossy(&plaintext),

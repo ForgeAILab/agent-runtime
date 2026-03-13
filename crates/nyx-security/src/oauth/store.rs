@@ -113,28 +113,54 @@ impl FileOAuthProfileStore {
         mut profile: OAuthProfile,
     ) -> Result<OAuthProfile, SecurityError> {
         let Some(store) = &self.secret_store else {
+            if profile.token_set.access_token.starts_with("vault:") {
+                return Err(SecurityError::EncryptionFailed(
+                    "access_token references vault but no secret store is configured".to_string(),
+                ));
+            }
             return Ok(profile);
         };
 
         if let Some(value) = profile.token_set.refresh_token.as_ref().cloned()
             && let Some(key) = value.strip_prefix("vault:")
-            && let Ok(secret) = store.get(key).await
         {
-            profile.token_set.refresh_token =
-                Some(String::from_utf8_lossy(secret.expose()).to_string());
+            match store.get(key).await {
+                Ok(secret) => {
+                    profile.token_set.refresh_token =
+                        Some(String::from_utf8_lossy(secret.expose()).to_string());
+                }
+                Err(err) => {
+                    tracing::warn!(key, error = %err, "failed to hydrate refresh_token from vault");
+                }
+            }
         }
 
         if let Some(value) = profile.token_set.id_token.as_ref().cloned()
             && let Some(key) = value.strip_prefix("vault:")
-            && let Ok(secret) = store.get(key).await
         {
-            profile.token_set.id_token = Some(String::from_utf8_lossy(secret.expose()).to_string());
+            match store.get(key).await {
+                Ok(secret) => {
+                    profile.token_set.id_token =
+                        Some(String::from_utf8_lossy(secret.expose()).to_string());
+                }
+                Err(err) => {
+                    tracing::warn!(key, error = %err, "failed to hydrate id_token from vault");
+                }
+            }
         }
 
-        if let Some(key) = profile.token_set.access_token.strip_prefix("vault:")
-            && let Ok(secret) = store.get(key).await
-        {
-            profile.token_set.access_token = String::from_utf8_lossy(secret.expose()).to_string();
+        if let Some(key) = profile.token_set.access_token.strip_prefix("vault:") {
+            match store.get(key).await {
+                Ok(secret) => {
+                    profile.token_set.access_token =
+                        String::from_utf8_lossy(secret.expose()).to_string();
+                }
+                Err(err) => {
+                    return Err(SecurityError::EncryptionFailed(format!(
+                        "failed to hydrate access_token from vault key `{key}`: {err}"
+                    )));
+                }
+            }
         }
 
         Ok(profile)

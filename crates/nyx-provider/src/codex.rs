@@ -12,7 +12,7 @@ use crate::{
     ProviderContent, ProviderError, ProviderRole, UsageMetadata,
 };
 
-const DEFAULT_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+const DEFAULT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/responses";
 
 #[derive(Clone)]
 pub struct OpenAiCodexProvider {
@@ -59,6 +59,13 @@ impl OpenAiCodexProvider {
         }
     }
 
+    async fn resolve_account_id(&self) -> Option<String> {
+        if self.account_id.is_some() {
+            return self.account_id.clone();
+        }
+        self.token_source.get_account_id().await
+    }
+
     async fn execute(
         &self,
         mut req: CompletionRequest,
@@ -68,6 +75,7 @@ impl OpenAiCodexProvider {
             req.model = self.model.clone();
         }
         let token = self.resolve_bearer_token().await?;
+        let account_id = self.resolve_account_id().await;
         let payload = build_payload(req, stream);
         let mut request = self
             .client
@@ -76,7 +84,7 @@ impl OpenAiCodexProvider {
             .header("OpenAI-Beta", "responses=experimental")
             .json(&payload);
 
-        if let Some(account_id) = &self.account_id {
+        if let Some(account_id) = &account_id {
             request = request.header("chatgpt-account-id", account_id);
         }
 

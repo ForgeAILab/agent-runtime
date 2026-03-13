@@ -268,28 +268,39 @@ pub fn build_provider_with_token_sources(
 
         #[cfg(feature = "claude")]
         "claude" | "anthropic" => {
-            if let Some(token_source) =
-                resolve_claude_token_source(_token_sources, cfg.auth_profile.as_deref())
-            {
-                let mut provider =
-                    crate::claude::ClaudeProvider::new_with_token_source(token_source);
-                if let Some(base_url) = &cfg.base_url {
-                    provider = provider.with_base_url(base_url.clone());
-                }
-                Ok((Arc::new(provider), cfg.model.clone()))
+            let api_key = resolve_api_key(cfg, "ANTHROPIC_API_KEY")?;
+            let provider = if let Some(base_url) = &cfg.base_url {
+                crate::claude::ClaudeProvider::new(api_key).with_base_url(base_url.clone())
             } else {
-                let api_key = resolve_api_key(cfg, "ANTHROPIC_API_KEY")?;
-                let provider = if let Some(base_url) = &cfg.base_url {
-                    crate::claude::ClaudeProvider::new(api_key).with_base_url(base_url.clone())
-                } else {
-                    crate::claude::ClaudeProvider::new(api_key)
-                };
-                Ok((Arc::new(provider), cfg.model.clone()))
-            }
+                crate::claude::ClaudeProvider::new(api_key)
+            };
+            Ok((Arc::new(provider), cfg.model.clone()))
         }
         #[cfg(not(feature = "claude"))]
         "claude" | "anthropic" => Err(ProviderError::Rejected(
             "provider `claude` is not compiled in this build".to_string(),
+        )),
+
+        #[cfg(feature = "claude")]
+        "claude-code" | "claude_code" => {
+            let Some(token_source) =
+                resolve_claude_token_source(_token_sources, cfg.auth_profile.as_deref())
+            else {
+                return Err(ProviderError::Rejected(
+                    "provider `claude-code` requires an OAuth/setup-token profile; \
+                     run `nyx provider login claude-code`"
+                        .to_string(),
+                ));
+            };
+            let mut provider = crate::claude::ClaudeProvider::new_with_token_source(token_source);
+            if let Some(base_url) = &cfg.base_url {
+                provider = provider.with_base_url(base_url.clone());
+            }
+            Ok((Arc::new(provider), cfg.model.clone()))
+        }
+        #[cfg(not(feature = "claude"))]
+        "claude-code" | "claude_code" => Err(ProviderError::Rejected(
+            "provider `claude-code` is not compiled in this build".to_string(),
         )),
 
         #[cfg(feature = "codex")]

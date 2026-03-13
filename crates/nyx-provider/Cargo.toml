@@ -13,6 +13,7 @@ openai = []
 claude = []
 compat = ["openai"]
 codex = []
+oauth = ["nyx-security/oauth"]
 cost = ["dep:nyx-obs", "dep:time"]
 cost-sqlite = ["cost", "dep:rusqlite", "dep:nyx-store"]
 

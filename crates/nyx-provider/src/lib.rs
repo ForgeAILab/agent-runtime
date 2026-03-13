@@ -6,6 +6,7 @@ use thiserror::Error;
 
 mod tool_call;
 pub use tool_call::{JsonDirectiveParser, ToolCall, ToolCallParser, XmlDirectiveParser};
+pub mod catalog;
 mod circuit_breaker;
 pub mod config;
 mod fallback;
@@ -167,6 +168,12 @@ pub async fn error_for_response(response: reqwest::Response) -> ProviderError {
 #[async_trait]
 pub trait BearerTokenSource: Send + Sync {
     async fn get_token(&self) -> Result<String, ProviderError>;
+
+    /// Returns the account ID associated with this token source, if any.
+    /// Used by providers that require an account-scoped header (e.g. ChatGPT-Account-Id).
+    async fn get_account_id(&self) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait]
@@ -243,6 +250,9 @@ pub mod testing {
         }
     }
 }
+
+#[cfg(feature = "oauth")]
+pub mod auth;
 
 #[cfg(feature = "cost")]
 pub mod cost;
