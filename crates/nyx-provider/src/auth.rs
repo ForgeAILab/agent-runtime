@@ -362,7 +362,7 @@ mod tests {
         let api_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/responses"))
+            .and(path("/codex/responses"))
             .and(header("authorization", "Bearer fresh-access-tok"))
             .and(header("openai-beta", "responses=experimental"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -393,7 +393,7 @@ mod tests {
             &ProviderConfig {
                 kind: "codex".to_string(),
                 model: "codex".to_string(),
-                base_url: Some(format!("{}/responses", api_server.uri())),
+                base_url: Some(api_server.uri()),
                 ..ProviderConfig::default()
             },
         );
@@ -420,7 +420,7 @@ mod tests {
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/responses"))
+            .and(path("/codex/responses"))
             .and(header("authorization", "Bearer fresh-after-refresh"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "codex",
@@ -456,7 +456,7 @@ mod tests {
             &ProviderConfig {
                 kind: "codex".to_string(),
                 model: "codex".to_string(),
-                base_url: Some(format!("{}/responses", api_server.uri())),
+                base_url: Some(api_server.uri()),
                 ..ProviderConfig::default()
             },
         );

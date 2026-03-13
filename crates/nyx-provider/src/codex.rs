@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -12,7 +13,8 @@ use crate::{
     ProviderContent, ProviderError, ProviderRole, UsageMetadata,
 };
 
-const DEFAULT_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/responses";
+const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
 #[derive(Clone)]
 pub struct OpenAiCodexProvider {
@@ -59,11 +61,16 @@ impl OpenAiCodexProvider {
         }
     }
 
-    async fn resolve_account_id(&self) -> Option<String> {
+    async fn resolve_account_id(&self, token: &str) -> Option<String> {
         if self.account_id.is_some() {
             return self.account_id.clone();
         }
-        self.token_source.get_account_id().await
+        // Try to get it from the profile store first
+        if let Some(id) = self.token_source.get_account_id().await {
+            return Some(id);
+        }
+        // Extract from JWT as last resort
+        extract_account_id_from_jwt(token)
     }
 
     async fn execute(
@@ -75,13 +82,21 @@ impl OpenAiCodexProvider {
             req.model = self.model.clone();
         }
         let token = self.resolve_bearer_token().await?;
-        let account_id = self.resolve_account_id().await;
+        let account_id = self.resolve_account_id(&token).await;
         let payload = build_payload(req, stream);
+
         let mut request = self
             .client
             .post(self.responses_url.clone())
-            .bearer_auth(token)
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
             .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "nyx")
+            .header(
+                "User-Agent",
+                format!("nyx ({} {}; {})", std::env::consts::OS, os_release(), std::env::consts::ARCH),
+            )
             .json(&payload);
 
         if let Some(account_id) = &account_id {
@@ -96,9 +111,41 @@ impl OpenAiCodexProvider {
     }
 }
 
+/// Extract `chatgpt_account_id` from the JWT token's claims.
+fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    claims
+        .get(JWT_CLAIM_PATH)?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(String::from)
+}
+
+fn os_release() -> String {
+    #[cfg(unix)]
+    {
+        let mut info: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut info) } == 0 {
+            let release = unsafe { std::ffi::CStr::from_ptr(info.release.as_ptr()) };
+            return release.to_string_lossy().to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Resolve the codex responses URL.
+///
+/// The Codex endpoint is at `/codex/responses` under the base URL (not `/responses`).
 fn resolve_responses_url(config_base_url: Option<&str>) -> String {
     if let Some(base_url) = config_base_url {
-        return base_url.to_string();
+        return ensure_codex_path(base_url);
     }
 
     if let Ok(url) = std::env::var("NYX_CODEX_RESPONSES_URL")
@@ -110,10 +157,22 @@ fn resolve_responses_url(config_base_url: Option<&str>) -> String {
     if let Ok(base) = std::env::var("NYX_CODEX_BASE_URL")
         && !base.trim().is_empty()
     {
-        return format!("{}/responses", base.trim_end_matches('/'));
+        return ensure_codex_path(base.trim());
     }
 
-    DEFAULT_RESPONSES_URL.to_string()
+    ensure_codex_path(DEFAULT_BASE_URL)
+}
+
+/// Ensure the URL ends with `/codex/responses`.
+fn ensure_codex_path(url: &str) -> String {
+    let normalized = url.trim_end_matches('/');
+    if normalized.ends_with("/codex/responses") {
+        return normalized.to_string();
+    }
+    if normalized.ends_with("/codex") {
+        return format!("{normalized}/responses");
+    }
+    format!("{normalized}/codex/responses")
 }
 
 fn map_role(role: ProviderRole) -> &'static str {
@@ -130,23 +189,33 @@ fn message_text(parts: &[ProviderContent]) -> String {
 }
 
 fn build_payload(req: CompletionRequest, stream: bool) -> serde_json::Value {
-    let input = req
-        .messages
-        .into_iter()
-        .map(|message| {
-            json!({
-                "role": map_role(message.role),
-                "content": [{"type": "input_text", "text": message_text(&message.content)}]
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut instructions: Option<String> = None;
+    let mut input = Vec::new();
+
+    for message in req.messages {
+        if message.role == ProviderRole::System {
+            let text = message_text(&message.content);
+            if !text.is_empty() {
+                instructions = Some(text);
+            }
+            continue;
+        }
+        input.push(json!({
+            "role": map_role(message.role),
+            "content": [{"type": "input_text", "text": message_text(&message.content)}]
+        }));
+    }
 
     let mut payload = json!({
         "model": req.model,
         "input": input,
         "stream": stream,
+        "store": false,
     });
 
+    if let Some(instructions) = instructions {
+        payload["instructions"] = json!(instructions);
+    }
     if let Some(max_tokens) = req.max_tokens {
         payload["max_output_tokens"] = json!(max_tokens);
     }
@@ -315,7 +384,11 @@ mod tests {
 
         cfg.base_url = Some("https://cfg/v1/responses".to_string());
         let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
-        assert_eq!(provider.responses_url(), "https://cfg/v1/responses");
+        // config base_url is used as-is after ensure_codex_path
+        assert_eq!(
+            provider.responses_url(),
+            "https://cfg/v1/responses/codex/responses"
+        );
 
         cfg.base_url = None;
         let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
@@ -325,7 +398,10 @@ mod tests {
             std::env::remove_var("NYX_CODEX_RESPONSES_URL");
         }
         let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
-        assert_eq!(provider.responses_url(), "https://env-base/v1/responses");
+        assert_eq!(
+            provider.responses_url(),
+            "https://env-base/v1/codex/responses"
+        );
 
         unsafe {
             std::env::remove_var("NYX_CODEX_BASE_URL");
@@ -333,13 +409,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_codex_path_appends_correctly() {
+        assert_eq!(
+            ensure_codex_path("https://chatgpt.com/backend-api"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            ensure_codex_path("https://chatgpt.com/backend-api/"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            ensure_codex_path("https://chatgpt.com/backend-api/codex"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            ensure_codex_path("https://chatgpt.com/backend-api/codex/responses"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[tokio::test]
     async fn complete_sets_expected_headers() {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/responses"))
+            .and(path("/codex/responses"))
             .and(header("authorization", "Bearer oauth-token"))
             .and(header("openai-beta", "responses=experimental"))
+            .and(header("originator", "nyx"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "codex",
                 "output_text": "ok",
@@ -349,7 +446,7 @@ mod tests {
             .await;
 
         let cfg = ProviderConfig {
-            base_url: Some(format!("{}/responses", server.uri())),
+            base_url: Some(server.uri()),
             model: "codex".to_string(),
             ..Default::default()
         };
@@ -374,7 +471,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/responses"))
+            .and(path("/codex/responses"))
             .and(header("authorization", "Bearer gateway-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "model": "codex",
@@ -384,7 +481,7 @@ mod tests {
             .await;
 
         let cfg = ProviderConfig {
-            base_url: Some(format!("{}/responses", server.uri())),
+            base_url: Some(server.uri()),
             api_key: Some(nyx_security::Secret::new("gateway-key".to_string())),
             model: "codex".to_string(),
             ..Default::default()
@@ -405,5 +502,47 @@ mod tests {
             .expect("complete");
 
         assert_eq!(resp.content, "fallback");
+    }
+
+    #[test]
+    fn extract_account_id_from_jwt_works() {
+        // Build a minimal JWT with the expected claim
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#);
+        let token = format!("{header}.{payload}.sig");
+
+        assert_eq!(
+            extract_account_id_from_jwt(&token),
+            Some("acct_123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_account_id_returns_none_for_non_jwt() {
+        assert_eq!(extract_account_id_from_jwt("not-a-jwt"), None);
+        assert_eq!(extract_account_id_from_jwt("a.b.c"), None);
+    }
+
+    #[test]
+    fn system_message_becomes_instructions() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![
+                crate::ProviderMessage::system("You are helpful"),
+                crate::ProviderMessage::user("hello"),
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+        let payload = build_payload(req, false);
+        assert_eq!(payload["instructions"], "You are helpful");
+        // input should only contain the user message, not system
+        let input = payload["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
     }
 }
