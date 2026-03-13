@@ -63,6 +63,18 @@ impl FileReadTool {
     const MAX_LINE_LEN: usize = 2000;
     /// Maximum total characters returned.
     const MAX_TOTAL_CHARS: usize = 100_000;
+
+    fn is_image_extension(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+                )
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(feature = "file")]
@@ -74,7 +86,8 @@ impl Tool for FileReadTool {
 
     fn description(&self) -> &str {
         "Read file content from disk. Supports optional line range to avoid flooding context. \
-         Returns at most 500 lines per call. Use offset/limit to paginate large files."
+         Returns at most 500 lines per call. For supported image files, returns an image content \
+         block instead of UTF-8 text. Use offset/limit to paginate large files."
     }
 
     fn schema(&self) -> Value {
@@ -110,6 +123,15 @@ impl Tool for FileReadTool {
             path.to_path_buf()
         };
         let resolved_path = ctx.sandbox.validate_read_path(&resolved_path)?;
+
+        if Self::is_image_extension(&resolved_path) {
+            let metadata = tokio::fs::metadata(&resolved_path).await?;
+            let size_kb = metadata.len() / 1024;
+            let description = format!("Image file: {} ({size_kb} KB)", resolved_path.display());
+            let file_url = format!("file://{}", resolved_path.display());
+            return Ok(ToolResult::text_and_image(description, file_url));
+        }
+
         let content = tokio::fs::read_to_string(&resolved_path).await?;
 
         let offset = input
@@ -1173,6 +1195,8 @@ mod tests {
     #[cfg(feature = "http")]
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[cfg(feature = "file")]
+    use crate::ContentBlock;
     #[cfg(feature = "http")]
     use crate::HttpTool;
     #[cfg(feature = "shell")]
@@ -1238,6 +1262,51 @@ mod tests {
             text.contains("showing lines 1-1 of 1 total"),
             "should contain summary"
         );
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_returns_image_for_png() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("demo.png");
+        std::fs::write(&path, b"not-a-real-png").expect("write image bytes");
+
+        let output = FileReadTool
+            .invoke(json!({ "path": path }), &ctx(vec![]))
+            .await
+            .expect("file read works");
+
+        let text = output.value.as_str().expect("text output");
+        assert!(text.contains("Image file:"), "should describe image file");
+        assert_eq!(
+            output.content,
+            vec![
+                ContentBlock::Text {
+                    text: text.to_string(),
+                },
+                ContentBlock::Image {
+                    url: format!("file://{}", path.display()),
+                    detail: None,
+                },
+            ]
+        );
+    }
+
+    #[cfg(feature = "file")]
+    #[tokio::test]
+    async fn file_read_returns_text_for_txt() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("demo.txt");
+        std::fs::write(&path, "plain text").expect("write text file");
+
+        let output = FileReadTool
+            .invoke(json!({ "path": path }), &ctx(vec![]))
+            .await
+            .expect("file read works");
+
+        assert!(output.content.is_empty(), "text reads should stay legacy");
+        let text = output.value.as_str().expect("text output");
+        assert!(text.contains("plain text"), "should contain file content");
     }
 
     #[cfg(feature = "file")]

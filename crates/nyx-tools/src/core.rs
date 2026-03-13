@@ -19,28 +19,71 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub value: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ContentBlock>,
 }
 
 impl ToolResult {
     pub fn json(value: Value) -> Self {
-        Self { value }
+        Self {
+            value,
+            content: Vec::new(),
+        }
     }
 
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             value: Value::String(text.into()),
+            content: Vec::new(),
         }
     }
 
     pub fn empty() -> Self {
-        Self { value: Value::Null }
+        Self {
+            value: Value::Null,
+            content: Vec::new(),
+        }
     }
 
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             value: serde_json::json!({ "error": message.into() }),
+            content: Vec::new(),
+        }
+    }
+
+    pub fn image(url: impl Into<String>) -> Self {
+        let url = url.into();
+        Self {
+            value: Value::String(url.clone()),
+            content: vec![ContentBlock::Image { url, detail: None }],
+        }
+    }
+
+    pub fn text_and_image(text: impl Into<String>, url: impl Into<String>) -> Self {
+        let text = text.into();
+        let url = url.into();
+        Self {
+            value: Value::String(text.clone()),
+            content: vec![
+                ContentBlock::Text { text },
+                ContentBlock::Image { url, detail: None },
+            ],
         }
     }
 }
@@ -237,6 +280,69 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ContentBlock, ToolResult};
+
+    #[test]
+    fn tool_result_image_sets_content_block() {
+        let result = ToolResult::image("file:///tmp/demo.png");
+
+        assert_eq!(result.value, json!("file:///tmp/demo.png"));
+        assert_eq!(
+            result.content,
+            vec![ContentBlock::Image {
+                url: "file:///tmp/demo.png".to_string(),
+                detail: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_result_text_and_image_sets_both_blocks() {
+        let result = ToolResult::text_and_image("preview", "file:///tmp/demo.png");
+
+        assert_eq!(result.value, json!("preview"));
+        assert_eq!(
+            result.content,
+            vec![
+                ContentBlock::Text {
+                    text: "preview".to_string(),
+                },
+                ContentBlock::Image {
+                    url: "file:///tmp/demo.png".to_string(),
+                    detail: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_result_legacy_constructors_have_empty_content() {
+        for result in [
+            ToolResult::text("hello"),
+            ToolResult::json(json!({"ok": true})),
+            ToolResult::error("boom"),
+            ToolResult::empty(),
+        ] {
+            assert!(result.content.is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_result_serde_roundtrip_with_image() {
+        let result = ToolResult::text_and_image("preview", "file:///tmp/demo.png");
+
+        let serialized = serde_json::to_value(&result).expect("serialize tool result");
+        let roundtrip: ToolResult =
+            serde_json::from_value(serialized).expect("deserialize tool result");
+
+        assert_eq!(roundtrip, result);
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

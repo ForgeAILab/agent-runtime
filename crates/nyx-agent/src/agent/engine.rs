@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::{
     AfterToolContext, AgentContext, AgentError, AgentResponse, BeforeToolContext,
     CharBasedEstimator, HookAction, Message, MessageContent, MessageRole, TokenEstimator,
-    render::render_tool_result_for_provider,
+    render::{render_tool_result_for_provider, render_tool_result_to_content},
 };
 
 #[derive(Debug, Clone)]
@@ -331,6 +331,7 @@ impl ToolLoopEngine {
 
                 let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let tool_result_text = render_tool_result_for_provider(&tool_result.value)?;
+                let tool_content_blocks = render_tool_result_to_content(&tool_result)?;
                 let observer_result_text = render_tool_result_for_observer(&tool_result.value);
 
                 if !ctx.hooks.is_empty() {
@@ -355,7 +356,10 @@ impl ToolLoopEngine {
                     .await
                     .map_err(|err| AgentError::Observability(err.to_string()))?;
 
-                history.push(Message::tool_result(tool_call.id.clone(), tool_result_text));
+                history.push(Message::tool_result_with_content(
+                    tool_call.id.clone(),
+                    tool_content_blocks,
+                ));
 
                 if ctx.cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
