@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::config::ProviderConfig;
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
-    ProviderContent, ProviderError, ProviderRole, StreamEvent, UsageMetadata,
+    ProviderContent, ProviderError, ProviderRole, StreamEvent, ToolCall, UsageMetadata,
 };
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -188,6 +188,40 @@ fn message_text(parts: &[ProviderContent]) -> String {
     parts.iter().filter_map(ProviderContent::as_text).collect()
 }
 
+/// Decode assistant content that may be a JSON array of blocks (produced by react agent).
+/// Returns (text, tool_call_items) where tool_call_items are Responses API `function_call` items.
+fn decode_assistant_content(content: &str, msg_index: u32) -> (String, Vec<serde_json::Value>) {
+    let Ok(blocks) = serde_json::from_str::<Vec<serde_json::Value>>(content) else {
+        return (content.to_string(), vec![]);
+    };
+    if blocks.is_empty() || !blocks.iter().all(|b| b.get("type").is_some()) {
+        return (content.to_string(), vec![]);
+    }
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        match block["type"].as_str() {
+            Some("text") => {
+                text = block["text"].as_str().unwrap_or("").to_string();
+            }
+            Some("tool_use") => {
+                let call_id = block["id"].as_str().unwrap_or("").to_string();
+                let name = block["name"].as_str().unwrap_or("").to_string();
+                let arguments = serde_json::to_string(&block["input"]).unwrap_or_default();
+                tool_calls.push(json!({
+                    "type": "function_call",
+                    "id": format!("fc_{msg_index}_{i}"),
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                }));
+            }
+            _ => {}
+        }
+    }
+    (text, tool_calls)
+}
+
 fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
     let mut instructions: Option<String> = None;
     let mut input = Vec::new();
@@ -204,20 +238,50 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
 
         let text = message_text(&message.content);
 
-        if message.role == ProviderRole::Assistant {
-            // Assistant messages are output items in the Responses API format
-            input.push(json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
-                "status": "completed",
-                "id": format!("msg_{msg_index}"),
-            }));
-        } else {
-            input.push(json!({
-                "role": map_role(message.role),
-                "content": [{"type": "input_text", "text": text}]
-            }));
+        match message.role {
+            ProviderRole::Assistant => {
+                // Decode JSON content blocks (may contain text + tool_use blocks)
+                let (assistant_text, tool_call_items) =
+                    decode_assistant_content(&text, msg_index);
+
+                // Add the assistant message output item
+                if !assistant_text.is_empty() {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": assistant_text, "annotations": []}],
+                        "status": "completed",
+                        "id": format!("msg_{msg_index}"),
+                    }));
+                }
+
+                // Add function_call output items
+                for tc in tool_call_items {
+                    input.push(tc);
+                }
+            }
+            ProviderRole::Tool => {
+                // Tool results become function_call_output items
+                if let Some(call_id) = &message.tool_call_id {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": text,
+                    }));
+                } else {
+                    // Legacy tool message without call_id — send as user message
+                    input.push(json!({
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}]
+                    }));
+                }
+            }
+            _ => {
+                input.push(json!({
+                    "role": map_role(message.role),
+                    "content": [{"type": "input_text", "text": text}]
+                }));
+            }
         }
         msg_index += 1;
     }
@@ -228,6 +292,23 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         "stream": true,
         "store": false,
     });
+
+    // Tool definitions
+    if !req.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = req
+            .tools
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                })
+            })
+            .collect();
+        payload["tools"] = json!(tools);
+    }
 
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
@@ -265,8 +346,17 @@ struct ResponsesResponse {
 
 #[derive(Debug, Deserialize)]
 struct ResponsesOutputItem {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContent>,
+    // function_call fields
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,10 +414,12 @@ fn parse_sse_response(
     }
 
     if let Some(parsed) = last_response {
+        let content = extract_text(&parsed);
+        let tool_calls = extract_tool_calls(&parsed);
         Ok(CompletionResponse {
-            content: extract_text(&parsed),
+            content,
             model: parsed.model.unwrap_or_else(|| fallback_model.to_string()),
-            tool_calls: Vec::new(),
+            tool_calls,
             usage: parsed.usage.map(UsageMetadata::from),
         })
     } else {
@@ -351,9 +443,30 @@ fn extract_text(parsed: &ResponsesResponse) -> String {
     parsed
         .output
         .iter()
+        .filter(|item| item.kind.as_deref() != Some("function_call"))
         .flat_map(|item| item.content.iter())
         .filter_map(|part| part.text.as_deref())
         .collect::<String>()
+}
+
+fn extract_tool_calls(parsed: &ResponsesResponse) -> Vec<ToolCall> {
+    parsed
+        .output
+        .iter()
+        .filter(|item| item.kind.as_deref() == Some("function_call"))
+        .filter_map(|item| {
+            let name = item.name.as_ref()?;
+            let call_id = item.call_id.clone();
+            let args_str = item.arguments.as_deref().unwrap_or("{}");
+            let input = serde_json::from_str(args_str)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            Some(ToolCall {
+                id: call_id,
+                name: name.clone(),
+                input,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
