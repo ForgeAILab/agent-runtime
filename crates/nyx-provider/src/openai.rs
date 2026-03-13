@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
-    ProviderError, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
+    ProviderError, ProviderRole, StreamEvent, ToolCall, ToolCallParser, UsageMetadata,
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -248,7 +248,14 @@ impl LlmProvider for OpenAiProvider {
 
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
         let response = self.complete_via_api(req).await?;
-        let stream = tokio_stream::iter(vec![Ok(response.content)]);
+        let stream = tokio_stream::iter(vec![
+            Ok(StreamEvent::delta(response.content)),
+            Ok(StreamEvent::Done {
+                model: Some(response.model),
+                usage: response.usage,
+                finish_reason: Some("stop".to_string()),
+            }),
+        ]);
         Ok(Box::pin(stream))
     }
 

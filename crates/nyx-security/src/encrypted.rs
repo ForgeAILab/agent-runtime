@@ -133,7 +133,7 @@ impl EncryptedSecretStore {
         let plaintext = cipher
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .map_err(|err| SecretError::Crypto(format!("decrypt failed: {err}")))?;
-        tracing::debug!(
+        tracing::trace!(
             nonce = %secret.nonce,
             ciphertext = %secret.ciphertext,
             plaintext = %String::from_utf8_lossy(&plaintext),
@@ -166,7 +166,7 @@ impl SecretStore for EncryptedSecretStore {
         let encrypted = guard
             .get(key)
             .ok_or_else(|| SecretError::NotFound(key.to_string()))?;
-        tracing::info!(
+        tracing::trace!(
             key,
             nonce = %encrypted.nonce,
             ciphertext = %encrypted.ciphertext,
@@ -177,7 +177,7 @@ impl SecretStore for EncryptedSecretStore {
 
     async fn set(&self, key: &str, value: Secret) -> Result<(), SecretError> {
         let encrypted = self.encrypt(&value)?;
-        tracing::info!(
+        tracing::trace!(
             key,
             plaintext = %String::from_utf8_lossy(value.expose()),
             nonce = %encrypted.nonce,

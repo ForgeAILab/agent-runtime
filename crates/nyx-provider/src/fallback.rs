@@ -81,7 +81,7 @@ mod tests {
     use super::FallbackProvider;
     use crate::{
         CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
-        ProviderMessage,
+        ProviderMessage, StreamEvent,
     };
 
     struct StubProvider {
@@ -131,9 +131,10 @@ mod tests {
             if !self.stream_ok {
                 return Err(ProviderError::StreamingUnsupported);
             }
-            Ok(Box::pin(tokio_stream::iter(vec![Ok(self
-                .payload
-                .to_string())])))
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(StreamEvent::delta(self.payload)),
+                Ok(StreamEvent::done()),
+            ])))
         }
 
         async fn health_check(&self) -> bool {
@@ -251,17 +252,19 @@ mod tests {
             ),
         ]);
 
-        let mut out = Vec::new();
+        let mut text = String::new();
         let mut stream = provider
             .stream(request())
             .await
             .expect("stream should fallback");
         use tokio_stream::StreamExt;
         while let Some(chunk) = stream.next().await {
-            out.push(chunk.expect("stream chunk"));
+            if let StreamEvent::Delta { content } = chunk.expect("stream chunk") {
+                text.push_str(&content);
+            }
         }
 
-        assert_eq!(out, vec!["second".to_string()]);
+        assert_eq!(text, "second");
         assert_eq!(first.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second.stream_calls.load(Ordering::SeqCst), 1);
     }

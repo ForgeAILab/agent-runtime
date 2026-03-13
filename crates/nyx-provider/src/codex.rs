@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::config::ProviderConfig;
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
-    ProviderContent, ProviderError, ProviderRole, UsageMetadata,
+    ProviderContent, ProviderError, ProviderRole, StreamEvent, UsageMetadata,
 };
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -188,10 +188,11 @@ fn message_text(parts: &[ProviderContent]) -> String {
     parts.iter().filter_map(ProviderContent::as_text).collect()
 }
 
-fn build_payload(req: CompletionRequest, stream: bool) -> serde_json::Value {
+fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
     let mut instructions: Option<String> = None;
     let mut input = Vec::new();
 
+    let mut msg_index: u32 = 0;
     for message in req.messages {
         if message.role == ProviderRole::System {
             let text = message_text(&message.content);
@@ -200,16 +201,31 @@ fn build_payload(req: CompletionRequest, stream: bool) -> serde_json::Value {
             }
             continue;
         }
-        input.push(json!({
-            "role": map_role(message.role),
-            "content": [{"type": "input_text", "text": message_text(&message.content)}]
-        }));
+
+        let text = message_text(&message.content);
+
+        if message.role == ProviderRole::Assistant {
+            // Assistant messages are output items in the Responses API format
+            input.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+                "status": "completed",
+                "id": format!("msg_{msg_index}"),
+            }));
+        } else {
+            input.push(json!({
+                "role": map_role(message.role),
+                "content": [{"type": "input_text", "text": text}]
+            }));
+        }
+        msg_index += 1;
     }
 
     let mut payload = json!({
         "model": req.model,
         "input": input,
-        "stream": stream,
+        "stream": true,
         "store": false,
     });
 
@@ -278,6 +294,55 @@ impl From<ResponsesUsage> for UsageMetadata {
     }
 }
 
+/// Parse a complete SSE response body, looking for `response.completed` or `response.done`
+/// events that contain the final response object.
+fn parse_sse_response(
+    body: &str,
+    fallback_model: &str,
+) -> Result<CompletionResponse, ProviderError> {
+    // SSE format: "event: <type>\ndata: <json>\n\n"
+    // We scan for the response.completed / response.done event.
+    let mut last_response: Option<ResponsesResponse> = None;
+
+    for chunk in body.split("\n\n") {
+        let data_line = chunk
+            .lines()
+            .find(|l| l.starts_with("data:"))
+            .map(|l| l.strip_prefix("data:").unwrap_or(l).trim());
+
+        let Some(data) = data_line else { continue };
+        if data == "[DONE]" || data.is_empty() {
+            continue;
+        }
+
+        // Try to parse as an SSE wrapper with a nested `response` field
+        if let Ok(wrapper) = serde_json::from_str::<SseEventWrapper>(data) {
+            if let Some(resp) = wrapper.response {
+                last_response = Some(resp);
+            }
+        }
+    }
+
+    if let Some(parsed) = last_response {
+        Ok(CompletionResponse {
+            content: extract_text(&parsed),
+            model: parsed.model.unwrap_or_else(|| fallback_model.to_string()),
+            tool_calls: Vec::new(),
+            usage: parsed.usage.map(UsageMetadata::from),
+        })
+    } else {
+        Err(ProviderError::InvalidResponse(
+            "no response.completed event in SSE stream",
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SseEventWrapper {
+    #[serde(default)]
+    response: Option<ResponsesResponse>,
+}
+
 fn extract_text(parsed: &ResponsesResponse) -> String {
     if let Some(text) = &parsed.output_text {
         return text.clone();
@@ -291,30 +356,164 @@ fn extract_text(parsed: &ResponsesResponse) -> String {
         .collect::<String>()
 }
 
+// ---------------------------------------------------------------------------
+// SSE text delta stream — parses Codex SSE into clean text deltas
+// ---------------------------------------------------------------------------
+
+use std::collections::VecDeque;
+use futures_core::Stream as FutStream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+/// Wraps a raw byte stream from the Codex SSE endpoint and yields only the
+/// text content from `response.output_text.delta` events.
+///
+/// This makes the `CompletionStream` output consistent across all providers:
+/// each yielded `String` is an incremental piece of the assistant's reply.
+struct SseTextDeltaStream {
+    inner: Pin<Box<dyn FutStream<Item = Result<String, ProviderError>> + Send>>,
+    buffer: String,
+    pending: VecDeque<StreamEvent>,
+}
+
+impl SseTextDeltaStream {
+    fn from_response(response: reqwest::Response) -> Self {
+        let byte_stream = response.bytes_stream().map(|item| match item {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+            Err(err) => Err(ProviderError::Http(err)),
+        });
+        Self {
+            inner: Box::pin(byte_stream),
+            buffer: String::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Parse buffered SSE data and extract stream events.
+    fn drain_events(&mut self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+
+        // Process complete SSE frames (terminated by \n\n)
+        while let Some(pos) = self.buffer.find("\n\n") {
+            let frame = self.buffer[..pos].to_string();
+            self.buffer = self.buffer[pos + 2..].to_string();
+
+            let mut event_type = None;
+            let mut data_line = None;
+
+            for line in frame.lines() {
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_type = Some(rest.trim().to_string());
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data_line = Some(rest.trim().to_string());
+                }
+            }
+
+            let Some(data) = data_line else { continue };
+            if data == "[DONE]" {
+                continue;
+            }
+
+            let event_type = event_type.as_deref().unwrap_or("");
+
+            match event_type {
+                "response.output_text.delta" => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(text) = v.get("delta").and_then(|d| d.as_str()) {
+                            if !text.is_empty() {
+                                events.push(StreamEvent::delta(text));
+                            }
+                        }
+                    }
+                }
+                "response.completed" | "response.done" => {
+                    // Extract model and usage from the completed response
+                    if let Ok(wrapper) = serde_json::from_str::<SseEventWrapper>(&data) {
+                        if let Some(resp) = wrapper.response {
+                            events.push(StreamEvent::Done {
+                                model: resp.model,
+                                usage: resp.usage.map(UsageMetadata::from),
+                                finish_reason: Some("stop".to_string()),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        events
+    }
+}
+
+impl FutStream for SseTextDeltaStream {
+    type Item = Result<StreamEvent, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // If we have buffered events, yield them one at a time
+        if let Some(event) = self.pending.pop_front() {
+            return Poll::Ready(Some(Ok(event)));
+        }
+
+        loop {
+            // Drain complete events from the buffer
+            let events = self.drain_events();
+            if !events.is_empty() {
+                self.pending.extend(events);
+                if let Some(event) = self.pending.pop_front() {
+                    return Poll::Ready(Some(Ok(event)));
+                }
+            }
+
+            // Poll the inner stream for more data
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(text))) => {
+                    self.buffer.push_str(&text);
+                    // Loop back to try draining events from the new data
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    // Stream ended — drain any remaining buffered events
+                    let events = self.drain_events();
+                    if !events.is_empty() {
+                        self.pending.extend(events);
+                        if let Some(event) = self.pending.pop_front() {
+                            return Poll::Ready(Some(Ok(event)));
+                        }
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiCodexProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let fallback_model = req.model.clone();
-        let response = self.execute(req, false).await?;
-        let parsed: ResponsesResponse = response
-            .json()
+        // Codex API requires stream=true; collect SSE events and extract the final response.
+        let response = self.execute(req, true).await?;
+        let body = response
+            .text()
             .await
-            .map_err(|_| ProviderError::InvalidResponse("invalid responses payload"))?;
+            .map_err(|_| ProviderError::InvalidResponse("failed to read response body"))?;
 
-        Ok(CompletionResponse {
-            content: extract_text(&parsed),
-            model: parsed.model.unwrap_or(fallback_model),
-            tool_calls: Vec::new(),
-            usage: parsed.usage.map(UsageMetadata::from),
-        })
+        let parsed = parse_sse_response(&body, &fallback_model)?;
+        Ok(parsed)
     }
 
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
         let response = self.execute(req, true).await?;
-        let stream = response.bytes_stream().map(|item| match item {
-            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
-            Err(err) => Err(ProviderError::Http(err)),
-        });
+
+        // Parse the raw SSE byte stream into clean text deltas.
+        // Codex sends `event: response.output_text.delta` with `{"delta":"..."}` data.
+        // We extract just the text content so downstream consumers get plain incremental text,
+        // consistent with the CompletionStream contract.
+        let stream = SseTextDeltaStream::from_response(response);
         Ok(Box::pin(stream))
     }
 
@@ -432,16 +631,18 @@ mod tests {
     async fn complete_sets_expected_headers() {
         let server = MockServer::start().await;
 
+        let sse_body = "event: response.completed\ndata: {\"response\":{\"model\":\"codex\",\"output_text\":\"ok\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\nevent: done\ndata: [DONE]\n\n";
+
         Mock::given(method("POST"))
             .and(path("/codex/responses"))
             .and(header("authorization", "Bearer oauth-token"))
             .and(header("openai-beta", "responses=experimental"))
             .and(header("originator", "nyx"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "model": "codex",
-                "output_text": "ok",
-                "usage": {"input_tokens": 1, "output_tokens": 2}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
             .mount(&server)
             .await;
 
@@ -470,13 +671,16 @@ mod tests {
     async fn gateway_fallback_is_used_when_token_source_fails() {
         let server = MockServer::start().await;
 
+        let sse_body = "event: response.completed\ndata: {\"response\":{\"model\":\"codex\",\"output_text\":\"fallback\"}}\n\nevent: done\ndata: [DONE]\n\n";
+
         Mock::given(method("POST"))
             .and(path("/codex/responses"))
             .and(header("authorization", "Bearer gateway-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "model": "codex",
-                "output_text": "fallback"
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
             .mount(&server)
             .await;
 

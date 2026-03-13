@@ -121,7 +121,92 @@ pub struct UsageMetadata {
     pub cache_write_tokens: Option<u32>,
 }
 
-pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+/// A structured event from a streaming completion.
+///
+/// Providers emit these so that downstream consumers (gateway endpoints,
+/// progressive messaging, etc.) can format them in any wire protocol —
+/// e.g. OpenAI Chat Completions SSE.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// An incremental text token from the assistant.
+    Delta {
+        content: String,
+    },
+    /// The stream has finished.  Carries final metadata when available.
+    Done {
+        model: Option<String>,
+        usage: Option<UsageMetadata>,
+        finish_reason: Option<String>,
+    },
+}
+
+impl StreamEvent {
+    /// Convenience: create a text delta event.
+    pub fn delta(content: impl Into<String>) -> Self {
+        Self::Delta {
+            content: content.into(),
+        }
+    }
+
+    /// Convenience: create a done event.
+    pub fn done() -> Self {
+        Self::Done {
+            model: None,
+            usage: None,
+            finish_reason: Some("stop".to_string()),
+        }
+    }
+
+    /// Format this event as an OpenAI-compatible SSE chunk.
+    ///
+    /// Each call returns a complete `data: {...}\n\n` line suitable for
+    /// writing directly to an HTTP response body.
+    pub fn to_openai_sse(&self, id: &str, model: &str) -> String {
+        match self {
+            Self::Delta { content } => {
+                let chunk = serde_json::json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": content },
+                        "finish_reason": serde_json::Value::Null,
+                    }],
+                });
+                format!("data: {chunk}\n\n")
+            }
+            Self::Done {
+                model: event_model,
+                usage,
+                finish_reason,
+            } => {
+                let m = event_model.as_deref().unwrap_or(model);
+                let fr = finish_reason.as_deref().unwrap_or("stop");
+                let mut chunk = serde_json::json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "model": m,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": fr,
+                    }],
+                });
+                if let Some(u) = usage {
+                    chunk["usage"] = serde_json::json!({
+                        "prompt_tokens": u.input_tokens,
+                        "completion_tokens": u.output_tokens,
+                        "total_tokens": u.input_tokens + u.output_tokens,
+                    });
+                }
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            }
+        }
+    }
+}
+
+pub type CompletionStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -228,7 +313,7 @@ pub mod testing {
         }
 
         async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
-            let model = req.model;
+            let model = req.model.clone();
             let token = req
                 .messages
                 .last()
@@ -240,8 +325,14 @@ pub mod testing {
                         .collect::<String>()
                 })
                 .unwrap_or_default();
-            let stream = tokio_stream::iter(vec![Ok(token)]);
-            let _ = model;
+            let stream = tokio_stream::iter(vec![
+                Ok(StreamEvent::delta(token)),
+                Ok(StreamEvent::Done {
+                    model: Some(model),
+                    usage: None,
+                    finish_reason: Some("stop".to_string()),
+                }),
+            ]);
             Ok(Box::pin(stream))
         }
 

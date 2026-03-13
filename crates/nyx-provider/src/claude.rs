@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
-    ProviderContent, ProviderError, ProviderRole, ToolCall, ToolCallParser, UsageMetadata,
+    ProviderContent, ProviderError, ProviderRole, StreamEvent, ToolCall, ToolCallParser,
+    UsageMetadata,
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -278,7 +279,14 @@ impl LlmProvider for ClaudeProvider {
 
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
         let response = self.complete_via_api(req).await?;
-        let stream = tokio_stream::iter(vec![Ok(response.content)]);
+        let stream = tokio_stream::iter(vec![
+            Ok(StreamEvent::delta(response.content)),
+            Ok(StreamEvent::Done {
+                model: Some(response.model),
+                usage: response.usage,
+                finish_reason: Some("stop".to_string()),
+            }),
+        ]);
         Ok(Box::pin(stream))
     }
 

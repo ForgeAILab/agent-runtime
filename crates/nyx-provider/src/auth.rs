@@ -361,15 +361,17 @@ mod tests {
     async fn stored_profile_token_flows_through_provider_to_api() {
         let api_server = MockServer::start().await;
 
+        let sse_body = "event: response.completed\ndata: {\"response\":{\"model\":\"codex\",\"output_text\":\"hello back\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\nevent: done\ndata: [DONE]\n\n";
+
         Mock::given(method("POST"))
             .and(path("/codex/responses"))
             .and(header("authorization", "Bearer fresh-access-tok"))
             .and(header("openai-beta", "responses=experimental"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "model": "codex",
-                "output_text": "hello back",
-                "usage": {"input_tokens": 5, "output_tokens": 3}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
             .expect(1)
             .mount(&api_server)
             .await;
@@ -419,14 +421,16 @@ mod tests {
             .mount(&token_server)
             .await;
 
+        let sse_body = "event: response.completed\ndata: {\"response\":{\"model\":\"codex\",\"output_text\":\"refreshed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\nevent: done\ndata: [DONE]\n\n";
+
         Mock::given(method("POST"))
             .and(path("/codex/responses"))
             .and(header("authorization", "Bearer fresh-after-refresh"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "model": "codex",
-                "output_text": "refreshed",
-                "usage": {"input_tokens": 5, "output_tokens": 3}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
             .expect(1)
             .mount(&api_server)
             .await;
