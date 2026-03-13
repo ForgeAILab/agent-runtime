@@ -492,6 +492,34 @@ pub fn build_provider_chain(cfgs: &[ProviderConfig]) -> Result<FallbackProvider,
     build_provider_chain_with_token_sources(cfgs, &HashMap::new())
 }
 
+/// Build a [`FallbackProvider`] chain by reusing already-built providers.
+///
+/// Each entry in `cfgs` is matched by position against `built_providers`.
+/// The raw provider `Arc` is cloned (not rebuilt) and wrapped with
+/// [`RetryProvider`] + [`CircuitBreakerProvider`] per the config.
+pub fn build_provider_chain_from_built(
+    cfgs: &[ProviderConfig],
+    built_providers: &[(Arc<dyn LlmProvider>, String)],
+) -> Result<FallbackProvider, ProviderError> {
+    if cfgs.is_empty() || built_providers.is_empty() {
+        return Err(ProviderError::Rejected(
+            "provider chain must not be empty".to_string(),
+        ));
+    }
+
+    let mut chain = Vec::with_capacity(built_providers.len());
+    for (i, (provider, model)) in built_providers.iter().enumerate() {
+        let cfg = cfgs.get(i).cloned().unwrap_or_default();
+        let retried: Arc<dyn LlmProvider> =
+            Arc::new(RetryProvider::new(Arc::clone(provider), &cfg.retry));
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(CircuitBreakerProvider::new(retried, &cfg.circuit_breaker));
+        chain.push((provider, model.clone()));
+    }
+
+    Ok(FallbackProvider::new(chain))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProviderConfig, build_provider, build_provider_chain};
