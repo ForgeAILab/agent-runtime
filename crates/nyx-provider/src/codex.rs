@@ -95,7 +95,12 @@ impl OpenAiCodexProvider {
             .header("originator", "nyx")
             .header(
                 "User-Agent",
-                format!("nyx ({} {}; {})", std::env::consts::OS, os_release(), std::env::consts::ARCH),
+                format!(
+                    "nyx ({} {}; {})",
+                    std::env::consts::OS,
+                    os_release(),
+                    std::env::consts::ARCH
+                ),
             )
             .json(&payload);
 
@@ -241,8 +246,7 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         match message.role {
             ProviderRole::Assistant => {
                 // Decode JSON content blocks (may contain text + tool_use blocks)
-                let (assistant_text, tool_call_items) =
-                    decode_assistant_content(&text, msg_index);
+                let (assistant_text, tool_call_items) = decode_assistant_content(&text, msg_index);
 
                 // Add the assistant message output item
                 if !assistant_text.is_empty() {
@@ -473,8 +477,8 @@ fn extract_tool_calls(parsed: &ResponsesResponse) -> Vec<ToolCall> {
 // SSE text delta stream — parses Codex SSE into clean text deltas
 // ---------------------------------------------------------------------------
 
-use std::collections::VecDeque;
 use futures_core::Stream as FutStream;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -824,8 +828,7 @@ mod tests {
     #[test]
     fn extract_account_id_from_jwt_works() {
         // Build a minimal JWT with the expected claim
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"alg":"none"}"#);
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#);
         let token = format!("{header}.{payload}.sig");

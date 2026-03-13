@@ -150,7 +150,7 @@ pub static PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         auth_method: ProviderAuthMethod::OAuth,
         default_env_var: None,
         default_base_url: Some("https://chatgpt.com/backend-api"),
-        default_model: Some("codex-mini-latest"),
+        default_model: Some("gpt-5.4"),
         requires_base_url: false,
         feature_gate: Some("codex"),
         description: "OpenAI Codex (OAuth)",

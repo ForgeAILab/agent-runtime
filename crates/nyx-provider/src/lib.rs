@@ -129,9 +129,7 @@ pub struct UsageMetadata {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// An incremental text token from the assistant.
-    Delta {
-        content: String,
-    },
+    Delta { content: String },
     /// The stream has finished.  Carries final metadata when available.
     Done {
         model: Option<String>,
