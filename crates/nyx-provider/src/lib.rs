@@ -11,10 +11,12 @@ mod circuit_breaker;
 pub mod config;
 mod fallback;
 pub mod model_info;
+mod rate_limit;
 mod retry;
 pub use circuit_breaker::CircuitBreakerProvider;
 pub use fallback::FallbackProvider;
 pub use model_info::{ModelInfo, ModelRegistry};
+pub use rate_limit::MinDelayProvider;
 pub use retry::RetryProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

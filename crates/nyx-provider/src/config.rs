@@ -5,8 +5,8 @@ use nyx_security::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BearerTokenSource, CircuitBreakerProvider, FallbackProvider, LlmProvider, ModelInfo,
-    ModelRegistry, ProviderError, RetryProvider,
+    BearerTokenSource, CircuitBreakerProvider, FallbackProvider, LlmProvider, MinDelayProvider,
+    ModelInfo, ModelRegistry, ProviderError, RetryProvider,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -100,6 +100,11 @@ pub struct ProviderConfig {
     pub retry: RetryConfig,
     #[serde(default, skip_serializing_if = "is_default_circuit_breaker")]
     pub circuit_breaker: CircuitBreakerConfig,
+    /// Minimum milliseconds between consecutive API calls.  When set, a
+    /// [`MinDelayProvider`] wrapper is inserted so rapid-fire tool-loop turns
+    /// are staggered and the provider stays within its rate budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_delay_ms: Option<u64>,
 }
 
 impl Default for ProviderConfig {
@@ -116,6 +121,7 @@ impl Default for ProviderConfig {
             auth_profile: None,
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            min_delay_ms: None,
         }
     }
 }
@@ -466,6 +472,24 @@ pub fn build_provider(
     build_provider_with_token_sources(cfg, &HashMap::new())
 }
 
+/// Wrap a raw provider with the resilience layers:
+/// `Raw → [MinDelay] → Retry → CircuitBreaker`
+fn wrap_with_resilience(
+    provider: Arc<dyn LlmProvider>,
+    cfg: &ProviderConfig,
+) -> Arc<dyn LlmProvider> {
+    let provider: Arc<dyn LlmProvider> = if let Some(ms) = cfg.min_delay_ms {
+        Arc::new(MinDelayProvider::new(
+            provider,
+            std::time::Duration::from_millis(ms),
+        ))
+    } else {
+        provider
+    };
+    let retried: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(provider, &cfg.retry));
+    Arc::new(CircuitBreakerProvider::new(retried, &cfg.circuit_breaker))
+}
+
 pub fn build_provider_chain_with_token_sources(
     cfgs: &[ProviderConfig],
     token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
@@ -479,9 +503,7 @@ pub fn build_provider_chain_with_token_sources(
     let mut chain = Vec::with_capacity(cfgs.len());
     for cfg in cfgs {
         let (provider, model) = build_provider_with_token_sources(cfg, token_sources)?;
-        let retried: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(provider, &cfg.retry));
-        let provider: Arc<dyn LlmProvider> =
-            Arc::new(CircuitBreakerProvider::new(retried, &cfg.circuit_breaker));
+        let provider = wrap_with_resilience(provider, cfg);
         chain.push((provider, model));
     }
 
@@ -510,10 +532,7 @@ pub fn build_provider_chain_from_built(
     let mut chain = Vec::with_capacity(built_providers.len());
     for (i, (provider, model)) in built_providers.iter().enumerate() {
         let cfg = cfgs.get(i).cloned().unwrap_or_default();
-        let retried: Arc<dyn LlmProvider> =
-            Arc::new(RetryProvider::new(Arc::clone(provider), &cfg.retry));
-        let provider: Arc<dyn LlmProvider> =
-            Arc::new(CircuitBreakerProvider::new(retried, &cfg.circuit_breaker));
+        let provider = wrap_with_resilience(Arc::clone(provider), &cfg);
         chain.push((provider, model.clone()));
     }
 
