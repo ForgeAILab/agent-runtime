@@ -175,6 +175,7 @@ pub struct TerminalSession {
     stdout_buf: Arc<tokio::sync::Mutex<OutputBuffer>>,
     stderr_buf: Arc<tokio::sync::Mutex<OutputBuffer>>,
     stdout_notify: Arc<tokio::sync::Notify>,
+    drain_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     interactive: bool,
     pub started_at: Instant,
 }
@@ -274,8 +275,11 @@ impl TerminalRegistry {
             let master_write = AsyncPtyFd::new(spawned.master_fd)
                 .map_err(|err| TerminalError::SpawnFailed(err.to_string()))?;
 
-            // Background drain stdout from PTY.
-            tokio::spawn(drain_into_buffer(master_read, Arc::clone(&stdout_buf)));
+            // Ensure wait() can join the drain task before reading final output.
+            let drain_tasks = vec![tokio::spawn(drain_into_buffer(
+                master_read,
+                Arc::clone(&stdout_buf),
+            ))];
 
             let session = Arc::new(TerminalSession {
                 child: tokio::sync::Mutex::new(spawned.child),
@@ -285,6 +289,7 @@ impl TerminalRegistry {
                 stdout_buf,
                 stderr_buf,
                 stdout_notify,
+                drain_tasks: tokio::sync::Mutex::new(drain_tasks),
                 interactive: true,
                 started_at: Instant::now(),
             });
@@ -313,15 +318,17 @@ impl TerminalRegistry {
             stderr,
         } = spawned;
 
-        // Background drain stdout & stderr.
-        tokio::spawn(drain_into_buffer(
-            BufReader::new(stdout),
-            Arc::clone(&stdout_buf),
-        ));
-        tokio::spawn(drain_into_buffer(
-            BufReader::new(stderr),
-            Arc::clone(&stderr_buf),
-        ));
+        // Ensure wait() can join the drain tasks before reading final output.
+        let drain_tasks = vec![
+            tokio::spawn(drain_into_buffer(
+                BufReader::new(stdout),
+                Arc::clone(&stdout_buf),
+            )),
+            tokio::spawn(drain_into_buffer(
+                BufReader::new(stderr),
+                Arc::clone(&stderr_buf),
+            )),
+        ];
 
         let session = Arc::new(TerminalSession {
             child: tokio::sync::Mutex::new(child),
@@ -331,6 +338,7 @@ impl TerminalRegistry {
             stdout_buf,
             stderr_buf,
             stdout_notify,
+            drain_tasks: tokio::sync::Mutex::new(drain_tasks),
             interactive,
             started_at: Instant::now(),
         });
@@ -487,41 +495,63 @@ impl TerminalRegistry {
 
         let mut child = session.child.lock().await;
         if timeout_ms == 0 {
-            return match child.try_wait()? {
-                Some(status) => Ok((
+            let result = match child.try_wait()? {
+                Some(status) => (
+                    TerminalStatus::Exited {
+                        exit_code: status.code().unwrap_or(-1),
+                    },
+                    false,
+                ),
+                None => (
+                    TerminalStatus::Running {
+                        pid: child.id().unwrap_or_default(),
+                    },
+                    true,
+                ),
+            };
+            drop(child);
+            if matches!(result.0, TerminalStatus::Exited { .. }) {
+                self.join_drain_tasks(&session).await;
+            }
+            return Ok(result);
+        }
+
+        let result: Result<(TerminalStatus, bool), TerminalError> =
+            match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+                Ok(Ok(status)) => Ok((
                     TerminalStatus::Exited {
                         exit_code: status.code().unwrap_or(-1),
                     },
                     false,
                 )),
-                None => Ok((
-                    TerminalStatus::Running {
-                        pid: child.id().unwrap_or_default(),
-                    },
-                    true,
-                )),
+                Ok(Err(err)) => Err(TerminalError::Io(err)),
+                Err(_) => {
+                    let status = match child.try_wait()? {
+                        Some(status) => TerminalStatus::Exited {
+                            exit_code: status.code().unwrap_or(-1),
+                        },
+                        None => TerminalStatus::Running {
+                            pid: child.id().unwrap_or_default(),
+                        },
+                    };
+                    Ok((status, true))
+                }
             };
+        let result = result?;
+        drop(child);
+        if matches!(result.0, TerminalStatus::Exited { .. }) {
+            self.join_drain_tasks(&session).await;
         }
+        Ok(result)
+    }
 
-        match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-            Ok(Ok(status)) => Ok((
-                TerminalStatus::Exited {
-                    exit_code: status.code().unwrap_or(-1),
-                },
-                false,
-            )),
-            Ok(Err(err)) => Err(TerminalError::Io(err)),
-            Err(_) => {
-                let status = match child.try_wait()? {
-                    Some(status) => TerminalStatus::Exited {
-                        exit_code: status.code().unwrap_or(-1),
-                    },
-                    None => TerminalStatus::Running {
-                        pid: child.id().unwrap_or_default(),
-                    },
-                };
-                Ok((status, true))
-            }
+    async fn join_drain_tasks(&self, session: &Arc<TerminalSession>) {
+        let drain_tasks = {
+            let mut drain_tasks = session.drain_tasks.lock().await;
+            std::mem::take(&mut *drain_tasks)
+        };
+        for drain_task in drain_tasks {
+            let _ = drain_task.await;
         }
     }
 
@@ -614,6 +644,36 @@ mod tests {
 
         let status = registry.status("done").await.expect("status works");
         assert!(matches!(status, TerminalStatus::Exited { .. }));
+    }
+
+    #[tokio::test]
+    async fn terminal_registry_wait_flushes_final_output_before_read() {
+        let registry = TerminalRegistry::new();
+        let tool_ctx = ToolContext::default();
+        registry
+            .spawn(
+                "wait-flush",
+                "sleep 0.05; printf done",
+                &tool_ctx,
+                HashMap::new(),
+                false,
+                None,
+            )
+            .await
+            .expect("spawn process");
+
+        let (status, timed_out) = registry
+            .wait("wait-flush", 500)
+            .await
+            .expect("wait for process");
+        assert!(matches!(status, TerminalStatus::Exited { .. }));
+        assert!(!timed_out, "process should complete before timeout");
+
+        let output = registry
+            .read("wait-flush", 0, None, None)
+            .await
+            .expect("read final output");
+        assert_eq!(output.stdout, "done");
     }
 
     #[tokio::test]
