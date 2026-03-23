@@ -1,5 +1,19 @@
 # OpenAI
 [[models]]
+prefix = "gpt-5.4"
+context_window = 1_050_000
+max_output_tokens = 128_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-5.4-mini"
+context_window = 400_000
+max_output_tokens = 128_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
 prefix = "gpt-4.1-mini"
 context_window = 1_047_576
 max_output_tokens = 32_768
@@ -532,6 +546,13 @@ supports_vision = false
 supports_tool_use = true
 
 [[models]]
+prefix = "glm-5"
+context_window = 198_000
+max_output_tokens = 32_000
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
 prefix = "minimax-m21"
 context_window = 198_000
 max_output_tokens = 32_768
@@ -540,6 +561,13 @@ supports_tool_use = true
 
 [[models]]
 prefix = "minimax-m25"
+context_window = 198_000
+max_output_tokens = 32_768
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "minimax-m2p5"
 context_window = 198_000
 max_output_tokens = 32_768
 supports_vision = false
@@ -568,8 +596,8 @@ supports_tool_use = true
 
 [[models]]
 prefix = "openai-gpt-54"
-context_window = 1_000_000
-max_output_tokens = 131_072
+context_window = 1_050_000
+max_output_tokens = 128_000
 supports_vision = true
 supports_tool_use = true
 
