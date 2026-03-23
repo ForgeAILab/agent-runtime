@@ -16,6 +16,7 @@ codex = []
 oauth = ["nyx-security/oauth"]
 cost = ["dep:nyx-obs", "dep:time"]
 cost-sqlite = ["cost", "dep:rusqlite", "dep:nyx-store"]
+model-cache-sqlite = ["dep:rusqlite", "dep:nyx-store"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -31,6 +32,7 @@ tokio-stream = "0.1"
 futures-core = "0.3"
 futures-util = { workspace = true }
 tracing = { workspace = true }
+toml = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 nyx-store = { path = "../nyx-store", default-features = false, features = ["sqlite"], optional = true }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"], optional = true }

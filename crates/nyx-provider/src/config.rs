@@ -149,10 +149,54 @@ impl ProviderConfig {
         info
     }
 
-    pub fn resolved_context_window(&self) -> Option<usize> {
-        let registry = ModelRegistry::new();
-        let context_window = self.resolved_model_info(&registry).context_window;
+    pub fn resolved_context_window(&self, registry: &ModelRegistry) -> Option<usize> {
+        let context_window = self.resolved_model_info(registry).context_window;
         (context_window > 0).then_some(context_window)
+    }
+
+    pub fn resolved_api_key(&self) -> Option<String> {
+        if let Some(api_key) = &self.api_key {
+            return Some(api_key.reveal().clone());
+        }
+
+        let env_name = self
+            .api_key_env
+            .clone()
+            .or_else(|| default_api_key_env(self.kind.as_str()).map(str::to_string))?;
+        std::env::var(&env_name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }
+}
+
+fn default_api_key_env(kind: &str) -> Option<&'static str> {
+    match kind {
+        "openai" | "compat" => Some("OPENAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "groq" => Some("GROQ_API_KEY"),
+        "mistral" => Some("MISTRAL_API_KEY"),
+        "xai" | "grok" => Some("XAI_API_KEY"),
+        "deepseek" => Some("DEEPSEEK_API_KEY"),
+        "together" | "together-ai" => Some("TOGETHER_API_KEY"),
+        "fireworks" | "fireworks-ai" => Some("FIREWORKS_API_KEY"),
+        "perplexity" => Some("PERPLEXITY_API_KEY"),
+        "cohere" => Some("COHERE_API_KEY"),
+        "nvidia" | "nvidia-nim" => Some("NVIDIA_API_KEY"),
+        "venice" => Some("VENICE_API_KEY"),
+        "vercel" | "vercel-ai" => Some("VERCEL_API_KEY"),
+        "cloudflare" | "cloudflare-ai" => Some("CLOUDFLARE_API_KEY"),
+        "synthetic" => Some("SYNTHETIC_API_KEY"),
+        "opencode" | "opencode-zen" => Some("OPENCODE_API_KEY"),
+        "astrai" => Some("ASTRAI_API_KEY"),
+        "moonshot" => Some("MOONSHOT_API_KEY"),
+        "glm" | "chatglm" | "zhipu" => Some("GLM_API_KEY"),
+        "minimax" => Some("MINIMAX_API_KEY"),
+        "qwen" | "dashscope" | "aliyun" => Some("DASHSCOPE_API_KEY"),
+        "qianfan" | "baidu" => Some("QIANFAN_API_KEY"),
+        "zai" | "z.ai" => Some("ZAI_API_KEY"),
+        "bedrock" | "aws-bedrock" => Some("AWS_BEARER_TOKEN_BEDROCK"),
+        "claude" | "anthropic" => Some("ANTHROPIC_API_KEY"),
+        _ => None,
     }
 }
 
@@ -199,18 +243,18 @@ fn make_compat(
     cfg: &ProviderConfig,
     default_env: &str,
     default_url: &str,
+    registry: &ModelRegistry,
 ) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
     let api_key = resolve_api_key(cfg, default_env)?;
     let base_url = cfg
         .base_url
         .clone()
         .unwrap_or_else(|| default_url.to_string());
-    let registry = ModelRegistry::new();
     Ok((
         Arc::new(crate::compat::OpenAiCompatProvider::new(
             base_url,
             api_key,
-            Some(cfg.resolved_model_info(&registry)),
+            Some(cfg.resolved_model_info(registry)),
         )),
         cfg.model.clone(),
     ))
@@ -222,6 +266,7 @@ fn make_compat_no_key(
     default_env: &str,
     default_url: &str,
     fallback_key: &str,
+    registry: &ModelRegistry,
 ) -> (Arc<dyn LlmProvider>, String) {
     let api_key = resolve_optional_key(cfg, default_env);
     let api_key = if api_key.trim().is_empty() {
@@ -233,19 +278,19 @@ fn make_compat_no_key(
         .base_url
         .clone()
         .unwrap_or_else(|| default_url.to_string());
-    let registry = ModelRegistry::new();
     (
         Arc::new(crate::compat::OpenAiCompatProvider::new(
             base_url,
             api_key,
-            Some(cfg.resolved_model_info(&registry)),
+            Some(cfg.resolved_model_info(registry)),
         )),
         cfg.model.clone(),
     )
 }
 
-pub fn build_provider_with_token_sources(
+pub fn build_provider_with_model_registry_and_token_sources(
     cfg: &ProviderConfig,
+    registry: &ModelRegistry,
     _token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
 ) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
     tracing::debug!(
@@ -339,12 +384,11 @@ pub fn build_provider_with_token_sources(
             let base_url = cfg.base_url.clone().ok_or_else(|| {
                 ProviderError::Rejected("provider.base_url is required for compat".to_string())
             })?;
-            let registry = ModelRegistry::new();
             Ok((
                 Arc::new(crate::compat::OpenAiCompatProvider::new(
                     base_url,
                     api_key,
-                    Some(cfg.resolved_model_info(&registry)),
+                    Some(cfg.resolved_model_info(registry)),
                 )),
                 cfg.model.clone(),
             ))
@@ -360,6 +404,7 @@ pub fn build_provider_with_token_sources(
             "OLLAMA_API_KEY",
             "http://localhost:11434/v1",
             "",
+            registry,
         )),
         #[cfg(feature = "compat")]
         "lmstudio" | "lm-studio" => Ok(make_compat_no_key(
@@ -367,6 +412,7 @@ pub fn build_provider_with_token_sources(
             "LM_STUDIO_API_KEY",
             "http://localhost:1234/v1",
             "lm-studio",
+            registry,
         )),
         #[cfg(not(feature = "compat"))]
         "ollama" | "lmstudio" | "lm-studio" => Err(ProviderError::Rejected(
@@ -374,80 +420,151 @@ pub fn build_provider_with_token_sources(
         )),
 
         #[cfg(feature = "compat")]
-        "openrouter" => make_compat(cfg, "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+        "openrouter" => make_compat(
+            cfg,
+            "OPENROUTER_API_KEY",
+            "https://openrouter.ai/api/v1",
+            registry,
+        ),
 
         #[cfg(feature = "compat")]
-        "groq" => make_compat(cfg, "GROQ_API_KEY", "https://api.groq.com/openai/v1"),
+        "groq" => make_compat(
+            cfg,
+            "GROQ_API_KEY",
+            "https://api.groq.com/openai/v1",
+            registry,
+        ),
         #[cfg(feature = "compat")]
-        "mistral" => make_compat(cfg, "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
+        "mistral" => make_compat(
+            cfg,
+            "MISTRAL_API_KEY",
+            "https://api.mistral.ai/v1",
+            registry,
+        ),
         #[cfg(feature = "compat")]
-        "xai" | "grok" => make_compat(cfg, "XAI_API_KEY", "https://api.x.ai/v1"),
+        "xai" | "grok" => make_compat(cfg, "XAI_API_KEY", "https://api.x.ai/v1", registry),
         #[cfg(feature = "compat")]
-        "deepseek" => make_compat(cfg, "DEEPSEEK_API_KEY", "https://api.deepseek.com"),
+        "deepseek" => make_compat(
+            cfg,
+            "DEEPSEEK_API_KEY",
+            "https://api.deepseek.com",
+            registry,
+        ),
         #[cfg(feature = "compat")]
-        "together" | "together-ai" => {
-            make_compat(cfg, "TOGETHER_API_KEY", "https://api.together.xyz/v1")
-        }
+        "together" | "together-ai" => make_compat(
+            cfg,
+            "TOGETHER_API_KEY",
+            "https://api.together.xyz/v1",
+            registry,
+        ),
         #[cfg(feature = "compat")]
         "fireworks" | "fireworks-ai" => make_compat(
             cfg,
             "FIREWORKS_API_KEY",
             "https://api.fireworks.ai/inference/v1",
+            registry,
         ),
         #[cfg(feature = "compat")]
-        "perplexity" => make_compat(cfg, "PERPLEXITY_API_KEY", "https://api.perplexity.ai"),
+        "perplexity" => make_compat(
+            cfg,
+            "PERPLEXITY_API_KEY",
+            "https://api.perplexity.ai",
+            registry,
+        ),
         #[cfg(feature = "compat")]
         "cohere" => make_compat(
             cfg,
             "COHERE_API_KEY",
             "https://api.cohere.com/compatibility/v1",
+            registry,
         ),
         #[cfg(feature = "compat")]
-        "nvidia" | "nvidia-nim" => {
-            make_compat(cfg, "NVIDIA_API_KEY", "https://integrate.api.nvidia.com/v1")
+        "nvidia" | "nvidia-nim" => make_compat(
+            cfg,
+            "NVIDIA_API_KEY",
+            "https://integrate.api.nvidia.com/v1",
+            registry,
+        ),
+        #[cfg(feature = "compat")]
+        "venice" => make_compat(
+            cfg,
+            "VENICE_API_KEY",
+            "https://api.venice.ai/api/v1",
+            registry,
+        ),
+        #[cfg(feature = "compat")]
+        "vercel" | "vercel-ai" => {
+            make_compat(cfg, "VERCEL_API_KEY", "https://api.vercel.ai/v1", registry)
         }
-        #[cfg(feature = "compat")]
-        "venice" => make_compat(cfg, "VENICE_API_KEY", "https://api.venice.ai/api/v1"),
-        #[cfg(feature = "compat")]
-        "vercel" | "vercel-ai" => make_compat(cfg, "VERCEL_API_KEY", "https://api.vercel.ai/v1"),
         #[cfg(feature = "compat")]
         "cloudflare" | "cloudflare-ai" => make_compat(
             cfg,
             "CLOUDFLARE_API_KEY",
             "https://gateway.ai.cloudflare.com/v1",
+            registry,
         ),
         #[cfg(feature = "compat")]
-        "synthetic" => make_compat(cfg, "SYNTHETIC_API_KEY", "https://api.synthetic.com"),
+        "synthetic" => make_compat(
+            cfg,
+            "SYNTHETIC_API_KEY",
+            "https://api.synthetic.com",
+            registry,
+        ),
         #[cfg(feature = "compat")]
-        "opencode" | "opencode-zen" => {
-            make_compat(cfg, "OPENCODE_API_KEY", "https://opencode.ai/zen/v1")
-        }
+        "opencode" | "opencode-zen" => make_compat(
+            cfg,
+            "OPENCODE_API_KEY",
+            "https://opencode.ai/zen/v1",
+            registry,
+        ),
         #[cfg(feature = "compat")]
-        "astrai" => make_compat(cfg, "ASTRAI_API_KEY", "https://as-trai.com/v1"),
+        "astrai" => make_compat(cfg, "ASTRAI_API_KEY", "https://as-trai.com/v1", registry),
 
         #[cfg(feature = "compat")]
-        "moonshot" => make_compat(cfg, "MOONSHOT_API_KEY", "https://api.moonshot.cn/v1"),
+        "moonshot" => make_compat(
+            cfg,
+            "MOONSHOT_API_KEY",
+            "https://api.moonshot.cn/v1",
+            registry,
+        ),
         #[cfg(feature = "compat")]
-        "glm" | "chatglm" | "zhipu" => {
-            make_compat(cfg, "GLM_API_KEY", "https://open.bigmodel.cn/api/paas/v4")
-        }
+        "glm" | "chatglm" | "zhipu" => make_compat(
+            cfg,
+            "GLM_API_KEY",
+            "https://open.bigmodel.cn/api/paas/v4",
+            registry,
+        ),
         #[cfg(feature = "compat")]
-        "minimax" => make_compat(cfg, "MINIMAX_API_KEY", "https://api.minimax.chat/v1"),
+        "minimax" => make_compat(
+            cfg,
+            "MINIMAX_API_KEY",
+            "https://api.minimax.chat/v1",
+            registry,
+        ),
         #[cfg(feature = "compat")]
         "qwen" | "dashscope" | "aliyun" => make_compat(
             cfg,
             "DASHSCOPE_API_KEY",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            registry,
         ),
         #[cfg(feature = "compat")]
-        "qianfan" | "baidu" => make_compat(cfg, "QIANFAN_API_KEY", "https://aip.baidubce.com"),
+        "qianfan" | "baidu" => {
+            make_compat(cfg, "QIANFAN_API_KEY", "https://aip.baidubce.com", registry)
+        }
         #[cfg(feature = "compat")]
-        "zai" | "z.ai" => make_compat(cfg, "ZAI_API_KEY", "https://api.z.ai/api/coding/paas/v4"),
+        "zai" | "z.ai" => make_compat(
+            cfg,
+            "ZAI_API_KEY",
+            "https://api.z.ai/api/coding/paas/v4",
+            registry,
+        ),
         #[cfg(feature = "compat")]
         "bedrock" | "aws-bedrock" => make_compat(
             cfg,
             "AWS_BEARER_TOKEN_BEDROCK",
             "https://bedrock-runtime.us-east-1.amazonaws.com",
+            registry,
         ),
 
         #[cfg(not(feature = "compat"))]
@@ -464,6 +581,14 @@ pub fn build_provider_with_token_sources(
             "provider `{other}` is not supported. Use `compat` with a base_url for custom endpoints."
         ))),
     }
+}
+
+pub fn build_provider_with_token_sources(
+    cfg: &ProviderConfig,
+    token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
+) -> Result<(Arc<dyn LlmProvider>, String), ProviderError> {
+    let registry = ModelRegistry::new();
+    build_provider_with_model_registry_and_token_sources(cfg, &registry, token_sources)
 }
 
 pub fn build_provider(
@@ -494,6 +619,15 @@ pub fn build_provider_chain_with_token_sources(
     cfgs: &[ProviderConfig],
     token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
 ) -> Result<FallbackProvider, ProviderError> {
+    let registry = ModelRegistry::new();
+    build_provider_chain_with_model_registry_and_token_sources(cfgs, &registry, token_sources)
+}
+
+pub fn build_provider_chain_with_model_registry_and_token_sources(
+    cfgs: &[ProviderConfig],
+    registry: &ModelRegistry,
+    token_sources: &HashMap<String, Arc<dyn BearerTokenSource>>,
+) -> Result<FallbackProvider, ProviderError> {
     if cfgs.is_empty() {
         return Err(ProviderError::Rejected(
             "provider chain must not be empty".to_string(),
@@ -502,7 +636,8 @@ pub fn build_provider_chain_with_token_sources(
 
     let mut chain = Vec::with_capacity(cfgs.len());
     for cfg in cfgs {
-        let (provider, model) = build_provider_with_token_sources(cfg, token_sources)?;
+        let (provider, model) =
+            build_provider_with_model_registry_and_token_sources(cfg, registry, token_sources)?;
         let provider = wrap_with_resilience(provider, cfg);
         chain.push((provider, model));
     }
@@ -630,7 +765,8 @@ base_url = "http://localhost:11434/v1"
             ..Default::default()
         };
 
-        assert_eq!(cfg.resolved_context_window(), Some(64_000));
+        let registry = ModelRegistry::new();
+        assert_eq!(cfg.resolved_context_window(&registry), Some(64_000));
     }
 
     #[test]
@@ -640,7 +776,8 @@ base_url = "http://localhost:11434/v1"
             ..Default::default()
         };
 
-        assert_eq!(cfg.resolved_context_window(), Some(200_000));
+        let registry = ModelRegistry::new();
+        assert_eq!(cfg.resolved_context_window(&registry), Some(200_000));
     }
 
     #[test]
@@ -650,7 +787,8 @@ base_url = "http://localhost:11434/v1"
             ..Default::default()
         };
 
-        assert_eq!(cfg.resolved_context_window(), None);
+        let registry = ModelRegistry::new();
+        assert_eq!(cfg.resolved_context_window(&registry), None);
     }
 
     #[test]
@@ -667,7 +805,8 @@ supports_vision = false
 
         assert_eq!(cfg.context_window, Some(100_000));
         assert_eq!(cfg.supports_vision, Some(false));
-        assert_eq!(cfg.resolved_context_window(), Some(100_000));
+        let registry = ModelRegistry::new();
+        assert_eq!(cfg.resolved_context_window(&registry), Some(100_000));
     }
 
     #[test]

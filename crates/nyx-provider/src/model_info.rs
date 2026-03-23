@@ -4,8 +4,10 @@ use std::sync::RwLock;
 use serde::Deserialize;
 
 use crate::ProviderError;
+#[cfg(feature = "model-cache-sqlite")]
+use crate::SqliteModelCache;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelInfo {
     pub model_id: String,
     pub context_window: usize,
@@ -13,6 +15,7 @@ pub struct ModelInfo {
     pub supports_vision: bool,
     pub supports_tool_use: bool,
     pub supports_streaming: bool,
+    pub context_budget_ratio: Option<f32>,
 }
 
 impl ModelInfo {
@@ -24,6 +27,7 @@ impl ModelInfo {
             supports_vision: false,
             supports_tool_use: true,
             supports_streaming: true,
+            context_budget_ratio: None,
         }
     }
 }
@@ -38,39 +42,47 @@ struct ModelEntry {
 pub struct ModelRegistry {
     built_in: Vec<ModelEntry>,
     cache: RwLock<HashMap<String, ModelInfo>>,
+    #[cfg(feature = "model-cache-sqlite")]
+    sqlite_cache: Option<SqliteModelCache>,
 }
 
 impl ModelRegistry {
     pub fn new() -> Self {
-        let mut built_in = vec![
-            built_in_model("gpt-4.1-mini", 1_047_576, Some(32_768), true, true),
-            built_in_model("gpt-4.1-nano", 1_047_576, Some(32_768), true, true),
-            built_in_model("gpt-4.1", 1_047_576, Some(32_768), true, true),
-            built_in_model("gpt-4o-mini", 128_000, Some(16_384), true, true),
-            built_in_model("gpt-4o", 128_000, Some(16_384), true, true),
-            built_in_model("gpt-4-turbo", 128_000, Some(4_096), true, true),
-            built_in_model("gpt-4", 8_192, Some(8_192), false, true),
-            built_in_model("gpt-3.5-turbo", 16_385, Some(4_096), false, true),
-            built_in_model("o4-mini", 200_000, Some(100_000), true, true),
-            built_in_model("o3", 200_000, Some(100_000), true, true),
-            built_in_model("o1-mini", 128_000, Some(65_536), false, true),
-            built_in_model("o1", 200_000, Some(100_000), true, true),
-            built_in_model("claude-opus-4", 200_000, Some(32_000), true, true),
-            built_in_model("claude-sonnet-4", 200_000, Some(16_000), true, true),
-            built_in_model("claude-haiku-3.5", 200_000, Some(8_192), true, true),
-            built_in_model("deepseek-chat", 65_536, Some(8_192), false, true),
-            built_in_model("deepseek-reasoner", 65_536, Some(8_192), false, false),
-        ];
-        built_in.sort_by(|left, right| right.prefix.len().cmp(&left.prefix.len()));
+        Self::from_bundled_models(parse_bundled_models(include_str!("../assets/models.toml")))
+    }
 
+    #[cfg(feature = "model-cache-sqlite")]
+    pub fn with_sqlite_cache(sqlite_cache: Option<SqliteModelCache>) -> Self {
+        let mut registry =
+            Self::from_bundled_models(parse_bundled_models(include_str!("../assets/models.toml")));
+        registry.sqlite_cache = sqlite_cache;
+        registry
+    }
+
+    fn from_bundled_models(mut built_in: Vec<ModelEntry>) -> Self {
+        let bundled_models = built_in.len();
+        built_in.sort_by(|left, right| right.prefix.len().cmp(&left.prefix.len()));
+        tracing::info!(bundled_models, "loaded bundled model metadata");
         Self {
             built_in,
             cache: RwLock::new(HashMap::new()),
+            #[cfg(feature = "model-cache-sqlite")]
+            sqlite_cache: None,
         }
     }
 
     pub fn resolve(&self, model: &str) -> Option<ModelInfo> {
         if let Some(info) = self.cache_read().get(model).cloned() {
+            return Some(info);
+        }
+
+        #[cfg(feature = "model-cache-sqlite")]
+        if let Some(info) = self
+            .sqlite_cache
+            .as_ref()
+            .and_then(|cache| cache.get(model).ok().flatten())
+        {
+            self.cache_write().insert(model.to_string(), info.clone());
             return Some(info);
         }
 
@@ -90,7 +102,7 @@ impl ModelRegistry {
         base_url: &str,
         api_key: &str,
     ) -> Result<ModelInfo, ProviderError> {
-        if let Some(info) = self.cache_read().get(model).cloned() {
+        if let Some(info) = self.resolve(model) {
             return Ok(info);
         }
 
@@ -129,10 +141,17 @@ impl ModelRegistry {
                         .and_then(|caps| caps.streaming)
                 })
                 .unwrap_or(true),
+            context_budget_ratio: None,
         };
 
         self.cache_write()
             .insert(info.model_id.clone(), info.clone());
+        #[cfg(feature = "model-cache-sqlite")]
+        if let Some(cache) = &self.sqlite_cache {
+            cache.put(&info.model_id, &info).map_err(|err| {
+                ProviderError::Rejected(format!("failed to persist model metadata: {err}"))
+            })?;
+        }
         Ok(info)
     }
 
@@ -157,24 +176,48 @@ impl Default for ModelInfo {
     }
 }
 
-fn built_in_model(
-    prefix: &str,
+fn built_in_model(model: BundledModel) -> ModelEntry {
+    ModelEntry {
+        prefix: model.prefix.clone(),
+        info: ModelInfo {
+            model_id: model.prefix,
+            context_window: model.context_window,
+            max_output_tokens: model.max_output_tokens,
+            supports_vision: model.supports_vision,
+            supports_tool_use: model.supports_tool_use,
+            supports_streaming: model.supports_streaming,
+            context_budget_ratio: model.context_budget_ratio,
+        },
+    }
+}
+
+fn parse_bundled_models(raw: &str) -> Vec<ModelEntry> {
+    let bundled: BundledModelFile = toml::from_str(raw)
+        .unwrap_or_else(|err| panic!("failed to parse bundled model metadata: {err}"));
+    bundled.models.into_iter().map(built_in_model).collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct BundledModelFile {
+    models: Vec<BundledModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BundledModel {
+    prefix: String,
     context_window: usize,
+    #[serde(default)]
     max_output_tokens: Option<usize>,
     supports_vision: bool,
     supports_tool_use: bool,
-) -> ModelEntry {
-    ModelEntry {
-        prefix: prefix.to_string(),
-        info: ModelInfo {
-            model_id: prefix.to_string(),
-            context_window,
-            max_output_tokens,
-            supports_vision,
-            supports_tool_use,
-            supports_streaming: true,
-        },
-    }
+    #[serde(default = "default_supports_streaming")]
+    supports_streaming: bool,
+    #[serde(default)]
+    context_budget_ratio: Option<f32>,
+}
+
+fn default_supports_streaming() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,9 +256,13 @@ mod tests {
 
     use super::{ModelInfo, ModelRegistry};
 
+    fn registry() -> ModelRegistry {
+        ModelRegistry::new()
+    }
+
     #[test]
     fn resolve_returns_known_prefix() {
-        let registry = ModelRegistry::new();
+        let registry = registry();
         let info = registry
             .resolve("gpt-4o-2024-08-06")
             .expect("built-in model should resolve");
@@ -227,7 +274,7 @@ mod tests {
 
     #[test]
     fn resolve_prefers_longest_prefix_match() {
-        let registry = ModelRegistry::new();
+        let registry = registry();
         let info = registry
             .resolve("gpt-4o-mini-2024-07-18")
             .expect("mini model should resolve");
@@ -238,8 +285,18 @@ mod tests {
 
     #[test]
     fn resolve_returns_none_for_unknown_model() {
-        let registry = ModelRegistry::new();
+        let registry = registry();
         assert_eq!(registry.resolve("my-custom-finetune"), None);
+    }
+
+    #[test]
+    fn bundled_toml_parses_and_round_trips_context_budget_ratio() {
+        let entries = super::parse_bundled_models(include_str!("../assets/models.toml"));
+        let deepseek = entries
+            .iter()
+            .find(|entry| entry.prefix == "deepseek-chat")
+            .expect("deepseek entry");
+        assert_eq!(deepseek.info.context_budget_ratio, Some(0.75));
     }
 
     #[tokio::test]
@@ -257,7 +314,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let registry = ModelRegistry::new();
+        let registry = registry();
         let info = registry
             .fetch_and_cache("llama-3.1-70b", &format!("{}/v1", server.uri()), "test-key")
             .await
@@ -272,6 +329,7 @@ mod tests {
                 supports_vision: false,
                 supports_tool_use: true,
                 supports_streaming: true,
+                context_budget_ratio: None,
             }
         );
 
@@ -287,7 +345,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let registry = ModelRegistry::new();
+        let registry = registry();
         let err = registry
             .fetch_and_cache("missing-model", &format!("{}/v1", server.uri()), "test-key")
             .await
@@ -295,5 +353,35 @@ mod tests {
 
         assert!(matches!(err, crate::ProviderError::Rejected(_)));
         assert_eq!(registry.resolve("missing-model"), None);
+    }
+
+    #[cfg(feature = "model-cache-sqlite")]
+    #[test]
+    fn resolve_prefers_sqlite_cache_over_bundled_data() {
+        let db = nyx_store::NyxDb::in_memory(&[
+            nyx_store::migrations(),
+            crate::model_cache_migrations(),
+        ])
+        .expect("db");
+        let cache = crate::SqliteModelCache::new(db.connection());
+        cache
+            .put(
+                "gpt-4o",
+                &ModelInfo {
+                    model_id: "gpt-4o".to_string(),
+                    context_window: 50_000,
+                    max_output_tokens: Some(10_000),
+                    supports_vision: false,
+                    supports_tool_use: true,
+                    supports_streaming: true,
+                    context_budget_ratio: None,
+                },
+            )
+            .expect("put");
+
+        let registry = ModelRegistry::with_sqlite_cache(Some(cache));
+        let info = registry.resolve("gpt-4o").expect("resolved");
+        assert_eq!(info.context_window, 50_000);
+        assert!(!info.supports_vision);
     }
 }

@@ -1,0 +1,623 @@
+# OpenAI
+[[models]]
+prefix = "gpt-4.1-mini"
+context_window = 1_047_576
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-4.1-nano"
+context_window = 1_047_576
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-4.1"
+context_window = 1_047_576
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-4o-mini"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-4o"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-4-turbo"
+context_window = 128_000
+max_output_tokens = 4_096
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-4"
+context_window = 8_192
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "gpt-3.5-turbo"
+context_window = 16_385
+max_output_tokens = 4_096
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "o4-mini"
+context_window = 200_000
+max_output_tokens = 100_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "o3"
+context_window = 200_000
+max_output_tokens = 100_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "o1-mini"
+context_window = 128_000
+max_output_tokens = 65_536
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "o1"
+context_window = 200_000
+max_output_tokens = 100_000
+supports_vision = true
+supports_tool_use = true
+
+# Anthropic
+[[models]]
+prefix = "claude-opus-4"
+context_window = 200_000
+max_output_tokens = 32_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "claude-sonnet-4"
+context_window = 200_000
+max_output_tokens = 16_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "claude-haiku-3.5"
+context_window = 200_000
+max_output_tokens = 8_192
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "claude-opus-4-5"
+context_window = 198_000
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "claude-opus-4-6"
+context_window = 1_000_000
+max_output_tokens = 128_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "claude-sonnet-4-5"
+context_window = 198_000
+max_output_tokens = 64_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "claude-sonnet-4-6"
+context_window = 1_000_000
+max_output_tokens = 64_000
+supports_vision = true
+supports_tool_use = true
+
+# DeepSeek
+[[models]]
+prefix = "deepseek-chat"
+context_window = 65_536
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+context_budget_ratio = 0.75
+
+[[models]]
+prefix = "deepseek-reasoner"
+context_window = 65_536
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = false
+
+[[models]]
+prefix = "deepseek-ai/DeepSeek-R1"
+context_window = 131_072
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "deepseek-ai/DeepSeek-V3.1"
+context_window = 131_072
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "deepseek-v3.2"
+context_window = 160_000
+max_output_tokens = 32_768
+supports_vision = false
+supports_tool_use = false
+
+# Hugging Face
+[[models]]
+prefix = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+context_window = 131_072
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "openai/gpt-oss-120b"
+context_window = 131_072
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+# Synthetic
+[[models]]
+prefix = "hf:MiniMaxAI/MiniMax-M2.5"
+context_window = 192_000
+max_output_tokens = 65_536
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:moonshotai/Kimi-K2-Thinking"
+context_window = 256_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:zai-org/GLM-4.7"
+context_window = 198_000
+max_output_tokens = 128_000
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:deepseek-ai/DeepSeek-R1-0528"
+context_window = 128_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:deepseek-ai/DeepSeek-V3-0324"
+context_window = 128_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:deepseek-ai/DeepSeek-V3.1"
+context_window = 128_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:deepseek-ai/DeepSeek-V3.1-Terminus"
+context_window = 128_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:deepseek-ai/DeepSeek-V3.2"
+context_window = 159_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:meta-llama/Llama-3.3-70B-Instruct"
+context_window = 128_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+context_window = 524_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:moonshotai/Kimi-K2-Instruct-0905"
+context_window = 256_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:moonshotai/Kimi-K2.5"
+context_window = 256_000
+max_output_tokens = 8_192
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:openai/gpt-oss-120b"
+context_window = 128_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:Qwen/Qwen3-235B-A22B-Instruct-2507"
+context_window = 256_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:Qwen/Qwen3-Coder-480B-A35B-Instruct"
+context_window = 256_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:Qwen/Qwen3-VL-235B-A22B-Instruct"
+context_window = 250_000
+max_output_tokens = 8_192
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:zai-org/GLM-4.5"
+context_window = 128_000
+max_output_tokens = 128_000
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:zai-org/GLM-4.6"
+context_window = 198_000
+max_output_tokens = 128_000
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:zai-org/GLM-5"
+context_window = 256_000
+max_output_tokens = 128_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:deepseek-ai/DeepSeek-V3"
+context_window = 128_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hf:Qwen/Qwen3-235B-A22B-Thinking-2507"
+context_window = 256_000
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+# Together
+[[models]]
+prefix = "zai-org/GLM-4.7"
+context_window = 202_752
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "moonshotai/Kimi-K2.5"
+context_window = 262_144
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+context_window = 10_000_000
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+context_window = 20_000_000
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "moonshotai/Kimi-K2-Instruct-0905"
+context_window = 262_144
+max_output_tokens = 8_192
+supports_vision = false
+supports_tool_use = true
+
+# Venice
+[[models]]
+prefix = "llama-3.3-70b"
+context_window = 128_000
+max_output_tokens = 4_096
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "llama-3.2-3b"
+context_window = 128_000
+max_output_tokens = 4_096
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "hermes-3-llama-3.1-405b"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = false
+
+[[models]]
+prefix = "qwen3-235b-a22b-thinking-2507"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "qwen3-235b-a22b-instruct-2507"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "qwen3-coder-480b-a35b-instruct"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "qwen3-coder-480b-a35b-instruct-turbo"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "qwen3-5-35b-a3b"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "qwen3-next-80b"
+context_window = 256_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "qwen3-vl-235b-a22b"
+context_window = 256_000
+max_output_tokens = 16_384
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "qwen3-4b"
+context_window = 32_000
+max_output_tokens = 4_096
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "venice-uncensored"
+context_window = 32_000
+max_output_tokens = 4_096
+supports_vision = false
+supports_tool_use = false
+
+[[models]]
+prefix = "mistral-31-24b"
+context_window = 128_000
+max_output_tokens = 4_096
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "google-gemma-3-27b-it"
+context_window = 198_000
+max_output_tokens = 16_384
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "openai-gpt-oss-120b"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "nvidia-nemotron-3-nano-30b-a3b"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "olafangensan-glm-4.7-flash-heretic"
+context_window = 128_000
+max_output_tokens = 24_000
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "zai-org-glm-4.6"
+context_window = 198_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "zai-org-glm-4.7"
+context_window = 198_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "zai-org-glm-4.7-flash"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "zai-org-glm-5"
+context_window = 198_000
+max_output_tokens = 32_000
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "kimi-k2-5"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "kimi-k2-thinking"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "minimax-m21"
+context_window = 198_000
+max_output_tokens = 32_768
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "minimax-m25"
+context_window = 198_000
+max_output_tokens = 32_768
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "openai-gpt-52"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
+prefix = "openai-gpt-52-codex"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "openai-gpt-53-codex"
+context_window = 400_000
+max_output_tokens = 128_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "openai-gpt-54"
+context_window = 1_000_000
+max_output_tokens = 131_072
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "openai-gpt-4o-2024-11-20"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "openai-gpt-4o-mini-2024-07-18"
+context_window = 128_000
+max_output_tokens = 16_384
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gemini-3-pro-preview"
+context_window = 198_000
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gemini-3-1-pro-preview"
+context_window = 1_000_000
+max_output_tokens = 32_768
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "gemini-3-flash-preview"
+context_window = 256_000
+max_output_tokens = 65_536
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "grok-41-fast"
+context_window = 1_000_000
+max_output_tokens = 30_000
+supports_vision = true
+supports_tool_use = true
+
+[[models]]
+prefix = "grok-code-fast-1"
+context_window = 256_000
+max_output_tokens = 10_000
+supports_vision = false
+supports_tool_use = true

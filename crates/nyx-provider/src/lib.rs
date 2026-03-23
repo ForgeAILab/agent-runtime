@@ -10,11 +10,17 @@ pub mod catalog;
 mod circuit_breaker;
 pub mod config;
 mod fallback;
+pub mod metadata_resolver;
+#[cfg(feature = "model-cache-sqlite")]
+mod model_cache;
 pub mod model_info;
 mod rate_limit;
 mod retry;
 pub use circuit_breaker::CircuitBreakerProvider;
 pub use fallback::FallbackProvider;
+pub use metadata_resolver::ProviderMetadataResolver;
+#[cfg(feature = "model-cache-sqlite")]
+pub use model_cache::{SqliteModelCache, model_cache_migrations};
 pub use model_info::{ModelInfo, ModelRegistry};
 pub use rate_limit::MinDelayProvider;
 pub use retry::RetryProvider;

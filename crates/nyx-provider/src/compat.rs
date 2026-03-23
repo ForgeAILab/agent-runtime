@@ -134,6 +134,7 @@ mod tests {
                 supports_vision: false,
                 supports_tool_use: true,
                 supports_streaming: true,
+                context_budget_ratio: None,
             }),
         );
         assert_eq!(stripped.messages[0].content.len(), 2);
@@ -179,6 +180,7 @@ mod tests {
                 supports_vision: true,
                 supports_tool_use: true,
                 supports_streaming: true,
+                context_budget_ratio: None,
             }),
         );
         assert_eq!(stripped.messages, req.messages);
