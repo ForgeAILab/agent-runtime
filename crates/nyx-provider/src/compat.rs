@@ -65,8 +65,8 @@ fn strip_image_content(
                     .content
                     .into_iter()
                     .map(|c| match c {
-                        ProviderContent::Image { .. } => ProviderContent::Text {
-                            text: "[image omitted — not supported by this provider]".to_string(),
+                        ProviderContent::Image { url, .. } => ProviderContent::Text {
+                            text: format!("IMAGE:{url}"),
                         },
                         other => other,
                     })
@@ -103,14 +103,14 @@ mod tests {
     use crate::ProviderRole;
 
     #[test]
-    fn strip_image_content_replaces_image_blocks_for_non_vision_models() {
+    fn strip_image_content_replaces_local_image_with_image_marker_for_non_vision_models() {
         let req = CompletionRequest {
             model: "test".to_string(),
             messages: vec![ProviderMessage {
                 role: ProviderRole::User,
                 content: vec![
                     ProviderContent::Image {
-                        url: "data:image/png;base64,abc".to_string(),
+                        url: "file:///tmp/nyx/media/photo.png".to_string(),
                         detail: None,
                     },
                     ProviderContent::Text {
@@ -140,11 +140,47 @@ mod tests {
         assert_eq!(stripped.messages[0].content.len(), 2);
         assert_eq!(
             stripped.messages[0].content[0].as_text().unwrap(),
-            "[image omitted — not supported by this provider]"
+            "IMAGE:file:///tmp/nyx/media/photo.png"
         );
         assert_eq!(
             stripped.messages[0].content[1].as_text().unwrap(),
             "describe this"
+        );
+    }
+
+    #[test]
+    fn strip_image_content_replaces_remote_image_with_image_marker_for_non_vision_models() {
+        let req = CompletionRequest {
+            model: "test".to_string(),
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: vec![ProviderContent::Image {
+                    url: "https://example.com/image.jpg".to_string(),
+                    detail: None,
+                }],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+
+        let stripped = strip_image_content(
+            req,
+            Some(&ModelInfo {
+                model_id: "test".to_string(),
+                context_window: 8_192,
+                max_output_tokens: None,
+                supports_vision: false,
+                supports_tool_use: true,
+                supports_streaming: true,
+                context_budget_ratio: None,
+            }),
+        );
+        assert_eq!(
+            stripped.messages[0].content[0].as_text().unwrap(),
+            "IMAGE:https://example.com/image.jpg"
         );
     }
 
