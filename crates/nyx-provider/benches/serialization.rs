@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use nyx_provider::{
-    JsonDirectiveParser, ProviderContent, ProviderMessage, ProviderRole, ToolDefinition,
-    XmlDirectiveParser,
+    JsonDirectiveParser, ProviderContent, ProviderMessage, ProviderRole, ToolCallParser,
+    ToolDefinition, XmlDirectiveParser,
 };
 
 const OPENAI_IMAGE_DETAIL: Option<&str> = Some("high");
@@ -166,10 +166,11 @@ fn make_request(messages: usize, tool_count: usize) -> nyx_provider::CompletionR
                 vec![ProviderContent::text(format!("tool response {index}"))]
             }
         };
+        let is_tool = role == ProviderRole::Tool;
         body.push(nyx_provider::ProviderMessage {
             role,
             content,
-            tool_call_id: if role == ProviderRole::Tool {
+            tool_call_id: if is_tool {
                 Some(format!("tool-result-{index}"))
             } else {
                 None
@@ -216,7 +217,7 @@ fn transform_messages(messages: &[ProviderMessage]) -> Vec<OpenAiRequestMessage>
                 ProviderRole::Assistant => {
                     let (content, tool_calls) = decode_assistant_blocks(&message.content);
                     OpenAiRequestMessage::Assistant {
-                        content: if content.is_empty() { None } else { Some(content) },
+                        content,
                         tool_calls,
                     }
                 }
