@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use nyx_provider::{
     JsonDirectiveParser, ProviderContent, ProviderMessage, ProviderRole, ToolCallParser,
@@ -41,12 +41,8 @@ enum OpenAiRequestContent {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenAiContentBlock {
-    Text {
-        text: String,
-    },
-    ImageUrl {
-        image_url: OpenAiImageUrl,
-    },
+    Text { text: String },
+    ImageUrl { image_url: OpenAiImageUrl },
 }
 
 #[derive(Serialize)]
@@ -152,7 +148,10 @@ fn make_request(messages: usize, tool_count: usize) -> nyx_provider::CompletionR
         };
         let content = match role {
             ProviderRole::System => {
-                vec![ProviderContent::text(format!("system setup {index}")), ProviderContent::text("context")]
+                vec![
+                    ProviderContent::text(format!("system setup {index}")),
+                    ProviderContent::text("context"),
+                ]
             }
             ProviderRole::User => vec![
                 ProviderContent::text(format!("user prompt {index}")),
@@ -161,7 +160,9 @@ fn make_request(messages: usize, tool_count: usize) -> nyx_provider::CompletionR
                     detail: OPENAI_IMAGE_DETAIL.map(str::to_string),
                 },
             ],
-            ProviderRole::Assistant => vec![ProviderContent::text(format!("assistant text {index}"))],
+            ProviderRole::Assistant => {
+                vec![ProviderContent::text(format!("assistant text {index}"))]
+            }
             ProviderRole::Tool => {
                 vec![ProviderContent::text(format!("tool response {index}"))]
             }
@@ -206,34 +207,32 @@ fn make_request(messages: usize, tool_count: usize) -> nyx_provider::CompletionR
 fn transform_messages(messages: &[ProviderMessage]) -> Vec<OpenAiRequestMessage> {
     messages
         .iter()
-        .map(|message| {
-            match message.role {
-                ProviderRole::System => OpenAiRequestMessage::System {
-                    content: provider_content_to_openai(message.content.clone()),
-                },
-                ProviderRole::User => OpenAiRequestMessage::User {
-                    content: provider_content_to_openai(message.content.clone()),
-                },
-                ProviderRole::Assistant => {
-                    let (content, tool_calls) = decode_assistant_blocks(&message.content);
-                    OpenAiRequestMessage::Assistant {
-                        content,
-                        tool_calls,
-                    }
+        .map(|message| match message.role {
+            ProviderRole::System => OpenAiRequestMessage::System {
+                content: provider_content_to_openai(message.content.clone()),
+            },
+            ProviderRole::User => OpenAiRequestMessage::User {
+                content: provider_content_to_openai(message.content.clone()),
+            },
+            ProviderRole::Assistant => {
+                let (content, tool_calls) = decode_assistant_blocks(&message.content);
+                OpenAiRequestMessage::Assistant {
+                    content,
+                    tool_calls,
                 }
-                ProviderRole::Tool => {
-                    if let Some(tool_call_id) = &message.tool_call_id {
-                        OpenAiRequestMessage::ToolResult {
-                            tool_call_id: tool_call_id.clone(),
-                            content: concat_text(&message.content),
-                        }
-                    } else {
-                        OpenAiRequestMessage::User {
-                            content: OpenAiRequestContent::Text(format!(
-                                "[Tool Result]\n{}",
-                                concat_text(&message.content)
-                            )),
-                        }
+            }
+            ProviderRole::Tool => {
+                if let Some(tool_call_id) = &message.tool_call_id {
+                    OpenAiRequestMessage::ToolResult {
+                        tool_call_id: tool_call_id.clone(),
+                        content: concat_text(&message.content),
+                    }
+                } else {
+                    OpenAiRequestMessage::User {
+                        content: OpenAiRequestContent::Text(format!(
+                            "[Tool Result]\n{}",
+                            concat_text(&message.content)
+                        )),
                     }
                 }
             }
@@ -274,7 +273,9 @@ fn benchmark_tool_definitions() -> Vec<String> {
     ]
 }
 
-fn decode_assistant_blocks(content: &[ProviderContent]) -> (Option<String>, Vec<OpenAiToolCallRequest>) {
+fn decode_assistant_blocks(
+    content: &[ProviderContent],
+) -> (Option<String>, Vec<OpenAiToolCallRequest>) {
     let raw = concat_text(content);
     let Ok(blocks) = serde_json::from_str::<Vec<Value>>(&raw) else {
         return (Some(raw), vec![]);
@@ -295,7 +296,10 @@ fn decode_assistant_blocks(content: &[ProviderContent]) -> (Option<String>, Vec<
                 }
                 "tool_use" => {
                     let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-                    let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let input = serde_json::to_string(block.get("input").unwrap_or(&Value::Null))
                         .unwrap_or_else(|_| "{}".to_string());
                     tool_calls.push(OpenAiToolCallRequest {
@@ -342,10 +346,13 @@ fn provider_content_to_openai(content: Vec<ProviderContent>) -> OpenAiRequestCon
 }
 
 fn concat_text(content: &[ProviderContent]) -> String {
-    content.iter().filter_map(|block| match block {
-        ProviderContent::Text { text } => Some(text.as_str()),
-        ProviderContent::Image { .. } => None,
-    }).collect()
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ProviderContent::Text { text } => Some(text.as_str()),
+            ProviderContent::Image { .. } => None,
+        })
+        .collect()
 }
 
 fn response_payload(message_count: usize) -> String {
@@ -425,19 +432,18 @@ fn benchmark_tool_definition_collection(c: &mut Criterion) {
             let tools = small
                 .tools
                 .iter()
-                .map(|tool| {
-                    OpenAiFunctionTool {
-                        tool_type: "function".to_string(),
-                        function: OpenAiFunctionDefinition {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters: tool.input_schema.clone(),
-                        },
-                    }
+                .map(|tool| OpenAiFunctionTool {
+                    tool_type: "function".to_string(),
+                    function: OpenAiFunctionDefinition {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.input_schema.clone(),
+                    },
                 })
                 .collect::<Vec<_>>();
             for item in tools {
-                total = total.saturating_add(serde_json::to_vec(&item).expect("serialize tool").len());
+                total =
+                    total.saturating_add(serde_json::to_vec(&item).expect("serialize tool").len());
             }
             black_box(total);
         });
@@ -449,19 +455,18 @@ fn benchmark_tool_definition_collection(c: &mut Criterion) {
             let tools = large
                 .tools
                 .iter()
-                .map(|tool| {
-                    OpenAiFunctionTool {
-                        tool_type: "function".to_string(),
-                        function: OpenAiFunctionDefinition {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters: tool.input_schema.clone(),
-                        },
-                    }
+                .map(|tool| OpenAiFunctionTool {
+                    tool_type: "function".to_string(),
+                    function: OpenAiFunctionDefinition {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: tool.input_schema.clone(),
+                    },
                 })
                 .collect::<Vec<_>>();
             for item in tools {
-                total = total.saturating_add(serde_json::to_vec(&item).expect("serialize tool").len());
+                total =
+                    total.saturating_add(serde_json::to_vec(&item).expect("serialize tool").len());
             }
             black_box(total);
         });
@@ -482,20 +487,28 @@ fn benchmark_response_deserialization(c: &mut Criterion) {
 fn benchmark_tool_call_parsing(c: &mut Criterion) {
     let fixtures = benchmark_tool_definitions();
     let mut group = c.benchmark_group("nyx_provider_tool_call_parsing");
-    group.bench_with_input(BenchmarkId::new("json", "tool_call"), &fixtures[0], |b, payload| {
-        let parser = JsonDirectiveParser;
-        b.iter(|| {
-            let calls = parser.parse(black_box(payload));
-            black_box(calls.len());
-        });
-    });
-    group.bench_with_input(BenchmarkId::new("xml", "tool_call"), &fixtures[1], |b, payload| {
-        let parser = XmlDirectiveParser;
-        b.iter(|| {
-            let calls = parser.parse(black_box(payload));
-            black_box(calls.len());
-        });
-    });
+    group.bench_with_input(
+        BenchmarkId::new("json", "tool_call"),
+        &fixtures[0],
+        |b, payload| {
+            let parser = JsonDirectiveParser;
+            b.iter(|| {
+                let calls = parser.parse(black_box(payload));
+                black_box(calls.len());
+            });
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("xml", "tool_call"),
+        &fixtures[1],
+        |b, payload| {
+            let parser = XmlDirectiveParser;
+            b.iter(|| {
+                let calls = parser.parse(black_box(payload));
+                black_box(calls.len());
+            });
+        },
+    );
     group.finish();
 }
 
