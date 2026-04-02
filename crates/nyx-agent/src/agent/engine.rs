@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::{
     AfterToolContext, AgentContext, AgentError, AgentResponse, BeforeToolContext,
-    CharBasedEstimator, HookAction, Message, MessageContent, MessageRole, TokenEstimator,
+    CharBasedEstimator, HookAction, Message, MessageContent, MessageRole,
     render::{render_tool_result_for_provider, render_tool_result_to_content},
 };
 
