@@ -86,7 +86,6 @@ mod tests {
         assert!(names.contains("process"), "missing process tool");
         #[cfg(feature = "http")]
         assert!(names.contains("http"), "missing http tool");
-        assert!(names.contains("skill"), "missing skill tool");
         #[cfg(feature = "sub-agent")]
         assert!(names.contains("sub_agent"), "missing sub_agent tool");
         #[cfg(feature = "permission")]

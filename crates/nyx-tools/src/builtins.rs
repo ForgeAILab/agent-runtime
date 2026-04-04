@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::SubAgentTool;
 #[cfg(feature = "terminal")]
 use crate::TerminalRegistry;
-use crate::{RegistryError, SkillTool, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
+use crate::{RegistryError, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 pub fn register_builtins(
     registry: &mut ToolRegistry,
@@ -44,7 +44,6 @@ pub fn register_builtins(
     #[cfg(feature = "http")]
     registry.register(Arc::new(HttpTool::default()))?;
 
-    registry.register(Arc::new(SkillTool))?;
     #[cfg(feature = "sub-agent")]
     registry.register(Arc::new(SubAgentTool))?;
 
