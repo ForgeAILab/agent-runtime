@@ -38,6 +38,9 @@ impl Tool for SessionTool {
                 "timezone": { "type": "string" },
                 "query": { "type": "string" },
                 "role": { "type": "string", "enum": ["user", "assistant", "tool"] },
+                "since_ms": { "type": "integer", "minimum": 0, "description": "Filter turns at or after this Unix timestamp (milliseconds)" },
+                "until_ms": { "type": "integer", "minimum": 0, "description": "Filter turns at or before this Unix timestamp (milliseconds)" },
+                "include_tool_calls": { "type": "boolean", "default": false, "description": "Include full tool_calls_json in the response" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                 "offset": { "type": "integer", "minimum": 0, "default": 0 },
                 "tool_allow": { "type": "array", "items": { "type": "string" } },
@@ -300,11 +303,14 @@ async fn read_turns(
     let role = parse_role(input)?;
     let limit = parse_limit(input)?;
     let offset = parse_offset(input)?;
+    let since_ms = parse_timestamp_ms(input, "since_ms")?;
+    let until_ms = parse_timestamp_ms(input, "until_ms")?;
+    let include_tool_calls = parse_include_tool_calls(input);
     match service
-        .read_turns(&session_id, limit, offset, role.as_deref())
+        .read_turns(&session_id, limit, offset, role.as_deref(), since_ms, until_ms)
         .await
     {
-        Ok(turns) => Ok(ToolResult::json(json!(format_turns(turns)))),
+        Ok(turns) => Ok(ToolResult::json(json!(format_turns(turns, include_tool_calls)))),
         Err(err) => Ok(ToolResult::error(err.to_string())),
     }
 }
@@ -327,11 +333,14 @@ async fn search_turns(
     let role = parse_role(input)?;
     let limit = parse_limit(input)?;
     let offset = parse_offset(input)?;
+    let since_ms = parse_timestamp_ms(input, "since_ms")?;
+    let until_ms = parse_timestamp_ms(input, "until_ms")?;
+    let include_tool_calls = parse_include_tool_calls(input);
     match service
-        .search_turns(&session_id, query, role.as_deref(), limit, offset)
+        .search_turns(&session_id, query, role.as_deref(), limit, offset, since_ms, until_ms)
         .await
     {
-        Ok(turns) => Ok(ToolResult::json(json!(format_turns(turns)))),
+        Ok(turns) => Ok(ToolResult::json(json!(format_turns(turns, include_tool_calls)))),
         Err(err) => Ok(ToolResult::error(err.to_string())),
     }
 }
@@ -490,18 +499,50 @@ fn parse_offset(input: &Value) -> Result<usize, ToolError> {
     Ok(raw as usize)
 }
 
-fn format_turns(turns: Vec<Turn>) -> Vec<Value> {
+fn parse_timestamp_ms(input: &Value, key: &str) -> Result<Option<u64>, ToolError> {
+    let Some(value) = input.get(key) else {
+        return Ok(None);
+    };
+    let Some(ms) = value.as_u64() else {
+        return Err(ToolError::InvalidInput(format!(
+            "{key} must be a non-negative integer (Unix timestamp in milliseconds)"
+        )));
+    };
+    Ok(Some(ms))
+}
+
+fn parse_include_tool_calls(input: &Value) -> bool {
+    input
+        .get("include_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn format_turns(turns: Vec<Turn>, include_tool_calls: bool) -> Vec<Value> {
     turns
         .into_iter()
         .map(|turn| {
-            json!({
+            let has_tool_calls = turn
+                .tool_calls_json
+                .as_ref()
+                .is_some_and(|json| !json.is_empty());
+            let mut obj = json!({
                 "id": turn.id,
                 "role": turn.role,
                 "content": truncate_content(&turn.content),
                 "timestamp_ms": turn.timestamp_ms,
                 "tool_call_id": turn.tool_call_id,
-                "has_tool_calls": turn.tool_calls_json.as_ref().is_some_and(|json| !json.is_empty())
-            })
+                "has_tool_calls": has_tool_calls
+            });
+            if include_tool_calls {
+                let parsed = turn
+                    .tool_calls_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .unwrap_or(Value::Null);
+                obj["tool_calls"] = parsed;
+            }
+            obj
         })
         .collect()
 }
@@ -648,13 +689,18 @@ mod tests {
             limit: usize,
             offset: usize,
             role: Option<&str>,
+            since_ms: Option<u64>,
+            until_ms: Option<u64>,
         ) -> Result<Vec<Turn>, KernelError> {
+            let since = since_ms.unwrap_or(0);
+            let until = until_ms.unwrap_or(u64::MAX);
             let mut turns = self
                 .turns
                 .lock()
                 .expect("turns lock")
                 .iter()
                 .filter(|turn| turn.channel_id == session_id)
+                .filter(|turn| turn.timestamp_ms >= since && turn.timestamp_ms <= until)
                 .cloned()
                 .collect::<Vec<_>>();
             if let Some(role) = role {
@@ -671,8 +717,12 @@ mod tests {
             role: Option<&str>,
             limit: usize,
             offset: usize,
+            since_ms: Option<u64>,
+            until_ms: Option<u64>,
         ) -> Result<Vec<Turn>, KernelError> {
             let query = query.to_ascii_lowercase();
+            let since = since_ms.unwrap_or(0);
+            let until = until_ms.unwrap_or(u64::MAX);
             let mut turns = self
                 .turns
                 .lock()
@@ -680,6 +730,7 @@ mod tests {
                 .iter()
                 .filter(|turn| turn.channel_id == session_id)
                 .filter(|turn| turn.content.to_ascii_lowercase().contains(&query))
+                .filter(|turn| turn.timestamp_ms >= since && turn.timestamp_ms <= until)
                 .cloned()
                 .collect::<Vec<_>>();
             if let Some(role) = role {
