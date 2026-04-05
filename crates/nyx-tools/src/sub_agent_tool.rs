@@ -30,6 +30,7 @@ impl Tool for SubAgentTool {
                 "tools": { "type": "array", "items": { "type": "string" } },
                 "max_turns": { "type": "integer", "default": 10 },
                 "agent_kind": { "type": "string", "default": "react" },
+                "plan": { "type": "string" },
                 "provider": { "type": "string", "description": "Named provider from config (e.g. 'main', 'backup'). Defaults to the parent agent's provider." }
             }
         })
@@ -101,17 +102,38 @@ async fn invoke_spawn(
         .get("provider")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let plan = input
+        .get("plan")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .filter(|_| matches!(agent_kind.as_str(), "coding" | "research"));
 
     if blocking {
         let result = match kernel_handle {
             Some(handle) => {
                 handle
-                    .spawn_sub_agent(&ctx.invocation, prompt, tools, max_turns, provider)
+                    .spawn_sub_agent(
+                        &ctx.invocation,
+                        prompt,
+                        tools,
+                        agent_kind.clone(),
+                        max_turns,
+                        plan.clone(),
+                        provider,
+                    )
                     .await
             }
             None => {
                 agent_service
-                    .spawn_sub_agent(&ctx.invocation, prompt, tools, max_turns, provider)
+                    .spawn_sub_agent(
+                        &ctx.invocation,
+                        prompt,
+                        tools,
+                        agent_kind.clone(),
+                        max_turns,
+                        plan.clone(),
+                        provider,
+                    )
                     .await
             }
         };
@@ -137,6 +159,7 @@ async fn invoke_spawn(
                     tools,
                     agent_kind,
                     max_turns,
+                    plan,
                     provider,
                     ctx.channel_id.clone(),
                 )
@@ -151,6 +174,7 @@ async fn invoke_spawn(
                     tools,
                     agent_kind,
                     max_turns,
+                    plan,
                     provider,
                     ctx.channel_id.clone(),
                 )
@@ -214,7 +238,16 @@ mod tests {
 
     #[derive(Default)]
     struct MockAgentService {
-        spawn_sub_calls: Mutex<Vec<(String, Option<Vec<String>>, usize, Option<String>)>>,
+        spawn_sub_calls: Mutex<
+            Vec<(
+                String,
+                Option<Vec<String>>,
+                String,
+                usize,
+                Option<String>,
+                Option<String>,
+            )>,
+        >,
         spawn_async_calls: Mutex<
             Vec<(
                 String,
@@ -222,6 +255,7 @@ mod tests {
                 Option<Vec<String>>,
                 String,
                 usize,
+                Option<String>,
                 Option<String>,
             )>,
         >,
@@ -235,13 +269,15 @@ mod tests {
             _ctx: &InvocationContext,
             prompt: String,
             tool_names: Option<Vec<String>>,
+            agent_kind: String,
             max_turns: usize,
+            plan: Option<String>,
             provider: Option<String>,
         ) -> Result<String, KernelError> {
             self.spawn_sub_calls
                 .lock()
                 .expect("spawn_sub_calls lock")
-                .push((prompt, tool_names, max_turns, provider));
+                .push((prompt, tool_names, agent_kind, max_turns, plan, provider));
             Ok("blocking-ok".to_string())
         }
 
@@ -253,13 +289,16 @@ mod tests {
             tool_names: Option<Vec<String>>,
             agent_kind: String,
             max_turns: usize,
+            plan: Option<String>,
             provider: Option<String>,
             _channel_id: Option<String>,
         ) -> Result<(), KernelError> {
             self.spawn_async_calls
                 .lock()
                 .expect("spawn_async_calls lock")
-                .push((id, prompt, tool_names, agent_kind, max_turns, provider));
+                .push((
+                    id, prompt, tool_names, agent_kind, max_turns, plan, provider,
+                ));
             Ok(())
         }
 
@@ -333,6 +372,8 @@ mod tests {
                     "action": "spawn",
                     "prompt": "hello",
                     "blocking": true,
+                    "agent_kind": "coding",
+                    "plan": "## Context\n- approved",
                     "tools": ["read"],
                     "max_turns": 7
                 }),
@@ -350,7 +391,15 @@ mod tests {
                 .lock()
                 .expect("spawn_sub_calls lock")
                 .as_slice(),
-            [("hello".to_string(), Some(vec!["read".to_string()]), 7, None)].as_slice()
+            [(
+                "hello".to_string(),
+                Some(vec!["read".to_string()]),
+                "coding".to_string(),
+                7,
+                Some("## Context\n- approved".to_string()),
+                None
+            )]
+            .as_slice()
         );
     }
 
@@ -366,7 +415,8 @@ mod tests {
                     "id": "researcher-1",
                     "prompt": "research",
                     "blocking": false,
-                    "agent_kind": "background",
+                    "agent_kind": "research",
+                    "plan": "## Proposed Approach\n- do work",
                     "max_turns": 12
                 }),
                 &ToolContext {
@@ -392,11 +442,43 @@ mod tests {
                 "researcher-1".to_string(),
                 "research".to_string(),
                 None,
-                "background".to_string(),
+                "research".to_string(),
                 12,
+                Some("## Proposed Approach\n- do work".to_string()),
                 None,
             )]
             .as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_is_ignored_for_react_agent() {
+        let mock = Arc::new(MockAgentService::default());
+        let cp = cp_with_agent_service(Arc::clone(&mock) as Arc<dyn AgentService>);
+
+        let _ = SubAgentTool
+            .invoke(
+                json!({
+                    "action": "spawn",
+                    "id": "react-1",
+                    "prompt": "do work",
+                    "agent_kind": "react",
+                    "plan": "should-not-pass-through"
+                }),
+                &ToolContext {
+                    control_plane: cp,
+                    ..ToolContext::default()
+                },
+            )
+            .await
+            .expect("invoke spawn");
+
+        assert_eq!(
+            mock.spawn_async_calls
+                .lock()
+                .expect("spawn_async_calls lock")[0]
+                .5,
+            None
         );
     }
 

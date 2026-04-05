@@ -399,6 +399,8 @@ pub struct AsyncAgentSpawnRequest {
     pub tools: Option<Vec<String>>,
     pub max_turns: usize,
     pub agent_kind: String,
+    #[serde(default)]
+    pub plan: Option<String>,
     pub provider: Option<String>,
     /// Channel to route the completion notification to (via heartbeat).
     #[serde(default)]
