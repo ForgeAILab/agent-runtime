@@ -17,6 +17,7 @@ mod skill_tool;
 mod sub_agent_tool;
 mod terminal;
 pub mod testing;
+mod tool_tool;
 #[cfg(any(feature = "web-search-brave", feature = "web-search-tavily"))]
 mod web_search;
 
@@ -40,6 +41,7 @@ pub use skill_tool::*;
 #[cfg(feature = "sub-agent")]
 pub use sub_agent_tool::*;
 pub use terminal::*;
+pub use tool_tool::*;
 #[cfg(any(feature = "web-search-brave", feature = "web-search-tavily"))]
 pub use web_search::*;
 
@@ -53,6 +55,7 @@ pub fn build_tools(sandbox: Arc<dyn Sandbox>) -> Result<Vec<Arc<dyn Tool>>, Regi
     registry.register(Arc::new(RequestPermissionTool::default()))?;
     #[cfg(feature = "session")]
     registry.register(Arc::new(SessionTool))?;
+    registry.register(Arc::new(ToolTool))?;
     Ok(registry.seal())
 }
 

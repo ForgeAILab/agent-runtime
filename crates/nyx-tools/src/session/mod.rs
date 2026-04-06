@@ -307,10 +307,20 @@ async fn read_turns(
     let until_ms = parse_timestamp_ms(input, "until_ms")?;
     let include_tool_calls = parse_include_tool_calls(input);
     match service
-        .read_turns(&session_id, limit, offset, role.as_deref(), since_ms, until_ms)
+        .read_turns(
+            &session_id,
+            limit,
+            offset,
+            role.as_deref(),
+            since_ms,
+            until_ms,
+        )
         .await
     {
-        Ok(turns) => Ok(ToolResult::json(json!(format_turns(turns, include_tool_calls)))),
+        Ok(turns) => Ok(ToolResult::json(json!(format_turns(
+            turns,
+            include_tool_calls
+        )))),
         Err(err) => Ok(ToolResult::error(err.to_string())),
     }
 }
@@ -337,10 +347,21 @@ async fn search_turns(
     let until_ms = parse_timestamp_ms(input, "until_ms")?;
     let include_tool_calls = parse_include_tool_calls(input);
     match service
-        .search_turns(&session_id, query, role.as_deref(), limit, offset, since_ms, until_ms)
+        .search_turns(
+            &session_id,
+            query,
+            role.as_deref(),
+            limit,
+            offset,
+            since_ms,
+            until_ms,
+        )
         .await
     {
-        Ok(turns) => Ok(ToolResult::json(json!(format_turns(turns, include_tool_calls)))),
+        Ok(turns) => Ok(ToolResult::json(json!(format_turns(
+            turns,
+            include_tool_calls
+        )))),
         Err(err) => Ok(ToolResult::error(err.to_string())),
     }
 }
