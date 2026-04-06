@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use nyx_security::Secret;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -18,7 +19,8 @@ pub struct WebSearchConfig {
     pub provider: String,
     /// API key (supports secret syntax: `env:VAR`, `enc:...`, plaintext).
     #[serde(default)]
-    pub api_key: String,
+    #[serde(skip_serializing)]
+    pub api_key: Secret<String>,
 }
 
 fn default_provider() -> String {
@@ -27,17 +29,16 @@ fn default_provider() -> String {
 
 /// Build the `WebSearchTool` from config. Returns `None` if no api_key is set.
 pub fn build_web_search_tool(config: &WebSearchConfig) -> Option<Arc<dyn Tool>> {
-    if config.api_key.trim().is_empty() {
+    if config.api_key.reveal().trim().is_empty() {
         return None;
     }
-    let api_key = config.api_key.clone();
     let provider: Arc<dyn WebSearchProvider> = match config.provider.as_str() {
         #[cfg(feature = "web-search-tavily")]
-        "tavily" => Arc::new(TavilySearchProvider::new(api_key)),
+        "tavily" => Arc::new(TavilySearchProvider::new(config.api_key.reveal().clone())),
         #[cfg(feature = "web-search-brave")]
-        "brave" => Arc::new(BraveSearchProvider::new(api_key)),
+        "brave" => Arc::new(BraveSearchProvider::new(config.api_key.reveal().clone())),
         #[cfg(feature = "web-search-brave")]
-        _ => Arc::new(BraveSearchProvider::new(api_key)),
+        _ => Arc::new(BraveSearchProvider::new(config.api_key.reveal().clone())),
         #[cfg(not(feature = "web-search-brave"))]
         _ => {
             tracing::warn!(
@@ -328,5 +329,21 @@ mod tests {
         let ctx = ToolContext::default();
         let err = tool.invoke(json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn web_search_config_resolves_env_api_key() {
+        unsafe {
+            std::env::set_var("TEST_WEB_KEY", "sk-env-web-key");
+        }
+        let config: WebSearchConfig = serde_json::from_value(json!({
+            "provider": "brave",
+            "api_key": "env:TEST_WEB_KEY"
+        }))
+        .expect("config should deserialize");
+        assert_eq!(config.api_key.reveal(), "sk-env-web-key");
+        unsafe {
+            std::env::remove_var("TEST_WEB_KEY");
+        }
     }
 }
