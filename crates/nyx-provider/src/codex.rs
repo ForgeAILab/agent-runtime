@@ -420,6 +420,14 @@ fn parse_sse_response(
     if let Some(parsed) = last_response {
         let content = extract_text(&parsed);
         let tool_calls = extract_tool_calls(&parsed);
+        tracing::debug!(
+            model = %parsed.model.as_deref().unwrap_or(fallback_model),
+            content_len = content.len(),
+            tool_calls = tool_calls.len(),
+            has_output_text = parsed.output_text.is_some(),
+            output_items = parsed.output.len(),
+            "codex completion parsed"
+        );
         Ok(CompletionResponse {
             content,
             model: parsed.model.unwrap_or_else(|| fallback_model.to_string()),
