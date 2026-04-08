@@ -365,8 +365,12 @@ struct ResponsesOutputItem {
 
 #[derive(Debug, Deserialize)]
 struct ResponsesContent {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,8 +401,14 @@ fn parse_sse_response(
     // SSE format: "event: <type>\ndata: <json>\n\n"
     // We scan for the response.completed / response.done event.
     let mut last_response: Option<ResponsesResponse> = None;
+    let mut streamed_text = String::new();
+    let mut streamed_tool_calls = Vec::new();
 
     for chunk in body.split("\n\n") {
+        let event_type = chunk
+            .lines()
+            .find(|l| l.starts_with("event:"))
+            .map(|l| l.strip_prefix("event:").unwrap_or(l).trim());
         let data_line = chunk
             .lines()
             .find(|l| l.starts_with("data:"))
@@ -407,6 +417,52 @@ fn parse_sse_response(
         let Some(data) = data_line else { continue };
         if data == "[DONE]" || data.is_empty() {
             continue;
+        }
+
+        match event_type.unwrap_or("") {
+            "response.output_text.done" => {
+                if let Ok(done) = serde_json::from_str::<SseOutputTextDone>(data)
+                    && let Some(text) = done.text
+                    && !text.is_empty()
+                {
+                    streamed_text.push_str(&text);
+                }
+            }
+            "response.output_item.done" => {
+                if let Ok(wrapper) = serde_json::from_str::<SseOutputItemWrapper>(data)
+                    && let Some(item) = wrapper.item
+                {
+                    match item.kind.as_deref() {
+                        Some("message") => {
+                            for part in item.content {
+                                let text = match part.kind.as_deref() {
+                                    Some("refusal") => part.refusal,
+                                    _ => part.text.or(part.refusal),
+                                };
+                                if let Some(text) = text && !text.is_empty() {
+                                    streamed_text.push_str(&text);
+                                }
+                            }
+                        }
+                        Some("function_call") => {
+                            if let Some(name) = item.name {
+                                let input = item
+                                    .arguments
+                                    .as_deref()
+                                    .and_then(|args| serde_json::from_str(args).ok())
+                                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                                streamed_tool_calls.push(ToolCall {
+                                    id: item.call_id,
+                                    name,
+                                    input,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
 
         // Try to parse as an SSE wrapper with a nested `response` field
@@ -418,8 +474,22 @@ fn parse_sse_response(
     }
 
     if let Some(parsed) = last_response {
-        let content = extract_text(&parsed);
-        let tool_calls = extract_tool_calls(&parsed);
+        let content = {
+            let content = extract_text(&parsed);
+            if content.is_empty() && !streamed_text.is_empty() {
+                streamed_text
+            } else {
+                content
+            }
+        };
+        let tool_calls = {
+            let tool_calls = extract_tool_calls(&parsed);
+            if tool_calls.is_empty() && !streamed_tool_calls.is_empty() {
+                streamed_tool_calls
+            } else {
+                tool_calls
+            }
+        };
         tracing::debug!(
             model = %parsed.model.as_deref().unwrap_or(fallback_model),
             content_len = content.len(),
@@ -434,6 +504,13 @@ fn parse_sse_response(
             tool_calls,
             usage: parsed.usage.map(UsageMetadata::from),
         })
+    } else if !streamed_text.is_empty() || !streamed_tool_calls.is_empty() {
+        Ok(CompletionResponse {
+            content: streamed_text,
+            model: fallback_model.to_string(),
+            tool_calls: streamed_tool_calls,
+            usage: None,
+        })
     } else {
         Err(ProviderError::InvalidResponse(
             "no response.completed event in SSE stream",
@@ -447,6 +524,18 @@ struct SseEventWrapper {
     response: Option<ResponsesResponse>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SseOutputItemWrapper {
+    #[serde(default)]
+    item: Option<ResponsesOutputItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseOutputTextDone {
+    #[serde(default)]
+    text: Option<String>,
+}
+
 fn extract_text(parsed: &ResponsesResponse) -> String {
     if let Some(text) = &parsed.output_text {
         return text.clone();
@@ -457,7 +546,7 @@ fn extract_text(parsed: &ResponsesResponse) -> String {
         .iter()
         .filter(|item| item.kind.as_deref() != Some("function_call"))
         .flat_map(|item| item.content.iter())
-        .filter_map(|part| part.text.as_deref())
+        .filter_map(|part| part.text.as_deref().or(part.refusal.as_deref()))
         .collect::<String>()
 }
 
@@ -831,6 +920,40 @@ mod tests {
             .expect("complete");
 
         assert_eq!(resp.content, "fallback");
+    }
+
+    #[test]
+    fn parse_sse_response_falls_back_to_output_item_done_text() {
+        let sse_body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello from item.done\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"model\":\"codex\",\"output_text\":\"\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+            "event: done\n",
+            "data: [DONE]\n\n"
+        );
+
+        let parsed = parse_sse_response(sse_body, "fallback-model").expect("parsed");
+        assert_eq!(parsed.content, "hello from item.done");
+        assert_eq!(parsed.model, "codex");
+        assert_eq!(parsed.usage.expect("usage").output_tokens, 2);
+    }
+
+    #[test]
+    fn parse_sse_response_falls_back_to_output_item_done_tool_calls() {
+        let sse_body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"call_123\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"model\":\"codex\",\"output_text\":\"\",\"output\":[]}}\n\n",
+            "event: done\n",
+            "data: [DONE]\n\n"
+        );
+
+        let parsed = parse_sse_response(sse_body, "fallback-model").expect("parsed");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "lookup");
+        assert_eq!(parsed.tool_calls[0].input["q"], "rust");
     }
 
     #[test]
