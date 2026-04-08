@@ -439,7 +439,9 @@ fn parse_sse_response(
                                     Some("refusal") => part.refusal,
                                     _ => part.text.or(part.refusal),
                                 };
-                                if let Some(text) = text && !text.is_empty() {
+                                if let Some(text) = text
+                                    && !text.is_empty()
+                                {
                                     streamed_text.push_str(&text);
                                 }
                             }
