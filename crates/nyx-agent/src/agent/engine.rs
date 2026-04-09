@@ -522,6 +522,7 @@ fn is_context_overflow(err: &AgentError) -> bool {
         "input tokens exceeds",
         "too many tokens",
         "prompt is too long",
+        "prompt exceeds max length",
     ]
     .iter()
     .any(|needle| text.contains(needle))
