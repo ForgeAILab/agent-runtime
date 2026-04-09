@@ -546,9 +546,16 @@ supports_vision = false
 supports_tool_use = true
 
 [[models]]
+prefix = "glm-5-turbo"
+context_window = 202_752
+max_output_tokens = 131_072
+supports_vision = false
+supports_tool_use = true
+
+[[models]]
 prefix = "glm-5"
-context_window = 198_000
-max_output_tokens = 32_000
+context_window = 202_752
+max_output_tokens = 131_072
 supports_vision = false
 supports_tool_use = true
 
