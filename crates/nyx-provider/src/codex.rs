@@ -401,7 +401,8 @@ fn parse_sse_response(
     // SSE format: "event: <type>\ndata: <json>\n\n"
     // We scan for the response.completed / response.done event.
     let mut last_response: Option<ResponsesResponse> = None;
-    let mut streamed_text = String::new();
+    let mut output_text_done_text = String::new();
+    let mut output_item_done_text = String::new();
     let mut streamed_tool_calls = Vec::new();
 
     for chunk in body.split("\n\n") {
@@ -425,7 +426,7 @@ fn parse_sse_response(
                     && let Some(text) = done.text
                     && !text.is_empty()
                 {
-                    streamed_text.push_str(&text);
+                    output_text_done_text.push_str(&text);
                 }
             }
             "response.output_item.done" => {
@@ -442,7 +443,7 @@ fn parse_sse_response(
                                 if let Some(text) = text
                                     && !text.is_empty()
                                 {
-                                    streamed_text.push_str(&text);
+                                    output_item_done_text.push_str(&text);
                                 }
                             }
                         }
@@ -474,6 +475,12 @@ fn parse_sse_response(
             }
         }
     }
+
+    let streamed_text = if !output_item_done_text.is_empty() {
+        output_item_done_text
+    } else {
+        output_text_done_text
+    };
 
     if let Some(parsed) = last_response {
         let content = {
@@ -956,6 +963,23 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "lookup");
         assert_eq!(parsed.tool_calls[0].input["q"], "rust");
+    }
+
+    #[test]
+    fn parse_sse_response_does_not_duplicate_when_both_done_events_exist() {
+        let sse_body = concat!(
+            "event: response.output_text.done\n",
+            "data: {\"text\":\"same text\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"same text\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"model\":\"codex\",\"output_text\":\"\",\"output\":[]}}\n\n",
+            "event: done\n",
+            "data: [DONE]\n\n"
+        );
+
+        let parsed = parse_sse_response(sse_body, "fallback-model").expect("parsed");
+        assert_eq!(parsed.content, "same text");
     }
 
     #[test]
