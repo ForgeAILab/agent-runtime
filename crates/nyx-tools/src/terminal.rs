@@ -29,6 +29,8 @@ pub struct TerminalInfo {
     pub id: String,
     pub interactive: bool,
     pub status: TerminalStatus,
+    pub runtime: Duration,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +180,7 @@ pub struct TerminalSession {
     drain_tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     interactive: bool,
     pub started_at: Instant,
+    command: String,
 }
 
 #[derive(Debug, Default)]
@@ -292,6 +295,7 @@ impl TerminalRegistry {
                 drain_tasks: tokio::sync::Mutex::new(drain_tasks),
                 interactive: true,
                 started_at: Instant::now(),
+                command: command.to_string(),
             });
 
             self.sessions.insert(id.to_string(), session);
@@ -341,6 +345,7 @@ impl TerminalRegistry {
             drain_tasks: tokio::sync::Mutex::new(drain_tasks),
             interactive,
             started_at: Instant::now(),
+            command: command.to_string(),
         });
 
         self.sessions.insert(id.to_string(), session);
@@ -578,6 +583,8 @@ impl TerminalRegistry {
                     id,
                     interactive: session.interactive,
                     status,
+                    runtime: session.started_at.elapsed(),
+                    command: session.command.clone(),
                 });
             }
         }

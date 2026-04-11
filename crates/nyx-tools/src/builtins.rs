@@ -651,6 +651,8 @@ impl ProcessTool {
                     "id": session.id,
                     "interactive": session.interactive,
                     "status": terminal_status_json(session.status),
+                    "runtime_ms": session.runtime.as_millis(),
+                    "command": session.command,
                 })
             })
             .collect::<Vec<_>>();

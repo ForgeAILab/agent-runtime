@@ -308,6 +308,7 @@ mod tests {
                 status: AsyncAgentStatus::Running,
                 created_at: Utc::now(),
                 completed_at: None,
+                prompt: "background research".to_string(),
             }]
         }
 

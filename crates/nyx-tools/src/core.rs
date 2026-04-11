@@ -380,6 +380,7 @@ pub struct AsyncAgentInfo {
     pub status: AsyncAgentStatus,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
