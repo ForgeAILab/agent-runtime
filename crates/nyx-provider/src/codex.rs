@@ -228,7 +228,6 @@ fn decode_assistant_content(content: &str, msg_index: u32) -> (String, Vec<serde
 }
 
 fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
-    let mut instructions: Option<String> = None;
     let mut input = Vec::new();
 
     let mut msg_index: u32 = 0;
@@ -236,7 +235,10 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         if message.role == ProviderRole::System {
             let text = message_text(&message.content);
             if !text.is_empty() {
-                instructions = Some(text);
+                input.push(json!({
+                    "role": "developer",
+                    "content": text,
+                }));
             }
             continue;
         }
@@ -314,23 +316,25 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         payload["tools"] = json!(tools);
     }
 
-    if let Some(instructions) = instructions {
-        payload["instructions"] = json!(instructions);
-    }
     if let Some(max_tokens) = req.max_tokens {
         payload["max_output_tokens"] = json!(max_tokens);
     }
     if let Some(temperature) = req.temperature {
         payload["temperature"] = json!(temperature);
     }
-    if let Some(budget) = req.thinking_tokens {
-        let effort = match budget {
-            0 => "low",
-            1..=1024 => "low",
-            1025..=8192 => "medium",
-            _ => "high",
+    {
+        let effort = if let Some(budget) = req.thinking_tokens {
+            match budget {
+                0 => "low",
+                1..=1024 => "low",
+                1025..=8192 => "medium",
+                _ => "high",
+            }
+        } else {
+            "high"
         };
-        payload["reasoning"] = json!({"effort": effort});
+        payload["include"] = json!(["reasoning.encrypted_content"]);
+        payload["reasoning"] = json!({"effort": effort, "summary": "auto"});
     }
 
     payload
@@ -779,6 +783,7 @@ pub fn resolve_token_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1003,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn system_message_becomes_instructions() {
+    fn system_message_becomes_developer_input() {
         let req = CompletionRequest {
             model: "codex".to_string(),
             messages: vec![
@@ -1016,10 +1021,44 @@ mod tests {
             thinking_tokens: None,
         };
         let payload = build_payload(req, false);
-        assert_eq!(payload["instructions"], "You are helpful");
-        // input should only contain the user message, not system
         let input = payload["input"].as_array().expect("input array");
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"], "You are helpful");
+        assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
+    fn reasoning_payload_matches_openai_responses_shape() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![crate::ProviderMessage::user("hello")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: Some(4096),
+        };
+        let payload = build_payload(req, false);
+
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+        assert_eq!(payload["reasoning"]["summary"], "auto");
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn reasoning_defaults_to_high_when_not_explicitly_set() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![crate::ProviderMessage::user("hello")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+        let payload = build_payload(req, false);
+
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert_eq!(payload["reasoning"]["summary"], "auto");
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
     }
 }
