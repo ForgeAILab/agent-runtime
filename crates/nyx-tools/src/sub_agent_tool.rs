@@ -35,7 +35,7 @@ impl Tool for SubAgentTool {
                     "enum": ["react", "background", "research", "coding", "claude-code", "codex", "gemini", "opencode"],
                     "description": "Sub-agent executor kind. CLI kinds run external agent CLIs."
                 },
-                "plan": { "type": "string" },
+                "plan": { "type": "string", "description": "Pre-approved plan for coding/research agents. When provided, the agent skips its exploration phase and executes the plan directly." },
                 "cwd": { "type": "string", "description": "Working directory for CLI agent kinds." },
                 "permission_mode": { "type": "string", "description": "Permission mode passed through to CLI agent executors." },
                 "provider": { "type": "string", "description": "Named provider from config (e.g. 'main', 'backup'). Defaults to the parent agent's provider." }
