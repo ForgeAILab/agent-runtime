@@ -983,13 +983,15 @@ fn apply_unified_patch(content: &str, patch: &str) -> Result<(String, usize), To
     }
 
     let has_trailing_newline = content.ends_with('\n');
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let source_lines = if content.is_empty() {
         Vec::new()
     } else {
-        content
-            .split('\n')
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
+        content.lines().map(ToString::to_string).collect::<Vec<_>>()
     };
 
     let mut src_index = 0_usize;
@@ -1057,9 +1059,9 @@ fn apply_unified_patch(content: &str, patch: &str) -> Result<(String, usize), To
         src_index += 1;
     }
 
-    let mut output = out_lines.join("\n");
+    let mut output = out_lines.join(newline);
     if has_trailing_newline && !output.ends_with('\n') {
-        output.push('\n');
+        output.push_str(newline);
     }
     Ok((output, changed))
 }
@@ -1488,6 +1490,31 @@ mod tests {
             .await
             .expect_err("invalid patch should fail");
         assert!(matches!(err, ToolError::InvalidPatch(_)));
+    }
+
+    #[cfg(feature = "file")]
+    #[test]
+    fn patch_matches_chinese_context_in_crlf_files() {
+        let content = "# 产品说明\r\n\r\n每个任务由一个或多个有序步骤组成：\r\n旧步骤\r\n";
+        let patch = "\
+--- a/prd-forge.md
++++ b/prd-forge.md
+@@ -1,4 +1,4 @@
+ # 产品说明
+ 
+ 每个任务由一个或多个有序步骤组成：
+-旧步骤
++新步骤
+";
+
+        let (patched, changed) =
+            super::apply_unified_patch(content, patch).expect("patch should apply");
+
+        assert_eq!(changed, 2);
+        assert_eq!(
+            patched,
+            "# 产品说明\r\n\r\n每个任务由一个或多个有序步骤组成：\r\n新步骤\r\n"
+        );
     }
 
     #[cfg(feature = "shell")]
