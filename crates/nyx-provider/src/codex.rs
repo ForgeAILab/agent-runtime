@@ -229,16 +229,14 @@ fn decode_assistant_content(content: &str, msg_index: u32) -> (String, Vec<serde
 
 fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
     let mut input = Vec::new();
+    let mut instructions = Vec::new();
 
     let mut msg_index: u32 = 0;
     for message in req.messages {
         if message.role == ProviderRole::System {
             let text = message_text(&message.content);
             if !text.is_empty() {
-                input.push(json!({
-                    "role": "developer",
-                    "content": text,
-                }));
+                instructions.push(text);
             }
             continue;
         }
@@ -292,8 +290,15 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         msg_index += 1;
     }
 
+    let instructions = if instructions.is_empty() {
+        "You are a helpful assistant.".to_string()
+    } else {
+        instructions.join("\n\n")
+    };
+
     let mut payload = json!({
         "model": req.model,
+        "instructions": instructions,
         "input": input,
         "stream": true,
         "store": false,
@@ -1008,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn system_message_becomes_developer_input() {
+    fn system_message_becomes_instructions() {
         let req = CompletionRequest {
             model: "codex".to_string(),
             messages: vec![
@@ -1022,10 +1027,24 @@ mod tests {
         };
         let payload = build_payload(req, false);
         let input = payload["input"].as_array().expect("input array");
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["role"], "developer");
-        assert_eq!(input[0]["content"], "You are helpful");
-        assert_eq!(input[1]["role"], "user");
+        assert_eq!(payload["instructions"], "You are helpful");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn payload_includes_default_instructions_when_system_missing() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![crate::ProviderMessage::user("hello")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+        let payload = build_payload(req, false);
+
+        assert_eq!(payload["instructions"], "You are a helpful assistant.");
     }
 
     #[test]
