@@ -15,7 +15,7 @@ impl Tool for SubAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn, list, inspect, and stop sub-agents. Non-blocking spawns deliver results via heartbeat — do not poll."
+        "Spawn, list, inspect, and stop sub-agents. Supports in-process kinds and CLI executors (claude-code/codex/gemini/opencode). Non-blocking spawns deliver results via heartbeat — do not poll."
     }
 
     fn schema(&self) -> Value {
@@ -29,8 +29,15 @@ impl Tool for SubAgentTool {
                 "blocking": { "type": "boolean", "default": false },
                 "tools": { "type": "array", "items": { "type": "string" } },
                 "max_turns": { "type": "integer", "default": 10 },
-                "agent_kind": { "type": "string", "default": "react" },
+                "agent_kind": {
+                    "type": "string",
+                    "default": "react",
+                    "enum": ["react", "background", "research", "coding", "claude-code", "codex", "gemini", "opencode"],
+                    "description": "Sub-agent executor kind. CLI kinds run external agent CLIs."
+                },
                 "plan": { "type": "string" },
+                "cwd": { "type": "string", "description": "Working directory for CLI agent kinds." },
+                "permission_mode": { "type": "string", "description": "Permission mode passed through to CLI agent executors." },
                 "provider": { "type": "string", "description": "Named provider from config (e.g. 'main', 'backup'). Defaults to the parent agent's provider." }
             }
         })
@@ -102,11 +109,23 @@ async fn invoke_spawn(
         .get("provider")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let cwd = input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    let permission_mode = input
+        .get("permission_mode")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let is_cli_kind = matches!(
+        agent_kind.as_str(),
+        "claude-code" | "codex" | "gemini" | "opencode"
+    );
     let plan = input
         .get("plan")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .filter(|_| matches!(agent_kind.as_str(), "coding" | "research"));
+        .filter(|_| !is_cli_kind && matches!(agent_kind.as_str(), "coding" | "research"));
 
     if blocking {
         let result = match kernel_handle {
@@ -120,6 +139,8 @@ async fn invoke_spawn(
                         max_turns,
                         plan.clone(),
                         provider,
+                        cwd.clone(),
+                        permission_mode.clone(),
                     )
                     .await
             }
@@ -133,6 +154,8 @@ async fn invoke_spawn(
                         max_turns,
                         plan.clone(),
                         provider,
+                        cwd.clone(),
+                        permission_mode.clone(),
                     )
                     .await
             }
@@ -161,6 +184,8 @@ async fn invoke_spawn(
                     max_turns,
                     plan,
                     provider,
+                    cwd.clone(),
+                    permission_mode.clone(),
                     ctx.channel_id.clone(),
                 )
                 .await
@@ -176,6 +201,8 @@ async fn invoke_spawn(
                     max_turns,
                     plan,
                     provider,
+                    cwd,
+                    permission_mode,
                     ctx.channel_id.clone(),
                 )
                 .await
@@ -273,6 +300,8 @@ mod tests {
             max_turns: usize,
             plan: Option<String>,
             provider: Option<String>,
+            _cwd: Option<std::path::PathBuf>,
+            _permission_mode: Option<String>,
         ) -> Result<String, KernelError> {
             self.spawn_sub_calls
                 .lock()
@@ -291,6 +320,8 @@ mod tests {
             max_turns: usize,
             plan: Option<String>,
             provider: Option<String>,
+            _cwd: Option<std::path::PathBuf>,
+            _permission_mode: Option<String>,
             _channel_id: Option<String>,
         ) -> Result<(), KernelError> {
             self.spawn_async_calls

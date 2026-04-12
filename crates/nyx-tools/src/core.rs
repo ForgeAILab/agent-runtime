@@ -403,6 +403,10 @@ pub struct AsyncAgentSpawnRequest {
     #[serde(default)]
     pub plan: Option<String>,
     pub provider: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     /// Channel to route the completion notification to (via heartbeat).
     #[serde(default)]
     pub channel_id: Option<String>,
