@@ -14,6 +14,10 @@ use crate::{
     render::{render_tool_result_for_provider, render_tool_result_to_content},
 };
 
+const TOOL_RESULT_PROVIDER_MAX_CHARS: usize = 8_000;
+const TOOL_RESULT_OBSERVER_MAX_CHARS: usize = 4_000;
+const RECENT_TURNS_TO_PRESERVE: usize = 24;
+
 #[derive(Debug, Clone)]
 pub struct ToolLoopEngine {
     model: String,
@@ -150,8 +154,12 @@ impl ToolLoopEngine {
                     }
                 }
             }
+            if let Some(token_budget) = ctx.token_budget {
+                apply_budget_trimming(&mut history, token_budget);
+            }
 
             let is_final_turn = turn + 1 == self.max_steps;
+            log_prompt_breakdown(turn, &history);
             let mut request_messages = to_provider_messages(&history, config.convert_file_urls);
             if is_final_turn {
                 request_messages.push(final_turn_system_message(turn, self.max_steps));
@@ -326,13 +334,22 @@ impl ToolLoopEngine {
                 let (tool_result, success) =
                     match tool.invoke(tool_call.input.clone(), &ctx.tool_ctx).await {
                         Ok(tool_result) => (tool_result, true),
-                        Err(err) => (nyx_tools::ToolResult::error(err.to_string()), false),
+                        Err(err) => (
+                            nyx_tools::ToolResult::error(short_tool_error(&err.to_string())),
+                            false,
+                        ),
                     };
 
                 let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                let tool_result_text = render_tool_result_for_provider(&tool_result.value)?;
+                let tool_result_text = truncate_head_tail(
+                    &render_tool_result_for_provider(&tool_result.value)?,
+                    TOOL_RESULT_PROVIDER_MAX_CHARS,
+                );
                 let tool_content_blocks = render_tool_result_to_content(&tool_result)?;
-                let observer_result_text = render_tool_result_for_observer(&tool_result.value);
+                let observer_result_text = truncate_head_tail(
+                    &render_tool_result_for_observer(&tool_result.value),
+                    TOOL_RESULT_OBSERVER_MAX_CHARS,
+                );
 
                 if !ctx.hooks.is_empty() {
                     let hook_ctx = AfterToolContext {
@@ -369,6 +386,94 @@ impl ToolLoopEngine {
 
         Err(AgentError::MaxStepsExceeded(self.max_steps))
     }
+}
+
+fn log_prompt_breakdown(turn: usize, history: &[Message]) {
+    let estimator = CharBasedEstimator;
+    let mut system = 0usize;
+    let mut user = 0usize;
+    let mut assistant = 0usize;
+    let mut tool = 0usize;
+    for message in history {
+        let tokens = estimator.count_messages(std::slice::from_ref(message));
+        match message.role {
+            MessageRole::System => system += tokens,
+            MessageRole::User => user += tokens,
+            MessageRole::Assistant => assistant += tokens,
+            MessageRole::Tool => tool += tokens,
+        }
+    }
+    tracing::debug!(
+        turn,
+        history_len = history.len(),
+        system_tokens = system,
+        user_tokens = user,
+        assistant_tokens = assistant,
+        tool_tokens = tool,
+        total_tokens = system + user + assistant + tool,
+        "dispatch prompt composition"
+    );
+}
+
+fn apply_budget_trimming(history: &mut Vec<Message>, token_budget: usize) {
+    let estimator = CharBasedEstimator;
+    if estimator.count_messages(history) <= token_budget || history.len() <= 2 {
+        return;
+    }
+    let mut preserved = Vec::new();
+    if let Some(first) = history.first()
+        && matches!(first.role, MessageRole::System)
+    {
+        preserved.push(first.clone());
+    }
+    let body = if preserved.is_empty() {
+        history.clone()
+    } else {
+        history[1..].to_vec()
+    };
+    let mut kept_recent = body
+        .into_iter()
+        .rev()
+        .take(RECENT_TURNS_TO_PRESERVE)
+        .collect::<Vec<_>>();
+    kept_recent.reverse();
+    preserved.extend(kept_recent);
+    while estimator.count_messages(&preserved) > token_budget && preserved.len() > 2 {
+        if let Some(idx) = preserved
+            .iter()
+            .position(|m| matches!(m.role, MessageRole::Tool))
+        {
+            preserved.remove(idx);
+            continue;
+        }
+        preserved.remove(1);
+    }
+    *history = preserved;
+}
+
+fn truncate_head_tail(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let keep = max_chars / 2;
+    let head = input.chars().take(keep).collect::<String>();
+    let tail = input
+        .chars()
+        .rev()
+        .take(max_chars.saturating_sub(keep))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{head}\n...[truncated {} chars]...\n{tail}",
+        input.chars().count().saturating_sub(max_chars)
+    )
+}
+
+fn short_tool_error(message: &str) -> String {
+    let first_line = message.lines().next().unwrap_or(message).trim();
+    truncate_head_tail(first_line, 400)
 }
 
 fn definitions_from_tools(tools: &[std::sync::Arc<dyn nyx_tools::Tool>]) -> Vec<ToolDefinition> {
