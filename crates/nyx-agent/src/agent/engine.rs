@@ -17,6 +17,11 @@ use crate::{
 const TOOL_RESULT_PROVIDER_MAX_CHARS: usize = 8_000;
 const TOOL_RESULT_OBSERVER_MAX_CHARS: usize = 4_000;
 const RECENT_TURNS_TO_PRESERVE: usize = crate::RECENT_CONTEXT_TURNS;
+const PROVIDER_MESSAGE_OVERHEAD_TOKENS: usize = 4;
+const PROVIDER_TOOL_OVERHEAD_TOKENS: usize = 16;
+const TRIMMED_TOOL_RESULT_HEAD_TOKENS: usize = 200;
+const TRIMMED_MEMORY_HEAD_TOKENS: usize = 160;
+const TRIMMED_HISTORY_HEAD_TOKENS: usize = 120;
 
 #[derive(Debug, Clone)]
 pub struct ToolLoopEngine {
@@ -50,7 +55,7 @@ impl ToolLoopEngine {
         include_tools: bool,
         config: &ToolLoopConfig,
     ) -> Result<CompletionResponse, AgentError> {
-        let tools = if include_tools {
+        let mut tools = if include_tools {
             if config.use_tool_catalog {
                 if let Ok(catalog) = ctx
                     .tool_ctx
@@ -81,10 +86,16 @@ impl ToolLoopEngine {
             Vec::<ToolDefinition>::new()
         };
 
+        let request_messages = if let Some(token_budget) = ctx.token_budget {
+            self.preflight_context_budget(ctx, messages, &mut tools, token_budget)
+        } else {
+            messages
+        };
+
         ctx.provider
             .complete(CompletionRequest {
                 model: self.model.clone(),
-                messages,
+                messages: request_messages,
                 tools,
                 max_tokens: None,
                 temperature: None,
@@ -386,6 +397,318 @@ impl ToolLoopEngine {
 
         Err(AgentError::MaxStepsExceeded(self.max_steps))
     }
+
+    fn preflight_context_budget(
+        &self,
+        ctx: &AgentContext,
+        mut messages: Vec<ProviderMessage>,
+        tools: &mut Vec<ToolDefinition>,
+        token_budget: usize,
+    ) -> Vec<ProviderMessage> {
+        if token_budget == 0 {
+            return messages;
+        }
+
+        let original_tokens = estimate_provider_request_tokens(&messages, tools);
+        if original_tokens <= token_budget {
+            return messages;
+        }
+
+        let mut records = Vec::new();
+        trim_tool_result_messages(&mut messages, token_budget, &mut records);
+        trim_memory_context_messages(&mut messages, token_budget, tools, &mut records);
+        trim_system_prompt_sections(&mut messages, token_budget, tools, &mut records);
+        trim_tool_definitions(tools, token_budget, &messages, &mut records);
+        trim_old_history_messages(&mut messages, token_budget, tools, &mut records);
+        trim_largest_text_blocks(&mut messages, token_budget, tools, &mut records);
+
+        let final_tokens = estimate_provider_request_tokens(&messages, tools);
+        tracing::warn!(
+            request_id = %ctx.tool_ctx.invocation.request_id,
+            session_id = ?ctx.tool_ctx.invocation.session_id,
+            channel_id = %ctx.channel_id,
+            model = %self.model,
+            budget_tokens = token_budget,
+            original_tokens,
+            final_tokens,
+            trimmed = %records.join("; "),
+            "preflight context budget applied"
+        );
+
+        messages
+    }
+}
+
+fn estimate_provider_request_tokens(
+    messages: &[ProviderMessage],
+    tools: &[ToolDefinition],
+) -> usize {
+    let estimator = CharBasedEstimator;
+    messages
+        .iter()
+        .map(|message| estimate_provider_message_tokens(message, &estimator))
+        .sum::<usize>()
+        + tools
+            .iter()
+            .map(|tool| {
+                PROVIDER_TOOL_OVERHEAD_TOKENS
+                    + estimator.count_text(&tool.name)
+                    + estimator.count_text(&tool.description)
+                    + estimator.count_text(&tool.input_schema.to_string())
+            })
+            .sum::<usize>()
+}
+
+fn estimate_provider_message_tokens(
+    message: &ProviderMessage,
+    estimator: &CharBasedEstimator,
+) -> usize {
+    PROVIDER_MESSAGE_OVERHEAD_TOKENS
+        + message
+            .content
+            .iter()
+            .map(|content| match content {
+                ProviderContent::Text { text } => estimator.count_text(text),
+                ProviderContent::Image { detail, .. } => match detail.as_deref() {
+                    Some("high") => 765,
+                    _ => 85,
+                },
+            })
+            .sum::<usize>()
+}
+
+fn trim_tool_result_messages(
+    messages: &mut [ProviderMessage],
+    token_budget: usize,
+    records: &mut Vec<String>,
+) {
+    for idx in 0..messages.len() {
+        if provider_messages_only_tokens(messages) <= token_budget {
+            break;
+        }
+        let message = &mut messages[idx];
+        if !matches!(message.role, ProviderRole::Tool) {
+            continue;
+        }
+        let mut changed = false;
+        for content in &mut message.content {
+            if let ProviderContent::Text { text } = content {
+                let original_chars = text.chars().count();
+                if original_chars > TRIMMED_TOOL_RESULT_HEAD_TOKENS * 3 {
+                    *text = summarize_text_block(
+                        text,
+                        TRIMMED_TOOL_RESULT_HEAD_TOKENS,
+                        "tool result trimmed by context budget",
+                    );
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            records.push("tool_result:summarized".to_string());
+        }
+    }
+}
+
+fn trim_memory_context_messages(
+    messages: &mut [ProviderMessage],
+    token_budget: usize,
+    tools: &[ToolDefinition],
+    records: &mut Vec<String>,
+) {
+    for idx in 0..messages.len() {
+        if estimate_provider_request_tokens(messages, tools) <= token_budget {
+            break;
+        }
+        let message = &mut messages[idx];
+        if !matches!(message.role, ProviderRole::User) {
+            continue;
+        }
+        for content in &mut message.content {
+            if let ProviderContent::Text { text } = content
+                && text.contains("<relevant_memories>")
+            {
+                *text = summarize_text_block(
+                    text,
+                    TRIMMED_MEMORY_HEAD_TOKENS,
+                    "auto-recalled memory trimmed by context budget",
+                );
+                records.push("memory:auto_recall_summarized".to_string());
+            }
+        }
+    }
+}
+
+fn trim_system_prompt_sections(
+    messages: &mut [ProviderMessage],
+    token_budget: usize,
+    tools: &[ToolDefinition],
+    records: &mut Vec<String>,
+) {
+    const SECTION_ORDER: &[&str] = &["MEMORY_CONTEXT", "MEMORY", "TOOLS", "WORKSPACE"];
+    for section in SECTION_ORDER {
+        if estimate_provider_request_tokens(messages, tools) <= token_budget {
+            return;
+        }
+        for message in messages
+            .iter_mut()
+            .filter(|message| matches!(message.role, ProviderRole::System))
+        {
+            for content in &mut message.content {
+                if let ProviderContent::Text { text } = content {
+                    let (trimmed, changed) = trim_named_system_section(text, section);
+                    if changed {
+                        *text = trimmed;
+                        records.push(format!("workspace_section:{section}:summarized"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn trim_old_history_messages(
+    messages: &mut Vec<ProviderMessage>,
+    token_budget: usize,
+    tools: &[ToolDefinition],
+    records: &mut Vec<String>,
+) {
+    while estimate_provider_request_tokens(messages, tools) > token_budget && messages.len() > 2 {
+        let Some(idx) = messages.iter().enumerate().find_map(|(idx, message)| {
+            (idx > 0 && idx + 1 < messages.len() && !matches!(message.role, ProviderRole::System))
+                .then_some(idx)
+        }) else {
+            break;
+        };
+        let role = format!("{:?}", messages[idx].role).to_lowercase();
+        messages.remove(idx);
+        records.push(format!("history:{role}:dropped"));
+    }
+}
+
+fn trim_tool_definitions(
+    tools: &mut [ToolDefinition],
+    token_budget: usize,
+    messages: &[ProviderMessage],
+    records: &mut Vec<String>,
+) {
+    if estimate_provider_request_tokens(messages, tools) <= token_budget {
+        return;
+    }
+    for tool in tools {
+        if tool.description.chars().count() > 240 {
+            tool.description = summarize_text_block(
+                &tool.description,
+                80,
+                "tool description trimmed by context budget",
+            );
+            records.push(format!(
+                "tool_definition:{}:description_summarized",
+                tool.name
+            ));
+        }
+        let schema_text = tool.input_schema.to_string();
+        if schema_text.chars().count() > 2_000 {
+            tool.input_schema = json!({
+                "type": "object",
+                "description": "schema trimmed by context budget; use documented tool inputs"
+            });
+            records.push(format!("tool_definition:{}:schema_summarized", tool.name));
+        }
+    }
+}
+
+fn trim_largest_text_blocks(
+    messages: &mut [ProviderMessage],
+    token_budget: usize,
+    tools: &[ToolDefinition],
+    records: &mut Vec<String>,
+) {
+    while estimate_provider_request_tokens(messages, tools) > token_budget {
+        let mut largest: Option<(usize, usize, usize)> = None;
+        for (message_idx, message) in messages.iter().enumerate() {
+            for (content_idx, content) in message.content.iter().enumerate() {
+                let ProviderContent::Text { text } = content else {
+                    continue;
+                };
+                let len = text.chars().count();
+                if len <= TRIMMED_HISTORY_HEAD_TOKENS * 3 {
+                    continue;
+                }
+                if largest.map_or(true, |(_, _, current)| len > current) {
+                    largest = Some((message_idx, content_idx, len));
+                }
+            }
+        }
+        let Some((message_idx, content_idx, _)) = largest else {
+            break;
+        };
+        if let ProviderContent::Text { text } = &mut messages[message_idx].content[content_idx] {
+            let role = format!("{:?}", messages[message_idx].role).to_lowercase();
+            *text = summarize_text_block(
+                text,
+                TRIMMED_HISTORY_HEAD_TOKENS,
+                "message content trimmed by context budget",
+            );
+            records.push(format!("history:{role}:content_summarized"));
+        }
+    }
+}
+
+fn provider_messages_only_tokens(messages: &[ProviderMessage]) -> usize {
+    estimate_provider_request_tokens(messages, &[])
+}
+
+fn summarize_text_block(text: &str, keep_tokens: usize, reason: &str) -> String {
+    let keep_chars = keep_tokens.saturating_mul(3);
+    let original_chars = text.chars().count();
+    if original_chars <= keep_chars {
+        return text.to_string();
+    }
+    let head = text.chars().take(keep_chars).collect::<String>();
+    format!(
+        "{head}\n[{reason}: omitted {} chars]",
+        original_chars.saturating_sub(keep_chars)
+    )
+}
+
+fn trim_named_system_section(input: &str, target: &str) -> (String, bool) {
+    let mut output = String::new();
+    let lines = input.lines().collect::<Vec<_>>();
+    let mut idx = 0usize;
+    let mut changed = false;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        output.push_str(line);
+        output.push('\n');
+        idx += 1;
+
+        if section_heading(line) != Some(target) {
+            continue;
+        }
+
+        let content_start = idx;
+        while idx < lines.len() && section_heading(lines[idx]).is_none() {
+            idx += 1;
+        }
+        let omitted = lines[content_start..idx].join("\n").chars().count();
+        output.push_str(&format!(
+            "[section {target} trimmed by context budget: omitted {omitted} chars]\n"
+        ));
+        changed = true;
+    }
+
+    if changed {
+        (output, true)
+    } else {
+        (input.to_string(), false)
+    }
+}
+
+fn section_heading(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    trimmed.strip_prefix("--- ")?.strip_suffix(" ---")
 }
 
 fn log_prompt_breakdown(turn: usize, history: &[Message]) {
@@ -655,13 +978,14 @@ mod tests {
     use async_trait::async_trait;
     use nyx_obs::testing::CaptureSink;
     use nyx_provider::{
-        CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderError,
+        CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
+        ProviderError, ProviderMessage, ProviderRole, ToolDefinition,
     };
     use tokio::sync::Mutex;
 
     use super::{
-        ToolLoopConfig, ToolLoopEngine, apply_budget_trimming, log_prompt_breakdown,
-        short_tool_error, truncate_head_tail,
+        ToolLoopConfig, ToolLoopEngine, apply_budget_trimming, estimate_provider_request_tokens,
+        log_prompt_breakdown, short_tool_error, truncate_head_tail,
     };
     use crate::{
         AgentContext, AgentError, ContextCompressor, Message, MessageRole, TokenEstimator,
@@ -841,12 +1165,86 @@ mod tests {
         ];
         apply_budget_trimming(&mut history, 200);
         assert!(matches!(history[0].role, MessageRole::System));
-        assert!(history
-            .iter()
-            .all(|m| !matches!(m.role, MessageRole::Tool)));
+        assert!(history.iter().all(|m| !matches!(m.role, MessageRole::Tool)));
         assert_eq!(
             history.last().and_then(|m| m.content[0].as_text()),
             Some("latest")
+        );
+    }
+
+    #[test]
+    fn preflight_trims_workspace_memory_history_and_tool_results_under_budget() {
+        let sink = CaptureSink::new();
+        let engine = ToolLoopEngine::new("small-context-model", 1);
+        let ctx = AgentContext {
+            provider: Arc::new(nyx_provider::testing::EchoProvider),
+            tools: Vec::new(),
+            sink: Arc::new(sink),
+            tool_ctx: nyx_tools::ToolContext {
+                invocation: nyx_core::InvocationContext {
+                    request_id: "req-budget".to_string(),
+                    session_id: Some("session-budget".to_string()),
+                    ..nyx_core::InvocationContext::default()
+                },
+                ..nyx_tools::ToolContext::default()
+            },
+            history: Vec::new(),
+            hooks: Vec::new(),
+            channel_id: "session-budget".to_string(),
+            compressor: None,
+            token_budget: Some(2_000),
+            thinking_tokens: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            suppress_progressive: false,
+            auto_approve: false,
+        };
+        let mut tools = vec![ToolDefinition {
+            name: "large_tool".to_string(),
+            description: "tool description ".repeat(400),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "description": "schema description ".repeat(400)
+                    }
+                }
+            }),
+        }];
+        let system_prompt = format!(
+            "--- WORKSPACE ---\n{}\n\n--- MEMORY ---\n{}\n\n--- AGENTS ---\nkeep rules",
+            "/tmp/workspace ".repeat(400),
+            "remembered fact ".repeat(600)
+        );
+        let messages = vec![
+            ProviderMessage::system(system_prompt),
+            ProviderMessage::assistant("older assistant context ".repeat(400)),
+            ProviderMessage {
+                role: ProviderRole::Tool,
+                content: vec![ProviderContent::text("tool output ".repeat(800))],
+                tool_call_id: Some("call-1".to_string()),
+            },
+            ProviderMessage::user("latest user request"),
+            ProviderMessage::user(format!(
+                "<relevant_memories>\n{}\n</relevant_memories>",
+                "memory row ".repeat(600)
+            )),
+        ];
+
+        let trimmed = engine.preflight_context_budget(&ctx, messages, &mut tools, 2_000);
+        let rendered = trimmed
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(ProviderContent::as_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(estimate_provider_request_tokens(&trimmed, &tools) <= 2_000);
+        assert!(rendered.contains("section MEMORY trimmed by context budget"));
+        assert!(rendered.contains("auto-recalled memory trimmed by context budget"));
+        assert!(
+            rendered.contains("tool result trimmed by context budget")
+                || !trimmed.iter().any(|m| matches!(m.role, ProviderRole::Tool))
         );
     }
 
