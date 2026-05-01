@@ -16,7 +16,7 @@ use crate::{
 
 const TOOL_RESULT_PROVIDER_MAX_CHARS: usize = 8_000;
 const TOOL_RESULT_OBSERVER_MAX_CHARS: usize = 4_000;
-const RECENT_TURNS_TO_PRESERVE: usize = 24;
+const RECENT_TURNS_TO_PRESERVE: usize = crate::RECENT_CONTEXT_TURNS;
 
 #[derive(Debug, Clone)]
 pub struct ToolLoopEngine {
@@ -659,7 +659,10 @@ mod tests {
     };
     use tokio::sync::Mutex;
 
-    use super::{ToolLoopConfig, ToolLoopEngine};
+    use super::{
+        ToolLoopConfig, ToolLoopEngine, apply_budget_trimming, log_prompt_breakdown,
+        short_tool_error, truncate_head_tail,
+    };
     use crate::{
         AgentContext, AgentError, ContextCompressor, Message, MessageRole, TokenEstimator,
     };
@@ -825,5 +828,52 @@ mod tests {
 
         assert!(matches!(err, AgentError::Provider(_)));
         assert_eq!(provider.calls.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn apply_budget_trimming_prefers_dropping_tool_messages() {
+        let mut history = vec![
+            Message::text(MessageRole::System, "system"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::tool_result(Some("c1".to_string()), &"tool-output".repeat(800)),
+            Message::user("latest"),
+        ];
+        apply_budget_trimming(&mut history, 200);
+        assert!(matches!(history[0].role, MessageRole::System));
+        assert!(history
+            .iter()
+            .all(|m| !matches!(m.role, MessageRole::Tool)));
+        assert_eq!(
+            history.last().and_then(|m| m.content[0].as_text()),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn truncate_head_tail_keeps_both_ends_when_truncated() {
+        let input = "abcdefghij";
+        let out = truncate_head_tail(input, 6);
+        assert!(out.contains("abc"));
+        assert!(out.contains("hij"));
+        assert!(out.contains("truncated 4 chars"));
+    }
+
+    #[test]
+    fn short_tool_error_uses_first_line_and_limits_size() {
+        let long = format!("{}\nsecond line", "x".repeat(600));
+        let out = short_tool_error(&long);
+        assert!(!out.contains("second line"));
+        assert!(out.chars().count() <= 460);
+    }
+
+    #[test]
+    fn log_prompt_breakdown_is_noop_for_normal_history() {
+        let history = vec![
+            Message::text(MessageRole::System, "system"),
+            Message::user("hello"),
+            Message::assistant("world"),
+        ];
+        log_prompt_breakdown(0, &history);
     }
 }
