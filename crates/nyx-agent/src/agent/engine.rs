@@ -402,7 +402,7 @@ impl ToolLoopEngine {
         &self,
         ctx: &AgentContext,
         mut messages: Vec<ProviderMessage>,
-        tools: &mut Vec<ToolDefinition>,
+        tools: &mut [ToolDefinition],
         token_budget: usize,
     ) -> Vec<ProviderMessage> {
         if token_budget == 0 {
@@ -635,7 +635,7 @@ fn trim_largest_text_blocks(
                 if len <= TRIMMED_HISTORY_HEAD_TOKENS * 3 {
                     continue;
                 }
-                if largest.map_or(true, |(_, _, current)| len > current) {
+                if largest.is_none_or(|(_, _, current)| len > current) {
                     largest = Some((message_idx, content_idx, len));
                 }
             }
