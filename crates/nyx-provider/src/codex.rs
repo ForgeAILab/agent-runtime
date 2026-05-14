@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -230,6 +230,7 @@ fn decode_assistant_content(content: &str, msg_index: u32) -> (String, Vec<serde
 fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
     let mut input = Vec::new();
     let mut instructions = Vec::new();
+    let mut emitted_function_calls = HashSet::new();
 
     let mut msg_index: u32 = 0;
     for message in req.messages {
@@ -261,17 +262,27 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
 
                 // Add function_call output items
                 for tc in tool_call_items {
+                    if let Some(call_id) = tc.get("call_id").and_then(|value| value.as_str()) {
+                        emitted_function_calls.insert(call_id.to_string());
+                    }
                     input.push(tc);
                 }
             }
             ProviderRole::Tool => {
                 // Tool results become function_call_output items
                 if let Some(call_id) = &message.tool_call_id {
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": text,
-                    }));
+                    if emitted_function_calls.contains(call_id) {
+                        input.push(json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": text,
+                        }));
+                    } else {
+                        tracing::warn!(
+                            tool_call_id = %call_id,
+                            "dropping orphaned Codex function_call_output"
+                        );
+                    }
                 } else {
                     // Legacy tool message without call_id — send as user message
                     input.push(json!({
@@ -1045,6 +1056,50 @@ mod tests {
         let payload = build_payload(req, false);
 
         assert_eq!(payload["instructions"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn payload_keeps_matched_function_call_output() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![
+                crate::ProviderMessage::assistant(
+                    r#"[{"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"rust"}}]"#,
+                ),
+                crate::ProviderMessage::tool_result("call_1", "result"),
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+        let payload = build_payload(req, false);
+        let input = payload["input"].as_array().expect("input array");
+
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn payload_drops_orphaned_function_call_output() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![
+                crate::ProviderMessage::tool_result("orphan", "stale output"),
+                crate::ProviderMessage::user("hello"),
+            ],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+        let payload = build_payload(req, false);
+        let input = payload["input"].as_array().expect("input array");
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
     }
 
     #[test]
