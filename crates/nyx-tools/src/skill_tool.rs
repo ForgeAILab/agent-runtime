@@ -24,12 +24,16 @@ impl Tool for SkillTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "get"],
+                    "enum": ["list", "get", "file"],
                     "description": "Skill action to execute"
                 },
                 "name": {
                     "type": "string",
-                    "description": "Skill name for action=get"
+                    "description": "Skill name for action=get or action=file"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Supporting file path for action=file"
                 }
             }
         })
@@ -57,7 +61,9 @@ impl Tool for SkillTool {
                         .map(|skill| json!({
                             "name": skill.name,
                             "description": skill.description,
-                            "version": skill.version
+                            "version": skill.version,
+                            "readiness": skill.readiness,
+                            "trust_level": skill.trust_level
                         }))
                         .collect::<Vec<_>>()
                 )))
@@ -78,13 +84,45 @@ impl Tool for SkillTool {
                         "version": skill.version,
                         "eligible": skill.eligible,
                         "body": skill.body,
-                        "source": skill.source
+                        "source": skill.source,
+                        "readiness": skill.readiness,
+                        "missing_requirements": skill.missing_requirements,
+                        "setup_help": skill.setup_help,
+                        "source_kind": skill.source_kind,
+                        "trust_level": skill.trust_level,
+                        "supporting_files": skill.supporting_files
                     }))),
                     None => Ok(ToolResult::error(format!("skill not found: {name}"))),
                 }
             }
+            "file" => {
+                let name = input
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ToolError::InvalidInput("missing name".to_string()))?;
+                let path = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ToolError::InvalidInput("missing path".to_string()))?;
+                match skill_service
+                    .get_skill_file(&ctx.invocation, name, path)
+                    .await
+                    .map_err(map_kernel_error)?
+                {
+                    Some(file) => Ok(ToolResult::json(json!({
+                        "name": name,
+                        "path": file.path,
+                        "kind": file.kind,
+                        "bytes": file.bytes,
+                        "content": file.content
+                    }))),
+                    None => Ok(ToolResult::error(format!(
+                        "skill supporting file not found: {name}:{path}"
+                    ))),
+                }
+            }
             other => Err(ToolError::InvalidInput(format!(
-                "unknown action: {other}; expected one of: list, get"
+                "unknown action: {other}; expected one of: list, get, file"
             ))),
         }
     }
@@ -97,7 +135,7 @@ mod tests {
     use async_trait::async_trait;
     use nyx_core::{
         ControlPlane, InvocationContext, KernelError, ServiceRegistryBuilder, SkillDetail,
-        SkillInfo, SkillService,
+        SkillFileContent, SkillInfo, SkillService,
     };
     use serde_json::json;
 
@@ -117,6 +155,11 @@ mod tests {
                 description: "Scaffold and author plugin tools".to_string(),
                 version: "0.1.0".to_string(),
                 eligible: true,
+                readiness: "available".to_string(),
+                missing_requirements: vec![],
+                setup_help: vec![],
+                source_kind: "npm_package".to_string(),
+                trust_level: "trusted".to_string(),
                 location: "/skills/nyx-plugin/SKILL.md".to_string(),
             }])
         }
@@ -140,7 +183,30 @@ mod tests {
                 eligible: true,
                 body: "Full skill body".to_string(),
                 source: "npm:@nyx/skills-official".to_string(),
+                readiness: "available".to_string(),
+                missing_requirements: vec![],
+                setup_help: vec![],
+                source_kind: "npm_package".to_string(),
+                trust_level: "trusted".to_string(),
+                supporting_files: vec![],
             }))
+        }
+
+        async fn get_skill_file(
+            &self,
+            _ctx: &InvocationContext,
+            name: &str,
+            relative_path: &str,
+        ) -> Result<Option<SkillFileContent>, KernelError> {
+            if name == "nyx-plugin" && relative_path == "references/api.md" {
+                return Ok(Some(SkillFileContent {
+                    path: "references/api.md".to_string(),
+                    kind: "reference".to_string(),
+                    bytes: 10,
+                    content: "Reference".to_string(),
+                }));
+            }
+            Ok(None)
         }
     }
 
@@ -172,7 +238,9 @@ mod tests {
             json!([{
                 "name": "nyx-plugin",
                 "description": "Scaffold and author plugin tools",
-                "version": "0.1.0"
+                "version": "0.1.0",
+                "readiness": "available",
+                "trust_level": "trusted"
             }])
         );
     }
@@ -199,7 +267,39 @@ mod tests {
                 "version": "0.1.0",
                 "eligible": true,
                 "body": "Full skill body",
-                "source": "npm:@nyx/skills-official"
+                "source": "npm:@nyx/skills-official",
+                "readiness": "available",
+                "missing_requirements": [],
+                "setup_help": [],
+                "source_kind": "npm_package",
+                "trust_level": "trusted",
+                "supporting_files": []
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn file_action_returns_supporting_file_content() {
+        let tool = SkillTool;
+        let result = tool
+            .invoke(
+                json!({ "action": "file", "name": "nyx-plugin", "path": "references/api.md" }),
+                &ToolContext {
+                    control_plane: cp_with_skills(),
+                    ..ToolContext::default()
+                },
+            )
+            .await
+            .expect("invoke file");
+
+        assert_eq!(
+            result.value,
+            json!({
+                "name": "nyx-plugin",
+                "path": "references/api.md",
+                "kind": "reference",
+                "bytes": 10,
+                "content": "Reference"
             })
         );
     }
