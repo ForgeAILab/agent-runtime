@@ -97,6 +97,8 @@ impl LlmProvider for RetryProvider {
                         attempt,
                         max = self.max_attempts,
                         delay_ms = delay,
+                        error = %err,
+                        error_kind = err.kind(),
                         "retrying provider request"
                     );
                     sleep(Duration::from_millis(delay)).await;
@@ -123,6 +125,8 @@ impl LlmProvider for RetryProvider {
                         attempt,
                         max = self.max_attempts,
                         delay_ms = delay,
+                        error = %err,
+                        error_kind = err.kind(),
                         "retrying provider stream"
                     );
                     sleep(Duration::from_millis(delay)).await;

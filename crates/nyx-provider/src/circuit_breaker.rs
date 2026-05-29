@@ -12,6 +12,15 @@ const STATE_CLOSED: u8 = 0;
 const STATE_OPEN: u8 = 1;
 const STATE_HALF_OPEN: u8 = 2;
 
+fn state_name(state: u8) -> &'static str {
+    match state {
+        STATE_CLOSED => "closed",
+        STATE_OPEN => "open",
+        STATE_HALF_OPEN => "half_open",
+        _ => "unknown",
+    }
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -71,6 +80,11 @@ impl CircuitBreakerProvider {
 
     fn record_failure(&self, err: &ProviderError) {
         if !is_retryable(err) {
+            tracing::debug!(
+                error = %err,
+                error_kind = err.kind(),
+                "provider failure ignored by circuit breaker"
+            );
             return;
         }
 
@@ -81,12 +95,32 @@ impl CircuitBreakerProvider {
             // Probe failed — re-open with fresh cooldown
             self.opened_at.store(now_secs(), Ordering::Relaxed);
             self.state.store(STATE_OPEN, Ordering::Relaxed);
-            tracing::warn!("circuit breaker re-opened — probe failed");
+            tracing::warn!(
+                error = %err,
+                error_kind = err.kind(),
+                failure_count = count,
+                cooldown_secs = self.cooldown_secs,
+                "circuit breaker re-opened; provider probe failed"
+            );
         } else if state == STATE_CLOSED && count >= self.failure_threshold {
             self.opened_at.store(now_secs(), Ordering::Relaxed);
             self.state.store(STATE_OPEN, Ordering::Relaxed);
             tracing::warn!(
-                "circuit breaker opened for provider after {count} consecutive failures"
+                error = %err,
+                error_kind = err.kind(),
+                failure_count = count,
+                failure_threshold = self.failure_threshold,
+                cooldown_secs = self.cooldown_secs,
+                "circuit breaker opened for provider"
+            );
+        } else {
+            tracing::debug!(
+                error = %err,
+                error_kind = err.kind(),
+                state = state_name(state),
+                failure_count = count,
+                failure_threshold = self.failure_threshold,
+                "provider failure recorded by circuit breaker"
             );
         }
     }

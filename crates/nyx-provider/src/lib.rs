@@ -231,6 +231,18 @@ pub enum ProviderError {
     StreamingUnsupported,
 }
 
+impl ProviderError {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            ProviderError::Http(_) => "http",
+            ProviderError::InvalidResponse(_) => "invalid_response",
+            ProviderError::Rejected(_) => "rejected",
+            ProviderError::RateLimited { .. } => "rate_limited",
+            ProviderError::StreamingUnsupported => "streaming_unsupported",
+        }
+    }
+}
+
 /// Build a [`ProviderError`] from a non-success HTTP response, distinguishing
 /// 429 (rate-limited) from other rejections and extracting `Retry-After`.
 pub async fn error_for_response(response: reqwest::Response) -> ProviderError {
