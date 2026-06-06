@@ -42,13 +42,16 @@ pub(crate) fn is_retryable(err: &ProviderError) -> bool {
         }
         ProviderError::InvalidResponse(_) => false,
         ProviderError::Rejected(msg) => {
+            if is_usage_limit_reached(msg) {
+                return false;
+            }
             // Some providers map non-2xx into Rejected("<status> <body>"), e.g.
             // "500 Internal Server Error ...". Treat 429/5xx as transient.
             parse_status_code(msg)
                 .map(|code| code == 429 || code >= 500)
                 .unwrap_or(false)
         }
-        ProviderError::RateLimited { .. } => true,
+        ProviderError::RateLimited { message, .. } => !is_usage_limit_reached(message),
         ProviderError::StreamingUnsupported => false,
     }
 }
@@ -76,6 +79,10 @@ fn pick_delay(err: &ProviderError, exponential_backoff_ms: u64) -> u64 {
 
 fn parse_status_code(msg: &str) -> Option<u16> {
     msg.split_whitespace().next()?.parse().ok()
+}
+
+fn is_usage_limit_reached(msg: &str) -> bool {
+    msg.contains("usage_limit_reached")
 }
 
 #[async_trait]
@@ -361,6 +368,21 @@ mod tests {
             .await
             .expect("rate-limited retry should succeed");
         assert_eq!(resp.content, "hi");
+    }
+
+    #[test]
+    fn usage_limit_reached_is_not_retryable() {
+        let err = ProviderError::RateLimited {
+            retry_after_ms: None,
+            message: r#"429 Too Many Requests {"error":{"type":"usage_limit_reached"}}"#
+                .to_string(),
+        };
+        assert!(!is_retryable(&err));
+
+        let err = ProviderError::Rejected(
+            r#"429 Too Many Requests {"error":{"type":"usage_limit_reached"}}"#.to_string(),
+        );
+        assert!(!is_retryable(&err));
     }
 
     #[test]
