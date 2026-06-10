@@ -401,6 +401,12 @@ struct OpenAiFunctionCall {
 struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: Option<u32>,
 }
 
 impl From<OpenAiUsage> for UsageMetadata {
@@ -408,7 +414,9 @@ impl From<OpenAiUsage> for UsageMetadata {
         Self {
             input_tokens: value.prompt_tokens,
             output_tokens: value.completion_tokens,
-            cache_read_tokens: None,
+            cache_read_tokens: value
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens),
             cache_write_tokens: None,
         }
     }
@@ -474,6 +482,51 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cache_read_tokens: None,
+                cache_write_tokens: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_usage_maps_cached_prompt_tokens() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "glm-5.1".to_string(),
+            messages: vec![crate::ProviderMessage::user("hi")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "glm-5.1",
+                "choices": [{"message": {"content": "hello"}}],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 96
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(
+            response.usage,
+            Some(UsageMetadata {
+                input_tokens: 120,
+                output_tokens: 7,
+                cache_read_tokens: Some(96),
                 cache_write_tokens: None,
             })
         );
