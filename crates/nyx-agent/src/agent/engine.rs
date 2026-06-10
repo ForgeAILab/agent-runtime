@@ -171,8 +171,11 @@ impl ToolLoopEngine {
 
             let is_final_turn = turn + 1 == self.max_steps;
             log_prompt_breakdown(turn, &history);
-            let mut request_messages =
-                to_provider_messages_with_history_breakpoint(&history, config.convert_file_urls);
+            let mut request_messages = to_provider_messages_for_request(
+                &history,
+                config.convert_file_urls,
+                ctx.cache_hints,
+            );
             if is_final_turn {
                 request_messages.push(final_turn_system_message(turn, self.max_steps));
             }
@@ -216,9 +219,10 @@ impl ToolLoopEngine {
                         );
                     }
 
-                    let mut retry_messages = to_provider_messages_with_history_breakpoint(
+                    let mut retry_messages = to_provider_messages_for_request(
                         &history,
                         config.convert_file_urls,
+                        ctx.cache_hints,
                     );
                     if is_final_turn {
                         retry_messages.push(final_turn_system_message(turn, self.max_steps));
@@ -855,10 +859,19 @@ pub(crate) fn to_provider_messages(
         .collect()
 }
 
-fn to_provider_messages_with_history_breakpoint(
+fn to_provider_messages_for_request(
     history: &[Message],
     convert_file_urls: bool,
+    cache_hints: bool,
 ) -> Vec<ProviderMessage> {
+    if !cache_hints {
+        let mut messages = to_provider_messages(history, convert_file_urls);
+        for message in &mut messages {
+            message.cache_breakpoint = false;
+        }
+        return messages;
+    }
+
     let mut request_history = history.to_vec();
     if let Some(last) = request_history.last_mut() {
         last.cache_breakpoint = true;
@@ -1027,7 +1040,7 @@ mod tests {
 
     use super::{
         ToolLoopConfig, ToolLoopEngine, apply_budget_trimming, estimate_provider_request_tokens,
-        log_prompt_breakdown, short_tool_error, to_provider_messages_with_history_breakpoint,
+        log_prompt_breakdown, short_tool_error, to_provider_messages_for_request,
         truncate_head_tail,
     };
     use crate::{
@@ -1140,6 +1153,7 @@ mod tests {
                     thinking_tokens: None,
                     cancel: tokio_util::sync::CancellationToken::new(),
                     suppress_progressive: false,
+                    cache_hints: true,
                     auto_approve: false,
                 },
                 &ToolLoopConfig {
@@ -1182,6 +1196,7 @@ mod tests {
                     thinking_tokens: None,
                     cancel: tokio_util::sync::CancellationToken::new(),
                     suppress_progressive: false,
+                    cache_hints: true,
                     auto_approve: false,
                 },
                 &ToolLoopConfig {
@@ -1247,12 +1262,24 @@ mod tests {
         semi_stable.cache_breakpoint = true;
         let history = vec![stable, semi_stable, Message::user("latest")];
 
-        let messages = to_provider_messages_with_history_breakpoint(&history, false);
+        let messages = to_provider_messages_for_request(&history, false, true);
 
         assert_eq!(messages.len(), 3);
         assert!(messages[0].cache_breakpoint);
         assert!(messages[1].cache_breakpoint);
         assert!(messages[2].cache_breakpoint);
+    }
+
+    #[test]
+    fn provider_conversion_disables_cache_breakpoints_when_policy_disables_hints() {
+        let mut stable = Message::text(MessageRole::System, "stable");
+        stable.cache_breakpoint = true;
+        let history = vec![stable, Message::user("latest")];
+
+        let messages = to_provider_messages_for_request(&history, false, false);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| !message.cache_breakpoint));
     }
 
     #[test]
@@ -1279,6 +1306,7 @@ mod tests {
             thinking_tokens: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             suppress_progressive: false,
+            cache_hints: true,
             auto_approve: false,
         };
         let mut tools = vec![ToolDefinition {
