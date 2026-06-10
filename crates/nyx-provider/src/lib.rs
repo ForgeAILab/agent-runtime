@@ -1,3 +1,9 @@
+//! Layer 1 LLM provider contracts and adapters.
+//!
+//! `nyx-provider` defines provider request/response types, the `LlmProvider`
+//! trait, provider wrappers, tool-call parsing, fallback/rate-limit layers, and
+//! model metadata registries. Concrete provider integrations are feature-gated.
+
 use std::pin::Pin;
 
 use async_trait::async_trait;
