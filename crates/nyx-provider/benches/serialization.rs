@@ -171,6 +171,7 @@ fn make_request(messages: usize, tool_count: usize) -> nyx_provider::CompletionR
         body.push(nyx_provider::ProviderMessage {
             role,
             content,
+            cache_breakpoint: false,
             tool_call_id: if is_tool {
                 Some(format!("tool-result-{index}"))
             } else {

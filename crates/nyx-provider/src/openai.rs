@@ -609,6 +609,7 @@ mod tests {
                         text: "What is in this image?".to_string(),
                     },
                 ],
+                cache_breakpoint: false,
                 tool_call_id: None,
             }],
             tools: vec![],

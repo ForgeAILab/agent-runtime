@@ -62,6 +62,7 @@ impl ProviderContent {
 pub struct ProviderMessage {
     pub role: ProviderRole,
     pub content: Vec<ProviderContent>,
+    pub cache_breakpoint: bool,
     /// Tool use ID for `Tool` role messages — correlates with the assistant `tool_use` block.
     pub tool_call_id: Option<String>,
 }
@@ -71,6 +72,7 @@ impl ProviderMessage {
         Self {
             role,
             content: vec![ProviderContent::text(content)],
+            cache_breakpoint: false,
             tool_call_id: None,
         }
     }
@@ -95,6 +97,7 @@ impl ProviderMessage {
         Self {
             role: ProviderRole::Tool,
             content: vec![ProviderContent::text(content)],
+            cache_breakpoint: false,
             tool_call_id: Some(id.into()),
         }
     }
