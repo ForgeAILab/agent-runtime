@@ -11,6 +11,7 @@ use crate::config::ProviderConfig;
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
     ProviderContent, ProviderError, ProviderRole, StreamEvent, ToolCall, UsageMetadata,
+    tool_names::ProviderToolNameMap,
 };
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -195,7 +196,11 @@ fn message_text(parts: &[ProviderContent]) -> String {
 
 /// Decode assistant content that may be a JSON array of blocks (produced by react agent).
 /// Returns (text, tool_call_items) where tool_call_items are Responses API `function_call` items.
-fn decode_assistant_content(content: &str, msg_index: u32) -> (String, Vec<serde_json::Value>) {
+fn decode_assistant_content(
+    content: &str,
+    msg_index: u32,
+    tool_name_map: &ProviderToolNameMap,
+) -> (String, Vec<serde_json::Value>) {
     let Ok(blocks) = serde_json::from_str::<Vec<serde_json::Value>>(content) else {
         return (content.to_string(), vec![]);
     };
@@ -211,7 +216,7 @@ fn decode_assistant_content(content: &str, msg_index: u32) -> (String, Vec<serde
             }
             Some("tool_use") => {
                 let call_id = block["id"].as_str().unwrap_or("").to_string();
-                let name = block["name"].as_str().unwrap_or("").to_string();
+                let name = tool_name_map.provider_name(block["name"].as_str().unwrap_or(""));
                 let arguments = serde_json::to_string(&block["input"]).unwrap_or_default();
                 tool_calls.push(json!({
                     "type": "function_call",
@@ -228,6 +233,7 @@ fn decode_assistant_content(content: &str, msg_index: u32) -> (String, Vec<serde
 }
 
 fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
+    let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
     let mut input = Vec::new();
     let mut instructions = Vec::new();
     let mut emitted_function_calls = HashSet::new();
@@ -247,7 +253,8 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         match message.role {
             ProviderRole::Assistant => {
                 // Decode JSON content blocks (may contain text + tool_use blocks)
-                let (assistant_text, tool_call_items) = decode_assistant_content(&text, msg_index);
+                let (assistant_text, tool_call_items) =
+                    decode_assistant_content(&text, msg_index, &tool_name_map);
 
                 // Add the assistant message output item
                 if !assistant_text.is_empty() {
@@ -323,7 +330,7 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
             .map(|t| {
                 json!({
                     "type": "function",
-                    "name": t.name,
+                    "name": tool_name_map.provider_name(&t.name),
                     "description": t.description,
                     "parameters": t.input_schema,
                 })
@@ -332,12 +339,10 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         payload["tools"] = json!(tools);
     }
 
-    if let Some(max_tokens) = req.max_tokens {
-        payload["max_output_tokens"] = json!(max_tokens);
-    }
-    if let Some(temperature) = req.temperature {
-        payload["temperature"] = json!(temperature);
-    }
+    // The ChatGPT backend used by the Codex provider currently rejects some
+    // public Responses API tuning fields. Compression requests may still set
+    // `max_tokens` and `temperature`; omit them here so those requests do not
+    // fail before the dispatch reaches the model call.
     {
         let effort = if let Some(budget) = req.thinking_tokens {
             match budget {
@@ -414,9 +419,18 @@ impl From<ResponsesUsage> for UsageMetadata {
 
 /// Parse a complete SSE response body, looking for `response.completed` or `response.done`
 /// events that contain the final response object.
+#[cfg(test)]
 fn parse_sse_response(
     body: &str,
     fallback_model: &str,
+) -> Result<CompletionResponse, ProviderError> {
+    parse_sse_response_with_tool_names(body, fallback_model, &ProviderToolNameMap::default())
+}
+
+fn parse_sse_response_with_tool_names(
+    body: &str,
+    fallback_model: &str,
+    tool_name_map: &ProviderToolNameMap,
 ) -> Result<CompletionResponse, ProviderError> {
     // SSE format: "event: <type>\ndata: <json>\n\n"
     // We scan for the response.completed / response.done event.
@@ -511,7 +525,7 @@ fn parse_sse_response(
                 content
             }
         };
-        let tool_calls = {
+        let mut tool_calls = {
             let tool_calls = extract_tool_calls(&parsed);
             if tool_calls.is_empty() && !streamed_tool_calls.is_empty() {
                 streamed_tool_calls
@@ -519,6 +533,7 @@ fn parse_sse_response(
                 tool_calls
             }
         };
+        tool_name_map.restore_call_names(&mut tool_calls);
         tracing::debug!(
             model = %parsed.model.as_deref().unwrap_or(fallback_model),
             content_len = content.len(),
@@ -534,10 +549,12 @@ fn parse_sse_response(
             usage: parsed.usage.map(UsageMetadata::from),
         })
     } else if !streamed_text.is_empty() || !streamed_tool_calls.is_empty() {
+        let mut tool_calls = streamed_tool_calls;
+        tool_name_map.restore_call_names(&mut tool_calls);
         Ok(CompletionResponse {
             content: streamed_text,
             model: fallback_model.to_string(),
-            tool_calls: streamed_tool_calls,
+            tool_calls,
             usage: None,
         })
     } else {
@@ -738,6 +755,7 @@ impl FutStream for SseTextDeltaStream {
 impl LlmProvider for OpenAiCodexProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let fallback_model = req.model.clone();
+        let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
         // Codex API requires stream=true; collect SSE events and extract the final response.
         let response = self.execute(req, true).await?;
         let body = response
@@ -745,7 +763,7 @@ impl LlmProvider for OpenAiCodexProvider {
             .await
             .map_err(|_| ProviderError::InvalidResponse("failed to read response body"))?;
 
-        let parsed = parse_sse_response(&body, &fallback_model)?;
+        let parsed = parse_sse_response_with_tool_names(&body, &fallback_model, &tool_name_map)?;
         Ok(parsed)
     }
 
@@ -1117,6 +1135,22 @@ mod tests {
         assert_eq!(payload["reasoning"]["effort"], "medium");
         assert_eq!(payload["reasoning"]["summary"], "auto");
         assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn payload_omits_max_output_tokens() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![crate::ProviderMessage::user("hello")],
+            tools: vec![],
+            max_tokens: Some(256),
+            temperature: Some(0.2),
+            thinking_tokens: None,
+        };
+        let payload = build_payload(req, false);
+
+        assert!(payload.get("max_output_tokens").is_none());
+        assert!(payload.get("temperature").is_none());
     }
 
     #[test]

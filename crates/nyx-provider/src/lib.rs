@@ -5,6 +5,7 @@ use futures_core::Stream;
 use thiserror::Error;
 
 mod tool_call;
+mod tool_names;
 pub use tool_call::{JsonDirectiveParser, ToolCall, ToolCallParser, XmlDirectiveParser};
 pub mod catalog;
 mod circuit_breaker;

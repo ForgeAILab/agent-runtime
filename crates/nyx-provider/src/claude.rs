@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
     ProviderContent, ProviderError, ProviderRole, StreamEvent, ToolCall, ToolCallParser,
-    UsageMetadata,
+    UsageMetadata, tool_names::ProviderToolNameMap,
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -59,6 +59,7 @@ impl ClaudeProvider {
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
         let endpoint = format!("{}/messages", self.base_url.trim_end_matches('/'));
+        let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
         let mut system_chunks = Vec::new();
         let mut messages = Vec::new();
 
@@ -87,7 +88,8 @@ impl ClaudeProvider {
                                 .filter_map(|b| match b["type"].as_str()? {
                                     "tool_use" => Some(ClaudeRequestBlock::ToolUse {
                                         id: b["id"].as_str().unwrap_or("").to_string(),
-                                        name: b["name"].as_str().unwrap_or("").to_string(),
+                                        name: tool_name_map
+                                            .provider_name(b["name"].as_str().unwrap_or("")),
                                         input: b["input"].clone(),
                                     }),
                                     "text" => Some(ClaudeRequestBlock::Text {
@@ -135,7 +137,7 @@ impl ClaudeProvider {
             .tools
             .into_iter()
             .map(|t| ClaudeToolDefinition {
-                name: t.name,
+                name: tool_name_map.provider_name(&t.name),
                 description: t.description,
                 input_schema: t.input_schema,
             })
@@ -212,6 +214,7 @@ impl ClaudeProvider {
         {
             tool_calls = parser.parse(&content_text);
         }
+        tool_name_map.restore_call_names(&mut tool_calls);
 
         Ok(CompletionResponse {
             content: content_text,
