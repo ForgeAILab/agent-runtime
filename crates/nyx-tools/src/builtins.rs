@@ -816,7 +816,7 @@ fn sanitize_html(raw: &str) -> String {
     let cleaned = CHROME_RE.replace_all(&scoped, "");
 
     // --- convert to markdown ---
-    let md = html2md::parse_html(&cleaned);
+    let md = html_to_markdown_lossy(&cleaned);
 
     // --- post-process: clean up markdown artifacts ---
     let md = clean_markdown(&md);
@@ -832,6 +832,45 @@ fn sanitize_html(raw: &str) -> String {
     }
     out.push_str(&collapse_blank_lines(&md));
     out
+}
+
+#[cfg(feature = "http")]
+fn html_to_markdown_lossy(html: &str) -> String {
+    if !html.is_ascii() {
+        tracing::warn!(
+            "html contains non-ASCII text; falling back to stripped text to avoid markdown conversion panic"
+        );
+        return strip_html_tags_lossy(html);
+    }
+
+    match std::panic::catch_unwind(|| html2md::parse_html(html)) {
+        Ok(markdown) => markdown,
+        Err(_) => {
+            tracing::warn!("html to markdown conversion panicked; falling back to stripped text");
+            strip_html_tags_lossy(html)
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+fn strip_html_tags_lossy(html: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static TAG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<[^>]+>").expect("static regex"));
+    static WHITESPACE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[ \t\r\n]+").expect("static regex"));
+
+    let text = TAG_RE.replace_all(html, " ");
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    WHITESPACE_RE.replace_all(text.trim(), " ").into_owned()
 }
 
 /// Remove markdown artifacts that don't carry readable content.
@@ -1204,6 +1243,8 @@ mod tests {
     use crate::HttpTool;
     #[cfg(feature = "shell")]
     use crate::ShellTool;
+    #[cfg(feature = "http")]
+    use crate::builtins::{html_to_markdown_lossy, strip_html_tags_lossy};
     #[cfg(feature = "file")]
     use crate::{FileApplyPatchTool, FileReadTool, FileWriteTool};
     #[cfg(feature = "terminal")]
@@ -1774,6 +1815,23 @@ mod tests {
         assert!(!text.contains("pageProps"), "should strip __NEXT_DATA__");
         assert!(!text.contains("display:none"), "should strip FOUC style");
         assert!(!text.contains("fallback"), "should strip hidden divs");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_markdown_fallback_strips_html_tags() {
+        let text =
+            strip_html_tags_lossy("<main><h1>Title&nbsp;Here</h1><p>A &amp; B &lt; C</p></main>");
+
+        assert_eq!(text, "Title Here A & B < C");
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_markdown_fallback_handles_non_ascii_html() {
+        let text = html_to_markdown_lossy("<main><p>创意&nbsp;工作者</p></main>");
+
+        assert_eq!(text, "创意 工作者");
     }
 
     #[cfg(feature = "terminal")]
