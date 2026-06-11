@@ -19,6 +19,7 @@ pub struct ClaudeProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    timeout: Duration,
     tool_call_parser: Option<Arc<dyn ToolCallParser>>,
     token_source: Option<Arc<dyn BearerTokenSource>>,
 }
@@ -29,6 +30,7 @@ impl ClaudeProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: CLAUDE_BASE_URL.to_string(),
+            timeout: Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS),
             tool_call_parser: None,
             token_source: None,
         }
@@ -39,6 +41,7 @@ impl ClaudeProvider {
             client: reqwest::Client::new(),
             api_key: String::new(),
             base_url: CLAUDE_BASE_URL.to_string(),
+            timeout: Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS),
             tool_call_parser: None,
             token_source: Some(token_source),
         }
@@ -46,6 +49,11 @@ impl ClaudeProvider {
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -191,7 +199,7 @@ impl ClaudeProvider {
             .post(endpoint)
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
-            .timeout(Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS));
+            .timeout(self.timeout);
 
         if let Some(token_source) = &self.token_source {
             let token = token_source.get_token().await?;
@@ -592,6 +600,18 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn claude_completion_timeout_defaults_and_can_override() {
+        let provider = ClaudeProvider::new("test-key");
+        assert_eq!(
+            provider.timeout,
+            Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS)
+        );
+
+        let provider = ClaudeProvider::new("test-key").with_timeout(Duration::from_secs(600));
+        assert_eq!(provider.timeout, Duration::from_secs(600));
+    }
 
     struct StaticTokenSource(String);
 

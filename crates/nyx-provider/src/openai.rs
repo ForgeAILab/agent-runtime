@@ -18,6 +18,7 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    timeout: Duration,
     tool_call_parser: Option<Arc<dyn ToolCallParser>>,
 }
 
@@ -27,12 +28,18 @@ impl OpenAiProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: OPENAI_BASE_URL.to_string(),
+            timeout: Duration::from_secs(OPENAI_COMPLETION_TIMEOUT_SECS),
             tool_call_parser: None,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -132,7 +139,7 @@ impl OpenAiProvider {
             .post(endpoint)
             .bearer_auth(&self.api_key)
             .json(&payload)
-            .timeout(Duration::from_secs(OPENAI_COMPLETION_TIMEOUT_SECS))
+            .timeout(self.timeout)
             .send()
             .await?;
 
@@ -427,6 +434,18 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn openai_completion_timeout_defaults_and_can_override() {
+        let provider = OpenAiProvider::new("test-key");
+        assert_eq!(
+            provider.timeout,
+            Duration::from_secs(OPENAI_COMPLETION_TIMEOUT_SECS)
+        );
+
+        let provider = OpenAiProvider::new("test-key").with_timeout(Duration::from_secs(600));
+        assert_eq!(provider.timeout, Duration::from_secs(600));
+    }
 
     #[tokio::test]
     async fn openai_plain_text_response() {

@@ -96,6 +96,8 @@ pub struct ProviderConfig {
     pub supports_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "is_default_retry")]
     pub retry: RetryConfig,
     #[serde(default, skip_serializing_if = "is_default_circuit_breaker")]
@@ -119,6 +121,7 @@ impl Default for ProviderConfig {
             context_window: None,
             supports_vision: None,
             auth_profile: None,
+            timeout_secs: None,
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             min_delay_ms: None,
@@ -167,6 +170,10 @@ impl ProviderConfig {
             .ok()
             .filter(|value| !value.trim().is_empty())
     }
+}
+
+fn configured_timeout(cfg: &ProviderConfig) -> Option<std::time::Duration> {
+    cfg.timeout_secs.map(std::time::Duration::from_secs)
 }
 
 fn default_api_key_env(kind: &str) -> Option<&'static str> {
@@ -250,14 +257,15 @@ fn make_compat(
         .base_url
         .clone()
         .unwrap_or_else(|| default_url.to_string());
-    Ok((
-        Arc::new(crate::compat::OpenAiCompatProvider::new(
-            base_url,
-            api_key,
-            Some(cfg.resolved_model_info(registry)),
-        )),
-        cfg.model.clone(),
-    ))
+    let mut provider = crate::compat::OpenAiCompatProvider::new(
+        base_url,
+        api_key,
+        Some(cfg.resolved_model_info(registry)),
+    );
+    if let Some(timeout) = configured_timeout(cfg) {
+        provider = provider.with_timeout(timeout);
+    }
+    Ok((Arc::new(provider), cfg.model.clone()))
 }
 
 #[cfg(feature = "compat")]
@@ -278,14 +286,15 @@ fn make_compat_no_key(
         .base_url
         .clone()
         .unwrap_or_else(|| default_url.to_string());
-    (
-        Arc::new(crate::compat::OpenAiCompatProvider::new(
-            base_url,
-            api_key,
-            Some(cfg.resolved_model_info(registry)),
-        )),
-        cfg.model.clone(),
-    )
+    let mut provider = crate::compat::OpenAiCompatProvider::new(
+        base_url,
+        api_key,
+        Some(cfg.resolved_model_info(registry)),
+    );
+    if let Some(timeout) = configured_timeout(cfg) {
+        provider = provider.with_timeout(timeout);
+    }
+    (Arc::new(provider), cfg.model.clone())
 }
 
 pub fn build_provider_with_model_registry_and_token_sources(
@@ -305,11 +314,14 @@ pub fn build_provider_with_model_registry_and_token_sources(
         #[cfg(feature = "openai")]
         "openai" => {
             let api_key = resolve_api_key(cfg, "OPENAI_API_KEY")?;
-            let provider = if let Some(base_url) = &cfg.base_url {
+            let mut provider = if let Some(base_url) = &cfg.base_url {
                 crate::openai::OpenAiProvider::new(api_key).with_base_url(base_url.clone())
             } else {
                 crate::openai::OpenAiProvider::new(api_key)
             };
+            if let Some(timeout) = configured_timeout(cfg) {
+                provider = provider.with_timeout(timeout);
+            }
             Ok((Arc::new(provider), cfg.model.clone()))
         }
         #[cfg(not(feature = "openai"))]
@@ -320,11 +332,14 @@ pub fn build_provider_with_model_registry_and_token_sources(
         #[cfg(feature = "claude")]
         "claude" | "anthropic" => {
             let api_key = resolve_api_key(cfg, "ANTHROPIC_API_KEY")?;
-            let provider = if let Some(base_url) = &cfg.base_url {
+            let mut provider = if let Some(base_url) = &cfg.base_url {
                 crate::claude::ClaudeProvider::new(api_key).with_base_url(base_url.clone())
             } else {
                 crate::claude::ClaudeProvider::new(api_key)
             };
+            if let Some(timeout) = configured_timeout(cfg) {
+                provider = provider.with_timeout(timeout);
+            }
             Ok((Arc::new(provider), cfg.model.clone()))
         }
         #[cfg(not(feature = "claude"))]
@@ -346,6 +361,9 @@ pub fn build_provider_with_model_registry_and_token_sources(
             let mut provider = crate::claude::ClaudeProvider::new_with_token_source(token_source);
             if let Some(base_url) = &cfg.base_url {
                 provider = provider.with_base_url(base_url.clone());
+            }
+            if let Some(timeout) = configured_timeout(cfg) {
+                provider = provider.with_timeout(timeout);
             }
             Ok((Arc::new(provider), cfg.model.clone()))
         }
@@ -384,14 +402,15 @@ pub fn build_provider_with_model_registry_and_token_sources(
             let base_url = cfg.base_url.clone().ok_or_else(|| {
                 ProviderError::Rejected("provider.base_url is required for compat".to_string())
             })?;
-            Ok((
-                Arc::new(crate::compat::OpenAiCompatProvider::new(
-                    base_url,
-                    api_key,
-                    Some(cfg.resolved_model_info(registry)),
-                )),
-                cfg.model.clone(),
-            ))
+            let mut provider = crate::compat::OpenAiCompatProvider::new(
+                base_url,
+                api_key,
+                Some(cfg.resolved_model_info(registry)),
+            );
+            if let Some(timeout) = configured_timeout(cfg) {
+                provider = provider.with_timeout(timeout);
+            }
+            Ok((Arc::new(provider), cfg.model.clone()))
         }
         #[cfg(not(feature = "compat"))]
         "compat" => Err(ProviderError::Rejected(
@@ -696,6 +715,85 @@ base_url = "http://localhost:11434/v1"
         assert_eq!(cfg.api_key_env, None);
         assert_eq!(cfg.context_window, None);
         assert_eq!(cfg.supports_vision, None);
+    }
+
+    #[test]
+    fn provider_config_deserializes_timeout_secs_from_toml() {
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+kind = "zai"
+model = "glm-5.1"
+timeout_secs = 600
+"#,
+        )
+        .expect("toml deserializes");
+
+        assert_eq!(cfg.kind, "zai");
+        assert_eq!(cfg.model, "glm-5.1");
+        assert_eq!(cfg.timeout_secs, Some(600));
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn build_zai_provider_accepts_timeout_secs_config() {
+        let cfg = ProviderConfig {
+            kind: "zai".to_string(),
+            model: "glm-5.1".to_string(),
+            api_key: Some(nyx_security::Secret::new("test-key".to_string())),
+            timeout_secs: Some(600),
+            ..Default::default()
+        };
+
+        let (_provider, model) = build_provider(&cfg).expect("zai provider builds");
+        assert_eq!(model, "glm-5.1");
+    }
+
+    #[cfg(feature = "compat")]
+    #[tokio::test]
+    async fn build_zai_provider_applies_timeout_secs_to_requests() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(3))
+                    .set_body_json(serde_json::json!({
+                        "model": "glm-5.1",
+                        "choices": [{"message": {"content": "late success"}}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = ProviderConfig {
+            kind: "zai".to_string(),
+            model: "glm-5.1".to_string(),
+            api_key: Some(nyx_security::Secret::new("test-key".to_string())),
+            base_url: Some(server.uri()),
+            timeout_secs: Some(1),
+            ..Default::default()
+        };
+
+        let (provider, model) = build_provider(&cfg).expect("zai provider builds");
+        let started = std::time::Instant::now();
+        let err = provider
+            .complete(crate::CompletionRequest {
+                model,
+                messages: vec![crate::ProviderMessage::user("hello")],
+                tools: vec![],
+                max_tokens: None,
+                temperature: None,
+                thinking_tokens: None,
+            })
+            .await
+            .expect_err("request should respect configured timeout");
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(matches!(err, crate::ProviderError::Http(ref err) if err.is_timeout()));
     }
 
     #[test]
