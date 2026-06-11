@@ -19,6 +19,7 @@ pub struct ClaudeProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    timeout: Duration,
     tool_call_parser: Option<Arc<dyn ToolCallParser>>,
     token_source: Option<Arc<dyn BearerTokenSource>>,
 }
@@ -29,6 +30,7 @@ impl ClaudeProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: CLAUDE_BASE_URL.to_string(),
+            timeout: Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS),
             tool_call_parser: None,
             token_source: None,
         }
@@ -39,6 +41,7 @@ impl ClaudeProvider {
             client: reqwest::Client::new(),
             api_key: String::new(),
             base_url: CLAUDE_BASE_URL.to_string(),
+            timeout: Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS),
             tool_call_parser: None,
             token_source: Some(token_source),
         }
@@ -46,6 +49,11 @@ impl ClaudeProvider {
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -60,7 +68,7 @@ impl ClaudeProvider {
     ) -> Result<CompletionResponse, ProviderError> {
         let endpoint = format!("{}/messages", self.base_url.trim_end_matches('/'));
         let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
-        let mut system_chunks = Vec::new();
+        let mut system_blocks = Vec::new();
         let mut messages = Vec::new();
 
         for message in req.messages {
@@ -68,13 +76,23 @@ impl ClaudeProvider {
                 ProviderRole::System => {
                     let text = concat_text(&message.content);
                     if !text.is_empty() {
-                        system_chunks.push(text);
+                        system_blocks.push(ClaudeSystemBlock {
+                            kind: "text".to_string(),
+                            text,
+                            cache_control: message.cache_breakpoint.then(cache_control),
+                        });
                     }
                 }
-                ProviderRole::User => messages.push(ClaudeMessage {
-                    role: "user".to_string(),
-                    content: provider_content_to_claude(message.content),
-                }),
+                ProviderRole::User => {
+                    let mut content = provider_content_to_claude(message.content);
+                    if message.cache_breakpoint {
+                        attach_cache_control(&mut content);
+                    }
+                    messages.push(ClaudeMessage {
+                        role: "user".to_string(),
+                        content,
+                    });
+                }
                 ProviderRole::Assistant => {
                     // Try to decode as JSON content blocks (set by the agent for tool_use
                     // round-tripping). Falls back to plain text if it's a normal response.
@@ -91,9 +109,11 @@ impl ClaudeProvider {
                                         name: tool_name_map
                                             .provider_name(b["name"].as_str().unwrap_or("")),
                                         input: b["input"].clone(),
+                                        cache_control: None,
                                     }),
                                     "text" => Some(ClaudeRequestBlock::Text {
                                         text: b["text"].as_str().unwrap_or("").to_string(),
+                                        cache_control: None,
                                     }),
                                     _ => None,
                                 })
@@ -105,6 +125,10 @@ impl ClaudeProvider {
                     } else {
                         provider_content_to_claude(message.content)
                     };
+                    let mut content = content;
+                    if message.cache_breakpoint {
+                        attach_cache_control(&mut content);
+                    }
                     messages.push(ClaudeMessage {
                         role: "assistant".to_string(),
                         content,
@@ -113,25 +137,35 @@ impl ClaudeProvider {
                 ProviderRole::Tool => {
                     if let Some(tool_use_id) = message.tool_call_id {
                         // Native tool calling: wrap in a tool_result content block.
+                        let mut content =
+                            ClaudeRequestContent::Blocks(vec![ClaudeRequestBlock::ToolResult {
+                                tool_use_id,
+                                content: concat_text(&message.content),
+                                cache_control: None,
+                            }]);
+                        if message.cache_breakpoint {
+                            attach_cache_control(&mut content);
+                        }
                         messages.push(ClaudeMessage {
                             role: "user".to_string(),
-                            content: ClaudeRequestContent::Blocks(vec![
-                                ClaudeRequestBlock::ToolResult {
-                                    tool_use_id,
-                                    content: concat_text(&message.content),
-                                },
-                            ]),
+                            content,
                         });
                     } else {
                         // Fallback for plain tool messages (text-based parser flow).
+                        let mut content = ClaudeRequestContent::Text(concat_text(&message.content));
+                        if message.cache_breakpoint {
+                            attach_cache_control(&mut content);
+                        }
                         messages.push(ClaudeMessage {
                             role: "user".to_string(),
-                            content: ClaudeRequestContent::Text(concat_text(&message.content)),
+                            content,
                         });
                     }
                 }
             }
         }
+
+        enforce_cache_control_limit(&mut system_blocks, &mut messages, 4);
 
         let tools: Vec<ClaudeToolDefinition> = req
             .tools
@@ -151,10 +185,10 @@ impl ClaudeProvider {
         let payload = ClaudeMessagesRequest {
             model: req.model,
             max_tokens: req.max_tokens.unwrap_or(1024),
-            system: if system_chunks.is_empty() {
+            system: if system_blocks.is_empty() {
                 None
             } else {
-                Some(system_chunks.join("\n\n"))
+                Some(system_blocks)
             },
             messages,
             temperature: req.temperature,
@@ -167,7 +201,7 @@ impl ClaudeProvider {
             .post(endpoint)
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
-            .timeout(Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS));
+            .timeout(self.timeout);
 
         if let Some(token_source) = &self.token_source {
             let token = token_source.get_token().await?;
@@ -238,17 +272,22 @@ fn provider_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestCon
         match block {
             ProviderContent::Text { text } => {
                 if !text.is_empty() {
-                    blocks.push(ClaudeRequestBlock::Text { text });
+                    blocks.push(ClaudeRequestBlock::Text {
+                        text,
+                        cache_control: None,
+                    });
                 }
             }
             ProviderContent::Image { url, .. } => {
                 if let Some((media_type, data)) = parse_data_uri(&url) {
                     blocks.push(ClaudeRequestBlock::Image {
                         source: ClaudeImageSource::Base64 { media_type, data },
+                        cache_control: None,
                     });
                 } else {
                     blocks.push(ClaudeRequestBlock::Image {
                         source: ClaudeImageSource::Url { url },
+                        cache_control: None,
                     });
                 }
             }
@@ -256,12 +295,67 @@ fn provider_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestCon
     }
 
     if blocks.len() == 1
-        && let ClaudeRequestBlock::Text { text } = &blocks[0]
+        && let ClaudeRequestBlock::Text { text, .. } = &blocks[0]
     {
         return ClaudeRequestContent::Text(text.clone());
     }
 
     ClaudeRequestContent::Blocks(blocks)
+}
+
+fn attach_cache_control(content: &mut ClaudeRequestContent) {
+    match content {
+        ClaudeRequestContent::Text(text) => {
+            let text = std::mem::take(text);
+            *content = ClaudeRequestContent::Blocks(vec![ClaudeRequestBlock::Text {
+                text,
+                cache_control: Some(cache_control()),
+            }]);
+        }
+        ClaudeRequestContent::Blocks(blocks) => {
+            if let Some(last) = blocks.last_mut() {
+                last.set_cache_control(Some(cache_control()));
+            }
+        }
+    }
+}
+
+fn enforce_cache_control_limit(
+    system_blocks: &mut [ClaudeSystemBlock],
+    messages: &mut [ClaudeMessage],
+    max_markers: usize,
+) {
+    let mut markers = system_blocks
+        .iter()
+        .filter(|block| block.cache_control.is_some())
+        .count()
+        + messages
+            .iter()
+            .map(ClaudeMessage::cache_control_count)
+            .sum::<usize>();
+    if markers <= max_markers {
+        return;
+    }
+    for block in system_blocks {
+        if block.cache_control.take().is_some() {
+            markers -= 1;
+            if markers <= max_markers {
+                return;
+            }
+        }
+    }
+    for message in messages {
+        markers = message.clear_cache_controls_until(markers, max_markers);
+        if markers <= max_markers {
+            return;
+        }
+    }
+}
+
+fn cache_control() -> ClaudeCacheControl {
+    ClaudeCacheControl {
+        kind: "ephemeral".to_string(),
+    }
 }
 
 fn parse_data_uri(value: &str) -> Option<(String, String)> {
@@ -340,7 +434,7 @@ struct ClaudeMessagesRequest {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<ClaudeSystemBlock>>,
     messages: Vec<ClaudeMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -356,6 +450,48 @@ struct ClaudeMessage {
     content: ClaudeRequestContent,
 }
 
+impl ClaudeMessage {
+    fn cache_control_count(&self) -> usize {
+        match &self.content {
+            ClaudeRequestContent::Text(_) => 0,
+            ClaudeRequestContent::Blocks(blocks) => blocks
+                .iter()
+                .filter(|block| block.cache_control().is_some())
+                .count(),
+        }
+    }
+
+    fn clear_cache_controls_until(&mut self, mut markers: usize, max_markers: usize) -> usize {
+        let ClaudeRequestContent::Blocks(blocks) = &mut self.content else {
+            return markers;
+        };
+        for block in blocks {
+            if block.set_cache_control(None).is_some() {
+                markers -= 1;
+                if markers <= max_markers {
+                    break;
+                }
+            }
+        }
+        markers
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudeSystemBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<ClaudeCacheControl>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClaudeCacheControl {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 /// Message content: either a plain string (no tool calls) or a list of typed content blocks.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -369,19 +505,50 @@ enum ClaudeRequestContent {
 enum ClaudeRequestBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ClaudeCacheControl>,
     },
     Image {
         source: ClaudeImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ClaudeCacheControl>,
     },
     ToolUse {
         id: String,
         name: String,
         input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ClaudeCacheControl>,
     },
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<ClaudeCacheControl>,
     },
+}
+
+impl ClaudeRequestBlock {
+    fn cache_control(&self) -> Option<&ClaudeCacheControl> {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::Image { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::ToolResult { cache_control, .. } => cache_control.as_ref(),
+        }
+    }
+
+    fn set_cache_control(
+        &mut self,
+        value: Option<ClaudeCacheControl>,
+    ) -> Option<ClaudeCacheControl> {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::Image { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::ToolResult { cache_control, .. } => std::mem::replace(cache_control, value),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -437,6 +604,18 @@ mod tests {
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn claude_completion_timeout_defaults_and_can_override() {
+        let provider = ClaudeProvider::new("test-key");
+        assert_eq!(
+            provider.timeout,
+            Duration::from_secs(CLAUDE_COMPLETION_TIMEOUT_SECS)
+        );
+
+        let provider = ClaudeProvider::new("test-key").with_timeout(Duration::from_secs(600));
+        assert_eq!(provider.timeout, Duration::from_secs(600));
+    }
+
     struct StaticTokenSource(String);
 
     #[async_trait]
@@ -462,6 +641,7 @@ mod tests {
                         text: "What is in this image?".to_string(),
                     },
                 ],
+                cache_breakpoint: false,
                 tool_call_id: None,
             }],
             tools: vec![],
@@ -521,6 +701,7 @@ mod tests {
                     url: "data:image/png;base64,QUJD".to_string(),
                     detail: None,
                 }],
+                cache_breakpoint: false,
                 tool_call_id: None,
             }],
             tools: vec![],
@@ -562,6 +743,95 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(response.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn claude_serializes_cache_control_system_blocks_and_message_breakpoint() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "claude-3-5-sonnet".to_string(),
+            messages: vec![
+                crate::ProviderMessage {
+                    role: crate::ProviderRole::System,
+                    content: vec![crate::ProviderContent::Text {
+                        text: "stable block".to_string(),
+                    }],
+                    cache_breakpoint: true,
+                    tool_call_id: None,
+                },
+                crate::ProviderMessage {
+                    role: crate::ProviderRole::System,
+                    content: vec![crate::ProviderContent::Text {
+                        text: "semi-stable block".to_string(),
+                    }],
+                    cache_breakpoint: true,
+                    tool_call_id: None,
+                },
+                crate::ProviderMessage {
+                    role: crate::ProviderRole::User,
+                    content: vec![crate::ProviderContent::Text {
+                        text: "latest user".to_string(),
+                    }],
+                    cache_breakpoint: true,
+                    tool_call_id: None,
+                },
+            ],
+            tools: vec![],
+            max_tokens: Some(256),
+            temperature: None,
+            thinking_tokens: None,
+        };
+
+        let expected = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 256,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "stable block",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": "semi-stable block",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "latest user",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(body_json(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "claude-3-5-sonnet",
+                "content": [{"type": "text", "text": "cached."}],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 7,
+                    "cache_creation_input_tokens": 9
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = ClaudeProvider::new("test-key").with_base_url(server.uri());
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.content, "cached.");
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.cache_read_tokens, Some(7));
+        assert_eq!(usage.cache_write_tokens, Some(9));
     }
 
     #[tokio::test]

@@ -1,3 +1,9 @@
+//! Layer 1 security capability.
+//!
+//! `nyx-security` owns sandbox execution, path policy helpers, encrypted secret
+//! handling, and optional OAuth/keyring integrations. Callers use trait
+//! boundaries and `Secret<T>` wrappers rather than handling secrets directly.
+
 use std::collections::HashMap;
 use std::fs;
 #[cfg(unix)]

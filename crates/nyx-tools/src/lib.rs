@@ -1,3 +1,9 @@
+//! Layer 2 tool contracts, registries, and built-in tools.
+//!
+//! `nyx-tools` defines the `Tool` trait, `ToolContext`, tool catalog services,
+//! registry helpers, and feature-gated built-ins. Tools receive pre-built
+//! context and use control-plane services for cross-capability access.
+
 mod builtins;
 mod catalog_service;
 mod core;

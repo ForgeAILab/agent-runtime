@@ -19,6 +19,7 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    timeout: Duration,
     tool_call_parser: Option<Arc<dyn ToolCallParser>>,
 }
 
@@ -28,12 +29,18 @@ impl OpenAiProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: OPENAI_BASE_URL.to_string(),
+            timeout: Duration::from_secs(OPENAI_COMPLETION_TIMEOUT_SECS),
             tool_call_parser: None,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -134,7 +141,7 @@ impl OpenAiProvider {
             .post(endpoint)
             .bearer_auth(&self.api_key)
             .json(&payload)
-            .timeout(Duration::from_secs(OPENAI_COMPLETION_TIMEOUT_SECS))
+            .timeout(self.timeout)
             .send()
             .await?;
 
@@ -407,6 +414,12 @@ struct OpenAiFunctionCall {
 struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: Option<u32>,
 }
 
 impl From<OpenAiUsage> for UsageMetadata {
@@ -414,7 +427,9 @@ impl From<OpenAiUsage> for UsageMetadata {
         Self {
             input_tokens: value.prompt_tokens,
             output_tokens: value.completion_tokens,
-            cache_read_tokens: None,
+            cache_read_tokens: value
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens),
             cache_write_tokens: None,
         }
     }
@@ -425,6 +440,18 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn openai_completion_timeout_defaults_and_can_override() {
+        let provider = OpenAiProvider::new("test-key");
+        assert_eq!(
+            provider.timeout,
+            Duration::from_secs(OPENAI_COMPLETION_TIMEOUT_SECS)
+        );
+
+        let provider = OpenAiProvider::new("test-key").with_timeout(Duration::from_secs(600));
+        assert_eq!(provider.timeout, Duration::from_secs(600));
+    }
 
     #[tokio::test]
     async fn openai_plain_text_response() {
@@ -480,6 +507,51 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cache_read_tokens: None,
+                cache_write_tokens: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_usage_maps_cached_prompt_tokens() {
+        let server = MockServer::start().await;
+        let req = CompletionRequest {
+            model: "glm-5.1".to_string(),
+            messages: vec![crate::ProviderMessage::user("hi")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "glm-5.1",
+                "choices": [{"message": {"content": "hello"}}],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 96
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new("test-key").with_base_url(server.uri());
+        let response = provider
+            .complete(req)
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(
+            response.usage,
+            Some(UsageMetadata {
+                input_tokens: 120,
+                output_tokens: 7,
+                cache_read_tokens: Some(96),
                 cache_write_tokens: None,
             })
         );
@@ -615,6 +687,7 @@ mod tests {
                         text: "What is in this image?".to_string(),
                     },
                 ],
+                cache_breakpoint: false,
                 tool_call_id: None,
             }],
             tools: vec![],

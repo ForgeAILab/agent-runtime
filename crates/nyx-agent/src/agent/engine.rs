@@ -171,7 +171,11 @@ impl ToolLoopEngine {
 
             let is_final_turn = turn + 1 == self.max_steps;
             log_prompt_breakdown(turn, &history);
-            let mut request_messages = to_provider_messages(&history, config.convert_file_urls);
+            let mut request_messages = to_provider_messages_for_request(
+                &history,
+                config.convert_file_urls,
+                ctx.cache_hints,
+            );
             if is_final_turn {
                 request_messages.push(final_turn_system_message(turn, self.max_steps));
             }
@@ -215,8 +219,11 @@ impl ToolLoopEngine {
                         );
                     }
 
-                    let mut retry_messages =
-                        to_provider_messages(&history, config.convert_file_urls);
+                    let mut retry_messages = to_provider_messages_for_request(
+                        &history,
+                        config.convert_file_urls,
+                        ctx.cache_hints,
+                    );
                     if is_final_turn {
                         retry_messages.push(final_turn_system_message(turn, self.max_steps));
                     }
@@ -743,16 +750,15 @@ fn apply_budget_trimming(history: &mut Vec<Message>, token_budget: usize) {
     if estimator.count_messages(history) <= token_budget || history.len() <= 2 {
         return;
     }
-    let mut preserved = Vec::new();
-    if let Some(first) = history.first()
-        && matches!(first.role, MessageRole::System)
-    {
-        preserved.push(first.clone());
-    }
+    let system_prefix_len = history
+        .iter()
+        .take_while(|message| matches!(message.role, MessageRole::System))
+        .count();
+    let mut preserved = history[..system_prefix_len].to_vec();
     let body = if preserved.is_empty() {
         history.clone()
     } else {
-        history[1..].to_vec()
+        history[system_prefix_len..].to_vec()
     };
     let mut kept_recent = body
         .into_iter()
@@ -761,15 +767,20 @@ fn apply_budget_trimming(history: &mut Vec<Message>, token_budget: usize) {
         .collect::<Vec<_>>();
     kept_recent.reverse();
     preserved.extend(kept_recent);
-    while estimator.count_messages(&preserved) > token_budget && preserved.len() > 2 {
+    let removal_floor = system_prefix_len;
+    while estimator.count_messages(&preserved) > token_budget
+        && preserved.len() > removal_floor.saturating_add(1)
+    {
         if let Some(idx) = preserved
             .iter()
-            .position(|m| matches!(m.role, MessageRole::Tool))
+            .enumerate()
+            .skip(removal_floor)
+            .find_map(|(idx, m)| matches!(m.role, MessageRole::Tool).then_some(idx))
         {
             preserved.remove(idx);
             continue;
         }
-        preserved.remove(1);
+        preserved.remove(removal_floor);
     }
     *history = preserved;
 }
@@ -841,10 +852,53 @@ pub(crate) fn to_provider_messages(
                         },
                     })
                     .collect(),
+                cache_breakpoint: message.cache_breakpoint,
                 tool_call_id: message.tool_call_id.clone(),
             }
         })
         .collect()
+}
+
+fn to_provider_messages_for_request(
+    history: &[Message],
+    convert_file_urls: bool,
+    cache_hints: bool,
+) -> Vec<ProviderMessage> {
+    if !cache_hints {
+        let mut messages = to_provider_messages(history, convert_file_urls);
+        for message in &mut messages {
+            message.cache_breakpoint = false;
+        }
+        return messages;
+    }
+
+    let mut request_history = history.to_vec();
+    if let Some(last) = request_history.last_mut() {
+        last.cache_breakpoint = true;
+    }
+    let mut messages = to_provider_messages(&request_history, convert_file_urls);
+    enforce_cache_breakpoint_limit(&mut messages, 4);
+    messages
+}
+
+fn enforce_cache_breakpoint_limit(messages: &mut [ProviderMessage], max_markers: usize) {
+    let mut markers = messages
+        .iter()
+        .filter(|message| message.cache_breakpoint)
+        .count();
+    if markers <= max_markers {
+        return;
+    }
+    for message in messages {
+        if !message.cache_breakpoint {
+            continue;
+        }
+        message.cache_breakpoint = false;
+        markers -= 1;
+        if markers <= max_markers {
+            break;
+        }
+    }
 }
 
 pub(crate) fn build_assistant_content(completion: &CompletionResponse) -> String {
@@ -966,6 +1020,7 @@ fn final_turn_system_message(turn: usize, max_steps: usize) -> ProviderMessage {
                 max_steps
             ),
         }],
+        cache_breakpoint: false,
         tool_call_id: None,
     }
 }
@@ -985,7 +1040,8 @@ mod tests {
 
     use super::{
         ToolLoopConfig, ToolLoopEngine, apply_budget_trimming, estimate_provider_request_tokens,
-        log_prompt_breakdown, short_tool_error, truncate_head_tail,
+        log_prompt_breakdown, short_tool_error, to_provider_messages_for_request,
+        truncate_head_tail,
     };
     use crate::{
         AgentContext, AgentError, ContextCompressor, Message, MessageRole, TokenEstimator,
@@ -1097,6 +1153,7 @@ mod tests {
                     thinking_tokens: None,
                     cancel: tokio_util::sync::CancellationToken::new(),
                     suppress_progressive: false,
+                    cache_hints: true,
                     auto_approve: false,
                 },
                 &ToolLoopConfig {
@@ -1139,6 +1196,7 @@ mod tests {
                     thinking_tokens: None,
                     cancel: tokio_util::sync::CancellationToken::new(),
                     suppress_progressive: false,
+                    cache_hints: true,
                     auto_approve: false,
                 },
                 &ToolLoopConfig {
@@ -1173,6 +1231,58 @@ mod tests {
     }
 
     #[test]
+    fn apply_budget_trimming_preserves_leading_system_run() {
+        let mut stable = Message::text(MessageRole::System, "stable system");
+        stable.cache_breakpoint = true;
+        let mut semi_stable = Message::text(MessageRole::System, "semi-stable system");
+        semi_stable.cache_breakpoint = true;
+        let mut history = vec![
+            stable.clone(),
+            semi_stable.clone(),
+            Message::user("old user ".repeat(500)),
+            Message::assistant("old assistant ".repeat(500)),
+            Message::user("latest"),
+        ];
+
+        apply_budget_trimming(&mut history, 80);
+
+        assert_eq!(history[0], stable);
+        assert_eq!(history[1], semi_stable);
+        assert_eq!(
+            history.last().and_then(|m| m.content[0].as_text()),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn provider_conversion_forwards_cache_breakpoints_and_marks_latest_history() {
+        let mut stable = Message::text(MessageRole::System, "stable");
+        stable.cache_breakpoint = true;
+        let mut semi_stable = Message::text(MessageRole::System, "semi-stable");
+        semi_stable.cache_breakpoint = true;
+        let history = vec![stable, semi_stable, Message::user("latest")];
+
+        let messages = to_provider_messages_for_request(&history, false, true);
+
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].cache_breakpoint);
+        assert!(messages[1].cache_breakpoint);
+        assert!(messages[2].cache_breakpoint);
+    }
+
+    #[test]
+    fn provider_conversion_disables_cache_breakpoints_when_policy_disables_hints() {
+        let mut stable = Message::text(MessageRole::System, "stable");
+        stable.cache_breakpoint = true;
+        let history = vec![stable, Message::user("latest")];
+
+        let messages = to_provider_messages_for_request(&history, false, false);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| !message.cache_breakpoint));
+    }
+
+    #[test]
     fn preflight_trims_workspace_memory_history_and_tool_results_under_budget() {
         let sink = CaptureSink::new();
         let engine = ToolLoopEngine::new("small-context-model", 1);
@@ -1196,6 +1306,7 @@ mod tests {
             thinking_tokens: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             suppress_progressive: false,
+            cache_hints: true,
             auto_approve: false,
         };
         let mut tools = vec![ToolDefinition {
@@ -1222,6 +1333,7 @@ mod tests {
             ProviderMessage {
                 role: ProviderRole::Tool,
                 content: vec![ProviderContent::text("tool output ".repeat(800))],
+                cache_breakpoint: false,
                 tool_call_id: Some("call-1".to_string()),
             },
             ProviderMessage::user("latest user request"),

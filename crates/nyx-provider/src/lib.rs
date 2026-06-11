@@ -1,3 +1,9 @@
+//! Layer 1 LLM provider contracts and adapters.
+//!
+//! `nyx-provider` defines provider request/response types, the `LlmProvider`
+//! trait, provider wrappers, tool-call parsing, fallback/rate-limit layers, and
+//! model metadata registries. Concrete provider integrations are feature-gated.
+
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -57,6 +63,7 @@ impl ProviderContent {
 pub struct ProviderMessage {
     pub role: ProviderRole,
     pub content: Vec<ProviderContent>,
+    pub cache_breakpoint: bool,
     /// Tool use ID for `Tool` role messages — correlates with the assistant `tool_use` block.
     pub tool_call_id: Option<String>,
 }
@@ -66,6 +73,7 @@ impl ProviderMessage {
         Self {
             role,
             content: vec![ProviderContent::text(content)],
+            cache_breakpoint: false,
             tool_call_id: None,
         }
     }
@@ -90,6 +98,7 @@ impl ProviderMessage {
         Self {
             role: ProviderRole::Tool,
             content: vec![ProviderContent::text(content)],
+            cache_breakpoint: false,
             tool_call_id: Some(id.into()),
         }
     }
