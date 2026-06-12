@@ -1,13 +1,14 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use super::error::CostError;
 use super::types::{
-    ChannelUsage, ModelUsage, UsageFilter, UsageGroupBy, UsageRecord, UsageSummary,
+    ChannelUsage, CostStore, ModelUsage, UsageFilter, UsageGroupBy, UsageRecord, UsageSummary,
 };
+#[cfg(feature = "cost-sqlite")]
+use std::sync::Arc;
 
 #[cfg(feature = "cost-sqlite")]
 const NYX_PROVIDER_NAMESPACE: &str = "nyx-provider";
@@ -34,12 +35,6 @@ const NYX_PROVIDER_MIGRATIONS: &[(u32, &str, &str)] = &[(
 #[cfg(feature = "cost-sqlite")]
 pub fn cost_migrations() -> (&'static str, &'static [(u32, &'static str, &'static str)]) {
     (NYX_PROVIDER_NAMESPACE, NYX_PROVIDER_MIGRATIONS)
-}
-
-#[async_trait]
-pub trait CostStore: Send + Sync {
-    async fn record(&self, r: UsageRecord) -> Result<(), CostError>;
-    async fn summary(&self, filter: UsageFilter) -> Result<UsageSummary, CostError>;
 }
 
 #[derive(Debug)]
@@ -367,10 +362,10 @@ fn summarize_records<'a>(
     }
 }
 
-pub type SharedCostStore = Arc<dyn CostStore>;
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::cost::{BudgetPolicy, BudgetWindow, CostTracker, PriceTable};
 
     use super::*;

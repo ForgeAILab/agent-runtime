@@ -372,7 +372,6 @@ pub mod testing {
 #[cfg(feature = "oauth")]
 pub mod auth;
 
-#[cfg(feature = "cost")]
 pub mod cost;
 #[cfg(feature = "cost-sqlite")]
 pub use cost::cost_migrations;

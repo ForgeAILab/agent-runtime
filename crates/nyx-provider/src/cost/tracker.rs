@@ -8,8 +8,7 @@ use time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
 
 use super::error::CostError;
 use super::price::PriceTable;
-use super::store::SharedCostStore;
-use super::types::{BudgetPolicy, BudgetWindow, UsageFilter, UsageRecord};
+use super::types::{BudgetPolicy, BudgetWindow, SharedCostStore, UsageFilter, UsageRecord};
 
 #[derive(Clone)]
 pub struct CostTracker {

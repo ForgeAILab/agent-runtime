@@ -1,13 +1,28 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+#[cfg(feature = "cost")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "cost")]
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-
+use super::error::CostError;
+#[cfg(feature = "cost")]
 use super::price::PriceOverride;
 
 pub use nyx_core::{
     ChannelUsage, ModelUsage, UsageFilter, UsageGroupBy, UsageRecord, UsageSummary,
 };
 
+#[async_trait]
+pub trait CostStore: Send + Sync {
+    async fn record(&self, r: UsageRecord) -> Result<(), CostError>;
+    async fn summary(&self, filter: UsageFilter) -> Result<UsageSummary, CostError>;
+}
+
+pub type SharedCostStore = Arc<dyn CostStore>;
+
+#[cfg(feature = "cost")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetWindow {
@@ -18,6 +33,7 @@ pub enum BudgetWindow {
     Lifetime,
 }
 
+#[cfg(feature = "cost")]
 impl BudgetWindow {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -29,6 +45,7 @@ impl BudgetWindow {
     }
 }
 
+#[cfg(feature = "cost")]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct BudgetPolicy {
     pub hard_limit_usd: Option<f64>,
@@ -37,10 +54,12 @@ pub struct BudgetPolicy {
     pub window: BudgetWindow,
 }
 
+#[cfg(feature = "cost")]
 fn default_enabled() -> bool {
     false
 }
 
+#[cfg(feature = "cost")]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CostConfig {
     #[serde(default = "default_enabled")]
