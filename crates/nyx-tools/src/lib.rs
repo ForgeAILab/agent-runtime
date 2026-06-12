@@ -59,14 +59,23 @@ pub fn build_tools(sandbox: Arc<dyn Sandbox>) -> Result<Vec<Arc<dyn Tool>>, Regi
     #[cfg(not(feature = "terminal"))]
     {
         let mut registry = ToolRegistry::new();
-        register_builtins(&mut registry, sandbox)?;
-        #[cfg(feature = "permission")]
-        registry.register(Arc::new(RequestPermissionTool::default()))?;
-        #[cfg(feature = "session")]
-        registry.register(Arc::new(SessionTool))?;
-        registry.register(Arc::new(ToolTool))?;
-        Ok(registry.seal())
+        register_default_tools(&mut registry, sandbox)?;
+        Ok(registry.seal().into_tools())
     }
+}
+
+#[cfg(not(feature = "terminal"))]
+pub fn register_default_tools(
+    registry: &mut ToolRegistry,
+    sandbox: Arc<dyn Sandbox>,
+) -> Result<(), RegistryError> {
+    register_builtins(registry, sandbox)?;
+    #[cfg(feature = "permission")]
+    registry.register(Arc::new(RequestPermissionTool::default()))?;
+    #[cfg(feature = "session")]
+    registry.register(Arc::new(SessionTool))?;
+    registry.register(Arc::new(ToolTool))?;
+    Ok(())
 }
 
 #[cfg(feature = "terminal")]
@@ -75,13 +84,23 @@ pub fn build_tools_with_terminal_registry(
     terminal_registry: Arc<TerminalRegistry>,
 ) -> Result<Vec<Arc<dyn Tool>>, RegistryError> {
     let mut registry = ToolRegistry::new();
-    register_builtins(&mut registry, sandbox, terminal_registry)?;
+    register_default_tools_with_terminal_registry(&mut registry, sandbox, terminal_registry)?;
+    Ok(registry.seal().into_tools())
+}
+
+#[cfg(feature = "terminal")]
+pub fn register_default_tools_with_terminal_registry(
+    registry: &mut ToolRegistry,
+    sandbox: Arc<dyn Sandbox>,
+    terminal_registry: Arc<TerminalRegistry>,
+) -> Result<(), RegistryError> {
+    register_builtins(registry, sandbox, terminal_registry)?;
     #[cfg(feature = "permission")]
     registry.register(Arc::new(RequestPermissionTool::default()))?;
     #[cfg(feature = "session")]
     registry.register(Arc::new(SessionTool))?;
     registry.register(Arc::new(ToolTool))?;
-    Ok(registry.seal())
+    Ok(())
 }
 
 #[cfg(test)]
