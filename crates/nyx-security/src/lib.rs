@@ -469,7 +469,7 @@ pub mod testing {
 
             let mut master_raw: libc::c_int = 0;
             let mut slave_raw: libc::c_int = 0;
-            let mut ws = libc::winsize {
+            let ws = libc::winsize {
                 ws_row: rows,
                 ws_col: cols,
                 ws_xpixel: 0,
@@ -481,7 +481,7 @@ pub mod testing {
                     &mut slave_raw,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut ws,
+                    &ws,
                 )
             };
             if ret != 0 {
