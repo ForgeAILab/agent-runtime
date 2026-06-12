@@ -26,6 +26,30 @@ mod secret;
 pub use config::{SecurityConfig, build_sandbox, build_sandbox_at_root, build_secret_store};
 pub use secret::{Secret, decrypt, derive_master_key, encrypt};
 
+pub(crate) const MASTER_KEY_ENV: &str = "NYX_MASTER_KEY";
+pub(crate) const DEPRECATED_MASTER_KEY_ENV: &str = "NYX_SECURITY_MASTER_KEY";
+
+pub(crate) fn master_key_from_env() -> Option<String> {
+    if let Ok(value) = std::env::var(MASTER_KEY_ENV)
+        && !value.is_empty()
+    {
+        return Some(value);
+    }
+
+    if let Ok(value) = std::env::var(DEPRECATED_MASTER_KEY_ENV)
+        && !value.is_empty()
+    {
+        tracing::warn!(
+            deprecated_env = DEPRECATED_MASTER_KEY_ENV,
+            replacement_env = MASTER_KEY_ENV,
+            "deprecated master key environment variable is configured"
+        );
+        return Some(value);
+    }
+
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxedCommand {
     pub program: String,
@@ -165,7 +189,7 @@ impl Default for SandboxPolicy {
 pub enum SecretError {
     #[error("secret key not found: {0}")]
     NotFound(String),
-    #[error("master key not configured; set NYX_SECURITY_MASTER_KEY or keyring item {0}")]
+    #[error("master key not configured; set NYX_MASTER_KEY or keyring item {0}")]
     MissingMasterKey(&'static str),
     #[error("cryptography error: {0}")]
     Crypto(String),
@@ -398,6 +422,17 @@ pub fn cleanup_temp_media(path: &Path) -> Result<(), SecurityError> {
         fs::remove_file(path).map_err(SandboxError::Io)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().expect("env lock")
+    }
 }
 
 pub mod testing {

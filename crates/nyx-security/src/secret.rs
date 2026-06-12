@@ -22,7 +22,6 @@ use crate::encrypted::EncryptedSecretStore;
 const ENC_PREFIX: &str = "enc:";
 const ENV_PREFIX: &str = "env:";
 const VAULT_PREFIX: &str = "vault:";
-const MASTER_KEY_ENV: &str = "NYX_MASTER_KEY";
 const MASTER_KEY_FILE_ENV: &str = "NYX_MASTER_KEY_FILE";
 const KEY_DERIVATION_SALT: &[u8] = b"nyx.config.secret.v1";
 const NONCE_LEN: usize = 12;
@@ -119,22 +118,21 @@ where
     }
 }
 
-pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> String {
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key is always valid");
+pub fn encrypt(plaintext: &str, key: &[u8]) -> Result<String, SecurityError> {
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
     let mut nonce_bytes = [0_u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
-        .expect("AES-256-GCM encryption should not fail with valid key/nonce");
+        .map_err(|err| SecurityError::EncryptionFailed(err.to_string()))?;
 
     let mut payload = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     payload.extend_from_slice(&nonce_bytes);
     payload.extend_from_slice(&ciphertext);
 
-    let encrypted = format!("{ENC_PREFIX}{}", BASE64.encode(payload));
-    // tracing::info!(plaintext, encrypted = %encrypted, "nyx-security secret::encrypt");
-    encrypted
+    Ok(format!("{ENC_PREFIX}{}", BASE64.encode(payload)))
 }
 
 pub fn decrypt(ciphertext: &str, key: &[u8; 32]) -> Result<String, SecurityError> {
@@ -155,15 +153,13 @@ pub fn decrypt(ciphertext: &str, key: &[u8; 32]) -> Result<String, SecurityError
         .decrypt(Nonce::from_slice(nonce_bytes), encrypted)
         .map_err(|_| SecurityError::DecryptionFailed)?;
 
-    let plaintext = String::from_utf8(plaintext).map_err(|_| SecurityError::InvalidUtf8Secret)?;
-    // tracing::info!(ciphertext, plaintext = %plaintext, "nyx-security secret::decrypt");
-    Ok(plaintext)
+    String::from_utf8(plaintext).map_err(|_| SecurityError::InvalidUtf8Secret)
 }
 
 pub fn derive_master_key() -> Result<[u8; 32], SecurityError> {
-    let passphrase = match std::env::var(MASTER_KEY_ENV) {
-        Ok(value) if !value.is_empty() => value,
-        _ => {
+    let passphrase = match crate::master_key_from_env() {
+        Some(value) => value,
+        None => {
             #[cfg(feature = "keyring")]
             {
                 if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
@@ -285,12 +281,17 @@ fn resolve_vault_secret(key_name: &str) -> Result<String, SecurityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::{DEPRECATED_MASTER_KEY_ENV, MASTER_KEY_ENV, test_support};
 
     fn test_key() -> [u8; 32] {
         [7_u8; 32]
+    }
+
+    fn clear_master_key_env() {
+        unsafe {
+            std::env::remove_var(MASTER_KEY_ENV);
+            std::env::remove_var(DEPRECATED_MASTER_KEY_ENV);
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -308,7 +309,7 @@ mod tests {
     #[test]
     fn decrypt_round_trip() {
         let key = test_key();
-        let encrypted = encrypt("hello world", &key);
+        let encrypted = encrypt("hello world", &key).expect("encrypt should succeed");
         let decrypted = decrypt(&encrypted, &key).expect("decrypt should succeed");
         assert_eq!(decrypted, "hello world");
     }
@@ -316,15 +317,21 @@ mod tests {
     #[test]
     fn encrypt_uses_unique_nonce() {
         let key = test_key();
-        let a = encrypt("same", &key);
-        let b = encrypt("same", &key);
+        let a = encrypt("same", &key).expect("encrypt should succeed");
+        let b = encrypt("same", &key).expect("encrypt should succeed");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn encrypt_bad_key_length_returns_error() {
+        let err = encrypt("secret", b"short").expect_err("bad key length should fail");
+        assert!(matches!(err, SecurityError::EncryptionFailed(_)));
     }
 
     #[test]
     fn decrypt_tampered_ciphertext_fails() {
         let key = test_key();
-        let encrypted = encrypt("secret", &key);
+        let encrypted = encrypt("secret", &key).expect("encrypt should succeed");
         let mut tampered = encrypted.into_bytes();
         let last = tampered.len() - 1;
         tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
@@ -343,7 +350,7 @@ mod tests {
 
     #[test]
     fn deserialize_env_secret() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = test_support::env_lock();
         unsafe { std::env::set_var("NYX_SECRET_TEST", "from-env") };
         let doc: SecretDoc = toml::from_str("value = \"env:NYX_SECRET_TEST\"").expect("parse");
         assert_eq!(doc.value.reveal(), "from-env");
@@ -352,7 +359,7 @@ mod tests {
 
     #[test]
     fn deserialize_missing_env_secret_fails() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = test_support::env_lock();
         unsafe { std::env::remove_var("NYX_SECRET_MISSING") };
         let err = toml::from_str::<SecretDoc>("value = \"env:NYX_SECRET_MISSING\"")
             .expect_err("missing env should fail");
@@ -361,18 +368,30 @@ mod tests {
 
     #[test]
     fn deserialize_encrypted_secret() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        unsafe { std::env::set_var("NYX_MASTER_KEY", "test-master-key") };
+        let _guard = test_support::env_lock();
+        clear_master_key_env();
+        unsafe { std::env::set_var(MASTER_KEY_ENV, "test-master-key") };
         let key = derive_master_key().expect("derive key");
-        let encrypted = encrypt("top-secret", &key);
+        let encrypted = encrypt("top-secret", &key).expect("encrypt should succeed");
         let doc: SecretDoc = toml::from_str(&format!("value = \"{encrypted}\"")).expect("parse");
         assert_eq!(doc.value.reveal(), "top-secret");
-        unsafe { std::env::remove_var("NYX_MASTER_KEY") };
+        clear_master_key_env();
+    }
+
+    #[test]
+    fn derive_master_key_honors_deprecated_env_fallback() {
+        let _guard = test_support::env_lock();
+        clear_master_key_env();
+        unsafe { std::env::set_var(DEPRECATED_MASTER_KEY_ENV, "legacy-master-key") };
+        let key = derive_master_key().expect("derive key");
+        let expected = derive_key_from_passphrase(b"legacy-master-key").expect("derive expected");
+        assert_eq!(key, expected);
+        clear_master_key_env();
     }
 
     #[test]
     fn deserialize_non_string_type_via_env() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = test_support::env_lock();
         #[derive(Debug, Deserialize)]
         struct PortDoc {
             port: Secret<u16>,
@@ -388,10 +407,11 @@ mod tests {
     fn deserialize_vault_secret() {
         use crate::encrypted::EncryptedSecretStore;
 
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = test_support::env_lock();
+        clear_master_key_env();
         let dir = tempfile::TempDir::new().expect("tmp");
         unsafe { std::env::set_var("NYX_VAULT_PATH", dir.path().join(".secrets")) };
-        unsafe { std::env::set_var("NYX_MASTER_KEY", "vault-master") };
+        unsafe { std::env::set_var(MASTER_KEY_ENV, "vault-master") };
         let key = derive_master_key().expect("derive");
         let store = EncryptedSecretStore::from_derived_key_with_storage(
             key,
@@ -403,22 +423,23 @@ mod tests {
 
         let doc: SecretDoc = toml::from_str("value = \"vault:test_key\"").expect("parse");
         assert_eq!(doc.value.reveal(), "vault-value");
-        unsafe { std::env::remove_var("NYX_MASTER_KEY") };
+        clear_master_key_env();
         unsafe { std::env::remove_var("NYX_VAULT_PATH") };
     }
 
     #[test]
     #[cfg(feature = "encrypted")]
     fn deserialize_missing_vault_secret_fails() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = test_support::env_lock();
+        clear_master_key_env();
         let dir = tempfile::TempDir::new().expect("tmp");
         unsafe { std::env::set_var("NYX_VAULT_PATH", dir.path().join(".secrets")) };
-        unsafe { std::env::set_var("NYX_MASTER_KEY", "vault-master") };
+        unsafe { std::env::set_var(MASTER_KEY_ENV, "vault-master") };
 
         let err = toml::from_str::<SecretDoc>("value = \"vault:missing_key\"")
             .expect_err("missing vault key should fail");
         assert!(err.to_string().contains("missing_key"));
-        unsafe { std::env::remove_var("NYX_MASTER_KEY") };
+        clear_master_key_env();
         unsafe { std::env::remove_var("NYX_VAULT_PATH") };
     }
 }

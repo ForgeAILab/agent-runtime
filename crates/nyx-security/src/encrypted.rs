@@ -11,7 +11,6 @@ use tokio::sync::RwLock;
 
 use crate::{Secret, SecretError, SecretStore};
 
-const MASTER_KEY_ENV: &str = "NYX_SECURITY_MASTER_KEY";
 #[cfg(feature = "keyring")]
 const KEYRING_SERVICE: &str = "nyx.security.master_key";
 #[cfg(feature = "keyring")]
@@ -32,12 +31,12 @@ pub struct EncryptedSecretStore {
 }
 
 impl EncryptedSecretStore {
-    /// Default constructor: checks `NYX_SECURITY_MASTER_KEY` env var first,
-    /// then the OS keychain (if the `keyring` feature is enabled), then
-    /// loads or creates a random key at `key_path` (0600 permissions on unix).
-    /// No subprocess is ever spawned.
+    /// Default constructor: checks `NYX_MASTER_KEY` env var first, then the
+    /// deprecated `NYX_SECURITY_MASTER_KEY` fallback, then the OS keychain (if
+    /// the `keyring` feature is enabled), then loads or creates a random key at
+    /// `key_path` (0600 permissions on unix). No subprocess is ever spawned.
     pub fn from_env_or_file(key_path: &Path) -> Result<Self, SecretError> {
-        if let Ok(passphrase) = std::env::var(MASTER_KEY_ENV) {
+        if let Some(passphrase) = crate::master_key_from_env() {
             return Ok(Self::from_passphrase(passphrase.as_bytes()));
         }
 
@@ -115,9 +114,9 @@ impl EncryptedSecretStore {
             ciphertext: hex_encode(&ciphertext),
         };
         tracing::debug!(
-            plaintext = %String::from_utf8_lossy(secret.expose()),
-            nonce = %encrypted.nonce,
-            ciphertext = %encrypted.ciphertext,
+            plaintext_len = secret.expose().len(),
+            nonce_len = nonce_bytes.len(),
+            ciphertext_len = ciphertext.len(),
             "nyx-security encrypted store encrypt"
         );
         Ok(encrypted)
@@ -134,9 +133,9 @@ impl EncryptedSecretStore {
             .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
             .map_err(|err| SecretError::Crypto(format!("decrypt failed: {err}")))?;
         tracing::trace!(
-            nonce = %secret.nonce,
-            ciphertext = %secret.ciphertext,
-            plaintext = %String::from_utf8_lossy(&plaintext),
+            nonce_len = nonce_bytes.len(),
+            ciphertext_len = ciphertext.len(),
+            plaintext_len = plaintext.len(),
             "nyx-security encrypted store decrypt"
         );
         Ok(Secret::from_bytes(plaintext))
@@ -168,8 +167,8 @@ impl SecretStore for EncryptedSecretStore {
             .ok_or_else(|| SecretError::NotFound(key.to_string()))?;
         tracing::trace!(
             key,
-            nonce = %encrypted.nonce,
-            ciphertext = %encrypted.ciphertext,
+            nonce_len = encrypted.nonce.len() / 2,
+            ciphertext_len = encrypted.ciphertext.len() / 2,
             "nyx-security encrypted store get"
         );
         self.decrypt(encrypted)
@@ -179,9 +178,9 @@ impl SecretStore for EncryptedSecretStore {
         let encrypted = self.encrypt(&value)?;
         tracing::trace!(
             key,
-            plaintext = %String::from_utf8_lossy(value.expose()),
-            nonce = %encrypted.nonce,
-            ciphertext = %encrypted.ciphertext,
+            plaintext_len = value.expose().len(),
+            nonce_len = encrypted.nonce.len() / 2,
+            ciphertext_len = encrypted.ciphertext.len() / 2,
             "nyx-security encrypted store set"
         );
         let mut guard = self.entries.write().await;
@@ -288,29 +287,60 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DEPRECATED_MASTER_KEY_ENV, MASTER_KEY_ENV};
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
+
+    struct MasterKeyEnvGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl MasterKeyEnvGuard {
+        fn new() -> Self {
+            let guard = crate::test_support::env_lock();
+            clear_master_key_env();
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for MasterKeyEnvGuard {
+        fn drop(&mut self) {
+            clear_master_key_env();
+        }
+    }
+
+    fn clear_master_key_env() {
+        unsafe {
+            std::env::remove_var(MASTER_KEY_ENV);
+            std::env::remove_var(DEPRECATED_MASTER_KEY_ENV);
+        }
+    }
 
     fn store_in(tmp: &TempDir) -> EncryptedSecretStore {
         let key_path = tmp.path().join(".secret_key");
         EncryptedSecretStore::from_env_or_file(&key_path).expect("from_env_or_file should succeed")
     }
 
-    #[tokio::test]
-    async fn encrypted_secret_store_round_trips_secret() {
+    #[test]
+    fn encrypted_secret_store_round_trips_secret() {
+        let _env = MasterKeyEnvGuard::new();
         let tmp = TempDir::new().unwrap();
         let store = store_in(&tmp);
 
-        store
-            .set("openai_api_key", Secret::from_string("super-secret-key"))
-            .await
-            .expect("set secret");
+        futures::executor::block_on(async {
+            store
+                .set("openai_api_key", Secret::from_string("super-secret-key"))
+                .await
+                .expect("set secret");
 
-        let value = store.get("openai_api_key").await.expect("read secret back");
-        assert_eq!(value.expose(), b"super-secret-key");
+            let value = store.get("openai_api_key").await.expect("read secret back");
+            assert_eq!(value.expose(), b"super-secret-key");
+        });
     }
 
-    #[tokio::test]
-    async fn creates_key_file_on_first_use() {
+    #[test]
+    fn creates_key_file_on_first_use() {
+        let _env = MasterKeyEnvGuard::new();
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
         assert!(!key_path.exists());
@@ -322,26 +352,47 @@ mod tests {
         assert_eq!(hex.len(), 64, "32 bytes = 64 hex chars");
     }
 
-    #[tokio::test]
-    async fn secrets_survive_process_restart() {
+    #[test]
+    fn secrets_survive_process_restart() {
+        let _env = MasterKeyEnvGuard::new();
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
 
         // First "process": write a secret
         {
             let store = EncryptedSecretStore::from_env_or_file(&key_path).unwrap();
-            store
-                .set("provider.api_key", Secret::from_string("sk-test-123"))
-                .await
-                .unwrap();
+            futures::executor::block_on(async {
+                store
+                    .set("provider.api_key", Secret::from_string("sk-test-123"))
+                    .await
+                    .unwrap();
+            });
         }
 
         // Second "process": re-open and read back
         {
             let store = EncryptedSecretStore::from_env_or_file(&key_path).unwrap();
-            let secret = store.get("provider.api_key").await.unwrap();
+            let secret = futures::executor::block_on(store.get("provider.api_key")).unwrap();
             assert_eq!(secret.expose(), b"sk-test-123");
         }
+    }
+
+    #[test]
+    fn deprecated_master_key_env_fallback_is_honored() {
+        let _env = MasterKeyEnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        unsafe { std::env::set_var(DEPRECATED_MASTER_KEY_ENV, "deprecated-master-key") };
+
+        let store = EncryptedSecretStore::from_env_or_file(&key_path)
+            .expect("deprecated env fallback should build store");
+        let expected = EncryptedSecretStore::from_passphrase(b"deprecated-master-key");
+
+        assert_eq!(store.key, expected.key);
+        assert!(
+            !key_path.exists(),
+            "env-derived store should not create a key file"
+        );
     }
 
     #[test]
@@ -353,6 +404,7 @@ mod tests {
 
     #[test]
     fn corrupt_key_file_returns_error() {
+        let _env = MasterKeyEnvGuard::new();
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
         std::fs::write(&key_path, "not-valid-hex!!").unwrap();
@@ -362,6 +414,7 @@ mod tests {
 
     #[test]
     fn wrong_length_key_file_returns_error() {
+        let _env = MasterKeyEnvGuard::new();
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
         // 16 bytes = 32 hex chars, not 32 bytes
