@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -14,6 +15,7 @@ use crate::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const CODEX_COMPLETION_TIMEOUT_SECS: u64 = 120;
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
 #[derive(Clone)]
@@ -24,6 +26,7 @@ pub struct OpenAiCodexProvider {
     gateway_api_key: Option<String>,
     client: reqwest::Client,
     model: String,
+    timeout: Duration,
 }
 
 impl OpenAiCodexProvider {
@@ -35,6 +38,10 @@ impl OpenAiCodexProvider {
             gateway_api_key: cfg.api_key.as_ref().map(|s| s.reveal().clone()),
             client: reqwest::Client::new(),
             model: cfg.model.clone(),
+            timeout: cfg
+                .timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| Duration::from_secs(CODEX_COMPLETION_TIMEOUT_SECS)),
         }
     }
 
@@ -102,7 +109,10 @@ impl OpenAiCodexProvider {
                     std::env::consts::ARCH
                 ),
             )
-            .json(&payload);
+            .json(&payload)
+            // Codex always uses SSE, so this bounds the whole stream and can
+            // abort long generations; keep it consistent with other providers.
+            .timeout(self.timeout);
 
         if let Some(account_id) = &account_id {
             request = request.header("chatgpt-account-id", account_id);
@@ -740,10 +750,7 @@ impl LlmProvider for OpenAiCodexProvider {
         let fallback_model = req.model.clone();
         // Codex API requires stream=true; collect SSE events and extract the final response.
         let response = self.execute(req, true).await?;
-        let body = response
-            .text()
-            .await
-            .map_err(|_| ProviderError::InvalidResponse("failed to read response body"))?;
+        let body = response.text().await.map_err(ProviderError::Http)?;
 
         let parsed = parse_sse_response(&body, &fallback_model)?;
         Ok(parsed)
@@ -810,6 +817,27 @@ mod tests {
         async fn get_token(&self) -> Result<String, ProviderError> {
             Ok("oauth-token".to_string())
         }
+    }
+
+    #[test]
+    fn codex_completion_timeout_defaults_and_uses_config_override() {
+        let cfg = ProviderConfig {
+            kind: "openai-codex".to_string(),
+            model: "codex".to_string(),
+            ..Default::default()
+        };
+        let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
+        assert_eq!(
+            provider.timeout,
+            Duration::from_secs(CODEX_COMPLETION_TIMEOUT_SECS)
+        );
+
+        let cfg = ProviderConfig {
+            timeout_secs: Some(600),
+            ..cfg
+        };
+        let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
+        assert_eq!(provider.timeout, Duration::from_secs(600));
     }
 
     #[tokio::test]
@@ -909,6 +937,47 @@ mod tests {
             .expect("complete");
 
         assert_eq!(resp.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn complete_applies_configured_timeout_to_sse_request() {
+        let server = MockServer::start().await;
+
+        let sse_body = "event: response.completed\ndata: {\"response\":{\"model\":\"codex\",\"output_text\":\"late success\"}}\n\nevent: done\ndata: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(3))
+                    .set_body_string(sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = ProviderConfig {
+            base_url: Some(server.uri()),
+            model: "codex".to_string(),
+            timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let provider = OpenAiCodexProvider::new(Arc::new(StaticTokenSource), &cfg);
+        let started = std::time::Instant::now();
+        let err = provider
+            .complete(CompletionRequest {
+                model: "codex".to_string(),
+                messages: vec![crate::ProviderMessage::user("hello")],
+                tools: vec![],
+                max_tokens: None,
+                temperature: None,
+                thinking_tokens: None,
+            })
+            .await
+            .expect_err("request should respect configured timeout");
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(matches!(err, ProviderError::Http(ref err) if err.is_timeout()));
     }
 
     #[tokio::test]
