@@ -1044,7 +1044,8 @@ mod tests {
         truncate_head_tail,
     };
     use crate::{
-        AgentContext, AgentError, ContextCompressor, Message, MessageRole, TokenEstimator,
+        AgentContext, AgentError, ContextCompressionError, ContextCompressor, Message, MessageRole,
+        TokenEstimator,
     };
 
     #[derive(Default)]
@@ -1059,7 +1060,7 @@ mod tests {
             mut history: Vec<Message>,
             _token_budget: usize,
             _estimator: &dyn TokenEstimator,
-        ) -> Result<Vec<Message>, AgentError> {
+        ) -> Result<Vec<Message>, ContextCompressionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if history.len() > 1 {
                 history.truncate(1);
