@@ -9,10 +9,11 @@ use crate::ModelInfo;
 #[cfg(feature = "model-cache-sqlite")]
 const NYX_PROVIDER_MODELS_NAMESPACE: &str = "nyx-provider-models";
 #[cfg(feature = "model-cache-sqlite")]
-const NYX_PROVIDER_MODEL_MIGRATIONS: &[(u32, &str, &str)] = &[(
-    1,
-    "create model metadata table",
-    r#"
+const NYX_PROVIDER_MODEL_MIGRATIONS: &[(u32, &str, &str)] = &[
+    (
+        1,
+        "create model metadata table",
+        r#"
     CREATE TABLE IF NOT EXISTS model_metadata (
         model_id TEXT PRIMARY KEY,
         context_window INTEGER NOT NULL,
@@ -24,7 +25,15 @@ const NYX_PROVIDER_MODEL_MIGRATIONS: &[(u32, &str, &str)] = &[(
         source TEXT NOT NULL
     );
     "#,
-)];
+    ),
+    (
+        2,
+        "add context budget ratio to model metadata",
+        r#"
+    ALTER TABLE model_metadata ADD COLUMN context_budget_ratio REAL;
+    "#,
+    ),
+];
 
 #[cfg(feature = "model-cache-sqlite")]
 pub fn model_cache_migrations() -> (&'static str, &'static [(u32, &'static str, &'static str)]) {
@@ -49,7 +58,8 @@ impl SqliteModelCache {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT model_id, context_window, max_output_tokens, supports_vision, supports_tool_use, supports_streaming
+            "SELECT model_id, context_window, max_output_tokens, supports_vision,
+                    supports_tool_use, supports_streaming, context_budget_ratio
              FROM model_metadata
              WHERE model_id = ?1",
         )?;
@@ -64,7 +74,7 @@ impl SqliteModelCache {
             supports_vision: row.get::<_, i64>(3)? != 0,
             supports_tool_use: row.get::<_, i64>(4)? != 0,
             supports_streaming: row.get::<_, i64>(5)? != 0,
-            context_budget_ratio: None,
+            context_budget_ratio: row.get::<_, Option<f64>>(6)?.map(|value| value as f32),
         }))
     }
 
@@ -76,8 +86,9 @@ impl SqliteModelCache {
         conn.execute(
             "INSERT INTO model_metadata (
                 model_id, context_window, max_output_tokens, supports_vision,
-                supports_tool_use, supports_streaming, fetched_at, source
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                supports_tool_use, supports_streaming, fetched_at, source,
+                context_budget_ratio
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(model_id) DO UPDATE SET
                 context_window = excluded.context_window,
                 max_output_tokens = excluded.max_output_tokens,
@@ -85,7 +96,8 @@ impl SqliteModelCache {
                 supports_tool_use = excluded.supports_tool_use,
                 supports_streaming = excluded.supports_streaming,
                 fetched_at = excluded.fetched_at,
-                source = excluded.source",
+                source = excluded.source,
+                context_budget_ratio = excluded.context_budget_ratio",
             rusqlite::params![
                 model_id,
                 info.context_window as i64,
@@ -95,6 +107,7 @@ impl SqliteModelCache {
                 if info.supports_streaming { 1 } else { 0 },
                 current_timestamp(),
                 "remote",
+                info.context_budget_ratio.map(f64::from),
             ],
         )?;
         Ok(())
@@ -143,7 +156,7 @@ mod tests {
             supports_vision: true,
             supports_tool_use: true,
             supports_streaming: true,
-            context_budget_ratio: None,
+            context_budget_ratio: Some(0.75),
         };
 
         cache.put("custom-model", &info).expect("put");
@@ -165,6 +178,7 @@ mod tests {
         let info_v2 = ModelInfo {
             context_window: 64_000,
             supports_vision: true,
+            context_budget_ratio: Some(0.8),
             ..info_v1.clone()
         };
 

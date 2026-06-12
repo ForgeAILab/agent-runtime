@@ -1,10 +1,17 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_core::Stream as FutStream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::shared::{concat_text, decode_assistant_content, function_tool_definitions};
+use crate::sse::{SseFrame, SseFrameParser};
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
     ProviderError, ProviderRole, StreamEvent, ToolCall, ToolCallParser, UsageMetadata,
@@ -52,101 +59,7 @@ impl OpenAiProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        let endpoint = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
-        let mut messages: Vec<OpenAiRequestMessage> = Vec::new();
-        for message in req.messages {
-            match message.role {
-                ProviderRole::System => {
-                    messages.push(OpenAiRequestMessage::System {
-                        content: OpenAiMessageContent::Text(concat_text(&message.content)),
-                    });
-                }
-                ProviderRole::User => {
-                    messages.push(OpenAiRequestMessage::User {
-                        content: provider_content_to_openai(message.content),
-                    });
-                }
-                ProviderRole::Assistant => {
-                    // Decode JSON content blocks (set by react agent for tool_use round-tripping).
-                    let (text, tool_calls) =
-                        decode_assistant_blocks(&concat_text(&message.content));
-                    messages.push(OpenAiRequestMessage::Assistant {
-                        content: if text.is_empty() { None } else { Some(text) },
-                        tool_calls,
-                    });
-                }
-                ProviderRole::Tool => {
-                    if let Some(tool_call_id) = message.tool_call_id {
-                        // Native tool result.
-                        messages.push(OpenAiRequestMessage::ToolResult {
-                            tool_call_id,
-                            content: concat_text(&message.content),
-                        });
-                    } else {
-                        // Fallback: legacy plain-text tool message.
-                        messages.push(OpenAiRequestMessage::User {
-                            content: OpenAiMessageContent::Text(format!(
-                                "[Tool Result]\n{}",
-                                concat_text(&message.content)
-                            )),
-                        });
-                    }
-                }
-            }
-        }
-
-        let tools: Vec<OpenAiFunctionTool> = req
-            .tools
-            .into_iter()
-            .map(|t| OpenAiFunctionTool {
-                kind: "function".to_string(),
-                function: OpenAiFunctionDefinition {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.input_schema,
-                },
-            })
-            .collect();
-
-        let (max_tokens, reasoning_effort) = if let Some(budget) = req.thinking_tokens {
-            // Reasoning models use max_completion_tokens (which includes
-            // reasoning tokens) instead of max_tokens, and accept a
-            // reasoning_effort hint.
-            let effort = match budget {
-                0 => None,
-                1..=1024 => Some("low"),
-                1025..=8192 => Some("medium"),
-                _ => Some("high"),
-            };
-            (req.max_tokens, effort)
-        } else {
-            (req.max_tokens, None)
-        };
-
-        let payload = OpenAiCompletionRequest {
-            model: req.model,
-            messages,
-            tools,
-            max_tokens,
-            temperature: req.temperature,
-            stream: Some(false),
-            reasoning_effort: reasoning_effort.map(|s| s.to_string()),
-        };
-
-        let response = self
-            .client
-            .post(endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .timeout(self.timeout)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(crate::error_for_response(response).await);
-        }
-
+        let response = self.execute_completion_request(req, false).await?;
         let parsed: OpenAiCompletionResponse = response.json().await?;
         let choice = parsed
             .choices
@@ -182,45 +95,135 @@ impl OpenAiProvider {
             usage: parsed.usage.map(UsageMetadata::from),
         })
     }
+
+    async fn execute_completion_request(
+        &self,
+        req: CompletionRequest,
+        stream: bool,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let endpoint = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let payload = build_completion_payload(req, stream);
+
+        let response = self
+            .client
+            .post(endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .timeout(self.timeout)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(crate::error_for_response(response).await);
+        }
+
+        Ok(response)
+    }
+}
+
+fn build_completion_payload(req: CompletionRequest, stream: bool) -> OpenAiCompletionRequest {
+    let mut messages: Vec<OpenAiRequestMessage> = Vec::new();
+    for message in req.messages {
+        match message.role {
+            ProviderRole::System => {
+                messages.push(OpenAiRequestMessage::System {
+                    content: OpenAiMessageContent::Text(concat_text(&message.content)),
+                });
+            }
+            ProviderRole::User => {
+                messages.push(OpenAiRequestMessage::User {
+                    content: provider_content_to_openai(message.content),
+                });
+            }
+            ProviderRole::Assistant => {
+                // Decode JSON content blocks (set by react agent for tool_use round-tripping).
+                let assistant_text = concat_text(&message.content);
+                let (text, tool_calls) = decode_openai_assistant_blocks(&assistant_text);
+                messages.push(OpenAiRequestMessage::Assistant {
+                    content: if text.is_empty() { None } else { Some(text) },
+                    tool_calls,
+                });
+            }
+            ProviderRole::Tool => {
+                if let Some(tool_call_id) = message.tool_call_id {
+                    // Native tool result.
+                    messages.push(OpenAiRequestMessage::ToolResult {
+                        tool_call_id,
+                        content: concat_text(&message.content),
+                    });
+                } else {
+                    // Fallback: legacy plain-text tool message.
+                    messages.push(OpenAiRequestMessage::User {
+                        content: OpenAiMessageContent::Text(format!(
+                            "[Tool Result]\n{}",
+                            concat_text(&message.content)
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
+    let tools: Vec<OpenAiFunctionTool> = function_tool_definitions(req.tools)
+        .into_iter()
+        .map(|tool| OpenAiFunctionTool {
+            kind: "function".to_string(),
+            function: OpenAiFunctionDefinition {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+            },
+        })
+        .collect();
+
+    let (max_tokens, reasoning_effort) = if let Some(budget) = req.thinking_tokens {
+        // Reasoning models use max_completion_tokens (which includes
+        // reasoning tokens) instead of max_tokens, and accept a
+        // reasoning_effort hint.
+        let effort = match budget {
+            0 => None,
+            1..=1024 => Some("low"),
+            1025..=8192 => Some("medium"),
+            _ => Some("high"),
+        };
+        (req.max_tokens, effort)
+    } else {
+        (req.max_tokens, None)
+    };
+
+    OpenAiCompletionRequest {
+        model: req.model,
+        messages,
+        tools,
+        max_tokens,
+        temperature: req.temperature,
+        stream: Some(stream),
+        stream_options: stream.then_some(OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        reasoning_effort: reasoning_effort.map(|s| s.to_string()),
+    }
 }
 
 /// Decode a content string that may be a JSON-encoded array of content blocks (produced by
 /// `build_assistant_content` in `react.rs`). Returns the extracted text and OpenAI tool calls.
-fn decode_assistant_blocks(content: &str) -> (String, Vec<OpenAiToolCallRequest>) {
-    let Ok(blocks) = serde_json::from_str::<Vec<Value>>(content) else {
+fn decode_openai_assistant_blocks(content: &str) -> (String, Vec<OpenAiToolCallRequest>) {
+    let Some(decoded) = decode_assistant_content(content) else {
         return (content.to_string(), vec![]);
     };
-    if blocks.is_empty() || !blocks.iter().all(|b| b.get("type").is_some()) {
-        return (content.to_string(), vec![]);
-    }
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    for block in &blocks {
-        match block["type"].as_str() {
-            Some("text") => {
-                text = block["text"].as_str().unwrap_or("").to_string();
-            }
-            Some("tool_use") => {
-                let id = block["id"].as_str().unwrap_or("").to_string();
-                let name = block["name"].as_str().unwrap_or("").to_string();
-                let arguments = serde_json::to_string(&block["input"]).unwrap_or_default();
-                tool_calls.push(OpenAiToolCallRequest {
-                    id,
-                    kind: "function".to_string(),
-                    function: OpenAiToolCallFunction { name, arguments },
-                });
-            }
-            _ => {}
-        }
-    }
-    (text, tool_calls)
-}
-
-fn concat_text(content: &[ProviderContent]) -> String {
-    content
-        .iter()
-        .filter_map(ProviderContent::as_text)
-        .collect::<String>()
+    let tool_calls = decoded
+        .tool_uses
+        .into_iter()
+        .map(|tool_use| OpenAiToolCallRequest {
+            id: tool_use.id,
+            kind: "function".to_string(),
+            function: OpenAiToolCallFunction {
+                name: tool_use.name,
+                arguments: serde_json::to_string(&tool_use.input).unwrap_or_default(),
+            },
+        })
+        .collect();
+    (decoded.text, tool_calls)
 }
 
 fn provider_content_to_openai(content: Vec<ProviderContent>) -> OpenAiMessageContent {
@@ -254,16 +257,8 @@ impl LlmProvider for OpenAiProvider {
     }
 
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
-        let response = self.complete_via_api(req).await?;
-        let stream = tokio_stream::iter(vec![
-            Ok(StreamEvent::delta(response.content)),
-            Ok(StreamEvent::Done {
-                model: Some(response.model),
-                usage: response.usage,
-                finish_reason: Some("stop".to_string()),
-            }),
-        ]);
-        Ok(Box::pin(stream))
+        let response = self.execute_completion_request(req, true).await?;
+        Ok(Box::pin(OpenAiSseStream::from_response(response)))
     }
 
     async fn health_check(&self) -> bool {
@@ -298,7 +293,14 @@ struct OpenAiCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OpenAiStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -429,11 +431,321 @@ impl From<OpenAiUsage> for UsageMetadata {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChunk {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<OpenAiStreamChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChoice {
+    #[serde(default)]
+    delta: OpenAiStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolCallDelta {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    _kind: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAiFunctionCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct OpenAiStreamState {
+    model: Option<String>,
+    usage: Option<UsageMetadata>,
+    finish_reason: Option<String>,
+    tool_calls: BTreeMap<u32, OpenAiToolCallAccumulator>,
+    saw_chunk: bool,
+    done_emitted: bool,
+}
+
+impl OpenAiStreamState {
+    fn handle_frame(&mut self, frame: &SseFrame) -> Result<Vec<StreamEvent>, ProviderError> {
+        let data = frame.data.trim();
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        if data == "[DONE]" {
+            return Ok(self.finish().into_iter().collect());
+        }
+
+        let chunk: OpenAiStreamChunk = serde_json::from_str(data)
+            .map_err(|_| ProviderError::InvalidResponse("invalid OpenAI stream chunk"))?;
+        self.saw_chunk = true;
+        if let Some(model) = chunk.model {
+            self.model = Some(model);
+        }
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage.into());
+        }
+
+        let mut events = Vec::new();
+        for choice in chunk.choices {
+            if let Some(content) = choice.delta.content
+                && !content.is_empty()
+            {
+                events.push(StreamEvent::delta(content));
+            }
+            if let Some(tool_call_deltas) = choice.delta.tool_calls {
+                for delta in tool_call_deltas {
+                    self.accumulate_tool_call_delta(delta);
+                }
+            }
+            if let Some(finish_reason) = choice.finish_reason {
+                self.finish_reason = Some(finish_reason);
+            }
+        }
+
+        Ok(events)
+    }
+
+    fn finish_on_eof(&mut self) -> Option<StreamEvent> {
+        if self.saw_chunk { self.finish() } else { None }
+    }
+
+    fn finish(&mut self) -> Option<StreamEvent> {
+        if self.done_emitted {
+            return None;
+        }
+        self.done_emitted = true;
+        let tool_call_count = self.tool_calls().len();
+        if tool_call_count > 0 {
+            tracing::debug!(tool_call_count, "OpenAI stream accumulated tool calls");
+        }
+        Some(StreamEvent::Done {
+            model: self.model.clone(),
+            usage: self.usage.clone(),
+            finish_reason: Some(
+                self.finish_reason
+                    .clone()
+                    .unwrap_or_else(|| "stop".to_string()),
+            ),
+        })
+    }
+
+    fn accumulate_tool_call_delta(&mut self, delta: OpenAiToolCallDelta) {
+        let entry = self.tool_calls.entry(delta.index).or_default();
+        if let Some(id) = delta.id {
+            entry.id = Some(id);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                entry.name.push_str(&name);
+            }
+            if let Some(arguments) = function.arguments {
+                entry.arguments.push_str(&arguments);
+            }
+        }
+    }
+
+    fn tool_calls(&self) -> Vec<ToolCall> {
+        self.tool_calls
+            .values()
+            .filter_map(OpenAiToolCallAccumulator::to_tool_call)
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct OpenAiToolCallAccumulator {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+impl OpenAiToolCallAccumulator {
+    fn to_tool_call(&self) -> Option<ToolCall> {
+        if self.name.is_empty() {
+            return None;
+        }
+        let input =
+            serde_json::from_str(&self.arguments).unwrap_or(Value::Object(Default::default()));
+        Some(ToolCall {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            input,
+        })
+    }
+}
+
+struct OpenAiSseStream {
+    inner: Pin<Box<dyn FutStream<Item = Result<String, ProviderError>> + Send>>,
+    parser: SseFrameParser,
+    state: OpenAiStreamState,
+    pending: VecDeque<Result<StreamEvent, ProviderError>>,
+}
+
+impl OpenAiSseStream {
+    fn from_response(response: reqwest::Response) -> Self {
+        let byte_stream = response.bytes_stream().map(|item| match item {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+            Err(err) => Err(ProviderError::Http(err)),
+        });
+        Self {
+            inner: Box::pin(byte_stream),
+            parser: SseFrameParser::default(),
+            state: OpenAiStreamState::default(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn enqueue_frames(&mut self, frames: Vec<SseFrame>) {
+        for frame in frames {
+            match self.state.handle_frame(&frame) {
+                Ok(events) => {
+                    self.pending.extend(events.into_iter().map(Ok));
+                }
+                Err(err) => {
+                    self.pending.push_back(Err(err));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn enqueue_eof(&mut self) {
+        let frames = self.parser.finish();
+        self.enqueue_frames(frames);
+        if let Some(event) = self.state.finish_on_eof() {
+            self.pending.push_back(Ok(event));
+        }
+    }
+}
+
+impl FutStream for OpenAiSseStream {
+    type Item = Result<StreamEvent, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(event) = self.pending.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+
+        loop {
+            let frames = self.parser.drain_frames();
+            if !frames.is_empty() {
+                self.enqueue_frames(frames);
+                if let Some(event) = self.pending.pop_front() {
+                    return Poll::Ready(Some(event));
+                }
+            }
+
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(text))) => {
+                    self.parser.push_str(&text);
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => {
+                    self.enqueue_eof();
+                    return Poll::Ready(self.pending.pop_front());
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const OPENAI_TOOL_STREAM_FIXTURE_CHUNKS: &[&str] = &[
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo \"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+
+    fn feed_openai_fixture(chunks: &[&str]) -> (Vec<StreamEvent>, OpenAiStreamState) {
+        let mut parser = SseFrameParser::default();
+        let mut state = OpenAiStreamState::default();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            parser.push_str(chunk);
+            for frame in parser.drain_frames() {
+                events.extend(state.handle_frame(&frame).expect("valid OpenAI frame"));
+            }
+        }
+        for frame in parser.finish() {
+            events.extend(state.handle_frame(&frame).expect("valid OpenAI frame"));
+        }
+        (events, state)
+    }
+
+    #[test]
+    fn openai_sse_parser_streams_text_usage_and_accumulates_tool_call() {
+        let (events, state) = feed_openai_fixture(OPENAI_TOOL_STREAM_FIXTURE_CHUNKS);
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Delta { content } => Some(content.as_str()),
+                StreamEvent::Done { .. } => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Hello ");
+
+        let done = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done {
+                    model,
+                    usage,
+                    finish_reason,
+                } => Some((model, usage, finish_reason)),
+                StreamEvent::Delta { .. } => None,
+            })
+            .expect("done event");
+        assert_eq!(done.0.as_deref(), Some("gpt-4o"));
+        assert_eq!(done.2.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            done.1.as_ref(),
+            Some(&UsageMetadata {
+                input_tokens: 12,
+                output_tokens: 7,
+                cache_read_tokens: Some(5),
+                cache_write_tokens: None,
+            })
+        );
+
+        let tool_calls = state.tool_calls();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(tool_calls[0].name, "lookup");
+        assert_eq!(tool_calls[0].input["q"], "rust");
+    }
 
     #[test]
     fn openai_completion_timeout_defaults_and_can_override() {

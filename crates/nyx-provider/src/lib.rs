@@ -22,6 +22,8 @@ mod model_cache;
 pub mod model_info;
 mod rate_limit;
 mod retry;
+mod shared;
+mod sse;
 pub use circuit_breaker::CircuitBreakerProvider;
 pub use fallback::FallbackProvider;
 pub use metadata_resolver::ProviderMetadataResolver;

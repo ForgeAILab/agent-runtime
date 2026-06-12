@@ -1,10 +1,19 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_core::Stream as FutStream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::shared::{
+    AssistantContentBlock, concat_text, decode_assistant_content, function_tool_definitions,
+};
+use crate::sse::{SseFrame, SseFrameParser};
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
     ProviderContent, ProviderError, ProviderRole, StreamEvent, ToolCall, ToolCallParser,
@@ -66,156 +75,8 @@ impl ClaudeProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        let endpoint = format!("{}/messages", self.base_url.trim_end_matches('/'));
-        let mut system_blocks = Vec::new();
-        let mut messages = Vec::new();
-
-        for message in req.messages {
-            match message.role {
-                ProviderRole::System => {
-                    let text = concat_text(&message.content);
-                    if !text.is_empty() {
-                        system_blocks.push(ClaudeSystemBlock {
-                            kind: "text".to_string(),
-                            text,
-                            cache_control: message.cache_breakpoint.then(cache_control),
-                        });
-                    }
-                }
-                ProviderRole::User => {
-                    let mut content = provider_content_to_claude(message.content);
-                    if message.cache_breakpoint {
-                        attach_cache_control(&mut content);
-                    }
-                    messages.push(ClaudeMessage {
-                        role: "user".to_string(),
-                        content,
-                    });
-                }
-                ProviderRole::Assistant => {
-                    // Try to decode as JSON content blocks (set by the agent for tool_use
-                    // round-tripping). Falls back to plain text if it's a normal response.
-                    let assistant_text = concat_text(&message.content);
-                    let content = if let Ok(blocks) =
-                        serde_json::from_str::<Vec<Value>>(&assistant_text)
-                    {
-                        if !blocks.is_empty() && blocks.iter().all(|b| b.get("type").is_some()) {
-                            let request_blocks: Vec<ClaudeRequestBlock> = blocks
-                                .into_iter()
-                                .filter_map(|b| match b["type"].as_str()? {
-                                    "tool_use" => Some(ClaudeRequestBlock::ToolUse {
-                                        id: b["id"].as_str().unwrap_or("").to_string(),
-                                        name: b["name"].as_str().unwrap_or("").to_string(),
-                                        input: b["input"].clone(),
-                                        cache_control: None,
-                                    }),
-                                    "text" => Some(ClaudeRequestBlock::Text {
-                                        text: b["text"].as_str().unwrap_or("").to_string(),
-                                        cache_control: None,
-                                    }),
-                                    _ => None,
-                                })
-                                .collect();
-                            ClaudeRequestContent::Blocks(request_blocks)
-                        } else {
-                            provider_content_to_claude(message.content)
-                        }
-                    } else {
-                        provider_content_to_claude(message.content)
-                    };
-                    let mut content = content;
-                    if message.cache_breakpoint {
-                        attach_cache_control(&mut content);
-                    }
-                    messages.push(ClaudeMessage {
-                        role: "assistant".to_string(),
-                        content,
-                    });
-                }
-                ProviderRole::Tool => {
-                    if let Some(tool_use_id) = message.tool_call_id {
-                        // Native tool calling: wrap in a tool_result content block.
-                        let mut content =
-                            ClaudeRequestContent::Blocks(vec![ClaudeRequestBlock::ToolResult {
-                                tool_use_id,
-                                content: concat_text(&message.content),
-                                cache_control: None,
-                            }]);
-                        if message.cache_breakpoint {
-                            attach_cache_control(&mut content);
-                        }
-                        messages.push(ClaudeMessage {
-                            role: "user".to_string(),
-                            content,
-                        });
-                    } else {
-                        // Fallback for plain tool messages (text-based parser flow).
-                        let mut content = ClaudeRequestContent::Text(concat_text(&message.content));
-                        if message.cache_breakpoint {
-                            attach_cache_control(&mut content);
-                        }
-                        messages.push(ClaudeMessage {
-                            role: "user".to_string(),
-                            content,
-                        });
-                    }
-                }
-            }
-        }
-
-        enforce_cache_control_limit(&mut system_blocks, &mut messages, 4);
-
-        let tools: Vec<ClaudeToolDefinition> = req
-            .tools
-            .into_iter()
-            .map(|t| ClaudeToolDefinition {
-                name: t.name,
-                description: t.description,
-                input_schema: t.input_schema,
-            })
-            .collect();
-
-        let thinking = req.thinking_tokens.map(|budget| ClaudeThinking {
-            kind: "enabled".to_string(),
-            budget_tokens: budget,
-        });
-
-        let payload = ClaudeMessagesRequest {
-            model: req.model,
-            max_tokens: req.max_tokens.unwrap_or(1024),
-            system: if system_blocks.is_empty() {
-                None
-            } else {
-                Some(system_blocks)
-            },
-            messages,
-            temperature: req.temperature,
-            tools,
-            thinking,
-        };
-
-        let mut request = self
-            .client
-            .post(endpoint)
-            .header("anthropic-version", "2023-06-01")
-            .json(&payload)
-            .timeout(self.timeout);
-
-        if let Some(token_source) = &self.token_source {
-            let token = token_source.get_token().await?;
-            request = request
-                .bearer_auth(token)
-                .header("anthropic-beta", "oauth-2025-04-20");
-        } else {
-            request = request.header("x-api-key", &self.api_key);
-        }
-
-        let response = request.send().await?;
-
-        if !response.status().is_success() {
-            return Err(crate::error_for_response(response).await);
-        }
-
+        let payload = build_messages_payload(req, false);
+        let response = self.send_messages_request(payload).await?;
         let parsed: ClaudeMessagesResponse = response.json().await?;
 
         let mut content_text = String::new();
@@ -254,13 +115,162 @@ impl ClaudeProvider {
             usage: parsed.usage.map(UsageMetadata::from),
         })
     }
+
+    async fn send_messages_request(
+        &self,
+        payload: ClaudeMessagesRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let endpoint = format!("{}/messages", self.base_url.trim_end_matches('/'));
+
+        let mut request = self
+            .client
+            .post(endpoint)
+            .header("anthropic-version", "2023-06-01")
+            .json(&payload)
+            .timeout(self.timeout);
+
+        if let Some(token_source) = &self.token_source {
+            let token = token_source.get_token().await?;
+            request = request
+                .bearer_auth(token)
+                .header("anthropic-beta", "oauth-2025-04-20");
+        } else {
+            request = request.header("x-api-key", &self.api_key);
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            return Err(crate::error_for_response(response).await);
+        }
+
+        Ok(response)
+    }
 }
 
-fn concat_text(content: &[ProviderContent]) -> String {
-    content
-        .iter()
-        .filter_map(ProviderContent::as_text)
-        .collect::<String>()
+fn build_messages_payload(req: CompletionRequest, stream: bool) -> ClaudeMessagesRequest {
+    let mut system_blocks = Vec::new();
+    let mut messages = Vec::new();
+
+    for message in req.messages {
+        match message.role {
+            ProviderRole::System => {
+                let text = concat_text(&message.content);
+                if !text.is_empty() {
+                    system_blocks.push(ClaudeSystemBlock {
+                        kind: "text".to_string(),
+                        text,
+                        cache_control: message.cache_breakpoint.then(cache_control),
+                    });
+                }
+            }
+            ProviderRole::User => {
+                let mut content = provider_content_to_claude(message.content);
+                if message.cache_breakpoint {
+                    attach_cache_control(&mut content);
+                }
+                messages.push(ClaudeMessage {
+                    role: "user".to_string(),
+                    content,
+                });
+            }
+            ProviderRole::Assistant => {
+                let mut content = assistant_content_to_claude(message.content);
+                if message.cache_breakpoint {
+                    attach_cache_control(&mut content);
+                }
+                messages.push(ClaudeMessage {
+                    role: "assistant".to_string(),
+                    content,
+                });
+            }
+            ProviderRole::Tool => {
+                if let Some(tool_use_id) = message.tool_call_id {
+                    // Native tool calling: wrap in a tool_result content block.
+                    let mut content =
+                        ClaudeRequestContent::Blocks(vec![ClaudeRequestBlock::ToolResult {
+                            tool_use_id,
+                            content: concat_text(&message.content),
+                            cache_control: None,
+                        }]);
+                    if message.cache_breakpoint {
+                        attach_cache_control(&mut content);
+                    }
+                    messages.push(ClaudeMessage {
+                        role: "user".to_string(),
+                        content,
+                    });
+                } else {
+                    // Fallback for plain tool messages (text-based parser flow).
+                    let mut content = ClaudeRequestContent::Text(concat_text(&message.content));
+                    if message.cache_breakpoint {
+                        attach_cache_control(&mut content);
+                    }
+                    messages.push(ClaudeMessage {
+                        role: "user".to_string(),
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    enforce_cache_control_limit(&mut system_blocks, &mut messages, 4);
+
+    let tools: Vec<ClaudeToolDefinition> = function_tool_definitions(req.tools)
+        .into_iter()
+        .map(|tool| ClaudeToolDefinition {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.parameters,
+        })
+        .collect();
+
+    let thinking = req.thinking_tokens.map(|budget| ClaudeThinking {
+        kind: "enabled".to_string(),
+        budget_tokens: budget,
+    });
+
+    ClaudeMessagesRequest {
+        model: req.model,
+        max_tokens: req.max_tokens.unwrap_or(1024),
+        system: if system_blocks.is_empty() {
+            None
+        } else {
+            Some(system_blocks)
+        },
+        messages,
+        temperature: req.temperature,
+        tools,
+        thinking,
+        stream: stream.then_some(true),
+    }
+}
+
+fn assistant_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestContent {
+    let assistant_text = concat_text(&content);
+    let Some(decoded) = decode_assistant_content(&assistant_text) else {
+        return provider_content_to_claude(content);
+    };
+
+    ClaudeRequestContent::Blocks(
+        decoded
+            .blocks
+            .into_iter()
+            .map(|block| match block {
+                AssistantContentBlock::Text(text) => ClaudeRequestBlock::Text {
+                    text,
+                    cache_control: None,
+                },
+                AssistantContentBlock::ToolUse(tool_use) => ClaudeRequestBlock::ToolUse {
+                    id: tool_use.id,
+                    name: tool_use.name,
+                    input: tool_use.input,
+                    cache_control: None,
+                },
+            })
+            .collect(),
+    )
 }
 
 fn provider_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestContent {
@@ -372,16 +382,9 @@ impl LlmProvider for ClaudeProvider {
     }
 
     async fn stream(&self, req: CompletionRequest) -> Result<CompletionStream, ProviderError> {
-        let response = self.complete_via_api(req).await?;
-        let stream = tokio_stream::iter(vec![
-            Ok(StreamEvent::delta(response.content)),
-            Ok(StreamEvent::Done {
-                model: Some(response.model),
-                usage: response.usage,
-                finish_reason: Some("stop".to_string()),
-            }),
-        ]);
-        Ok(Box::pin(stream))
+        let payload = build_messages_payload(req, true);
+        let response = self.send_messages_request(payload).await?;
+        Ok(Box::pin(ClaudeSseStream::from_response(response)))
     }
 
     async fn health_check(&self) -> bool {
@@ -439,6 +442,8 @@ struct ClaudeMessagesRequest {
     tools: Vec<ClaudeToolDefinition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ClaudeThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -595,11 +600,450 @@ impl From<ClaudeUsage> for UsageMetadata {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    message: Option<ClaudeStreamMessage>,
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    content_block: Option<ClaudeStreamContentBlock>,
+    #[serde(default)]
+    delta: Option<ClaudeStreamDelta>,
+    #[serde(default)]
+    usage: Option<ClaudeStreamUsage>,
+    #[serde(default)]
+    error: Option<ClaudeStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamMessage {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<ClaudeStreamUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamDelta {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    partial_json: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamUsage {
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamError {
+    #[serde(default, rename = "type")]
+    _kind: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeStreamState {
+    model: Option<String>,
+    usage: ClaudeStreamUsageAccumulator,
+    finish_reason: Option<String>,
+    tool_calls: BTreeMap<u32, ClaudeToolUseAccumulator>,
+    saw_event: bool,
+    done_emitted: bool,
+}
+
+impl ClaudeStreamState {
+    fn handle_frame(&mut self, frame: &SseFrame) -> Result<Vec<StreamEvent>, ProviderError> {
+        let data = frame.data.trim();
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        if data == "[DONE]" {
+            return Ok(self.finish().into_iter().collect());
+        }
+
+        let event: ClaudeStreamEvent = serde_json::from_str(data)
+            .map_err(|_| ProviderError::InvalidResponse("invalid Claude stream event"))?;
+        self.saw_event = true;
+        if let Some(error) = event.error {
+            return Err(ProviderError::Rejected(error.message));
+        }
+
+        let kind = frame.event.as_deref().unwrap_or(event.kind.as_str());
+        let mut events = Vec::new();
+        match kind {
+            "message_start" => {
+                if let Some(message) = event.message {
+                    if let Some(model) = message.model {
+                        self.model = Some(model);
+                    }
+                    if let Some(usage) = message.usage {
+                        self.usage.apply(usage);
+                    }
+                }
+                if let Some(usage) = event.usage {
+                    self.usage.apply(usage);
+                }
+            }
+            "content_block_start" => {
+                let index = event.index.unwrap_or_default();
+                if let Some(block) = event.content_block {
+                    match block.kind.as_str() {
+                        "text" => {
+                            if let Some(text) = block.text
+                                && !text.is_empty()
+                            {
+                                events.push(StreamEvent::delta(text));
+                            }
+                        }
+                        "tool_use" => {
+                            let entry = self.tool_calls.entry(index).or_default();
+                            entry.id = block.id;
+                            if let Some(name) = block.name {
+                                entry.name = name;
+                            }
+                            entry.initial_input = block.input;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_delta" => {
+                let index = event.index.unwrap_or_default();
+                if let Some(delta) = event.delta {
+                    match delta.kind.as_deref() {
+                        Some("text_delta") => {
+                            if let Some(text) = delta.text
+                                && !text.is_empty()
+                            {
+                                events.push(StreamEvent::delta(text));
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(partial_json) = delta.partial_json {
+                                self.tool_calls
+                                    .entry(index)
+                                    .or_default()
+                                    .partial_json
+                                    .push_str(&partial_json);
+                            }
+                        }
+                        _ => {
+                            if let Some(text) = delta.text
+                                && !text.is_empty()
+                            {
+                                events.push(StreamEvent::delta(text));
+                            }
+                        }
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(delta) = event.delta
+                    && let Some(stop_reason) = delta.stop_reason
+                {
+                    self.finish_reason = Some(map_claude_finish_reason(&stop_reason));
+                }
+                if let Some(usage) = event.usage {
+                    self.usage.apply(usage);
+                }
+            }
+            "message_stop" => {
+                events.extend(self.finish());
+            }
+            _ => {}
+        }
+
+        Ok(events)
+    }
+
+    fn finish_on_eof(&mut self) -> Option<StreamEvent> {
+        if self.saw_event { self.finish() } else { None }
+    }
+
+    fn finish(&mut self) -> Option<StreamEvent> {
+        if self.done_emitted {
+            return None;
+        }
+        self.done_emitted = true;
+        let tool_call_count = self.tool_calls().len();
+        if tool_call_count > 0 {
+            tracing::debug!(tool_call_count, "Claude stream accumulated tool calls");
+        }
+        Some(StreamEvent::Done {
+            model: self.model.clone(),
+            usage: self.usage.to_usage_metadata(),
+            finish_reason: Some(
+                self.finish_reason
+                    .clone()
+                    .unwrap_or_else(|| "stop".to_string()),
+            ),
+        })
+    }
+
+    fn tool_calls(&self) -> Vec<ToolCall> {
+        self.tool_calls
+            .values()
+            .filter_map(ClaudeToolUseAccumulator::to_tool_call)
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeStreamUsageAccumulator {
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
+    cache_write_tokens: Option<u32>,
+    seen: bool,
+}
+
+impl ClaudeStreamUsageAccumulator {
+    fn apply(&mut self, usage: ClaudeStreamUsage) {
+        self.seen = true;
+        if let Some(input_tokens) = usage.input_tokens {
+            self.input_tokens = Some(input_tokens);
+        }
+        if let Some(output_tokens) = usage.output_tokens {
+            self.output_tokens = Some(output_tokens);
+        }
+        if let Some(cache_read_tokens) = usage.cache_read_input_tokens {
+            self.cache_read_tokens = Some(cache_read_tokens);
+        }
+        if let Some(cache_write_tokens) = usage.cache_creation_input_tokens {
+            self.cache_write_tokens = Some(cache_write_tokens);
+        }
+    }
+
+    fn to_usage_metadata(&self) -> Option<UsageMetadata> {
+        self.seen.then_some(UsageMetadata {
+            input_tokens: self.input_tokens.unwrap_or_default(),
+            output_tokens: self.output_tokens.unwrap_or_default(),
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeToolUseAccumulator {
+    id: Option<String>,
+    name: String,
+    partial_json: String,
+    initial_input: Option<Value>,
+}
+
+impl ClaudeToolUseAccumulator {
+    fn to_tool_call(&self) -> Option<ToolCall> {
+        if self.name.is_empty() {
+            return None;
+        }
+        let input = if self.partial_json.is_empty() {
+            self.initial_input
+                .clone()
+                .unwrap_or(Value::Object(Default::default()))
+        } else {
+            serde_json::from_str(&self.partial_json).unwrap_or(Value::Object(Default::default()))
+        };
+        Some(ToolCall {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            input,
+        })
+    }
+}
+
+fn map_claude_finish_reason(reason: &str) -> String {
+    match reason {
+        "end_turn" | "stop_sequence" => "stop".to_string(),
+        "max_tokens" => "length".to_string(),
+        "tool_use" => "tool_calls".to_string(),
+        other => other.to_string(),
+    }
+}
+
+struct ClaudeSseStream {
+    inner: Pin<Box<dyn FutStream<Item = Result<String, ProviderError>> + Send>>,
+    parser: SseFrameParser,
+    state: ClaudeStreamState,
+    pending: VecDeque<Result<StreamEvent, ProviderError>>,
+}
+
+impl ClaudeSseStream {
+    fn from_response(response: reqwest::Response) -> Self {
+        let byte_stream = response.bytes_stream().map(|item| match item {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+            Err(err) => Err(ProviderError::Http(err)),
+        });
+        Self {
+            inner: Box::pin(byte_stream),
+            parser: SseFrameParser::default(),
+            state: ClaudeStreamState::default(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn enqueue_frames(&mut self, frames: Vec<SseFrame>) {
+        for frame in frames {
+            match self.state.handle_frame(&frame) {
+                Ok(events) => {
+                    self.pending.extend(events.into_iter().map(Ok));
+                }
+                Err(err) => {
+                    self.pending.push_back(Err(err));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn enqueue_eof(&mut self) {
+        let frames = self.parser.finish();
+        self.enqueue_frames(frames);
+        if let Some(event) = self.state.finish_on_eof() {
+            self.pending.push_back(Ok(event));
+        }
+    }
+}
+
+impl FutStream for ClaudeSseStream {
+    type Item = Result<StreamEvent, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(event) = self.pending.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+
+        loop {
+            let frames = self.parser.drain_frames();
+            if !frames.is_empty() {
+                self.enqueue_frames(frames);
+                if let Some(event) = self.pending.pop_front() {
+                    return Poll::Ready(Some(event));
+                }
+            }
+
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(text))) => {
+                    self.parser.push_str(&text);
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => {
+                    self.enqueue_eof();
+                    return Poll::Ready(self.pending.pop_front());
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const CLAUDE_TOOL_STREAM_FIXTURE_CHUNKS: &[&str] = &[
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":18,\"output_tokens\":1,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":2}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let \"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Tor\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"onto\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":23}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ];
+
+    fn feed_claude_fixture(chunks: &[&str]) -> (Vec<StreamEvent>, ClaudeStreamState) {
+        let mut parser = SseFrameParser::default();
+        let mut state = ClaudeStreamState::default();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            parser.push_str(chunk);
+            for frame in parser.drain_frames() {
+                events.extend(state.handle_frame(&frame).expect("valid Claude frame"));
+            }
+        }
+        for frame in parser.finish() {
+            events.extend(state.handle_frame(&frame).expect("valid Claude frame"));
+        }
+        (events, state)
+    }
+
+    #[test]
+    fn claude_sse_parser_streams_text_usage_and_accumulates_tool_call() {
+        let (events, state) = feed_claude_fixture(CLAUDE_TOOL_STREAM_FIXTURE_CHUNKS);
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Delta { content } => Some(content.as_str()),
+                StreamEvent::Done { .. } => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "Let ");
+
+        let done = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done {
+                    model,
+                    usage,
+                    finish_reason,
+                } => Some((model, usage, finish_reason)),
+                StreamEvent::Delta { .. } => None,
+            })
+            .expect("done event");
+        assert_eq!(done.0.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(done.2.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            done.1.as_ref(),
+            Some(&UsageMetadata {
+                input_tokens: 18,
+                output_tokens: 23,
+                cache_read_tokens: Some(4),
+                cache_write_tokens: Some(2),
+            })
+        );
+
+        let tool_calls = state.tool_calls();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("toolu_1"));
+        assert_eq!(tool_calls[0].name, "weather");
+        assert_eq!(tool_calls[0].input["city"], "Toronto");
+    }
 
     #[test]
     fn claude_completion_timeout_defaults_and_can_override() {
