@@ -15,6 +15,7 @@ use crate::sse::{SseFrame, SseFrameParser};
 use crate::{
     CompletionRequest, CompletionResponse, CompletionStream, LlmProvider, ProviderContent,
     ProviderError, ProviderRole, StreamEvent, ToolCall, ToolCallParser, UsageMetadata,
+    tool_names::ProviderToolNameMap,
 };
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -59,6 +60,7 @@ impl OpenAiProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
+        let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
         let response = self.execute_completion_request(req, false).await?;
         let parsed: OpenAiCompletionResponse = response.json().await?;
         let choice = parsed
@@ -87,6 +89,7 @@ impl OpenAiProvider {
         {
             tool_calls = parser.parse(&content);
         }
+        tool_name_map.restore_call_names(&mut tool_calls);
 
         Ok(CompletionResponse {
             content,
@@ -122,6 +125,7 @@ impl OpenAiProvider {
 }
 
 fn build_completion_payload(req: CompletionRequest, stream: bool) -> OpenAiCompletionRequest {
+    let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
     let mut messages: Vec<OpenAiRequestMessage> = Vec::new();
     for message in req.messages {
         match message.role {
@@ -138,7 +142,8 @@ fn build_completion_payload(req: CompletionRequest, stream: bool) -> OpenAiCompl
             ProviderRole::Assistant => {
                 // Decode JSON content blocks (set by react agent for tool_use round-tripping).
                 let assistant_text = concat_text(&message.content);
-                let (text, tool_calls) = decode_openai_assistant_blocks(&assistant_text);
+                let (text, tool_calls) =
+                    decode_openai_assistant_blocks(&assistant_text, &tool_name_map);
                 messages.push(OpenAiRequestMessage::Assistant {
                     content: if text.is_empty() { None } else { Some(text) },
                     tool_calls,
@@ -169,7 +174,7 @@ fn build_completion_payload(req: CompletionRequest, stream: bool) -> OpenAiCompl
         .map(|tool| OpenAiFunctionTool {
             kind: "function".to_string(),
             function: OpenAiFunctionDefinition {
-                name: tool.name,
+                name: tool_name_map.provider_name(&tool.name),
                 description: tool.description,
                 parameters: tool.parameters,
             },
@@ -207,7 +212,10 @@ fn build_completion_payload(req: CompletionRequest, stream: bool) -> OpenAiCompl
 
 /// Decode a content string that may be a JSON-encoded array of content blocks (produced by
 /// `build_assistant_content` in `react.rs`). Returns the extracted text and OpenAI tool calls.
-fn decode_openai_assistant_blocks(content: &str) -> (String, Vec<OpenAiToolCallRequest>) {
+fn decode_openai_assistant_blocks(
+    content: &str,
+    tool_name_map: &ProviderToolNameMap,
+) -> (String, Vec<OpenAiToolCallRequest>) {
     let Some(decoded) = decode_assistant_content(content) else {
         return (content.to_string(), vec![]);
     };
@@ -218,7 +226,7 @@ fn decode_openai_assistant_blocks(content: &str) -> (String, Vec<OpenAiToolCallR
             id: tool_use.id,
             kind: "function".to_string(),
             function: OpenAiToolCallFunction {
-                name: tool_use.name,
+                name: tool_name_map.provider_name(&tool_use.name),
                 arguments: serde_json::to_string(&tool_use.input).unwrap_or_default(),
             },
         })

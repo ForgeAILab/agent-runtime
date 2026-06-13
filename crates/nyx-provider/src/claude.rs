@@ -17,7 +17,7 @@ use crate::sse::{SseFrame, SseFrameParser};
 use crate::{
     BearerTokenSource, CompletionRequest, CompletionResponse, CompletionStream, LlmProvider,
     ProviderContent, ProviderError, ProviderRole, StreamEvent, ToolCall, ToolCallParser,
-    UsageMetadata,
+    UsageMetadata, tool_names::ProviderToolNameMap,
 };
 
 const CLAUDE_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -75,6 +75,7 @@ impl ClaudeProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
+        let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
         let payload = build_messages_payload(req, false);
         let response = self.send_messages_request(payload).await?;
         let parsed: ClaudeMessagesResponse = response.json().await?;
@@ -107,6 +108,7 @@ impl ClaudeProvider {
         {
             tool_calls = parser.parse(&content_text);
         }
+        tool_name_map.restore_call_names(&mut tool_calls);
 
         Ok(CompletionResponse {
             content: content_text,
@@ -149,6 +151,7 @@ impl ClaudeProvider {
 }
 
 fn build_messages_payload(req: CompletionRequest, stream: bool) -> ClaudeMessagesRequest {
+    let tool_name_map = ProviderToolNameMap::from_tools(&req.tools);
     let mut system_blocks = Vec::new();
     let mut messages = Vec::new();
 
@@ -175,7 +178,7 @@ fn build_messages_payload(req: CompletionRequest, stream: bool) -> ClaudeMessage
                 });
             }
             ProviderRole::Assistant => {
-                let mut content = assistant_content_to_claude(message.content);
+                let mut content = assistant_content_to_claude(message.content, &tool_name_map);
                 if message.cache_breakpoint {
                     attach_cache_control(&mut content);
                 }
@@ -220,7 +223,7 @@ fn build_messages_payload(req: CompletionRequest, stream: bool) -> ClaudeMessage
     let tools: Vec<ClaudeToolDefinition> = function_tool_definitions(req.tools)
         .into_iter()
         .map(|tool| ClaudeToolDefinition {
-            name: tool.name,
+            name: tool_name_map.provider_name(&tool.name),
             description: tool.description,
             input_schema: tool.parameters,
         })
@@ -247,7 +250,10 @@ fn build_messages_payload(req: CompletionRequest, stream: bool) -> ClaudeMessage
     }
 }
 
-fn assistant_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestContent {
+fn assistant_content_to_claude(
+    content: Vec<ProviderContent>,
+    tool_name_map: &ProviderToolNameMap,
+) -> ClaudeRequestContent {
     let assistant_text = concat_text(&content);
     let Some(decoded) = decode_assistant_content(&assistant_text) else {
         return provider_content_to_claude(content);
@@ -264,7 +270,7 @@ fn assistant_content_to_claude(content: Vec<ProviderContent>) -> ClaudeRequestCo
                 },
                 AssistantContentBlock::ToolUse(tool_use) => ClaudeRequestBlock::ToolUse {
                     id: tool_use.id,
-                    name: tool_use.name,
+                    name: tool_name_map.provider_name(&tool_use.name),
                     input: tool_use.input,
                     cache_control: None,
                 },
