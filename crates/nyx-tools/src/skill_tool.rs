@@ -40,10 +40,7 @@ impl Tool for SkillTool {
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing action".to_string()))?;
+        let action = crate::input::require_str(&input, "action")?;
 
         let Some(skill_service) = ctx.control_plane.get_service::<dyn SkillService>() else {
             return Ok(ToolResult::error("skill service not available"));
@@ -69,10 +66,7 @@ impl Tool for SkillTool {
                 )))
             }
             "get" => {
-                let name = input
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing name".to_string()))?;
+                let name = crate::input::require_str(&input, "name")?;
                 match skill_service
                     .get_skill(&ctx.invocation, name)
                     .await
@@ -96,14 +90,8 @@ impl Tool for SkillTool {
                 }
             }
             "file" => {
-                let name = input
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing name".to_string()))?;
-                let path = input
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ToolError::InvalidInput("missing path".to_string()))?;
+                let name = crate::input::require_str(&input, "name")?;
+                let path = crate::input::require_str(&input, "path")?;
                 match skill_service
                     .get_skill_file(&ctx.invocation, name, path)
                     .await

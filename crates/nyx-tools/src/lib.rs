@@ -9,6 +9,7 @@ mod catalog_service;
 mod core;
 #[cfg(feature = "cost")]
 mod cost;
+mod input;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(unix)]

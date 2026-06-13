@@ -1,9 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::{SubAgentError, SubAgentRunner, Tool, ToolContext, ToolError, ToolResult};
+
+fn lock_poison_tolerant<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
 
 #[derive(Debug, Default)]
 pub struct NoopTool {
@@ -52,10 +56,7 @@ impl SpyTool {
     }
 
     pub fn invocations(&self) -> Vec<Value> {
-        self.invocations
-            .lock()
-            .expect("invocations mutex poisoned")
-            .clone()
+        lock_poison_tolerant(&self.invocations).clone()
     }
 }
 
@@ -74,10 +75,7 @@ impl Tool for SpyTool {
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        self.invocations
-            .lock()
-            .expect("invocations mutex poisoned")
-            .push(input.clone());
+        lock_poison_tolerant(&self.invocations).push(input.clone());
         Ok(ToolResult::json(input))
     }
 }
@@ -111,7 +109,7 @@ pub struct RecordingSubAgentRunner {
 
 impl RecordingSubAgentRunner {
     pub fn calls(&self) -> Vec<RecordedSubAgentCall> {
-        self.calls.lock().expect("calls mutex poisoned").clone()
+        lock_poison_tolerant(&self.calls).clone()
     }
 }
 
@@ -128,7 +126,7 @@ impl SubAgentRunner for RecordingSubAgentRunner {
             tool_names: tools.iter().map(|tool| tool.name().to_string()).collect(),
             max_turns,
         };
-        self.calls.lock().expect("calls mutex poisoned").push(call);
+        lock_poison_tolerant(&self.calls).push(call);
         Ok("recorded".to_string())
     }
 }

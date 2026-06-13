@@ -53,10 +53,7 @@ impl Tool for SessionTool {
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing action".to_string()))?;
+        let action = crate::input::require_str(&input, "action")?;
 
         match action {
             "create" | "list" | "update" | "delete" | "merge" | "info" => {
@@ -104,8 +101,8 @@ async fn create_session(
     ctx: &ToolContext,
     service: &Arc<dyn SessionMetadataService>,
 ) -> Result<ToolResult, ToolError> {
-    let session_id = required_str(input, "session_id")?;
-    let workspace_dir = if let Some(raw) = input.get("workspace_dir").and_then(Value::as_str) {
+    let session_id = crate::input::require_str(input, "session_id")?;
+    let workspace_dir = if let Some(raw) = crate::input::optional_str(input, "workspace_dir")? {
         match validate_workspace_dir(raw, ctx).await? {
             Some(path) => Some(path),
             None => {
@@ -122,26 +119,18 @@ async fn create_session(
     let metadata = SessionMetadata {
         session_id: session_id.to_string(),
         parent_id: Some(
-            input
-                .get("parent_id")
-                .and_then(Value::as_str)
+            crate::input::optional_str(input, "parent_id")?
                 .unwrap_or("main")
                 .to_string(),
         ),
-        label: input
-            .get("label")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
+        label: crate::input::optional_str(input, "label")?.map(ToString::to_string),
         workspace_dir,
-        timezone: input
-            .get("timezone")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
+        timezone: crate::input::optional_str(input, "timezone")?.map(ToString::to_string),
         provider: None,
         group_mode: None,
         respond_to_mention: None,
-        tool_allow: array_of_strings(input.get("tool_allow"))?,
-        tool_deny: array_of_strings(input.get("tool_deny"))?,
+        tool_allow: crate::input::optional_string_array(input, "tool_allow")?,
+        tool_deny: crate::input::optional_string_array(input, "tool_deny")?,
         created_at: now,
         updated_at: now,
     };
@@ -179,7 +168,7 @@ async fn update_session(
     ctx: &ToolContext,
     service: &Arc<dyn SessionMetadataService>,
 ) -> Result<ToolResult, ToolError> {
-    let session_id = required_str(input, "session_id")?;
+    let session_id = crate::input::require_str(input, "session_id")?;
     let Some(mut existing) = (match service.get_metadata(session_id).await {
         Ok(value) => value,
         Err(err) => return Ok(ToolResult::error(err.to_string())),
@@ -189,26 +178,24 @@ async fn update_session(
         )));
     };
 
-    if let Some(parent_id) = nullable_string(input, "parent_id")? {
+    if let Some(parent_id) = crate::input::nullable_string(input, "parent_id")? {
         existing.parent_id = parent_id;
     }
-    if let Some(label) = nullable_string(input, "label")? {
+    if let Some(label) = crate::input::nullable_string(input, "label")? {
         existing.label = label;
     }
-    if let Some(timezone) = nullable_string(input, "timezone")? {
+    if let Some(timezone) = crate::input::nullable_string(input, "timezone")? {
         existing.timezone = timezone;
     }
-    if let Some(tool_allow) = nullable_array_of_strings(input, "tool_allow")? {
+    if let Some(tool_allow) = crate::input::nullable_string_array(input, "tool_allow")? {
         existing.tool_allow = tool_allow;
     }
-    if let Some(tool_deny) = nullable_array_of_strings(input, "tool_deny")? {
+    if let Some(tool_deny) = crate::input::nullable_string_array(input, "tool_deny")? {
         existing.tool_deny = tool_deny;
     }
-    if let Some(workspace_field) = input.get("workspace_dir") {
-        if workspace_field.is_null() {
-            existing.workspace_dir = None;
-        } else if let Some(raw) = workspace_field.as_str() {
-            match validate_workspace_dir(raw, ctx).await? {
+    if let Some(workspace_dir) = crate::input::nullable_string(input, "workspace_dir")? {
+        if let Some(raw) = workspace_dir {
+            match validate_workspace_dir(&raw, ctx).await? {
                 Some(path) => existing.workspace_dir = Some(path),
                 None => {
                     return Ok(ToolResult::error(format!(
@@ -217,9 +204,7 @@ async fn update_session(
                 }
             }
         } else {
-            return Ok(ToolResult::error(
-                "workspace_dir must be a string or null".to_string(),
-            ));
+            existing.workspace_dir = None;
         }
     }
     existing.updated_at = now_timestamp_ms();
@@ -237,7 +222,7 @@ async fn delete_session(
     input: &Value,
     service: &Arc<dyn SessionMetadataService>,
 ) -> Result<ToolResult, ToolError> {
-    let session_id = required_str(input, "session_id")?;
+    let session_id = crate::input::require_str(input, "session_id")?;
     if session_id == "main" {
         return Ok(ToolResult::error("cannot delete the main session"));
     }
@@ -254,12 +239,9 @@ async fn merge_sessions(
     input: &Value,
     service: &Arc<dyn SessionMetadataService>,
 ) -> Result<ToolResult, ToolError> {
-    let source = required_str(input, "source")?;
-    let target = required_str(input, "target")?;
-    let delete_source = input
-        .get("delete_source")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let source = crate::input::require_str(input, "source")?;
+    let target = crate::input::require_str(input, "target")?;
+    let delete_source = crate::input::optional_bool(input, "delete_source")?.unwrap_or(false);
 
     if let Err(err) = service.merge_sessions(source, target).await {
         return Ok(ToolResult::error(err.to_string()));
@@ -278,7 +260,7 @@ async fn session_info(
     input: &Value,
     service: &Arc<dyn SessionMetadataService>,
 ) -> Result<ToolResult, ToolError> {
-    let session_id = required_str(input, "session_id")?;
+    let session_id = crate::input::require_str(input, "session_id")?;
     match service.resolve_config(session_id).await {
         Ok(resolved) => Ok(ToolResult::json(json!({
             "session_id": resolved.session_id,
@@ -330,7 +312,7 @@ async fn search_turns(
     ctx: &ToolContext,
     service: &Arc<dyn SessionConversationService>,
 ) -> Result<ToolResult, ToolError> {
-    let Some(query) = input.get("query").and_then(Value::as_str) else {
+    let Some(query) = crate::input::optional_str(input, "query")? else {
         return Ok(ToolResult::error("missing query"));
     };
     if query.is_empty() {
@@ -398,62 +380,6 @@ async fn validate_workspace_dir(
     }
 }
 
-fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidInput(format!("missing {key}")))
-}
-
-fn array_of_strings(value: Option<&Value>) -> Result<Option<Vec<String>>, ToolError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let Some(items) = value.as_array() else {
-        return Err(ToolError::InvalidInput(
-            "expected an array of strings".to_string(),
-        ));
-    };
-    let mut result = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(value) = item.as_str() else {
-            return Err(ToolError::InvalidInput(
-                "expected an array of strings".to_string(),
-            ));
-        };
-        result.push(value.to_string());
-    }
-    Ok(Some(result))
-}
-
-fn nullable_array_of_strings(
-    input: &Value,
-    key: &str,
-) -> Result<Option<Option<Vec<String>>>, ToolError> {
-    let Some(value) = input.get(key) else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(Some(None));
-    }
-    Ok(Some(array_of_strings(Some(value))?))
-}
-
-fn nullable_string(input: &Value, key: &str) -> Result<Option<Option<String>>, ToolError> {
-    let Some(value) = input.get(key) else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(Some(None));
-    }
-    let Some(value) = value.as_str() else {
-        return Err(ToolError::InvalidInput(format!(
-            "{key} must be a string or null"
-        )));
-    };
-    Ok(Some(Some(value.to_string())))
-}
-
 fn now_timestamp_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as u64,
@@ -475,13 +401,11 @@ fn resolve_session_id(input: &Value, ctx: &ToolContext) -> Result<String, &'stat
 }
 
 fn parse_role(input: &Value) -> Result<Option<String>, ToolError> {
-    let Some(value) = input.get("role") else {
+    let role = crate::input::optional_str(input, "role").map_err(|_| {
+        ToolError::InvalidInput("role must be one of: user, assistant, tool".to_string())
+    })?;
+    let Some(role) = role else {
         return Ok(None);
-    };
-    let Some(role) = value.as_str() else {
-        return Err(ToolError::InvalidInput(
-            "role must be one of: user, assistant, tool".to_string(),
-        ));
     };
     if !matches!(role, "user" | "assistant" | "tool") {
         return Err(ToolError::InvalidInput(
@@ -492,13 +416,11 @@ fn parse_role(input: &Value) -> Result<Option<String>, ToolError> {
 }
 
 fn parse_limit(input: &Value) -> Result<usize, ToolError> {
-    let Some(raw) = input.get("limit") else {
+    let Some(raw) = crate::input::optional_u64(input, "limit").map_err(|_| {
+        ToolError::InvalidInput("limit must be an integer between 1 and 100".to_string())
+    })?
+    else {
         return Ok(20);
-    };
-    let Some(raw) = raw.as_u64() else {
-        return Err(ToolError::InvalidInput(
-            "limit must be an integer between 1 and 100".to_string(),
-        ));
     };
     if raw == 0 || raw > 100 {
         return Err(ToolError::InvalidInput(
@@ -509,33 +431,26 @@ fn parse_limit(input: &Value) -> Result<usize, ToolError> {
 }
 
 fn parse_offset(input: &Value) -> Result<usize, ToolError> {
-    let Some(raw) = input.get("offset") else {
+    let Some(raw) = crate::input::optional_u64(input, "offset").map_err(|_| {
+        ToolError::InvalidInput("offset must be a non-negative integer".to_string())
+    })?
+    else {
         return Ok(0);
-    };
-    let Some(raw) = raw.as_u64() else {
-        return Err(ToolError::InvalidInput(
-            "offset must be a non-negative integer".to_string(),
-        ));
     };
     Ok(raw as usize)
 }
 
 fn parse_timestamp_ms(input: &Value, key: &str) -> Result<Option<u64>, ToolError> {
-    let Some(value) = input.get(key) else {
-        return Ok(None);
-    };
-    let Some(ms) = value.as_u64() else {
-        return Err(ToolError::InvalidInput(format!(
+    crate::input::optional_u64(input, key).map_err(|_| {
+        ToolError::InvalidInput(format!(
             "{key} must be a non-negative integer (Unix timestamp in milliseconds)"
-        )));
-    };
-    Ok(Some(ms))
+        ))
+    })
 }
 
 fn parse_include_tool_calls(input: &Value) -> bool {
-    input
-        .get("include_tool_calls")
-        .and_then(Value::as_bool)
+    crate::input::optional_bool(input, "include_tool_calls")
+        .unwrap_or(None)
         .unwrap_or(false)
 }
 

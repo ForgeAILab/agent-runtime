@@ -4,7 +4,7 @@ use nyx_core::{ControlPlaneExt, ToolCatalogService, ToolSelection};
 use nyx_obs::Event;
 use nyx_provider::{
     CompletionRequest, CompletionResponse, ProviderContent, ProviderMessage, ProviderRole,
-    ToolDefinition,
+    ToolCall, ToolDefinition,
 };
 use serde_json::{Value, json};
 
@@ -312,93 +312,7 @@ impl ToolLoopEngine {
             history.push(Message::assistant(build_assistant_content(&completion)));
 
             for tool_call in &completion.tool_calls {
-                let Some(tool) = ctx.tools.iter().find(|t| t.name() == tool_call.name) else {
-                    return Err(AgentError::ToolNotFound(tool_call.name.clone()));
-                };
-
-                let mut before_tool_aborted = None;
-                if !ctx.hooks.is_empty() {
-                    let hook_ctx = BeforeToolContext {
-                        tool_name: tool.name(),
-                        input: &tool_call.input,
-                        turn,
-                    };
-                    for hook in &ctx.hooks {
-                        if let HookAction::Abort(reason) = hook.before_tool(&hook_ctx).await {
-                            before_tool_aborted = Some(reason);
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(reason) = before_tool_aborted {
-                    history.push(Message::tool_result(tool_call.id.clone(), reason));
-                    continue;
-                }
-
-                let input_json =
-                    serde_json::to_string(&tool_call.input).unwrap_or_else(|_| "{}".to_string());
-                ctx.sink
-                    .emit(Event::tool_invoked(
-                        "nyx-agent",
-                        tool.name(),
-                        Some(input_json),
-                    ))
-                    .await
-                    .map_err(|err| AgentError::Observability(err.to_string()))?;
-
-                let started = Instant::now();
-
-                let (tool_result, success) =
-                    match tool.invoke(tool_call.input.clone(), &ctx.tool_ctx).await {
-                        Ok(tool_result) => (tool_result, true),
-                        Err(err) => (
-                            nyx_tools::ToolResult::error(short_tool_error(&err.to_string())),
-                            false,
-                        ),
-                    };
-
-                let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                let tool_result_text = truncate_head_tail(
-                    &render_tool_result_for_provider(&tool_result.value)?,
-                    TOOL_RESULT_PROVIDER_MAX_CHARS,
-                );
-                let tool_content_blocks = render_tool_result_to_content(&tool_result)?;
-                let observer_result_text = truncate_head_tail(
-                    &render_tool_result_for_observer(&tool_result.value),
-                    TOOL_RESULT_OBSERVER_MAX_CHARS,
-                );
-
-                if !ctx.hooks.is_empty() {
-                    let hook_ctx = AfterToolContext {
-                        tool_name: tool.name(),
-                        input: &tool_call.input,
-                        output: &tool_result_text,
-                        success,
-                        duration_ms,
-                    };
-                    for hook in &ctx.hooks {
-                        let _ = hook.after_tool(&hook_ctx).await;
-                    }
-                }
-
-                ctx.sink
-                    .emit(Event::tool_result(
-                        "nyx-agent",
-                        tool.name(),
-                        observer_result_text,
-                    ))
-                    .await
-                    .map_err(|err| AgentError::Observability(err.to_string()))?;
-
-                history.push(Message::tool_result_with_content(
-                    tool_call.id.clone(),
-                    tool_content_blocks,
-                ));
-
-                if ctx.cancel.is_cancelled() {
-                    return Err(AgentError::Cancelled);
-                }
+                invoke_tool_call(ctx, &mut history, tool_call, turn).await?;
             }
         }
 
@@ -444,6 +358,101 @@ impl ToolLoopEngine {
 
         messages
     }
+}
+
+async fn invoke_tool_call(
+    ctx: &AgentContext,
+    history: &mut Vec<Message>,
+    tool_call: &ToolCall,
+    turn: usize,
+) -> Result<(), AgentError> {
+    let Some(tool) = ctx.tools.iter().find(|t| t.name() == tool_call.name) else {
+        return Err(AgentError::ToolNotFound(tool_call.name.clone()));
+    };
+
+    let mut before_tool_aborted = None;
+    if !ctx.hooks.is_empty() {
+        let hook_ctx = BeforeToolContext {
+            tool_name: tool.name(),
+            input: &tool_call.input,
+            turn,
+        };
+        for hook in &ctx.hooks {
+            if let HookAction::Abort(reason) = hook.before_tool(&hook_ctx).await {
+                before_tool_aborted = Some(reason);
+                break;
+            }
+        }
+    }
+
+    if let Some(reason) = before_tool_aborted {
+        history.push(Message::tool_result(tool_call.id.clone(), reason));
+        return Ok(());
+    }
+
+    let input_json = serde_json::to_string(&tool_call.input).unwrap_or_else(|_| "{}".to_string());
+    ctx.sink
+        .emit(Event::tool_invoked(
+            "nyx-agent",
+            tool.name(),
+            Some(input_json),
+        ))
+        .await
+        .map_err(|err| AgentError::Observability(err.to_string()))?;
+
+    let started = Instant::now();
+
+    let (tool_result, success) = match tool.invoke(tool_call.input.clone(), &ctx.tool_ctx).await {
+        Ok(tool_result) => (tool_result, true),
+        Err(err) => (
+            nyx_tools::ToolResult::error(short_tool_error(&err.to_string())),
+            false,
+        ),
+    };
+
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let tool_result_text = truncate_head_tail(
+        &render_tool_result_for_provider(&tool_result.value)?,
+        TOOL_RESULT_PROVIDER_MAX_CHARS,
+    );
+    let tool_content_blocks = render_tool_result_to_content(&tool_result)?;
+    let observer_result_text = truncate_head_tail(
+        &render_tool_result_for_observer(&tool_result.value),
+        TOOL_RESULT_OBSERVER_MAX_CHARS,
+    );
+
+    if !ctx.hooks.is_empty() {
+        let hook_ctx = AfterToolContext {
+            tool_name: tool.name(),
+            input: &tool_call.input,
+            output: &tool_result_text,
+            success,
+            duration_ms,
+        };
+        for hook in &ctx.hooks {
+            let _ = hook.after_tool(&hook_ctx).await;
+        }
+    }
+
+    ctx.sink
+        .emit(Event::tool_result(
+            "nyx-agent",
+            tool.name(),
+            observer_result_text,
+        ))
+        .await
+        .map_err(|err| AgentError::Observability(err.to_string()))?;
+
+    history.push(Message::tool_result_with_content(
+        tool_call.id.clone(),
+        tool_content_blocks,
+    ));
+
+    if ctx.cancel.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+
+    Ok(())
 }
 
 fn estimate_provider_request_tokens(

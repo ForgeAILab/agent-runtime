@@ -1,3 +1,5 @@
+#[cfg(feature = "http")]
+use std::borrow::Cow;
 #[cfg(feature = "terminal")]
 use std::collections::HashMap;
 use std::path::Path;
@@ -111,10 +113,7 @@ impl Tool for FileReadTool {
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let path = input
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing path".to_string()))?;
+        let path = crate::input::require_str(&input, "path")?;
         let path = Path::new(path);
         let resolved_path = if path.is_relative() {
             ctx.workspace_dir.join(path)
@@ -133,15 +132,11 @@ impl Tool for FileReadTool {
 
         let content = tokio::fs::read_to_string(&resolved_path).await?;
 
-        let offset = input
-            .get("offset")
-            .and_then(Value::as_u64)
+        let offset = crate::input::optional_u64(&input, "offset")?
             .map(|v| v.max(1) as usize)
             .unwrap_or(1);
 
-        let limit = input
-            .get("limit")
-            .and_then(Value::as_u64)
+        let limit = crate::input::optional_u64(&input, "limit")?
             .map(|v| (v as usize).min(Self::MAX_LINES))
             .unwrap_or(Self::MAX_LINES);
 
@@ -227,14 +222,8 @@ impl Tool for FileWriteTool {
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let path = input
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing path".to_string()))?;
-        let content = input
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing content".to_string()))?;
+        let path = crate::input::require_str(&input, "path")?;
+        let content = crate::input::require_str(&input, "content")?;
 
         let path = Path::new(path);
         let resolved_path = if path.is_relative() {
@@ -283,14 +272,8 @@ impl Tool for FileApplyPatchTool {
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let path = input
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing path".to_string()))?;
-        let patch = input
-            .get("patch")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing patch".to_string()))?;
+        let path = crate::input::require_str(&input, "path")?;
+        let patch = crate::input::require_str(&input, "patch")?;
 
         let file_path = Path::new(path);
         let resolved_path = if file_path.is_relative() {
@@ -347,15 +330,9 @@ impl Tool for ShellTool {
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let command_text = input
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing command".to_string()))?;
+        let command_text = crate::input::require_str(&input, "command")?;
         let default_pwd = ctx.workspace_dir.to_str().unwrap_or(".");
-        let pwd = input
-            .get("pwd")
-            .and_then(Value::as_str)
-            .unwrap_or(default_pwd);
+        let pwd = crate::input::optional_str(&input, "pwd")?.unwrap_or(default_pwd);
 
         let mut command = SandboxedCommand::new("sh")
             .arg("-lc")
@@ -482,10 +459,7 @@ impl Tool for ProcessTool {
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing action".to_string()))?;
+        let action = crate::input::require_str(&input, "action")?;
 
         match action {
             "start" => self.action_start(&input, ctx).await,
@@ -504,10 +478,7 @@ impl Tool for ProcessTool {
 #[cfg(feature = "terminal")]
 impl ProcessTool {
     fn require_id(input: &Value) -> Result<&str, ToolError> {
-        input
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing id".to_string()))
+        crate::input::require_str(input, "id")
     }
 
     async fn action_start(
@@ -516,20 +487,14 @@ impl ProcessTool {
         ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let id = Self::require_id(input)?;
-        let command = input
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing command".to_string()))?;
-        let pwd = input.get("pwd").and_then(Value::as_str).map(str::to_string);
-        let interactive = input
-            .get("interactive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let tty = input.get("tty").and_then(Value::as_bool).unwrap_or(false);
+        let command = crate::input::require_str(input, "command")?;
+        let pwd = crate::input::optional_str(input, "pwd")?.map(str::to_string);
+        let interactive = crate::input::optional_bool(input, "interactive")?.unwrap_or(false);
+        let tty = crate::input::optional_bool(input, "tty")?.unwrap_or(false);
 
         if tty {
-            let cols = input.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
-            let rows = input.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+            let cols = crate::input::optional_u64(input, "cols")?.unwrap_or(80) as u16;
+            let rows = crate::input::optional_u64(input, "rows")?.unwrap_or(24) as u16;
 
             self.terminal_registry
                 .spawn_pty(id, command, ctx, HashMap::new(), pwd, cols, rows)
@@ -557,15 +522,9 @@ impl ProcessTool {
 
     async fn action_read(&self, input: &Value) -> Result<ToolResult, ToolError> {
         let id = Self::require_id(input)?;
-        let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
-        let offset = input
-            .get("offset")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize);
-        let limit = input
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize);
+        let timeout_ms = crate::input::optional_u64(input, "timeout_ms")?.unwrap_or(0);
+        let offset = crate::input::optional_u64(input, "offset")?.map(|v| v as usize);
+        let limit = crate::input::optional_u64(input, "limit")?.map(|v| v as usize);
 
         let output = self
             .terminal_registry
@@ -585,14 +544,8 @@ impl ProcessTool {
 
     async fn action_write(&self, input: &Value) -> Result<ToolResult, ToolError> {
         let id = Self::require_id(input)?;
-        let raw = input
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing input".to_string()))?;
-        let no_newline = input
-            .get("no_newline")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let raw = crate::input::require_str(input, "input")?;
+        let no_newline = crate::input::optional_bool(input, "no_newline")?.unwrap_or(false);
 
         let data = if no_newline || raw.ends_with('\n') {
             raw.to_string()
@@ -611,10 +564,7 @@ impl ProcessTool {
 
     async fn action_wait(&self, input: &Value) -> Result<ToolResult, ToolError> {
         let id = Self::require_id(input)?;
-        let timeout_ms = input
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(30_000);
+        let timeout_ms = crate::input::optional_u64(input, "timeout_ms")?.unwrap_or(30_000);
 
         let (status, timed_out) = self.terminal_registry.wait(id, timeout_ms).await?;
         let output = self.terminal_registry.read(id, 0, None, None).await?;
@@ -722,6 +672,24 @@ fn looks_like_html(body: &str) -> bool {
         || (trimmed.starts_with('<') && (trimmed.contains("</") || trimmed.contains("/>")))
 }
 
+#[cfg(feature = "http")]
+fn static_regex<'a>(
+    compiled: &'a Result<regex::Regex, regex::Error>,
+    label: &str,
+) -> Option<&'a regex::Regex> {
+    match compiled {
+        Ok(regex) => Some(regex),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                regex = label,
+                "failed to compile HTTP sanitizer regex; skipping sanitizer step"
+            );
+            None
+        }
+    }
+}
+
 /// Extract readable content from an HTML page.
 ///
 /// 1. Grab `<title>` as a heading.
@@ -734,20 +702,20 @@ fn sanitize_html(raw: &str) -> String {
     use std::sync::LazyLock;
 
     // --- title ---
-    static TITLE_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("static regex"));
+    static TITLE_RE: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>"));
 
-    let title = TITLE_RE
-        .captures(raw)
+    let title = static_regex(&TITLE_RE, "title")
+        .and_then(|regex| regex.captures(raw))
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().trim().to_owned());
 
     // --- body ---
-    static BODY_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<body\b[^>]*>(.*)</body>").expect("static regex"));
+    static BODY_RE: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"(?is)<body\b[^>]*>(.*)</body>"));
 
-    let body = BODY_RE
-        .captures(raw)
+    let body = static_regex(&BODY_RE, "body")
+        .and_then(|regex| regex.captures(raw))
         .and_then(|c| c.get(1))
         .map(|m| m.as_str())
         .unwrap_or(raw);
@@ -755,7 +723,7 @@ fn sanitize_html(raw: &str) -> String {
     // --- strip non-content tags BEFORE content scoping ---
     // This must happen first so that stray </script> etc. don't confuse
     // the greedy content-region regex.
-    static STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    static STRIP_RE: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| {
         Regex::new(concat!(
             r"(?is)",
             r"<script\b[^>]*>.*?</script>|",
@@ -772,37 +740,39 @@ fn sanitize_html(raw: &str) -> String {
             // HTML comments (React boundaries, etc.)
             r"<!--.*?-->",
         ))
-        .expect("static regex")
     });
 
-    let stripped = STRIP_RE.replace_all(body, "");
+    let stripped = static_regex(&STRIP_RE, "strip")
+        .map(|regex| regex.replace_all(body, ""))
+        .unwrap_or_else(|| Cow::Borrowed(body));
 
     // --- narrow to content region (after scripts are gone) ---
     // Try each selector independently (not as alternations) to avoid
     // a broader <main> overshadowing a narrower <article>.
-    static ARTICLE_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<article\b[^>]*>(.*)</article>").expect("static regex"));
-    static MAIN_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<main\b[^>]*>(.*)</main>").expect("static regex"));
-    static ROLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?is)<\w+\b[^>]*\brole\s*=\s*"main"[^>]*>(.*)</\w+>"#).expect("static regex")
-    });
-    static CONTENT_AREA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    static ARTICLE_RE: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"(?is)<article\b[^>]*>(.*)</article>"));
+    static MAIN_RE: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"(?is)<main\b[^>]*>(.*)</main>"));
+    static ROLE_RE: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r#"(?is)<\w+\b[^>]*\brole\s*=\s*"main"[^>]*>(.*)</\w+>"#));
+    static CONTENT_AREA_RE: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| {
         Regex::new(r#"(?is)<\w+\b[^>]*\bid\s*=\s*"content-area"[^>]*>(.*)</\w+>"#)
-            .expect("static regex")
     });
 
-    let scoped = ARTICLE_RE
-        .captures(&stripped)
-        .or_else(|| MAIN_RE.captures(&stripped))
-        .or_else(|| ROLE_RE.captures(&stripped))
-        .or_else(|| CONTENT_AREA_RE.captures(&stripped))
+    let scoped = static_regex(&ARTICLE_RE, "article")
+        .and_then(|regex| regex.captures(&stripped))
+        .or_else(|| static_regex(&MAIN_RE, "main").and_then(|regex| regex.captures(&stripped)))
+        .or_else(|| static_regex(&ROLE_RE, "role-main").and_then(|regex| regex.captures(&stripped)))
+        .or_else(|| {
+            static_regex(&CONTENT_AREA_RE, "content-area")
+                .and_then(|regex| regex.captures(&stripped))
+        })
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| stripped.into_owned());
 
     // --- strip chrome tags (only needed after scoping) ---
-    static CHROME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    static CHROME_RE: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| {
         Regex::new(concat!(
             r"(?is)",
             r"<nav\b[^>]*>.*?</nav>|",
@@ -810,10 +780,11 @@ fn sanitize_html(raw: &str) -> String {
             r"<aside\b[^>]*>.*?</aside>|",
             r"<form\b[^>]*>.*?</form>",
         ))
-        .expect("static regex")
     });
 
-    let cleaned = CHROME_RE.replace_all(&scoped, "");
+    let cleaned = static_regex(&CHROME_RE, "chrome")
+        .map(|regex| regex.replace_all(&scoped, ""))
+        .unwrap_or_else(|| Cow::Borrowed(scoped.as_str()));
 
     // --- convert to markdown ---
     let md = html2md::parse_html(&cleaned);
@@ -842,17 +813,21 @@ fn clean_markdown(s: &str) -> String {
 
     // Links whose visible text is empty or only zero-width/whitespace chars,
     // e.g. `[​](#webhooks)` or `[\u{200b}](#foo)`.
-    static EMPTY_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\[[\s\u{200b}\u{200c}\u{feff}]*\]\([^)]*\)").expect("static regex")
-    });
+    static EMPTY_LINK_RE: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"\[[\s\u{200b}\u{200c}\u{feff}]*\]\([^)]*\)"));
 
     // "Loading..." skeleton lines left by React Suspense shimmer divs.
-    static LOADING_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?m)^\s*Loading\.{3}\s*$").expect("static regex"));
+    static LOADING_RE: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*Loading\.{3}\s*$"));
 
-    let out = EMPTY_LINK_RE.replace_all(s, "");
-    let out = LOADING_RE.replace_all(&out, "");
-    out.into_owned()
+    let out = static_regex(&EMPTY_LINK_RE, "empty-link")
+        .map(|regex| regex.replace_all(s, ""))
+        .unwrap_or_else(|| Cow::Borrowed(s));
+    if let Some(regex) = static_regex(&LOADING_RE, "loading") {
+        regex.replace_all(&out, "").into_owned()
+    } else {
+        out.into_owned()
+    }
 }
 
 /// Collapse runs of 3+ newlines into exactly 2 (one blank line).
@@ -908,20 +883,15 @@ impl Tool for HttpTool {
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         let response_format =
-            HttpResponseFormat::parse(input.get("response_format").and_then(Value::as_str))?;
-        let method = input
-            .get("method")
-            .and_then(Value::as_str)
+            HttpResponseFormat::parse(crate::input::optional_str(&input, "response_format")?)?;
+        let method = crate::input::optional_str(&input, "method")?
             .unwrap_or("GET")
             .parse::<reqwest::Method>()
             .map_err(|err| ToolError::InvalidInput(err.to_string()))?;
-        let url = input
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("missing url".to_string()))?;
+        let url = crate::input::require_str(&input, "url")?;
 
         let mut req = self.client.request(method, url);
-        if let Some(headers) = input.get("headers").and_then(Value::as_object) {
+        if let Some(headers) = crate::input::optional_object(&input, "headers")? {
             for (key, value) in headers {
                 if let Some(v) = value.as_str() {
                     req = req.header(key, v);
@@ -1219,7 +1189,10 @@ mod tests {
     #[async_trait]
     impl Sandbox for SpySandbox {
         async fn execute(&self, cmd: SandboxedCommand) -> Result<SandboxedOutput, SandboxError> {
-            self.calls.lock().expect("calls mutex poisoned").push(cmd);
+            self.calls
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(cmd);
             self.executions.fetch_add(1, Ordering::Relaxed);
             Ok(SandboxedOutput {
                 status: 0,
