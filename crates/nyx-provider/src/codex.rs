@@ -317,6 +317,13 @@ fn build_payload(req: CompletionRequest, _stream: bool) -> serde_json::Value {
         instructions.join("\n\n")
     };
 
+    if input.is_empty() {
+        input.push(json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue."}]
+        }));
+    }
+
     let mut payload = json!({
         "model": req.model,
         "instructions": instructions,
@@ -1195,6 +1202,24 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn payload_synthesizes_input_when_messages_are_system_only() {
+        let req = CompletionRequest {
+            model: "codex".to_string(),
+            messages: vec![crate::ProviderMessage::system("You are helpful")],
+            tools: vec![],
+            max_tokens: None,
+            temperature: None,
+            thinking_tokens: None,
+        };
+        let payload = build_payload(req, false);
+        let input = payload["input"].as_array().expect("input array");
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "Continue.");
     }
 
     #[test]
