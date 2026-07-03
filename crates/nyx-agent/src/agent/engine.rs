@@ -367,7 +367,23 @@ async fn invoke_tool_call(
     turn: usize,
 ) -> Result<(), AgentError> {
     let Some(tool) = ctx.tools.iter().find(|t| t.name() == tool_call.name) else {
-        return Err(AgentError::ToolNotFound(tool_call.name.clone()));
+        // The model can request tools it saw in history but that this dispatch
+        // profile doesn't offer (e.g. message_action during a heartbeat).
+        // Answer with an error result so it can recover instead of aborting
+        // the whole run — an abort would also persist a tool_use with no
+        // matching tool_result, corrupting history for every later turn.
+        tracing::warn!(
+            tool = %tool_call.name,
+            "model called a tool not offered in this dispatch; returning error result"
+        );
+        history.push(Message::tool_result(
+            tool_call.id.clone(),
+            format!(
+                "Error: tool '{}' is not available in this context. Use only the tools listed in this conversation.",
+                tool_call.name
+            ),
+        ));
+        return Ok(());
     };
 
     let mut before_tool_aborted = None;
