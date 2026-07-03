@@ -428,12 +428,17 @@ struct OpenAiPromptTokensDetails {
 
 impl From<OpenAiUsage> for UsageMetadata {
     fn from(value: OpenAiUsage) -> Self {
+        // OpenAI-style `prompt_tokens` INCLUDES cached tokens, while
+        // `UsageMetadata::input_tokens` counts only non-cached input (the
+        // Anthropic convention). Subtract so downstream cache-hit ratios and
+        // cost estimates don't double-count the cached portion.
+        let cached = value
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens);
         Self {
-            input_tokens: value.prompt_tokens,
+            input_tokens: value.prompt_tokens.saturating_sub(cached.unwrap_or(0)),
             output_tokens: value.completion_tokens,
-            cache_read_tokens: value
-                .prompt_tokens_details
-                .and_then(|details| details.cached_tokens),
+            cache_read_tokens: cached,
             cache_write_tokens: None,
         }
     }
@@ -741,7 +746,7 @@ mod tests {
         assert_eq!(
             done.1.as_ref(),
             Some(&UsageMetadata {
-                input_tokens: 12,
+                input_tokens: 7,
                 output_tokens: 7,
                 cache_read_tokens: Some(5),
                 cache_write_tokens: None,
@@ -860,10 +865,12 @@ mod tests {
             .await
             .expect("request should succeed");
 
+        // prompt_tokens (120) includes the 96 cached tokens; input_tokens is
+        // normalized to the non-cached remainder.
         assert_eq!(
             response.usage,
             Some(UsageMetadata {
-                input_tokens: 120,
+                input_tokens: 24,
                 output_tokens: 7,
                 cache_read_tokens: Some(96),
                 cache_write_tokens: None,

@@ -133,6 +133,12 @@ pub struct CompletionResponse {
     pub usage: Option<UsageMetadata>,
 }
 
+/// Token usage for a single completion.
+///
+/// Counters are disjoint (Anthropic convention): `input_tokens` counts only
+/// NON-cached input, so total prompt size is `input_tokens + cache_read_tokens`.
+/// Adapters for APIs whose `prompt_tokens` includes cached tokens (OpenAI-style)
+/// must subtract the cached portion when mapping into this struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageMetadata {
     pub input_tokens: u32,

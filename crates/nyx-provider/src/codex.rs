@@ -413,14 +413,27 @@ struct ResponsesUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<ResponsesInputTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 impl From<ResponsesUsage> for UsageMetadata {
     fn from(value: ResponsesUsage) -> Self {
+        // Responses API `input_tokens` includes cached tokens; normalize to
+        // the disjoint-counter convention (see `UsageMetadata` docs).
+        let cached = value
+            .input_tokens_details
+            .and_then(|details| details.cached_tokens);
         UsageMetadata {
-            input_tokens: value.input_tokens,
+            input_tokens: value.input_tokens.saturating_sub(cached.unwrap_or(0)),
             output_tokens: value.output_tokens,
-            cache_read_tokens: None,
+            cache_read_tokens: cached,
             cache_write_tokens: None,
         }
     }
