@@ -807,17 +807,10 @@ fn sanitize_html(raw: &str) -> String {
 
 #[cfg(feature = "http")]
 fn html_to_markdown_lossy(html: &str) -> String {
-    if !html.is_ascii() {
-        tracing::warn!(
-            "html contains non-ASCII text; falling back to stripped text to avoid markdown conversion panic"
-        );
-        return strip_html_tags_lossy(html);
-    }
-
-    match std::panic::catch_unwind(|| html2md::parse_html(html)) {
+    match htmd::convert(html) {
         Ok(markdown) => markdown,
-        Err(_) => {
-            tracing::warn!("html to markdown conversion panicked; falling back to stripped text");
+        Err(err) => {
+            tracing::warn!(error = %err, "html to markdown conversion failed; falling back to stripped text");
             strip_html_tags_lossy(html)
         }
     }
@@ -1801,10 +1794,10 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[test]
-    fn http_markdown_fallback_handles_non_ascii_html() {
+    fn http_markdown_converts_non_ascii_html() {
         let text = html_to_markdown_lossy("<main><p>创意&nbsp;工作者</p></main>");
 
-        assert_eq!(text, "创意 工作者");
+        assert_eq!(text, "创意\u{a0}工作者");
     }
 
     #[cfg(feature = "terminal")]
