@@ -374,7 +374,7 @@ fn open_pty(cols: u16, rows: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut master_raw: libc::c_int = 0;
     let mut slave_raw: libc::c_int = 0;
 
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
@@ -388,7 +388,7 @@ fn open_pty(cols: u16, rows: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
             &mut slave_raw,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &ws,
+            &mut ws,
         )
     };
     if ret != 0 {
