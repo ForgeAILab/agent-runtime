@@ -618,34 +618,97 @@ fn trim_old_history_messages(
     }
 }
 
+/// Reduce a JSON Schema to its callable skeleton: keep `type`, `required`,
+/// `format`, `enum`, numeric bounds, property names with their (recursively
+/// reduced) subschemas, and `items`/`additionalProperties`; drop
+/// property-level `description`, `default`, and `examples`. The result always
+/// lets a model construct a valid invocation — trimming removes
+/// documentation, never fields.
+fn reduce_tool_schema(schema: &Value) -> Value {
+    fn reduce_node(node: &Value) -> Value {
+        let Value::Object(map) = node else {
+            return node.clone();
+        };
+        let mut out = serde_json::Map::new();
+        for (key, value) in map {
+            match key.as_str() {
+                "type" | "required" | "enum" | "format" | "minimum" | "maximum" => {
+                    out.insert(key.clone(), value.clone());
+                }
+                "properties" => {
+                    if let Value::Object(props) = value {
+                        let reduced = props
+                            .iter()
+                            .map(|(name, sub)| (name.clone(), reduce_node(sub)))
+                            .collect::<serde_json::Map<_, _>>();
+                        out.insert(key.clone(), Value::Object(reduced));
+                    }
+                }
+                "items" | "additionalProperties" => {
+                    out.insert(key.clone(), reduce_node(value));
+                }
+                _ => {}
+            }
+        }
+        Value::Object(out)
+    }
+
+    let mut reduced = reduce_node(schema);
+    // Keep a clipped top-level description so the tool's purpose survives.
+    if let (Value::Object(out), Some(Value::String(description))) =
+        (&mut reduced, schema.get("description"))
+    {
+        out.insert(
+            "description".to_string(),
+            Value::String(description.chars().take(240).collect()),
+        );
+    }
+    reduced
+}
+
 fn trim_tool_definitions(
     tools: &mut [ToolDefinition],
     token_budget: usize,
     messages: &[ProviderMessage],
     records: &mut Vec<String>,
 ) {
-    if estimate_provider_request_tokens(messages, tools) <= token_budget {
-        return;
+    // Pass 1: reduce schemas to their callable skeleton, largest first,
+    // re-checking the budget between tools so trimming stops as soon as the
+    // request fits. Schemas are never replaced with empty stubs.
+    let mut order: Vec<usize> = (0..tools.len()).collect();
+    order
+        .sort_by_key(|&idx| std::cmp::Reverse(tools[idx].input_schema.to_string().chars().count()));
+    for idx in order {
+        if estimate_provider_request_tokens(messages, tools) <= token_budget {
+            return;
+        }
+        let reduced = reduce_tool_schema(&tools[idx].input_schema);
+        if reduced.to_string().chars().count() < tools[idx].input_schema.to_string().chars().count()
+        {
+            tools[idx].input_schema = reduced;
+            records.push(format!(
+                "tool_definition:{}:schema_reduced",
+                tools[idx].name
+            ));
+        }
     }
-    for tool in tools {
-        if tool.description.chars().count() > 240 {
-            tool.description = summarize_text_block(
-                &tool.description,
+
+    // Pass 2: only after schema reduction, fall back to summarizing long
+    // tool descriptions.
+    for idx in 0..tools.len() {
+        if estimate_provider_request_tokens(messages, tools) <= token_budget {
+            return;
+        }
+        if tools[idx].description.chars().count() > 240 {
+            tools[idx].description = summarize_text_block(
+                &tools[idx].description,
                 80,
                 "tool description trimmed by context budget",
             );
             records.push(format!(
                 "tool_definition:{}:description_summarized",
-                tool.name
+                tools[idx].name
             ));
-        }
-        let schema_text = tool.input_schema.to_string();
-        if schema_text.chars().count() > 2_000 {
-            tool.input_schema = json!({
-                "type": "object",
-                "description": "schema trimmed by context budget; use documented tool inputs"
-            });
-            records.push(format!("tool_definition:{}:schema_summarized", tool.name));
         }
     }
 }
@@ -1065,8 +1128,8 @@ mod tests {
 
     use super::{
         ToolLoopConfig, ToolLoopEngine, apply_budget_trimming, estimate_provider_request_tokens,
-        log_prompt_breakdown, short_tool_error, to_provider_messages_for_request,
-        truncate_head_tail,
+        log_prompt_breakdown, reduce_tool_schema, short_tool_error,
+        to_provider_messages_for_request, trim_tool_definitions, truncate_head_tail,
     };
     use crate::{
         AgentContext, AgentError, ContextCompressionError, ContextCompressor, Message, MessageRole,
@@ -1383,6 +1446,137 @@ mod tests {
         assert!(
             rendered.contains("tool result trimmed by context budget")
                 || !trimmed.iter().any(|m| matches!(m.role, ProviderRole::Tool))
+        );
+    }
+
+    #[test]
+    fn reduce_tool_schema_keeps_callable_skeleton() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["action"],
+            "description": "Manage scheduled jobs.",
+            "properties": {
+                "action": { "type": "string", "enum": ["add", "list"], "description": "what to do" },
+                "agent": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["isolated", "session"],
+                            "description": "dispatch mode",
+                            "default": "session"
+                        }
+                    }
+                }
+            }
+        });
+
+        let reduced = reduce_tool_schema(&schema);
+
+        assert_eq!(reduced["required"], serde_json::json!(["action"]));
+        assert_eq!(
+            reduced["properties"]["action"]["enum"],
+            serde_json::json!(["add", "list"])
+        );
+        assert_eq!(
+            reduced["properties"]["agent"]["properties"]["mode"]["enum"],
+            serde_json::json!(["isolated", "session"])
+        );
+        assert!(reduced["properties"]["action"].get("description").is_none());
+        assert!(
+            reduced["properties"]["agent"]["properties"]["mode"]
+                .get("default")
+                .is_none()
+        );
+        assert_eq!(reduced["description"], "Manage scheduled jobs.");
+    }
+
+    #[test]
+    fn trim_tool_definitions_reduces_largest_first_and_stops_at_budget() {
+        let messages = vec![ProviderMessage::user("hello")];
+        let small = ToolDefinition {
+            name: "small".to_string(),
+            description: "short".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "q": { "type": "string", "description": "query text" } }
+            }),
+        };
+        let huge = ToolDefinition {
+            name: "huge".to_string(),
+            description: "short".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": { "type": "string", "enum": ["a", "b"], "description": "x".repeat(4_000) }
+                }
+            }),
+        };
+        let mut tools = vec![small.clone(), huge];
+
+        // Budget that fits exactly once the huge schema has been reduced.
+        let budget = {
+            let mut probe = tools.clone();
+            probe[1].input_schema = reduce_tool_schema(&probe[1].input_schema);
+            estimate_provider_request_tokens(&messages, &probe)
+        };
+
+        let mut records = Vec::new();
+        trim_tool_definitions(&mut tools, budget, &messages, &mut records);
+
+        assert_eq!(
+            records,
+            vec!["tool_definition:huge:schema_reduced".to_string()]
+        );
+        assert_eq!(
+            tools[0].input_schema, small.input_schema,
+            "smaller tool must stay untouched once the budget is met"
+        );
+        assert_eq!(
+            tools[1].input_schema["properties"]["action"]["enum"],
+            serde_json::json!(["a", "b"])
+        );
+        assert!(
+            tools[1].input_schema["properties"]["action"]
+                .get("description")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn trim_tool_definitions_never_empties_schema() {
+        let messages = vec![ProviderMessage::user("hello")];
+        let mut tools = vec![ToolDefinition {
+            name: "cronish".to_string(),
+            description: "tool description ".repeat(100),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": { "type": "string", "enum": ["add", "list"], "description": "y".repeat(3_000) },
+                    "job_id": { "type": "string", "description": "z".repeat(1_000) }
+                }
+            }),
+        }];
+
+        let mut records = Vec::new();
+        trim_tool_definitions(&mut tools, 1, &messages, &mut records);
+
+        let schema = &tools[0].input_schema;
+        let properties = schema["properties"].as_object().expect("properties kept");
+        assert!(properties.contains_key("action"));
+        assert!(properties.contains_key("job_id"));
+        assert_eq!(schema["required"], serde_json::json!(["action"]));
+        assert!(
+            records
+                .iter()
+                .any(|r| r == "tool_definition:cronish:schema_reduced")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r == "tool_definition:cronish:description_summarized")
         );
     }
 
