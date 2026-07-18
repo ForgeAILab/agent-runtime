@@ -551,7 +551,6 @@ context_window = 202_752
 max_output_tokens = 131_072
 supports_vision = false
 supports_tool_use = true
-context_budget_ratio = 0.4
 
 [[models]]
 prefix = "glm-5"
