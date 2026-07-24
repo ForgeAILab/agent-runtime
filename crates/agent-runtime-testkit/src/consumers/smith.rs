@@ -22,6 +22,7 @@ pub fn build(
     observer: Arc<RecordingObserver>,
 ) -> Result<Runtime, RuntimeError> {
     RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(crate::scenarios::fake_model_profile())
         .provider(provider)
         .system_prompt(INSTRUCTIONS)
         .approval(Arc::new(AllowAll)) // the terminal user approves interactively

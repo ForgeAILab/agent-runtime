@@ -43,13 +43,58 @@ jobs:
   # Minimum-supported-Rust-version verification (compatibility-contract:
   # "Declared toolchain and license"). Production packages must build without a
   # newer compiler than the declared MSRV.
+  #
+  # Every production package is listed explicitly. A partial list is how an
+  # MSRV violation reaches a release: a `let`-chain in a package nobody built
+  # on 1.86 compiles fine on stable and fails only for the consumer.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.86.0
       - name: build production packages on MSRV
-        run: cargo build -p agent-runtime-core -p agent-runtime
+        run: >
+          cargo build
+          -p agent-runtime-registry
+          -p agent-runtime-core
+          -p agent-runtime-ability
+          -p agent-runtime-provider
+          -p agent-runtime-context
+          -p agent-runtime-obs
+          -p agent-runtime
+      - name: build production packages on MSRV with all features
+        run: >
+          cargo build --all-features
+          -p agent-runtime-registry
+          -p agent-runtime-core
+          -p agent-runtime-ability
+          -p agent-runtime-provider
+          -p agent-runtime-context
+          -p agent-runtime-obs
+          -p agent-runtime
+
+  # Default-feature dependency boundaries (package-architecture: "Dependency-light
+  # registry and ability packages"). These are contracts, not preferences: a
+  # descriptor-only extension must not have to pull the runtime, and the registry
+  # kernel must stay std-only.
+  dependency-boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: registry kernel is std-only by default
+        run: |
+          tree=$(cargo tree -p agent-runtime-registry --no-default-features -e normal)
+          echo "$tree"
+          test "$(echo "$tree" | grep -c .)" -eq 1
+      - name: ability depends only on the registry kernel by default
+        run: |
+          tree=$(cargo tree -p agent-runtime-ability --no-default-features -e normal)
+          echo "$tree"
+          test "$(echo "$tree" | grep -c .)" -eq 2
+          echo "$tree" | grep -q agent-runtime-registry
+      - name: context builds without a provider or network client
+        run: cargo build -p agent-runtime-context
 
   # Dependency + license policy, including the consumer-domain dependency ban.
   deny:

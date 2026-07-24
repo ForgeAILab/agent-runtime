@@ -10,8 +10,11 @@ completed_at:
   policy boundary, package layout, migration order, and explicit non-goals.
 - [ ] 0.2 Confirm the permanent repository name, remote location, and public
   package names before publication; `agent-runtime*` remains a working name.
-  _(Deferred: still working names; a publication decision is required before a
-  release tag — see 7.4.)_
+  _(Still deferred, deliberately. `v0.1.0` is tagged under the working
+  `agent-runtime*` names with `repository = "https://example.invalid/..."`. A
+  git tag claims nothing publicly, so the naming decision stays open; this task
+  gates **crates.io publication**, not the tag. Renaming before publication is
+  still expected — see `docs/migration-0.1.md`.)_
 - [x] 0.3 Confirm MIT licensing and record the exact Nyx source revision,
   contributor notices, and path mappings before importing implementation.
   _(MIT chosen; donor revision `7f51ccd` and path map recorded in
@@ -99,10 +102,13 @@ completed_at:
   importing their domain types into production packages.
 - [x] 7.3 Establish pre-release compatibility CI and document how an explicitly
   breaking release coordinates consumer proposals.
-- [ ] 7.4 Tag the first `0.1.0` candidate only after the shared suite and all
+- [x] 7.4 Tag the first `0.1.0` candidate only after the shared suite and all
   available consumer compatibility fixtures pass.
-  _(All suites pass and the workspace is release-ready; tagging is gated on the
-  repository/package-name decision in 0.2 and the maintainer's go-ahead.)_
+  _(Tagged `v0.1.0` after the combined validation: fmt, Clippy-as-error, 409
+  workspace tests, doc tests, MSRV 1.86 across all seven production packages,
+  the dependency-boundary checks, and the Smith/Nyx/Open Forge compatibility
+  suites. Held until the dependent `add-registry-driven-context-runtime-2026-07-24`
+  scope was also complete, per that change's task 0.2.)_
 
 ## 8. Consumer Handoffs
 

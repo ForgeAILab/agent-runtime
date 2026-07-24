@@ -1,0 +1,10 @@
+{
+  "change_id": "add-registry-driven-context-runtime",
+  "change_ref": "add-registry-driven-context-runtime-2026-07-24",
+  "created_at": "2026-07-24T17:50:16Z",
+  "updated_at": "2026-07-24T18:05:00Z",
+  "completed_at": null,
+  "status": "implementing",
+  "implementation_started_at": "2026-07-24T18:05:00Z",
+  "depends_on": ["add-shared-agent-runtime-2026-07-23"]
+}

@@ -1,0 +1,41 @@
+[package]
+name = "agent-runtime-obs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Observability facade for the shared agent runtime: an async EventSink, fanout, and CLI/file/SQLite sinks over the neutral event envelope"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+agent-runtime-core.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[features]
+# `cli` is on by default so `cargo add agent-runtime-obs` gives a working
+# terminal sink. `file` (JSONL) and `sqlite` are opt-in so the default graph
+# stays lean and consumers with their own store use `ObsRow` instead.
+default = ["cli"]
+cli = []
+file = []
+sqlite = ["dep:rusqlite"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+tempfile = "3"
+# Test-only: constructing sample RegistryId/RegistryRevision/Fingerprint
+# values for the new planning-event render tests. Not needed by the sinks
+# themselves, which only ever forward the already-serialized envelope.
+agent-runtime-registry.workspace = true
+
+[lints]
+workspace = true

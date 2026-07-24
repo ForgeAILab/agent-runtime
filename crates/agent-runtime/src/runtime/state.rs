@@ -1,6 +1,7 @@
 //! Mutable per-session state guarded behind the session handle.
 
 use agent_runtime_core::content::Message;
+use agent_runtime_core::store::TurnManifest;
 use agent_runtime_core::usage::UsageLedger;
 
 /// The canonical mutable state of one session.
@@ -10,6 +11,8 @@ pub struct SessionState {
     pub history: Vec<Message>,
     /// The accumulated usage ledger.
     pub usage: UsageLedger,
+    /// The run manifest recorded for each completed turn, in turn order.
+    pub manifests: Vec<TurnManifest>,
 }
 
 impl SessionState {
@@ -18,6 +21,7 @@ impl SessionState {
         Self {
             history,
             usage: UsageLedger::new(),
+            manifests: Vec::new(),
         }
     }
 }

@@ -22,11 +22,13 @@
 
 pub mod approval;
 pub mod cancel;
+pub mod catalog;
 pub mod clock;
 pub mod content;
 pub mod error;
 pub mod event;
 pub mod ids;
+pub mod manifest;
 pub mod metadata;
 pub mod observer;
 pub mod provider;
@@ -44,8 +46,16 @@ pub mod prelude {
     pub use crate::clock::{Clock, Deadline, SystemClock, Timestamp};
     pub use crate::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock, UserInput};
     pub use crate::error::{ErrorKind, Result, RuntimeError};
-    pub use crate::event::{EventEnvelope, LimitKind, RuntimeEvent, SCHEMA_VERSION, TurnFinish};
+    pub use crate::event::{
+        BudgetCategory, CompactionReason, EstimationConfidence, EventEnvelope, LimitKind,
+        RuntimeEvent, SCHEMA_VERSION, TurnFinish,
+    };
     pub use crate::ids::{AttemptId, EventId, RequestId, SessionId, ToolCallId, TurnId};
+    pub use crate::manifest::{
+        ActivatedCapability, CapabilityResolution, ContextSegmentRecord, MANIFEST_SCHEMA_VERSION,
+        ManifestReason, ModelResolution, PolicyRevisions, ReplayMismatch, ReplayMode,
+        RevisionMismatch, RunManifest, SegmentId, SegmentKind, SegmentSensitivity, SummaryCoverage,
+    };
     pub use crate::metadata::{MetaValue, Metadata, VendorLimits};
     pub use crate::observer::EventObserver;
     pub use crate::provider::{
@@ -54,7 +64,7 @@ pub mod prelude {
         ProviderStreamEvent, ReasoningConfig, ReasoningSupport, Sampling, ToolChoice, ToolSchema,
         UnsupportedFeature,
     };
-    pub use crate::store::{Secret, SecretStore, SessionSnapshot, SessionStore};
+    pub use crate::store::{Secret, SecretStore, SessionSnapshot, SessionStore, TurnManifest};
     pub use crate::tool::{
         Effect, InvocationContext, Tool, ToolEffects, ToolOutcome, ToolSpec, WriteScope,
     };

@@ -1,7 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/agent-runtime-registry",
     "crates/agent-runtime-core",
+    "crates/agent-runtime-ability",
+    "crates/agent-runtime-provider",
+    "crates/agent-runtime-context",
+    "crates/agent-runtime-obs",
     "crates/agent-runtime",
     "crates/agent-runtime-testkit",
 ]
@@ -35,7 +40,12 @@ jsonschema = { version = "=0.28.3", default-features = false }
 uuid = { version = "=1.19.0", features = ["v4"] }
 
 # Internal workspace crates (path + version so a future tagged release resolves).
+agent-runtime-registry = { path = "crates/agent-runtime-registry", version = "0.1.0" }
 agent-runtime-core = { path = "crates/agent-runtime-core", version = "0.1.0" }
+agent-runtime-ability = { path = "crates/agent-runtime-ability", version = "0.1.0" }
+agent-runtime-provider = { path = "crates/agent-runtime-provider", version = "0.1.0" }
+agent-runtime-context = { path = "crates/agent-runtime-context", version = "0.1.0" }
+agent-runtime-obs = { path = "crates/agent-runtime-obs", version = "0.1.0" }
 agent-runtime = { path = "crates/agent-runtime", version = "0.1.0" }
 agent-runtime-testkit = { path = "crates/agent-runtime-testkit", version = "0.1.0" }
 

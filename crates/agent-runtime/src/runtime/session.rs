@@ -161,6 +161,7 @@ impl SessionHandle {
             id: self.inner.id.clone(),
             history: state.history.clone(),
             usage: state.usage.clone(),
+            manifests: state.manifests.clone(),
             identity: self
                 .inner
                 .minter

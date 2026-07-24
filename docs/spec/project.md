@@ -18,18 +18,35 @@
 - Package manager: Cargo workspace
 - License: MIT
 
-## Planned Packages
+## Packages
 
+- `agent-runtime-registry`: the registry kernel — namespaced identity,
+  revisions, provenance, layered sealing, bounded cards, scoped views, and
+  fingerprints. Std-only by default.
 - `agent-runtime-core`: host-neutral contracts, events, errors, cancellation,
-  usage primitives, and adapter traits
-- `agent-runtime`: the embeddable runtime, provider adapters, direct agent
-  loop, and tool execution
+  usage primitives, the layered model catalog, run manifests, and adapter
+  traits
+- `agent-runtime-ability`: descriptor-first abilities and lazy, policy-checked
+  activation. Depends on the registry kernel alone by default.
+- `agent-runtime-provider`: provider adapters, injectable transport, retry
+  classification, and optional remote catalog sources
+- `agent-runtime-context`: the authoritative context engine — versioned
+  fragments, complete token accounting, semantic compaction, and cache-aware
+  planning. Deterministic and network-free.
+- `agent-runtime`: the embeddable runtime — registry hub, capability routing,
+  the direct agent loop, tool execution, and the session facade
+- `agent-runtime-obs`: optional event sinks and projections, never on the
+  execution path
 - `agent-runtime-testkit`: deterministic fake providers, clocks, event
-  recorders, and conformance fixtures
+  recorders, and reusable conformance suites
 
-Only `agent-runtime-core` and `agent-runtime` are intended as production
-dependencies. Additional internal packages require evidence that a package
-boundary materially improves dependency isolation or independent reuse.
+Every package except `agent-runtime-testkit` is a production dependency, but
+most hosts need only `agent-runtime`, which re-exports the supported
+composition surface. The leaf packages exist so an extension author can depend
+on the smallest relevant contract — a descriptor-only ability extension needs
+`agent-runtime-registry` and `agent-runtime-ability` and nothing else. A new
+package still requires evidence that its boundary materially improves
+dependency isolation or independent reuse.
 
 ## Conventions
 

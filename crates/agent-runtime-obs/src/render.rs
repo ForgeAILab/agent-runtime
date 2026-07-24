@@ -1,0 +1,316 @@
+//! Neutral rendering of runtime events to a compact human log line.
+//!
+//! The presentation here is deliberately terse and product-neutral: it names
+//! the canonical [`RuntimeEvent`] payload and summarizes its salient fields.
+//! Consumers wanting a different look implement their own [`crate::EventSink`]
+//! or format the [`crate::ObsRow`] projection instead.
+
+use agent_runtime_core::event::{EventEnvelope, RuntimeEvent};
+use serde_json::Value;
+
+/// The stable snake_case discriminant of a [`RuntimeEvent`].
+///
+/// Matches the `event` serde tag, and is used both by [`log_line`] and by the
+/// [`crate::ObsRow`] projection so a stored `event_type` column is filterable
+/// without parsing the payload JSON. The match is exhaustive, so adding a new
+/// event variant forces this table to be updated.
+pub fn event_type(payload: &RuntimeEvent) -> &'static str {
+    match payload {
+        RuntimeEvent::SessionStarted => "session_started",
+        RuntimeEvent::TurnStarted => "turn_started",
+        RuntimeEvent::RegistrySnapshotSealed { .. } => "registry_snapshot_sealed",
+        RuntimeEvent::ScopedViewDerived { .. } => "scoped_view_derived",
+        RuntimeEvent::ModelProfileResolved { .. } => "model_profile_resolved",
+        RuntimeEvent::CapabilityRetrievalPerformed { .. } => "capability_retrieval_performed",
+        RuntimeEvent::CapabilitiesActivated { .. } => "capabilities_activated",
+        RuntimeEvent::ContextPlanned { .. } => "context_planned",
+        RuntimeEvent::ContextCompacted { .. } => "context_compacted",
+        RuntimeEvent::CachePlanChanged { .. } => "cache_plan_changed",
+        RuntimeEvent::BudgetFailure { .. } => "budget_failure",
+        RuntimeEvent::ProviderAttemptStarted { .. } => "provider_attempt_started",
+        RuntimeEvent::TextDelta { .. } => "text_delta",
+        RuntimeEvent::ReasoningDelta { .. } => "reasoning_delta",
+        RuntimeEvent::ToolCallRequested { .. } => "tool_call_requested",
+        RuntimeEvent::ToolCallCompleted { .. } => "tool_call_completed",
+        RuntimeEvent::Downgrade { .. } => "downgrade",
+        RuntimeEvent::Usage { .. } => "usage",
+        RuntimeEvent::CacheObservation { .. } => "cache_observation",
+        RuntimeEvent::ProviderAttemptFinished { .. } => "provider_attempt_finished",
+        RuntimeEvent::LimitReached { .. } => "limit_reached",
+        RuntimeEvent::Error { .. } => "error",
+        RuntimeEvent::TurnCompleted { .. } => "turn_completed",
+        RuntimeEvent::SessionShutdown => "session_shutdown",
+    }
+}
+
+/// Renders a single-line, key-first summary of an event envelope.
+///
+/// Shape: `#<seq> <ts>ms session=<id>[ turn=<id>] <summary>`.
+pub fn log_line(env: &EventEnvelope) -> String {
+    let turn = env
+        .turn
+        .as_ref()
+        .map(|t| format!(" turn={t}"))
+        .unwrap_or_default();
+    format!(
+        "#{seq} {ts}ms session={session}{turn} {summary}",
+        seq = env.seq,
+        ts = env.timestamp.as_millis(),
+        session = env.session,
+        summary = summary(&env.payload),
+    )
+}
+
+fn summary(payload: &RuntimeEvent) -> String {
+    match payload {
+        RuntimeEvent::RegistrySnapshotSealed { snapshot, entries } => {
+            format!("registry_snapshot_sealed snapshot={snapshot} entries={entries}")
+        }
+        RuntimeEvent::ScopedViewDerived {
+            snapshot,
+            view,
+            visible_entries,
+        } => format!(
+            "scoped_view_derived snapshot={snapshot} view={view} visible_entries={visible_entries}"
+        ),
+        RuntimeEvent::ModelProfileResolved {
+            provider,
+            model,
+            profile,
+        } => format!("model_profile_resolved provider={provider} model={model} profile={profile}"),
+        RuntimeEvent::CapabilityRetrievalPerformed {
+            resolver_revision,
+            index_revision,
+            candidates,
+        } => {
+            let index = index_revision
+                .as_ref()
+                .map(|r| r.as_str().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let ids = candidates
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "capability_retrieval_performed resolver={resolver_revision} index={index} candidates={} {}",
+                candidates.len(),
+                clip(&ids, 200)
+            )
+        }
+        RuntimeEvent::CapabilitiesActivated { epoch, activation } => {
+            let ids = activation
+                .iter()
+                .map(|a| format!("{}@{}", a.id, a.revision))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "capabilities_activated epoch={epoch} count={} {}",
+                activation.len(),
+                clip(&ids, 200)
+            )
+        }
+        RuntimeEvent::ContextPlanned {
+            context,
+            cache_plan,
+            segment_count,
+            totals,
+            input_budget_tokens,
+            reserved_tokens,
+            confidence,
+        } => {
+            let totals_str = totals
+                .iter()
+                .map(|(kind, tokens)| format!("{kind}={tokens}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}",
+                totals_str
+            )
+        }
+        RuntimeEvent::ContextCompacted {
+            context,
+            reason,
+            evicted,
+            summaries,
+            reclaimed_tokens,
+        } => format!(
+            "context_compacted context={context} reason={reason:?} evicted={} summaries={} reclaimed_tokens={reclaimed_tokens}",
+            evicted.len(),
+            summaries.len()
+        ),
+        RuntimeEvent::CachePlanChanged {
+            cache_plan,
+            preserved_prefix_tokens,
+            invalidated_prefix_tokens,
+            provider_cache_supported,
+        } => format!(
+            "cache_plan_changed cache_plan={cache_plan} preserved={preserved_prefix_tokens} invalidated={invalidated_prefix_tokens} provider_cache_supported={provider_cache_supported}"
+        ),
+        RuntimeEvent::BudgetFailure {
+            category,
+            requested_tokens,
+            limit_tokens,
+        } => format!(
+            "budget_failure category={category:?} requested={requested_tokens} limit={limit_tokens}"
+        ),
+        RuntimeEvent::ProviderAttemptStarted { index, model, .. } => {
+            format!("provider_attempt_started model={model} index={index}")
+        }
+        RuntimeEvent::TextDelta { text } => format!("text_delta {}", clip(text, 120)),
+        RuntimeEvent::ReasoningDelta { text, redacted } => {
+            format!("reasoning_delta redacted={redacted} {}", clip(text, 120))
+        }
+        RuntimeEvent::ToolCallRequested {
+            name, arguments, ..
+        } => format!(
+            "tool_call_requested {name} {}",
+            clip(&compact(arguments), 200)
+        ),
+        RuntimeEvent::ToolCallCompleted { name, is_error, .. } => format!(
+            "tool_call_completed {name} {}",
+            if *is_error { "error" } else { "ok" }
+        ),
+        RuntimeEvent::Downgrade { capability, detail } => {
+            format!("downgrade {capability}: {detail}")
+        }
+        RuntimeEvent::Usage { record } => format!(
+            "usage source={:?} {}",
+            record.source,
+            compact(&serde_json::to_value(&record.delta).unwrap_or(Value::Null))
+        ),
+        RuntimeEvent::CacheObservation {
+            read_tokens,
+            write_tokens,
+        } => format!("cache_observation read={read_tokens} write={write_tokens}"),
+        RuntimeEvent::ProviderAttemptFinished {
+            finish, retryable, ..
+        } => format!("provider_attempt_finished finish={finish:?} retryable={retryable}"),
+        RuntimeEvent::LimitReached { limit } => format!("limit_reached {limit:?}"),
+        RuntimeEvent::Error { error } => format!("error {error}"),
+        RuntimeEvent::TurnCompleted { finish } => format!("turn_completed {finish:?}"),
+        RuntimeEvent::SessionStarted
+        | RuntimeEvent::TurnStarted
+        | RuntimeEvent::SessionShutdown => event_type(payload).to_string(),
+    }
+}
+
+/// Compact JSON rendering of a value (no whitespace).
+fn compact(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+/// Clip a string to at most `max` characters, appending an ellipsis when cut.
+/// Uses char boundaries so multi-byte text never panics.
+fn clip(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(max).collect();
+    format!("{truncated}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_runtime_core::clock::Timestamp;
+    use agent_runtime_core::ids::{EventId, SessionId, ToolCallId, TurnId};
+
+    fn envelope(turn: Option<&str>, payload: RuntimeEvent) -> EventEnvelope {
+        EventEnvelope::new(
+            7,
+            EventId::new("evt-7"),
+            SessionId::new("s-1"),
+            turn.map(TurnId::new),
+            Timestamp(1234),
+            payload,
+        )
+    }
+
+    #[test]
+    fn event_type_matches_serde_tag() {
+        let env = envelope(None, RuntimeEvent::SessionStarted);
+        let json = serde_json::to_value(&env.payload).unwrap();
+        assert_eq!(json["event"], event_type(&env.payload));
+    }
+
+    #[test]
+    fn log_line_includes_seq_session_and_turn() {
+        let env = envelope(
+            Some("turn-2"),
+            RuntimeEvent::ToolCallRequested {
+                call: ToolCallId::new("call-1"),
+                name: "read".to_string(),
+                arguments: serde_json::json!({ "path": "a.txt" }),
+            },
+        );
+        let line = log_line(&env);
+        assert!(line.starts_with("#7 1234ms session=s-1 turn=turn-2 "));
+        assert!(line.contains("tool_call_requested read"));
+        assert!(line.contains("\"path\":\"a.txt\""));
+    }
+
+    #[test]
+    fn clip_is_multibyte_safe() {
+        let env = envelope(
+            None,
+            RuntimeEvent::TextDelta {
+                text: "记".repeat(300),
+            },
+        );
+        // Must not panic on a multi-byte boundary and must be shortened.
+        let line = log_line(&env);
+        assert!(line.contains('…'));
+    }
+
+    #[test]
+    fn capabilities_activated_renders_ids_and_revisions_only() {
+        use agent_runtime_core::manifest::ActivatedCapability;
+        use agent_runtime_registry::{RegistryId, RegistryRevision};
+
+        let env = envelope(
+            None,
+            RuntimeEvent::CapabilitiesActivated {
+                epoch: 1,
+                activation: vec![ActivatedCapability::new(
+                    RegistryId::skill("web-research"),
+                    RegistryRevision::new("r1"),
+                )],
+            },
+        );
+        let line = log_line(&env);
+        assert_eq!(event_type(&env.payload), "capabilities_activated");
+        assert!(line.contains("epoch=1"));
+        assert!(line.contains("count=1"));
+        assert!(line.contains("skill:web-research@r1"));
+    }
+
+    #[test]
+    fn context_planned_renders_bounded_metrics_only() {
+        use std::collections::BTreeMap;
+
+        use agent_runtime_core::event::EstimationConfidence;
+        use agent_runtime_core::manifest::SegmentKind;
+        use agent_runtime_registry::Fingerprint;
+
+        let env = envelope(
+            None,
+            RuntimeEvent::ContextPlanned {
+                context: Fingerprint::of("context"),
+                cache_plan: Fingerprint::of("cache"),
+                segment_count: 3,
+                totals: BTreeMap::from([(SegmentKind::new("history"), 42)]),
+                input_budget_tokens: 8000,
+                reserved_tokens: 512,
+                confidence: EstimationConfidence::Estimated,
+            },
+        );
+        let line = log_line(&env);
+        assert_eq!(event_type(&env.payload), "context_planned");
+        assert!(line.contains("segments=3"));
+        assert!(line.contains("history=42"));
+        assert!(line.contains("input_budget=8000"));
+        assert!(line.contains("reserved=512"));
+    }
+}

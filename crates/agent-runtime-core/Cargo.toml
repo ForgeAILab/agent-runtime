@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# The registry kernel is std-only and sits below core: it owns the identity and
+# fingerprint primitives that catalog profiles, snapshots, and plans all share.
+agent-runtime-registry = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

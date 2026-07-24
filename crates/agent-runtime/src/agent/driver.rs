@@ -13,25 +13,56 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 
+use agent_runtime_context::budget::ContextError;
+use agent_runtime_context::cache::CachePlan;
+use agent_runtime_context::plan::ContextPlan;
+use agent_runtime_context::sizing::EstimationConfidence as SizerConfidence;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::clock::{Clock, Deadline};
 use agent_runtime_core::content::{ContentPart, Message, ToolCall, UserInput};
-use agent_runtime_core::event::{LimitKind, RuntimeEvent, TurnFinish};
+use agent_runtime_core::error::RuntimeError;
+use agent_runtime_core::event::{
+    BudgetCategory, EstimationConfidence, LimitKind, RuntimeEvent, TurnFinish,
+};
 use agent_runtime_core::ids::{RequestId, TurnId};
+use agent_runtime_core::manifest::SegmentKind;
 use agent_runtime_core::provider::{
     FinishReason, Provider, ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest,
     ProviderStreamEvent, ToolChoice, UnsupportedFeature,
 };
+use agent_runtime_core::store::TurnManifest;
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
 
 use crate::agent::assembler::ToolCallAssembler;
 use crate::agent::config::LoopConfig;
+use crate::agent::planning::RunPlanner;
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
 use crate::runtime::emitter::EventEmitter;
 use crate::runtime::state::SessionState;
 use crate::tool::ToolExecutor;
 use crate::tool::registry::SealedToolRegistry;
+
+/// Sums a plan's segment token counts by kind, for the planning event's
+/// bounded metrics. Identifiers and counts only — never segment content.
+fn segment_totals(plan: &ContextPlan) -> std::collections::BTreeMap<SegmentKind, u32> {
+    let mut totals = std::collections::BTreeMap::new();
+    for segment in plan.segments() {
+        *totals
+            .entry(SegmentKind::new(segment.kind.as_str()))
+            .or_insert(0u32) += segment.tokens;
+    }
+    totals
+}
+
+/// Maps the context crate's confidence onto core's event vocabulary. They are
+/// separate types so core does not depend on the context crate.
+fn map_confidence(confidence: SizerConfidence) -> EstimationConfidence {
+    match confidence {
+        SizerConfidence::Exact => EstimationConfidence::Exact,
+        SizerConfidence::Estimated => EstimationConfidence::Estimated,
+    }
+}
 
 /// The outcome of one provider request (all its attempts).
 enum ProviderTurnOutcome {
@@ -53,6 +84,7 @@ pub struct Driver {
     executor: ToolExecutor,
     clock: Arc<dyn Clock>,
     config: Arc<LoopConfig>,
+    planner: Arc<RunPlanner>,
 }
 
 impl Driver {
@@ -63,6 +95,7 @@ impl Driver {
         executor: ToolExecutor,
         clock: Arc<dyn Clock>,
         config: Arc<LoopConfig>,
+        planner: Arc<RunPlanner>,
     ) -> Self {
         Self {
             provider,
@@ -70,6 +103,7 @@ impl Driver {
             executor,
             clock,
             config,
+            planner,
         }
     }
 
@@ -144,7 +178,38 @@ impl Driver {
                 .expect("session state poisoned")
                 .history
                 .clone();
-            let mut request = self.build_request(&history);
+            let mut request = match self.build_request(&history, &emitter, &turn, &state, &turn_id)
+            {
+                Ok(request) => request,
+                Err(err) => {
+                    // Planning failed before any network I/O — that is the
+                    // point of preflight enforcement, so report the budget
+                    // category rather than letting an oversized request go.
+                    if let Some(report) = &err.report {
+                        emitter.emit(
+                            turn.clone(),
+                            RuntimeEvent::BudgetFailure {
+                                category: BudgetCategory::Input,
+                                requested_tokens: report.total_input_tokens,
+                                limit_tokens: report.input_budget,
+                            },
+                        );
+                    }
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::Error {
+                            error: RuntimeError::config(err.to_string()),
+                        },
+                    );
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::TurnCompleted {
+                            finish: TurnFinish::Failed,
+                        },
+                    );
+                    return;
+                }
+            };
 
             if let Err(err) = self.validate_and_downgrade(&mut request, &emitter, &turn) {
                 emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
@@ -338,19 +403,71 @@ impl Driver {
         );
     }
 
-    fn build_request(&self, history: &[Message]) -> ProviderRequest {
-        let mut messages = Vec::new();
-        if let Some(prompt) = &self.config.system_prompt {
-            messages.push(Message::system(prompt.clone()));
-        }
-        messages.extend_from_slice(history);
+    /// Compiles the turn's context into a plan and derives the provider
+    /// request from it.
+    ///
+    /// The plan is the sole authority: everything the request carries was
+    /// counted against the model's budget first, and the loop has no path that
+    /// appends to a request afterwards. Sampling, reasoning, and output limits
+    /// are request *options* rather than context, so they are applied on top of
+    /// the plan's messages and tools without adding anything the plan did not
+    /// account for.
+    fn build_request(
+        &self,
+        history: &[Message],
+        emitter: &EventEmitter,
+        turn: &Option<TurnId>,
+        state: &Arc<Mutex<SessionState>>,
+        turn_id: &TurnId,
+    ) -> Result<ProviderRequest, ContextError> {
+        let planned = self.planner.plan_turn(
+            self.config.system_prompt.as_deref(),
+            history,
+            &self.registry.schemas(),
+        )?;
 
-        let mut request = ProviderRequest::new(self.config.model.clone(), messages);
-        request.tools = self.registry.schemas();
+        let plan = &planned.plan;
+        emitter.emit(
+            turn.clone(),
+            RuntimeEvent::ContextPlanned {
+                context: plan.fingerprint(),
+                cache_plan: plan
+                    .cache_plan()
+                    .map(CachePlan::fingerprint)
+                    .unwrap_or_else(|| plan.fingerprint()),
+                segment_count: plan.segments().len() as u32,
+                totals: segment_totals(plan),
+                input_budget_tokens: plan.input_tokens(),
+                reserved_tokens: plan
+                    .output_reserve()
+                    .saturating_add(plan.reasoning_reserve()),
+                confidence: map_confidence(plan.confidence()),
+            },
+        );
+
+        if let Some(cache_plan) = plan.cache_plan() {
+            emitter.emit(
+                turn.clone(),
+                RuntimeEvent::CachePlanChanged {
+                    cache_plan: cache_plan.fingerprint(),
+                    preserved_prefix_tokens: cache_plan.preserved_prefix_tokens,
+                    invalidated_prefix_tokens: cache_plan.invalidated_tokens,
+                    provider_cache_supported: cache_plan.provider_cache.unsupported.is_empty(),
+                },
+            );
+        }
+
+        state
+            .lock()
+            .expect("session state poisoned")
+            .manifests
+            .push(TurnManifest::new(turn_id.clone(), planned.manifest));
+
+        let mut request = plan.to_provider_request(self.config.model.clone());
         request.sampling = self.config.sampling.clone();
         request.reasoning = self.config.reasoning.clone();
         request.max_output_tokens = self.config.max_output_tokens;
-        request
+        Ok(request)
     }
 
     /// Validates the request against the model's capabilities. Unsupported

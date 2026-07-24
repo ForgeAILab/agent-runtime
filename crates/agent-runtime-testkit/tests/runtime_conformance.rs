@@ -21,6 +21,7 @@ use agent_runtime_testkit::{RecordingObserver, consumers, scenarios};
 
 fn build(provider: Arc<dyn Provider>, observer: Arc<RecordingObserver>) -> Runtime {
     RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(provider)
         .approval(Arc::new(AllowAll))
         .workspace(Arc::new(agent_runtime_testkit::MemoryWorkspace::new("/ws")))
@@ -262,6 +263,7 @@ async fn exhausted_provider_attempts_emit_structured_limit() {
     );
     let observer = RecordingObserver::shared();
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(provider))
         .observer(observer.clone())
         .retry(RetryPolicy::none())
@@ -301,6 +303,7 @@ async fn retry_backoff_stops_promptly_on_cancellation() {
         }])],
     );
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(provider))
         .retry(RetryPolicy {
             max_attempts: 2,
@@ -346,6 +349,7 @@ async fn attempt_deadline_is_capped_by_turn_deadline() {
     config.turn_time_limit_ms = Some(10);
     config.attempt_time_limit_ms = Some(100);
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(provider.clone())
         .clock(clock)
         .loop_config(config)
@@ -410,6 +414,7 @@ async fn inline_run_participates_in_shutdown_drain() {
 async fn one_shutdown_deadline_bounds_all_active_turns() {
     let observer = RecordingObserver::shared();
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(UnresponsiveProvider))
         .observer(observer.clone())
         .shutdown_timeout_ms(30)
@@ -550,6 +555,7 @@ async fn tool_step_limit_emits_structured_terminal() {
         scripts,
     ));
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(provider)
         .approval(Arc::new(AllowAll))
         .workspace(Arc::new(agent_runtime_testkit::MemoryWorkspace::new("/ws")))
@@ -583,6 +589,7 @@ async fn tool_step_limit_emits_structured_terminal() {
 async fn unsupported_reasoning_downgrades_when_allowed() {
     let observer = RecordingObserver::shared();
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(scenarios::fake_no_reasoning("answer")))
         .approval(Arc::new(AllowAll))
         .reasoning(ReasoningConfig {
@@ -605,6 +612,7 @@ async fn unsupported_reasoning_downgrades_when_allowed() {
 async fn unsupported_reasoning_fails_closed_when_strict() {
     let observer = RecordingObserver::shared();
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(scenarios::fake_no_reasoning("answer")))
         .approval(Arc::new(AllowAll))
         .reasoning(ReasoningConfig {
@@ -645,6 +653,7 @@ async fn unknown_tool_becomes_error_result_and_loop_continues() {
         "recovered",
     ));
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(provider)
         .approval(Arc::new(AllowAll))
         .observer(observer.clone())
@@ -702,6 +711,7 @@ async fn session_resumes_from_store() {
     let store = Arc::new(agent_runtime_testkit::InMemorySessionStore::new());
     let observer = RecordingObserver::shared();
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(scenarios::fake_text("first")))
         .approval(Arc::new(AllowAll))
         .session_store(store.clone())
@@ -730,6 +740,7 @@ async fn session_resumes_from_store() {
 async fn fresh_session_ids_do_not_collide_across_runtime_restarts() {
     let store = Arc::new(agent_runtime_testkit::InMemorySessionStore::new());
     let first_runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(scenarios::fake_text("first")))
         .session_store(store.clone())
         .build()
@@ -742,6 +753,7 @@ async fn fresh_session_ids_do_not_collide_across_runtime_restarts() {
     first.shutdown().await.unwrap();
 
     let second_runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(scenarios::fake_text("second")))
         .session_store(store)
         .build()
@@ -759,6 +771,7 @@ async fn resumed_session_continues_ids_and_event_sequences() {
     let store = Arc::new(agent_runtime_testkit::InMemorySessionStore::new());
     let first_observer = RecordingObserver::shared();
     let first_runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(scenarios::fake_text("first")))
         .session_store(store.clone())
         .observer(first_observer.clone())
@@ -783,6 +796,7 @@ async fn resumed_session_continues_ids_and_event_sequences() {
 
     let second_observer = RecordingObserver::shared();
     let second_runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(scenarios::fake_text("second")))
         .session_store(store)
         .observer(second_observer.clone())

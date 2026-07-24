@@ -5,9 +5,24 @@ use serde_json::Value;
 use agent_runtime::provider::fake::{
     FakeProvider, ScriptedStream, tool_call_fragments, usage_event,
 };
+use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
 use agent_runtime_core::provider::{
-    Capabilities, FinishReason, ProviderStreamEvent, ReasoningSupport,
+    Capabilities, FinishReason, ModelId, ProviderStreamEvent, ReasoningSupport,
 };
+
+/// The model profile every fixture plans against.
+///
+/// The runtime refuses to plan a request without resolvable limits, so a
+/// fixture must declare them just as a real host does. The window is
+/// deliberately generous: these fixtures exercise the loop, not the budget —
+/// budget enforcement has its own dedicated tests.
+pub fn fake_model_profile() -> ResolvedModelProfile {
+    ResolvedModelProfile::explicit(
+        "fake",
+        ModelId::new("fake"),
+        ModelLimits::new(128_000, 128_000, 4_096),
+    )
+}
 
 /// A provider that emits a single text reply then stops.
 pub fn fake_text(text: &str) -> FakeProvider {

@@ -1,0 +1,27 @@
+[package]
+name = "agent-runtime-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Provider adapters (deterministic fake + OpenAI-compatible) and retry helpers for the shared agent runtime"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+agent-runtime-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+async-stream.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "agent-runtime-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The dependency-light registry kernel: namespaced identities, revisions, layered sealing, cards, scoped views, and fingerprints"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# std-only by default: no runtime, provider, Tokio, HTTP, or storage dependency.
+# `serde` adds (de)serialization without changing registry semantics.
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "agent-runtime-ability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "One neutral registry for a system's abilities: a generic name-keyed registry plus tool/skill capability kinds"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Registry-only by default (std only, per the registry kernel's own default
+# feature graph). The `tool` feature bridges the runtime's Tool contract
+# (pulling agent-runtime-core); `serde` adds (de)serialization.
+agent-runtime-registry = { workspace = true }
+agent-runtime-core = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+tool = ["dep:agent-runtime-core"]
+serde = ["dep:serde", "agent-runtime-registry/serde"]
+
+[dev-dependencies]
+async-trait.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+use agent_runtime::core::catalog::{ModelLimits, ResolvedModelProfile};
 use agent_runtime::core::prelude::*;
 use agent_runtime::provider::fake::{
     FakeProvider, ScriptedStream, tool_call_fragments, usage_event,
@@ -69,6 +70,11 @@ fn scripted_provider() -> FakeProvider {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), RuntimeError> {
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(128_000, 128_000, 4_096),
+        ))
         .provider(Arc::new(scripted_provider()))
         .approval(Arc::new(AllowAll))
         .tool(Arc::new(EchoTool))

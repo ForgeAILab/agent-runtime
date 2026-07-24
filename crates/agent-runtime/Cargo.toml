@@ -11,7 +11,12 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+agent-runtime-registry = { workspace = true, features = ["serde"] }
 agent-runtime-core.workspace = true
+agent-runtime-ability = { workspace = true, features = ["tool", "serde"] }
+agent-runtime-provider.workspace = true
+agent-runtime-context.workspace = true
+agent-runtime-obs = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -24,8 +29,18 @@ pin-project-lite.workspace = true
 jsonschema.workspace = true
 uuid.workspace = true
 
+[features]
+# The core loop, registry hub, ability catalog, provider mechanism, and
+# context engine are always present — that is the supported facade. `obs`
+# re-exports the optional sibling facade for one-stop consumption; leave it
+# off to keep the graph lean (it pulls tokio channels, and its own `sqlite`
+# feature pulls rusqlite).
+default = []
+obs = ["dep:agent-runtime-obs"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+agent-runtime-obs.workspace = true
 
 [lints]
 workspace = true

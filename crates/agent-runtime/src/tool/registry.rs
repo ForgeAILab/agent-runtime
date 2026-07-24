@@ -1,13 +1,19 @@
-//! The deterministic tool registry.
+//! The tool registry — a schema-validating specialization of the one registry.
 //!
-//! Adapted from Nyx `crates/nyx-tools/src/registry.rs` (donor revision in
-//! `PROVENANCE.md`). Registration is fail-closed on name conflicts and
-//! insertion order is preserved so advertisement and result ordering are
-//! deterministic. Sealing freezes the set for sharing across a session.
+//! The name-conflict, ordering, and sealing mechanics live in the shared
+//! [`agent_runtime_ability::Registry`] (a re-export of
+//! `agent-runtime-registry`'s generic mechanism); this module layers the
+//! tool-specific concerns on top: JSON-schema validation at registration and
+//! per-call argument validation before a call is surfaced or invoked.
+//! Registration stays fail-closed on name conflicts and insertion order is
+//! preserved so advertisement and result ordering are deterministic. Tools are
+//! held via [`ToolEntry`], a [`Named`](agent_runtime_ability::Named) wrapper —
+//! the registry kernel's `Named` can't be implemented directly for the
+//! foreign `Arc<dyn Tool>`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
+use agent_runtime_ability::{Registry, Sealed, ToolEntry};
 use agent_runtime_core::content::ToolCall;
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::provider::{ProviderError, ProviderErrorKind, ToolSchema};
@@ -16,8 +22,7 @@ use agent_runtime_core::tool::{Tool, ToolSpec};
 /// A mutable builder for a set of tools.
 #[derive(Debug, Default)]
 pub struct ToolRegistry {
-    names: HashSet<String>,
-    tools: Vec<Arc<dyn Tool>>,
+    inner: Registry<ToolEntry>,
 }
 
 impl ToolRegistry {
@@ -26,23 +31,21 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Registers a tool. Fails with a [`agent_runtime_core::error::ErrorKind::Conflict`]
-    /// error if the name is already taken; the first registration wins.
+    /// Registers a tool. Fails with a
+    /// [`agent_runtime_core::error::ErrorKind::Conflict`] error if the name is
+    /// already taken (the first registration wins) or a
+    /// [`agent_runtime_core::error::ErrorKind::Config`] error if the tool's
+    /// input schema is invalid.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), RuntimeError> {
         let name = tool.name().to_owned();
-        if self.names.contains(&name) {
-            return Err(RuntimeError::conflict(format!(
-                "duplicate tool name `{name}`"
-            )));
-        }
         jsonschema::validator_for(&tool.input_schema()).map_err(|error| {
             RuntimeError::config(format!(
                 "tool `{name}` has an invalid input schema: {error}"
             ))
         })?;
-        self.names.insert(name);
-        self.tools.push(tool);
-        Ok(())
+        self.inner
+            .register(ToolEntry::new(tool))
+            .map_err(|error| RuntimeError::conflict(error.to_string()))
     }
 
     /// Registers many tools, failing on the first conflict.
@@ -59,7 +62,7 @@ impl ToolRegistry {
     /// Freezes the registry.
     pub fn seal(self) -> SealedToolRegistry {
         SealedToolRegistry {
-            tools: Arc::from(self.tools.into_boxed_slice()),
+            inner: self.inner.seal(),
         }
     }
 }
@@ -67,50 +70,56 @@ impl ToolRegistry {
 /// An immutable, shareable set of tools with deterministic ordering.
 #[derive(Debug, Clone)]
 pub struct SealedToolRegistry {
-    tools: Arc<[Arc<dyn Tool>]>,
+    inner: Sealed<ToolEntry>,
 }
 
 impl SealedToolRegistry {
     /// An empty sealed registry.
     pub fn empty() -> Self {
         Self {
-            tools: Arc::from(Vec::new().into_boxed_slice()),
+            inner: Sealed::empty(),
         }
     }
 
     /// The number of tools.
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.inner.len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.inner.is_empty()
     }
 
     /// Looks up a tool by name (linear scan; order-preserving).
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.iter().find(|t| t.name() == name).cloned()
+        self.inner.get(name).map(|entry| entry.as_arc().clone())
     }
 
     /// Whether a tool with `name` is present.
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.iter().any(|t| t.name() == name)
+        self.inner.contains(name)
     }
 
     /// Iterates tools in registration order.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
-        self.tools.iter()
+        self.inner.iter().map(ToolEntry::as_arc)
     }
 
     /// The specs of all tools, in registration order.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|t| t.spec()).collect()
+        self.inner
+            .iter()
+            .map(|entry| entry.as_arc().spec())
+            .collect()
     }
 
     /// The provider-advertised schemas of all tools, in registration order.
     pub fn schemas(&self) -> Vec<ToolSchema> {
-        self.tools.iter().map(|t| t.spec().to_schema()).collect()
+        self.inner
+            .iter()
+            .map(|entry| entry.as_arc().spec().to_schema())
+            .collect()
     }
 
     /// Validates one assembled model call against the registered tool's input

@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::clock::Timestamp;
 use crate::content::Message;
 use crate::error::RuntimeError;
-use crate::ids::SessionId;
+use crate::ids::{SessionId, TurnId};
+use crate::manifest::RunManifest;
 use crate::usage::UsageLedger;
 
 /// A value whose contents must never appear in logs or events.
@@ -59,6 +60,26 @@ pub struct SessionIdentityState {
     pub event_seq: u64,
 }
 
+/// A run manifest recorded for one turn of a session.
+///
+/// Kept as an explicit `(turn, manifest)` pair rather than a map so a
+/// snapshot's persisted shape never depends on how a map type serializes a
+/// non-primitive key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnManifest {
+    /// The turn this manifest describes.
+    pub turn: TurnId,
+    /// The recorded manifest.
+    pub manifest: RunManifest,
+}
+
+impl TurnManifest {
+    /// Pairs `manifest` with the turn it describes.
+    pub fn new(turn: TurnId, manifest: RunManifest) -> Self {
+        Self { turn, manifest }
+    }
+}
+
 /// A persisted snapshot of a session's canonical state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -72,6 +93,10 @@ pub struct SessionSnapshot {
     /// Monotonic identity counters restored when this session resumes.
     #[serde(default)]
     pub identity: SessionIdentityState,
+    /// Per-turn run manifests, for audit and replay. Empty (and absent from
+    /// the wire form) for snapshots persisted before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manifests: Vec<TurnManifest>,
     /// When the snapshot was last updated.
     pub updated: Timestamp,
 }
@@ -95,7 +120,12 @@ pub trait SecretStore: Send + Sync + fmt::Debug {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::manifest::{CapabilityResolution, ModelResolution, RunManifest};
+    use crate::provider::ModelId;
+    use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
     #[test]
     fn secret_never_leaks_in_debug_or_display() {
@@ -103,5 +133,52 @@ mod tests {
         assert_eq!(format!("{s:?}"), "Secret([redacted])");
         assert_eq!(format!("{s}"), "[redacted]");
         assert_eq!(s.expose(), "hunter2");
+    }
+
+    fn sample_manifest() -> RunManifest {
+        RunManifest::new(
+            Fingerprint::of("snapshot"),
+            Fingerprint::of("view"),
+            ModelResolution::new(
+                "acme",
+                ModelId::new("acme-large"),
+                Fingerprint::of("profile"),
+                BTreeMap::new(),
+            ),
+            CapabilityResolution::new(RegistryRevision::new("resolver-1")),
+            Fingerprint::of("context"),
+            Fingerprint::of("cache-plan"),
+        )
+    }
+
+    #[test]
+    fn a_snapshot_with_manifests_round_trips_through_json() {
+        let snapshot = SessionSnapshot {
+            id: SessionId::new("s-1"),
+            history: vec![Message::user("hi")],
+            usage: UsageLedger::new(),
+            identity: SessionIdentityState::default(),
+            manifests: vec![TurnManifest::new(TurnId::new("turn-1"), sample_manifest())],
+            updated: Timestamp::ZERO,
+        };
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snapshot, back);
+        assert_eq!(back.manifests.len(), 1);
+        assert_eq!(back.manifests[0].turn, TurnId::new("turn-1"));
+    }
+
+    #[test]
+    fn a_snapshot_without_manifests_still_loads() {
+        // Simulates a snapshot persisted before the `manifests` field
+        // existed: the key is entirely absent from the wire form.
+        let legacy = serde_json::json!({
+            "id": "s-1",
+            "history": [],
+            "updated": 0,
+        });
+        let snapshot: SessionSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(snapshot.manifests.is_empty());
     }
 }

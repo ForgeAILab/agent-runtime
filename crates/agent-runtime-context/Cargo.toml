@@ -1,0 +1,25 @@
+[package]
+name = "agent-runtime-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The authoritative context engine: versioned fragments, complete token accounting, semantic compaction, and cache-aware planning"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Deterministic and network-free by construction: core contracts plus the
+# registry kernel's identity primitives, and nothing else.
+agent-runtime-core.workspace = true
+agent-runtime-registry = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

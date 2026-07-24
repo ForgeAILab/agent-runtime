@@ -4,9 +4,17 @@
 //! runtime composition can be checked against. They are the shared contract the
 //! consumer adapter fixtures also run.
 
+pub mod ability;
+pub mod cache;
 pub mod cancellation;
+pub mod catalog;
+pub mod compaction;
+pub mod context;
 pub mod event_schema;
 pub mod provider;
+pub mod registry;
+pub mod replay;
+pub mod retrieval;
 pub mod runtime;
 pub mod shutdown;
 pub mod tool;
