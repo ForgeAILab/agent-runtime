@@ -135,9 +135,17 @@ completed_at:
   priority, requirement, sensitivity, pairing, and cache-class contracts.
   _(Deterministic `sort_key` and `content_hash`; a changed content revision
   changes the hash, which is what makes the plan fingerprint meaningful.)_
-- [ ] 5.2 Migrate prompt sections, history, tool schemas/results, active
+- [x] 5.2 Migrate prompt sections, history, tool schemas/results, active
   abilities, current input, memory/retrieval hooks, and continuation state into
   deterministic fragment producers.
+  _(`RunPlanner::fragments` produces the fragments the runtime owns — host
+  instructions, activated tool schemas, history, and the current input, which
+  stays required while older history is optional so compaction has something it
+  may act on. `SystemPromptBuilder::into_fragments` covers named prompt
+  sections. `Memory`, `Retrieval`, and `Continuation` are fragment *kinds* with
+  ordering and cache semantics defined, contributed by the host rather than
+  synthesized by the runtime: their content is host policy, and inventing it
+  here would put product policy in the shared mechanism.)_
 - [x] 5.3 Implement `ContextPlanner` and immutable `ContextPlan`, making it the
   exclusive source of provider messages, tools, reserves, counts, and cache
   hints.
@@ -275,11 +283,20 @@ completed_at:
   migrated to the context crate's builder. README/CHANGELOG/PROVENANCE
   updated; no reference to the removed crate remains outside historical
   provenance text.)_
-- [ ] 9.3 Keep `agent-runtime-provider` independently testable and add optional
+- [x] 9.3 Keep `agent-runtime-provider` independently testable and add optional
   catalog-source/request-sizing/provider-cache integrations without requiring
   them in core.
-- [ ] 9.4 Keep `agent-runtime-obs` optional, project new neutral events without
+  _(Every provider test runs offline through the injected transport. The
+  catalog source reads a host-owned cache and is never on the request path;
+  `ProviderCacheCapability` is declared by the adapter and consumed by the
+  context engine, so core needs neither.)_
+- [x] 9.4 Keep `agent-runtime-obs` optional, project new neutral events without
   making a sink part of the execution path, and preserve host-owned storage.
+  _(`obs` stays an optional feature of `agent-runtime` and is absent from the
+  default execution graph. Its renderers were extended for the nine new
+  planning events **exhaustively** — no catch-all arm — so the next event added
+  forces a decision about how it renders, and they emit fingerprints, ids, and
+  counts only.)_
 - [x] 9.5 Re-export the supported composition surface from `agent-runtime`,
   document extension-author leaf dependencies, and add public API examples.
   _(`prelude` now gathers the registry/ability/context/hub/capability surface
