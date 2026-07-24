@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Formatting + lint gate. Clippy warnings are errors.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (warnings as errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Build + test on macOS and Linux.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: cargo build --workspace --all-features
+      - name: test
+        run: cargo test --workspace --all-features
+      - name: doc tests
+        run: cargo test --workspace --doc
+
+  # Minimum-supported-Rust-version verification (compatibility-contract:
+  # "Declared toolchain and license"). Production packages must build without a
+  # newer compiler than the declared MSRV.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - name: build production packages on MSRV
+        run: cargo build -p agent-runtime-core -p agent-runtime
+
+  # Dependency + license policy, including the consumer-domain dependency ban.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Cross-consumer compatibility gate. A shared-runtime release candidate runs
+  # the supported contract suites for each consumer. A failing consumer blocks a
+  # compatible release unless it is explicitly declared breaking. The fixtures
+  # under agent-runtime-testkit use only neutral host adapters, never consumer
+  # domain types, so this job needs no consumer repository checkout.
+  consumer-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: smith adapter contract suite
+        run: cargo test -p agent-runtime-testkit --test consumer_smith
+      - name: nyx adapter contract suite
+        run: cargo test -p agent-runtime-testkit --test consumer_nyx
+      - name: open-forge adapter contract suite
+        run: cargo test -p agent-runtime-testkit --test consumer_open_forge

@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agent-runtime-core",
+    "crates/agent-runtime",
+    "crates/agent-runtime-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+authors = ["Agent Runtime contributors"]
+repository = "https://example.invalid/agent-runtime"
+description = "Neutral, embeddable Rust agent runtime shared by independent products"
+keywords = ["ai", "agent", "llm", "runtime"]
+categories = ["asynchronous", "api-bindings"]
+
+# Public, host-neutral dependency set. Production packages MUST NOT add any
+# dependency on a consumer repository (Smith, Nyx, Open Forge) or their domain
+# types. See PROVENANCE.md and CONTRIBUTING.md for the boundary rule.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+async-stream = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync", "rt", "macros", "time"] }
+tokio-util = { version = "0.7", default-features = false }
+pin-project-lite = "0.2"
+jsonschema = { version = "=0.28.3", default-features = false }
+uuid = { version = "=1.19.0", features = ["v4"] }
+
+# Internal workspace crates (path + version so a future tagged release resolves).
+agent-runtime-core = { path = "crates/agent-runtime-core", version = "0.1.0" }
+agent-runtime = { path = "crates/agent-runtime", version = "0.1.0" }
+agent-runtime-testkit = { path = "crates/agent-runtime-testkit", version = "0.1.0" }
+
+# Clippy-as-error at the workspace level. CI additionally runs
+# `cargo clippy --all-targets -- -D warnings` for the full set.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

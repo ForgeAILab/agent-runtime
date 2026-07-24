@@ -1,0 +1,49 @@
+# cargo-deny configuration for the shared runtime.
+# Enforces the license and dependency-boundary policy from CONTRIBUTING.md.
+# Run locally with: cargo deny check
+
+[graph]
+all-features = true
+
+[licenses]
+# Production packages ship under MIT. Permit the common permissive licenses that
+# appear in the transitive graph; copyleft licenses are denied by omission.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+# Consumer-domain crates MUST NOT enter the production dependency graph. If any
+# of these ever appears as a dependency of a production package the build fails.
+# (Test/dev-only fixtures use neutral local host adapters, never these crates.)
+deny = [
+    { name = "nyx-core" },
+    { name = "nyx-provider" },
+    { name = "nyx-agent" },
+    { name = "nyx-tools" },
+    { name = "nyx-runtime" },
+    { name = "smith" },
+    { name = "smith-core" },
+    { name = "forge-daemon" },
+    { name = "forge-cli" },
+    { name = "forge-client" },
+]
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
