@@ -66,15 +66,17 @@ impl SessionHandle {
         self.inner.emitter.subscribe()
     }
 
-    /// Sends input, spawning the turn concurrently and returning its id
-    /// immediately. Events flow through [`SessionHandle::subscribe`].
+    /// Queues input for this session and returns its turn id immediately.
+    /// Turns execute serially in submission order while events flow through
+    /// [`SessionHandle::subscribe`].
     pub fn send(&self, input: UserInput) -> TurnId {
         let (turn_id, _completion) = self.spawn_turn(input);
         turn_id
     }
 
-    /// Runs a turn inline to completion and returns its id. Convenient for
-    /// headless hosts that consume events through an observer.
+    /// Queues a turn, waits for its tracked task to complete, and returns its
+    /// id. Convenient for headless hosts that consume events through an
+    /// observer.
     pub async fn run(&self, input: UserInput) -> TurnId {
         let (turn_id, completion) = self.spawn_turn(input);
         if let Some(completion) = completion {
@@ -84,9 +86,9 @@ impl SessionHandle {
     }
 
     fn spawn_turn(&self, input: UserInput) -> (TurnId, Option<oneshot::Receiver<()>>) {
-        let turn_id = self.inner.minter.turn();
         let (completed_tx, completed_rx) = oneshot::channel();
         let mut turns = self.inner.turns.lock().expect("session turns poisoned");
+        let turn_id = self.inner.minter.turn();
         if turns.shutting_down {
             return (turn_id, None);
         }

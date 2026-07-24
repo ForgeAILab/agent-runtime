@@ -68,10 +68,11 @@ impl Runtime {
         // freshly minted id must never silently load an older snapshot.
         let mut state = SessionState::with_history(request.initial_history);
         let mut identity = Default::default();
-        if explicit_id
-            && let Some(store) = &self.shared.session_store
-            && let Some(snapshot) = store.load(&session_id).await?
-        {
+        let snapshot = match (explicit_id, &self.shared.session_store) {
+            (true, Some(store)) => store.load(&session_id).await?,
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
             state.history = snapshot.history;
             state.usage = snapshot.usage;
             identity = snapshot.identity;

@@ -417,7 +417,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         let post = self.transport.post_stream(http);
         tokio::pin!(post);
         let mut bytes = tokio::select! {
-            result = &mut post => result?,
+            biased;
             _ = ctx.cancel.cancelled() => {
                 return Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"));
             }
@@ -427,6 +427,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                     "provider deadline elapsed",
                 ));
             }
+            result = &mut post => result?,
         };
         let cancel = ctx.cancel.clone();
         let deadline = ctx.deadline;
@@ -440,7 +441,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
 
             'outer: loop {
                 let next = tokio::select! {
-                    chunk = bytes.next() => chunk,
+                    biased;
                     _ = cancel.cancelled() => {
                         yield ProviderStreamEvent::Error {
                             error: ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"),
@@ -456,6 +457,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         };
                         return;
                     }
+                    chunk = bytes.next() => chunk,
                 };
                 let Some(chunk) = next else {
                     break;

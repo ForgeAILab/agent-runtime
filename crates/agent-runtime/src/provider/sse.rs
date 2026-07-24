@@ -18,6 +18,7 @@ pub struct SseFrame {
 #[derive(Debug, Default)]
 pub struct SseFrameParser {
     buffer: String,
+    pending_cr: bool,
 }
 
 impl SseFrameParser {
@@ -28,9 +29,30 @@ impl SseFrameParser {
 
     /// Appends raw text, normalizing `\r\n` and `\r` to `\n`.
     pub fn push_str(&mut self, chunk: &str) {
-        // Normalize newlines so frame splitting is uniform across servers.
-        let normalized = chunk.replace("\r\n", "\n").replace('\r', "\n");
-        self.buffer.push_str(&normalized);
+        // Normalize newlines so frame splitting is uniform across servers,
+        // including when an HTTP chunk boundary splits a CRLF pair.
+        let mut chars = chunk.chars().peekable();
+        if self.pending_cr {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            self.buffer.push('\n');
+            self.pending_cr = false;
+        }
+        while let Some(ch) = chars.next() {
+            if ch != '\r' {
+                self.buffer.push(ch);
+                continue;
+            }
+            match chars.peek() {
+                Some('\n') => {
+                    chars.next();
+                    self.buffer.push('\n');
+                }
+                Some(_) => self.buffer.push('\n'),
+                None => self.pending_cr = true,
+            }
+        }
     }
 
     /// Drains all complete frames (those terminated by a blank line).
@@ -48,6 +70,10 @@ impl SseFrameParser {
 
     /// Flushes a trailing partial frame (called at end-of-stream).
     pub fn finish(&mut self) -> Option<SseFrame> {
+        if self.pending_cr {
+            self.buffer.push('\n');
+            self.pending_cr = false;
+        }
         let raw = std::mem::take(&mut self.buffer);
         let trimmed = raw.trim_matches('\n');
         if trimmed.is_empty() {
@@ -102,6 +128,17 @@ mod tests {
         p.push_str("tial\n\n");
         let frames = p.drain_frames();
         assert_eq!(frames[0].data, "partial");
+    }
+
+    #[test]
+    fn normalizes_crlf_split_across_chunks_without_inventing_a_blank_line() {
+        let mut p = SseFrameParser::new();
+        p.push_str("data: first\r");
+        assert!(p.drain_frames().is_empty());
+        p.push_str("\ndata: second\r\n\r\n");
+        let frames = p.drain_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, "first\nsecond");
     }
 
     #[test]
