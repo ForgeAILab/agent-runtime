@@ -19,17 +19,32 @@
 //! - [`observer::EventObserver`] — a synchronous event sink.
 //! - [`clock::Clock`] — injectable time.
 //! - [`grant::SecurityCheck`] — a registered security check.
+//! - [`isolation::IsolationBackend`] — an engine-neutral untrusted-execution
+//!   backend.
+//! - [`broker::CredentialBroker`], [`broker::EgressBroker`],
+//!   [`broker::FilesystemBroker`] — grant-mediated host operation brokers.
+//! - [`guard::LeakDetector`], [`guard::ContentGuard`] — defense-in-depth
+//!   leak detection and untrusted-content risk signals.
+//!
+//! The runtime itself, not a host adapter, owns
+//! [`check_set::SecurityCheckSet`]: the sealed composer that evaluates every
+//! registered [`grant::SecurityCheck`] for one [`security::AuthorizationRequest`]
+//! and produces the composed [`grant::AuthorizationDecision`].
 #![forbid(unsafe_code)]
 
 pub mod approval;
+pub mod broker;
 pub mod cancel;
 pub mod catalog;
+pub mod check_set;
 pub mod clock;
 pub mod content;
 pub mod error;
 pub mod event;
 pub mod grant;
+pub mod guard;
 pub mod ids;
+pub mod isolation;
 pub mod manifest;
 pub mod metadata;
 pub mod observer;
@@ -45,7 +60,16 @@ pub mod prelude {
     pub use crate::approval::{
         AllowAll, ApprovalDecision, ApprovalPolicy, ApprovalRequest, DenyAll,
     };
+    pub use crate::broker::{
+        CredentialBroker, CredentialError, CredentialRef, CredentialSink, EgressAuthorization,
+        EgressBroker, EgressDenied, EgressRequest, EgressTuple, FilesystemBroker, FilesystemError,
+        FilesystemHandle, FilesystemRight, FilesystemRights, MountName,
+    };
     pub use crate::cancel::{CancelReason, Cancellation};
+    pub use crate::check_set::{
+        ActionClass, AdvisoryFinding, CheckAudit, CheckSetError, CheckSetOutcome, CheckStatus,
+        EnforcementLimits, RevocationTarget, SecurityCheckSet, SecurityCheckSetBuilder,
+    };
     pub use crate::clock::{Clock, Deadline, SystemClock, Timestamp};
     pub use crate::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock, UserInput};
     pub use crate::error::{ErrorKind, Result, RuntimeError};
@@ -58,7 +82,18 @@ pub mod prelude {
         GrantConstraints, PolicyEpoch, SecurityCheck, SecurityCheckId, SecurityCheckMode,
         SecurityCheckOutcome, SecurityCheckRevision, SecuritySignal,
     };
+    pub use crate::guard::{
+        ContentGuard, ContentGuardId, ContentGuardRevision, GuardFindings, GuardRiskKind,
+        GuardRiskSignal, GuardedFragment, LeakBoundary, LeakCoverageRevision, LeakDetector,
+        LeakDetectorId, LeakFinding, LeakScanResult,
+    };
     pub use crate::ids::{AttemptId, EventId, RequestId, SessionId, TenantId, ToolCallId, TurnId};
+    pub use crate::isolation::{
+        BackendConformance, BoundedRendering, DeclaredInterface, IsolationBackend,
+        IsolationBackendId, IsolationBackendRevision, IsolationError, IsolationInvocation,
+        IsolationInvocationContext, IsolationInvocationId, IsolationOutcome, IsolationProfile,
+        ResourceLimitKind, ResourceLimits, TerminationReason, VerifiedArtifact, backend_conforms,
+    };
     pub use crate::manifest::{
         ActivatedCapability, CapabilityResolution, ContextSegmentRecord, MANIFEST_SCHEMA_VERSION,
         ManifestReason, ModelResolution, PolicyRevisions, ReplayMismatch, ReplayMode,

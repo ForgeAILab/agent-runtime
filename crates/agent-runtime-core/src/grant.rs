@@ -566,10 +566,9 @@ impl CapabilityGrant {
     /// check-set revision. See the type's doc comment for exactly what
     /// `pub(crate)` buys and what it does not.
     ///
-    /// `#[allow(dead_code)]`: this task lands the type only, not the
-    /// composer that will call it, so nothing in-crate reaches it outside
-    /// tests yet.
-    #[allow(dead_code)]
+    /// Called by [`crate::check_set::SecurityCheckSet`]'s composition path —
+    /// the only place inside this crate that mints a grant from a composed
+    /// `Allow`/`RequireApproval` decision.
     pub(crate) fn issue(
         context: &SecurityContext,
         action: SecurityAction,
@@ -646,16 +645,11 @@ impl CapabilityGrant {
     /// Consumes one use if any remain, atomically. Returns whether a use was
     /// consumed.
     ///
-    /// `pub(crate)`: called by the enforcement point after
-    /// [`CapabilityGrant::covers`] has already accepted the presenting
-    /// request — never by `covers` itself, which must not consume or alter a
-    /// grant on a failed check, per the spec's own "without consuming or
-    /// altering another grant".
-    ///
-    /// `#[allow(dead_code)]`: this task lands the type only, not the
-    /// enforcement point that will call it, so nothing in-crate reaches it
-    /// outside tests yet.
-    #[allow(dead_code)]
+    /// `pub(crate)`: called by [`crate::check_set::SecurityCheckSet::present`]
+    /// after it has already independently accepted every clause a presenting
+    /// request must satisfy — never by `covers` itself, which must not
+    /// consume or alter a grant on a failed check, per the spec's own
+    /// "without consuming or altering another grant".
     pub(crate) fn consume(&self) -> bool {
         self.remaining_uses
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
