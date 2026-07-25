@@ -154,6 +154,8 @@ security guarantees.
 | Packaging | Core contracts stay lightweight; the Wasmtime reference backend lives in an opt-in package, and client backends remain separately replaceable |
 | MSRV | Existing packages remain Rust 1.86; the opt-in sandbox package may follow the maintained engine's higher MSRV |
 | Public schema versions | Security context fields and new security events are additions to versioned public schemas; every schema they touch bumps its published version |
+| Network egress ownership | Network egress is a host conformance contract, not a runtime-owned client: the runtime performs normalized-tuple authorization and orders credential injection strictly after it, but DNS resolution, dialing, pooling, redirect-following, and TLS are host-transport-owned; a transport that does not pass the (adversarial, release-blocking) conformance suite has not met the requirement, the same way an unapproved `IsolationBackend` has not met `UntrustedToolV1` (`design.md` Decision 6) |
+| Capability hub | The `hub`/`capability` subsystem (`crates/agent-runtime/src/hub`, `.../capability`) is kept and wired into the driver, not deleted — deliberate forward-looking design for one registry spanning tool, skill, MCP, and sub-agent capability kinds, so an agent facing a task can discover what will help and either use a tool with a skill or dispatch a sub-agent. Discovery, activation, and sub-agent dispatch are each authority-bearing and pass the same composed authorization path; dispatch is the highest-risk of the three and is governed by the runtime-api delta's "Bounded sub-agent delegation" requirement (`design.md` Decision 12) |
 
 ## Approval Boundary
 

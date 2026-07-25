@@ -533,9 +533,9 @@ It can only mean "after the runtime's own endpoint/data-egress authorization
 decision" — a decision the runtime *can* make, since it constructs the request
 before handing it off.
 
-**Two ways to fix this, one recommendation.**
+**Two ways to fix this; (b) is the settled decision.**
 
-**(a) Take a real HTTP client dependency in a production package.** The
+**(a) Take a real HTTP client dependency in a production package (rejected).** The
 runtime (or a new production package it depends on by default, or optionally)
 owns DNS resolution, connection pooling, TLS, and redirect handling directly —
 for example via `reqwest`/`hyper`/`rustls` — so every requirement in
@@ -557,7 +557,7 @@ the sandbox package's MSRV isolation (Decision 10) but means egress guarantees
 apply only to hosts who opt in, which is a materially weaker default posture
 than this proposal otherwise commits to.
 
-**(b) Egress is a host conformance contract (recommended).** The runtime
+**(b) Egress is a host conformance contract (adopted).** The runtime
 specifies the required transport *behavior* — every scenario in
 security-enforcement's three network requirements — as a conformance suite a
 host-supplied `HttpTransport` (or its production successor) must pass, the
@@ -607,10 +607,27 @@ invariant intact for everything the runtime itself owns, and states the actual
 boundary of the guarantee instead of implying ownership of code this
 repository does not run.
 
-**Recommendation:** (b). Alternative (a) is recorded above with its cost and
-remains available as a future option — for instance if conformance proves too
-weak in practice, or if a majority of hosts converge on wanting the runtime to
-own the client anyway — but is not the default this proposal adopts.
+**Consequence: the transport conformance suite is load-bearing, not
+illustrative.** Because the runtime's own network-egress guarantee is now
+conditional on a conforming host transport rather than on code the runtime
+executes itself, the suite that defines "conforming" carries exactly as much
+weight as the guarantee it stands in for. A suite that only exercises
+cooperative, happy-path transport behavior would let a non-conforming
+transport pass and silently invalidate every network-egress requirement this
+proposal makes, with no way for the runtime to detect the gap at run time. The
+suite MUST therefore be adversarial: at minimum it must include DNS rebinding
+between the runtime's authorization decision and the transport's actual dial
+(the resolved address changes inside that window), redirect chains that
+change origin across one or more hops, HTTP/2 connection coalescing across
+hostnames that share a certificate, and connection reuse after re-resolution
+(a pooled connection from a prior authorization reused for a subsequently
+re-resolved address without a fresh authorization check). `tasks.md` task
+10.2b tracks this suite as release-blocking, not optional hardening.
+
+**Decision:** (b) is adopted. Alternative (a) is recorded above with its cost
+and remains available as a future revision — for instance if conformance
+proves too weak in practice, or if a majority of hosts converge on wanting the
+runtime to own the client anyway — but is not adopted here.
 
 **Everything else in the original egress design carries forward as scope for
 the conformance contract and the runtime's own authorization-tuple logic**,
@@ -790,6 +807,68 @@ consumer in the composed set (a host may still register one in anticipation of
 a future consumer, but should see that it is currently unconsumed and paying
 in-path cost for no effect) — a lint, not a hard rejection, since an
 unconsumed advisory check is wasteful rather than unsound.
+
+### Decision 12: The capability hub is kept and wired, not removed
+
+The predecessor change (`add-registry-driven-context-runtime-2026-07-24`)
+built the `hub`/`capability` subsystem in `crates/agent-runtime/src`
+(~4,260 lines across `src/hub` and `src/capability`: scoped registry views,
+retrieval, dependency-aware selection, activation epochs) without wiring it
+into the driver. It has no production call site today: the driver advertises
+tools from the raw sealed `SealedToolRegistry`
+(`crates/agent-runtime/src/agent/driver.rs:445`), `crate::hub`/
+`crate::capability` are reachable only from the public `prelude` re-export
+(`crates/agent-runtime/src/lib.rs:152,155`) and one hardcoded revision
+reference in `crates/agent-runtime/src/agent/planning.rs:320-322`, and
+producing an `agent_runtime_ability::activation::Activated::AgentDefinition`
+value never starts a sub-agent (that variant's own doc comment says so, in
+`crates/agent-runtime-ability/src/activation.rs`). This change's own Phase B
+task 8.1 left an open question about that fact — wire the subsystem into the
+driver, or delete it. That question is now resolved: the subsystem is KEPT,
+because it is deliberate forward-looking
+design for a capability hub — one registry that manages every capability kind
+(`agent_runtime_ability::AbilityKind::Tool | Skill | Mcp | Agent`) so an agent
+facing a task (for example, "do deep research") can discover what will help —
+a skill, a tool such as a browser, an agent definition — and either use a
+tool with a skill or dispatch a sub-agent. `tasks.md` §8 tracks the wiring
+work this decision requires.
+
+Wiring the hub changes it from inert to authority-bearing. Capability
+discovery, activation, and sub-agent dispatch are three distinct steps, each
+a point where authority could be granted, so each MUST pass the same composed
+authorization path Decision 1 defines rather than a capability-hub-specific
+shortcut:
+
+- **Discovery** (`capability::retrieval`/`selection`/`preactivation`) already
+  operates only over an already-scoped `RegistryView`, so a denied or unready
+  entry is invisible before retrieval — this property must survive wiring
+  unchanged, not be reintroduced as a post-hoc filter over an unscoped view.
+- **Activation** (`agent_runtime_ability::activation::activate`) already runs
+  `ActivationPolicy::authorize` before `ActivationHandle::activate`, so no
+  side effect occurs before authorization; wiring the hub into the driver
+  MUST NOT add a second, driver-owned activation path that bypasses this
+  function.
+- **Sub-agent dispatch is the highest-risk of the three**, because unlike
+  discovery or activation it does not merely expose or materialize
+  something — it creates a new session that must inherit a strict subset of
+  the parent session's authority. The executor that closes the "producing an
+  `AgentDefinition` never starts the sub-agent" gap (`tasks.md` task 8.2) is
+  what performs dispatch, and it is governed by the already-specified
+  runtime-api delta requirement "Bounded sub-agent delegation": the child
+  session's security subject, composed check set, and approved isolation
+  backend/profile set MUST each be derived as a subset of the parent's, the
+  parent turn's trust classification and content-guard/taint evidence for any
+  content seeding the child MUST propagate into the child's authorization
+  requests, and the child MUST NOT be able to activate a capability, backend,
+  or profile the parent was not itself authorized for. This decision does not
+  restate that requirement's mechanics; it establishes that sub-agent dispatch
+  through the capability hub is the concrete call site "Bounded sub-agent
+  delegation" governs, not a parallel path exempt from it.
+
+Wiring the hub also requires `RunManifest`'s `CapabilityResolution` to record
+the resolver and index revisions that actually ran, and the actual
+`ActivatedCapability` set, instead of the hardcoded placeholder
+`planning.rs` writes today — see `tasks.md` task 8.3.
 
 ## Risks / Trade-offs
 

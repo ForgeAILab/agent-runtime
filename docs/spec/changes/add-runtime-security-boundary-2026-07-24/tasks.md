@@ -14,12 +14,16 @@ phases:
   land first, with the single explicit exception noted at task 2.3.
 - **Phase B** is a prerequisite this change *assumes* but that does not exist
   yet: the `hub`/`capability` subsystem has no production call site today (see
-  task 8.1). Phase B must resolve before task 2.3 can proceed.
-- **Phase C** is the egress and filesystem brokers. It is explicitly gated on
-  `design.md` Decision 6 (network egress: host conformance contract vs. a real
-  runtime-owned HTTP dependency) being ratified, since where broker behavior
-  for DNS/dial/redirect/pooling lives depends entirely on which option that
-  decision resolves to.
+  task 8). The subsystem is KEPT and will be wired, not deleted — that
+  question is resolved (`design.md` Decision 12) — so Phase B is sequencing
+  work, not an open design question. Phase B must resolve before task 2.3 can
+  proceed.
+- **Phase C** is the egress and filesystem brokers. `design.md` Decision 6
+  (network egress: host conformance contract vs. a real runtime-owned HTTP
+  dependency) is RESOLVED — the host conformance contract is adopted — so
+  Phase C is unblocked on that axis; where broker behavior for
+  DNS/dial/redirect/pooling lives, and how it is tested, follows directly
+  from that decision.
 
 ## 0. Approval and coordination
 
@@ -120,9 +124,13 @@ phases:
 - [ ] 2.3 Route registry scoping, retrieval, dependency expansion, activation,
   and invocation through one composed check-set revision and security subject;
   denied entries must remain indistinguishable from absent entries.
-  **GATED on Phase B task 8.1**: the `hub`/`capability` subsystem this task
-  would route through has no production call site today — this is "build the
-  path, then route it," not "route the existing path," until 8.1 resolves.
+  **GATED on Phase B task 8.1 — this is a definite yes, not an open
+  question.** Whether the `hub`/`capability` subsystem gets wired at all was
+  the open question in the predecessor change; it is resolved (`design.md`
+  Decision 12: kept and wired). The gate remaining here is sequencing only —
+  8.1 has to land before 2.3 can route through it, since 8.1 is what gives
+  the driver a scoped/activated path to route through at all — not
+  uncertainty about whether 8.1 will happen.
 - [x] 2.4a Fix the executor so a network-effect tool invocation is no longer
   exempt from the pre-invocation approval/workspace gate.
   _(Verified: `crates/agent-runtime-core/src/tool.rs`'s
@@ -326,31 +334,72 @@ manifest revisions; they do not require Phase B or Phase C.
 
 ## Phase B — Prerequisites this change assumes but that do not exist yet
 
-### 8. Registry/Capability Subsystem Wiring Decision
+### 8. Capability Hub Wiring
 
-- [ ] 8.1 The `hub`/`capability` subsystem in `crates/agent-runtime/src`
-  (~4,260 lines across `src/hub` and `src/capability`: scoped registry views,
-  retrieval, activation epochs) has no production call site today — the
-  agent driver advertises tools directly from the raw sealed
-  `SealedToolRegistry` (`crates/agent-runtime/src/agent/driver.rs`), not
-  through `ScopedRegistry`/`RegistryHub`. `crate::hub`/`crate::capability` are
-  reachable only from the public `prelude` re-export
-  (`crates/agent-runtime/src/lib.rs`) and one revision-constant reference in
-  `crates/agent-runtime/src/agent/planning.rs`, neither of which routes actual
-  tool discovery or invocation through it. Either wire this subsystem into the
-  driver's tool advertisement/invocation path so registry-foundation's
-  per-security-subject/composed-check-set-set-revision scoping
-  ("Policy-scoped registry views") actually governs what a session can see and
-  invoke, or make an explicit decision to remove it. **Do not delete the
-  subsystem as part of this task** — deletion, if chosen, is its own reviewed
-  change. This task **blocks task 2.3**.
+The `hub`/`capability` subsystem in `crates/agent-runtime/src` (~4,260 lines
+across `src/hub` and `src/capability`: scoped registry views, retrieval,
+dependency-aware selection, activation epochs) is KEPT, not deleted
+(`design.md` Decision 12) — it is deliberate forward-looking design for a
+capability hub spanning every `agent_runtime_ability::AbilityKind` (Tool,
+Skill, Mcp, Agent), so an agent facing a task can discover what will help and
+either use a tool with a skill or dispatch a sub-agent. It has no production
+call site today: the agent driver advertises tools directly from the raw
+sealed `SealedToolRegistry` (`crates/agent-runtime/src/agent/driver.rs:445`),
+not through `ScopedRegistry`/`RegistryHub`; `crate::hub`/`crate::capability`
+are reachable only from the public `prelude` re-export
+(`crates/agent-runtime/src/lib.rs:152,155`) and one hardcoded revision
+reference in `crates/agent-runtime/src/agent/planning.rs:320-322`; and
+producing an `agent_runtime_ability::activation::Activated::AgentDefinition`
+value never starts a sub-agent today (that variant's own doc comment says so).
+Wiring it is three concrete, independently landable pieces of work:
+
+- [ ] 8.1 Route the driver's tool advertisement and invocation path through
+  the scoped/activated view (`hub::RegistryHub::scoped` /
+  `hub::ScopedRegistry`, `capability::CapabilityResolver`) instead of the raw
+  sealed `SealedToolRegistry`, so registry-foundation's
+  per-security-subject/composed-check-set-revision scoping ("Policy-scoped
+  registry views") actually governs what a session can see and invoke, and a
+  denied or unready entry stays indistinguishable from an absent one all the
+  way through advertisement. This task **blocks task 2.3**.
+- [ ] 8.2 Implement a sub-agent executor that actually dispatches a session
+  when `agent_runtime_ability::activation::Activated::AgentDefinition` is
+  produced. Today no code path in `crates/agent-runtime/src` consumes an
+  `AgentDefinition` and starts a session from it — the type only carries
+  enough information to construct or delegate to one
+  (`crates/agent-runtime-ability/src/activation.rs`). This is the
+  highest-risk piece of the three (`design.md` Decision 12): the executor
+  MUST derive the child session's security subject, composed check set, and
+  approved isolation backend/profile set as a strict subset of the parent
+  session's, and propagate the parent turn's trust classification/taint
+  evidence into the child's authorization requests, per runtime-api's
+  "Bounded sub-agent delegation" — this task implements that requirement, it
+  does not re-specify it.
+- [ ] 8.3 Make the run manifest's `CapabilityResolution` record the real
+  capability resolution instead of the placeholder it writes today.
+  `crates/agent-runtime/src/agent/planning.rs:320-322` constructs
+  `CapabilityResolution::new(RegistryRevision::new(crate::capability::DETERMINISTIC_RETRIEVER_REVISION))`
+  unconditionally, and the driver never calls `RunManifest::with_activation`
+  outside `agent-runtime-core`'s own unit tests
+  (`crates/agent-runtime-core/src/manifest.rs`). Once 8.1 routes real
+  retrieval/selection/activation through the driver, planning must record the
+  resolver revision that actually ran (and index revision, if an embedding
+  index was consulted) and attach the actual `ActivatedCapability` set via
+  `with_activation(...)`.
+
+**Do not delete the subsystem.** The wire-or-delete question this section
+used to track is resolved to wire (`design.md` Decision 12); removal is not
+in scope for this change.
 
 ## Phase C — Egress and filesystem brokers
 
-**GATE:** blocked on `design.md` Decision 6 being ratified (task 0.1) — the
-choice between a host transport-conformance contract (recommended) and a
-runtime-owned HTTP client dependency determines where DNS/dial/redirect/
-pooling behavior is implemented and tested, which every task below depends on.
+**GATE: RESOLVED for the transport question.** `design.md` Decision 6 is
+ratified (task 0.1) — the host transport-conformance contract is adopted over
+a runtime-owned HTTP client dependency — so Phase C is unblocked on that
+axis. Where DNS/dial/redirect/pooling behavior is implemented and tested
+follows directly from that decision: the runtime owns normalized-tuple
+authorization and credential-injection ordering (tasks 10.1, 11.1); the host
+transport owns DNS/dial/pooling/TLS and is verified only through the
+conformance suite (tasks 10.2, 10.2b).
 
 ### 9. Filesystem Broker
 
@@ -386,6 +435,16 @@ pooling behavior is implemented and tested, which every task below depends on.
   cookie store, and — critically — redirects surfaced to the runtime rather
   than followed internally, since only the runtime holds the rule and
   address-class tables a redirect target must be checked against.
+- [ ] 10.2b Make the 10.2 conformance suite adversarial, not illustrative —
+  release-blocking per `design.md` Decision 6's consequence paragraph, since
+  the runtime's own network-egress guarantee is conditional on a transport
+  passing it and the runtime cannot verify conformance at run time. The suite
+  MUST include at minimum: DNS rebinding between the runtime's authorization
+  decision and the transport's actual dial; redirect chains that change
+  origin across one or more hops; HTTP/2 connection coalescing across
+  hostnames that share a certificate; and connection reuse after
+  re-resolution (a pooled connection from a prior authorization reused for a
+  subsequently re-resolved address without a fresh authorization check).
 - [ ] 10.3 Reauthorize every enabled redirect hop as a new request (including
   a rewritten method) against the same rule/address-class checks as the
   original request, strip `Referer`/cookies on origin change, and enforce a
