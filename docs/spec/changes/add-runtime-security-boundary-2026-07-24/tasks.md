@@ -56,16 +56,27 @@ phases:
 contract-and-composer complete — the security vocabulary, `SecurityContext`/
 `AuthorizationRequest`, `CapabilityGrant`, and the runtime-owned
 `SecurityCheckSet` composer all exist in `agent-runtime-core`/
-`agent-runtime-registry` with 121 passing unit tests, but **nothing in the
-executor, driver, or builder calls any of it yet** — `SecurityCheckSet`,
-`CapabilityGrant`, and `AuthorizationRequest` have zero references outside
-`agent-runtime-core` (`crates/agent-runtime/src`,
-`crates/agent-runtime-provider/src`, `crates/agent-runtime-ability/src` all
-grep clean for them). A ticked box in Section 1 below means the type or
-composition rule exists and is tested in isolation, never that enforcement is
-active. Task 2.4b is the first task that routes a real gating decision
-through the composed `SecurityCheckSet`, ahead of `ApprovalPolicy` — that is
-what makes Section 1 live.
+`agent-runtime-registry` with 121 passing unit tests.
+
+**Enforcement status (commit `fe50d5a`):** the composer is now IN THE LIVE
+PATH for tool invocation. `ToolExecutor::run_one` builds an
+`AuthorizationRequest` and calls `SecurityCheckSet::authorize` as a distinct
+step ahead of `ApprovalPolicy`; a `Deny` returns before approval is consulted
+and before tool code runs. `RuntimeBuilder::build` hard-fails when a tool
+declaring effects that require authorization is registered without either a
+host authoritative check or an explicit `legacy_approval_authority()` opt-in,
+so default-deny holds without a permissive fallback.
+
+Two limits a reader must not overclaim from the ticked boxes below. First,
+tool invocation is the ONLY enforced action class so far: capability
+discovery, activation, provider egress, and sub-agent dispatch do not yet
+pass through the composer. Second, the `SecurityEvidence` attached to each
+request is a conservative placeholder (least-trusted class plus a fingerprint
+of the tool name) because no content guard is wired — so the
+untrusted-content-to-authorization taint linkage that
+`security-enforcement`'s "Central default-deny authorization" requires is
+structurally present but not yet carrying real provenance. Section 3 supplies
+it.
 
 ### 1. Security Contracts
 
@@ -303,9 +314,23 @@ what makes Section 1 live.
   this does not authorize editing the Smith, Nyx, or Open Forge repositories
   themselves — only this repository's testkit fixtures that model their
   adapters, plus documentation of what each consumer must change.
-- [ ] 2.2 Replace free-form effect handling with typed permission/resource
-  requests covering filesystem, network, credential, process, stdio, clock, and
-  random authority.
+- [x] 2.2a Derive typed permission/resource requests from declared tool
+  effects for filesystem, network, and process authority.
+  _(Verified: `crates/agent-runtime-core/src/tool.rs` —
+  `ToolEffects::authorization_request()` maps `Effect::Write{scope}` to
+  `Permission::FsWrite` with a `SecurityResource::Filesystem{mount,
+  segments}`, `Effect::SpawnProcess` to `Permission::ProcessSpawn`, and
+  `Effect::Network` to `Permission::NetHttp`. Multiple write scopes collapse
+  the resource to the mount root, and the executor's per-scope
+  `Workspace::contains` check still validates each scope individually. Tests
+  cover each mapping plus the collapse and combined-effect cases.)_
+- [ ] 2.2b Extend `Effect` so credential, stdio, clock, and random authority
+  are declarable at all. `authorization_request()` can never request
+  `Permission::{CredentialUse, StdioRead, StdioWrite, ClockRead, RandomRead}`
+  today because `Effect` has no variant that implies them, so those
+  permissions are structurally unreachable through the tool path rather than
+  merely unused. Blocks any claim that the typed vocabulary fully covers the
+  authority a native tool can exercise.
 - [ ] 2.3 Route registry scoping, retrieval, dependency expansion, activation,
   and invocation through one composed check-set revision and security subject;
   denied entries must remain indistinguishable from absent entries.
@@ -328,11 +353,27 @@ what makes Section 1 live.
   satisfies tool-execution's "Fail-closed approval" scenario "Network-only
   tool requires authorization" at the level of the pre-existing
   `ApprovalPolicy`/`Workspace` mechanism.)_
-- [ ] 2.4b Route the same gating decision through the new composed
+- [x] 2.4b Route the same gating decision through the new composed
   `SecurityCheckSet` authorization (Section 1) as a distinct step *before*
   optional approval, rather than only through `ApprovalPolicy` — 2.4a fixed
   the immediate network-effect gap in the pre-existing mechanism, but does not
   by itself add the separate "authorization" step Decision 1 defines.
+  _(Verified: `crates/agent-runtime/src/tool/executor.rs::run_one` builds an
+  `AuthorizationRequest` and calls `SecurityCheckSet::authorize` before any
+  `ApprovalPolicy` call. `AuthorizationDecision::Deny` returns immediately
+  without consulting approval and without reaching `tool.invoke`;
+  `RequireApproval` consults approval and then `resolve_approval`, so
+  approval can only accept or reject an already bounded grant.
+  `RuntimeBuilder::build` fails when a tool requiring authorization is
+  registered with neither a host authoritative check nor
+  `legacy_approval_authority()`, naming both remedies in the error, so
+  default-deny holds with no permissive fallback. Tests: denial
+  short-circuits before approval and tool body; authorization precedes the
+  body for a network-only tool; approval cannot widen past a composed deny;
+  four builder tests covering the failure and each remedy. Satisfies
+  security-enforcement's "Central default-deny authorization" for the tool
+  invocation action class only — see the Enforcement status note at the top
+  of Phase A for what remains unenforced.)_
 - [ ] 2.5 Add native-tool trust classification. Reject untrusted in-process
   native tools, require an approved isolation backend/profile for untrusted
   artifacts, and document that enforceable trusted-native I/O must use runtime
