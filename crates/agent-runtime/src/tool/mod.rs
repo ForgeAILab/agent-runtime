@@ -9,6 +9,6 @@ pub mod executor;
 pub mod registry;
 pub mod scheduler;
 
-pub use executor::ToolExecutor;
+pub use executor::{SecurityConfig, ToolExecutor};
 pub use registry::{SealedToolRegistry, ToolRegistry};
 pub use scheduler::{ConflictPolicy, plan_batches};

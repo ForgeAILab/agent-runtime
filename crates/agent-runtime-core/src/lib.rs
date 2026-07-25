@@ -29,7 +29,11 @@
 //! The runtime itself, not a host adapter, owns
 //! [`check_set::SecurityCheckSet`]: the sealed composer that evaluates every
 //! registered [`grant::SecurityCheck`] for one [`security::AuthorizationRequest`]
-//! and produces the composed [`grant::AuthorizationDecision`].
+//! and produces the composed [`grant::AuthorizationDecision`]. Default-deny
+//! means an upgraded host with no authoritative coverage denies every
+//! privileged tool call; [`compat::LegacyApprovalAuthority`] is the shipped,
+//! named migration aid that closes that gap without a permissive fallback —
+//! see its own doc comment.
 #![forbid(unsafe_code)]
 
 pub mod approval;
@@ -38,6 +42,7 @@ pub mod cancel;
 pub mod catalog;
 pub mod check_set;
 pub mod clock;
+pub mod compat;
 pub mod content;
 pub mod error;
 pub mod event;
@@ -71,6 +76,7 @@ pub mod prelude {
         EnforcementLimits, RevocationTarget, SecurityCheckSet, SecurityCheckSetBuilder,
     };
     pub use crate::clock::{Clock, Deadline, SystemClock, Timestamp};
+    pub use crate::compat::LegacyApprovalAuthority;
     pub use crate::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock, UserInput};
     pub use crate::error::{ErrorKind, Result, RuntimeError};
     pub use crate::event::{

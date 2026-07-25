@@ -13,10 +13,15 @@ use agent_runtime_context::compaction::SemanticCompactor;
 use agent_runtime_context::sizing::{CharRatioSizer, RequestSizer};
 use agent_runtime_core::approval::{ApprovalPolicy, DenyAll};
 use agent_runtime_core::catalog::{ModelCatalog, ResolvedModelProfile};
+use agent_runtime_core::check_set::{ActionClass, EnforcementLimits, SecurityCheckSetBuilder};
 use agent_runtime_core::clock::{Clock, SystemClock};
+use agent_runtime_core::compat::LegacyApprovalAuthority;
 use agent_runtime_core::error::RuntimeError;
+use agent_runtime_core::grant::{SecurityCheck, SecurityCheckMode};
+use agent_runtime_core::ids::TenantId;
 use agent_runtime_core::observer::EventObserver;
 use agent_runtime_core::provider::{ModelId, Provider, ReasoningConfig, StructuredOutputConfig};
+use agent_runtime_core::security::{PermissionSet, SecuritySubject};
 use agent_runtime_core::store::{SecretStore, SessionStore};
 use agent_runtime_core::tool::Tool;
 use agent_runtime_core::workspace::{DenyAllWorkspace, Workspace};
@@ -28,9 +33,9 @@ use crate::agent::config::{DowngradePolicy, LoopConfig};
 use crate::agent::driver::Driver;
 use crate::provider::retry::RetryPolicy;
 use crate::runtime::engine::{Runtime, RuntimeShared};
-use crate::tool::ToolExecutor;
 use crate::tool::registry::ToolRegistry;
 use crate::tool::scheduler::ConflictPolicy;
+use crate::tool::{SecurityConfig, ToolExecutor};
 
 /// Builds a [`Runtime`] from host services and configuration.
 #[derive(Debug)]
@@ -54,6 +59,17 @@ pub struct RuntimeBuilder {
     compactor: Option<SemanticCompactor>,
     cache_capability: Option<ProviderCacheCapability>,
     revisions: RunRevisions,
+    security_checks: Vec<(
+        Arc<dyn SecurityCheck>,
+        SecurityCheckMode,
+        PermissionSet,
+        ActionClass,
+    )>,
+    has_authoritative_check: bool,
+    legacy_approval_authority: bool,
+    enforcement_limits: Option<EnforcementLimits>,
+    security_subject: Option<SecuritySubject>,
+    tenant: Option<TenantId>,
 }
 
 impl RuntimeBuilder {
@@ -79,6 +95,12 @@ impl RuntimeBuilder {
             compactor: None,
             cache_capability: None,
             revisions: RunRevisions::empty(),
+            security_checks: Vec::new(),
+            has_authoritative_check: false,
+            legacy_approval_authority: false,
+            enforcement_limits: None,
+            security_subject: None,
+            tenant: None,
         }
     }
 
@@ -170,6 +192,66 @@ impl RuntimeBuilder {
     /// Sets the workspace boundary.
     pub fn workspace(mut self, workspace: Arc<dyn Workspace>) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    /// Registers a host-supplied [`SecurityCheck`] under an explicit
+    /// [`SecurityCheckMode`], host-assigned [`PermissionSet`] coverage, and
+    /// [`ActionClass`] — mirrors
+    /// [`SecurityCheckSetBuilder::register`]'s own signature and host-assigns-
+    /// coverage discipline. At least one `Authoritative` registration, from
+    /// this method or from [`RuntimeBuilder::legacy_approval_authority`], is
+    /// what lets [`RuntimeBuilder::build`] proceed when any registered tool
+    /// declares effects requiring authorization; see that method's doc
+    /// comment.
+    pub fn security_check(
+        mut self,
+        check: Arc<dyn SecurityCheck>,
+        mode: SecurityCheckMode,
+        coverage: PermissionSet,
+        action_class: ActionClass,
+    ) -> Self {
+        if mode == SecurityCheckMode::Authoritative {
+            self.has_authoritative_check = true;
+        }
+        self.security_checks
+            .push((check, mode, coverage, action_class));
+        self
+    }
+
+    /// Sets the host-configured ceilings the composed `SecurityCheckSet`
+    /// enforces. Defaults to [`EnforcementLimits::default`] when unset.
+    pub fn enforcement_limits(mut self, limits: EnforcementLimits) -> Self {
+        self.enforcement_limits = Some(limits);
+        self
+    }
+
+    /// Sets the security subject every request this runtime's executor
+    /// authorizes is attributed to. Every session this runtime starts shares
+    /// it; per-session/per-user subject distinction is registry-routing
+    /// work (`tasks.md` 2.3), not something this builder invents. Defaults
+    /// to a fixed placeholder subject when unset.
+    pub fn security_subject(mut self, subject: SecuritySubject) -> Self {
+        self.security_subject = Some(subject);
+        self
+    }
+
+    /// Sets the tenant every request this runtime's executor authorizes is
+    /// scoped to. Defaults to a fixed placeholder tenant when unset.
+    pub fn tenant(mut self, tenant: TenantId) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+
+    /// Opts into [`LegacyApprovalAuthority`], the shipped, named migration
+    /// aid that reproduces the pre-existing mandatory-approval behavior for
+    /// mutating, process-spawning, and network-effect tools without
+    /// expressing any new policy of its own. See that type's own doc
+    /// comment for exactly what it does and does not grant, and
+    /// [`RuntimeBuilder::build`]'s doc comment for why a host must call this
+    /// or register its own authoritative check.
+    pub fn legacy_approval_authority(mut self) -> Self {
+        self.legacy_approval_authority = true;
         self
     }
 
@@ -278,8 +360,20 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Builds the runtime, sealing the tool registry and applying fail-closed
-    /// defaults for any omitted services.
+    /// Builds the runtime, sealing the tool registry, sealing the composed
+    /// `SecurityCheckSet`, and applying fail-closed defaults for any omitted
+    /// services.
+    ///
+    /// Fails when any registered tool declares effects
+    /// [`agent_runtime_core::tool::ToolEffects::requires_authorization`] but
+    /// the host supplied neither an `Authoritative` check via
+    /// [`RuntimeBuilder::security_check`] nor
+    /// [`RuntimeBuilder::legacy_approval_authority`]. There is deliberately
+    /// no fallback: [`agent_runtime_core::check_set::SecurityCheckSet`] is
+    /// default-deny, so a runtime with no authoritative coverage would deny
+    /// every privileged tool call at first use rather than at build — the
+    /// same reasoning that already makes a missing model profile a build
+    /// failure above, not a guessed context window.
     pub fn build(self) -> Result<Runtime, RuntimeError> {
         let provider = self
             .provider
@@ -312,6 +406,48 @@ impl RuntimeBuilder {
             }
         };
 
+        let effectful_tools: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|tool| tool.effects().requires_authorization())
+            .map(|tool| tool.name().to_owned())
+            .collect();
+
+        let mut check_set_builder = SecurityCheckSetBuilder::new(
+            self.enforcement_limits.unwrap_or_default(),
+            self.clock.clone(),
+        );
+        let mut has_authoritative_check = self.has_authoritative_check;
+        for (check, mode, coverage, action_class) in self.security_checks {
+            check_set_builder.register(check, mode, coverage, action_class);
+        }
+        if self.legacy_approval_authority {
+            let compat = Arc::new(LegacyApprovalAuthority::new());
+            let coverage = compat.coverage().clone();
+            check_set_builder.register(
+                compat,
+                SecurityCheckMode::Authoritative,
+                coverage,
+                ActionClass::new("legacy-compat"),
+            );
+            has_authoritative_check = true;
+        }
+        if !effectful_tools.is_empty() && !has_authoritative_check {
+            return Err(RuntimeError::config(format!(
+                "tool(s) {effectful_tools:?} declare effects that require authorization \
+                 (a write, a process spawn, or network access), but no authoritative \
+                 SecurityCheck was registered and RuntimeBuilder::legacy_approval_authority() \
+                 was not called; register an authoritative check via \
+                 RuntimeBuilder::security_check(...), or opt into the shipped compatibility \
+                 check by calling RuntimeBuilder::legacy_approval_authority()"
+            )));
+        }
+        let security_check_set = Arc::new(
+            check_set_builder
+                .seal()
+                .map_err(|err| RuntimeError::config(err.to_string()))?,
+        );
+
         let mut registry = ToolRegistry::new();
         registry.register_all(self.tools)?;
         let registry = registry.seal();
@@ -320,6 +456,13 @@ impl RuntimeBuilder {
         let workspace = self.workspace.unwrap_or_else(|| Arc::new(DenyAllWorkspace));
 
         let config = Arc::new(self.config);
+        let security = SecurityConfig {
+            check_set: security_check_set,
+            subject: self
+                .security_subject
+                .unwrap_or_else(|| SecuritySubject::new("runtime")),
+            tenant: self.tenant.unwrap_or_else(|| TenantId::new("default")),
+        };
         let executor = ToolExecutor::new(
             registry.clone(),
             approval,
@@ -327,6 +470,7 @@ impl RuntimeBuilder {
             self.clock.clone(),
             config.output_limit,
             config.conflict_policy,
+            security,
         );
         // A profile already names its provider; fall back to it so a manifest
         // never records a placeholder the host never chose.
@@ -374,5 +518,156 @@ impl RuntimeBuilder {
             shutdown_timeout_ms: self.shutdown_timeout_ms,
         };
         Ok(Runtime::from_shared(Arc::new(shared)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_runtime_core::cancel::Cancellation;
+    use agent_runtime_core::catalog::ModelLimits;
+    use agent_runtime_core::grant::{
+        GrantConstraints, SecurityCheckId, SecurityCheckOutcome, SecurityCheckRevision,
+    };
+    use agent_runtime_core::security::AuthorizationRequest;
+    use agent_runtime_core::tool::{InvocationContext, ToolEffects, ToolOutcome};
+    use agent_runtime_provider::fake::FakeProvider;
+    use agent_runtime_registry::Permission;
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    fn profile() -> ResolvedModelProfile {
+        ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(128_000, 128_000, 4_096),
+        )
+    }
+
+    #[derive(Debug)]
+    struct MutatingTool;
+    #[async_trait]
+    impl Tool for MutatingTool {
+        fn name(&self) -> &str {
+            "mutate"
+        }
+        fn description(&self) -> &str {
+            "writes"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read_only().with_write("/ws/out")
+        }
+        async fn invoke(
+            &self,
+            _arguments: Value,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::text("wrote"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadOnlyTool;
+    #[async_trait]
+    impl Tool for ReadOnlyTool {
+        fn name(&self) -> &str {
+            "read"
+        }
+        fn description(&self) -> &str {
+            "reads"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read_only()
+        }
+        async fn invoke(
+            &self,
+            _arguments: Value,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::text("read"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct AlwaysAllowCheck {
+        id: SecurityCheckId,
+        revision: SecurityCheckRevision,
+    }
+    #[async_trait]
+    impl SecurityCheck for AlwaysAllowCheck {
+        fn id(&self) -> &SecurityCheckId {
+            &self.id
+        }
+        fn revision(&self) -> &SecurityCheckRevision {
+            &self.revision
+        }
+        async fn evaluate(
+            &self,
+            _request: &AuthorizationRequest,
+            _cancel: &Cancellation,
+        ) -> SecurityCheckOutcome {
+            SecurityCheckOutcome::Allow {
+                constraints: GrantConstraints::unconstrained(),
+            }
+        }
+    }
+
+    #[test]
+    fn build_fails_when_effectful_tools_have_no_authoritative_coverage() {
+        let err = RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .tool(Arc::new(MutatingTool))
+            .build()
+            .expect_err("an effectful tool with no authoritative coverage must fail to build");
+        assert!(err.message.contains("mutate"));
+        assert!(err.message.contains("legacy_approval_authority"));
+        assert!(err.message.contains("security_check"));
+    }
+
+    #[test]
+    fn build_succeeds_with_only_read_only_tools_and_no_security_check() {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .tool(Arc::new(ReadOnlyTool))
+            .build()
+            .expect("read-only tools need no authoritative coverage");
+    }
+
+    #[test]
+    fn build_succeeds_with_the_legacy_compatibility_opt_in() {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .tool(Arc::new(MutatingTool))
+            .legacy_approval_authority()
+            .build()
+            .expect("legacy_approval_authority() must satisfy the coverage gate");
+    }
+
+    #[test]
+    fn build_succeeds_with_a_host_registered_authoritative_check() {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .tool(Arc::new(MutatingTool))
+            .security_check(
+                Arc::new(AlwaysAllowCheck {
+                    id: SecurityCheckId::new("host-check"),
+                    revision: SecurityCheckRevision::new("v1"),
+                }),
+                SecurityCheckMode::Authoritative,
+                PermissionSet::single(Permission::FsWrite),
+                ActionClass::new("test"),
+            )
+            .build()
+            .expect("a host-registered authoritative check must satisfy the coverage gate");
     }
 }

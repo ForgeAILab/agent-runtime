@@ -47,6 +47,7 @@ pub fn build(
         .workspace(Arc::new(MemoryWorkspace::new("/data/workspace")))
         .tool(Arc::new(EchoTool))
         .tool(Arc::new(WriteTool::new("/data/workspace/out")))
+        .legacy_approval_authority()
         .observer(observer)
         .clock(Arc::new(SystemClock))
         .build()

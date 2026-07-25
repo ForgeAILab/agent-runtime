@@ -6,6 +6,7 @@
 //! `Err(RuntimeError)`; a tool that ran but reported a domain failure returns an
 //! `Ok` [`ToolOutcome`] with `is_error = true`.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -13,12 +14,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use agent_runtime_registry::Permission;
+
 use crate::cancel::Cancellation;
 use crate::clock::{Clock, Deadline};
 use crate::content::{ContentPart, ToolResultBlock};
 use crate::error::RuntimeError;
 use crate::ids::{RequestId, ToolCallId};
 use crate::provider::ToolSchema;
+use crate::security::{PermissionSet, SecurityResource};
 use crate::workspace::Workspace;
 
 /// A single declared side effect of a tool.
@@ -148,6 +152,89 @@ impl ToolEffects {
         self.write_scopes()
             .any(|a| other.write_scopes().any(|b| a == b))
     }
+
+    /// The permission set and resource this invocation's declared effects
+    /// require authorization for, given the concrete call name and the
+    /// workspace mount its write scopes are relative to.
+    ///
+    /// Only meaningful when [`ToolEffects::requires_authorization`] is
+    /// true — callers gate on that exactly as they already do for approval,
+    /// so a pure [`Effect::Read`] never reaches here and contributes
+    /// nothing when present alongside a requires-authorization effect.
+    ///
+    /// One [`crate::security::AuthorizationRequest`] carries exactly one
+    /// [`SecurityResource`], so when more than one resource-bearing effect
+    /// is declared, the first one found in `Write`, `SpawnProcess`,
+    /// `Network` order supplies the resource; the returned [`PermissionSet`]
+    /// still lists every permission every declared effect implies, so
+    /// composition denies the whole request unless each of them is
+    /// individually covered.
+    ///
+    /// - [`Effect::Write`] contributes [`Permission::FsWrite`], scoped to a
+    ///   filesystem resource under `mount` at the write scope's path
+    ///   segments (the scope's `mount` prefix, if present, is stripped
+    ///   before segmenting). Two or more declared write scopes collapse the
+    ///   resource to the mount root, since one resource cannot represent
+    ///   two disjoint scopes — the executor's own per-scope workspace check
+    ///   still validates every declared scope individually.
+    /// - [`Effect::SpawnProcess`] contributes [`Permission::ProcessSpawn`],
+    ///   scoped to a [`SecurityResource::Other`] resource keyed by
+    ///   `tool_name`: a process spawn has no path or endpoint of its own to
+    ///   scope to.
+    /// - [`Effect::Network`] contributes [`Permission::NetHttp`], scoped to
+    ///   a [`SecurityResource::Network`] resource with an empty origin,
+    ///   method, and segments. This is deliberately imprecise:
+    ///   [`Effect::Network`] is a bare unit variant carrying no endpoint
+    ///   (task 2.7b tracks adding one), so every network-effect tool
+    ///   authorizes against the same undifferentiated resource today; an
+    ///   authoritative check that wants to distinguish endpoints cannot yet
+    ///   do so from this resource alone.
+    ///
+    /// [`agent_runtime_registry::Permission`] also names `credential.use`,
+    /// `stdio.read`/`stdio.write`, `clock.read`, and `random.read`; no
+    /// [`Effect`] variant declares any of them today, so this mapping never
+    /// requests them — a tool that exercises that authority without a
+    /// declared effect for it is, by construction, underdeclared for it.
+    pub fn authorization_request(
+        &self,
+        tool_name: &str,
+        mount: &str,
+    ) -> (PermissionSet, SecurityResource) {
+        let mut permissions: BTreeSet<Permission> = BTreeSet::new();
+        let mut resource: Option<SecurityResource> = None;
+
+        let write_scopes: Vec<&WriteScope> = self.write_scopes().collect();
+        if !write_scopes.is_empty() {
+            permissions.insert(Permission::FsWrite);
+            resource.get_or_insert_with(|| match write_scopes.as_slice() {
+                [only] => filesystem_resource(mount, only.as_str()),
+                _ => SecurityResource::filesystem(mount, Vec::new()),
+            });
+        }
+        if self.spawns_process() {
+            permissions.insert(Permission::ProcessSpawn);
+            resource.get_or_insert_with(|| SecurityResource::other("process", tool_name));
+        }
+        if self.has_network() {
+            permissions.insert(Permission::NetHttp);
+            resource.get_or_insert_with(|| SecurityResource::network("", "", Vec::new()));
+        }
+
+        let resource = resource.unwrap_or_else(|| SecurityResource::other("tool", tool_name));
+        (permissions.into_iter().collect(), resource)
+    }
+}
+
+/// A filesystem resource under `mount` for `scope`'s path, relative to
+/// `mount` when `scope` carries it as a literal prefix.
+fn filesystem_resource(mount: &str, scope: &str) -> SecurityResource {
+    let relative = scope.strip_prefix(mount).unwrap_or(scope);
+    let segments = relative
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect();
+    SecurityResource::filesystem(mount, segments)
 }
 
 /// A tool's advertised specification.
@@ -389,6 +476,60 @@ mod tests {
         assert!(!ToolEffects::read_only().mutates());
         assert!(a.writes_overlap(&b));
         assert!(!a.writes_overlap(&c));
+    }
+
+    #[test]
+    fn write_effect_maps_to_fs_write_scoped_under_the_mount() {
+        let effects = ToolEffects::read_only().with_write("/ws/out/file.txt");
+        let (permissions, resource) = effects.authorization_request("write", "/ws");
+        assert_eq!(permissions, PermissionSet::single(Permission::FsWrite));
+        assert_eq!(
+            resource,
+            SecurityResource::filesystem("/ws", vec!["out".into(), "file.txt".into()])
+        );
+    }
+
+    #[test]
+    fn multiple_write_scopes_collapse_to_the_mount_root() {
+        let effects = ToolEffects::read_only()
+            .with_write("/ws/a")
+            .with_write("/ws/b");
+        let (permissions, resource) = effects.authorization_request("write", "/ws");
+        assert_eq!(permissions, PermissionSet::single(Permission::FsWrite));
+        assert_eq!(resource, SecurityResource::filesystem("/ws", Vec::new()));
+    }
+
+    #[test]
+    fn spawn_effect_maps_to_process_spawn_scoped_by_tool_name() {
+        let effects = ToolEffects::new(vec![]).with_spawn();
+        let (permissions, resource) = effects.authorization_request("shell", "/ws");
+        assert_eq!(permissions, PermissionSet::single(Permission::ProcessSpawn));
+        assert_eq!(resource, SecurityResource::other("process", "shell"));
+    }
+
+    #[test]
+    fn network_effect_maps_to_net_http_with_an_undifferentiated_resource() {
+        let effects = ToolEffects::new(vec![]).with_network();
+        let (permissions, resource) = effects.authorization_request("fetch", "/ws");
+        assert_eq!(permissions, PermissionSet::single(Permission::NetHttp));
+        assert_eq!(resource, SecurityResource::network("", "", Vec::new()));
+    }
+
+    #[test]
+    fn combined_effects_request_every_implied_permission() {
+        let effects = ToolEffects::read_only()
+            .with_write("/ws/out")
+            .with_spawn()
+            .with_network();
+        let (permissions, _resource) = effects.authorization_request("build", "/ws");
+        assert_eq!(
+            permissions,
+            PermissionSet::from_iter([
+                Permission::FsWrite,
+                Permission::ProcessSpawn,
+                Permission::NetHttp
+            ])
+        );
     }
 
     #[test]

@@ -61,6 +61,7 @@ pub fn build(
         .workspace(Arc::new(MemoryWorkspace::new(WORKSPACE_ROOT)))
         .tool(Arc::new(EchoTool))
         .tool(Arc::new(WriteTool::new("/forge/task/output")))
+        .legacy_approval_authority()
         .observer(observer)
         .clock(Arc::new(SystemClock))
         .build()

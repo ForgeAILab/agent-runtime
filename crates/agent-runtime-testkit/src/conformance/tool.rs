@@ -2,12 +2,16 @@
 
 use std::sync::Arc;
 
-use agent_runtime::tool::{ConflictPolicy, ToolExecutor, ToolRegistry};
+use agent_runtime::tool::{ConflictPolicy, SecurityConfig, ToolExecutor, ToolRegistry};
 use agent_runtime_core::approval::{AllowAll, DenyAll};
 use agent_runtime_core::cancel::Cancellation;
+use agent_runtime_core::check_set::{ActionClass, EnforcementLimits, SecurityCheckSetBuilder};
 use agent_runtime_core::clock::{Deadline, SystemClock};
+use agent_runtime_core::compat::LegacyApprovalAuthority;
 use agent_runtime_core::content::ToolCall;
-use agent_runtime_core::ids::{RequestId, ToolCallId};
+use agent_runtime_core::grant::SecurityCheckMode;
+use agent_runtime_core::ids::{RequestId, SessionId, TenantId, ToolCallId};
+use agent_runtime_core::security::SecuritySubject;
 
 use crate::tools::{EchoTool, WriteTool};
 use crate::workspace::MemoryWorkspace;
@@ -23,6 +27,27 @@ pub fn assert_registry_rejects_duplicates() {
     );
 }
 
+/// A composed check set registering only [`LegacyApprovalAuthority`] —
+/// reproduces the pre-authorization-layer posture these conformance
+/// assertions exercise: mutating tools still gate purely on the injected
+/// [`agent_runtime_core::approval::ApprovalPolicy`].
+fn security_config() -> SecurityConfig {
+    let mut builder =
+        SecurityCheckSetBuilder::new(EnforcementLimits::default(), Arc::new(SystemClock));
+    let compat = Arc::new(LegacyApprovalAuthority::new());
+    builder.register(
+        compat.clone(),
+        SecurityCheckMode::Authoritative,
+        compat.coverage().clone(),
+        ActionClass::new("conformance"),
+    );
+    SecurityConfig {
+        check_set: Arc::new(builder.seal().unwrap()),
+        subject: SecuritySubject::new("conformance-subject"),
+        tenant: TenantId::new("conformance-tenant"),
+    }
+}
+
 fn executor(approval: Arc<dyn agent_runtime_core::approval::ApprovalPolicy>) -> ToolExecutor {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(EchoTool)).unwrap();
@@ -34,6 +59,7 @@ fn executor(approval: Arc<dyn agent_runtime_core::approval::ApprovalPolicy>) -> 
         Arc::new(SystemClock),
         10_000,
         ConflictPolicy::ScopeOverlap,
+        security_config(),
     )
 }
 
@@ -52,6 +78,7 @@ pub async fn assert_fail_closed_without_approval() {
         .execute(
             &[write_call()],
             &RequestId::new("r"),
+            &SessionId::new("s1"),
             &Cancellation::new(),
             Deadline::never(),
         )
@@ -66,6 +93,7 @@ pub async fn assert_runs_when_approved() {
         .execute(
             &[write_call()],
             &RequestId::new("r"),
+            &SessionId::new("s1"),
             &Cancellation::new(),
             Deadline::never(),
         )

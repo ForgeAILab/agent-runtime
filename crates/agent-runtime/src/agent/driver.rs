@@ -382,7 +382,13 @@ impl Driver {
 
                     let results = self
                         .executor
-                        .execute(&tool_calls, &request_id, &turn_cancel, turn_deadline)
+                        .execute(
+                            &tool_calls,
+                            &request_id,
+                            emitter.session(),
+                            &turn_cancel,
+                            turn_deadline,
+                        )
                         .await;
 
                     for block in &results {

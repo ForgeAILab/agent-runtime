@@ -164,6 +164,6 @@ pub mod prelude {
         Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle, StartSession,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
-    pub use crate::tool::{SealedToolRegistry, ToolExecutor, ToolRegistry};
+    pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};
     pub use agent_runtime_core::prelude::*;
 }

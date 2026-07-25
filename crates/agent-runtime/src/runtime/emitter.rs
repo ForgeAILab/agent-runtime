@@ -60,6 +60,11 @@ impl EventEmitter {
         self.seq.load(Ordering::SeqCst)
     }
 
+    /// The session this emitter belongs to.
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
     /// Emits an event under `turn`, delivering it to observers and subscribers.
     pub fn emit(&self, turn: Option<TurnId>, payload: RuntimeEvent) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
