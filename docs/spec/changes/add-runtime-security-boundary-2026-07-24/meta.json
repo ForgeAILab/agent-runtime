@@ -1,0 +1,9 @@
+{
+  "change_id": "add-runtime-security-boundary",
+  "change_ref": "add-runtime-security-boundary-2026-07-24",
+  "created_at": "2026-07-24T23:07:10Z",
+  "updated_at": "2026-07-25T04:49:20Z",
+  "completed_at": null,
+  "status": "proposed",
+  "depends_on": ["add-registry-driven-context-runtime-2026-07-24"]
+}

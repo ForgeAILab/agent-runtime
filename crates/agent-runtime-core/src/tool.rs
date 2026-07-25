@@ -102,11 +102,32 @@ impl ToolEffects {
             .any(|e| matches!(e, Effect::Write { .. } | Effect::SpawnProcess))
     }
 
+    /// Whether invoking the tool exercises authority that must be authorized
+    /// before it runs: a write, a process spawn, or network I/O.
+    ///
+    /// Broader than [`mutates`](Self::mutates), which network-only tools pass
+    /// through undetected. Hosts that gated approval on `mutates()` will start
+    /// seeing approval requests for network-only tools that previously ran
+    /// unapproved; that is the intended fix, not a regression.
+    pub fn requires_authorization(&self) -> bool {
+        self.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::Write { .. } | Effect::SpawnProcess | Effect::Network
+            )
+        })
+    }
+
     /// Whether the tool spawns processes.
     pub fn spawns_process(&self) -> bool {
         self.effects
             .iter()
             .any(|e| matches!(e, Effect::SpawnProcess))
+    }
+
+    /// Whether the tool performs network I/O.
+    pub fn has_network(&self) -> bool {
+        self.effects.iter().any(|e| matches!(e, Effect::Network))
     }
 
     /// Whether the tool only reads (no writes, spawns, or network).
@@ -330,10 +351,12 @@ pub trait Tool: Send + Sync + fmt::Debug {
     /// The JSON schema of the tool's input.
     fn input_schema(&self) -> Value;
 
-    /// The declared effects. Defaults to read-only.
-    fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
-    }
+    /// The declared effects.
+    ///
+    /// Required, not defaulted: an implicit read-only default would let a
+    /// tool that forgot to declare its authority be silently treated as
+    /// harmless and skip approval.
+    fn effects(&self) -> ToolEffects;
 
     /// The advertised specification.
     fn spec(&self) -> ToolSpec {
@@ -366,6 +389,14 @@ mod tests {
         assert!(!ToolEffects::read_only().mutates());
         assert!(a.writes_overlap(&b));
         assert!(!a.writes_overlap(&c));
+    }
+
+    #[test]
+    fn network_only_effects_require_authorization_but_do_not_mutate() {
+        let network = ToolEffects::read_only().with_network();
+        assert!(!network.mutates());
+        assert!(network.requires_authorization());
+        assert!(!ToolEffects::read_only().requires_authorization());
     }
 
     #[test]

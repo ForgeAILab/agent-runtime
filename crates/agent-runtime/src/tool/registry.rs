@@ -156,7 +156,7 @@ impl SealedToolRegistry {
 mod tests {
     use super::*;
     use agent_runtime_core::error::ErrorKind;
-    use agent_runtime_core::tool::{InvocationContext, ToolOutcome};
+    use agent_runtime_core::tool::{InvocationContext, ToolEffects, ToolOutcome};
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
@@ -172,6 +172,9 @@ mod tests {
         }
         fn input_schema(&self) -> Value {
             json!({"type": "object"})
+        }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read_only()
         }
         async fn invoke(
             &self,

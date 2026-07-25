@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use serde_json::Value;
 
 use agent_runtime_context::budget::ContextError;
 use agent_runtime_context::cache::CachePlan;
@@ -32,6 +33,7 @@ use agent_runtime_core::provider::{
 };
 use agent_runtime_core::store::TurnManifest;
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
+use agent_runtime_registry::Fingerprint;
 
 use crate::agent::assembler::ToolCallAssembler;
 use crate::agent::config::LoopConfig;
@@ -53,6 +55,16 @@ fn segment_totals(plan: &ContextPlan) -> std::collections::BTreeMap<SegmentKind,
             .or_insert(0u32) += segment.tokens;
     }
     totals
+}
+
+/// The top-level key names of validated tool-call arguments, sorted
+/// (`serde_json::Value`'s object map is already key-sorted). Never the
+/// values — see [`RuntimeEvent::ToolCallRequested`].
+fn argument_keys(arguments: &Value) -> Vec<String> {
+    arguments
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Maps the context crate's confidence onto core's event vocabulary. They are
@@ -356,7 +368,14 @@ impl Driver {
                             RuntimeEvent::ToolCallRequested {
                                 call: call.id.clone(),
                                 name: call.name.clone(),
-                                arguments: call.arguments.clone(),
+                                argument_keys: argument_keys(&call.arguments),
+                                argument_fingerprint: Fingerprint::of(
+                                    serde_json::to_vec(&call.arguments).unwrap_or_default(),
+                                ),
+                                arguments: self
+                                    .config
+                                    .emit_raw_tool_arguments
+                                    .then(|| call.arguments.clone()),
                             },
                         );
                     }
@@ -408,10 +427,10 @@ impl Driver {
     ///
     /// The plan is the sole authority: everything the request carries was
     /// counted against the model's budget first, and the loop has no path that
-    /// appends to a request afterwards. Sampling, reasoning, and output limits
-    /// are request *options* rather than context, so they are applied on top of
-    /// the plan's messages and tools without adding anything the plan did not
-    /// account for.
+    /// appends to a request afterwards. Sampling, reasoning, structured output,
+    /// and output limits are request *options* rather than context, so they are
+    /// applied on top of the plan's messages and tools without adding anything
+    /// the plan did not account for.
     fn build_request(
         &self,
         history: &[Message],
@@ -466,6 +485,7 @@ impl Driver {
         let mut request = plan.to_provider_request(self.config.model.clone());
         request.sampling = self.config.sampling.clone();
         request.reasoning = self.config.reasoning.clone();
+        request.structured_output = self.config.structured_output.clone();
         request.max_output_tokens = self.config.max_output_tokens;
         Ok(request)
     }

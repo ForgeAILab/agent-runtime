@@ -4,7 +4,7 @@
 //! wording, workflow rules) is expressed only through the host-supplied
 //! `system_prompt` text and injected adapters — the loop hard-codes none of it.
 
-use agent_runtime_core::provider::{ModelId, ReasoningConfig, Sampling};
+use agent_runtime_core::provider::{ModelId, ReasoningConfig, Sampling, StructuredOutputConfig};
 
 use crate::provider::retry::RetryPolicy;
 use crate::tool::scheduler::ConflictPolicy;
@@ -58,6 +58,10 @@ pub struct LoopConfig {
     pub output_limit: usize,
     /// Reasoning configuration for the request.
     pub reasoning: Option<ReasoningConfig>,
+    /// Structured-output configuration for the request. A model that cannot
+    /// satisfy it either fails before network I/O or is downgraded per
+    /// [`LoopConfig::downgrade`].
+    pub structured_output: Option<StructuredOutputConfig>,
     /// Maximum output tokens per attempt.
     pub max_output_tokens: Option<u32>,
     /// Sampling parameters.
@@ -66,6 +70,12 @@ pub struct LoopConfig {
     pub conflict_policy: ConflictPolicy,
     /// Which unsupported capabilities may be downgraded.
     pub downgrade: DowngradePolicy,
+    /// Whether tool-call arguments are emitted verbatim on
+    /// [`agent_runtime_core::event::RuntimeEvent::ToolCallRequested`].
+    /// Arguments may echo secrets a model was induced to reveal or values
+    /// sourced from host configuration, so the event carries only argument
+    /// key names and a content fingerprint unless a host opts in here.
+    pub emit_raw_tool_arguments: bool,
 }
 
 impl LoopConfig {
@@ -80,10 +90,12 @@ impl LoopConfig {
             attempt_time_limit_ms: None,
             output_limit: 100_000,
             reasoning: None,
+            structured_output: None,
             max_output_tokens: None,
             sampling: Sampling::default(),
             conflict_policy: ConflictPolicy::ScopeOverlap,
             downgrade: DowngradePolicy::strict(),
+            emit_raw_tool_arguments: false,
         }
     }
 }

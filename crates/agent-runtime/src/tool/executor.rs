@@ -9,13 +9,15 @@
 //! errors all become canonical error [`ToolResultBlock`]s so the model always
 //! receives a result for every call it made.
 
+use std::future::pending;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::future::join_all;
 
 use agent_runtime_core::approval::{ApprovalPolicy, ApprovalRequest};
 use agent_runtime_core::cancel::Cancellation;
-use agent_runtime_core::clock::{Clock, Deadline};
+use agent_runtime_core::clock::{Clock, Deadline, SystemClock};
 use agent_runtime_core::content::{ToolCall, ToolResultBlock};
 use agent_runtime_core::ids::RequestId;
 use agent_runtime_core::tool::{InvocationContext, Tool, ToolEffects};
@@ -126,7 +128,7 @@ impl ToolExecutor {
         let effects = tool.effects();
 
         // Fail-closed approval + workspace enforcement before any side effect.
-        if effects.mutates() {
+        if effects.requires_authorization() {
             let approval_request = ApprovalRequest {
                 call_id: call.id.clone(),
                 tool: call.name.clone(),
@@ -170,7 +172,22 @@ impl ToolExecutor {
             output_limit: self.output_limit,
         };
 
-        match tool.invoke(call.arguments.clone(), &ctx).await {
+        let outcome = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return error_block(call, "cancelled while tool was running", self.output_limit);
+            }
+            _ = wait_for_deadline(deadline) => {
+                return error_block(
+                    call,
+                    "deadline elapsed while tool was running",
+                    self.output_limit,
+                );
+            }
+            result = tool.invoke(call.arguments.clone(), &ctx) => result,
+        };
+
+        match outcome {
             Ok(outcome) => {
                 outcome.into_result_block(call.id.clone(), call.name.clone(), self.output_limit)
             }
@@ -180,6 +197,14 @@ impl ToolExecutor {
                 block
             }
         }
+    }
+}
+
+async fn wait_for_deadline(deadline: Deadline) {
+    match deadline.remaining_millis(&SystemClock) {
+        Some(0) => {}
+        Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+        None => pending::<()>().await,
     }
 }
 
@@ -221,12 +246,68 @@ mod tests {
         fn input_schema(&self) -> Value {
             json!({"type":"object"})
         }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read_only()
+        }
         async fn invoke(
             &self,
             arguments: Value,
             _ctx: &InvocationContext,
         ) -> Result<ToolOutcome, RuntimeError> {
             Ok(ToolOutcome::json(arguments))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NetworkTool;
+    #[async_trait]
+    impl Tool for NetworkTool {
+        fn name(&self) -> &str {
+            "network"
+        }
+        fn description(&self) -> &str {
+            "performs network I/O"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::new(vec![]).with_network()
+        }
+        async fn invoke(
+            &self,
+            _arguments: Value,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::text("fetched"))
+        }
+    }
+
+    /// Ignores `should_stop()` entirely; only the executor's cancel/deadline
+    /// preemption can end it.
+    #[derive(Debug)]
+    struct HangingTool;
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hang"
+        }
+        fn description(&self) -> &str {
+            "never returns"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read_only()
+        }
+        async fn invoke(
+            &self,
+            _arguments: Value,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            unreachable!("preempted before the sleep elapses")
         }
     }
 
@@ -269,6 +350,9 @@ mod tests {
         fn input_schema(&self) -> Value {
             json!({"type":"object"})
         }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read_only()
+        }
         async fn invoke(
             &self,
             _arguments: Value,
@@ -294,6 +378,8 @@ mod tests {
         reg.register(Arc::new(EchoTool)).unwrap();
         reg.register(Arc::new(WriteTool)).unwrap();
         reg.register(Arc::new(LargeErrorTool)).unwrap();
+        reg.register(Arc::new(NetworkTool)).unwrap();
+        reg.register(Arc::new(HangingTool)).unwrap();
         reg.seal()
     }
 
@@ -428,5 +514,91 @@ mod tests {
         let text = out[0].content[0].as_text().unwrap();
         assert!(out[0].is_error);
         assert_eq!(text.chars().count(), 20);
+    }
+
+    #[tokio::test]
+    async fn network_only_tool_requires_approval() {
+        let ex = ToolExecutor::new(
+            registry(),
+            Arc::new(DenyAll),
+            Arc::new(WsRoot),
+            Arc::new(SystemClock),
+            10_000,
+            ConflictPolicy::ScopeOverlap,
+        );
+        let calls = vec![call("network", "c1", json!({}))];
+        let out = ex
+            .execute(
+                &calls,
+                &RequestId::new("r"),
+                &Cancellation::new(),
+                Deadline::never(),
+            )
+            .await;
+        assert!(out[0].is_error);
+        assert!(
+            out[0].content[0]
+                .as_text()
+                .unwrap()
+                .contains("approval denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_tool_that_ignores_should_stop_is_terminated_at_deadline() {
+        let ex = ToolExecutor::new(
+            registry(),
+            Arc::new(AllowAll),
+            Arc::new(WsRoot),
+            Arc::new(SystemClock),
+            10_000,
+            ConflictPolicy::ScopeOverlap,
+        );
+        let calls = vec![call("hang", "c1", json!({}))];
+        let out = tokio::time::timeout(
+            Duration::from_millis(2_000),
+            ex.execute(
+                &calls,
+                &RequestId::new("r"),
+                &Cancellation::new(),
+                Deadline::after(&SystemClock, 30),
+            ),
+        )
+        .await
+        .expect("deadline must preempt a tool that ignores should_stop()");
+        assert!(out[0].is_error);
+        assert!(
+            out[0].content[0]
+                .as_text()
+                .unwrap()
+                .contains("deadline elapsed")
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_tool_that_ignores_cancellation_is_terminated_on_cancel() {
+        let ex = ToolExecutor::new(
+            registry(),
+            Arc::new(AllowAll),
+            Arc::new(WsRoot),
+            Arc::new(SystemClock),
+            10_000,
+            ConflictPolicy::ScopeOverlap,
+        );
+        let calls = vec![call("hang", "c1", json!({}))];
+        let cancel = Cancellation::new();
+        let request = RequestId::new("r");
+        let run = ex.execute(&calls, &request, &cancel, Deadline::never());
+        let trigger = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            cancel.cancel(agent_runtime_core::cancel::CancelReason::UserRequested);
+        };
+        let (out, ()) = tokio::time::timeout(Duration::from_millis(2_000), async {
+            tokio::join!(run, trigger)
+        })
+        .await
+        .expect("cancellation must preempt a tool that ignores should_stop()");
+        assert!(out[0].is_error);
+        assert!(out[0].content[0].as_text().unwrap().contains("cancelled"));
     }
 }

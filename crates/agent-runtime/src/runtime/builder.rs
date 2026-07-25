@@ -16,7 +16,7 @@ use agent_runtime_core::catalog::{ModelCatalog, ResolvedModelProfile};
 use agent_runtime_core::clock::{Clock, SystemClock};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::observer::EventObserver;
-use agent_runtime_core::provider::{ModelId, Provider, ReasoningConfig};
+use agent_runtime_core::provider::{ModelId, Provider, ReasoningConfig, StructuredOutputConfig};
 use agent_runtime_core::store::{SecretStore, SessionStore};
 use agent_runtime_core::tool::Tool;
 use agent_runtime_core::workspace::{DenyAllWorkspace, Workspace};
@@ -230,6 +230,21 @@ impl RuntimeBuilder {
     /// Sets the reasoning configuration.
     pub fn reasoning(mut self, reasoning: ReasoningConfig) -> Self {
         self.config.reasoning = Some(reasoning);
+        self
+    }
+
+    /// Sets the structured-output configuration.
+    pub fn structured_output(mut self, structured_output: StructuredOutputConfig) -> Self {
+        self.config.structured_output = Some(structured_output);
+        self
+    }
+
+    /// Opts into emitting tool-call arguments verbatim on
+    /// [`agent_runtime_core::event::RuntimeEvent::ToolCallRequested`]. Off by
+    /// default: arguments may echo secrets or host-configured values, so only
+    /// argument key names and a content fingerprint are emitted otherwise.
+    pub fn emit_raw_tool_arguments(mut self, emit: bool) -> Self {
+        self.config.emit_raw_tool_arguments = emit;
         self
     }
 
