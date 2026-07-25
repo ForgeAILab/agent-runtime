@@ -1,6 +1,6 @@
 ---
 created_at: 2026-07-24T23:07:10Z
-updated_at: 2026-07-25T04:49:20Z
+updated_at: 2026-07-25T10:30:00Z
 completed_at:
 ---
 
@@ -52,9 +52,24 @@ phases:
 
 ## Phase A — Grafts onto the existing architecture (ungated)
 
+**Section 1 status (commits `ebf130e`, `1916d40` on `feat/security-boundary-phase-a`):**
+contract-and-composer complete — the security vocabulary, `SecurityContext`/
+`AuthorizationRequest`, `CapabilityGrant`, and the runtime-owned
+`SecurityCheckSet` composer all exist in `agent-runtime-core`/
+`agent-runtime-registry` with 121 passing unit tests, but **nothing in the
+executor, driver, or builder calls any of it yet** — `SecurityCheckSet`,
+`CapabilityGrant`, and `AuthorizationRequest` have zero references outside
+`agent-runtime-core` (`crates/agent-runtime/src`,
+`crates/agent-runtime-provider/src`, `crates/agent-runtime-ability/src` all
+grep clean for them). A ticked box in Section 1 below means the type or
+composition rule exists and is tested in isolation, never that enforcement is
+active. Task 2.4b is the first task that routes a real gating decision
+through the composed `SecurityCheckSet`, ahead of `ApprovalPolicy` — that is
+what makes Section 1 live.
+
 ### 1. Security Contracts
 
-- [ ] 1.1 Add `SecuritySubject`, `SecurityContext` (including `tenant`),
+- [x] 1.1a Add `SecuritySubject`, `SecurityContext` (including `tenant`),
   typed `Permission` and `SecurityResource` types, `AuthorizationRequest`
   (including prepared `SecurityEvidence`: trust-class join, content-guard
   digest, per-argument taint attribution), `SecurityCheckMode`,
@@ -64,28 +79,162 @@ phases:
   core. `SecurityCheckMode` and a check's permission coverage are host-assigned
   at the registration call site, not fields the check implementation supplies
   authoritatively.
-- [ ] 1.2 Implement a runtime-owned `SecurityCheckSet` that validates stable
+  _(Verified: `crates/agent-runtime-registry/src/security.rs` defines
+  `Permission`/`TrustClass`/`ArtifactKind`/`IsolationProfileId` as
+  dependency-free vocabulary, each with an `Other(Cow<'static, str>)` variant
+  that a unit test proves never compares equal to a known variant even with
+  the same rendered name. `crates/agent-runtime-core/src/security.rs` adds
+  `SecuritySubject`, `SecurityContext` (with a `tenant: TenantId` field,
+  distinct from the optional `workspace`), `SecurityResource`,
+  `SecurityEvidence` (`trust_join`, `content_guard_digest`,
+  `argument_taint: BTreeMap<ArgumentPath, TaintSource>`), and
+  `AuthorizationRequest`. `CheckSetRevision` (security.rs) is a distinct
+  newtype from `RegistryRevision`, with a doc comment explaining why the two
+  must not be unified. `crates/agent-runtime-core/src/grant.rs` adds
+  `DecisionCode` (`#[non_exhaustive]`, stable slugged variants plus `Other`),
+  `SecurityCheckMode`, `SecurityCheckOutcome`, `AuthorizationDecision`, and
+  `CapabilityGrant`: private fields, no `Serialize`/`Deserialize` derive, a
+  `pub(crate)` `issue` constructor, and no `Clone` impl (its use-count
+  bookkeeping is an interior `AtomicU32`) — so a grant cannot be built from a
+  struct literal, deserialized from guest-reachable bytes, or duplicated. The
+  `SecurityCheck` trait (grant.rs) has no `mode()` method by design — its doc
+  comment states mode and coverage are host-assigned at registration, never
+  read from the check — matching the task's own last sentence exactly. All
+  121 tests in `agent-runtime-core`'s lib target pass
+  (`cargo test -p agent-runtime-core --lib`).)_
+- [ ] 1.1b Add the guest-facing opaque handle table this task's own code
+  explicitly defers: guest handle → grant resolution scoped to exactly one
+  isolation invocation, invocation-scoped issuance, and teardown that
+  destroys host-side resources so a handle presented after teardown resolves
+  to nothing (security-enforcement's "Bounded capability grants": "Guest-
+  facing references to a grant SHALL be opaque backend handles resolved
+  through a host-owned table scoped to exactly one invocation"; see also the
+  "opaque grant handle is presented outside its invocation" scenario in
+  `specs/security-enforcement/spec.md`). `CapabilityGrant`'s own doc comment
+  in `crates/agent-runtime-core/src/grant.rs` states this precisely: "What
+  this task does **not** build is the host-owned, per-invocation opaque-
+  handle table... That is a stateful runtime component, not a type, and is
+  left to the task that wires isolation invocations together." No task in
+  this file currently claims that work explicitly; the closest candidate is
+  4.3 (the Wasmtime backend's "fresh per-invocation stores"), since a
+  per-invocation handle table is naturally scoped to the same lifetime a
+  fresh store is. Whoever picks up Section 4 in detail should either fold
+  this into 4.3 or give it its own task number.
+- [x] 1.2 Implement a runtime-owned `SecurityCheckSet` that validates stable
   check identities/revisions and composes authoritative, required-constraint,
   and advisory checks with deny-wins, **per-permission** authoritative
   coverage (not per action/resource as a whole), a **per-dimension
   constraint-meet algebra** (unconstrained dimensions default to top, an empty
   meet on any dimension denies), approval-preservation, and
   mandatory-authoritative-coverage semantics.
-- [ ] 1.3 Add fail-closed defaults and validate that unknown permissions,
+  _(Verified: `crates/agent-runtime-core/src/check_set.rs`'s
+  `SecurityCheckSetBuilder`/`SecurityCheckSet` seals registrations into a
+  `BTreeMap` and its `compose()` method implements deny-wins
+  (`an_enforcing_deny_wins_over_an_allow`), per-permission coverage tracked
+  via separate `known`/`covered` sets per requested permission
+  (`partial_permission_coverage_denies_the_whole_request`), the
+  `GrantConstraints::meet` per-dimension algebra in `grant.rs` (`Top` is the
+  identity/default, `Bottom` is absorbing —
+  `two_authoritative_checks_with_conflicting_constraints_deny`,
+  `empty_meet_on_any_dimension_denies`), approval preservation
+  (`require_approval_when_an_enforcing_check_requires_it`), and
+  mandatory-authoritative-coverage
+  (`only_advisory_checks_denies_for_missing_coverage`). Note: the module's
+  own doc comment lists three items explicitly out of scope for this task —
+  resource-scope narrowing onto the issued grant, seal-time rejection of an
+  action class with no authoritative coverage (left as an evaluation-time
+  denial instead), and manifest recording of `EnforcementLimits` (task
+  7.2) — none of which the task's own wording above promises.)_
+- [x] 1.3 Add fail-closed defaults and validate that unknown permissions,
   missing authoritative coverage, enforcing-check error/timeout, stale revision,
   wrong subject/resource, and grant replay all deny without side effects.
-- [ ] 1.4 Separate hard authorization from interactive approval and prove that
+  _(Verified, each clause has a passing test: unknown permission —
+  `unknown_permission_denies`; missing authoritative coverage —
+  `partial_permission_coverage_denies_the_whole_request`; enforcing-check
+  error/timeout — `a_panicking_check_denies_without_poisoning_composer_state`
+  and `required_constraint_timeout_denies_while_advisory_timeout_is_recorded_only`;
+  stale revision — `stale_check_set_revision_denies_without_evaluating_checks`;
+  wrong subject/resource — `present_denies_a_different_subject`,
+  `present_denies_a_different_resource`, and `grant.rs`'s
+  `covers_rejects_a_different_subject`/`covers_rejects_a_different_session`/
+  `covers_rejects_a_different_resource`; grant replay —
+  `grant_use_count_exhaustion_denies_the_second_presentation` (present in both
+  `grant.rs` and `check_set.rs`). "Without side effects" is structural, not
+  just tested: `CapabilityGrant::consume` (`grant.rs`) is `pub(crate)` and its
+  doc comment states it is "never [called] by `covers` itself, which must not
+  consume or alter a grant on a failed check" — `SecurityCheckSet::present`
+  checks every clause (revocation, subject/session/action, resource
+  containment, permission coverage, check-set revision, policy-epoch
+  currency, expiry) before calling `consume`, so a failed clause returns
+  early and never reaches it.)_
+- [x] 1.4 Separate hard authorization from interactive approval and prove that
   approval cannot widen an eligible grant or override a hard denial.
-- [ ] 1.5 Define engine-neutral `IsolationBackend`, `IsolationProfile`,
+  _(Verified: `check_set.rs`'s module doc comment section "Authorization is
+  separate from approval" states this module "never references
+  [`crate::approval::ApprovalPolicy`]" — composed evaluation stops at
+  `AuthorizationDecision::RequireApproval`, and a caller that wants approval
+  consults `ApprovalPolicy` itself, then reports the result back through
+  `SecurityCheckSet::resolve_approval(eligible: CapabilityGrant, approved:
+  bool)`. That signature is itself the proof of "cannot widen": it takes
+  ownership of the exact grant composition already produced plus a plain
+  `bool`, with no parameter through which a wider resource, permission, or
+  subject could enter. Test `resolve_approval_cannot_widen_the_eligible_grant`
+  exercises this end to end (denial leaves `remaining_uses` unchanged; a
+  second, independent composition proves no channel exists to mutate the
+  sealed check set or a later grant's scope). Test
+  `approval_cannot_override_an_enforcing_denial` proves a `RequireApproval`
+  outcome from one check never survives an `EnforcingCheckDenied` from
+  another — composition denies before approval is ever reached. Boundary
+  worth recording: this composer's "authorization" is deliberately not the
+  same call as "approval" — the composer only ever returns `RequireApproval`
+  and it is the *caller's* job to invoke `ApprovalPolicy` and report back;
+  nothing in this repository's production code does that yet (see the Phase
+  A status note above).)_
+- [x] 1.5 Define engine-neutral `IsolationBackend`, `IsolationProfile`,
   `IsolationInvocation`, `CredentialBroker`, `EgressBroker`,
   `FilesystemBroker`, `LeakDetector`, and `ContentGuard` contracts without
   consumer-domain types.
-- [ ] 1.6 Reject duplicate/ambiguous check registrations and add
+  _(Verified, and CONTRACTS ONLY — no backend, broker, or guard
+  implementation exists, and none of this is wired into the executor, driver,
+  or builder: `crates/agent-runtime-core/src/isolation.rs`'s own module doc
+  states "This module defines contracts only: no backend, no WASM engine, and
+  no wiring into the executor, driver, or builder"; `broker.rs`'s module doc
+  states "None of them is implemented in this crate"; `guard.rs`'s states
+  "Neither trait is implemented here". All eight named traits/types exist:
+  `IsolationBackend`/`IsolationProfile`/`IsolationInvocation` (isolation.rs),
+  `CredentialBroker`/`EgressBroker`/`FilesystemBroker` (broker.rs), and
+  `LeakDetector`/`ContentGuard` (guard.rs), none depending on a
+  consumer-domain crate — `broker.rs`'s `EgressBroker` doc comment notes it
+  "depends on no HTTP client or URL parsing crate". Implementing a conforming
+  backend is Section 4 (Wasmtime/WASIp2), and implementing the brokers
+  themselves is Sections 9–11 (filesystem, egress, credential injection) —
+  none of which have landed. Do not read this tick as isolation being usable
+  by a tool today.)_
+- [x] 1.6 Reject duplicate/ambiguous check registrations and add
   order-independence (including a permutation property test proving the
   per-dimension constraint meet is commutative/associative regardless of
   registration or completion order), no-authorizer, conflicting-constraint,
   required-failure, advisory-failure, and approval-composition tests.
-- [ ] 1.7 Implement policy epochs (composed check-set revision plus each
+  _(Verified: duplicate/ambiguous registration —
+  `duplicate_check_id_is_rejected_even_with_a_different_revision` (rejects
+  the same id even at a different revision, closing the "revision ambiguity"
+  gap by construction) and `action_class_ceiling_is_enforced_at_seal`.
+  Order-independence — `composition_is_identical_across_registration_order_permutations`
+  (registration order) plus `grant.rs`'s
+  `constraint_value_meet_is_commutative`,
+  `constraint_value_meet_is_associative`,
+  `constraint_value_meet_is_order_independent_under_every_permutation`, and
+  `grant_constraints_meet_is_order_independent_across_permuted_check_orderings`
+  (the permutation property tests). No-authorizer —
+  `only_advisory_checks_denies_for_missing_coverage` (no authoritative check
+  registered at all). Conflicting-constraint —
+  `two_authoritative_checks_with_conflicting_constraints_deny`.
+  Required-failure/advisory-failure — both halves of
+  `required_constraint_timeout_denies_while_advisory_timeout_is_recorded_only`.
+  Approval-composition — `require_approval_when_an_enforcing_check_requires_it`,
+  `resolve_approval_cannot_widen_the_eligible_grant`,
+  `approval_cannot_override_an_enforcing_denial`.)_
+- [x] 1.7 Implement policy epochs (composed check-set revision plus each
   contributing authoritative/required-constraint check's declared
   policy-data revision) and an explicit revoke operation addressable by
   security subject, session, or grant id, with a bounded maximum revocation
@@ -93,13 +242,49 @@ phases:
   that a policy-data revision change invalidates a grant without a check-set
   revision change (security-enforcement's "Grant revocation and policy
   epochs").
-- [ ] 1.8 Enforce the host-configured ceilings from security-enforcement's
+  _(Verified: `PolicyEpoch` (`grant.rs`) carries `check_set_revision` plus
+  `policy_data_revisions: BTreeMap<SecurityCheckId, SecurityCheckRevision>`.
+  `check_set.rs`'s `RevocationTarget` enum addresses `Subject`/`Session`/
+  `Grant(Fingerprint)`; `SecurityCheckSet::revoke`/`is_revoked` implement it.
+  Tests `revoked_but_unexpired_and_unconsumed_grant_is_denied`,
+  `revoke_by_session_denies_presentation`, and
+  `revoke_by_grant_fingerprint_denies_only_that_grant` match the task's exact
+  wording. `policy_data_revision_change_invalidates_a_grant_without_a_check_set_change`
+  proves the second required property, asserting `set.revision()` is
+  unchanged while `present()` now returns `GrantRevisionOrEpochStale`. The
+  revocation-latency bound is precise, not a timer: `check_set.rs`'s module
+  doc states "There is no epoch-tick interval to configure or wait out: the
+  maximum revocation latency is the time until the grant is next presented"
+  — `SecurityCheckSet::present` independently recomputes
+  `current_policy_epoch()` and checks the revocation record on every call, so
+  the bound this task delivers is "next presentation", not a background tick
+  or polling interval.)_
+- [x] 1.8 Enforce the host-configured ceilings from security-enforcement's
   "Bounded enforcement path" (registered checks per action class, per-session
   authorization request rate, concurrent check evaluations, retained advisory
   signal volume), catch a panicking check at its boundary without poisoning
   shared composer state or aborting the session, and short-circuit a check
   that exceeds a consecutive-failure threshold to a structural fast-path deny
   for a configured window without invoking its body.
+  _(Verified: `EnforcementLimits` (`check_set.rs`) declares all four
+  ceilings; each has a passing test —
+  `action_class_ceiling_is_enforced_at_seal`,
+  `per_session_authorization_rate_ceiling_denies_structurally` (including
+  that the rolling window resets after it elapses),
+  `concurrent_check_evaluations_are_bounded_by_the_ceiling`, and
+  `advisory_signal_retention_is_bounded_per_session`. Panic containment —
+  `a_panicking_check_denies_without_poisoning_composer_state` proves an
+  unrelated request against the same sealed `SecurityCheckSet` still succeeds
+  after a check panics; the module doc comment explains why structurally: a
+  panicking check's future is driven through
+  `AssertUnwindSafe(..).catch_unwind()` and no lock is ever held across an
+  `.await`, so no shared state can be poisoned. Consecutive-failure
+  fast-path — `a_check_exceeding_the_failure_threshold_short_circuits_without_invoking_its_body`
+  proves the check's own body is not invoked (`invocations` counter stays at
+  3) on the call that trips the fast path. Not covered by this task's own
+  wording, and not tested here: recording each ceiling value in the run
+  manifest, which is security-enforcement's own separate scenario and is
+  explicitly deferred to task 7.2 per the module doc comment.)_
 
 ### 2. Tool and Capability Enforcement
 
