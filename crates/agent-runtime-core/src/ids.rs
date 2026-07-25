@@ -69,6 +69,10 @@ neutral_id!(
     SessionId
 );
 neutral_id!(
+    /// Identifies the tenant a session is scoped to.
+    TenantId
+);
+neutral_id!(
     /// Identifies one turn (one host input and the work it triggers) inside a session.
     TurnId
 );

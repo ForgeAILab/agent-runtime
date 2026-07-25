@@ -18,6 +18,7 @@
 //! - [`store::SessionStore`] / [`store::SecretStore`] — persistence and secrets.
 //! - [`observer::EventObserver`] — a synchronous event sink.
 //! - [`clock::Clock`] — injectable time.
+//! - [`grant::SecurityCheck`] — a registered security check.
 #![forbid(unsafe_code)]
 
 pub mod approval;
@@ -27,11 +28,13 @@ pub mod clock;
 pub mod content;
 pub mod error;
 pub mod event;
+pub mod grant;
 pub mod ids;
 pub mod manifest;
 pub mod metadata;
 pub mod observer;
 pub mod provider;
+pub mod security;
 pub mod store;
 pub mod tool;
 pub mod usage;
@@ -50,7 +53,12 @@ pub mod prelude {
         BudgetCategory, CompactionReason, EstimationConfidence, EventEnvelope, LimitKind,
         RuntimeEvent, SCHEMA_VERSION, TurnFinish,
     };
-    pub use crate::ids::{AttemptId, EventId, RequestId, SessionId, ToolCallId, TurnId};
+    pub use crate::grant::{
+        AuthorizationDecision, CapabilityGrant, ConstraintDimension, ConstraintValue, DecisionCode,
+        GrantConstraints, PolicyEpoch, SecurityCheck, SecurityCheckId, SecurityCheckMode,
+        SecurityCheckOutcome, SecurityCheckRevision, SecuritySignal,
+    };
+    pub use crate::ids::{AttemptId, EventId, RequestId, SessionId, TenantId, ToolCallId, TurnId};
     pub use crate::manifest::{
         ActivatedCapability, CapabilityResolution, ContextSegmentRecord, MANIFEST_SCHEMA_VERSION,
         ManifestReason, ModelResolution, PolicyRevisions, ReplayMismatch, ReplayMode,
@@ -63,6 +71,10 @@ pub mod prelude {
         ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
         ProviderStreamEvent, ReasoningConfig, ReasoningSupport, Sampling, ToolChoice, ToolSchema,
         UnsupportedFeature,
+    };
+    pub use crate::security::{
+        ArgumentPath, AuthorizationRequest, CheckSetRevision, PermissionSet, SecurityAction,
+        SecurityContext, SecurityEvidence, SecurityResource, SecuritySubject, TaintSource,
     };
     pub use crate::store::{Secret, SecretStore, SessionSnapshot, SessionStore, TurnManifest};
     pub use crate::tool::{
