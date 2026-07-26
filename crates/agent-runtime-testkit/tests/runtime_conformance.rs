@@ -512,7 +512,8 @@ async fn events_are_versioned_and_roundtrip() {
     let session = runtime.start_session(StartSession::new()).await.unwrap();
     session.run(UserInput::text("hi")).await;
     event_schema::assert_versioned_and_roundtrips(&observer.events());
-    event_schema::assert_v1_golden_fixture();
+    event_schema::assert_v3_golden_fixture();
+    event_schema::assert_v1_fixture_rejected_by_current_schema();
 }
 
 // runtime-api: "Two hosts run the same fixture" — canonical event sequences are

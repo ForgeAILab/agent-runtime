@@ -14,6 +14,9 @@
 //! - [`Named`] / [`Registry`] / [`Sealed`] — a simpler, flat name-keyed
 //!   collection for catalogs that don't need namespaced identity or layered
 //!   sealing (a plain tool set, a plain skill set).
+//! - [`Permission`] / [`TrustClass`] / [`ArtifactKind`] / [`IsolationProfileId`]
+//!   — the dependency-free security vocabulary a descriptor carries, shared
+//!   by `agent-runtime-ability` and `agent-runtime-core` alike.
 //!
 //! # Isolation
 //!
@@ -34,6 +37,7 @@ mod entry;
 mod error;
 mod fingerprint;
 mod id;
+mod security;
 mod snapshot;
 mod view;
 
@@ -44,5 +48,6 @@ pub use entry::RegistryEntry;
 pub use error::RegistryError;
 pub use fingerprint::{Fingerprint, FingerprintHasher};
 pub use id::{EntryProvenance, RegistryDomain, RegistryId, RegistryRevision, RegistrySource};
+pub use security::{ArtifactKind, IsolationProfileId, Permission, TrustClass};
 pub use snapshot::RegistrySnapshot;
 pub use view::{RegistryView, ViewFilter};

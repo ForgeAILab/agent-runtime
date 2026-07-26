@@ -163,11 +163,23 @@ fn summary(payload: &RuntimeEvent) -> String {
             format!("reasoning_delta redacted={redacted} {}", clip(text, 120))
         }
         RuntimeEvent::ToolCallRequested {
-            name, arguments, ..
-        } => format!(
-            "tool_call_requested {name} {}",
-            clip(&compact(arguments), 200)
-        ),
+            name,
+            argument_keys,
+            argument_fingerprint,
+            arguments,
+            ..
+        } => {
+            let keys = argument_keys.join(",");
+            match arguments {
+                Some(raw) => format!(
+                    "tool_call_requested {name} keys=[{keys}] fp={argument_fingerprint} {}",
+                    clip(&compact(raw), 200)
+                ),
+                None => {
+                    format!("tool_call_requested {name} keys=[{keys}] fp={argument_fingerprint}")
+                }
+            }
+        }
         RuntimeEvent::ToolCallCompleted { name, is_error, .. } => format!(
             "tool_call_completed {name} {}",
             if *is_error { "error" } else { "ok" }
@@ -237,18 +249,47 @@ mod tests {
 
     #[test]
     fn log_line_includes_seq_session_and_turn() {
+        use agent_runtime_registry::Fingerprint;
+
         let env = envelope(
             Some("turn-2"),
             RuntimeEvent::ToolCallRequested {
                 call: ToolCallId::new("call-1"),
                 name: "read".to_string(),
-                arguments: serde_json::json!({ "path": "a.txt" }),
+                argument_keys: vec!["path".to_string()],
+                argument_fingerprint: Fingerprint::of("path=a.txt"),
+                arguments: None,
             },
         );
         let line = log_line(&env);
         assert!(line.starts_with("#7 1234ms session=s-1 turn=turn-2 "));
         assert!(line.contains("tool_call_requested read"));
-        assert!(line.contains("\"path\":\"a.txt\""));
+        assert!(line.contains("keys=[path]"));
+        assert!(
+            !line.contains("a.txt"),
+            "raw argument values must not appear by default"
+        );
+    }
+
+    #[test]
+    fn log_line_includes_raw_arguments_only_when_present() {
+        use agent_runtime_registry::Fingerprint;
+
+        let env = envelope(
+            Some("turn-2"),
+            RuntimeEvent::ToolCallRequested {
+                call: ToolCallId::new("call-1"),
+                name: "read".to_string(),
+                argument_keys: vec!["path".to_string()],
+                argument_fingerprint: Fingerprint::of("path=a.txt"),
+                arguments: Some(serde_json::json!({ "path": "a.txt" })),
+            },
+        );
+        let line = log_line(&env);
+        assert!(
+            line.contains("\"path\":\"a.txt\""),
+            "a host that opted into raw arguments must see them rendered"
+        );
     }
 
     #[test]

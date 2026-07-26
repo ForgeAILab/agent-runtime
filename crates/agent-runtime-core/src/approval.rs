@@ -33,6 +33,11 @@ impl ApprovalRequest {
     pub fn write_scopes(&self) -> Vec<WriteScope> {
         self.effects.write_scopes().cloned().collect()
     }
+
+    /// Whether the invocation spawns a process, distinct from a plain write.
+    pub fn spawns_process(&self) -> bool {
+        self.effects.spawns_process()
+    }
 }
 
 /// The outcome of an approval decision.
@@ -97,6 +102,24 @@ impl ApprovalPolicy for AllowAll {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawns_process_is_distinguishable_from_a_plain_write() {
+        let write = ApprovalRequest {
+            call_id: ToolCallId::new("c"),
+            tool: "write".into(),
+            arguments: Value::Null,
+            effects: ToolEffects::read_only().with_write("/w"),
+        };
+        let spawn = ApprovalRequest {
+            call_id: ToolCallId::new("c"),
+            tool: "spawn".into(),
+            arguments: Value::Null,
+            effects: ToolEffects::new(vec![]).with_spawn(),
+        };
+        assert!(!write.spawns_process());
+        assert!(spawn.spawns_process());
+    }
 
     #[tokio::test]
     async fn deny_all_is_fail_closed() {

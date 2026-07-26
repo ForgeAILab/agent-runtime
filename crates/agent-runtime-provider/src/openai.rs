@@ -256,6 +256,8 @@ struct StreamChunk {
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,6 +319,27 @@ fn map_finish_reason(raw: &str) -> FinishReason {
         "content_filter" => FinishReason::ContentFilter,
         _ => FinishReason::Stop,
     }
+}
+
+fn stream_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Server,
+        "OpenAI-compatible provider reported a stream error",
+    )
+    .retryable()
+}
+
+fn decode_stream_chunk(data: &str) -> Result<StreamChunk, ProviderError> {
+    let chunk = serde_json::from_str::<StreamChunk>(data).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::MalformedStream,
+            "invalid OpenAI stream chunk",
+        )
+    })?;
+    if chunk.error.is_some() {
+        return Err(stream_error());
+    }
+    Ok(chunk)
 }
 
 /// Maps one decoded chunk to zero or more neutral events.
@@ -480,6 +503,12 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 parser.push_str(&text);
                 for frame in parser.drain_frames() {
                     let data = frame.data.trim();
+                    if frame.event.as_deref() == Some("error") {
+                        yield ProviderStreamEvent::Error {
+                            error: stream_error(),
+                        };
+                        return;
+                    }
                     if data.is_empty() {
                         continue;
                     }
@@ -490,7 +519,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         emitted_finish = true;
                         break 'outer;
                     }
-                    match serde_json::from_str::<StreamChunk>(data) {
+                    match decode_stream_chunk(data) {
                         Ok(parsed) => {
                             saw_chunk = true;
                             let mut events = Vec::new();
@@ -502,12 +531,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                                 pending_finish = finish;
                             }
                         }
-                        Err(_) => {
+                        Err(error) => {
                             yield ProviderStreamEvent::Error {
-                                error: ProviderError::new(
-                                    ProviderErrorKind::MalformedStream,
-                                    "invalid OpenAI stream chunk",
-                                ),
+                                error,
                             };
                             return;
                         }
@@ -529,13 +555,18 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             if !emitted_finish {
                 if let Some(frame) = parser.finish() {
                     let data = frame.data.trim();
-                    if data == "[DONE]" {
+                    if frame.event.as_deref() == Some("error") {
+                        yield ProviderStreamEvent::Error {
+                            error: stream_error(),
+                        };
+                        return;
+                    } else if data == "[DONE]" {
                         yield ProviderStreamEvent::Finish {
                             reason: pending_finish.unwrap_or(FinishReason::Stop),
                         };
                         emitted_finish = true;
                     } else if !data.is_empty() {
-                        match serde_json::from_str::<StreamChunk>(data) {
+                        match decode_stream_chunk(data) {
                             Ok(parsed) => {
                                 saw_chunk = true;
                                 let mut events = Vec::new();
@@ -547,12 +578,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                                     pending_finish = finish;
                                 }
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 yield ProviderStreamEvent::Error {
-                                    error: ProviderError::new(
-                                        ProviderErrorKind::MalformedStream,
-                                        "invalid OpenAI stream chunk",
-                                    ),
+                                    error,
                                 };
                                 return;
                             }
@@ -844,6 +872,54 @@ mod tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_error_frame_is_terminal_and_redaction_safe() {
+        let secret = "sk-must-not-escape";
+        let sse = format!(
+            "event: error\ndata: {{\"error\":{{\"message\":\"echoed {secret}\"}}}}\n\n\
+             data: [DONE]\n\n"
+        );
+        let p = OpenAiProvider::new(
+            ReplayTransport::new(vec![&sse]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let req = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+        let events = collect(p.stream(req, ctx()).await.unwrap()).await;
+
+        assert_eq!(events.len(), 1, "the trailing [DONE] must not be consumed");
+        let ProviderStreamEvent::Error { error } = &events[0] else {
+            panic!("expected a terminal provider error, got {events:?}");
+        };
+        assert_eq!(error.kind, ProviderErrorKind::Server);
+        assert!(error.retryable);
+        assert!(!format!("{error:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn unnamed_provider_error_envelope_is_not_accepted_as_an_empty_chunk() {
+        let sse = concat!(
+            "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let p = OpenAiProvider::new(
+            ReplayTransport::new(vec![sse]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let req = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+        let events = collect(p.stream(req, ctx()).await.unwrap()).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderStreamEvent::Error {
+                error: ProviderError {
+                    kind: ProviderErrorKind::Server,
+                    retryable: true,
+                    ..
+                }
+            }]
         ));
     }
 

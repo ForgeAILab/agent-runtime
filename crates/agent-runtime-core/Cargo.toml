@@ -19,6 +19,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
+# Needed only by `check_set`'s `SecurityCheckSet`: `FutureExt::catch_unwind`
+# contains a panicking check at its boundary (security-enforcement's "Bounded
+# enforcement path") without `unsafe_code`, and `join_all` runs registered
+# checks concurrently while preserving their sorted-by-id input order. Already
+# a workspace dependency used by agent-runtime, agent-runtime-provider, and
+# agent-runtime-obs; this is not a new third-party dependency.
+futures-util.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true
 

@@ -1,0 +1,235 @@
+[
+  {
+    "schema_version": 3,
+    "seq": 0,
+    "id": "evt-1",
+    "session": "session-fixture",
+    "timestamp": 100,
+    "payload": { "event": "session_started" }
+  },
+  {
+    "schema_version": 3,
+    "seq": 1,
+    "id": "evt-2",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 101,
+    "payload": { "event": "turn_started" }
+  },
+  {
+    "schema_version": 3,
+    "seq": 2,
+    "id": "evt-3",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 102,
+    "payload": {
+      "event": "provider_attempt_started",
+      "request": "req-1",
+      "attempt": "att-1",
+      "index": 0,
+      "model": "fixture-model"
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 3,
+    "id": "evt-4",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 103,
+    "payload": { "event": "text_delta", "text": "hello" }
+  },
+  {
+    "schema_version": 3,
+    "seq": 4,
+    "id": "evt-5",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 104,
+    "payload": {
+      "event": "reasoning_delta",
+      "text": "[redacted]",
+      "redacted": true
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 5,
+    "id": "evt-6",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 105,
+    "payload": {
+      "event": "tool_call_requested",
+      "call": "call-1",
+      "name": "lookup",
+      "argument_keys": ["query"],
+      "argument_fingerprint": "a66c984521bce1db68b4208017f18d0a"
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 6,
+    "id": "evt-7",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 106,
+    "payload": {
+      "event": "tool_call_completed",
+      "call": "call-1",
+      "name": "lookup",
+      "is_error": false
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 7,
+    "id": "evt-8",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 107,
+    "payload": {
+      "event": "downgrade",
+      "capability": "reasoning",
+      "detail": "fixture downgrade"
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 8,
+    "id": "evt-9",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 108,
+    "payload": {
+      "event": "usage",
+      "record": {
+        "source": "provider_attempt",
+        "provenance": {
+          "request": "req-1",
+          "attempt": "att-1",
+          "failed": false
+        },
+        "delta": {
+          "input_uncached": 3,
+          "output": 2
+        }
+      }
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 9,
+    "id": "evt-10",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 109,
+    "payload": {
+      "event": "cache_observation",
+      "read_tokens": 2,
+      "write_tokens": 1
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 10,
+    "id": "evt-11",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 110,
+    "payload": {
+      "event": "provider_attempt_finished",
+      "attempt": "att-1",
+      "finish": "stop",
+      "retryable": false
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 11,
+    "id": "evt-12",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 111,
+    "payload": { "event": "limit_reached", "limit": "provider_attempts" }
+  },
+  {
+    "schema_version": 3,
+    "seq": 12,
+    "id": "evt-13",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 112,
+    "payload": {
+      "event": "error",
+      "error": {
+        "kind": "provider",
+        "message": "fixture error",
+        "retryable": false
+      }
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 13,
+    "id": "evt-14",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 113,
+    "payload": {
+      "event": "turn_completed",
+      "finish": { "outcome": "completed" }
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 14,
+    "id": "evt-15",
+    "session": "session-fixture",
+    "turn": "turn-2",
+    "timestamp": 114,
+    "payload": {
+      "event": "turn_completed",
+      "finish": {
+        "outcome": "cancelled",
+        "reason": "user_requested"
+      }
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 15,
+    "id": "evt-16",
+    "session": "session-fixture",
+    "turn": "turn-3",
+    "timestamp": 115,
+    "payload": {
+      "event": "turn_completed",
+      "finish": {
+        "outcome": "limit_reached",
+        "limit": "output"
+      }
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 16,
+    "id": "evt-17",
+    "session": "session-fixture",
+    "turn": "turn-4",
+    "timestamp": 116,
+    "payload": {
+      "event": "turn_completed",
+      "finish": { "outcome": "failed" }
+    }
+  },
+  {
+    "schema_version": 3,
+    "seq": 17,
+    "id": "evt-18",
+    "session": "session-fixture",
+    "timestamp": 117,
+    "payload": { "event": "session_shutdown" }
+  }
+]

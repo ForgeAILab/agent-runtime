@@ -21,6 +21,9 @@ impl Tool for EchoTool {
     fn input_schema(&self) -> Value {
         json!({"type": "object", "additionalProperties": true})
     }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::read_only()
+    }
     async fn invoke(
         &self,
         arguments: Value,
@@ -82,6 +85,9 @@ impl Tool for FailingTool {
     }
     fn input_schema(&self) -> Value {
         json!({"type": "object"})
+    }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::read_only()
     }
     async fn invoke(
         &self,

@@ -34,7 +34,13 @@ use crate::usage::UsageRecord;
 ///
 /// Bumped to 2 for the registry-driven context runtime: nine new planning
 /// variants (registry sealing through budget failure) join the vocabulary.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped to 3 because [`RuntimeEvent::ToolCallRequested`] no longer carries
+/// tool-call arguments verbatim by default: `arguments` became optional and
+/// `argument_keys`/`argument_fingerprint` were added so raw values — which may
+/// echo secrets a model was induced to reveal, or host-configured data — reach
+/// the event stream only when a host explicitly opts in.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// A configured limit the runtime enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,8 +242,22 @@ pub enum RuntimeEvent {
         call: ToolCallId,
         /// The tool name.
         name: String,
-        /// The validated arguments.
-        arguments: Value,
+        /// The validated arguments' top-level key names, sorted. Always
+        /// present, so a subscriber can see the call's shape without its
+        /// values.
+        argument_keys: Vec<String>,
+        /// A content fingerprint of the validated arguments, for correlating
+        /// identical or differing calls across the event stream without
+        /// exposing values. Not a security boundary: it is an unsalted,
+        /// non-cryptographic digest (see [`Fingerprint`]), so it can confirm
+        /// a guessed low-entropy value.
+        argument_fingerprint: Fingerprint,
+        /// The arguments verbatim. `None` unless the host's loop
+        /// configuration explicitly opts into raw argument visibility, since
+        /// arguments may echo secrets a model was induced to reveal or values
+        /// sourced from host configuration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<Value>,
     },
     /// A tool call finished.
     ToolCallCompleted {
