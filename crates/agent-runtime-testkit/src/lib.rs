@@ -21,6 +21,6 @@ pub mod workspace;
 
 pub use clock::ManualClock;
 pub use recorder::RecordingObserver;
-pub use stores::{InMemorySecretStore, InMemorySessionStore};
+pub use stores::{InMemoryCheckpointStore, InMemorySecretStore, InMemorySessionStore};
 pub use transport::ReplayTransport;
 pub use workspace::MemoryWorkspace;

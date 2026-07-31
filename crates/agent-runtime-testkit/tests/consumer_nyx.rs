@@ -18,7 +18,7 @@ async fn nyx_adapter_passes_shared_conformance() {
     ));
     let runtime = consumers::nyx::build(provider, observer.clone()).expect("nyx runtime");
     let session = runtime.start_session(StartSession::new()).await.unwrap();
-    session.run(UserInput::text("hi")).await;
+    session.run(UserInput::text("hi")).await.unwrap();
 
     let payloads = observer.payloads();
     rt::assert_terminates(&payloads);

@@ -61,7 +61,7 @@ async fn structured_output_reaches_the_provider_request() {
         .start_session(StartSession::new())
         .await
         .expect("session starts");
-    session.run(UserInput::text("hi")).await;
+    session.run(UserInput::text("hi")).await.unwrap();
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
@@ -93,7 +93,7 @@ async fn structured_output_downgrades_when_unsupported_and_allowed() {
         .expect("session starts");
 
     let mut events = session.subscribe();
-    session.send(UserInput::text("hi"));
+    session.send(UserInput::text("hi")).unwrap();
 
     let mut saw_downgrade = false;
     while let Some(env) = events.next().await {
@@ -136,7 +136,7 @@ async fn structured_output_fails_closed_by_default_when_unsupported() {
         .expect("session starts");
 
     let mut events = session.subscribe();
-    session.send(UserInput::text("hi"));
+    session.send(UserInput::text("hi")).unwrap();
 
     let mut saw_error = false;
     while let Some(env) = events.next().await {

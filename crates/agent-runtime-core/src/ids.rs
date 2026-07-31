@@ -89,6 +89,18 @@ neutral_id!(
     ToolCallId
 );
 neutral_id!(
+    /// Identifies one durable host-interaction request.
+    InteractionRequestId
+);
+neutral_id!(
+    /// Identifies one question within a structured interaction.
+    QuestionId
+);
+neutral_id!(
+    /// Identifies one selectable choice within a question.
+    ChoiceId
+);
+neutral_id!(
     /// Identifies one emitted runtime event.
     EventId
 );

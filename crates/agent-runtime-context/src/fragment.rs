@@ -9,6 +9,8 @@
 //!
 //! Contributors build fragments; they never append to the request themselves.
 
+use std::collections::BTreeSet;
+
 use agent_runtime_core::content::{ContentPart, Message};
 use agent_runtime_core::ids::ToolCallId;
 use agent_runtime_core::provider::ToolSchema;
@@ -38,8 +40,10 @@ impl std::fmt::Display for FragmentId {
     }
 }
 
-/// What a fragment contributes. The kind drives default ordering and which
-/// compaction strategies may touch it.
+/// What a fragment contributes for accounting and compaction policy.
+///
+/// It never determines wire placement; [`ContextPosition`] is the sole
+/// ordering contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FragmentKind {
@@ -67,6 +71,100 @@ pub enum FragmentKind {
     Summary,
 }
 
+/// A placement lane in the canonical provider request.
+///
+/// Classification and placement are deliberately independent:
+/// [`FragmentKind`] controls accounting and compaction policy, while this
+/// lane controls where a fragment appears on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextLane {
+    /// System/developer instructions.
+    Instructions,
+    /// Activated ability instructions and tool schemas.
+    Capabilities,
+    /// Host memory, retrieval, and explicit summaries.
+    Memory,
+    /// Canonical conversation messages.
+    Conversation,
+    /// Provider continuation material that must trail the conversation.
+    TailContext,
+}
+
+/// Stable placement of one fragment within the provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ContextPosition {
+    /// The broad placement lane.
+    pub lane: ContextLane,
+    /// Monotonic order within the lane.
+    pub sequence: u64,
+}
+
+impl ContextPosition {
+    /// Creates an explicit placement.
+    pub const fn new(lane: ContextLane, sequence: u64) -> Self {
+        Self { lane, sequence }
+    }
+
+    /// A conservative default placement for a fragment kind.
+    ///
+    /// Conversation kinds intentionally share one default sequence. Runtime
+    /// history contributors must set their canonical message index
+    /// explicitly; classification never decides their relative order.
+    pub const fn for_kind(kind: FragmentKind) -> Self {
+        match kind {
+            FragmentKind::SystemInstruction => Self::new(ContextLane::Instructions, 0),
+            FragmentKind::DeveloperInstruction => Self::new(ContextLane::Instructions, 1),
+            FragmentKind::AbilityInstruction => Self::new(ContextLane::Capabilities, 0),
+            FragmentKind::ToolSchema => Self::new(ContextLane::Capabilities, 1),
+            FragmentKind::Memory => Self::new(ContextLane::Memory, 0),
+            FragmentKind::Summary => Self::new(ContextLane::Memory, 1),
+            FragmentKind::Retrieval => Self::new(ContextLane::Memory, 2),
+            FragmentKind::History | FragmentKind::ToolResult | FragmentKind::UserInput => {
+                Self::new(ContextLane::Conversation, 0)
+            }
+            FragmentKind::Continuation => Self::new(ContextLane::TailContext, 0),
+        }
+    }
+}
+
+impl Default for ContextPosition {
+    fn default() -> Self {
+        Self::new(ContextLane::Conversation, 0)
+    }
+}
+
+/// Stable identity for a complete conversation turn group.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConversationGroupId(String);
+
+impl ConversationGroupId {
+    /// Creates a group identity.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The stable group id.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One assistant tool-call message and every result it owns.
+///
+/// A single assistant message may contain several parallel calls, so the
+/// exchange carries a set rather than the old one-id pairing slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolExchange {
+    /// The assistant message containing the calls.
+    pub assistant: Message,
+    /// Every call id in the assistant message.
+    pub call_ids: BTreeSet<ToolCallId>,
+    /// Matching result messages, in canonical conversation order.
+    pub results: Vec<Message>,
+}
+
 impl FragmentKind {
     /// A stable lowercase slug used in budget reports, events, and manifests.
     pub fn as_str(self) -> &'static str {
@@ -82,25 +180,6 @@ impl FragmentKind {
             FragmentKind::Retrieval => "retrieval",
             FragmentKind::Continuation => "continuation",
             FragmentKind::Summary => "summary",
-        }
-    }
-
-    /// The default ordering rank: stable instruction material first, then
-    /// activated schemas, then conversation, then the current turn. Planners may
-    /// override this, but the default is what makes a cache prefix long.
-    pub fn order_rank(self) -> u8 {
-        match self {
-            FragmentKind::SystemInstruction => 0,
-            FragmentKind::DeveloperInstruction => 1,
-            FragmentKind::AbilityInstruction => 2,
-            FragmentKind::ToolSchema => 3,
-            FragmentKind::Memory => 4,
-            FragmentKind::Summary => 5,
-            FragmentKind::History => 6,
-            FragmentKind::ToolResult => 7,
-            FragmentKind::Retrieval => 8,
-            FragmentKind::Continuation => 9,
-            FragmentKind::UserInput => 10,
         }
     }
 }
@@ -265,12 +344,15 @@ fn push_part_text(out: &mut String, part: &ContentPart) {
 }
 
 /// A versioned unit of provider context.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ContextFragment {
     /// Stable identity, unique within a plan.
     pub id: FragmentId,
     /// What this fragment contributes.
     pub kind: FragmentKind,
+    /// Canonical wire placement, independent of [`kind`](Self::kind).
+    #[serde(default)]
+    pub position: ContextPosition,
     /// Who contributed it.
     pub source: FragmentSource,
     /// The revision of the content behind this fragment. A changed revision
@@ -286,6 +368,14 @@ pub struct ContextFragment {
     /// must both survive compaction or both be removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing: Option<ToolCallId>,
+    /// Every tool-call id this fragment owns or answers. This is the
+    /// multi-call replacement for `pairing`; the legacy field remains
+    /// readable during the bounded migration.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pairings: BTreeSet<ToolCallId>,
+    /// The complete conversation turn this fragment belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_group: Option<ConversationGroupId>,
     /// Sensitivity classification.
     pub sensitivity: Sensitivity,
     /// Cache classification.
@@ -293,6 +383,56 @@ pub struct ContextFragment {
     /// A contributor-supplied token hint, used only when no sizer is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_hint: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ContextFragmentWire {
+    id: FragmentId,
+    kind: FragmentKind,
+    #[serde(default)]
+    position: Option<ContextPosition>,
+    source: FragmentSource,
+    revision: RegistryRevision,
+    requirement: Requirement,
+    priority: i32,
+    content: FragmentContent,
+    #[serde(default)]
+    pairing: Option<ToolCallId>,
+    #[serde(default)]
+    pairings: BTreeSet<ToolCallId>,
+    #[serde(default)]
+    conversation_group: Option<ConversationGroupId>,
+    sensitivity: Sensitivity,
+    cache_class: CacheClass,
+    #[serde(default)]
+    token_hint: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for ContextFragment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ContextFragmentWire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id,
+            kind: wire.kind,
+            position: wire
+                .position
+                .unwrap_or_else(|| ContextPosition::for_kind(wire.kind)),
+            source: wire.source,
+            revision: wire.revision,
+            requirement: wire.requirement,
+            priority: wire.priority,
+            content: wire.content,
+            pairing: wire.pairing,
+            pairings: wire.pairings,
+            conversation_group: wire.conversation_group,
+            sensitivity: wire.sensitivity,
+            cache_class: wire.cache_class,
+            token_hint: wire.token_hint,
+        })
+    }
 }
 
 impl ContextFragment {
@@ -308,12 +448,15 @@ impl ContextFragment {
         Self {
             id: FragmentId::new(id),
             kind,
+            position: ContextPosition::for_kind(kind),
             source,
             revision,
             requirement: Requirement::Required,
             priority: 0,
             content,
             pairing: None,
+            pairings: BTreeSet::new(),
+            conversation_group: None,
             sensitivity: Sensitivity::Internal,
             cache_class: CacheClass::Stable,
             token_hint: None,
@@ -326,9 +469,27 @@ impl ContextFragment {
         self
     }
 
-    /// Sets the intra-kind ordering priority.
+    /// Sets ordering priority among fragments at the same explicit position.
     pub fn with_priority(mut self, priority: i32) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Sets the canonical wire placement.
+    pub fn with_position(mut self, position: ContextPosition) -> Self {
+        self.position = position;
+        self
+    }
+
+    /// Places this fragment at `sequence` in its current lane.
+    pub fn with_sequence(mut self, sequence: u64) -> Self {
+        self.position.sequence = sequence;
+        self
+    }
+
+    /// Associates the fragment with a complete conversation turn group.
+    pub fn in_conversation_group(mut self, group: ConversationGroupId) -> Self {
+        self.conversation_group = Some(group);
         self
     }
 
@@ -346,8 +507,24 @@ impl ContextFragment {
 
     /// Pairs this fragment with a tool call.
     pub fn paired_with(mut self, call: ToolCallId) -> Self {
-        self.pairing = Some(call);
+        self.pairing = Some(call.clone());
+        self.pairings.insert(call);
         self
+    }
+
+    /// Pairs this fragment with every call id in one parallel exchange.
+    pub fn paired_with_many(mut self, calls: impl IntoIterator<Item = ToolCallId>) -> Self {
+        self.pairings.extend(calls);
+        self
+    }
+
+    /// Every effective pairing id, including a legacy single-id field.
+    pub fn pairing_ids(&self) -> BTreeSet<ToolCallId> {
+        let mut ids = self.pairings.clone();
+        if let Some(call) = &self.pairing {
+            ids.insert(call.clone());
+        }
+        ids
     }
 
     /// Sets the contributor's token hint.
@@ -369,16 +546,31 @@ impl ContextFragment {
         hasher
             .pair("id", self.id.as_str())
             .pair("kind", self.kind.as_str())
+            .pair("lane", format!("{:?}", self.position.lane))
+            .pair("sequence", self.position.sequence.to_string())
             .pair("revision", self.revision.as_str())
             .pair("cache_class", self.cache_class.as_str())
             .pair("content", self.content.text_for_sizing());
+        if let Some(group) = &self.conversation_group {
+            hasher.pair("conversation_group", group.as_str());
+        }
+        for call in self.pairing_ids() {
+            hasher.pair("pairing", call.as_str());
+        }
         hasher.finish()
     }
 
-    /// The canonical sort key: kind rank, then priority, then id. Deterministic
-    /// for identical inputs regardless of contribution order.
-    pub fn sort_key(&self) -> (u8, i32, &str) {
-        (self.kind.order_rank(), self.priority, self.id.as_str())
+    /// The canonical sort key: placement first, then contributor tie-breaks.
+    ///
+    /// `FragmentKind` is intentionally absent so accounting classification
+    /// can never reorder conversation messages.
+    pub fn sort_key(&self) -> (ContextLane, u64, i32, &str) {
+        (
+            self.position.lane,
+            self.position.sequence,
+            self.priority,
+            self.id.as_str(),
+        )
     }
 }
 
@@ -432,6 +624,16 @@ mod tests {
         let json = serde_json::to_string(&fragment).unwrap();
         let back: ContextFragment = serde_json::from_str(&json).unwrap();
         assert_eq!(fragment, back);
+    }
+
+    #[test]
+    fn legacy_fragment_without_position_derives_the_lane_from_kind() {
+        let fragment = text_fragment("sys", FragmentKind::SystemInstruction, "x");
+        let mut json = serde_json::to_value(&fragment).unwrap();
+        json.as_object_mut().unwrap().remove("position");
+        let restored: ContextFragment = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.position.lane, ContextLane::Instructions);
+        assert_eq!(restored.position.sequence, 0);
     }
 
     #[test]

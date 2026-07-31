@@ -625,6 +625,11 @@ impl fmt::Debug for AgentView {
 }
 
 impl AgentView {
+    /// The policy-scoped ability view used by live retrieval.
+    pub fn abilities(&self) -> &RegistryView<AbilityHandle> {
+        &self.abilities
+    }
+
     /// Resolves a visible ability by id, yielding the same typed
     /// [`AbilityHandle`] host composition uses.
     pub fn resolve_ability(&self, id: &RegistryId) -> Option<&AbilityHandle> {

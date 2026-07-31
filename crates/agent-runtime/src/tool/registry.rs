@@ -37,14 +37,15 @@ impl ToolRegistry {
     /// [`agent_runtime_core::error::ErrorKind::Config`] error if the tool's
     /// input schema is invalid.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), RuntimeError> {
-        let name = tool.name().to_owned();
-        jsonschema::validator_for(&tool.input_schema()).map_err(|error| {
+        let entry = ToolEntry::new(tool);
+        let name = entry.spec().name.clone();
+        jsonschema::validator_for(&entry.spec().input_schema).map_err(|error| {
             RuntimeError::config(format!(
                 "tool `{name}` has an invalid input schema: {error}"
             ))
         })?;
         self.inner
-            .register(ToolEntry::new(tool))
+            .register(entry)
             .map_err(|error| RuntimeError::conflict(error.to_string()))
     }
 
@@ -96,6 +97,11 @@ impl SealedToolRegistry {
         self.inner.get(name).map(|entry| entry.as_arc().clone())
     }
 
+    /// Looks up the cached specification sealed with the registry.
+    pub fn spec(&self, name: &str) -> Option<&ToolSpec> {
+        self.inner.get(name).map(ToolEntry::spec)
+    }
+
     /// Whether a tool with `name` is present.
     pub fn contains(&self, name: &str) -> bool {
         self.inner.contains(name)
@@ -110,7 +116,7 @@ impl SealedToolRegistry {
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.inner
             .iter()
-            .map(|entry| entry.as_arc().spec())
+            .map(|entry| entry.spec().clone())
             .collect()
     }
 
@@ -118,19 +124,55 @@ impl SealedToolRegistry {
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.inner
             .iter()
-            .map(|entry| entry.as_arc().spec().to_schema())
+            .map(|entry| entry.spec().to_schema())
             .collect()
+    }
+
+    /// Provider schemas filtered by current host-interaction readiness.
+    ///
+    /// Implementations remain registered for exact checkpoint recovery even
+    /// when their schema is omitted from a new provider request.
+    pub fn schemas_with_interaction(&self, interaction_ready: bool) -> Vec<ToolSchema> {
+        self.inner
+            .iter()
+            .filter(|entry| interaction_ready || !entry.as_arc().supports_interaction())
+            .map(|entry| entry.spec().to_schema())
+            .collect()
+    }
+
+    /// Validates arguments for one registered tool. Exact approval edits pass
+    /// through this same validator before they can be prepared again.
+    pub fn validate_arguments(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        let Some(entry) = self.inner.get(name) else {
+            return Err(RuntimeError::tool(format!(
+                "tool `{name}` is not available"
+            )));
+        };
+        let validator = jsonschema::validator_for(&entry.spec().input_schema).map_err(|error| {
+            RuntimeError::config(format!(
+                "registered tool `{name}` has an invalid input schema: {error}"
+            ))
+        })?;
+        validator.validate(arguments).map_err(|error| {
+            RuntimeError::tool(format!(
+                "tool call `{name}` arguments do not match its input schema: {error}"
+            ))
+        })
     }
 
     /// Validates one assembled model call against the registered tool's input
     /// schema before the call is exposed to observers or invoked.
     pub fn validate_call(&self, call: &ToolCall) -> Result<(), ProviderError> {
-        let Some(tool) = self.get(&call.name) else {
+        let Some(spec) = self.spec(&call.name) else {
             // Unknown tools deliberately become canonical tool-error results;
             // only calls to registered schemas can claim validated arguments.
             return Ok(());
         };
-        let schema = tool.input_schema();
+        let schema = spec.input_schema.clone();
         let validator = jsonschema::validator_for(&schema).map_err(|error| {
             ProviderError::new(
                 ProviderErrorKind::BadRequest,
@@ -156,14 +198,14 @@ impl SealedToolRegistry {
 mod tests {
     use super::*;
     use agent_runtime_core::error::ErrorKind;
-    use agent_runtime_core::tool::{InvocationContext, ToolEffects, ToolOutcome};
+    use agent_runtime_core::tool::{InvocationContext, LegacyTool, ToolEffects, ToolOutcome};
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
     #[derive(Debug)]
     struct Noop(&'static str);
     #[async_trait]
-    impl Tool for Noop {
+    impl LegacyTool for Noop {
         fn name(&self) -> &str {
             self.0
         }
@@ -174,9 +216,9 @@ mod tests {
             json!({"type": "object"})
         }
         fn effects(&self) -> ToolEffects {
-            ToolEffects::read_only()
+            ToolEffects::new(vec![])
         }
-        async fn invoke(
+        async fn invoke_legacy(
             &self,
             _arguments: Value,
             _ctx: &InvocationContext,
@@ -200,7 +242,7 @@ mod tests {
         reg.register(Arc::new(Noop("b"))).unwrap();
         reg.register(Arc::new(Noop("c"))).unwrap();
         let sealed = reg.seal();
-        let names: Vec<&str> = sealed.iter().map(|t| t.name()).collect();
+        let names: Vec<String> = sealed.iter().map(|t| t.spec().name).collect();
         assert_eq!(names, ["a", "b", "c"]);
         assert!(sealed.contains("b"));
     }

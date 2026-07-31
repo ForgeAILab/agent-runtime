@@ -17,15 +17,16 @@ categories.workspace = true
 agent-runtime-registry = { workspace = true }
 agent-runtime-core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2.workspace = true
 
 [features]
 default = []
-tool = ["dep:agent-runtime-core"]
+tool = ["dep:agent-runtime-core", "dep:serde_json"]
 serde = ["dep:serde", "agent-runtime-registry/serde"]
 
 [dev-dependencies]
 async-trait.workspace = true
-serde_json.workspace = true
 tempfile = "3"
 
 [lints]

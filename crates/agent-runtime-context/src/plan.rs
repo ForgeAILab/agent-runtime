@@ -188,7 +188,7 @@ impl ContextPlan {
     /// [`crate::planner::ContextPlanner::plan`] never populates it itself —
     /// only [`crate::planner::ContextPlanner::plan_with_cache`] attaches a
     /// non-empty outcome, and only when its attached
-    /// [`crate::compaction::SemanticCompactor`] actually changed something.
+    /// [`crate::compaction::StructuralCompactor`] actually changed something.
     /// Returns a new plan; the receiver is unchanged.
     pub fn with_compaction_outcome(mut self, outcome: CompactionOutcome) -> Self {
         self.compaction = outcome;

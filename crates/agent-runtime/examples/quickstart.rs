@@ -23,7 +23,7 @@ use agent_runtime_core::provider::{Capabilities, FinishReason, ProviderStreamEve
 struct EchoTool;
 
 #[async_trait]
-impl Tool for EchoTool {
+impl LegacyTool for EchoTool {
     fn name(&self) -> &str {
         "echo"
     }
@@ -34,9 +34,9 @@ impl Tool for EchoTool {
         json!({"type": "object", "additionalProperties": true})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
+        ToolEffects::new(vec![])
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         arguments: Value,
         _ctx: &InvocationContext,
@@ -88,8 +88,8 @@ async fn main() -> Result<(), RuntimeError> {
 
     // Subscribe before sending so we capture the whole turn.
     let mut events = session.subscribe();
-    let turn = session.send(UserInput::text("please call the echo tool"));
-    println!("=== started turn {turn} ===");
+    let turn = session.send(UserInput::text("please call the echo tool"))?;
+    println!("=== started turn {} ===", turn.id());
 
     while let Some(env) = events.next().await {
         println!("[{:>3}] {}", env.seq, describe(&env.payload));
@@ -115,7 +115,7 @@ async fn main() -> Result<(), RuntimeError> {
 
 fn describe(event: &RuntimeEvent) -> String {
     match event {
-        RuntimeEvent::TextDelta { text } => format!("text: {text:?}"),
+        RuntimeEvent::TextDelta { text, .. } => format!("text: {text:?}"),
         RuntimeEvent::ToolCallRequested { name, .. } => format!("tool requested: {name}"),
         RuntimeEvent::ToolCallCompleted { name, is_error, .. } => {
             format!("tool completed: {name} (error={is_error})")

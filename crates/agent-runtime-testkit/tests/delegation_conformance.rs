@@ -8,6 +8,11 @@ async fn spawn_lifecycle_is_ordered_and_carries_the_final_result() {
 }
 
 #[tokio::test]
+async fn child_artifact_results_are_transferred_into_parent_ownership() {
+    delegation::assert_child_artifact_result_transfers_to_parent().await;
+}
+
+#[tokio::test]
 async fn a_reasoning_only_child_answer_survives_as_the_result() {
     delegation::assert_reasoning_only_result_survives().await;
 }
@@ -55,4 +60,14 @@ async fn follow_ups_reuse_the_child_and_the_turn_cap_is_enforced() {
 #[tokio::test]
 async fn children_stop_with_their_parent() {
     delegation::assert_parent_teardown_stops_children().await;
+}
+
+#[tokio::test]
+async fn returned_child_input_is_lossless_and_pairs_the_parallel_suffix() {
+    delegation::assert_returned_input_pairs_and_is_lossless().await;
+}
+
+#[tokio::test]
+async fn reverse_arrival_child_inputs_are_delivered_in_canonical_order() {
+    delegation::assert_returned_input_reverse_arrival_is_canonical().await;
 }

@@ -13,9 +13,11 @@
 //! [`ActivationHandle::activate`] is actually called.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use agent_runtime_registry::{EntryProvenance, RegistryRevision, RegistrySource};
+use sha2::{Digest, Sha256};
 
 use crate::Named;
 use crate::ability::{Ability, AbilityKind};
@@ -75,6 +77,20 @@ pub struct Skill {
     /// to compute one.
     #[cfg_attr(feature = "serde", serde(default))]
     revision: Option<RegistryRevision>,
+    /// Expected SHA-256 digest for a file-backed instruction body.
+    ///
+    /// File-backed skills without this value remain discoverable but fail
+    /// closed at activation. Descriptor search therefore performs no I/O,
+    /// while activation proves it loaded the exact reviewed bytes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    expected_sha256: Option<[u8; 32]>,
+    /// Host-controlled registry layer. File frontmatter never selects this.
+    #[cfg_attr(feature = "serde", serde(default = "built_in_source"))]
+    registry_source: RegistrySource,
+}
+
+const fn built_in_source() -> RegistrySource {
+    RegistrySource::BuiltIn
 }
 
 impl Skill {
@@ -91,6 +107,8 @@ impl Skill {
             files: Vec::new(),
             metadata: BTreeMap::new(),
             revision: None,
+            expected_sha256: None,
+            registry_source: RegistrySource::BuiltIn,
         }
     }
 
@@ -107,7 +125,22 @@ impl Skill {
             files: Vec::new(),
             metadata: BTreeMap::new(),
             revision: None,
+            expected_sha256: None,
+            registry_source: RegistrySource::BuiltIn,
         }
+    }
+
+    /// A file-backed skill pinned to exact reviewed bytes.
+    ///
+    /// `expected_sha256` is computed out of band by the host or package
+    /// builder. Constructing the descriptor never opens `path`.
+    pub fn from_verified_file(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        path: impl Into<PathBuf>,
+        expected_sha256: [u8; 32],
+    ) -> Self {
+        Self::from_file(name, description, path).with_expected_sha256(expected_sha256)
     }
 
     /// Adds a supporting file.
@@ -132,11 +165,47 @@ impl Skill {
         self
     }
 
+    /// Pins a file-backed instruction body to an exact SHA-256 digest.
+    pub fn with_expected_sha256(mut self, expected_sha256: [u8; 32]) -> Self {
+        self.expected_sha256 = Some(expected_sha256);
+        self
+    }
+
+    /// Sets the host-controlled source layer used by registry precedence.
+    ///
+    /// This value must come from the host's trusted discovery policy, never
+    /// from skill-body or frontmatter claims.
+    pub fn with_registry_source(mut self, source: RegistrySource) -> Self {
+        self.registry_source = source;
+        self
+    }
+
     /// Resolves the skill's instruction body, reading the file if needed.
     pub fn load_instructions(&self) -> std::io::Result<String> {
         match &self.source {
             SkillSource::Inline(text) => Ok(text.clone()),
-            SkillSource::File(path) => std::fs::read_to_string(path),
+            SkillSource::File(path) => {
+                let expected = self.expected_sha256.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "file-backed skill has no verified SHA-256 digest",
+                    )
+                })?;
+                let bytes = std::fs::read(path)?;
+                let found: [u8; 32] = Sha256::digest(&bytes).into();
+                if found != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "skill content digest changed (expected {}, found {})",
+                            hex_digest(&expected),
+                            hex_digest(&found)
+                        ),
+                    ));
+                }
+                String::from_utf8(bytes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            }
         }
     }
 
@@ -148,9 +217,10 @@ impl Skill {
     fn content_revision(&self) -> RegistryRevision {
         self.revision.clone().unwrap_or_else(|| match &self.source {
             SkillSource::Inline(text) => RegistryRevision::from_content(text),
-            SkillSource::File(path) => {
-                RegistryRevision::from_content(path.to_string_lossy().as_bytes())
-            }
+            SkillSource::File(path) => self.expected_sha256.map_or_else(
+                || RegistryRevision::from_content(path.to_string_lossy().as_bytes()),
+                |digest| RegistryRevision::new(format!("sha256:{}", hex_digest(&digest))),
+            ),
         })
     }
 
@@ -161,6 +231,21 @@ impl Skill {
             SkillSource::Inline(_) => None,
         }
     }
+
+    /// Expected file digest, if the host pinned one.
+    pub fn expected_sha256(&self) -> Option<&[u8; 32]> {
+        self.expected_sha256.as_ref()
+    }
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 impl Named for Skill {
@@ -183,11 +268,15 @@ impl Ability for Skill {
         AbilityDescriptor::new(
             AbilityKind::Skill,
             self.name.clone(),
-            EntryProvenance::new(RegistrySource::BuiltIn, revision.clone()),
+            EntryProvenance::new(self.registry_source, revision.clone()),
             self.name.clone(),
             self.description.clone(),
             revision,
         )
+    }
+
+    fn materialize(&self) -> Result<Activated, ActivationError> {
+        ActivationHandle::activate(self)
     }
 }
 
@@ -223,9 +312,15 @@ mod tests {
     fn file_skill_reads_body_at_load_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
-        std::fs::write(&path, "do the thing").unwrap();
-        let skill = Skill::from_file("deploy", "Deploy the app", &path)
-            .with_file(SkillFile::new("script", dir.path().join("run.sh")));
+        let body = b"do the thing";
+        std::fs::write(&path, body).unwrap();
+        let skill = Skill::from_verified_file(
+            "deploy",
+            "Deploy the app",
+            &path,
+            Sha256::digest(body).into(),
+        )
+        .with_file(SkillFile::new("script", dir.path().join("run.sh")));
         assert_eq!(skill.load_instructions().unwrap(), "do the thing");
         assert_eq!(skill.instructions_path(), Some(path.as_path()));
         assert_eq!(skill.files.len(), 1);
@@ -240,7 +335,13 @@ mod tests {
     fn searching_a_skill_never_reads_its_instruction_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
-        let skill = Skill::from_file("deploy", "Deploy the app to production", &path);
+        let body = b"do the thing";
+        let skill = Skill::from_verified_file(
+            "deploy",
+            "Deploy the app to production",
+            &path,
+            Sha256::digest(body).into(),
+        );
         assert!(!path.exists());
 
         // Indexing and searching use only the descriptor's bounded card.
@@ -254,7 +355,7 @@ mod tests {
 
         // Only now does the file come into existence, and only `activate`
         // reads it.
-        std::fs::write(&path, "do the thing").unwrap();
+        std::fs::write(&path, body).unwrap();
         let activated = skill.activate().unwrap();
         assert_eq!(
             activated,
@@ -282,5 +383,46 @@ mod tests {
             skill.descriptor().content_revision().as_str(),
             "packaged-v3"
         );
+    }
+
+    #[test]
+    fn changing_a_file_after_descriptor_creation_fails_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        let reviewed = b"reviewed instructions";
+        std::fs::write(&path, reviewed).unwrap();
+        let skill = Skill::from_verified_file(
+            "deploy",
+            "Deploy the app",
+            &path,
+            Sha256::digest(reviewed).into(),
+        );
+        let descriptor = skill.descriptor();
+
+        std::fs::write(&path, "changed after review").unwrap();
+        let error = skill
+            .activate()
+            .expect_err("changed instructions must fail closed");
+        assert!(matches!(error, ActivationError::Unavailable { .. }));
+        assert_eq!(
+            descriptor.content_revision(),
+            &RegistryRevision::new(format!(
+                "sha256:{}",
+                hex_digest(&Sha256::digest(reviewed).into())
+            ))
+        );
+    }
+
+    #[test]
+    fn unverified_file_is_discoverable_but_cannot_activate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        std::fs::write(&path, "instructions").unwrap();
+        let skill = Skill::from_file("deploy", "Deploy the app", &path);
+        assert!(skill.descriptor().card().matches_any(&["deploy".into()]));
+        assert!(matches!(
+            skill.activate(),
+            Err(ActivationError::Unavailable { .. })
+        ));
     }
 }

@@ -57,9 +57,9 @@ mod skill;
 mod tool;
 
 pub use ability::{Ability, AbilityCard, AbilityKind, AbilityRegistry, SealedAbilities};
-pub use agent_runtime_registry::{NameConflict, Named, Registry, Sealed};
+pub use agent_runtime_registry::{NameConflict, Named, Permission, Registry, Sealed};
 pub use descriptor::AbilityDescriptor;
 pub use skill::{Skill, SkillFile, SkillSource};
 
 #[cfg(feature = "tool")]
-pub use tool::{ToolAbility, ToolEntry, tool_ability};
+pub use tool::{ToolAbility, ToolEntry, tool_ability, tool_ability_with_descriptor};

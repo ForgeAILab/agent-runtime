@@ -37,10 +37,12 @@
 #![forbid(unsafe_code)]
 
 pub mod approval;
+pub mod artifact;
 pub mod broker;
 pub mod cancel;
 pub mod catalog;
 pub mod check_set;
+pub mod checkpoint;
 pub mod clock;
 pub mod compat;
 pub mod content;
@@ -50,6 +52,7 @@ pub mod event;
 pub mod grant;
 pub mod guard;
 pub mod ids;
+pub mod interaction;
 pub mod isolation;
 pub mod manifest;
 pub mod metadata;
@@ -64,7 +67,14 @@ pub mod workspace;
 /// A convenient re-export of the most commonly used items.
 pub mod prelude {
     pub use crate::approval::{
-        AllowAll, ApprovalDecision, ApprovalPolicy, ApprovalRequest, DenyAll,
+        AllowAll, ApprovalDecision, ApprovalOrigin, ApprovalPolicy, ApprovalRequest, DenyAll,
+        UnavailableApproval,
+    };
+    pub use crate::artifact::{
+        ArtifactChunk, ArtifactDigest, ArtifactError, ArtifactId, ArtifactLineage,
+        ArtifactProvenance, ArtifactRead, ArtifactRef, ArtifactRetention, ArtifactSensitivity,
+        ArtifactStore, ArtifactTransfer, ArtifactWrite, MAX_ARTIFACT_ID_CHARS,
+        MAX_ARTIFACT_MEDIA_TYPE_CHARS, MAX_ARTIFACT_READ_BYTES, MAX_ARTIFACT_TRANSFER_BYTES,
     };
     pub use crate::broker::{
         CredentialBroker, CredentialError, CredentialRef, CredentialSink, EgressAuthorization,
@@ -76,6 +86,10 @@ pub mod prelude {
         ActionClass, AdvisoryFinding, CheckAudit, CheckSetError, CheckSetOutcome, CheckStatus,
         EnforcementLimits, RevocationTarget, SecurityCheckSet, SecurityCheckSetBuilder,
     };
+    pub use crate::checkpoint::{
+        AssembledModelResponse, CHECKPOINT_SCHEMA_VERSION, CheckpointStore, CheckpointWatermark,
+        TURN_TRANSITION_REVISION, ToolSlotCheckpoint, TurnCheckpoint, TurnState,
+    };
     pub use crate::clock::{Clock, Deadline, SystemClock, Timestamp};
     pub use crate::compat::LegacyApprovalAuthority;
     pub use crate::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock, UserInput};
@@ -85,7 +99,8 @@ pub mod prelude {
     pub use crate::error::{ErrorKind, Result, RuntimeError};
     pub use crate::event::{
         BudgetCategory, ChildPhase, CompactionReason, EstimationConfidence, EventEnvelope,
-        LimitKind, RuntimeEvent, SCHEMA_VERSION, TurnFinish,
+        LimitKind, PlanItemProjection, PlanItemStatus, PlanSensitivity, RuntimeEvent,
+        SCHEMA_VERSION, TurnFinish,
     };
     pub use crate::grant::{
         AuthorizationDecision, CapabilityGrant, ConstraintDimension, ConstraintValue, DecisionCode,
@@ -98,7 +113,16 @@ pub mod prelude {
         LeakDetectorId, LeakFinding, LeakScanResult,
     };
     pub use crate::ids::{
-        AttemptId, ChildId, EventId, RequestId, SessionId, TenantId, ToolCallId, TurnId,
+        AttemptId, ChildId, ChoiceId, EventId, InteractionRequestId, QuestionId, RequestId,
+        SessionId, TenantId, ToolCallId, TurnId,
+    };
+    pub use crate::interaction::{
+        Choice, INTERACTION_SCHEMA_VERSION, InteractionBroker, InteractionOrigin,
+        InteractionOutcomeKind, InteractionReadiness, InteractionRequest, InteractionResponse,
+        InteractionResponseKind, InteractionSensitivity, MAX_CHOICE_DESCRIPTION_CHARS,
+        MAX_CHOICE_LABEL_CHARS, MAX_CHOICES_PER_QUESTION, MAX_FREE_FORM_CHARS, MAX_QUESTION_CHARS,
+        MAX_QUESTION_HEADER_CHARS, MAX_QUESTIONS, Question, QuestionAnswer, Questionnaire,
+        UnavailableInteractionBroker,
     };
     pub use crate::isolation::{
         BackendConformance, BoundedRendering, DeclaredInterface, IsolationBackend,
@@ -125,7 +149,8 @@ pub mod prelude {
     };
     pub use crate::store::{Secret, SecretStore, SessionSnapshot, SessionStore, TurnManifest};
     pub use crate::tool::{
-        Effect, InvocationContext, Tool, ToolEffects, ToolOutcome, ToolSpec, WriteScope,
+        Effect, InvocationContext, LegacyTool, PreparationContext, PreparedToolCall, Tool,
+        ToolCallDisplay, ToolContent, ToolEffects, ToolOutcome, ToolSpec, WriteScope,
     };
     pub use crate::usage::{
         CounterKind, Provenance, UsageDelta, UsageLedger, UsageRecord, UsageSource,

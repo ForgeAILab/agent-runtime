@@ -1,0 +1,31 @@
+[
+  {
+    "schema_version": 6,
+    "seq": 0,
+    "id": "evt-v6-1",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 100,
+    "payload": {
+      "event": "interaction_requested",
+      "request": "interaction-1",
+      "call": "call-1",
+      "question_count": 2,
+      "sensitivity": "sensitive"
+    }
+  },
+  {
+    "schema_version": 6,
+    "seq": 1,
+    "id": "evt-v6-2",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 101,
+    "payload": {
+      "event": "interaction_resolved",
+      "request": "interaction-1",
+      "call": "call-1",
+      "outcome": "answered"
+    }
+  }
+]

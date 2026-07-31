@@ -19,7 +19,7 @@ async fn open_forge_adapter_passes_shared_conformance() {
     let runtime =
         consumers::open_forge::build(provider, observer.clone()).expect("open forge runtime");
     let session = runtime.start_session(StartSession::new()).await.unwrap();
-    session.run(UserInput::text("hi")).await;
+    session.run(UserInput::text("hi")).await.unwrap();
 
     let payloads = observer.payloads();
     rt::assert_terminates(&payloads);

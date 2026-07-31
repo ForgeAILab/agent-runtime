@@ -5,22 +5,33 @@
 //! `agent.delegate` permission unless a suite withholds it) and a scripted
 //! child factory, then asserts the `agent-delegation` capability contract.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 use agent_runtime::delegation::{
-    CapacityPolicy, ChildRuntimeFactory, ChildState, DELEGATION_PERMISSION, DelegationConfig,
-    DelegationCoordinator, DelegationLimits, SpawnOutcome,
+    CapacityPolicy, ChildRuntimeFactory, ChildState, ChildTaskOutcome, ChildTaskResult,
+    DELEGATION_PERMISSION, DelegationConfig, DelegationCoordinator, DelegationLimits, SpawnOutcome,
 };
-use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, usage_event};
+use agent_runtime::harness::{ArtifactOffloader, QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
+use agent_runtime::provider::fake::{
+    FakeProvider, ScriptedStream, tool_call_fragments, usage_event,
+};
 use agent_runtime::registry::Permission;
 use agent_runtime::runtime::{Runtime, RuntimeBuilder, SessionHandle, StartSession};
+use agent_runtime_core::artifact::{
+    ArtifactChunk, ArtifactDigest, ArtifactError, ArtifactId, ArtifactRead, ArtifactRef,
+    ArtifactStore, ArtifactWrite, MAX_ARTIFACT_READ_BYTES,
+};
 use agent_runtime_core::cancel::Cancellation;
 use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
 use agent_runtime_core::check_set::ActionClass;
+use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::UserInput;
 use agent_runtime_core::delegation::{
     ChildLimits, ChildModelSelection, ChildSpec, ToolViewScope, WorkspacePolicy,
@@ -31,9 +42,15 @@ use agent_runtime_core::grant::{
     GrantConstraints, SecurityCheck, SecurityCheckId, SecurityCheckMode, SecurityCheckOutcome,
     SecurityCheckRevision,
 };
-use agent_runtime_core::provider::{Capabilities, FinishReason, ModelId, ProviderStreamEvent};
+use agent_runtime_core::interaction::{InteractionOrigin, InteractionRequest, InteractionResponse};
+use agent_runtime_core::provider::{
+    Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
+    ProviderError, ProviderStream, ProviderStreamEvent,
+};
 use agent_runtime_core::security::{AuthorizationRequest, PermissionSet};
-use agent_runtime_core::tool::Tool;
+use agent_runtime_core::tool::{
+    InvocationContext, LegacyTool, PreparedToolCall, Tool, ToolEffects, ToolOutcome, ToolSpec,
+};
 
 use crate::tools::{EchoTool, WriteTool};
 
@@ -105,6 +122,8 @@ pub struct ScriptedChildFactory {
     scripts: Mutex<VecDeque<Vec<ScriptedStream>>>,
     providers: Mutex<Vec<Arc<FakeProvider>>>,
     tools: Vec<Arc<dyn Tool>>,
+    event_buffer: usize,
+    artifact_store: Option<Arc<dyn ArtifactStore>>,
 }
 
 impl ScriptedChildFactory {
@@ -114,12 +133,28 @@ impl ScriptedChildFactory {
             scripts: Mutex::new(scripts.into()),
             providers: Mutex::new(Vec::new()),
             tools: Vec::new(),
+            event_buffer: 1024,
+            artifact_store: None,
         }
     }
 
     /// Registers `tools` on every child builder.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Sets the child event buffer. Control-path conformance uses a capacity
+    /// of one to prove returned input does not depend on observer delivery.
+    pub fn with_event_buffer(mut self, event_buffer: usize) -> Self {
+        self.event_buffer = event_buffer;
+        self
+    }
+
+    /// Enables standard oversized-output offloading and explicit child-result
+    /// ownership transfer through one protected store.
+    pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
         self
     }
 
@@ -148,7 +183,8 @@ impl ChildRuntimeFactory for ScriptedChildFactory {
             .push(provider.clone());
         let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
             .provider(provider)
-            .model_profile(profile());
+            .model_profile(profile())
+            .event_buffer(self.event_buffer);
         for tool in &self.tools {
             builder = builder.tool(tool.clone());
         }
@@ -157,11 +193,131 @@ impl ChildRuntimeFactory for ScriptedChildFactory {
         if self
             .tools
             .iter()
-            .any(|t| t.effects().requires_authorization())
+            .any(|tool| !tool.spec().permission_upper_bound.is_empty())
         {
             builder = builder.legacy_approval_authority();
         }
+        if let Some(store) = &self.artifact_store {
+            let offloader = ArtifactOffloader::new(store.clone())
+                .with_threshold_bytes(256)?
+                .with_preview_chars(128)?;
+            builder = builder.tool_output_processor(Arc::new(offloader));
+        }
         Ok(builder)
+    }
+
+    fn artifact_store(&self) -> Option<Arc<dyn ArtifactStore>> {
+        self.artifact_store.clone()
+    }
+}
+
+#[derive(Debug, Default)]
+struct DelegationArtifactState {
+    next_id: usize,
+    values: BTreeMap<ArtifactId, (ArtifactRef, Vec<u8>)>,
+    idempotency: BTreeMap<String, ArtifactId>,
+}
+
+/// Protected in-memory artifact store used to exercise the default bounded
+/// transfer implementation rather than a test-only ownership shortcut.
+#[derive(Debug, Default)]
+struct DelegationArtifactStore {
+    state: Mutex<DelegationArtifactState>,
+}
+
+#[async_trait]
+impl ArtifactStore for DelegationArtifactStore {
+    async fn put(&self, write: ArtifactWrite) -> Result<ArtifactRef, ArtifactError> {
+        let mut state = self.state.lock().expect("artifact store poisoned");
+        if let Some(id) = state.idempotency.get(&write.idempotency_key) {
+            let (reference, bytes) = state
+                .values
+                .get(id)
+                .expect("idempotency index points at stored artifact");
+            if bytes == &write.bytes
+                && reference.media_type == write.media_type
+                && reference.sensitivity == write.sensitivity
+                && reference.retention == write.retention
+                && reference.provenance == write.provenance
+            {
+                return Ok(reference.clone());
+            }
+            return Err(ArtifactError::Integrity {
+                detail: "artifact idempotency key was reused for different content".into(),
+            });
+        }
+
+        state.next_id = state.next_id.saturating_add(1);
+        let id = ArtifactId::new(format!("delegation-artifact-{}", state.next_id))?;
+        let reference = ArtifactRef {
+            id: id.clone(),
+            digest: ArtifactDigest::new("sha256", format!("{:064x}", write.bytes.len()))?,
+            media_type: write.media_type,
+            byte_length: write.bytes.len() as u64,
+            sensitivity: write.sensitivity,
+            retention: write.retention,
+            provenance: write.provenance,
+        };
+        state.idempotency.insert(write.idempotency_key, id.clone());
+        state.values.insert(id, (reference.clone(), write.bytes));
+        Ok(reference)
+    }
+
+    async fn read(&self, read: ArtifactRead) -> Result<ArtifactChunk, ArtifactError> {
+        let state = self.state.lock().expect("artifact store poisoned");
+        let (reference, bytes) = state.values.get(&read.id).ok_or(ArtifactError::NotFound)?;
+        if read.session != reference.provenance.session {
+            return Err(ArtifactError::AccessDenied);
+        }
+        let start = usize::try_from(read.offset).map_err(|_| ArtifactError::InvalidRange {
+            detail: "artifact offset does not fit this platform".into(),
+        })?;
+        if start > bytes.len() {
+            return Err(ArtifactError::InvalidRange {
+                detail: "artifact offset exceeds content".into(),
+            });
+        }
+        let end = start.saturating_add(read.limit as usize).min(bytes.len());
+        Ok(ArtifactChunk {
+            reference: reference.clone(),
+            bytes: bytes[start..end].to_vec(),
+            offset: read.offset,
+            next_offset: (end < bytes.len()).then_some(end as u64),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ChildArtifactTool;
+
+#[async_trait]
+impl LegacyTool for ChildArtifactTool {
+    fn name(&self) -> &str {
+        "produce_child_artifact"
+    }
+
+    fn description(&self) -> &str {
+        "Produce a large delegated result that the parent must recover"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","additionalProperties":false})
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default()
+    }
+
+    async fn invoke_legacy(
+        &self,
+        _arguments: Value,
+        _ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        Ok(ToolOutcome::text(format!(
+            "{}CHILD_ARTIFACT_SENTINEL{}",
+            "delegated-head-".repeat(5_000),
+            "-delegated-tail".repeat(5_000),
+        )))
     }
 }
 
@@ -209,6 +365,407 @@ pub fn reasoning_only_child_script(text: &str) -> Vec<ScriptedStream> {
             reason: FinishReason::Stop,
         },
     ])]
+}
+
+#[derive(Debug)]
+struct CountingEditTool {
+    invocations: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LegacyTool for CountingEditTool {
+    fn name(&self) -> &str {
+        "edit"
+    }
+
+    fn description(&self) -> &str {
+        "Counts edit invocations without mutating a real workspace."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default()
+    }
+
+    async fn invoke_legacy(
+        &self,
+        _arguments: Value,
+        _ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        self.invocations.fetch_add(1, Ordering::AcqRel);
+        Ok(ToolOutcome::text("edited"))
+    }
+}
+
+fn questionnaire_arguments() -> Value {
+    json!({
+        "questions": [{
+            "id": "implementation",
+            "header": "Implementation",
+            "prompt": "Which implementation should be used?",
+            "choices": [
+                {
+                    "id": "recommended",
+                    "label": "Recommended",
+                    "description": "Use the recommended implementation"
+                },
+                {
+                    "id": "alternate",
+                    "label": "Alternate"
+                }
+            ],
+            "allow_free_form": true
+        }],
+        "sensitivity": "sensitive"
+    })
+}
+
+const RENAMED_QUESTIONNAIRE_TOOL_NAME: &str = "request_task_details";
+
+/// Proves the child-return seam is defined by the typed interaction contract,
+/// not by the standard questionnaire tool's well-known name.
+#[derive(Debug)]
+struct RenamedQuestionnaireTool;
+
+#[async_trait]
+impl Tool for RenamedQuestionnaireTool {
+    fn spec(&self) -> ToolSpec {
+        let mut spec = QuestionnaireTool::new().spec();
+        spec.name = RENAMED_QUESTIONNAIRE_TOOL_NAME.to_owned();
+        spec
+    }
+
+    fn supports_interaction(&self) -> bool {
+        true
+    }
+
+    fn interaction_request(
+        &self,
+        prepared: &PreparedToolCall,
+        origin: InteractionOrigin,
+        deadline: Deadline,
+    ) -> Result<Option<InteractionRequest>, RuntimeError> {
+        QuestionnaireTool::new().interaction_request(prepared, origin, deadline)
+    }
+
+    fn resolve_interaction(
+        &self,
+        prepared: &PreparedToolCall,
+        response: &InteractionResponse,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        QuestionnaireTool::new().resolve_interaction(prepared, response)
+    }
+
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        QuestionnaireTool::new().invoke(prepared, ctx).await
+    }
+}
+
+fn read_ask_edit_script() -> Vec<ScriptedStream> {
+    let mut events = Vec::new();
+    events.extend(tool_call_fragments(0, "call-read", "echo", "{}"));
+    events.extend(tool_call_fragments(
+        1,
+        "call-question",
+        RENAMED_QUESTIONNAIRE_TOOL_NAME,
+        &questionnaire_arguments().to_string(),
+    ));
+    events.extend(tool_call_fragments(2, "call-edit", "edit", "{}"));
+    events.push(usage_event(12, 2));
+    events.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    vec![ScriptedStream::new(events)]
+}
+
+#[derive(Debug)]
+struct GatedAskProvider {
+    gate: Option<Arc<Notify>>,
+    entered: Option<Arc<AtomicBool>>,
+}
+
+#[async_trait]
+impl Provider for GatedAskProvider {
+    fn describe(&self) -> Vec<ModelDescriptor> {
+        Vec::new()
+    }
+
+    fn capabilities(&self, _model: &ModelId) -> Option<Capabilities> {
+        Some(Capabilities::basic_streaming())
+    }
+
+    async fn stream(
+        &self,
+        _request: agent_runtime_core::provider::ProviderRequest,
+        _ctx: ProviderCallContext,
+    ) -> Result<ProviderStream, ProviderError> {
+        if let Some(entered) = &self.entered {
+            entered.store(true, Ordering::Release);
+        }
+        if let Some(gate) = &self.gate {
+            gate.notified().await;
+        }
+        let mut events = tool_call_fragments(
+            0,
+            "call-question",
+            QUESTIONNAIRE_TOOL_NAME,
+            &questionnaire_arguments().to_string(),
+        );
+        events.push(ProviderStreamEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        });
+        Ok(Box::pin(futures_util::stream::iter(events)))
+    }
+}
+
+#[derive(Debug)]
+struct ReverseArrivalFactory {
+    next: AtomicUsize,
+    first_gate: Arc<Notify>,
+    first_entered: Arc<AtomicBool>,
+}
+
+impl ChildRuntimeFactory for ReverseArrivalFactory {
+    fn child_builder(&self, _spec: &ChildSpec) -> Result<RuntimeBuilder, RuntimeError> {
+        let index = self.next.fetch_add(1, Ordering::AcqRel);
+        let provider = if index == 0 {
+            GatedAskProvider {
+                gate: Some(self.first_gate.clone()),
+                entered: Some(self.first_entered.clone()),
+            }
+        } else {
+            GatedAskProvider {
+                gate: None,
+                entered: None,
+            }
+        };
+        Ok(RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(Arc::new(provider))
+            .model_profile(profile())
+            .event_buffer(1)
+            .tool(Arc::new(QuestionnaireTool::new())))
+    }
+}
+
+/// A child `[read, typed-interaction, edit]` parallel batch completes one fully paired
+/// exchange, returns exact input without a root broker, and never invokes the
+/// suffix edit. The outcome remains available to idempotent host waiters while
+/// automatic delivery drains exactly once, even with a one-event observer
+/// buffer.
+pub async fn assert_returned_input_pairs_and_is_lossless() {
+    let (_runtime, parent) = parent_session(true).await;
+    let edit_invocations = Arc::new(AtomicUsize::new(0));
+    let mut child_script = read_ask_edit_script();
+    child_script.push(text_child_script("continued after explicit follow-up").remove(0));
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![child_script])
+            .with_event_buffer(1)
+            .with_tools(vec![
+                Arc::new(EchoTool),
+                Arc::new(RenamedQuestionnaireTool),
+                Arc::new(CountingEditTool {
+                    invocations: edit_invocations.clone(),
+                }),
+            ]),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default()).unwrap();
+
+    let outcome = coordinator
+        .spawn(child_spec("inspect, clarify, then edit"))
+        .await
+        .unwrap();
+    let (child, handle) = match outcome {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+
+    let first = coordinator.wait_task_outcome(&child).await.unwrap();
+    let request = match first {
+        ChildTaskOutcome::NeedsInput {
+            child: outcome_child,
+            request,
+        } => {
+            assert_eq!(outcome_child, child);
+            request
+        }
+        other => panic!("expected returned child input, got {other:?}"),
+    };
+    assert_eq!(request.origin().session(), handle.id());
+    assert_eq!(
+        coordinator.wait_task_outcome(&child).await.unwrap(),
+        ChildTaskOutcome::NeedsInput {
+            child: child.clone(),
+            request: request.clone(),
+        },
+        "host waits are idempotent and cannot race automatic delivery"
+    );
+
+    let delivered = coordinator.take_ready_task_outcomes();
+    assert_eq!(
+        delivered,
+        [ChildTaskOutcome::NeedsInput {
+            child: child.clone(),
+            request: request.clone(),
+        }]
+    );
+    assert!(coordinator.take_ready_task_outcomes().is_empty());
+    assert!(matches!(
+        coordinator.task_outcome(&child).unwrap(),
+        Some(ChildTaskOutcome::NeedsInput { .. })
+    ));
+
+    let blocks = handle
+        .history()
+        .into_iter()
+        .flat_map(|message| message.content)
+        .filter_map(|part| match part {
+            agent_runtime_core::content::ContentPart::ToolResult(block) => Some(block),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|block| block.name.as_str())
+            .collect::<Vec<_>>(),
+        ["echo", RENAMED_QUESTIONNAIRE_TOOL_NAME, "edit"]
+    );
+    assert!(!blocks[0].is_error);
+    assert!(!blocks[1].is_error);
+    assert!(blocks[2].is_error);
+    assert!(
+        blocks[2]
+            .content
+            .iter()
+            .filter_map(agent_runtime_core::content::ContentPart::as_text)
+            .any(|text| text.contains("skipped"))
+    );
+    assert_eq!(edit_invocations.load(Ordering::Acquire), 0);
+    assert_eq!(
+        factory.provider(0).requests().len(),
+        1,
+        "NeedsInput must not issue a second child provider request"
+    );
+
+    coordinator
+        .follow_up(
+            &child,
+            UserInput::text("Use the recommended implementation"),
+        )
+        .await
+        .unwrap();
+    let status = coordinator.wait(&child).await.unwrap();
+    assert_eq!(
+        status.last_result.as_deref(),
+        Some("continued after explicit follow-up")
+    );
+    assert!(matches!(
+        coordinator.task_outcome(&child).unwrap(),
+        Some(ChildTaskOutcome::Completed { ref result, .. })
+            if result.text == "continued after explicit follow-up"
+    ));
+    assert_eq!(
+        coordinator.take_ready_task_outcomes(),
+        [ChildTaskOutcome::Completed {
+            child: child.clone(),
+            result: ChildTaskResult {
+                text: "continued after explicit follow-up".to_owned(),
+                artifacts: Vec::new(),
+            },
+        }],
+        "explicit follow-up must clear stale input and deliver its own completion once"
+    );
+    assert!(coordinator.take_ready_task_outcomes().is_empty());
+    assert_eq!(factory.provider(0).requests().len(), 2);
+}
+
+/// Concurrent returned-input arrivals are delivered in canonical
+/// `(child_id, request_id)` order even when child two arrives first, and a
+/// simultaneous host waiter cannot consume the automatic delivery.
+pub async fn assert_returned_input_reverse_arrival_is_canonical() {
+    let (_runtime, parent) = parent_session(true).await;
+    let first_gate = Arc::new(Notify::new());
+    let first_entered = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(ReverseArrivalFactory {
+        next: AtomicUsize::new(0),
+        first_gate: first_gate.clone(),
+        first_entered: first_entered.clone(),
+    });
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+
+    let first = coordinator.spawn(child_spec("first")).await.unwrap();
+    let first_child = match first {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected first child, got {other:?}"),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !first_entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let second = coordinator.spawn(child_spec("second")).await.unwrap();
+    let second_child = match second {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected second child, got {other:?}"),
+    };
+    let second_outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        coordinator.wait_task_outcome(&second_child),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        second_outcome,
+        ChildTaskOutcome::NeedsInput { .. }
+    ));
+
+    first_gate.notify_one();
+    let first_outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        coordinator.wait_task_outcome(&first_child),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(first_outcome, ChildTaskOutcome::NeedsInput { .. }));
+
+    let (automatic, first_read, second_read) = tokio::join!(
+        coordinator.wait_ready_task_outcomes(),
+        coordinator.wait_task_outcome(&first_child),
+        coordinator.wait_task_outcome(&second_child),
+    );
+    let automatic = automatic.unwrap();
+    assert_eq!(
+        automatic
+            .iter()
+            .map(|outcome| match outcome {
+                ChildTaskOutcome::NeedsInput { child, .. }
+                | ChildTaskOutcome::Completed { child, .. } => child.as_str(),
+            })
+            .collect::<Vec<_>>(),
+        [first_child.as_str(), second_child.as_str()]
+    );
+    assert!(matches!(
+        first_read.unwrap(),
+        ChildTaskOutcome::NeedsInput { .. }
+    ));
+    assert!(matches!(
+        second_read.unwrap(),
+        ChildTaskOutcome::NeedsInput { .. }
+    ));
 }
 
 /// Spawn one child and assert the parent stream carries the ordered,
@@ -281,6 +838,113 @@ pub async fn assert_spawn_lifecycle_and_result() {
     assert_eq!(
         coordinator.result(&child).unwrap().as_deref(),
         Some("child answer")
+    );
+}
+
+/// A child-produced artifact is copied explicitly into parent ownership,
+/// retains source lineage, and remains recoverable only under the new owner.
+pub async fn assert_child_artifact_result_transfers_to_parent() {
+    let (_runtime, parent) = parent_session(true).await;
+    let mut call = tool_call_fragments(0, "call-child-artifact", "produce_child_artifact", "{}");
+    call.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let store = Arc::new(DelegationArtifactStore::default());
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![vec![
+            ScriptedStream::new(call),
+            ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "artifact ready".into(),
+                },
+                usage_event(8, 2),
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]),
+        ]])
+        .with_tools(vec![Arc::new(ChildArtifactTool)])
+        .with_artifact_store(store.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+
+    let (child, handle) = match coordinator
+        .spawn(child_spec("produce a large result"))
+        .await
+        .unwrap()
+    {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    let result = match coordinator.wait_task_outcome(&child).await.unwrap() {
+        ChildTaskOutcome::Completed {
+            child: outcome_child,
+            result,
+        } => {
+            assert_eq!(outcome_child, child);
+            result
+        }
+        other => panic!("expected a completed artifact result, got {other:?}"),
+    };
+    assert_eq!(result.text, "artifact ready");
+    assert_eq!(result.artifacts.len(), 1);
+
+    let transferred = &result.artifacts[0];
+    assert_eq!(transferred.provenance.session, *parent.id());
+    assert_eq!(transferred.provenance.purpose, "delegation.child-result");
+    let lineage = transferred
+        .provenance
+        .derived_from
+        .as_ref()
+        .expect("parent reference preserves child lineage");
+    assert_eq!(lineage.session, *handle.id());
+    assert_ne!(lineage.id, transferred.id);
+    assert_eq!(lineage.digest, transferred.digest);
+
+    let status = coordinator.wait(&child).await.unwrap();
+    assert_eq!(status.last_artifacts, result.artifacts);
+    assert_eq!(
+        coordinator.take_ready_task_outcomes(),
+        [ChildTaskOutcome::Completed {
+            child: child.clone(),
+            result: result.clone(),
+        }]
+    );
+
+    let mut bytes = Vec::new();
+    let mut offset = 0u64;
+    while offset < transferred.byte_length {
+        let chunk = store
+            .read(ArtifactRead {
+                session: parent.id().clone(),
+                id: transferred.id.clone(),
+                offset,
+                limit: MAX_ARTIFACT_READ_BYTES,
+            })
+            .await
+            .unwrap();
+        bytes.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset.unwrap_or(transferred.byte_length);
+    }
+    assert_eq!(bytes.len() as u64, transferred.byte_length);
+    assert!(
+        String::from_utf8(bytes)
+            .unwrap()
+            .contains("CHILD_ARTIFACT_SENTINEL")
+    );
+    assert_eq!(
+        store
+            .read(ArtifactRead {
+                session: handle.id().clone(),
+                id: transferred.id.clone(),
+                offset: 0,
+                limit: 1,
+            })
+            .await
+            .unwrap_err(),
+        ArtifactError::AccessDenied,
+        "the copied parent reference grants no authority back to the child"
     );
 }
 
@@ -398,9 +1062,9 @@ pub async fn assert_approval_sees_the_spawn_detail() {
     let seen = approval.seen.lock().expect("seen poisoned").clone();
     let request = seen
         .iter()
-        .find(|request| request.tool == "delegation.spawn")
+        .find(|request| request.prepared().tool() == "delegation.spawn")
         .expect("the spawn was routed through approval");
-    let rendered = request.arguments.to_string();
+    let rendered = request.prepared().arguments().to_string();
     assert!(
         rendered.contains("summarize the auth module"),
         "approval must see the child task: {rendered}"
@@ -630,10 +1294,20 @@ pub async fn assert_follow_up_and_turn_limit() {
     assert_eq!(status.last_result.as_deref(), Some("first"));
     assert_eq!(status.turns_used, 1);
 
-    coordinator
-        .follow_up(&child, UserInput::text("continue"))
-        .await
-        .unwrap();
+    let (first_follow_up, competing_follow_up) = tokio::join!(
+        coordinator.follow_up(&child, UserInput::text("continue")),
+        coordinator.follow_up(&child, UserInput::text("competing continuation")),
+    );
+    assert_eq!(
+        usize::from(first_follow_up.is_ok()) + usize::from(competing_follow_up.is_ok()),
+        1,
+        "the final child-turn slot must be reserved atomically"
+    );
+    let rejected = first_follow_up
+        .err()
+        .or_else(|| competing_follow_up.err())
+        .expect("one concurrent follow-up is rejected");
+    assert!(rejected.message.contains("turn limit"), "{rejected:?}");
     let status = coordinator.wait(&child).await.unwrap();
     assert_eq!(status.last_result.as_deref(), Some("second"));
     assert_eq!(status.turns_used, 2);

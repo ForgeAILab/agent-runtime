@@ -4,14 +4,14 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use agent_runtime_core::error::RuntimeError;
-use agent_runtime_core::tool::{InvocationContext, Tool, ToolEffects, ToolOutcome};
+use agent_runtime_core::tool::{InvocationContext, LegacyTool, ToolEffects, ToolOutcome};
 
 /// A read-only tool that echoes its arguments back.
 #[derive(Debug, Default)]
 pub struct EchoTool;
 
 #[async_trait]
-impl Tool for EchoTool {
+impl LegacyTool for EchoTool {
     fn name(&self) -> &str {
         "echo"
     }
@@ -22,9 +22,9 @@ impl Tool for EchoTool {
         json!({"type": "object", "additionalProperties": true})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
+        ToolEffects::new(vec![])
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         arguments: Value,
         _ctx: &InvocationContext,
@@ -49,7 +49,7 @@ impl WriteTool {
 }
 
 #[async_trait]
-impl Tool for WriteTool {
+impl LegacyTool for WriteTool {
     fn name(&self) -> &str {
         "write"
     }
@@ -60,9 +60,9 @@ impl Tool for WriteTool {
         json!({"type": "object"})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only().with_write(self.scope.clone())
+        ToolEffects::new(vec![]).with_write(self.scope.clone())
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         _arguments: Value,
         _ctx: &InvocationContext,
@@ -84,7 +84,7 @@ pub fn named_echo(name: impl Into<String>) -> NamedEchoTool {
 }
 
 #[async_trait]
-impl Tool for NamedEchoTool {
+impl LegacyTool for NamedEchoTool {
     fn name(&self) -> &str {
         &self.name
     }
@@ -95,9 +95,9 @@ impl Tool for NamedEchoTool {
         json!({"type": "object", "additionalProperties": true})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
+        ToolEffects::new(vec![])
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         arguments: Value,
         _ctx: &InvocationContext,
@@ -111,7 +111,7 @@ impl Tool for NamedEchoTool {
 pub struct FailingTool;
 
 #[async_trait]
-impl Tool for FailingTool {
+impl LegacyTool for FailingTool {
     fn name(&self) -> &str {
         "fail"
     }
@@ -122,9 +122,9 @@ impl Tool for FailingTool {
         json!({"type": "object"})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
+        ToolEffects::new(vec![])
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         _arguments: Value,
         _ctx: &InvocationContext,

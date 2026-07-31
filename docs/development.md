@@ -88,3 +88,37 @@ A release candidate is tagged only after:
 A failing consumer suite blocks a **compatible** release. A release may proceed
 only if it is explicitly declared **breaking** and coordinated consumer
 proposals are documented in `CHANGELOG.md`.
+
+### Consumer compatibility matrix
+
+Run the neutral contract row in this repository for every release candidate.
+The product row is additionally required when that consumer is adopting the
+candidate revision.
+
+| Consumer | Neutral contract gate | Coordinated product gate |
+| --- | --- | --- |
+| Smith | `cargo test -p agent-runtime-testkit --test consumer_smith` | Smith runtime/CLI/TUI contract and PTY suites against an exact local or pinned runtime revision |
+| Nyx | `cargo test -p agent-runtime-testkit --test consumer_nyx` | Nyx workspace tests against the candidate revision |
+| Open Forge | `cargo test -p agent-runtime-testkit --test consumer_open_forge` | Open Forge workspace tests against the candidate revision |
+
+Record the exact consumer commit and runtime commit in the release change or
+tag notes. A sibling path override is acceptable for local verification but
+must remain uncommitted; the released consumer manifest must resolve an exact
+version, tag, or Git revision.
+
+### Schema and MSRV matrix
+
+```sh
+# Current event vocabulary plus every retained compatibility fixture.
+cargo test -p agent-runtime-testkit event_schema
+
+# All production packages on the declared minimum compiler.
+cargo +1.86.0 build \
+  -p agent-runtime-registry -p agent-runtime-core -p agent-runtime-ability \
+  -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-obs \
+  -p agent-runtime --all-features
+```
+
+The current event schema is v8. Golden fixtures cover the compatible v5, v6,
+v7, and v8 forms; older unattributed provider-output deltas are rejected
+deliberately.

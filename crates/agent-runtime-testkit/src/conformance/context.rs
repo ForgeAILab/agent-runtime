@@ -131,7 +131,7 @@ pub fn assert_provider_request_is_fully_accounted_for(plan: &ContextPlan, model:
 }
 
 /// Asserts a budget report's per-category tokens sum to its reported total,
-/// are ordered by fragment-kind rank, and that every listed category
+/// are ordered by the stable accounting-key order, and that every listed category
 /// actually contributed at least one fragment.
 pub fn assert_budget_report_attributes_by_category(report: &BudgetReport) {
     let summed: u32 = report.categories.iter().map(|c| c.tokens).sum();
@@ -143,8 +143,8 @@ pub fn assert_budget_report_attributes_by_category(report: &BudgetReport) {
         report
             .categories
             .windows(2)
-            .all(|pair| pair[0].kind.order_rank() <= pair[1].kind.order_rank()),
-        "categories must be ordered by fragment-kind rank"
+            .all(|pair| pair[0].kind <= pair[1].kind),
+        "categories must be ordered by the stable accounting key"
     );
     for category in &report.categories {
         assert!(

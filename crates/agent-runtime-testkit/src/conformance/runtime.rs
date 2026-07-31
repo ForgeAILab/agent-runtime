@@ -11,7 +11,7 @@ use agent_runtime_core::event::RuntimeEvent;
 /// at the first `TurnCompleted`.
 pub async fn run_turn_collect(session: &SessionHandle, input: UserInput) -> Vec<RuntimeEvent> {
     let mut stream = session.subscribe();
-    let _turn = session.send(input);
+    let _turn = session.send(input).unwrap();
     let mut payloads = Vec::new();
     while let Some(env) = stream.next().await {
         let is_end = matches!(env.payload, RuntimeEvent::TurnCompleted { .. });

@@ -36,7 +36,7 @@ async fn run_one_turn(prompt: &str, input: &str) -> SessionSnapshot {
         .start_session(StartSession::new())
         .await
         .expect("session starts");
-    session.run(UserInput::text(input)).await;
+    session.run(UserInput::text(input)).await.unwrap();
     session.snapshot()
 }
 

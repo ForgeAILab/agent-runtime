@@ -26,7 +26,7 @@ pub struct NoSpawnApproval;
 #[async_trait]
 impl ApprovalPolicy for NoSpawnApproval {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        if request.effects.spawns_process() {
+        if request.prepared().effects().spawns_process() {
             ApprovalDecision::deny("process spawning is disabled by platform policy")
         } else {
             ApprovalDecision::Allow

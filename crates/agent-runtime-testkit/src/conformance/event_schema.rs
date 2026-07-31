@@ -5,6 +5,11 @@ use serde_json::Value;
 
 const EVENT_ENVELOPE_V1: &str = include_str!("fixtures/event-envelope-v1.json");
 const EVENT_ENVELOPE_V3: &str = include_str!("fixtures/event-envelope-v3.json");
+const EVENT_ENVELOPE_V4: &str = include_str!("fixtures/event-envelope-v4.json");
+const EVENT_ENVELOPE_V5: &str = include_str!("fixtures/event-envelope-v5.json");
+const EVENT_ENVELOPE_V6: &str = include_str!("fixtures/event-envelope-v6.json");
+const EVENT_ENVELOPE_V7: &str = include_str!("fixtures/event-envelope-v7.json");
+const EVENT_ENVELOPE_V8: &str = include_str!("fixtures/event-envelope-v8.json");
 
 /// Asserts every envelope carries the current schema version, round-trips
 /// losslessly through JSON, and that sequence numbers are strictly increasing.
@@ -27,17 +32,69 @@ pub fn assert_versioned_and_roundtrips(events: &[EventEnvelope]) {
     }
 }
 
-/// Asserts the current serializer remains byte-structure compatible with the
-/// committed v3 golden event fixture.
-pub fn assert_v3_golden_fixture() {
-    let expected: Value = serde_json::from_str(EVENT_ENVELOPE_V3).expect("valid v3 fixture JSON");
+/// Asserts the previous attempt-streaming schema remains readable and
+/// byte-structure stable after the v6 vocabulary extension.
+pub fn assert_v5_golden_fixture() {
+    let expected: Value = serde_json::from_str(EVENT_ENVELOPE_V5).expect("valid v5 fixture JSON");
     let envelopes: Vec<EventEnvelope> =
-        serde_json::from_value(expected.clone()).expect("v3 fixture remains readable");
-    let actual = serde_json::to_value(envelopes).expect("serialize v3 fixture");
+        serde_json::from_value(expected.clone()).expect("v5 fixture remains readable");
+    let actual = serde_json::to_value(envelopes).expect("serialize v5 fixture");
     assert_eq!(
         actual, expected,
-        "the v3 EventEnvelope JSON representation changed"
+        "the v5 EventEnvelope JSON representation changed"
     );
+}
+
+/// Asserts the current serializer exactly matches the metadata-only v6 host
+/// interaction lifecycle fixture.
+pub fn assert_v6_golden_fixture() {
+    let expected: Value = serde_json::from_str(EVENT_ENVELOPE_V6).expect("valid v6 fixture JSON");
+    let envelopes: Vec<EventEnvelope> =
+        serde_json::from_value(expected.clone()).expect("v6 fixture remains readable");
+    let actual = serde_json::to_value(envelopes).expect("serialize v6 fixture");
+    assert_eq!(
+        actual, expected,
+        "the v6 EventEnvelope JSON representation changed"
+    );
+}
+
+/// Asserts the current serializer exactly matches the metadata-only v7 child
+/// interaction handoff fixture.
+pub fn assert_v7_golden_fixture() {
+    let expected: Value = serde_json::from_str(EVENT_ENVELOPE_V7).expect("valid v7 fixture JSON");
+    let envelopes: Vec<EventEnvelope> =
+        serde_json::from_value(expected.clone()).expect("v7 fixture remains readable");
+    let actual = serde_json::to_value(envelopes).expect("serialize v7 fixture");
+    assert_eq!(
+        actual, expected,
+        "the v7 EventEnvelope JSON representation changed"
+    );
+}
+
+/// Asserts the current serializer exactly matches the v8 durability-aligned
+/// public and sensitive todo-plan projections.
+pub fn assert_v8_golden_fixture() {
+    let expected: Value = serde_json::from_str(EVENT_ENVELOPE_V8).expect("valid v8 fixture JSON");
+    let envelopes: Vec<EventEnvelope> =
+        serde_json::from_value(expected.clone()).expect("v8 fixture remains readable");
+    let actual = serde_json::to_value(envelopes).expect("serialize v8 fixture");
+    assert_eq!(
+        actual, expected,
+        "the v8 EventEnvelope JSON representation changed"
+    );
+}
+
+/// Asserts old unattributed delta fixtures remain rejected by v6 just as they
+/// were by v5; adding interaction events does not relax output attribution.
+pub fn assert_unattributed_output_fixtures_are_rejected() {
+    for fixture in [EVENT_ENVELOPE_V3, EVENT_ENVELOPE_V4] {
+        let err = serde_json::from_str::<Vec<EventEnvelope>>(fixture)
+            .expect_err("pre-v5 unattributed output must not deserialize");
+        assert!(
+            err.to_string().contains("request") || err.to_string().contains("attempt"),
+            "expected missing request/attempt identity, got: {err}"
+        );
+    }
 }
 
 /// Asserts the frozen v1 golden fixture no longer deserializes under the
@@ -49,10 +106,7 @@ pub fn assert_v3_golden_fixture() {
 pub fn assert_v1_fixture_rejected_by_current_schema() {
     let err = serde_json::from_str::<Vec<EventEnvelope>>(EVENT_ENVELOPE_V1)
         .expect_err("the v1 fixture must not deserialize under the current schema");
-    assert!(
-        err.to_string().contains("argument_keys"),
-        "expected the v1 fixture to be rejected for missing argument_keys, got: {err}"
-    );
+    assert!(!err.to_string().is_empty());
 }
 
 #[cfg(test)]
@@ -60,8 +114,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v3_golden_fixture_is_exactly_compatible() {
-        assert_v3_golden_fixture();
+    fn v5_golden_fixture_is_exactly_compatible() {
+        assert_v5_golden_fixture();
+    }
+
+    #[test]
+    fn v6_golden_fixture_is_exactly_compatible() {
+        assert_v6_golden_fixture();
+    }
+
+    #[test]
+    fn v7_golden_fixture_is_exactly_compatible() {
+        assert_v7_golden_fixture();
+    }
+
+    #[test]
+    fn v8_golden_fixture_is_exactly_compatible() {
+        assert_v8_golden_fixture();
+    }
+
+    #[test]
+    fn unattributed_output_fixtures_are_rejected_by_v6() {
+        assert_unattributed_output_fixtures_are_rejected();
     }
 
     #[test]

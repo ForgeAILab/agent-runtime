@@ -93,6 +93,8 @@ pub enum UsageSource {
     ProviderAttempt,
     /// A tool-loop step.
     ToolLoop,
+    /// A dedicated semantic-context summary call.
+    SemanticSummary,
     /// A consumer-facing aggregate.
     Rollup,
 }
@@ -109,6 +111,9 @@ pub struct Provenance {
     /// The tool call, if this record came from a tool step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<ToolCallId>,
+    /// Stable host-neutral purpose label for separately attributed work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
     /// Whether the producing attempt failed (kept so failures stay visible).
     #[serde(default)]
     pub failed: bool,

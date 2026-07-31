@@ -48,7 +48,7 @@ async fn prompt_reaches_provider_and_events_reach_a_sink() {
         .start_session(StartSession::new())
         .await
         .expect("session starts");
-    session.run(UserInput::text("hi")).await;
+    session.run(UserInput::text("hi")).await.unwrap();
 
     // 3. The assembled prompt reached the provider as the first system message.
     let requests = provider.requests();

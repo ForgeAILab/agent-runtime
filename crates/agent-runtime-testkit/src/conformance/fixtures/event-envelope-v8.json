@@ -1,0 +1,57 @@
+[
+  {
+    "schema_version": 8,
+    "seq": 0,
+    "id": "evt-v8-1",
+    "session": "session-1",
+    "turn": "turn-1",
+    "timestamp": 100,
+    "payload": {
+      "event": "plan_updated",
+      "revision": 3,
+      "sensitivity": "public",
+      "counts": {
+        "cancelled": 0,
+        "completed": 1,
+        "in_progress": 1,
+        "pending": 1
+      },
+      "items": [
+        {
+          "id": "inspect",
+          "text": "Inspect the implementation",
+          "status": "completed"
+        },
+        {
+          "id": "change",
+          "text": "Implement the change",
+          "status": "in_progress"
+        },
+        {
+          "id": "verify",
+          "text": "Run focused verification",
+          "status": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "schema_version": 8,
+    "seq": 1,
+    "id": "evt-v8-2",
+    "session": "session-2",
+    "turn": "turn-4",
+    "timestamp": 101,
+    "payload": {
+      "event": "plan_updated",
+      "revision": 1,
+      "sensitivity": "sensitive",
+      "counts": {
+        "cancelled": 0,
+        "completed": 0,
+        "in_progress": 1,
+        "pending": 2
+      }
+    }
+  }
+]

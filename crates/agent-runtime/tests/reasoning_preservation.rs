@@ -24,7 +24,7 @@ use agent_runtime::runtime::{RuntimeBuilder, StartSession};
 struct ProbeTool;
 
 #[async_trait]
-impl Tool for ProbeTool {
+impl LegacyTool for ProbeTool {
     fn name(&self) -> &str {
         "probe"
     }
@@ -35,9 +35,9 @@ impl Tool for ProbeTool {
         json!({"type": "object", "additionalProperties": true})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
+        ToolEffects::new(vec![])
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         arguments: Value,
         _ctx: &InvocationContext,
@@ -114,7 +114,10 @@ async fn reasoning_is_retained_and_resent_within_the_turn() {
         .start_session(StartSession::new())
         .await
         .expect("session starts");
-    session.run(UserInput::text("call the probe tool")).await;
+    session
+        .run(UserInput::text("call the probe tool"))
+        .await
+        .unwrap();
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2, "a tool turn makes two provider requests");
@@ -179,7 +182,7 @@ async fn redacted_reasoning_stays_a_separate_flagged_part() {
         .start_session(StartSession::new())
         .await
         .expect("session starts");
-    session.run(UserInput::text("hello")).await;
+    session.run(UserInput::text("hello")).await.unwrap();
 
     assert_eq!(
         reasoning_parts(&session.snapshot().history),
@@ -233,8 +236,8 @@ async fn a_reasoning_only_completion_reports_no_visible_output() {
 
     let mut completions = Vec::new();
     let mut events = session.subscribe();
-    session.run(UserInput::text("first")).await;
-    session.run(UserInput::text("second")).await;
+    session.run(UserInput::text("first")).await.unwrap();
+    session.run(UserInput::text("second")).await.unwrap();
     while let Some(env) = events.next().await {
         if let RuntimeEvent::TurnCompleted {
             finish,
@@ -305,9 +308,9 @@ async fn a_new_turn_sheds_prior_reasoning() {
         .start_session(StartSession::new())
         .await
         .expect("session starts");
-    session.run(UserInput::text("first")).await;
-    session.run(UserInput::text("second")).await;
-    session.run(UserInput::text("third")).await;
+    session.run(UserInput::text("first")).await.unwrap();
+    session.run(UserInput::text("second")).await.unwrap();
+    session.run(UserInput::text("third")).await.unwrap();
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);

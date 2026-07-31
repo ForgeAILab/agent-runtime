@@ -2,7 +2,7 @@
 //! trustworthy rather than merely smaller.
 //!
 //! [`validate_compacted`] is the structural gate every compaction result
-//! passes through, whether produced by [`SemanticCompactor`] or a host's own
+//! passes through, whether produced by [`StructuralCompactor`] or a host's own
 //! [`agent_runtime::context::Compactor`] implementation — so most of these
 //! assertions are written directly against it: a host authoring a custom
 //! compactor can run them against its own candidate outputs the same way this
@@ -11,16 +11,15 @@
 //! gate rejects a candidate anyway if that is somehow violated. A tool call
 //! and its result must both survive or both be removed together — never one
 //! without the other, since an orphaned half is unusable to a provider. A
-//! `Sensitivity::Secret` fragment must never be folded into a summary, since a
-//! summary's text is exactly the kind of derived content that could leak it.
-//! And repeating compaction from an already-compacted state must change
-//! nothing, or a turn that only adds a little content would rewrite history
-//! again on every single request.
+//! `Sensitivity::Secret` fragment must never be covered by host-supplied
+//! semantic-summary provenance. The shipped structural compactor never
+//! creates a summary itself. Repeating compaction once no safe structural
+//! operation remains must change nothing.
 
 use agent_runtime::context::{
     CharRatioSizer, CompactionErrorKind, CompactionOutcome, CompactionPolicy, ContextFragment,
-    FragmentContent, FragmentId, FragmentKind, FragmentSource, RequestSizer, SemanticCompactor,
-    Sensitivity, SummaryProvenance, validate_compacted,
+    FragmentContent, FragmentId, FragmentKind, FragmentSource, RequestSizer, Sensitivity,
+    StructuralCompactor, SummaryProvenance, validate_compacted,
 };
 use agent_runtime::core::ids::ToolCallId;
 use agent_runtime::registry::RegistryRevision;
@@ -143,55 +142,54 @@ pub fn assert_summary_records_exactly_what_it_replaced(
 /// Asserts compacting `fragments` preserves every fragment it marked
 /// [`agent_runtime::context::Requirement::Required`].
 pub fn assert_compaction_preserves_required_content(
-    compactor: &SemanticCompactor,
+    compactor: &StructuralCompactor,
     sizer: &dyn RequestSizer,
     fragments: &[ContextFragment],
 ) {
-    let (result, outcome) = compactor
+    let compacted = compactor
         .maybe_compact(fragments, sizer)
         .expect("compaction must succeed for this assertion to be meaningful");
     for fragment in fragments.iter().filter(|f| f.is_required()) {
         assert!(
-            result.iter().any(|r| r.id == fragment.id),
+            compacted.fragments.iter().any(|r| r.id == fragment.id),
             "required fragment `{}` must survive compaction",
             fragment.id
         );
     }
-    assert!(validate_compacted(fragments, &result, &outcome).is_ok());
+    assert!(validate_compacted(fragments, &compacted.fragments, &compacted.outcome).is_ok());
 }
 
-/// Asserts compacting an already-compacted (at-or-under-low-watermark)
-/// fragment set again changes nothing: an empty outcome and an identical
-/// fragment list.
-pub fn assert_repeated_compaction_from_the_low_watermark_is_a_noop(
-    compactor: &SemanticCompactor,
+/// Asserts compacting an already structurally compacted fragment set again
+/// changes nothing: an empty outcome and an identical fragment list.
+pub fn assert_repeated_structural_compaction_is_a_noop(
+    compactor: &StructuralCompactor,
     sizer: &dyn RequestSizer,
     fragments: &[ContextFragment],
 ) {
-    let (once, outcome1) = compactor
+    let once = compactor
         .maybe_compact(fragments, sizer)
         .expect("first compaction must succeed for this assertion to be meaningful");
     assert!(
-        !outcome1.is_noop(),
+        !once.outcome.is_noop(),
         "the fixture must actually need compaction for a second pass to prove anything"
     );
-    let (twice, outcome2) = compactor
-        .maybe_compact(&once, sizer)
+    let twice = compactor
+        .maybe_compact(&once.fragments, sizer)
         .expect("second compaction must succeed");
     assert!(
-        outcome2.is_noop(),
+        twice.outcome.is_noop(),
         "compacting an already-compacted fragment set again must change nothing"
     );
     assert_eq!(
-        once, twice,
+        once.fragments, twice.fragments,
         "a no-op compaction pass must return the same fragments"
     );
 }
 
 /// Runs every compaction assertion over a standard fixture set: a required
 /// system instruction, a `Sensitivity::Secret` optional history fragment that
-/// must survive as-is, and enough old optional history to force
-/// summarization.
+/// must survive as-is, and enough old optional history to exercise structural
+/// bounding.
 pub fn assert_compaction_conformance() {
     // `validate_compacted` gate: dropped required content, broken pairing,
     // and secret summarization must each be rejected; a clean candidate must
@@ -218,17 +216,21 @@ pub fn assert_compaction_conformance() {
             summary: FragmentId::new("summary-1"),
             covers: vec![FragmentId::new("secret")],
             policy_revision: RegistryRevision::new("conformance-1"),
+            source_artifact: None,
+            model_purpose: None,
+            model_revision: None,
+            sensitivity: None,
         }],
         ..CompactionOutcome::default()
     };
     assert_secret_summarization_is_rejected(&[secret], &[], &claimed_outcome);
 
-    // `SemanticCompactor`: required content survives, old optional history is
-    // summarized with correct provenance, and repeating compaction from the
-    // low watermark is a no-op.
+    // `StructuralCompactor`: required content survives, old optional history
+    // is bounded without a fabricated semantic summary, and repeating the
+    // exhausted structural pass is a no-op.
     let sizer = CharRatioSizer::default();
     let policy = CompactionPolicy::new(RegistryRevision::new("conformance-compaction-1"), 200, 80);
-    let compactor = SemanticCompactor::new(policy);
+    let compactor = StructuralCompactor::new(policy);
 
     let old_a = conformance_optional_fragment("old-a", FragmentKind::History, 1, &"x".repeat(400));
     let old_b = conformance_optional_fragment("old-b", FragmentKind::History, 1, &"x".repeat(400));
@@ -236,31 +238,36 @@ pub fn assert_compaction_conformance() {
     let fragments = vec![sys, old_a, old_b, recent];
 
     assert_compaction_preserves_required_content(&compactor, &sizer, &fragments);
-    let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
-    assert_summary_records_exactly_what_it_replaced(&fragments, &result, &outcome);
-    assert_repeated_compaction_from_the_low_watermark_is_a_noop(&compactor, &sizer, &fragments);
+    let compacted = compactor.maybe_compact(&fragments, &sizer).unwrap();
+    assert!(
+        compacted.outcome.summarized.is_empty(),
+        "structural compaction must never claim to summarize meaning"
+    );
+    assert!(
+        !compacted
+            .fragments
+            .iter()
+            .any(|fragment| fragment.kind == FragmentKind::Summary),
+        "structural compaction must not fabricate summary fragments"
+    );
+    assert_repeated_structural_compaction_is_a_noop(&compactor, &sizer, &fragments);
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
-    use agent_runtime::context::CacheClass;
     use agent_runtime::core::content::{ContentPart, Message, ToolCall, ToolResultBlock};
 
     #[test]
-    fn semantic_compactor_and_validate_compacted_satisfy_the_conformance_suite() {
+    fn structural_compactor_and_validate_compacted_satisfy_the_conformance_suite() {
         assert_compaction_conformance();
     }
 
-    /// A call and its result declared at *different* priorities: summarizing
-    /// one group without the other breaks pairing, and `SemanticCompactor`
-    /// must fail closed rather than silently returning the broken candidate.
-    /// This is the practical case the `validate_compacted`-based assertions
-    /// above model directly.
+    /// A call and result declared at different priorities remain present
+    /// together because structural compaction never folds either group into
+    /// a fabricated summary.
     #[test]
-    fn a_real_compactor_run_that_would_split_a_pair_across_priorities_fails_closed() {
+    fn structural_compaction_cannot_split_a_pair_across_priorities() {
         let call_id = ToolCallId::new("conformance-split-1");
         let call_message = Message::assistant(vec![ContentPart::ToolCall(ToolCall {
             id: call_id.clone(),
@@ -299,30 +306,32 @@ mod tests {
             conformance_optional_fragment("padding", FragmentKind::History, 1, &"y".repeat(400));
 
         let sizer = CharRatioSizer::default();
-        // The low watermark is chosen so that folding just the priority-1
-        // group (`call` plus `padding`) already lands under target: stage
-        // summarize's outer loop re-checks the target immediately after that
-        // fold and stops before it ever reaches priority 2's `result`,
-        // leaving `result` referencing a `call` that summarization removed.
         let policy = CompactionPolicy::new(RegistryRevision::new("conformance-split-1"), 50, 35);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
         let fragments = vec![call_fragment, result_fragment, padding];
 
-        let err = compactor.maybe_compact(&fragments, &sizer).expect_err(
-            "splitting a pair across priorities must be rejected, never silently returned",
+        let compacted = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        assert!(
+            compacted
+                .fragments
+                .iter()
+                .any(|fragment| fragment.id == FragmentId::new("call"))
         );
-        assert_eq!(
-            err.kind,
-            CompactionErrorKind::InvalidPairing,
-            "the real compactor must fail closed exactly the way `assert_broken_pairing_is_rejected` models"
+        assert!(
+            compacted
+                .fragments
+                .iter()
+                .any(|fragment| fragment.id == FragmentId::new("result"))
         );
+        assert!(compacted.outcome.summarized.is_empty());
+        assert!(validate_compacted(&fragments, &compacted.fragments, &compacted.outcome).is_ok());
     }
 
     #[test]
-    fn secret_history_is_never_folded_into_a_summary_by_the_real_compactor() {
+    fn structural_compactor_never_folds_secret_history_into_a_summary() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("conformance-secret-1"), 100, 40);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let secret =
             conformance_optional_fragment("secret", FragmentKind::History, 1, &"x".repeat(320))
@@ -331,19 +340,10 @@ mod tests {
             conformance_optional_fragment("other", FragmentKind::History, 2, &"x".repeat(160));
         let fragments = vec![secret.clone(), other];
 
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
-        assert!(result.iter().any(|f| f.id == secret.id));
-        let secret_ids: BTreeSet<&FragmentId> = fragments
-            .iter()
-            .filter(|f| f.sensitivity == Sensitivity::Secret)
-            .map(|f| &f.id)
-            .collect();
-        for provenance in &outcome.summarized {
-            for covered in &provenance.covers {
-                assert!(!secret_ids.contains(covered));
-            }
-        }
-        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+        let compacted = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        assert!(compacted.fragments.iter().any(|f| f.id == secret.id));
+        assert!(compacted.outcome.summarized.is_empty());
+        assert!(validate_compacted(&fragments, &compacted.fragments, &compacted.outcome).is_ok());
     }
 
     #[test]
@@ -358,25 +358,23 @@ mod tests {
     }
 
     #[test]
-    fn cache_class_and_sensitivity_are_exercised_on_the_summary_itself() {
-        // Sanity check that a real summary fragment (not just the provenance
-        // record) is marked ephemeral cache class, matching its derived,
-        // turn-specific nature.
+    fn structural_compactor_never_emits_a_summary_fragment_or_provenance() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("conformance-cache-1"), 200, 80);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
         let old_a =
             conformance_optional_fragment("old-a", FragmentKind::History, 1, &"x".repeat(400));
         let old_b =
             conformance_optional_fragment("old-b", FragmentKind::History, 1, &"x".repeat(400));
         let fragments = vec![old_a, old_b];
 
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
-        assert!(!outcome.summarized.is_empty());
-        let summary = result
-            .iter()
-            .find(|f| f.kind == FragmentKind::Summary)
-            .expect("a summary fragment must be present");
-        assert_eq!(summary.cache_class, CacheClass::Ephemeral);
+        let compacted = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        assert!(compacted.outcome.summarized.is_empty());
+        assert!(
+            !compacted
+                .fragments
+                .iter()
+                .any(|fragment| fragment.kind == FragmentKind::Summary)
+        );
     }
 }

@@ -107,6 +107,43 @@ impl ActivationEpochs {
         self.history.push(ActivationEpoch::build(index, activated));
         self.history.last().expect("an epoch was just pushed")
     }
+
+    /// Restores an exact persisted epoch history after validating that every
+    /// epoch is the canonical, monotonic successor of the preceding one.
+    pub(crate) fn restore(
+        history: Vec<Vec<(RegistryId, RegistryRevision)>>,
+    ) -> Result<Self, String> {
+        if history.is_empty() {
+            return Err("activation state contains no epoch".into());
+        }
+        let mut restored = Self::new();
+        for (index, persisted) in history.into_iter().enumerate() {
+            let mut canonical = persisted.clone();
+            canonical.sort_by(|left, right| left.0.cmp(&right.0));
+            canonical.dedup_by(|left, right| left.0 == right.0);
+            if canonical != persisted {
+                return Err(format!(
+                    "activation epoch {index} is not canonically ordered or contains duplicate ids"
+                ));
+            }
+            if let Some(previous) = restored.current() {
+                for (id, revision) in previous.activated() {
+                    if !canonical
+                        .iter()
+                        .any(|(next_id, next_revision)| next_id == id && next_revision == revision)
+                    {
+                        return Err(format!(
+                            "activation epoch {index} regresses or changes `{id}`"
+                        ));
+                    }
+                }
+            }
+            restored
+                .history
+                .push(ActivationEpoch::build(index as u64, canonical));
+        }
+        Ok(restored)
+    }
 }
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ use agent_runtime_core::provider::ToolSchema;
 
 use crate::budget::{BudgetReport, ContextBudget, ContextError, ContextPolicy};
 use crate::cache::{CachePlan, ProviderCacheCapability};
-use crate::compaction::SemanticCompactor;
+use crate::compaction::{CompactionError, CompactionResult, validate_compacted};
 use crate::fragment::{ContextFragment, FragmentContent, FragmentKind};
 use crate::plan::{ContextPlan, PlanSegment};
 use crate::sizing::{EstimationConfidence, RequestSizer};
@@ -52,7 +52,7 @@ pub trait Compactor: Send + Sync + fmt::Debug {
         fragments: &[ContextFragment],
         report: &BudgetReport,
         budget: &ContextBudget,
-    ) -> Option<Vec<ContextFragment>>;
+    ) -> Result<Option<CompactionResult>, CompactionError>;
 }
 
 /// Compiles versioned fragments into one immutable [`ContextPlan`].
@@ -109,7 +109,7 @@ impl<'a> ContextPlanner<'a> {
     pub fn plan_with_cache(
         &self,
         fragments: Vec<ContextFragment>,
-        compactor: Option<&SemanticCompactor>,
+        compactor: Option<&dyn Compactor>,
         capability: &ProviderCacheCapability,
         previous: Option<&CachePlan>,
     ) -> Result<ContextPlan, ContextError> {
@@ -118,7 +118,7 @@ impl<'a> ContextPlanner<'a> {
             sizer: self.sizer,
             policy: self.policy.clone(),
             budget: self.budget,
-            compactor: compactor.map(|compactor| compactor as &dyn Compactor),
+            compactor,
         };
         let plan = planner.plan(fragments)?;
         let cache_plan = CachePlan::build(
@@ -127,14 +127,7 @@ impl<'a> ContextPlanner<'a> {
             previous,
             capability,
         );
-        let mut plan = plan.with_cache_plan(cache_plan);
-        if let Some(compactor) = compactor {
-            let outcome = compactor.last_outcome();
-            if !outcome.is_noop() {
-                plan = plan.with_compaction_outcome(outcome);
-            }
-        }
-        Ok(plan)
+        Ok(plan.with_cache_plan(cache_plan))
     }
 
     /// Compiles `fragments` into an immutable plan.
@@ -161,6 +154,7 @@ impl<'a> ContextPlanner<'a> {
         mut fragments: Vec<ContextFragment>,
         compaction_attempted: bool,
     ) -> Result<ContextPlan, ContextError> {
+        validate_unique_fragment_ids(&fragments)?;
         fragments.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         validate_pairing(&fragments)?;
 
@@ -193,8 +187,19 @@ impl<'a> ContextPlanner<'a> {
 
             if recoverable && !compaction_attempted {
                 if let Some(compactor) = self.compactor {
-                    if let Some(reduced) = compactor.compact(&fragments, &report, &self.budget) {
-                        return self.plan_inner(reduced, true);
+                    let reduced = compactor
+                        .compact(&fragments, &report, &self.budget)
+                        .map_err(|err| ContextError::compaction(err.to_string()))?;
+                    if let Some(result) = reduced {
+                        validate_compacted(&fragments, &result.fragments, &result.outcome)
+                            .map_err(|error| ContextError::compaction(error.to_string()))?;
+                        let mut outcome = result.outcome;
+                        let original_tokens = report.total_input_tokens;
+                        return self.plan_inner(result.fragments, true).map(|plan| {
+                            outcome.reclaimed_tokens =
+                                original_tokens.saturating_sub(plan.input_tokens());
+                            plan.with_compaction_outcome(outcome)
+                        });
                     }
                 }
             }
@@ -267,6 +272,19 @@ impl<'a> ContextPlanner<'a> {
     }
 }
 
+fn validate_unique_fragment_ids(fragments: &[ContextFragment]) -> Result<(), ContextError> {
+    let mut seen = BTreeSet::new();
+    for fragment in fragments {
+        if !seen.insert(fragment.id.clone()) {
+            return Err(ContextError::duplicate_fragment_id(format!(
+                "context fragment id `{}` was contributed more than once",
+                fragment.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validates that every tool-call/result pairing is complete.
 ///
 /// A [`FragmentKind::ToolResult`] fragment carrying `pairing = Some(id)` is
@@ -278,15 +296,14 @@ pub(crate) fn validate_pairing(fragments: &[ContextFragment]) -> Result<(), Cont
     let mut calls: BTreeMap<ToolCallId, u32> = BTreeMap::new();
     let mut results: BTreeMap<ToolCallId, u32> = BTreeMap::new();
     for fragment in fragments {
-        let Some(call_id) = &fragment.pairing else {
-            continue;
-        };
-        let counter = if fragment.kind == FragmentKind::ToolResult {
-            &mut results
-        } else {
-            &mut calls
-        };
-        *counter.entry(call_id.clone()).or_insert(0) += 1;
+        for call_id in fragment.pairing_ids() {
+            let counter = if fragment.kind == FragmentKind::ToolResult {
+                &mut results
+            } else {
+                &mut calls
+            };
+            *counter.entry(call_id).or_insert(0) += 1;
+        }
     }
 
     let mut ids: BTreeSet<ToolCallId> = calls.keys().cloned().collect();
@@ -313,20 +330,25 @@ pub(crate) fn validate_pairing(fragments: &[ContextFragment]) -> Result<(), Cont
 /// forward pass), passes message fragments through unchanged, and wraps any
 /// other text fragment in its own message via [`default_role_for`].
 fn merge_into_messages(fragments: &[ContextFragment]) -> Vec<Message> {
-    let mut instruction_parts: Vec<&str> = Vec::new();
-    let mut flushed_instructions = false;
+    // Tool-schema fragments do not produce messages and therefore must not
+    // act as an instruction flush boundary. Collect every instruction in
+    // canonical fragment order first so an explicitly later ability section
+    // cannot disappear merely because a schema preceded it in the capability
+    // lane.
+    let instruction_parts: Vec<&str> = fragments
+        .iter()
+        .filter(|fragment| is_instruction_kind(fragment.kind))
+        .filter_map(|fragment| match &fragment.content {
+            FragmentContent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut messages = Vec::new();
+    flush_instructions(&mut messages, &instruction_parts);
 
     for fragment in fragments {
         if is_instruction_kind(fragment.kind) {
-            if let FragmentContent::Text(text) = &fragment.content {
-                instruction_parts.push(text.as_str());
-                continue;
-            }
-        }
-        if !flushed_instructions {
-            flush_instructions(&mut messages, &instruction_parts);
-            flushed_instructions = true;
+            continue;
         }
         match &fragment.content {
             FragmentContent::Message(message) => messages.push(message.clone()),
@@ -335,9 +357,6 @@ fn merge_into_messages(fragments: &[ContextFragment]) -> Vec<Message> {
             }
             FragmentContent::Tool(_) => {}
         }
-    }
-    if !flushed_instructions {
-        flush_instructions(&mut messages, &instruction_parts);
     }
     messages
 }
@@ -392,7 +411,7 @@ mod tests {
     use agent_runtime_registry::RegistryRevision;
 
     use crate::budget::ContextErrorKind;
-    use crate::fragment::FragmentSource;
+    use crate::fragment::{ContextLane, ContextPosition, FragmentSource};
     use crate::sizing::CharRatioSizer;
 
     fn profile(
@@ -483,6 +502,22 @@ mod tests {
         let plan_a = planner.plan(a).unwrap();
         let plan_b = planner.plan(b).unwrap();
         assert_eq!(plan_a.fingerprint(), plan_b.fingerprint());
+    }
+
+    #[test]
+    fn duplicate_fragment_ids_fail_before_sorting_or_accounting() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+
+        let error = planner
+            .plan(vec![
+                text_fragment("same", FragmentKind::SystemInstruction, "first"),
+                text_fragment("same", FragmentKind::Memory, "second"),
+            ])
+            .unwrap_err();
+        assert_eq!(error.kind, ContextErrorKind::DuplicateFragmentId);
+        assert!(error.message.contains("same"));
     }
 
     #[test]
@@ -582,6 +617,43 @@ mod tests {
         assert!(joined.contains("be helpful"));
         assert!(joined.contains("be terse"));
         assert!(joined.contains("use the search tool"));
+    }
+
+    #[test]
+    fn tool_schema_does_not_hide_a_later_ability_instruction() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let schema = ToolSchema {
+            name: "search".into(),
+            description: "searches".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let fragments = vec![
+            text_fragment("sys", FragmentKind::SystemInstruction, "be helpful"),
+            ContextFragment::new(
+                "tool",
+                FragmentKind::ToolSchema,
+                FragmentSource::Host,
+                RegistryRevision::new("t1"),
+                FragmentContent::Tool(Box::new(schema)),
+            )
+            .with_position(ContextPosition::new(ContextLane::Capabilities, 1)),
+            text_fragment(
+                "late-ability",
+                FragmentKind::AbilityInstruction,
+                "follow the activated skill",
+            )
+            .with_position(ContextPosition::new(ContextLane::Capabilities, 10)),
+            text_fragment("input", FragmentKind::UserInput, "hi"),
+        ];
+
+        let plan = planner.plan(fragments).unwrap();
+        assert_eq!(plan.messages()[0].role, Role::System);
+        let instructions = plan.messages()[0].joined_text();
+        assert!(instructions.contains("be helpful"));
+        assert!(instructions.contains("follow the activated skill"));
+        assert_eq!(plan.messages()[1], Message::user("hi"));
     }
 
     #[test]
@@ -716,17 +788,43 @@ mod tests {
             fragments: &[ContextFragment],
             _report: &BudgetReport,
             _budget: &ContextBudget,
-        ) -> Option<Vec<ContextFragment>> {
+        ) -> Result<Option<CompactionResult>, CompactionError> {
             let reduced: Vec<ContextFragment> = fragments
                 .iter()
                 .filter(|f| f.is_required())
                 .cloned()
                 .collect();
             if reduced.len() == fragments.len() {
-                None
+                Ok(None)
             } else {
-                Some(reduced)
+                Ok(Some(CompactionResult {
+                    fragments: reduced,
+                    outcome: Default::default(),
+                }))
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct MutateRequiredCompactor;
+
+    impl Compactor for MutateRequiredCompactor {
+        fn compact(
+            &self,
+            fragments: &[ContextFragment],
+            _report: &BudgetReport,
+            _budget: &ContextBudget,
+        ) -> Result<Option<CompactionResult>, CompactionError> {
+            let mut reduced = fragments
+                .iter()
+                .filter(|fragment| fragment.is_required())
+                .cloned()
+                .collect::<Vec<_>>();
+            reduced[0].content = FragmentContent::Text("adversarial rewrite".into());
+            Ok(Some(CompactionResult {
+                fragments: reduced,
+                outcome: Default::default(),
+            }))
         }
     }
 
@@ -747,6 +845,23 @@ mod tests {
 
         let plan = planner.plan(fragments).unwrap();
         assert_eq!(plan.segments().len(), 2);
+    }
+
+    #[test]
+    fn authoritative_planner_rejects_an_adversarial_compactor() {
+        let p = profile(300, 300, 50);
+        let sizer = CharRatioSizer::default();
+        let planner =
+            ContextPlanner::new(&p, &sizer, policy(50, 0)).with_compactor(&MutateRequiredCompactor);
+        let fragments = vec![
+            text_fragment("sys", FragmentKind::SystemInstruction, "be helpful"),
+            text_fragment("padding", FragmentKind::Memory, &"x".repeat(2_000)).optional(),
+            text_fragment("input", FragmentKind::UserInput, "hi"),
+        ];
+
+        let error = planner.plan(fragments).unwrap_err();
+        assert_eq!(error.kind, ContextErrorKind::Compaction);
+        assert!(error.message.contains("required_content_modified"));
     }
 
     #[test]
@@ -775,13 +890,13 @@ mod tests {
     #[test]
     fn plan_with_cache_attaches_a_cache_plan_and_the_compactor_outcome() {
         use crate::cache::ProviderCacheCapability;
-        use crate::compaction::{CompactionPolicy, SemanticCompactor};
+        use crate::compaction::{CompactionPolicy, StructuralCompactor};
 
         let p = profile(300, 300, 50);
         let sizer = CharRatioSizer::default();
         let planner = ContextPlanner::new(&p, &sizer, policy(50, 0));
         let compaction_policy = CompactionPolicy::new(RegistryRevision::new("cp-1"), 10, 5);
-        let compactor = SemanticCompactor::new(compaction_policy);
+        let compactor = StructuralCompactor::new(compaction_policy);
         let capability = ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test");
 
         let optional_padding =

@@ -26,6 +26,8 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use crate::FingerprintHasher;
+
 /// A typed runtime permission.
 ///
 /// [`Permission::Other`] models a host-defined namespaced permission: it is
@@ -89,6 +91,26 @@ impl Permission {
             Permission::RandomRead => "random.read",
             Permission::Other(name) => name,
         }
+    }
+
+    /// Absorbs the typed variant into a fingerprint without collapsing a
+    /// known permission into a textually identical [`Permission::Other`].
+    pub fn fingerprint_into(&self, hasher: &mut FingerprintHasher) {
+        match self {
+            Permission::FsRead => hasher.field("permission.fs_read"),
+            Permission::FsWrite => hasher.field("permission.fs_write"),
+            Permission::FsCreate => hasher.field("permission.fs_create"),
+            Permission::FsDelete => hasher.field("permission.fs_delete"),
+            Permission::NetHttp => hasher.field("permission.net_http"),
+            Permission::DataEgress => hasher.field("permission.data_egress"),
+            Permission::CredentialUse => hasher.field("permission.credential_use"),
+            Permission::ProcessSpawn => hasher.field("permission.process_spawn"),
+            Permission::StdioRead => hasher.field("permission.stdio_read"),
+            Permission::StdioWrite => hasher.field("permission.stdio_write"),
+            Permission::ClockRead => hasher.field("permission.clock_read"),
+            Permission::RandomRead => hasher.field("permission.random_read"),
+            Permission::Other(name) => hasher.pair("permission.other", name.as_bytes()),
+        };
     }
 }
 
@@ -224,6 +246,15 @@ mod tests {
         // They still render identically: the distinction is structural
         // (variant identity), not textual.
         assert_eq!(known.as_str(), host_defined.as_str());
+    }
+
+    #[test]
+    fn permission_fingerprints_preserve_variant_identity() {
+        let mut known = FingerprintHasher::new();
+        Permission::FsRead.fingerprint_into(&mut known);
+        let mut host_defined = FingerprintHasher::new();
+        Permission::other("fs.read").fingerprint_into(&mut host_defined);
+        assert_ne!(known.finish(), host_defined.finish());
     }
 
     #[test]

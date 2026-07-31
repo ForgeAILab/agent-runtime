@@ -2,23 +2,27 @@
 //!
 //! Collects host-injected services and neutral loop configuration, then
 //! produces an immutable, shareable [`Runtime`]. Missing optional services get
-//! fail-closed defaults: no approval policy → [`DenyAll`]; no workspace →
-//! [`DenyAllWorkspace`]; no observers → none.
+//! fail-closed defaults: no approval policy → [`UnavailableApproval`]; no
+//! workspace → [`DenyAllWorkspace`]; no observers → none.
 
 use std::sync::Arc;
 
-use agent_runtime_context::budget::ContextPolicy;
+use agent_runtime_ability::activation::{ActivationContext, ActivationPolicy, FailClosedPolicy};
+use agent_runtime_ability::{Ability, AbilityDescriptor};
+use agent_runtime_context::budget::{ContextBudget, ContextPolicy};
 use agent_runtime_context::cache::ProviderCacheCapability;
-use agent_runtime_context::compaction::SemanticCompactor;
+use agent_runtime_context::compaction::StructuralCompactor;
 use agent_runtime_context::sizing::{CharRatioSizer, RequestSizer};
-use agent_runtime_core::approval::{ApprovalPolicy, DenyAll};
+use agent_runtime_core::approval::{ApprovalPolicy, UnavailableApproval};
 use agent_runtime_core::catalog::{ModelCatalog, ResolvedModelProfile};
 use agent_runtime_core::check_set::{ActionClass, EnforcementLimits, SecurityCheckSetBuilder};
+use agent_runtime_core::checkpoint::CheckpointStore;
 use agent_runtime_core::clock::{Clock, SystemClock};
 use agent_runtime_core::compat::LegacyApprovalAuthority;
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::grant::{SecurityCheck, SecurityCheckMode};
 use agent_runtime_core::ids::TenantId;
+use agent_runtime_core::interaction::{InteractionBroker, UnavailableInteractionBroker};
 use agent_runtime_core::observer::EventObserver;
 use agent_runtime_core::provider::{ModelId, Provider, ReasoningConfig, StructuredOutputConfig};
 use agent_runtime_core::security::{PermissionSet, SecuritySubject};
@@ -31,8 +35,14 @@ use crate::agent::planning::{RunPlanner, RunRevisions};
 
 use crate::agent::config::{DowngradePolicy, LoopConfig};
 use crate::agent::driver::Driver;
+use crate::capability::{ActivationBudget, CapabilityResolver};
+use crate::harness::{
+    ContextContributor, HarnessPipelineBuilder, HistoryProjector, LiveAbilityRuntime,
+    ModelInterceptor, ToolOutputProcessor, ToolViewResolver, TurnCommitHook,
+};
+use crate::hub::ScopeInputs;
 use crate::provider::retry::RetryPolicy;
-use crate::runtime::engine::{Runtime, RuntimeShared};
+use crate::runtime::engine::{ActiveSessionRegistry, Runtime, RuntimeShared};
 use crate::tool::registry::ToolRegistry;
 use crate::tool::scheduler::ConflictPolicy;
 use crate::tool::{SecurityConfig, ToolExecutor};
@@ -45,6 +55,7 @@ pub struct RuntimeBuilder {
     approval: Option<Arc<dyn ApprovalPolicy>>,
     workspace: Option<Arc<dyn Workspace>>,
     session_store: Option<Arc<dyn SessionStore>>,
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     secret_store: Option<Arc<dyn SecretStore>>,
     observers: Vec<Arc<dyn EventObserver>>,
     clock: Arc<dyn Clock>,
@@ -57,7 +68,7 @@ pub struct RuntimeBuilder {
     model_catalog: Option<Arc<dyn ModelCatalog>>,
     sizer: Option<Arc<dyn RequestSizer>>,
     context_policy: Option<ContextPolicy>,
-    compactor: Option<SemanticCompactor>,
+    compactor: Option<StructuralCompactor>,
     cache_capability: Option<ProviderCacheCapability>,
     revisions: RunRevisions,
     security_checks: Vec<(
@@ -71,6 +82,18 @@ pub struct RuntimeBuilder {
     enforcement_limits: Option<EnforcementLimits>,
     security_subject: Option<SecuritySubject>,
     tenant: Option<TenantId>,
+    interaction_broker: Arc<dyn InteractionBroker>,
+    allow_child_interaction: bool,
+    return_child_interactions_to_parent: bool,
+    live_ability_routing: bool,
+    abilities: Vec<Arc<dyn Ability>>,
+    tool_descriptor_overrides: Vec<AbilityDescriptor>,
+    scope_inputs: ScopeInputs,
+    capability_resolver: Arc<CapabilityResolver>,
+    activation_policy: Arc<dyn ActivationPolicy>,
+    activation_context: ActivationContext,
+    activation_budget: Option<ActivationBudget>,
+    harness: HarnessPipelineBuilder,
 }
 
 impl RuntimeBuilder {
@@ -82,6 +105,7 @@ impl RuntimeBuilder {
             approval: None,
             workspace: None,
             session_store: None,
+            checkpoint_store: None,
             secret_store: None,
             observers: Vec::new(),
             clock: Arc::new(SystemClock),
@@ -103,6 +127,18 @@ impl RuntimeBuilder {
             enforcement_limits: None,
             security_subject: None,
             tenant: None,
+            interaction_broker: Arc::new(UnavailableInteractionBroker),
+            allow_child_interaction: false,
+            return_child_interactions_to_parent: false,
+            live_ability_routing: false,
+            abilities: Vec::new(),
+            tool_descriptor_overrides: Vec::new(),
+            scope_inputs: ScopeInputs::new(),
+            capability_resolver: Arc::new(CapabilityResolver::new()),
+            activation_policy: Arc::new(FailClosedPolicy),
+            activation_context: ActivationContext::new(),
+            activation_budget: None,
+            harness: HarnessPipelineBuilder::new(),
         }
     }
 
@@ -148,7 +184,7 @@ impl RuntimeBuilder {
 
     /// Attaches a semantic compactor. Without one, a plan that exceeds its
     /// budget fails rather than being silently reduced.
-    pub fn compactor(mut self, compactor: SemanticCompactor) -> Self {
+    pub fn compactor(mut self, compactor: StructuralCompactor) -> Self {
         self.compactor = Some(compactor);
         self
     }
@@ -182,6 +218,109 @@ impl RuntimeBuilder {
     /// Registers many tools.
     pub fn tools(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
         self.tools.extend(tools);
+        self
+    }
+
+    /// Enables session-scoped descriptor retrieval and activation for the
+    /// registered tool surface.
+    ///
+    /// Existing hosts remain on the legacy all-tools-visible path until they
+    /// opt in here or register an ability/descriptor override.
+    pub fn live_ability_routing(mut self) -> Self {
+        self.live_ability_routing = true;
+        self
+    }
+
+    /// Registers a non-tool ability for live retrieval and activation.
+    pub fn ability(mut self, ability: Arc<dyn Ability>) -> Self {
+        self.live_ability_routing = true;
+        self.abilities.push(ability);
+        self
+    }
+
+    /// Replaces the generic descriptor synthesized for the executable tool
+    /// with exact host-authored retrieval, risk, cost, and permission
+    /// metadata. The descriptor id must be `tool:<registered-name>`.
+    pub fn tool_ability_descriptor(mut self, descriptor: AbilityDescriptor) -> Self {
+        self.live_ability_routing = true;
+        self.tool_descriptor_overrides.push(descriptor);
+        self
+    }
+
+    /// Sets the immutable host scope used to derive each session ability view.
+    pub fn scope_inputs(mut self, inputs: ScopeInputs) -> Self {
+        self.live_ability_routing = true;
+        self.scope_inputs = inputs;
+        self
+    }
+
+    /// Sets the deterministic capability resolver.
+    pub fn capability_resolver(mut self, resolver: Arc<CapabilityResolver>) -> Self {
+        self.live_ability_routing = true;
+        self.capability_resolver = resolver;
+        self
+    }
+
+    /// Sets activation authorization policy. Invocation authorization remains
+    /// a separate mandatory boundary.
+    pub fn activation_policy(mut self, policy: Arc<dyn ActivationPolicy>) -> Self {
+        self.live_ability_routing = true;
+        self.activation_policy = policy;
+        self
+    }
+
+    /// Sets readiness, denial, and dependency facts used at activation time.
+    pub fn activation_context(mut self, context: ActivationContext) -> Self {
+        self.live_ability_routing = true;
+        self.activation_context = context;
+        self
+    }
+
+    /// Caps initial and on-demand activation schema cost and cardinality.
+    pub fn activation_budget(mut self, budget: ActivationBudget) -> Self {
+        self.live_ability_routing = true;
+        self.activation_budget = Some(budget);
+        self
+    }
+
+    /// Adds a session ability-view narrowing component.
+    pub fn tool_view_resolver(mut self, component: Arc<dyn ToolViewResolver>) -> Self {
+        self.live_ability_routing = true;
+        self.harness.tool_view_resolver(component);
+        self
+    }
+
+    /// Adds the one protected semantic-history projector.
+    ///
+    /// The same component will commonly also be registered as a
+    /// [`TurnCommitHook`] so model/storage work happens at a durable boundary
+    /// and provider planning only projects already-checkpointed state.
+    pub fn history_projector(mut self, component: Arc<dyn HistoryProjector>) -> Self {
+        self.harness.history_projector(component);
+        self
+    }
+
+    /// Adds an authoritative context contributor.
+    pub fn context_contributor(mut self, component: Arc<dyn ContextContributor>) -> Self {
+        self.harness.context_contributor(component);
+        self
+    }
+
+    /// Adds a bounded provider-option interceptor.
+    pub fn model_interceptor(mut self, component: Arc<dyn ModelInterceptor>) -> Self {
+        self.harness.model_interceptor(component);
+        self
+    }
+
+    /// Adds an exact pre-bounding tool-output processor.
+    pub fn tool_output_processor(mut self, component: Arc<dyn ToolOutputProcessor>) -> Self {
+        self.harness.tool_output_processor(component);
+        self
+    }
+
+    /// Adds a post-turn state commit hook.
+    pub fn turn_commit_hook(mut self, component: Arc<dyn TurnCommitHook>) -> Self {
+        self.harness.turn_commit_hook(component);
         self
     }
 
@@ -260,6 +399,16 @@ impl RuntimeBuilder {
     /// Sets the session store.
     pub fn session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    /// Sets the protected exact-turn checkpoint store.
+    ///
+    /// Unlike [`RuntimeBuilder::session_store`], this store may receive raw
+    /// provider requests, prepared arguments, and pending interactions needed
+    /// for idempotent mid-turn recovery. Hosts must protect it accordingly.
+    pub fn checkpoint_store(mut self, store: Arc<dyn CheckpointStore>) -> Self {
+        self.checkpoint_store = Some(store);
         self
     }
 
@@ -370,33 +519,61 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the host bridge for bounded task-information interactions.
+    pub fn interaction_broker(mut self, broker: Arc<dyn InteractionBroker>) -> Self {
+        self.interaction_broker = broker;
+        self
+    }
+
+    /// Explicitly allows delegated child sessions to present interactions.
+    ///
+    /// Disabled by default so a child cannot unexpectedly seize root UI.
+    pub fn allow_child_interaction(mut self, allow: bool) -> Self {
+        self.allow_child_interaction = allow;
+        self
+    }
+
+    /// Routes child questionnaire requests back as typed delegation outcomes
+    /// instead of presenting them through the root host broker.
+    pub(crate) fn return_child_interactions_to_parent(&mut self) {
+        self.return_child_interactions_to_parent = true;
+        self.allow_child_interaction = false;
+    }
+
     /// Retains only the registered tools `keep` accepts. Used by the
     /// delegation coordinator to derive a child's scoped tool view.
     pub(crate) fn scope_tools(&mut self, keep: impl Fn(&Arc<dyn Tool>) -> bool) {
         self.tools.retain(|tool| keep(tool));
+        let retained = self
+            .tools
+            .iter()
+            .map(|tool| agent_runtime_registry::RegistryId::tool(tool.spec().name))
+            .collect::<std::collections::BTreeSet<_>>();
+        self.tool_descriptor_overrides
+            .retain(|descriptor| retained.contains(descriptor.id()));
     }
 
     /// Removes any session store so the built runtime's sessions are
     /// ephemeral — a delegated child must never persist or resume.
     pub(crate) fn clear_session_store(&mut self) {
         self.session_store = None;
+        self.checkpoint_store = None;
     }
 
     /// Builds the runtime, sealing the tool registry, sealing the composed
     /// `SecurityCheckSet`, and applying fail-closed defaults for any omitted
     /// services.
     ///
-    /// Fails when any registered tool declares effects
-    /// [`agent_runtime_core::tool::ToolEffects::requires_authorization`] but
-    /// the host supplied neither an `Authoritative` check via
+    /// Fails when any registered tool declares a non-empty typed permission
+    /// upper bound but the host supplied neither an `Authoritative` check via
     /// [`RuntimeBuilder::security_check`] nor
     /// [`RuntimeBuilder::legacy_approval_authority`]. There is deliberately
     /// no fallback: [`agent_runtime_core::check_set::SecurityCheckSet`] is
     /// default-deny, so a runtime with no authoritative coverage would deny
-    /// every privileged tool call at first use rather than at build — the
+    /// every authority-bearing tool call at first use rather than at build — the
     /// same reasoning that already makes a missing model profile a build
     /// failure above, not a guessed context window.
-    pub fn build(self) -> Result<Runtime, RuntimeError> {
+    pub fn build(mut self) -> Result<Runtime, RuntimeError> {
         let provider = self
             .provider
             .ok_or_else(|| RuntimeError::config("a provider is required"))?;
@@ -428,11 +605,56 @@ impl RuntimeBuilder {
             }
         };
 
-        let effectful_tools: Vec<String> = self
+        let context_policy = self.context_policy.take().unwrap_or_else(|| {
+            ContextPolicy::new(
+                RegistryRevision::new("default-context-policy-1"),
+                self.config.max_output_tokens.unwrap_or(1_024),
+                0,
+            )
+        });
+        let activation_budget = self.activation_budget.unwrap_or_else(|| {
+            let resolved = ContextBudget::from_limits(&profile.limits, &context_policy);
+            ActivationBudget::new(resolved.capability_budget, 8)
+        });
+        let harness = Arc::new(self.harness.seal()?);
+        let live_abilities = if self.live_ability_routing {
+            if let Some(ability) = self.abilities.iter().find(|ability| {
+                ability.descriptor().kind() == &agent_runtime_ability::AbilityKind::Tool
+            }) {
+                return Err(RuntimeError::config(format!(
+                    "tool ability `{}` must be registered through RuntimeBuilder::tool plus \
+                     ::tool_ability_descriptor so delegation scoping cannot retain a descriptor \
+                     without its executable implementation",
+                    ability.descriptor().id()
+                )));
+            }
+            let sealed = LiveAbilityRuntime::seal(
+                std::mem::take(&mut self.tools),
+                self.tool_descriptor_overrides,
+                self.abilities,
+                self.capability_resolver,
+                self.activation_policy,
+                self.activation_context,
+                self.scope_inputs,
+                activation_budget,
+            )?;
+            self.tools = sealed.tools;
+            Some(sealed.runtime)
+        } else {
+            if !self.tool_descriptor_overrides.is_empty() || !self.abilities.is_empty() {
+                return Err(RuntimeError::internal(
+                    "ability composition was registered without live routing",
+                ));
+            }
+            None
+        };
+
+        let privileged_tools: Vec<String> = self
             .tools
             .iter()
-            .filter(|tool| tool.effects().requires_authorization())
-            .map(|tool| tool.name().to_owned())
+            .map(|tool| tool.spec())
+            .filter(|spec| !spec.permission_upper_bound.is_empty())
+            .map(|spec| spec.name)
             .collect();
 
         let mut check_set_builder = SecurityCheckSetBuilder::new(
@@ -454,10 +676,10 @@ impl RuntimeBuilder {
             );
             has_authoritative_check = true;
         }
-        if !effectful_tools.is_empty() && !has_authoritative_check {
+        if !privileged_tools.is_empty() && !has_authoritative_check {
             return Err(RuntimeError::config(format!(
-                "tool(s) {effectful_tools:?} declare effects that require authorization \
-                 (a write, a process spawn, or network access), but no authoritative \
+                "tool(s) {privileged_tools:?} declare non-empty typed permission upper bounds \
+                 (including read or host-defined authority), but no authoritative \
                  SecurityCheck was registered and RuntimeBuilder::legacy_approval_authority() \
                  was not called; register an authoritative check via \
                  RuntimeBuilder::security_check(...), or opt into the shipped compatibility \
@@ -474,7 +696,9 @@ impl RuntimeBuilder {
         registry.register_all(self.tools)?;
         let registry = registry.seal();
 
-        let approval = self.approval.unwrap_or_else(|| Arc::new(DenyAll));
+        let approval = self
+            .approval
+            .unwrap_or_else(|| Arc::new(UnavailableApproval));
         let workspace = self.workspace.unwrap_or_else(|| Arc::new(DenyAllWorkspace));
 
         let config = Arc::new(self.config);
@@ -504,13 +728,7 @@ impl RuntimeBuilder {
             provider_name,
             self.sizer
                 .unwrap_or_else(|| Arc::new(CharRatioSizer::default())),
-            self.context_policy.unwrap_or_else(|| {
-                ContextPolicy::new(
-                    RegistryRevision::new("default-context-policy-1"),
-                    config.max_output_tokens.unwrap_or(1_024),
-                    0,
-                )
-            }),
+            context_policy,
             self.compactor,
             self.cache_capability.unwrap_or_else(|| {
                 ProviderCacheCapability::none(
@@ -521,6 +739,8 @@ impl RuntimeBuilder {
             self.revisions,
         ));
 
+        let session_store = self.session_store;
+        let checkpoint_store = self.checkpoint_store;
         let driver = Driver::new(
             provider,
             registry,
@@ -528,17 +748,26 @@ impl RuntimeBuilder {
             self.clock.clone(),
             config.clone(),
             planner,
+            session_store.clone(),
+            checkpoint_store.clone(),
+            self.interaction_broker,
+            self.allow_child_interaction,
+            self.return_child_interactions_to_parent,
+            harness,
+            live_abilities,
         );
 
         let shared = RuntimeShared {
             driver,
             clock: self.clock,
-            session_store: self.session_store,
+            session_store,
+            checkpoint_store,
             secret_store: self.secret_store,
             observers: Arc::from(self.observers.into_boxed_slice()),
             event_buffer: self.event_buffer,
             shutdown_timeout_ms: self.shutdown_timeout_ms,
             injection_queue_limit: self.injection_queue_limit,
+            active_sessions: Arc::new(ActiveSessionRegistry::default()),
         };
         Ok(Runtime::from_shared(Arc::new(shared)))
     }
@@ -553,7 +782,7 @@ mod tests {
         GrantConstraints, SecurityCheckId, SecurityCheckOutcome, SecurityCheckRevision,
     };
     use agent_runtime_core::security::AuthorizationRequest;
-    use agent_runtime_core::tool::{InvocationContext, ToolEffects, ToolOutcome};
+    use agent_runtime_core::tool::{InvocationContext, LegacyTool, ToolEffects, ToolOutcome};
     use agent_runtime_provider::fake::FakeProvider;
     use agent_runtime_registry::Permission;
     use async_trait::async_trait;
@@ -570,7 +799,7 @@ mod tests {
     #[derive(Debug)]
     struct MutatingTool;
     #[async_trait]
-    impl Tool for MutatingTool {
+    impl LegacyTool for MutatingTool {
         fn name(&self) -> &str {
             "mutate"
         }
@@ -581,9 +810,9 @@ mod tests {
             json!({"type":"object"})
         }
         fn effects(&self) -> ToolEffects {
-            ToolEffects::read_only().with_write("/ws/out")
+            ToolEffects::new(vec![]).with_write("/ws/out")
         }
-        async fn invoke(
+        async fn invoke_legacy(
             &self,
             _arguments: Value,
             _ctx: &InvocationContext,
@@ -593,9 +822,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct ReadOnlyTool;
+    struct PureTool;
     #[async_trait]
-    impl Tool for ReadOnlyTool {
+    impl LegacyTool for PureTool {
         fn name(&self) -> &str {
             "read"
         }
@@ -606,9 +835,9 @@ mod tests {
             json!({"type":"object"})
         }
         fn effects(&self) -> ToolEffects {
-            ToolEffects::read_only()
+            ToolEffects::new(vec![])
         }
-        async fn invoke(
+        async fn invoke_legacy(
             &self,
             _arguments: Value,
             _ctx: &InvocationContext,
@@ -655,13 +884,49 @@ mod tests {
     }
 
     #[test]
-    fn build_succeeds_with_only_read_only_tools_and_no_security_check() {
+    fn build_succeeds_with_only_authority_free_tools_and_no_security_check() {
         RuntimeBuilder::new(ModelId::new("fake"))
             .model_profile(profile())
             .provider(Arc::new(FakeProvider::text_reply("hi")))
-            .tool(Arc::new(ReadOnlyTool))
+            .tool(Arc::new(PureTool))
             .build()
-            .expect("read-only tools need no authoritative coverage");
+            .expect("authority-free tools need no authoritative coverage");
+    }
+
+    #[test]
+    fn legacy_read_effect_requires_authoritative_coverage() {
+        #[derive(Debug)]
+        struct LegacyReader;
+        #[async_trait]
+        impl LegacyTool for LegacyReader {
+            fn name(&self) -> &str {
+                "legacy_read"
+            }
+            fn description(&self) -> &str {
+                "reads an unspecified workspace resource"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type":"object"})
+            }
+            fn effects(&self) -> ToolEffects {
+                ToolEffects::read_only()
+            }
+            async fn invoke_legacy(
+                &self,
+                _arguments: Value,
+                _ctx: &InvocationContext,
+            ) -> Result<ToolOutcome, RuntimeError> {
+                Ok(ToolOutcome::text("read"))
+            }
+        }
+
+        let err = RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .tool(Arc::new(LegacyReader))
+            .build()
+            .expect_err("an unspecified legacy read must map to broad fs.read authority");
+        assert!(err.message.contains("legacy_read"));
     }
 
     #[test]

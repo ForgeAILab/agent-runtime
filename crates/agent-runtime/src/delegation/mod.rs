@@ -28,9 +28,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
-use tokio::sync::watch;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Notify, watch};
 
-use agent_runtime_core::approval::{ApprovalDecision, ApprovalPolicy, ApprovalRequest};
+use agent_runtime_core::approval::{
+    ApprovalDecision, ApprovalOrigin, ApprovalPolicy, ApprovalRequest,
+};
+use agent_runtime_core::artifact::{ArtifactRef, ArtifactStore, ArtifactTransfer};
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::UserInput;
@@ -39,16 +43,18 @@ use agent_runtime_core::error::{ErrorKind, RuntimeError};
 use agent_runtime_core::event::{ChildPhase, RuntimeEvent, TurnFinish};
 use agent_runtime_core::grant::AuthorizationDecision;
 use agent_runtime_core::ids::{ChildId, SessionId, ToolCallId};
+use agent_runtime_core::ids::{InteractionRequestId, QuestionId, TurnId};
+use agent_runtime_core::interaction::{InteractionRequest, InteractionSensitivity, Questionnaire};
 use agent_runtime_core::security::{
     AuthorizationRequest, SecurityAction, SecurityContext, SecurityEvidence,
 };
-use agent_runtime_core::tool::ToolEffects;
+use agent_runtime_core::tool::{PreparedToolCall, ToolCallDisplay, ToolEffects};
 use agent_runtime_core::usage::CounterKind;
 use agent_runtime_registry::{Fingerprint, Permission, TrustClass};
 
 use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::engine::Runtime;
-use crate::runtime::session::SessionHandle;
+use crate::runtime::session::{SessionHandle, TurnHandle};
 use crate::tool::SecurityConfig;
 
 /// The host-defined permission delegation operations request from the
@@ -65,6 +71,15 @@ pub const DELEGATION_PERMISSION: &str = "agent.delegate";
 pub trait ChildRuntimeFactory: Send + Sync + fmt::Debug {
     /// A builder for the child described by `spec`.
     fn child_builder(&self, spec: &ChildSpec) -> Result<RuntimeBuilder, RuntimeError>;
+
+    /// Protected artifact store shared by the parent/child composition.
+    ///
+    /// Returning a store does not widen `artifact.read`; the coordinator uses
+    /// it only for explicit child-to-parent ownership transfer after a typed
+    /// reference is observed from the exact child turn.
+    fn artifact_store(&self) -> Option<Arc<dyn ArtifactStore>> {
+        None
+    }
 }
 
 /// Deterministic caps on delegated children.
@@ -196,6 +211,151 @@ pub struct ChildStatus {
     pub max_turns: u32,
     /// The latest completed task's final visible answer, if any.
     pub last_result: Option<String>,
+    /// Parent-owned artifact references returned with the latest completed
+    /// task.
+    pub last_artifacts: Vec<ArtifactRef>,
+}
+
+/// Exact typed result of one completed delegated child task.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildTaskResult {
+    /// Final visible answer.
+    pub text: String,
+    /// Parent-owned artifacts explicitly copied from this child turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactRef>,
+}
+
+impl fmt::Debug for ChildTaskResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildTaskResult")
+            .field("text_chars", &self.text.chars().count())
+            .field("artifact_count", &self.artifacts.len())
+            .finish()
+    }
+}
+
+/// Exact typed result of one delegated child task.
+///
+/// `NeedsInput` retains the protected interaction request; callers must not
+/// stringify it into ordinary conversation or plaintext persistence. Use
+/// [`ChildTaskOutcome::model_projection`] for the bounded delivery shape.
+#[derive(Clone, PartialEq)]
+pub enum ChildTaskOutcome {
+    /// The child completed its current task.
+    Completed {
+        /// Stable child identity.
+        child: ChildId,
+        /// Final visible result and parent-owned artifact references.
+        result: ChildTaskResult,
+    },
+    /// The child is blocked on attributed task information.
+    NeedsInput {
+        /// Stable child identity.
+        child: ChildId,
+        /// Exact protected interaction request.
+        request: InteractionRequest,
+    },
+}
+
+impl fmt::Debug for ChildTaskOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed { child, result } => formatter
+                .debug_struct("ChildTaskOutcome::Completed")
+                .field("child", child)
+                .field("result", result)
+                .finish(),
+            Self::NeedsInput { child, request } => formatter
+                .debug_struct("ChildTaskOutcome::NeedsInput")
+                .field("child", child)
+                .field("request", request.id())
+                .field(
+                    "question_count",
+                    &request.questionnaire_payload().questions().len(),
+                )
+                .field("sensitivity", &request.sensitivity())
+                .finish(),
+        }
+    }
+}
+
+impl ChildTaskOutcome {
+    /// Redaction-safe model delivery. Public questionnaires retain their
+    /// prompts; sensitive questionnaires carry attribution and question ids
+    /// only and must be rendered by the trusted root interaction host.
+    pub fn model_projection(&self) -> Option<ChildNeedsInputProjection> {
+        let Self::NeedsInput { child, request } = self else {
+            return None;
+        };
+        Some(ChildNeedsInputProjection::from_request(
+            child.clone(),
+            request,
+        ))
+    }
+}
+
+/// Bounded, sensitivity-aware projection of a delegated interaction.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildNeedsInputProjection {
+    /// Stable child identity.
+    pub child: ChildId,
+    /// Exact child session.
+    pub child_session: SessionId,
+    /// Child turn.
+    pub turn: TurnId,
+    /// Originating call.
+    pub call: ToolCallId,
+    /// Interaction request identity.
+    pub request: InteractionRequestId,
+    /// Question identities in canonical order.
+    pub question_ids: Vec<QuestionId>,
+    /// Content-handling requirement.
+    pub sensitivity: InteractionSensitivity,
+    /// Exact prompts only when explicitly public.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_questionnaire: Option<Questionnaire>,
+}
+
+impl ChildNeedsInputProjection {
+    fn from_request(child: ChildId, request: &InteractionRequest) -> Self {
+        Self {
+            child,
+            child_session: request.origin().session().clone(),
+            turn: request.origin().turn().clone(),
+            call: request.origin().call().clone(),
+            request: request.id().clone(),
+            question_ids: request
+                .questionnaire_payload()
+                .questions()
+                .iter()
+                .map(|question| question.id().clone())
+                .collect(),
+            sensitivity: request.sensitivity(),
+            public_questionnaire: (request.sensitivity() == InteractionSensitivity::Public)
+                .then(|| request.questionnaire_payload().clone()),
+        }
+    }
+}
+
+impl fmt::Debug for ChildNeedsInputProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildNeedsInputProjection")
+            .field("child", &self.child)
+            .field("child_session", &self.child_session)
+            .field("turn", &self.turn)
+            .field("call", &self.call)
+            .field("request", &self.request)
+            .field("question_count", &self.question_ids.len())
+            .field("sensitivity", &self.sensitivity)
+            .field(
+                "has_public_questionnaire",
+                &self.public_questionnaire.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// The structured outcome of a spawn request.
@@ -247,12 +407,22 @@ struct QueuedSpawn {
     spec: ChildSpec,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TaskOutcomeKey {
+    Completed(TurnId),
+    NeedsInput(InteractionRequestId),
+}
+
 struct CoordinatorInner {
     parent: SessionHandle,
     factory: Arc<dyn ChildRuntimeFactory>,
     config: DelegationConfig,
     children: Mutex<BTreeMap<ChildId, ChildEntry>>,
     queue: Mutex<Vec<QueuedSpawn>>,
+    spawn_reservations: Mutex<usize>,
+    returned_inputs: Mutex<BTreeMap<(ChildId, InteractionRequestId), InteractionRequest>>,
+    ready_task_outcomes: Mutex<BTreeMap<(ChildId, TaskOutcomeKey), ChildTaskOutcome>>,
+    returned_inputs_changed: Notify,
     next_child: AtomicU64,
 }
 
@@ -288,6 +458,10 @@ impl DelegationCoordinator {
                 config,
                 children: Mutex::new(BTreeMap::new()),
                 queue: Mutex::new(Vec::new()),
+                spawn_reservations: Mutex::new(0),
+                returned_inputs: Mutex::new(BTreeMap::new()),
+                ready_task_outcomes: Mutex::new(BTreeMap::new()),
+                returned_inputs_changed: Notify::new(),
                 next_child: AtomicU64::new(0),
             }),
         };
@@ -306,18 +480,31 @@ impl DelegationCoordinator {
         self.authorize("delegation.spawn", spawn_detail(&spec))
             .await?;
 
-        let alive = self.alive_children();
-        if alive >= self.inner.config.limits.max_running_children {
+        let at_capacity = {
+            let mut reservations = self
+                .inner
+                .spawn_reservations
+                .lock()
+                .expect("delegation spawn reservations poisoned");
+            let occupied = self.alive_children().saturating_add(*reservations);
+            if occupied >= self.inner.config.limits.max_running_children {
+                Some(occupied)
+            } else {
+                *reservations = (*reservations).saturating_add(1);
+                None
+            }
+        };
+        if let Some(occupied) = at_capacity {
             return match self.inner.config.capacity_policy {
                 CapacityPolicy::Reject => Ok(SpawnOutcome::AtCapacity {
-                    running: alive,
+                    running: occupied,
                     limit: self.inner.config.limits.max_running_children,
                 }),
                 CapacityPolicy::Queue { max_pending } => {
                     let mut queue = self.inner.queue.lock().expect("delegation queue poisoned");
                     if queue.len() >= max_pending {
                         return Ok(SpawnOutcome::AtCapacity {
-                            running: alive,
+                            running: occupied,
                             limit: self.inner.config.limits.max_running_children,
                         });
                     }
@@ -332,7 +519,16 @@ impl DelegationCoordinator {
         }
 
         let child = self.mint_child_id();
-        let handle = self.start_child(child.clone(), spec).await?;
+        let started = self.start_child(child.clone(), spec).await;
+        {
+            let mut reservations = self
+                .inner
+                .spawn_reservations
+                .lock()
+                .expect("delegation spawn reservations poisoned");
+            *reservations = (*reservations).saturating_sub(1);
+        }
+        let handle = started?;
         Ok(SpawnOutcome::Spawned { child, handle })
     }
 
@@ -365,6 +561,130 @@ impl DelegationCoordinator {
         Ok(self.status(child)?.last_result)
     }
 
+    /// Observes the current exact task outcome for `child` without consuming
+    /// either host-waiter or automatic model-delivery readiness.
+    pub fn task_outcome(&self, child: &ChildId) -> Result<Option<ChildTaskOutcome>, RuntimeError> {
+        let status = self.status(child)?;
+        let request = self
+            .inner
+            .returned_inputs
+            .lock()
+            .expect("returned child inputs poisoned")
+            .iter()
+            .find(|((candidate, _), _)| candidate == child)
+            .map(|(_, request)| request.clone());
+        if let Some(request) = request {
+            return Ok(Some(ChildTaskOutcome::NeedsInput {
+                child: child.clone(),
+                request,
+            }));
+        }
+        if status.state == ChildState::Idle {
+            return Ok(Some(ChildTaskOutcome::Completed {
+                child: child.clone(),
+                result: ChildTaskResult {
+                    text: status.last_result.unwrap_or_default(),
+                    artifacts: status.last_artifacts,
+                },
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Compatibility alias for [`Self::task_outcome`].
+    ///
+    /// Host wait/status reads are intentionally idempotent. Automatic parent
+    /// injection has a separate exact-once ordered delivery queue.
+    pub fn take_task_outcome(
+        &self,
+        child: &ChildId,
+    ) -> Result<Option<ChildTaskOutcome>, RuntimeError> {
+        self.task_outcome(child)
+    }
+
+    /// Takes the once-delivery projection of every currently returned
+    /// interaction in canonical
+    /// `(child_id, request_id)` order.
+    ///
+    /// The exact protected outcomes remain retained for host inspection and
+    /// explicit follow-up. Only their automatic delivery markers are
+    /// consumed.
+    pub fn take_ready_task_outcomes(&self) -> Vec<ChildTaskOutcome> {
+        let ready = {
+            let mut ready = self
+                .inner
+                .ready_task_outcomes
+                .lock()
+                .expect("ready child task outcomes poisoned");
+            std::mem::take(&mut *ready)
+        };
+        ready.into_values().collect()
+    }
+
+    /// Waits for and drains the next non-empty canonical batch of returned
+    /// child task outcomes.
+    ///
+    /// Both normal completion and returned input use this lossless path.
+    /// It is independent of bounded event observers and ends when the parent
+    /// session is cancelled or shut down.
+    pub async fn wait_ready_task_outcomes(&self) -> Result<Vec<ChildTaskOutcome>, RuntimeError> {
+        loop {
+            let changed = self.inner.returned_inputs_changed.notified();
+            let outcomes = self.take_ready_task_outcomes();
+            if !outcomes.is_empty() {
+                return Ok(outcomes);
+            }
+            tokio::select! {
+                _ = changed => {}
+                _ = self.inner.parent.inner().cancel.cancelled() => {
+                    return Err(RuntimeError::cancelled(
+                        "parent session ended while waiting for child task outcomes",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Waits until the child completes normally or returns exact task input.
+    pub async fn wait_task_outcome(
+        &self,
+        child: &ChildId,
+    ) -> Result<ChildTaskOutcome, RuntimeError> {
+        let mut status_rx = {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            children
+                .get(child)
+                .ok_or_else(|| unknown_child(child))?
+                .status
+                .subscribe()
+        };
+        loop {
+            if let Some(outcome) = self.take_task_outcome(child)? {
+                return Ok(outcome);
+            }
+            let status = status_rx.borrow().clone();
+            if status.state.is_terminal() {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` terminated before producing a task outcome"
+                )));
+            }
+            tokio::select! {
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(RuntimeError::conflict(format!(
+                            "child `{child}` outcome channel closed"
+                        )));
+                    }
+                }
+                _ = self.inner.returned_inputs_changed.notified() => {}
+            }
+        }
+    }
+
     /// Sends a follow-up task to an existing child under its original
     /// specification and limits.
     pub async fn follow_up(&self, child: &ChildId, input: UserInput) -> Result<(), RuntimeError> {
@@ -377,7 +697,7 @@ impl DelegationCoordinator {
             }),
         )
         .await?;
-        let (handle, status_tx) = {
+        let (handle, status_tx, previous_status) = {
             let children = self
                 .inner
                 .children
@@ -400,13 +720,30 @@ impl DelegationCoordinator {
                     ),
                 ));
             }
-            (entry.handle.clone(), entry.status.clone())
+            let previous = status.clone();
+            entry.status.send_modify(|status| {
+                status.turns_used += 1;
+                status.state = ChildState::Running;
+            });
+            (entry.handle.clone(), entry.status.clone(), previous)
         };
-        status_tx.send_modify(|status| {
-            status.turns_used += 1;
-            status.state = ChildState::Running;
-        });
-        handle.send(input);
+        let cleared = clear_returned_inputs_for_child(&self.inner, child, &handle);
+        let turn = match handle.send(input) {
+            Ok(turn) => turn,
+            Err(error) => {
+                restore_returned_inputs_for_child(&self.inner, child, &handle, cleared)?;
+                status_tx.send_replace(previous_status);
+                return Err(error);
+            }
+        };
+        self.inner.parent.inner().emitter.emit(
+            None,
+            RuntimeEvent::ChildProgress {
+                child: child.clone(),
+                phase: ChildPhase::TurnStarted,
+            },
+        );
+        self.spawn_returned_input_collector(child.clone(), handle, turn);
         Ok(())
     }
 
@@ -453,6 +790,7 @@ impl DelegationCoordinator {
         };
         handle.cancel(CancelReason::UserRequested);
         let _ = handle.shutdown().await;
+        clear_returned_inputs_for_child(&self.inner, child, &handle);
 
         // Wait for the *terminal* snapshot, not merely non-running: an idle
         // child is stopped through its monitor observing the shutdown, and
@@ -494,8 +832,9 @@ impl DelegationCoordinator {
         for (_, handle) in &handles {
             handle.cancel(reason.clone());
         }
-        for (_, handle) in &handles {
+        for (child, handle) in &handles {
             let _ = handle.shutdown().await;
+            clear_returned_inputs_for_child(&self.inner, child, handle);
         }
     }
 
@@ -571,12 +910,31 @@ impl DelegationCoordinator {
                 format!("delegation authorization denied: {code}"),
             )),
             AuthorizationDecision::RequireApproval { eligible } => {
-                let approval_request = ApprovalRequest {
-                    call_id: ToolCallId::new(format!("{operation}@{}", self.inner.parent.id())),
-                    tool: operation.to_string(),
-                    arguments: detail,
-                    effects: ToolEffects::read_only(),
-                };
+                let prepared = PreparedToolCall::new(
+                    ToolCallId::new(format!("{operation}@{}", self.inner.parent.id())),
+                    operation,
+                    detail,
+                    agent_runtime_core::security::PermissionSet::single(Permission::other(
+                        DELEGATION_PERMISSION.to_string(),
+                    )),
+                    agent_runtime_core::security::SecurityResource::other(
+                        "child-agent",
+                        self.inner.parent.id().to_string(),
+                    ),
+                    ToolEffects::new(vec![]),
+                    ToolCallDisplay::new("Authorize child-agent operation"),
+                );
+                let approval_request = ApprovalRequest::new(
+                    prepared,
+                    Deadline::never(),
+                    ApprovalOrigin::new(
+                        self.inner.parent.id().clone(),
+                        agent_runtime_core::ids::RequestId::new(format!(
+                            "{operation}@{}",
+                            self.inner.parent.id()
+                        )),
+                    ),
+                );
                 let decision = approval.decide(&approval_request).await;
                 let allowed = decision.is_allowed();
                 let resolved = security.check_set.resolve_approval(eligible, allowed);
@@ -586,6 +944,14 @@ impl DelegationCoordinator {
                     let reason = match decision {
                         ApprovalDecision::Deny { reason } => reason,
                         ApprovalDecision::Allow => "approval could not be resolved".to_string(),
+                        ApprovalDecision::Edit { .. } => {
+                            "delegation approval cannot edit the prepared action".to_string()
+                        }
+                        ApprovalDecision::TimedOut => "approval timed out".to_string(),
+                        ApprovalDecision::Cancelled => "approval was cancelled".to_string(),
+                        ApprovalDecision::Unavailable { reason } => {
+                            format!("approval unavailable: {reason}")
+                        }
                     };
                     Err(RuntimeError::new(
                         ErrorKind::Approval,
@@ -650,6 +1016,7 @@ impl DelegationCoordinator {
             turns_used: 1,
             max_turns: spec.limits.max_turns,
             last_result: None,
+            last_artifacts: Vec::new(),
         });
 
         // Subscribe before sending the task so no lifecycle event is missed.
@@ -664,7 +1031,7 @@ impl DelegationCoordinator {
             .lock()
             .expect("delegation children poisoned")
             .insert(
-                child,
+                child.clone(),
                 ChildEntry {
                     handle: handle.clone(),
                     _runtime: runtime,
@@ -674,7 +1041,15 @@ impl DelegationCoordinator {
                 },
             );
 
-        handle.send(spec.task);
+        let turn = handle.send(spec.task)?;
+        self.inner.parent.inner().emitter.emit(
+            None,
+            RuntimeEvent::ChildProgress {
+                child: child.clone(),
+                phase: ChildPhase::TurnStarted,
+            },
+        );
+        self.spawn_returned_input_collector(child.clone(), handle.clone(), turn);
         Ok(handle)
     }
 
@@ -688,7 +1063,10 @@ impl DelegationCoordinator {
         // Delegation-management tools never reach a child view, whatever the
         // requested scope.
         let delegation_names = self.inner.config.delegation_tool_names.clone();
-        builder.scope_tools(|tool| !delegation_names.iter().any(|n| n == tool.name()));
+        builder.scope_tools(|tool| {
+            let name = tool.spec().name;
+            !delegation_names.iter().any(|candidate| candidate == &name)
+        });
 
         // Apply the spec's scope. A read-only workspace posture also forces
         // the read-only tool filter, so a child that must not mutate cannot
@@ -697,16 +1075,24 @@ impl DelegationCoordinator {
         match &spec.tools {
             ToolViewScope::All => {}
             ToolViewScope::ReadOnly => {
-                builder.scope_tools(|tool| !tool.effects().requires_authorization());
+                builder.scope_tools(tool_is_read_only);
             }
             ToolViewScope::Named { names } => {
                 let names = names.clone();
-                builder.scope_tools(|tool| names.iter().any(|n| n == tool.name()));
+                builder.scope_tools(|tool| {
+                    let name = tool.spec().name;
+                    names.iter().any(|candidate| candidate == &name)
+                });
             }
         }
         if read_only_posture {
-            builder.scope_tools(|tool| !tool.effects().requires_authorization());
+            builder.scope_tools(tool_is_read_only);
         }
+
+        // Child interactions are never presented directly through the root
+        // host broker. The runtime completes the exchange and returns the
+        // exact request through this coordinator's protected outcome path.
+        builder.return_child_interactions_to_parent();
 
         // Children are ephemeral: no persistence, no resume.
         builder.clear_session_store();
@@ -727,6 +1113,68 @@ impl DelegationCoordinator {
         Ok((runtime, handle))
     }
 
+    /// Lossless control path for a child turn's protected returned
+    /// interaction. This is deliberately independent of the bounded
+    /// observability broadcast used by [`Self::spawn_monitor`].
+    fn spawn_returned_input_collector(
+        &self,
+        child: ChildId,
+        handle: SessionHandle,
+        turn: TurnHandle,
+    ) {
+        let coordinator = self.inner.clone();
+        tokio::spawn(async move {
+            let turn_id = turn.id().clone();
+            let (finish, returned) = turn.outcome().await;
+            if finish.is_some() {
+                coordinator.parent.inner().emitter.emit(
+                    None,
+                    RuntimeEvent::ChildProgress {
+                        child: child.clone(),
+                        phase: ChildPhase::TurnFinished,
+                    },
+                );
+            }
+            let result = match (finish, returned) {
+                (Some(TurnFinish::NeedsInput { request }), Some(exact))
+                    if exact.id() == &request =>
+                {
+                    record_returned_input(&coordinator, &child, &handle, exact)
+                }
+                (Some(TurnFinish::NeedsInput { .. }), _) => Err(RuntimeError::conflict(
+                    "child completed with needs_input but its protected request was unavailable",
+                )),
+                (Some(TurnFinish::Completed | TurnFinish::LimitReached { .. }), None) => {
+                    match transfer_completed_result(
+                        &coordinator,
+                        &child,
+                        &handle,
+                        &turn_id,
+                        last_assistant_text(&handle),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            record_completed_outcome(&coordinator, &child, turn_id, result)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => return,
+            };
+            if let Err(error) = result {
+                update_status(&coordinator, &child, |status| {
+                    status.state = ChildState::Failed;
+                });
+                coordinator
+                    .parent
+                    .inner()
+                    .emitter
+                    .emit(None, RuntimeEvent::ChildFailed { child, error });
+            }
+        });
+    }
+
     /// Mirrors one child's canonical events onto the parent stream as
     /// attributed child lifecycle events, enforces the token budget, and
     /// resolves the terminal state exactly once.
@@ -745,15 +1193,7 @@ impl DelegationCoordinator {
             let mut terminal = false;
             while let Some(envelope) = events.next().await {
                 match envelope.payload {
-                    RuntimeEvent::TurnStarted => {
-                        parent_emitter.emit(
-                            None,
-                            RuntimeEvent::ChildProgress {
-                                child: child.clone(),
-                                phase: ChildPhase::TurnStarted,
-                            },
-                        );
-                    }
+                    RuntimeEvent::TurnStarted => {}
                     RuntimeEvent::ToolCallCompleted { name, .. } => {
                         parent_emitter.emit(
                             None,
@@ -776,30 +1216,16 @@ impl DelegationCoordinator {
                         }
                     }
                     RuntimeEvent::TurnCompleted { finish, .. } => {
-                        parent_emitter.emit(
-                            None,
-                            RuntimeEvent::ChildProgress {
-                                child: child.clone(),
-                                phase: ChildPhase::TurnFinished,
-                            },
-                        );
                         match finish {
-                            TurnFinish::Completed | TurnFinish::LimitReached { .. } => {
-                                let result = last_assistant_text(&handle);
-                                update_status(&coordinator, &child, |status| {
-                                    status.state = ChildState::Idle;
-                                    status.last_result = Some(result.clone());
-                                });
-                                // The final result rides the event itself, so
-                                // coalescing progress can never lose it.
-                                parent_emitter.emit(
-                                    None,
-                                    RuntimeEvent::ChildCompleted {
-                                        child: child.clone(),
-                                        result,
-                                    },
-                                );
-                            }
+                            // Normal and returned-input task outcomes use the
+                            // lossless TurnHandle completion cell. This
+                            // bounded broadcast is observability only.
+                            TurnFinish::Completed
+                            | TurnFinish::LimitReached { .. }
+                            // The protected NeedsInput control path is the
+                            // lossless turn-completion cell. This bounded
+                            // broadcast is observability only and may lag.
+                            | TurnFinish::NeedsInput { .. } => {}
                             TurnFinish::Cancelled { reason } => {
                                 terminal = true;
                                 update_status(&coordinator, &child, |status| {
@@ -914,6 +1340,15 @@ impl DelegationCoordinator {
     }
 }
 
+fn tool_is_read_only(tool: &Arc<dyn agent_runtime_core::tool::Tool>) -> bool {
+    tool.spec().permission_upper_bound.iter().all(|permission| {
+        matches!(
+            permission,
+            Permission::FsRead | Permission::ClockRead | Permission::RandomRead
+        )
+    })
+}
+
 fn update_status(
     coordinator: &Arc<CoordinatorInner>,
     child: &ChildId,
@@ -926,6 +1361,259 @@ fn update_status(
     if let Some(entry) = children.get(child) {
         entry.status.send_modify(apply);
     }
+}
+
+fn record_returned_input(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    handle: &SessionHandle,
+    request: InteractionRequest,
+) -> Result<(), RuntimeError> {
+    request.validate()?;
+    if request.origin().session() != handle.id() {
+        return Err(RuntimeError::conflict(
+            "returned child interaction did not preserve exact session attribution",
+        ));
+    }
+    let key = (child.clone(), request.id().clone());
+    let outcome_key = (
+        child.clone(),
+        TaskOutcomeKey::NeedsInput(request.id().clone()),
+    );
+    {
+        let mut returned = coordinator
+            .returned_inputs
+            .lock()
+            .expect("returned child inputs poisoned");
+        if let Some(existing) = returned.get(&key) {
+            if existing == &request {
+                return Ok(());
+            }
+            return Err(RuntimeError::conflict(
+                "duplicate returned child interaction identity has different protected content",
+            ));
+        }
+        returned.insert(key.clone(), request.clone());
+        coordinator
+            .ready_task_outcomes
+            .lock()
+            .expect("ready child task outcomes poisoned")
+            .insert(
+                outcome_key,
+                ChildTaskOutcome::NeedsInput {
+                    child: child.clone(),
+                    request: request.clone(),
+                },
+            );
+    }
+
+    update_status(coordinator, child, |status| {
+        status.state = ChildState::Idle;
+        status.last_result = None;
+        status.last_artifacts.clear();
+    });
+    coordinator.parent.inner().emitter.emit(
+        None,
+        RuntimeEvent::ChildNeedsInput {
+            child: child.clone(),
+            child_session: handle.id().clone(),
+            turn: request.origin().turn().clone(),
+            call: request.origin().call().clone(),
+            request: request.id().clone(),
+            question_ids: request
+                .questionnaire_payload()
+                .questions()
+                .iter()
+                .map(|question| question.id().clone())
+                .collect(),
+            sensitivity: request.sensitivity(),
+        },
+    );
+    coordinator.returned_inputs_changed.notify_waiters();
+    Ok(())
+}
+
+fn record_completed_outcome(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    turn: TurnId,
+    result: ChildTaskResult,
+) -> Result<(), RuntimeError> {
+    let outcome = ChildTaskOutcome::Completed {
+        child: child.clone(),
+        result: result.clone(),
+    };
+    let key = (child.clone(), TaskOutcomeKey::Completed(turn));
+    if coordinator
+        .ready_task_outcomes
+        .lock()
+        .expect("ready child task outcomes poisoned")
+        .insert(key, outcome)
+        .is_some()
+    {
+        return Err(RuntimeError::conflict(
+            "duplicate completed child task outcome identity",
+        ));
+    }
+    update_status(coordinator, child, |status| {
+        status.state = ChildState::Idle;
+        status.last_result = Some(result.text.clone());
+        status.last_artifacts = result.artifacts.clone();
+    });
+    coordinator.parent.inner().emitter.emit(
+        None,
+        RuntimeEvent::ChildCompleted {
+            child: child.clone(),
+            result: result.text,
+        },
+    );
+    coordinator.returned_inputs_changed.notify_waiters();
+    Ok(())
+}
+
+async fn transfer_completed_result(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    handle: &SessionHandle,
+    turn: &TurnId,
+    text: String,
+) -> Result<ChildTaskResult, RuntimeError> {
+    let sources = handle.artifacts_for_turn(turn);
+    if sources.is_empty() {
+        return Ok(ChildTaskResult {
+            text,
+            artifacts: Vec::new(),
+        });
+    }
+    let store = coordinator.factory.artifact_store().ok_or_else(|| {
+        RuntimeError::conflict(
+            "child produced artifact references but its host exposed no ownership-transfer store",
+        )
+    })?;
+    let mut artifacts = Vec::with_capacity(sources.len());
+    for source in sources {
+        if source.provenance.session != *handle.id() {
+            return Err(RuntimeError::conflict(
+                "child result contained an artifact owned by another session",
+            ));
+        }
+        let idempotency_key = Fingerprint::of_fields([
+            b"delegation-child-artifact-transfer".as_slice(),
+            coordinator.parent.id().as_str().as_bytes(),
+            handle.id().as_str().as_bytes(),
+            child.as_str().as_bytes(),
+            turn.as_str().as_bytes(),
+            source.id.as_str().as_bytes(),
+            source.digest.algorithm.as_bytes(),
+            source.digest.hex.as_bytes(),
+        ]);
+        let transferred = store
+            .transfer(ArtifactTransfer {
+                source: source.clone(),
+                target_session: coordinator.parent.id().clone(),
+                purpose: "delegation.child-result".into(),
+                idempotency_key: idempotency_key.as_str().to_owned(),
+            })
+            .await
+            .map_err(|error| {
+                RuntimeError::tool(format!(
+                    "failed to transfer child `{child}` artifact `{}`: {error}",
+                    source.id
+                ))
+            })?;
+        if transferred.provenance.session != *coordinator.parent.id()
+            || transferred
+                .provenance
+                .derived_from
+                .as_ref()
+                .is_none_or(|lineage| {
+                    lineage.session != *handle.id()
+                        || lineage.id != source.id
+                        || lineage.digest != source.digest
+                })
+        {
+            return Err(RuntimeError::internal(
+                "child artifact transfer returned invalid ownership lineage",
+            ));
+        }
+        artifacts.push(transferred);
+    }
+    Ok(ChildTaskResult { text, artifacts })
+}
+
+fn clear_returned_inputs_for_child(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    handle: &SessionHandle,
+) -> Vec<(InteractionRequest, Option<ChildTaskOutcome>)> {
+    let cleared = {
+        let mut returned = coordinator
+            .returned_inputs
+            .lock()
+            .expect("returned child inputs poisoned");
+        let keys = returned
+            .keys()
+            .filter(|(candidate, _)| candidate == child)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut ready = coordinator
+            .ready_task_outcomes
+            .lock()
+            .expect("ready child task outcomes poisoned");
+        keys.into_iter()
+            .filter_map(|key| {
+                let ready_key = (key.0.clone(), TaskOutcomeKey::NeedsInput(key.1.clone()));
+                let pending = ready.remove(&ready_key);
+                returned.remove(&key).map(|request| (request, pending))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (request, _) in &cleared {
+        handle
+            .inner()
+            .execution
+            .clear_returned_interaction(request.id());
+    }
+    cleared
+}
+
+fn restore_returned_inputs_for_child(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    handle: &SessionHandle,
+    cleared: Vec<(InteractionRequest, Option<ChildTaskOutcome>)>,
+) -> Result<(), RuntimeError> {
+    let mut returned = coordinator
+        .returned_inputs
+        .lock()
+        .expect("returned child inputs poisoned");
+    let mut ready = coordinator
+        .ready_task_outcomes
+        .lock()
+        .expect("ready child task outcomes poisoned");
+    for (request, pending) in &cleared {
+        let key = (child.clone(), request.id().clone());
+        if returned.insert(key.clone(), request.clone()).is_some() {
+            return Err(RuntimeError::conflict(
+                "could not roll back returned child interaction transaction",
+            ));
+        }
+        if let Some(outcome) = pending {
+            ready.insert(
+                (
+                    child.clone(),
+                    TaskOutcomeKey::NeedsInput(request.id().clone()),
+                ),
+                outcome.clone(),
+            );
+        }
+    }
+    drop(ready);
+    drop(returned);
+    for (request, _) in cleared {
+        handle.inner().execution.return_interaction(request)?;
+    }
+    Ok(())
 }
 
 fn release_capacity(coordinator: &Arc<CoordinatorInner>, child: &ChildId) {
@@ -949,6 +1637,10 @@ fn release_capacity(coordinator: &Arc<CoordinatorInner>, child: &ChildId) {
 /// Starts the next queued spawn if a slot is free (queue policy only).
 async fn start_queued(coordinator: &Arc<CoordinatorInner>) {
     let next = {
+        let mut reservations = coordinator
+            .spawn_reservations
+            .lock()
+            .expect("delegation spawn reservations poisoned");
         let alive = coordinator
             .children
             .lock()
@@ -956,13 +1648,14 @@ async fn start_queued(coordinator: &Arc<CoordinatorInner>) {
             .values()
             .filter(|entry| !entry.status.borrow().state.is_terminal())
             .count();
-        if alive >= coordinator.config.limits.max_running_children {
+        if alive.saturating_add(*reservations) >= coordinator.config.limits.max_running_children {
             return;
         }
         let mut queue = coordinator.queue.lock().expect("delegation queue poisoned");
         if queue.is_empty() {
             return;
         }
+        *reservations = (*reservations).saturating_add(1);
         queue.remove(0)
     };
     let handle = DelegationCoordinator {
@@ -970,7 +1663,14 @@ async fn start_queued(coordinator: &Arc<CoordinatorInner>) {
     };
     // A queued spawn was validated and authorized at submission; a failure to
     // start it now surfaces as a ChildFailed event so it is not silently lost.
-    if let Err(err) = handle.start_child(next.child.clone(), next.spec).await {
+    let started = handle.start_child(next.child.clone(), next.spec).await;
+    let mut reservations = coordinator
+        .spawn_reservations
+        .lock()
+        .expect("delegation spawn reservations poisoned");
+    *reservations = (*reservations).saturating_sub(1);
+    drop(reservations);
+    if let Err(err) = started {
         coordinator.parent.inner().emitter.emit(
             None,
             RuntimeEvent::ChildFailed {

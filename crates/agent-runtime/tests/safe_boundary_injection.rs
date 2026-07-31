@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use agent_runtime::context::{CompactionPolicy, ContextPolicy, StructuralCompactor};
 use agent_runtime::core::catalog::{ModelLimits, ResolvedModelProfile};
 use agent_runtime::prelude::*;
 use agent_runtime::provider::fake::{
@@ -33,7 +34,7 @@ struct InjectingTool {
 }
 
 #[async_trait]
-impl Tool for InjectingTool {
+impl LegacyTool for InjectingTool {
     fn name(&self) -> &str {
         "probe"
     }
@@ -44,9 +45,9 @@ impl Tool for InjectingTool {
         json!({"type": "object", "additionalProperties": true})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
+        ToolEffects::new(vec![])
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         _arguments: Value,
         _ctx: &InvocationContext,
@@ -96,7 +97,7 @@ async fn mid_turn_content_is_introduced_at_the_next_tool_boundary() {
     let session = runtime.start_session(StartSession::new()).await.unwrap();
     session_slot.set(session.clone()).unwrap();
 
-    session.run(UserInput::text("go")).await;
+    session.run(UserInput::text("go")).await.unwrap();
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
@@ -131,6 +132,97 @@ async fn mid_turn_content_is_introduced_at_the_next_tool_boundary() {
     assert!(inject_pos > tool_pos);
 }
 
+#[tokio::test]
+async fn provider_boundary_injection_keeps_accepted_turn_suffix_required() {
+    let mut first = tool_call_fragments(0, "call-1", "probe", "{}");
+    first.insert(
+        0,
+        ProviderStreamEvent::ReasoningDelta {
+            text: "current-turn reasoning must survive".into(),
+            redacted: false,
+        },
+    );
+    first.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![
+            ScriptedStream::new(first),
+            ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "done".into(),
+                },
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]),
+        ],
+    ));
+    let compact_profile = ResolvedModelProfile::explicit(
+        "fake",
+        ModelId::new("fake"),
+        ModelLimits::new(1_000, 1_000, 128),
+    );
+    let session_slot: Arc<OnceLock<SessionHandle>> = Arc::new(OnceLock::new());
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider.clone())
+        .model_profile(compact_profile)
+        .context_policy(ContextPolicy::new(
+            RegistryRevision::new("injection-context-1"),
+            128,
+            0,
+        ))
+        .compactor(StructuralCompactor::new(CompactionPolicy::new(
+            RegistryRevision::new("injection-compaction-1"),
+            100,
+            10,
+        )))
+        .tool(Arc::new(InjectingTool {
+            session: session_slot.clone(),
+        }))
+        .build()
+        .unwrap();
+    let session = runtime
+        .start_session(StartSession::new().with_history(vec![
+            Message::user("old question"),
+            Message::text(Role::Assistant, "x".repeat(8_000)),
+        ]))
+        .await
+        .unwrap();
+    session_slot.set(session.clone()).unwrap();
+
+    session.run(UserInput::text("go")).await.unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let continuation = &requests[1].messages;
+    assert!(continuation.len() >= 4);
+    let active = &continuation[continuation.len() - 4..];
+    assert_eq!(
+        active
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>(),
+        [Role::User, Role::Assistant, Role::Tool, Role::User]
+    );
+    assert_eq!(active[0].joined_text(), "go");
+    assert_eq!(active[1].tool_calls().count(), 1);
+    assert!(active[1].content.iter().any(|part| {
+        matches!(
+            part,
+            ContentPart::Reasoning { text, .. }
+                if text == "current-turn reasoning must survive"
+        )
+    }));
+    assert!(matches!(
+        active[2].content.as_slice(),
+        [ContentPart::ToolResult(result)] if result.call_id == ToolCallId::new("call-1")
+    ));
+    assert_eq!(active[3].joined_text(), "host update: build finished");
+}
+
 /// Content queued while the session is idle is introduced at the start of the
 /// next turn, after that turn's input.
 #[tokio::test]
@@ -146,7 +238,7 @@ async fn queued_content_is_introduced_at_the_next_turn_start() {
     session
         .inject(InjectedContent::text("earlier notification"))
         .unwrap();
-    session.run(UserInput::text("next question")).await;
+    session.run(UserInput::text("next question")).await.unwrap();
 
     let requests = provider.requests();
     let texts: Vec<String> = requests[0]
@@ -188,7 +280,7 @@ async fn queue_overflow_is_structured_and_must_deliver_survives() {
         .inject(InjectedContent::text("final child result").must_deliver())
         .expect("must-deliver content is always accepted");
 
-    session.run(UserInput::text("go")).await;
+    session.run(UserInput::text("go")).await.unwrap();
     let texts: Vec<String> = provider.requests()[0]
         .messages
         .iter()

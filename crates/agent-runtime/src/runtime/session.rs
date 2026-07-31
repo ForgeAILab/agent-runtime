@@ -1,23 +1,28 @@
 //! The session handle: send input, subscribe to events, cancel, and shut down.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::AbortHandle;
 
+use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
+use agent_runtime_core::checkpoint::TurnCheckpoint;
 use agent_runtime_core::content::{Message, UserInput};
 use agent_runtime_core::error::RuntimeError;
-use agent_runtime_core::event::RuntimeEvent;
+use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
 use agent_runtime_core::ids::{SessionId, TurnId};
+use agent_runtime_core::interaction::InteractionRequest;
 use agent_runtime_core::store::SessionSnapshot;
 
+use crate::capability::ActivationEpoch;
 use crate::ids::IdMinter;
 use crate::runtime::emitter::{EventEmitter, RuntimeEventStream};
-use crate::runtime::engine::RuntimeShared;
+use crate::runtime::engine::{ActiveSessionLease, RuntimeShared};
 use crate::runtime::inject::{InjectedContent, InjectionQueue};
-use crate::runtime::state::SessionState;
+use crate::runtime::state::{SessionExecutionContext, SessionState};
 
 /// The shared inner state of a session.
 #[derive(Debug)]
@@ -31,12 +36,16 @@ pub struct SessionInner {
     pub(crate) emitter: Arc<EventEmitter>,
     pub(crate) minter: Arc<IdMinter>,
     pub(crate) state: Arc<Mutex<SessionState>>,
+    pub(crate) execution: Arc<SessionExecutionContext>,
     pub(crate) inbox: Arc<Mutex<InjectionQueue>>,
     pub(crate) turn_gate: AsyncMutex<()>,
     pub(crate) turns: Mutex<ActiveTurns>,
     pub(crate) turn_ready: Notify,
     pub(crate) turns_changed: Notify,
     pub(crate) shutdown_lock: AsyncMutex<bool>,
+    pub(crate) active_session_lease: ActiveSessionLease,
+    /// An unanswered interaction checkpoint was intentionally left dormant.
+    pub(crate) recovery_deferred: bool,
 }
 
 /// Active turn bookkeeping shared with shutdown.
@@ -45,8 +54,90 @@ pub(crate) struct ActiveTurns {
     shutting_down: bool,
     count: usize,
     aborts: Vec<AbortHandle>,
+    cancellations: BTreeMap<TurnId, Cancellation>,
+    current: Option<TurnId>,
     next_ticket: u64,
     serving_ticket: u64,
+}
+
+#[derive(Debug, Default)]
+struct TurnCompletionState {
+    done: bool,
+    finish: Option<TurnFinish>,
+    returned_interaction: Option<InteractionRequest>,
+}
+
+#[derive(Debug, Default)]
+struct TurnCompletion {
+    state: Mutex<TurnCompletionState>,
+    notify: Notify,
+}
+
+impl TurnCompletion {
+    fn finish(&self, finish: Option<TurnFinish>, returned_interaction: Option<InteractionRequest>) {
+        let should_notify = {
+            let mut state = self.state.lock().expect("turn completion poisoned");
+            if state.done {
+                false
+            } else {
+                state.finish = finish;
+                state.returned_interaction = returned_interaction;
+                state.done = true;
+                true
+            }
+        };
+        if should_notify {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.state.lock().expect("turn completion poisoned").done {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.state.lock().expect("turn completion poisoned").done {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn outcome(&self) -> (Option<TurnFinish>, Option<InteractionRequest>) {
+        self.wait().await;
+        let state = self.state.lock().expect("turn completion poisoned");
+        (state.finish.clone(), state.returned_interaction.clone())
+    }
+}
+
+/// A handle to one accepted turn.
+#[derive(Debug, Clone)]
+pub struct TurnHandle {
+    id: TurnId,
+    cancel: Cancellation,
+    completion: Arc<TurnCompletion>,
+}
+
+impl TurnHandle {
+    /// The accepted turn id.
+    pub fn id(&self) -> &TurnId {
+        &self.id
+    }
+
+    /// Waits until the turn task has reached a terminal boundary.
+    pub async fn completed(&self) {
+        self.completion.wait().await;
+    }
+
+    pub(crate) async fn outcome(&self) -> (Option<TurnFinish>, Option<InteractionRequest>) {
+        self.completion.outcome().await
+    }
+
+    /// Interrupts only this turn, including while it is queued.
+    pub fn interrupt(&self, reason: CancelReason) {
+        self.cancel.cancel(reason);
+    }
 }
 
 /// A handle to one active or resumable session.
@@ -70,6 +161,15 @@ impl SessionHandle {
         self.inner.parent.as_ref()
     }
 
+    /// Returns the session's current frozen activation epoch when live
+    /// capability routing is enabled.
+    ///
+    /// This read-only projection lets hosts recover composition emitted
+    /// before they subscribed without exposing mutable activation state.
+    pub fn activation_epoch(&self) -> Option<ActivationEpoch> {
+        self.inner.execution.activation_epoch()
+    }
+
     pub(crate) fn inner(&self) -> &Arc<SessionInner> {
         &self.inner
     }
@@ -87,48 +187,61 @@ impl SessionHandle {
             .push(content)
     }
 
-    /// Subscribes to this session's event stream. Multiple concurrent
-    /// subscribers each receive the full canonical sequence.
+    /// Subscribes to events emitted after this call. Multiple concurrent
+    /// subscribers receive the same live sequence; the persisted journal is
+    /// authoritative for earlier events and any detected delivery gaps.
     pub fn subscribe(&self) -> RuntimeEventStream {
         self.inner.emitter.subscribe()
     }
 
-    /// Queues input for this session and returns its turn id immediately.
+    /// Queues input for this session and returns a turn-local handle.
     /// Turns execute serially in submission order while events flow through
     /// [`SessionHandle::subscribe`].
-    pub fn send(&self, input: UserInput) -> TurnId {
-        let (turn_id, _completion) = self.spawn_turn(input);
-        turn_id
+    pub fn send(&self, input: UserInput) -> Result<TurnHandle, RuntimeError> {
+        self.spawn_turn(input)
     }
 
     /// Queues a turn, waits for its tracked task to complete, and returns its
-    /// id. Convenient for headless hosts that consume events through an
+    /// handle. Convenient for headless hosts that consume events through an
     /// observer.
-    pub async fn run(&self, input: UserInput) -> TurnId {
-        let (turn_id, completion) = self.spawn_turn(input);
-        if let Some(completion) = completion {
-            let _ = completion.await;
-        }
-        turn_id
+    pub async fn run(&self, input: UserInput) -> Result<TurnHandle, RuntimeError> {
+        let handle = self.spawn_turn(input)?;
+        handle.completed().await;
+        Ok(handle)
     }
 
-    fn spawn_turn(&self, input: UserInput) -> (TurnId, Option<oneshot::Receiver<()>>) {
-        let (completed_tx, completed_rx) = oneshot::channel();
-        let mut turns = self.inner.turns.lock().expect("session turns poisoned");
-        let turn_id = self.inner.minter.turn();
-        if turns.shutting_down {
-            return (turn_id, None);
+    fn spawn_turn(&self, input: UserInput) -> Result<TurnHandle, RuntimeError> {
+        if self.inner.recovery_deferred {
+            return Err(RuntimeError::conflict(
+                "session has a deferred pending interaction and cannot accept a new turn",
+            ));
         }
+        let mut turns = self.inner.turns.lock().expect("session turns poisoned");
+        if turns.shutting_down {
+            return Err(RuntimeError::conflict(
+                "session is shutting down and no longer accepts turns",
+            ));
+        }
+        let turn_id = self.inner.minter.turn();
+        let turn_cancel = self.inner.cancel.child();
+        let completion = Arc::new(TurnCompletion::default());
         turns.aborts.retain(|handle| !handle.is_finished());
         turns.count += 1;
         let ticket = turns.next_ticket;
         turns.next_ticket += 1;
+        turns
+            .cancellations
+            .insert(turn_id.clone(), turn_cancel.clone());
 
         let inner = self.inner.clone();
         let tid = turn_id.clone();
+        let task_cancel = turn_cancel.clone();
+        let task_completion = completion.clone();
         let active = ActiveTurnGuard {
             inner: inner.clone(),
             ticket,
+            turn: turn_id.clone(),
+            completion: completion.clone(),
         };
         let task = tokio::spawn(async move {
             let _active = active;
@@ -146,30 +259,151 @@ impl SessionHandle {
                 ready.await;
             }
             let _turn = inner.turn_gate.lock().await;
+            {
+                let mut turns = inner.turns.lock().expect("session turns poisoned");
+                turns.current = Some(tid.clone());
+            }
             inner
                 .shared
                 .driver
                 .run_turn(
                     inner.state.clone(),
+                    inner.execution.clone(),
                     inner.emitter.clone(),
                     inner.minter.clone(),
-                    inner.cancel.clone(),
+                    task_cancel,
                     inner.inbox.clone(),
-                    tid,
+                    tid.clone(),
                     input,
                 )
                 .await;
-            let _ = completed_tx.send(());
+            let finish = inner.execution.take_turn_finish(&tid);
+            let returned_interaction = inner.execution.returned_interaction_value();
+            task_completion.finish(finish, returned_interaction);
         });
         turns.aborts.push(task.abort_handle());
         drop(turns);
-        (turn_id, Some(completed_rx))
+        Ok(TurnHandle {
+            id: turn_id,
+            cancel: turn_cancel,
+            completion,
+        })
     }
 
-    /// Cancels the session. Cancellation propagates to active provider attempts
-    /// and tool invocations.
-    pub fn cancel(&self, reason: CancelReason) {
+    pub(crate) fn spawn_checkpoint_resume(
+        &self,
+        checkpoint: TurnCheckpoint,
+    ) -> Result<TurnHandle, RuntimeError> {
+        let mut turns = self.inner.turns.lock().expect("session turns poisoned");
+        if turns.shutting_down {
+            return Err(RuntimeError::conflict(
+                "session is shutting down and cannot resume a turn",
+            ));
+        }
+        if checkpoint.session != self.inner.id {
+            return Err(RuntimeError::conflict(
+                "cannot resume a checkpoint from another session",
+            ));
+        }
+        checkpoint.validate()?;
+
+        let turn_id = checkpoint.turn.clone();
+        let turn_cancel = self.inner.cancel.child();
+        let completion = Arc::new(TurnCompletion::default());
+        turns.aborts.retain(|handle| !handle.is_finished());
+        turns.count += 1;
+        let ticket = turns.next_ticket;
+        turns.next_ticket += 1;
+        turns
+            .cancellations
+            .insert(turn_id.clone(), turn_cancel.clone());
+
+        let inner = self.inner.clone();
+        let tid = turn_id.clone();
+        let completion_turn = turn_id.clone();
+        let task_cancel = turn_cancel.clone();
+        let task_completion = completion.clone();
+        let active = ActiveTurnGuard {
+            inner: inner.clone(),
+            ticket,
+            turn: turn_id.clone(),
+            completion: completion.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let _active = active;
+            loop {
+                let ready = inner.turn_ready.notified();
+                if inner
+                    .turns
+                    .lock()
+                    .expect("session turns poisoned")
+                    .serving_ticket
+                    == ticket
+                {
+                    break;
+                }
+                ready.await;
+            }
+            let _turn = inner.turn_gate.lock().await;
+            {
+                let mut turns = inner.turns.lock().expect("session turns poisoned");
+                turns.current = Some(tid);
+            }
+            inner
+                .shared
+                .driver
+                .resume_turn(
+                    inner.state.clone(),
+                    inner.execution.clone(),
+                    inner.emitter.clone(),
+                    inner.minter.clone(),
+                    task_cancel,
+                    inner.inbox.clone(),
+                    checkpoint,
+                )
+                .await;
+            let returned_interaction = inner.execution.returned_interaction_value();
+            let finish = inner.execution.take_turn_finish(&completion_turn);
+            task_completion.finish(finish, returned_interaction);
+        });
+        turns.aborts.push(task.abort_handle());
+        drop(turns);
+        Ok(TurnHandle {
+            id: turn_id,
+            cancel: turn_cancel,
+            completion,
+        })
+    }
+
+    /// Interrupts the currently serving turn without cancelling the session.
+    pub fn interrupt_current_turn(&self, reason: CancelReason) -> Result<(), RuntimeError> {
+        let cancel = {
+            let turns = self.inner.turns.lock().expect("session turns poisoned");
+            let current = turns.current.as_ref().ok_or_else(|| {
+                RuntimeError::not_found("there is no currently serving turn to interrupt")
+            })?;
+            turns.cancellations.get(current).cloned().ok_or_else(|| {
+                RuntimeError::internal("active turn cancellation handle is missing")
+            })?
+        };
+        cancel.cancel(reason);
+        Ok(())
+    }
+
+    /// Permanently cancels this session. Cancellation propagates to active and
+    /// future child tokens.
+    pub fn cancel_session(&self, reason: CancelReason) {
+        self.inner
+            .turns
+            .lock()
+            .expect("session turns poisoned")
+            .shutting_down = true;
         self.inner.cancel.cancel(reason);
+    }
+
+    /// Compatibility alias for terminal session cancellation.
+    pub fn cancel(&self, reason: CancelReason) {
+        self.cancel_session(reason);
     }
 
     /// The current conversation history.
@@ -194,8 +428,17 @@ impl SessionHandle {
                 .inner
                 .minter
                 .snapshot(self.inner.emitter.next_sequence()),
+            extension_state: self.inner.execution.snapshot_extension_state(),
             updated: self.inner.shared.clock.now(),
         }
+    }
+
+    /// Typed artifact references produced by one turn.
+    ///
+    /// This protected result path is used by delegation and host UIs; it does
+    /// not parse model-facing preview markers or the bounded event stream.
+    pub fn artifacts_for_turn(&self, turn: &TurnId) -> Vec<ArtifactRef> {
+        self.inner.execution.artifacts_for_turn(turn)
     }
 
     /// Cancels and drains active turns within the bounded shutdown timeout,
@@ -244,28 +487,37 @@ impl SessionHandle {
         }
 
         self.inner.emitter.emit(None, RuntimeEvent::SessionShutdown);
-        if let Some(store) = &self.inner.shared.session_store {
-            store.save(&self.snapshot()).await?;
-        }
-
+        let save_result = match &self.inner.shared.session_store {
+            Some(store) => store.save(&self.snapshot()).await,
+            None => Ok(()),
+        };
         *shutdown_complete = true;
-        Ok(())
+        self.inner.active_session_lease.release();
+        save_result
     }
 }
 
 struct ActiveTurnGuard {
     inner: Arc<SessionInner>,
     ticket: u64,
+    turn: TurnId,
+    completion: Arc<TurnCompletion>,
 }
 
 impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
         let mut turns = self.inner.turns.lock().expect("session turns poisoned");
         turns.count = turns.count.saturating_sub(1);
+        turns.cancellations.remove(&self.turn);
+        if turns.current.as_ref() == Some(&self.turn) {
+            turns.current = None;
+        }
         if self.ticket >= turns.serving_ticket {
             turns.serving_ticket = self.ticket + 1;
         }
         drop(turns);
+        self.inner.execution.clear_turn(&self.turn);
+        self.completion.finish(None, None);
         self.inner.turn_ready.notify_waiters();
         self.inner.turns_changed.notify_waiters();
     }

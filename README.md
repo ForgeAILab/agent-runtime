@@ -7,10 +7,12 @@ independently released products:
 - Nyx, a self-hosted agent platform
 - Open Forge, an agent workflow and orchestration product
 
-It owns reusable **mechanism** — provider normalization, one direct
-provider/tool loop, cancellation, usage accounting, and deterministic testing —
-while each consumer keeps its own **policy**: prompts, configuration, presentation,
-persistence, approval, and domain types.
+It owns reusable **mechanism** — provider normalization, one checkpointable
+provider/tool turn machine, prepared-invocation security, cancellation, usage
+accounting, session-scoped capability activation, and deterministic testing —
+while each consumer keeps its own **policy**: authored prompts, configuration,
+presentation, persistence implementations, approval defaults, and domain
+types.
 
 ## Packages
 
@@ -20,9 +22,9 @@ persistence, approval, and domain types.
 | `agent-runtime-core` | Host-neutral contracts: IDs, messages/content, structured errors, cancellation, deadlines, redaction-safe metadata, versioned events, disjoint usage counters, and the provider/tool/approval/workspace/store/observer/clock traits. |
 | `agent-runtime-ability` | Descriptor-first abilities on the registry kernel: bounded `AbilityDescriptor`s, dependency/conflict/readiness metadata, lazy policy-checked activation, and the unified `Ability`/`AbilityKind` view. Registry-only by default; `tool` bridges the runtime's `Tool`. |
 | `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, a configurable OpenAI-compatible adapter, a deterministic fake, and the attempt-recording retry/backoff classifier. |
-| `agent-runtime-context` | The authoritative context engine: versioned `ContextFragment`s (including folded-in composable system-prompt sections via `SystemPromptBuilder`), complete token accounting (`RequestSizer`/`CharRatioSizer`), semantic compaction, and cache-aware planning through `ContextPlanner`. Deterministic and network-free. |
+| `agent-runtime-context` | The authoritative context engine: versioned and positioned `ContextFragment`s (including composable system-prompt sections), complete token accounting (`RequestSizer`/`CharRatioSizer`), deterministic structural compaction, and cache-aware planning through `ContextPlanner`. Deterministic and network-free. |
 | `agent-runtime-obs` | Observability facade over the event envelope: an async `EventSink`, `FanoutSink`, a `SinkObserver` bridge, an event-stream pump, an `ObsRow` SQL projection, and feature-gated CLI/file/SQLite sinks. |
-| `agent-runtime` | The embeddable runtime: the registry hub, capability retrieval/activation, the direct agent loop, the tool registry/executor, and the `RuntimeBuilder` / `Runtime` / `SessionHandle` facade. Re-exports `registry`, `ability`, `provider`, and `context`, and `obs` behind an opt-in feature. |
+| `agent-runtime` | The embeddable runtime: session-scoped registry views and activation epochs, the checkpointable direct turn machine, prepared tool execution, host interaction, delegation, and reusable harness components for todos, memory, artifacts, and semantic summaries. Re-exports `registry`, `ability`, `provider`, and `context`, and `obs` behind an opt-in feature. |
 | `agent-runtime-testkit` | Deterministic fakes, clocks, event recorders, reusable conformance suites, and neutral consumer adapter fixtures. |
 
 All crates except `agent-runtime-testkit` are intended as production
@@ -50,10 +52,25 @@ let runtime = RuntimeBuilder::new(ModelId::new("fake"))
     .build()?;
 
 let session = runtime.start_session(StartSession::new()).await?;
-session.run(UserInput::text("hi")).await;
+let turn = session.run(UserInput::text("hi")).await?;
+println!("completed {}", turn.id());
 # Ok(())
 # }
 ```
+
+`SessionHandle::send` returns a turn-local `TurnHandle`; interrupting it does
+not permanently cancel the session. `cancel_session` is reserved for terminal
+teardown. Hosts that need crash recovery can inject separate `SessionStore`
+and protected `CheckpointStore` implementations. The ordinary store receives
+completed session state; the protected store records exact versioned
+mid-turn states and pending interactions.
+
+Live capability routing is opt-in through
+`RuntimeBuilder::live_ability_routing()`. The runtime always retains the
+protected, authority-free `registry.search` bootstrap, derives a scoped view
+per session, and advertises only the current activation epoch. Reusable
+behavior above the neutral kernel is composed through ordered, phase-specific
+harness components rather than an unrestricted mutable middleware chain.
 
 ## Development
 
@@ -83,7 +100,7 @@ This runtime seeds its reusable provider, agent-loop, and tool mechanisms from
 the Nyx project, with all product policy removed. The donor revision, path
 mappings, and retained notices are recorded in [`PROVENANCE.md`](PROVENANCE.md).
 
-The specification for this work lives under
-[`docs/spec/`](docs/spec/changes/add-shared-agent-runtime-2026-07-23/). Adopting
-the runtime in Nyx, Smith, or Open Forge requires a separate approved proposal in
-each consumer repository; this repository does not modify any consumer.
+The current stabilization specification lives under
+[`docs/spec/changes/stabilize-session-harness-pipeline-2026-07-31/`](docs/spec/changes/stabilize-session-harness-pipeline-2026-07-31/).
+Adopting a breaking runtime revision in Nyx, Smith, or Open Forge requires a
+separate coordinated consumer change.

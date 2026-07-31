@@ -33,7 +33,7 @@
 //!     .build()?;
 //!
 //! let session = runtime.start_session(StartSession::new()).await?;
-//! session.run(UserInput::text("hi")).await;
+//! session.run(UserInput::text("hi")).await?;
 //! assert!(session.history().iter().any(|m| m.joined_text().contains("hello")));
 //! # Ok(())
 //! # }
@@ -93,6 +93,7 @@
 pub mod agent;
 pub mod capability;
 pub mod delegation;
+pub mod harness;
 pub mod hub;
 pub mod ids;
 pub mod runtime;
@@ -150,24 +151,28 @@ pub mod prelude {
     };
 
     // -- registry hub: the administrative facade over every typed domain -----
+    pub use crate::harness::{QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
     pub use crate::hub::{RegistryHub, RegistryHubBuilder, ScopeInputs, ScopedRegistry};
 
     // -- capability retrieval, selection, and pre-activation -----------------
-    pub use crate::capability::{ActivationBudget, CapabilityResolver, RoutingQuery};
+    pub use crate::capability::{
+        ActivationBudget, ActivationEpoch, CapabilityResolver, RoutingQuery,
+    };
 
     // -- provider adapters and the embeddable runtime facade -----------------
     pub use crate::agent::config::{DowngradePolicy, LoopConfig};
     pub use crate::delegation::{
-        CapacityPolicy, ChildRuntimeFactory, ChildState, ChildStatus, DELEGATION_PERMISSION,
-        DelegationCapacity, DelegationConfig, DelegationCoordinator, DelegationLimits,
-        SpawnOutcome,
+        CapacityPolicy, ChildRuntimeFactory, ChildState, ChildStatus, ChildTaskOutcome,
+        ChildTaskResult, DELEGATION_PERMISSION, DelegationCapacity, DelegationConfig,
+        DelegationCoordinator, DelegationLimits, SpawnOutcome,
     };
     pub use crate::provider::fake::FakeProvider;
     pub use crate::provider::openai::{OpenAiConfig, OpenAiProvider};
     pub use crate::provider::retry::RetryPolicy;
     pub use crate::provider::transport::{ByteStream, HttpRequest, HttpTransport};
     pub use crate::runtime::{
-        InjectedContent, Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle, StartSession,
+        CheckpointRecoveryPolicy, InjectedContent, Runtime, RuntimeBuilder, RuntimeEventStream,
+        SessionHandle, StartSession, TurnHandle,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};

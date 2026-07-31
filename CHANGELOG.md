@@ -25,11 +25,45 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - `Named`/`Registry<T>`/`Sealed<T>` moved to `agent-runtime-registry`. A `Named`
   impl on a foreign type (e.g. `Arc<dyn YourTrait>`) is now an orphan impl and
   needs a local newtype.
-- Event `SCHEMA_VERSION` is `2`, adding nine planning-lifecycle variants.
-  Existing variants are unchanged and the v1 golden fixture still guards the v1
-  wire representation.
+- Event `SCHEMA_VERSION` is now `8`. Since the registry-driven v2 baseline,
+  tool-call argument projection, delegation, attempt-scoped streaming,
+  metadata-only host interaction, lossless child `needs_input`, and
+  durability-aligned `PlanUpdated` each advanced the vocabulary. Golden
+  fixtures retain the compatible v5 through v8 wire forms; pre-v5
+  unattributed output deltas are intentionally rejected.
+- `SessionHandle::send` and `run` return `Result<TurnHandle, RuntimeError>`.
+  `TurnHandle` owns turn-local interruption and completion; use
+  `cancel_session` only for terminal session teardown. The compatibility
+  `cancel` alias retains terminal semantics.
+- `Tool` now separates `spec`, argument/resource `prepare`, and exact
+  `invoke(PreparedToolCall, ..)`. `LegacyTool` remains as a conservative
+  migration adapter, but cannot claim invocation-specific authority.
 
 ### Changed
+- The direct loop is a versioned, checkpointable turn machine. Mutable
+  planning/cache/activation/extension state is session-owned, and completed
+  turns are saved before `TurnCompleted` becomes the durable terminal
+  boundary.
+- Conversation classification no longer determines provider-wire placement.
+  Chronology is preserved within one conversation lane, complete parallel
+  tool exchanges are atomic, and the active-turn continuation is required
+  during compaction.
+- Deterministic compaction is named `StructuralCompactor` and no longer
+  fabricates semantic summaries. The asynchronous semantic-summary
+  coordinator stores originals, calls a purpose-attributed model, and submits
+  provenance-bearing history projection back through deterministic planning.
+- Live ability routing derives a scoped view and activation epochs per
+  session. `registry.search` stages an authorized, dependency-complete bundle
+  transactionally and exposes it only after the canonical search result
+  commits. Hosts attaching after session startup can inspect the current
+  immutable epoch through `SessionHandle::activation_epoch`; live event
+  subscriptions cover events emitted after subscription, while persisted
+  journals remain authoritative for earlier events and delivery gaps.
+- A valid persisted provider-cache baseline is now discarded and rebuilt when
+  a resumed session changes model profile or provider cache contract; malformed
+  or unknown cache-state schemas still fail closed. Ready terminal hooks can
+  record an explicit cancellation without converting it into a failed turn,
+  while pending hooks remain cancellation- and deadline-bounded.
 - Split the monolithic `agent-runtime` crate into focused, single-responsibility
   crates so consumers (Nyx, Open Forge, Smith) can depend on just the mechanism
   they need. Provider adapters moved from `agent-runtime::provider` into the new
@@ -54,6 +88,26 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- Protected `CheckpointStore` records for accepted input, assembled model
+  responses, pending approvals/interactions, raw tool outcomes, every
+  canonical tool result, and terminal publication. Recovery never implicitly
+  replays an indeterminate provider call or tool side effect.
+- Invocation-specific prepared authority: canonical arguments, exact
+  `SecurityResource`, typed permission bounds, scheduler effects, approval
+  display, and a preparation fingerprint all describe the same immutable
+  action. Edited approval input restarts preparation and authorization.
+- Phase-specific ordered harness contracts for tool views, context, history
+  projection, model options, tool output, and turn commits. Components receive
+  immutable views, return explicit patches, and are bounded by turn
+  cancellation/deadlines.
+- Standard harness components: typed checkpointed todos with `PlanUpdated`,
+  descriptor-first lazily verified skills, bounded memory contribution,
+  session-private artifact offloading plus authorized paginated
+  `artifact.read`, structured questionnaire interaction, and
+  purpose-attributed semantic summary coordination.
+- Lossless delegated task outcomes, including typed child `needs_input`
+  handoff without a root broker, deterministic multi-child delivery, and
+  follow-up reuse of the same child session.
 - Agent delegation (`add-agent-delegation-runtime`): a neutral
   `DelegationCoordinator` spawns children as full runtime sessions built by a
   host `ChildRuntimeFactory`, with spawn/list/follow-up/wait/result/stop
@@ -110,11 +164,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   `agent-runtime-core`.
 - `agent-runtime-context`: the authoritative context engine — versioned
   `ContextFragment`s, complete provider-wire token accounting via
-  `RequestSizer`/`CharRatioSizer`, semantic compaction, cache-aware planning,
+  `RequestSizer`/`CharRatioSizer`, structural compaction, cache-aware planning,
   and the immutable `ContextPlan` that is the exclusive source of provider
   messages/tools/reserves/counts. Includes the folded-in composable
   system-prompt mechanism (`SystemPromptBuilder` and its section types).
-  Deterministic and network-free.
+  Deterministic and network-free; semantic summarization is coordinated above
+  it by the runtime harness.
 - `agent-runtime-obs`: an observability facade over the neutral event envelope —
   an async `EventSink` trait, `FanoutSink`, a `SinkObserver` bridge onto the
   runtime's observer hook, a `drive` pump for the async event stream, an

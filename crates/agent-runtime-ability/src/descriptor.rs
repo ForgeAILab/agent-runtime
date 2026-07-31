@@ -19,6 +19,7 @@
 
 use std::fmt;
 
+pub use agent_runtime_registry::Permission;
 use agent_runtime_registry::{
     EntryProvenance, Fingerprint, FingerprintHasher, RegistryCard, RegistryId, RegistryRevision,
 };
@@ -99,32 +100,6 @@ impl fmt::Display for Affordance {
     }
 }
 
-/// A bounded, normalized permission name a capability requires to run, such
-/// as `network:egress` or `fs:write`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(transparent))]
-pub struct Permission(String);
-
-impl Permission {
-    /// A normalized permission name: trimmed, lowercased, and bounded to
-    /// [`MAX_TOKEN_CHARS`].
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(normalized_token(name))
-    }
-
-    /// The permission as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Permission {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// A bounded, normalized input/output modality name, such as `text`,
 /// `image`, or `audio`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -165,16 +140,20 @@ where
     )
 }
 
-fn normalize_permissions<I, S>(items: I) -> Vec<Permission>
+fn normalize_permissions<I>(items: I) -> Vec<Permission>
 where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
+    I: IntoIterator<Item = Permission>,
 {
     normalize_sorted(
         items
             .into_iter()
-            .map(Permission::new)
-            .filter(|p| !p.0.is_empty())
+            .filter_map(|permission| match permission {
+                Permission::Other(name) => {
+                    let name = normalized_token(name.into_owned());
+                    (!name.is_empty()).then(|| Permission::other(name))
+                }
+                known => Some(known),
+            })
             .collect(),
     )
 }
@@ -617,10 +596,9 @@ impl AbilityDescriptor {
     }
 
     /// Declares required permissions, bounded and normalized.
-    pub fn with_permissions<I, S>(mut self, permissions: I) -> Self
+    pub fn with_permissions<I>(mut self, permissions: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = Permission>,
     {
         self.permissions = normalize_permissions(permissions);
         self
@@ -678,7 +656,7 @@ impl AbilityDescriptor {
             conflict.fingerprint_into(hasher);
         }
         for permission in &self.permissions {
-            hasher.pair("permission", permission.as_str());
+            permission.fingerprint_into(hasher);
         }
         hasher.pair("risk", self.risk.as_str());
         self.readiness.fingerprint_into(hasher);
@@ -739,7 +717,11 @@ mod tests {
 
         let descriptor = descriptor()
             .with_affordances(affordances)
-            .with_permissions(["Network:Egress", "network:egress", " FS:Write "])
+            .with_permissions([
+                Permission::other("Network:Egress"),
+                Permission::other("network:egress"),
+                Permission::FsWrite,
+            ])
             .with_input_modalities(["TEXT", "Text", "image"]);
 
         // Every affordance/permission/modality is lowercased...
@@ -761,15 +743,19 @@ mod tests {
         // ...and mixed-case duplicates collapse to one normalized entry.
         assert_eq!(
             descriptor.permissions(),
-            [
-                Permission::new("fs:write"),
-                Permission::new("network:egress")
-            ]
+            [Permission::FsWrite, Permission::other("network:egress")]
         );
         assert_eq!(
             descriptor.input_modalities(),
             [Modality::new("image"), Modality::new("text")]
         );
+    }
+
+    #[test]
+    fn descriptor_fingerprint_distinguishes_known_and_host_defined_permissions() {
+        let known = descriptor().with_permissions([Permission::FsRead]);
+        let host_defined = descriptor().with_permissions([Permission::other("fs.read")]);
+        assert_ne!(known.fingerprint(), host_defined.fingerprint());
     }
 
     #[test]

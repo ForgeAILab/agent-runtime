@@ -37,7 +37,8 @@ impl ApprovalPolicy for WorkspaceScopedApproval {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
         let prefix = format!("{}/", self.root);
         if request
-            .effects
+            .prepared()
+            .effects()
             .write_scopes()
             .all(|s| s.as_str() == self.root || s.as_str().starts_with(&prefix))
         {

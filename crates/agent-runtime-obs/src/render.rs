@@ -25,12 +25,17 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::CapabilitiesActivated { .. } => "capabilities_activated",
         RuntimeEvent::ContextPlanned { .. } => "context_planned",
         RuntimeEvent::ContextCompacted { .. } => "context_compacted",
+        RuntimeEvent::PlanUpdated { .. } => "plan_updated",
         RuntimeEvent::CachePlanChanged { .. } => "cache_plan_changed",
         RuntimeEvent::BudgetFailure { .. } => "budget_failure",
         RuntimeEvent::ProviderAttemptStarted { .. } => "provider_attempt_started",
         RuntimeEvent::TextDelta { .. } => "text_delta",
         RuntimeEvent::ReasoningDelta { .. } => "reasoning_delta",
+        RuntimeEvent::ProviderAttemptOutputCommitted { .. } => "provider_attempt_output_committed",
+        RuntimeEvent::ProviderAttemptOutputDiscarded { .. } => "provider_attempt_output_discarded",
         RuntimeEvent::ToolCallRequested { .. } => "tool_call_requested",
+        RuntimeEvent::InteractionRequested { .. } => "interaction_requested",
+        RuntimeEvent::InteractionResolved { .. } => "interaction_resolved",
         RuntimeEvent::ToolCallCompleted { .. } => "tool_call_completed",
         RuntimeEvent::Downgrade { .. } => "downgrade",
         RuntimeEvent::Usage { .. } => "usage",
@@ -41,6 +46,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::TurnCompleted { .. } => "turn_completed",
         RuntimeEvent::ChildSpawned { .. } => "child_spawned",
         RuntimeEvent::ChildProgress { .. } => "child_progress",
+        RuntimeEvent::ChildNeedsInput { .. } => "child_needs_input",
         RuntimeEvent::ChildCompleted { .. } => "child_completed",
         RuntimeEvent::ChildStopped { .. } => "child_stopped",
         RuntimeEvent::ChildFailed { .. } => "child_failed",
@@ -146,6 +152,16 @@ fn summary(payload: &RuntimeEvent) -> String {
             evicted.len(),
             summaries.len()
         ),
+        RuntimeEvent::PlanUpdated {
+            revision,
+            sensitivity,
+            counts,
+            items,
+        } => format!(
+            "plan_updated revision={revision} sensitivity={sensitivity:?} counts={} public_items={}",
+            compact(&serde_json::to_value(counts).unwrap_or(Value::Null)),
+            items.as_ref().map_or(0, Vec::len)
+        ),
         RuntimeEvent::CachePlanChanged {
             cache_plan,
             preserved_prefix_tokens,
@@ -164,9 +180,30 @@ fn summary(payload: &RuntimeEvent) -> String {
         RuntimeEvent::ProviderAttemptStarted { index, model, .. } => {
             format!("provider_attempt_started model={model} index={index}")
         }
-        RuntimeEvent::TextDelta { text } => format!("text_delta {}", clip(text, 120)),
-        RuntimeEvent::ReasoningDelta { text, redacted } => {
-            format!("reasoning_delta redacted={redacted} {}", clip(text, 120))
+        RuntimeEvent::TextDelta {
+            request,
+            attempt,
+            text,
+        } => format!(
+            "text_delta request={request} attempt={attempt} {}",
+            clip(text, 120)
+        ),
+        RuntimeEvent::ReasoningDelta {
+            request,
+            attempt,
+            text,
+            redacted,
+        } => {
+            format!(
+                "reasoning_delta request={request} attempt={attempt} redacted={redacted} {}",
+                clip(text, 120)
+            )
+        }
+        RuntimeEvent::ProviderAttemptOutputCommitted { request, attempt } => {
+            format!("provider_attempt_output_committed request={request} attempt={attempt}")
+        }
+        RuntimeEvent::ProviderAttemptOutputDiscarded { request, attempt } => {
+            format!("provider_attempt_output_discarded request={request} attempt={attempt}")
         }
         RuntimeEvent::ToolCallRequested {
             name,
@@ -186,6 +223,19 @@ fn summary(payload: &RuntimeEvent) -> String {
                 }
             }
         }
+        RuntimeEvent::InteractionRequested {
+            request,
+            call,
+            question_count,
+            sensitivity,
+        } => format!(
+            "interaction_requested request={request} call={call} questions={question_count} sensitivity={sensitivity:?}"
+        ),
+        RuntimeEvent::InteractionResolved {
+            request,
+            call,
+            outcome,
+        } => format!("interaction_resolved request={request} call={call} outcome={outcome:?}"),
         RuntimeEvent::ToolCallCompleted { name, is_error, .. } => format!(
             "tool_call_completed {name} {}",
             if *is_error { "error" } else { "ok" }
@@ -233,6 +283,21 @@ fn summary(payload: &RuntimeEvent) -> String {
         RuntimeEvent::ChildProgress { child, phase } => {
             format!("child_progress child={child} phase={phase:?}")
         }
+        RuntimeEvent::ChildNeedsInput {
+            child,
+            child_session,
+            turn,
+            call,
+            request,
+            question_ids,
+            sensitivity,
+        } => {
+            format!(
+                "child_needs_input child={child} child_session={child_session} turn={turn} \
+                 call={call} request={request} questions={} sensitivity={sensitivity:?}",
+                question_ids.len()
+            )
+        }
         RuntimeEvent::ChildCompleted { child, result } => {
             format!("child_completed child={child} {}", clip(result, 200))
         }
@@ -267,7 +332,7 @@ fn clip(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use agent_runtime_core::clock::Timestamp;
-    use agent_runtime_core::ids::{EventId, SessionId, ToolCallId, TurnId};
+    use agent_runtime_core::ids::{AttemptId, EventId, RequestId, SessionId, ToolCallId, TurnId};
 
     fn envelope(turn: Option<&str>, payload: RuntimeEvent) -> EventEnvelope {
         EventEnvelope::new(
@@ -337,6 +402,8 @@ mod tests {
         let env = envelope(
             None,
             RuntimeEvent::TextDelta {
+                request: RequestId::new("req-1"),
+                attempt: AttemptId::new("att-1"),
                 text: "记".repeat(300),
             },
         );

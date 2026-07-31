@@ -210,7 +210,7 @@ impl ActivationContext {
 /// policy, and the default [`FailClosedPolicy`] only approves when
 /// dependencies are satisfied, no conflict is active, the expected revision
 /// (if any) matches, and readiness requirements are met.
-pub trait ActivationPolicy {
+pub trait ActivationPolicy: Send + Sync + fmt::Debug {
     /// Authorizes activating `descriptor` given `context`.
     fn authorize(
         &self,

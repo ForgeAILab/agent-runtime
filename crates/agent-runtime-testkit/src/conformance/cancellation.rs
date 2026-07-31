@@ -11,7 +11,7 @@ use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
 /// and asserts the turn terminates with a cancelled `TurnCompleted`.
 pub async fn assert_cancel_terminates(session: &SessionHandle) {
     let mut stream = session.subscribe();
-    let _turn = session.send(UserInput::text("go"));
+    let _turn = session.send(UserInput::text("go")).unwrap();
 
     let mut cancel_issued = false;
     while let Some(env) = stream.next().await {
@@ -19,7 +19,9 @@ pub async fn assert_cancel_terminates(session: &SessionHandle) {
             RuntimeEvent::TextDelta { .. } | RuntimeEvent::ProviderAttemptStarted { .. }
                 if !cancel_issued =>
             {
-                session.cancel(CancelReason::UserRequested);
+                session
+                    .interrupt_current_turn(CancelReason::UserRequested)
+                    .expect("the running turn has a cancellation handle");
                 cancel_issued = true;
             }
             RuntimeEvent::TurnCompleted { finish, .. } => {

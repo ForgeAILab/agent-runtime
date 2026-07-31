@@ -10,7 +10,7 @@ use agent_runtime_core::event::RuntimeEvent;
 /// asserts shutdown completes (bounded) and emits a terminal `SessionShutdown`.
 pub async fn assert_bounded_shutdown(session: &SessionHandle) {
     let mut stream = session.subscribe();
-    let _turn = session.send(UserInput::text("go"));
+    let _turn = session.send(UserInput::text("go")).unwrap();
 
     // Ensure the turn is actually running before shutting down.
     let _first = stream.next().await;

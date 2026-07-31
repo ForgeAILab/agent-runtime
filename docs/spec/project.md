@@ -6,7 +6,7 @@
 - Role: neutral Rust agent runtime shared by Smith, Nyx, and Open Forge
 - Ownership model: independent repository and release lifecycle
 - Consumer model: versioned dependency for three independently released products
-- Status: proposal only
+- Status: active pre-1.0 implementation
 
 ## Tech Stack
 
@@ -31,10 +31,11 @@
 - `agent-runtime-provider`: provider adapters, injectable transport, retry
   classification, and optional remote catalog sources
 - `agent-runtime-context`: the authoritative context engine — versioned
-  fragments, complete token accounting, semantic compaction, and cache-aware
-  planning. Deterministic and network-free.
+  positioned fragments, complete token accounting, structural compaction, and
+  cache-aware planning. Deterministic and network-free.
 - `agent-runtime`: the embeddable runtime — registry hub, capability routing,
-  the direct agent loop, tool execution, and the session facade
+  checkpointable direct turn machine, prepared tool execution, host
+  interaction, delegation, generic harness components, and the session facade
 - `agent-runtime-obs`: optional event sinks and projections, never on the
   execution path
 - `agent-runtime-testkit`: deterministic fake providers, clocks, event
@@ -55,7 +56,8 @@ dependency isolation or independent reuse.
 - Dependency direction: shared packages MUST NOT depend on Smith, Nyx, Open
   Forge, or their domain types
 - Extensibility: hosts inject provider, tool, approval, workspace, session,
-  credential, and event integrations through neutral contracts
+  checkpoint, artifact, credential, interaction, and event integrations
+  through neutral contracts
 - Source ownership: moved behavior has one canonical implementation; consumers
   MUST remove superseded copies during their migration
 - Code style: `cargo fmt`; Clippy warnings are errors
@@ -73,6 +75,6 @@ dependency isolation or independent reuse.
 | Provider contracts, common adapters, direct agent loop, and tool contracts | Agent Runtime |
 | Streaming events, cancellation, usage/cache accounting, and runtime testkit | Agent Runtime |
 | Terminal UI, `smith -p`, and Smith-specific configuration/defaults | Smith |
-| Chat adapters, memory, cron, workflows, gateway, and Nyx product policy | Nyx |
+| Chat adapters, memory source/persistence policy, cron, workflows, gateway, and Nyx product policy | Nyx |
 | Task lifecycle, database, API, web UI, review gates, and Forge product policy | Open Forge |
 | Generic Git/worktree support | Remains in Open Forge until a second consumer adopts it through an approved change |

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use agent_runtime_core::clock::Timestamp;
 use agent_runtime_core::event::{EventEnvelope, RuntimeEvent};
-use agent_runtime_core::ids::{EventId, SessionId};
+use agent_runtime_core::ids::{AttemptId, EventId, RequestId, SessionId};
 
 use crate::{EventSink, ObsError};
 
@@ -66,6 +66,8 @@ pub fn sample_event(seq: u64) -> EventEnvelope {
         None,
         Timestamp(seq),
         RuntimeEvent::TextDelta {
+            request: RequestId::new("req-test"),
+            attempt: AttemptId::new("att-test"),
             text: format!("chunk-{seq}"),
         },
     )

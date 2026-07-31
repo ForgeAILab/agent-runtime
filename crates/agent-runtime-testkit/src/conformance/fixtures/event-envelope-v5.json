@@ -1,0 +1,86 @@
+[
+  {
+    "schema_version": 5,
+    "seq": 0,
+    "id": "evt-v5-1",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 100,
+    "payload": {
+      "event": "provider_attempt_started",
+      "request": "req-1",
+      "attempt": "att-1",
+      "index": 0,
+      "model": "fixture-model"
+    }
+  },
+  {
+    "schema_version": 5,
+    "seq": 1,
+    "id": "evt-v5-2",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 101,
+    "payload": {
+      "event": "text_delta",
+      "request": "req-1",
+      "attempt": "att-1",
+      "text": "committed"
+    }
+  },
+  {
+    "schema_version": 5,
+    "seq": 2,
+    "id": "evt-v5-3",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 102,
+    "payload": {
+      "event": "reasoning_delta",
+      "request": "req-1",
+      "attempt": "att-1",
+      "text": "thinking",
+      "redacted": false
+    }
+  },
+  {
+    "schema_version": 5,
+    "seq": 3,
+    "id": "evt-v5-4",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 103,
+    "payload": {
+      "event": "provider_attempt_output_committed",
+      "request": "req-1",
+      "attempt": "att-1"
+    }
+  },
+  {
+    "schema_version": 5,
+    "seq": 4,
+    "id": "evt-v5-5",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 104,
+    "payload": {
+      "event": "provider_attempt_finished",
+      "attempt": "att-1",
+      "finish": "stop",
+      "retryable": false
+    }
+  },
+  {
+    "schema_version": 5,
+    "seq": 5,
+    "id": "evt-v5-6",
+    "session": "session-fixture",
+    "turn": "turn-1",
+    "timestamp": 105,
+    "payload": {
+      "event": "provider_attempt_output_discarded",
+      "request": "req-2",
+      "attempt": "att-2"
+    }
+  }
+]

@@ -34,13 +34,15 @@ pub use budget::{
     BudgetReport, CategoryUsage, ContextBudget, ContextError, ContextErrorKind, ContextPolicy,
 };
 pub use cache::{CachePlan, ProviderCacheCapability, ProviderCachePlan, SegmentFingerprint};
+#[allow(deprecated)]
 pub use compaction::{
-    CompactionError, CompactionErrorKind, CompactionOutcome, CompactionPolicy, SemanticCompactor,
-    SummaryProvenance, validate_compacted,
+    CompactionError, CompactionErrorKind, CompactionOutcome, CompactionPolicy, CompactionResult,
+    SemanticCompactor, StructuralCompactor, SummaryProvenance, validate_compacted,
 };
 pub use fragment::{
-    CacheClass, ContextFragment, FragmentContent, FragmentId, FragmentKind, FragmentSource,
-    Requirement, Sensitivity,
+    CacheClass, ContextFragment, ContextLane, ContextPosition, ConversationGroupId,
+    FragmentContent, FragmentId, FragmentKind, FragmentSource, Requirement, Sensitivity,
+    ToolExchange,
 };
 pub use plan::{ContextPlan, PlanInputs, PlanSegment};
 pub use planner::{Compactor, ContextPlanner};

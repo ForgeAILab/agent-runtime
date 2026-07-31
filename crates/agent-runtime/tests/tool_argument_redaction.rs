@@ -26,7 +26,7 @@ use agent_runtime_registry::Fingerprint;
 struct ProbeTool;
 
 #[async_trait]
-impl Tool for ProbeTool {
+impl LegacyTool for ProbeTool {
     fn name(&self) -> &str {
         "probe"
     }
@@ -37,9 +37,9 @@ impl Tool for ProbeTool {
         json!({"type": "object", "additionalProperties": true})
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read_only()
+        ToolEffects::new(vec![])
     }
-    async fn invoke(
+    async fn invoke_legacy(
         &self,
         arguments: Value,
         _ctx: &InvocationContext,
@@ -86,7 +86,9 @@ async fn tool_call_requested_from(runtime: Runtime) -> RuntimeEvent {
         .await
         .expect("session starts");
     let mut events = session.subscribe();
-    session.send(UserInput::text("please call the probe tool"));
+    session
+        .send(UserInput::text("please call the probe tool"))
+        .unwrap();
 
     while let Some(env) = events.next().await {
         if matches!(env.payload, RuntimeEvent::ToolCallRequested { .. }) {

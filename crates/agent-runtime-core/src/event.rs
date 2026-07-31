@@ -24,7 +24,11 @@ use crate::cancel::CancelReason;
 use crate::clock::Timestamp;
 use crate::delegation::WorkspacePolicy;
 use crate::error::RuntimeError;
-use crate::ids::{AttemptId, ChildId, EventId, RequestId, SessionId, ToolCallId, TurnId};
+use crate::ids::{
+    AttemptId, ChildId, EventId, InteractionRequestId, QuestionId, RequestId, SessionId,
+    ToolCallId, TurnId,
+};
+use crate::interaction::{InteractionOutcomeKind, InteractionSensitivity};
 use crate::manifest::{ActivatedCapability, SegmentId, SegmentKind, SummaryCoverage};
 use crate::metadata::Metadata;
 
@@ -56,7 +60,21 @@ use crate::usage::UsageRecord;
 /// Bumped to 4 for agent delegation: the child lifecycle variants
 /// ([`RuntimeEvent::ChildSpawned`] through [`RuntimeEvent::ChildFailed`])
 /// join the vocabulary, emitted on the parent session's stream.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// Bumped to 5 for attempt-scoped speculative provider output: text and
+/// reasoning deltas now carry request/attempt identity and every attempt has
+/// an explicit output commit or discard terminal.
+///
+/// Bumped to 6 for metadata-only host-interaction request/resolution
+/// lifecycle events.
+///
+/// Bumped to 7 for lossless delegated interaction handoff: child turns may
+/// finish with `needs_input`, and parents receive an attributed,
+/// metadata-only [`RuntimeEvent::ChildNeedsInput`] event.
+///
+/// Bumped to 8 for the generic, durability-aligned
+/// [`RuntimeEvent::PlanUpdated`] projection.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// A configured limit the runtime enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +106,12 @@ pub enum TurnFinish {
         /// The exhausted limit.
         limit: LimitKind,
     },
+    /// A delegated child completed a paired metadata result and returned an
+    /// exact task-information request to its parent.
+    NeedsInput {
+        /// Returned interaction request.
+        request: InteractionRequestId,
+    },
     /// The turn failed with an error.
     Failed,
 }
@@ -113,6 +137,41 @@ pub enum CompactionReason {
     BudgetExceeded,
     /// The host explicitly requested compaction.
     HostRequested,
+}
+
+/// Public status of one generic harness todo item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    /// Work has not started.
+    Pending,
+    /// Work is actively in progress.
+    InProgress,
+    /// Work completed.
+    Completed,
+    /// Work was intentionally cancelled.
+    Cancelled,
+}
+
+/// Content handling for a plan projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanSensitivity {
+    /// Bounded item ids and text may enter the ordinary event stream.
+    Public,
+    /// Only aggregate counts may enter the ordinary event stream.
+    Sensitive,
+}
+
+/// One bounded public todo projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanItemProjection {
+    /// Stable item id.
+    pub id: String,
+    /// Bounded task text.
+    pub text: String,
+    /// Current status.
+    pub status: PlanItemStatus,
 }
 
 /// A coarse context-budget category, used in budget-failure reporting.
@@ -229,6 +288,21 @@ pub enum RuntimeEvent {
         /// Tokens reclaimed by compaction.
         reclaimed_tokens: u32,
     },
+    /// A generic harness todo plan reached a durable tool-result boundary.
+    ///
+    /// Sensitive plans carry aggregate counts only. Public item content is
+    /// bounded by the todo component before it reaches this event.
+    PlanUpdated {
+        /// Monotonic plan revision inside the session.
+        revision: u64,
+        /// Content-handling posture.
+        sensitivity: PlanSensitivity,
+        /// Number of items in each status.
+        counts: BTreeMap<String, u32>,
+        /// Bounded items, present only for a public plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        items: Option<Vec<PlanItemProjection>>,
+    },
     /// The cache plan changed.
     CachePlanChanged {
         /// The new cache plan's fingerprint.
@@ -262,15 +336,37 @@ pub enum RuntimeEvent {
     },
     /// A fragment of visible output text.
     TextDelta {
+        /// The logical request producing this speculative fragment.
+        request: RequestId,
+        /// The provider attempt producing this speculative fragment.
+        attempt: AttemptId,
         /// The text fragment.
         text: String,
     },
     /// A fragment of reasoning.
     ReasoningDelta {
+        /// The logical request producing this speculative fragment.
+        request: RequestId,
+        /// The provider attempt producing this speculative fragment.
+        attempt: AttemptId,
         /// The reasoning fragment.
         text: String,
         /// Whether it is redacted.
         redacted: bool,
+    },
+    /// Speculative text/reasoning from an attempt became canonical.
+    ProviderAttemptOutputCommitted {
+        /// The logical request.
+        request: RequestId,
+        /// The committed provider attempt.
+        attempt: AttemptId,
+    },
+    /// Speculative text/reasoning from an attempt was discarded.
+    ProviderAttemptOutputDiscarded {
+        /// The logical request.
+        request: RequestId,
+        /// The discarded provider attempt.
+        attempt: AttemptId,
     },
     /// A validated tool call was requested by the model.
     ToolCallRequested {
@@ -294,6 +390,29 @@ pub enum RuntimeEvent {
         /// sourced from host configuration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments: Option<Value>,
+    },
+    /// A checkpointed task-information interaction was presented to a host.
+    ///
+    /// Prompt text, choices, and answer content remain in protected
+    /// checkpoints and never enter the default observability stream.
+    InteractionRequested {
+        /// Exact request identity.
+        request: InteractionRequestId,
+        /// Tool call owning the interaction.
+        call: ToolCallId,
+        /// Number of questions presented.
+        question_count: u8,
+        /// Content handling requested by the tool.
+        sensitivity: InteractionSensitivity,
+    },
+    /// A host interaction reached one authority-free terminal outcome.
+    InteractionResolved {
+        /// Exact request identity.
+        request: InteractionRequestId,
+        /// Tool call owning the interaction.
+        call: ToolCallId,
+        /// Metadata-only outcome; answer content is deliberately absent.
+        outcome: InteractionOutcomeKind,
     },
     /// A tool call finished.
     ToolCallCompleted {
@@ -378,6 +497,25 @@ pub enum RuntimeEvent {
         child: ChildId,
         /// What the child is doing.
         phase: ChildPhase,
+    },
+    /// A delegated child is blocked on exact task-information input. Emitted
+    /// on the parent stream with metadata only; questionnaire prompts and
+    /// answers remain on the protected typed interaction path.
+    ChildNeedsInput {
+        /// Stable child identity.
+        child: ChildId,
+        /// Exact child session that owns the request.
+        child_session: SessionId,
+        /// Child turn blocked on the request.
+        turn: TurnId,
+        /// Tool call that produced the request.
+        call: ToolCallId,
+        /// Interaction request identity.
+        request: InteractionRequestId,
+        /// Question identities in canonical request order.
+        question_ids: Vec<QuestionId>,
+        /// Content-handling requirement.
+        sensitivity: InteractionSensitivity,
     },
     /// A delegated child completed a task. The child remains available for
     /// follow-ups within its limits; this is not a terminal event.
@@ -495,7 +633,11 @@ mod tests {
             SessionId::new("s"),
             None,
             Timestamp::ZERO,
-            RuntimeEvent::TextDelta { text: "hi".into() },
+            RuntimeEvent::TextDelta {
+                request: RequestId::new("r1"),
+                attempt: AttemptId::new("a1"),
+                text: "hi".into(),
+            },
         );
         let decorated = base
             .clone()

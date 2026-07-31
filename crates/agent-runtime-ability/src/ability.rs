@@ -17,6 +17,7 @@ use agent_runtime_registry::{
     RegistrySource, Sealed,
 };
 
+use crate::activation::{Activated, ActivationError};
 use crate::descriptor::AbilityDescriptor;
 
 /// A registered ability, wrapped so the kernel's [`Named`] can be implemented
@@ -127,6 +128,17 @@ pub trait Ability: Named + Send + Sync + fmt::Debug {
             self.description().to_owned(),
             revision,
         )
+    }
+
+    /// Materializes this ability after activation policy has authorized its
+    /// descriptor.
+    ///
+    /// Discovery never calls this method. Implementations that have no live
+    /// payload may keep the fail-closed default.
+    fn materialize(&self) -> Result<Activated, ActivationError> {
+        Err(ActivationError::Unavailable {
+            reason: format!("ability `{}` has no activation payload", self.name()),
+        })
     }
 }
 

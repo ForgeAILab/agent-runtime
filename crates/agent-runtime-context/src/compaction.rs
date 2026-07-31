@@ -1,4 +1,4 @@
-//! Semantic compaction: the policy-driven [`Compactor`] implementation that
+//! Structural compaction: the policy-driven [`Compactor`] implementation that
 //! keeps a plan under budget without ever losing required content or
 //! breaking a tool-call/result pairing.
 //!
@@ -6,12 +6,11 @@
 //! triggers once a fragment set reaches the high watermark and reduces it to
 //! at most the low watermark — deliberately lower than the trigger — so a
 //! turn that only adds a little new content does not retrigger compaction,
-//! and rewrite history again, on the very next request. [`SemanticCompactor`]
-//! applies five strategies in a fixed order, stopping as soon as the target
+//! and rewrite history again, on the very next request. [`StructuralCompactor`]
+//! applies four strategies in a fixed order, stopping as soon as the target
 //! is met: strip prior-turn reasoning from history messages, evict
-//! expired/optional fragments outright, bound oversized tool results, elide
-//! reproducible detail from older history, then summarize the oldest
-//! remaining eligible history. The reasoning strip removes only zero-value
+//! expired/optional fragments outright, bound oversized tool results, then
+//! elide reproducible detail from older history. The reasoning strip removes only zero-value
 //! [`ContentPart::Reasoning`] parts from messages before the last user
 //! message and never drops a fragment; every other stage only ever touches
 //! [`Requirement::Optional`] fragments, so required content is preserved by
@@ -20,32 +19,30 @@
 //! pairing, is somehow violated — a structured error instead of a silently
 //! degraded plan.
 //!
-//! A summary is a new [`FragmentKind::Summary`] fragment. `ContextFragment`
-//! has no compaction-specific fields, so a summary's provenance — which
-//! original fragments it replaced and under which policy revision — is
-//! recorded beside it, in the [`SummaryProvenance`] entries of a
-//! [`CompactionOutcome`]. A `Sensitivity::Secret` fragment is never eligible
-//! for summarization; [`validate_compacted`] also rejects any outcome that
-//! claims otherwise.
+//! This deterministic package never fabricates semantic summaries. A
+//! harness-level coordinator may submit an explicit [`FragmentKind::Summary`]
+//! together with [`SummaryProvenance`]; [`validate_compacted`] rejects any
+//! outcome that claims a `Sensitivity::Secret` source. If structural
+//! operations cannot reach the target, the authoritative planner rejects the
+//! still-over-budget candidate.
 //!
 //! The runtime is responsible for folding [`CompactionPolicy::revision`] into
 //! a plan's [`crate::plan::PlanInputs`] under the key `"compaction_policy"`;
 //! [`crate::planner::ContextPlanner`] never populates that seam itself (see
 //! `plan.rs`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::content::{ContentPart, Role};
 use agent_runtime_registry::RegistryRevision;
 
 use crate::budget::{BudgetReport, ContextBudget};
 use crate::fragment::{
-    CacheClass, ContextFragment, FragmentContent, FragmentId, FragmentKind, FragmentSource,
-    Requirement, Sensitivity,
+    ContextFragment, FragmentContent, FragmentId, FragmentKind, Requirement, Sensitivity,
 };
 use crate::planner::{Compactor, validate_pairing};
 use crate::sizing::{DEFAULT_CHARS_PER_TOKEN, RequestSizer};
@@ -67,6 +64,19 @@ pub struct SummaryProvenance {
     pub covers: Vec<FragmentId>,
     /// The compaction policy revision in effect when the summary was made.
     pub policy_revision: RegistryRevision,
+    /// Protected artifact containing the exact originals, for recoverable
+    /// semantic summaries. Structural-only outcomes leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_artifact: Option<ArtifactRef>,
+    /// Dedicated model-purpose label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_purpose: Option<String>,
+    /// Model/implementation revision that produced the semantic summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<RegistryRevision>,
+    /// Maximum sensitivity among covered originals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<Sensitivity>,
 }
 
 /// What one compaction pass actually did.
@@ -83,6 +93,22 @@ pub struct CompactionOutcome {
     pub bounded: Vec<FragmentId>,
     /// Summaries created this pass, with their provenance.
     pub summarized: Vec<SummaryProvenance>,
+    /// Input tokens reclaimed between the rejected and accepted plans.
+    ///
+    /// The authoritative planner populates this from its two budget reports;
+    /// direct compactor callers populate it from their supplied sizer.
+    #[serde(default)]
+    pub reclaimed_tokens: u32,
+}
+
+/// One owned compaction result. Content and provenance cannot be observed
+/// independently or leak from a previous request/session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionResult {
+    /// The replacement fragments.
+    pub fragments: Vec<ContextFragment>,
+    /// Exactly what this replacement changed.
+    pub outcome: CompactionOutcome,
 }
 
 impl CompactionOutcome {
@@ -130,6 +156,8 @@ impl CompactionPolicy {
 pub enum CompactionErrorKind {
     /// The candidate result is missing a fragment that was required.
     RequiredContentDropped,
+    /// A required fragment retained its id but its content or metadata changed.
+    RequiredContentModified,
     /// The candidate result leaves a tool call or result unmatched.
     InvalidPairing,
     /// A `Sensitivity::Secret` fragment was covered by a new summary.
@@ -141,6 +169,7 @@ impl CompactionErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             CompactionErrorKind::RequiredContentDropped => "required_content_dropped",
+            CompactionErrorKind::RequiredContentModified => "required_content_modified",
             CompactionErrorKind::InvalidPairing => "invalid_pairing",
             CompactionErrorKind::SecretSummarized => "secret_summarized",
         }
@@ -166,6 +195,15 @@ impl CompactionError {
         Self {
             kind: CompactionErrorKind::RequiredContentDropped,
             message: format!("required fragment `{fragment}` was dropped by compaction"),
+            fragment: Some(fragment),
+        }
+    }
+
+    /// A required fragment was retained under the same id but modified.
+    pub fn required_content_modified(fragment: FragmentId) -> Self {
+        Self {
+            kind: CompactionErrorKind::RequiredContentModified,
+            message: format!("required fragment `{fragment}` was modified by compaction"),
             fragment: Some(fragment),
         }
     }
@@ -207,8 +245,16 @@ pub fn validate_compacted(
     outcome: &CompactionOutcome,
 ) -> Result<(), CompactionError> {
     for fragment in original.iter().filter(|f| f.is_required()) {
-        if !candidate.iter().any(|c| c.id == fragment.id) {
+        let Some(retained) = candidate
+            .iter()
+            .find(|candidate| candidate.id == fragment.id)
+        else {
             return Err(CompactionError::required_content_dropped(
+                fragment.id.clone(),
+            ));
+        };
+        if retained != fragment {
+            return Err(CompactionError::required_content_modified(
                 fragment.id.clone(),
             ));
         }
@@ -216,6 +262,32 @@ pub fn validate_compacted(
 
     if let Err(err) = validate_pairing(candidate) {
         return Err(CompactionError::invalid_pairing(err.message));
+    }
+
+    // A grouped conversation turn is removed or retained as a unit. This is
+    // stricter than call/result pairing alone: it also prevents a compactor
+    // from keeping one result while replacing an adjacent result or assistant
+    // message from the same parallel exchange.
+    let mut original_groups: BTreeMap<&str, BTreeSet<&FragmentId>> = BTreeMap::new();
+    for fragment in original {
+        if let Some(group) = &fragment.conversation_group {
+            original_groups
+                .entry(group.as_str())
+                .or_default()
+                .insert(&fragment.id);
+        }
+    }
+    for (group, ids) in original_groups {
+        let retained = ids
+            .iter()
+            .filter(|id| candidate.iter().any(|fragment| &fragment.id == **id))
+            .count();
+        if retained != 0 && retained != ids.len() {
+            return Err(CompactionError::invalid_pairing(format!(
+                "conversation group `{group}` retained {retained} of {} fragments",
+                ids.len()
+            )));
+        }
     }
 
     for summary in &outcome.summarized {
@@ -233,7 +305,7 @@ pub fn validate_compacted(
 }
 
 /// The summed estimated token cost of `fragments` under `sizer` — the
-/// quantity [`SemanticCompactor::maybe_compact`] compares against the
+/// quantity [`StructuralCompactor::maybe_compact`] compares against the
 /// policy's watermarks.
 pub fn total_input_tokens(fragments: &[ContextFragment], sizer: &dyn RequestSizer) -> u32 {
     total_tokens_with(fragments, &|fragment| sizer.size_fragment(fragment))
@@ -328,6 +400,9 @@ fn stage_strip_prior_reasoning(
             return;
         }
         let fragment = &mut fragments[index];
+        if fragment.is_required() {
+            continue;
+        }
         let FragmentContent::Message(message) = &mut fragment.content else {
             continue;
         };
@@ -359,7 +434,7 @@ fn stage_evict(
             .enumerate()
             .filter(|(_, f)| {
                 f.requirement == Requirement::Optional
-                    && f.pairing.is_none()
+                    && f.pairing_ids().is_empty()
                     && matches!(
                         f.kind,
                         FragmentKind::Memory | FragmentKind::Retrieval | FragmentKind::Continuation
@@ -401,6 +476,7 @@ fn truncate_oversized(
             .filter(|f| {
                 f.requirement == Requirement::Optional
                     && f.kind == kind
+                    && f.pairing_ids().is_empty()
                     && text_len(f) > max_chars
                     && !bounded.contains(&f.id)
             })
@@ -450,112 +526,13 @@ fn stage_elide(
     );
 }
 
-/// Stage 4: folds the oldest remaining eligible group of optional
-/// `History`/`ToolResult` fragments — grouped by [`ContextFragment::priority`],
-/// which contributors use to mark "the same turn" — into one new
-/// [`FragmentKind::Summary`] fragment, oldest priority first, until the
-/// target is met or no eligible group remains. A group containing a
-/// required or `Sensitivity::Secret` fragment is never folded, so a required
-/// tool-call/result pair or secret content structurally cannot be
-/// summarized away.
-fn stage_summarize(
-    fragments: &mut Vec<ContextFragment>,
-    size_of: &dyn Fn(&ContextFragment) -> u32,
-    target: u32,
-    outcome: &mut CompactionOutcome,
-    policy_revision: &RegistryRevision,
-) {
-    'outer: loop {
-        if total_tokens_with(fragments.as_slice(), size_of) <= target {
-            return;
-        }
-
-        let mut priorities: Vec<i32> = fragments
-            .iter()
-            .filter(|f| matches!(f.kind, FragmentKind::History | FragmentKind::ToolResult))
-            .map(|f| f.priority)
-            .collect();
-        priorities.sort_unstable();
-        priorities.dedup();
-
-        for priority in priorities {
-            let group: Vec<usize> = fragments
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| {
-                    f.priority == priority
-                        && matches!(f.kind, FragmentKind::History | FragmentKind::ToolResult)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            if group.is_empty() {
-                continue;
-            }
-            let eligible = group.iter().all(|&index| {
-                fragments[index].requirement == Requirement::Optional
-                    && fragments[index].sensitivity != Sensitivity::Secret
-            });
-            if !eligible {
-                continue;
-            }
-
-            let mut covers: Vec<FragmentId> = group
-                .iter()
-                .map(|&index| fragments[index].id.clone())
-                .collect();
-            covers.sort();
-            let sensitivity = group
-                .iter()
-                .map(|&index| fragments[index].sensitivity)
-                .max()
-                .unwrap_or(Sensitivity::Internal);
-            let summary_id = FragmentId::new(format!("summary-{priority}"));
-            let text = format!(
-                "compacted {} fragment(s) at priority {priority}: {}",
-                group.len(),
-                covers
-                    .iter()
-                    .map(FragmentId::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let summary = ContextFragment::new(
-                summary_id.as_str().to_owned(),
-                FragmentKind::Summary,
-                FragmentSource::Compactor,
-                policy_revision.clone(),
-                FragmentContent::Text(text),
-            )
-            .with_sensitivity(sensitivity)
-            .with_cache_class(CacheClass::Ephemeral)
-            .with_priority(priority);
-
-            let mut removal_order = group.clone();
-            removal_order.sort_unstable_by(|a, b| b.cmp(a));
-            for index in removal_order {
-                fragments.remove(index);
-            }
-            fragments.push(summary);
-
-            outcome.summarized.push(SummaryProvenance {
-                summary: summary_id,
-                covers,
-                policy_revision: policy_revision.clone(),
-            });
-
-            continue 'outer;
-        }
-        return;
-    }
-}
-
-/// Runs the compaction stages (0 through 4), in order, down to `target`,
+/// Runs the structural compaction stages (0 through 3), in order, toward
+/// `target`,
 /// then validates the result via [`validate_compacted`].
 fn compact_pipeline(
     fragments: &[ContextFragment],
     size_of: &dyn Fn(&ContextFragment) -> u32,
     target: u32,
-    policy_revision: &RegistryRevision,
 ) -> Result<(Vec<ContextFragment>, CompactionOutcome), CompactionError> {
     let mut candidate = fragments.to_vec();
     let mut outcome = CompactionOutcome::default();
@@ -576,58 +553,29 @@ fn compact_pipeline(
         &mut outcome,
         DEFAULT_BOUND_CHARS,
     );
-    stage_summarize(
-        &mut candidate,
-        size_of,
-        target,
-        &mut outcome,
-        policy_revision,
-    );
-
     validate_compacted(fragments, &candidate, &outcome)?;
     Ok((candidate, outcome))
 }
 
 /// The policy-driven [`Compactor`]: strips prior-turn reasoning, evicts
 /// expired/optional fragments, bounds oversized tool results, elides
-/// reproducible detail, then summarizes older history — in that order —
-/// stopping as soon as the target is met. See the module documentation for
-/// the full contract.
-#[derive(Debug)]
-pub struct SemanticCompactor {
+/// reproducible detail — in that order — stopping as soon as the target is
+/// met or no safe structural operation remains. It never claims to summarize
+/// meaning. See the module documentation for the full contract.
+#[derive(Debug, Clone)]
+pub struct StructuralCompactor {
     policy: CompactionPolicy,
-    last_outcome: Mutex<CompactionOutcome>,
 }
 
-impl SemanticCompactor {
+impl StructuralCompactor {
     /// Builds a compactor enforcing `policy`.
     pub fn new(policy: CompactionPolicy) -> Self {
-        Self {
-            policy,
-            last_outcome: Mutex::new(CompactionOutcome::default()),
-        }
+        Self { policy }
     }
 
     /// The policy this compactor enforces.
     pub fn policy(&self) -> &CompactionPolicy {
         &self.policy
-    }
-
-    /// The outcome of the most recent [`SemanticCompactor::maybe_compact`] or
-    /// [`Compactor::compact`] call. Empty until compaction has run at least
-    /// once, and empty again after a call that found nothing to do.
-    pub fn last_outcome(&self) -> CompactionOutcome {
-        self.last_outcome
-            .lock()
-            .expect("compaction outcome lock poisoned")
-            .clone()
-    }
-
-    fn record_outcome(&self, outcome: CompactionOutcome) {
-        *self
-            .last_outcome
-            .lock()
-            .expect("compaction outcome lock poisoned") = outcome;
     }
 
     /// Compacts `fragments` toward the policy's low watermark if — and only
@@ -643,47 +591,44 @@ impl SemanticCompactor {
         &self,
         fragments: &[ContextFragment],
         sizer: &dyn RequestSizer,
-    ) -> Result<(Vec<ContextFragment>, CompactionOutcome), CompactionError> {
+    ) -> Result<CompactionResult, CompactionError> {
         let size_of = |fragment: &ContextFragment| sizer.size_fragment(fragment);
         let current = total_tokens_with(fragments, &size_of);
         if current < self.policy.high_watermark {
-            let outcome = CompactionOutcome::default();
-            self.record_outcome(outcome.clone());
-            return Ok((fragments.to_vec(), outcome));
+            return Ok(CompactionResult {
+                fragments: fragments.to_vec(),
+                outcome: CompactionOutcome::default(),
+            });
         }
-        let (candidate, outcome) = compact_pipeline(
-            fragments,
-            &size_of,
-            self.policy.low_watermark,
-            &self.policy.revision,
-        )?;
-        self.record_outcome(outcome.clone());
-        Ok((candidate, outcome))
+        let (candidate, mut outcome) =
+            compact_pipeline(fragments, &size_of, self.policy.low_watermark)?;
+        outcome.reclaimed_tokens = current.saturating_sub(total_tokens_with(&candidate, &size_of));
+        Ok(CompactionResult {
+            fragments: candidate,
+            outcome,
+        })
     }
 }
 
-impl Compactor for SemanticCompactor {
+impl Compactor for StructuralCompactor {
     fn compact(
         &self,
         fragments: &[ContextFragment],
         _report: &BudgetReport,
         budget: &ContextBudget,
-    ) -> Option<Vec<ContextFragment>> {
+    ) -> Result<Option<CompactionResult>, CompactionError> {
         let target = self.policy.low_watermark.min(budget.input_budget);
-        match compact_pipeline(
-            fragments,
-            &fallback_token_estimate,
-            target,
-            &self.policy.revision,
-        ) {
-            Ok((candidate, outcome)) => {
-                self.record_outcome(outcome);
-                Some(candidate)
-            }
-            Err(_) => None,
-        }
+        let (fragments, outcome) = compact_pipeline(fragments, &fallback_token_estimate, target)?;
+        Ok(Some(CompactionResult { fragments, outcome }))
     }
 }
+
+/// Bounded migration alias for the former, overstated name.
+#[deprecated(
+    since = "0.1.0",
+    note = "use StructuralCompactor; semantic summaries are coordinated by agent_runtime::harness"
+)]
+pub type SemanticCompactor = StructuralCompactor;
 
 #[cfg(test)]
 mod tests {
@@ -696,6 +641,7 @@ mod tests {
     use agent_runtime_core::provider::{Capabilities, ModelId};
 
     use crate::budget::{ContextErrorKind, ContextPolicy};
+    use crate::fragment::FragmentSource;
     use crate::plan::PlanInputs;
     use crate::planner::ContextPlanner;
     use crate::sizing::CharRatioSizer;
@@ -800,48 +746,45 @@ mod tests {
     fn compaction_does_not_trigger_below_the_high_watermark_but_does_trigger_at_it() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 50);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let below = vec![memory_fragment("mem", &text_for_token_count(99))];
-        let (result, outcome) = compactor.maybe_compact(&below, &sizer).unwrap();
-        assert!(outcome.is_noop());
-        assert_eq!(result, below);
+        let result = compactor.maybe_compact(&below, &sizer).unwrap();
+        assert!(result.outcome.is_noop());
+        assert_eq!(result.fragments, below);
 
         let at = vec![memory_fragment("mem", &text_for_token_count(100))];
-        let (result, outcome) = compactor.maybe_compact(&at, &sizer).unwrap();
-        assert!(!outcome.is_noop());
-        assert!(total_input_tokens(&result, &sizer) <= 50);
+        let result = compactor.maybe_compact(&at, &sizer).unwrap();
+        assert!(!result.outcome.is_noop());
+        assert!(total_input_tokens(&result.fragments, &sizer) <= 50);
     }
 
-    /// Requirement "Semantic context compaction" conformance:
-    /// repeated-compaction.
+    /// Requirement "Structural and semantic compaction are distinct":
+    /// repeated structural compaction.
     #[test]
     fn compacting_twice_from_the_low_watermark_is_a_no_op() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 300, 100);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
-        let mut fragments = vec![required_system("sys", "be helpful")];
-        for turn in 0..5 {
-            fragments.push(history_fragment(
-                &format!("turn-{turn}"),
-                turn,
-                &text_for_token_count(60),
-            ));
-        }
+        let fragments = vec![
+            required_system("sys", "be helpful"),
+            history_fragment("turn-0", 0, &text_for_token_count(350)),
+        ];
 
-        let (once, outcome1) = compactor.maybe_compact(&fragments, &sizer).unwrap();
-        assert!(!outcome1.is_noop());
-        assert!(total_input_tokens(&once, &sizer) <= 100);
+        let once = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        assert!(!once.outcome.is_noop());
+        assert!(total_input_tokens(&once.fragments, &sizer) <= 100);
+        assert!(once.outcome.summarized.is_empty());
 
-        let (twice, outcome2) = compactor.maybe_compact(&once, &sizer).unwrap();
-        assert!(outcome2.is_noop());
-        assert_eq!(once, twice);
+        let twice = compactor.maybe_compact(&once.fragments, &sizer).unwrap();
+        assert!(twice.outcome.is_noop());
+        assert_eq!(once.fragments, twice.fragments);
     }
 
     /// Requirement "Semantic context compaction" conformance: cannot-fit.
     /// Mirrors the planner's own "required content cannot fit" contract with
-    /// the real `SemanticCompactor` attached, and proves it was never
+    /// the real `StructuralCompactor` attached, and proves it was never
     /// invoked (its outcome stays empty) since required-only content alone
     /// does not fit.
     #[test]
@@ -850,7 +793,7 @@ mod tests {
         let sizer = CharRatioSizer::default();
         let ctx_policy = ContextPolicy::new(RegistryRevision::new("policy-1"), 50, 0);
         let compaction_policy = CompactionPolicy::new(RegistryRevision::new("cp-1"), 10, 5);
-        let compactor = SemanticCompactor::new(compaction_policy);
+        let compactor = StructuralCompactor::new(compaction_policy);
         let planner = ContextPlanner::new(&profile, &sizer, ctx_policy).with_compactor(&compactor);
 
         let huge_required = required_system("sys", &"x".repeat(4_000));
@@ -859,7 +802,6 @@ mod tests {
         let err = planner.plan(fragments).unwrap_err();
         assert_eq!(err.kind, ContextErrorKind::BudgetExceeded);
         assert!(err.message.contains("required content alone"));
-        assert!(compactor.last_outcome().is_noop());
     }
 
     /// Requirement "Semantic context compaction" conformance:
@@ -897,6 +839,16 @@ mod tests {
         let err =
             validate_compacted(&original, &candidate, &CompactionOutcome::default()).unwrap_err();
         assert_eq!(err.kind, CompactionErrorKind::RequiredContentDropped);
+        assert_eq!(err.fragment, Some(FragmentId::new("sys")));
+    }
+
+    #[test]
+    fn validate_compacted_rejects_modified_required_content() {
+        let original = vec![required_system("sys", "be helpful")];
+        let candidate = vec![required_system("sys", "modified")];
+        let err =
+            validate_compacted(&original, &candidate, &CompactionOutcome::default()).unwrap_err();
+        assert_eq!(err.kind, CompactionErrorKind::RequiredContentModified);
         assert_eq!(err.fragment, Some(FragmentId::new("sys")));
     }
 
@@ -941,6 +893,10 @@ mod tests {
                 summary: FragmentId::new("summary-0"),
                 covers: vec![FragmentId::new("secret-1")],
                 policy_revision: RegistryRevision::new("p1"),
+                source_artifact: None,
+                model_purpose: None,
+                model_revision: None,
+                sensitivity: None,
             }],
             ..CompactionOutcome::default()
         };
@@ -952,26 +908,26 @@ mod tests {
     fn a_secret_optional_history_fragment_is_never_folded_into_a_summary() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 40);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let secret = history_fragment("secret", 1, &text_for_token_count(80))
             .with_sensitivity(Sensitivity::Secret);
         let other = history_fragment("other", 2, &text_for_token_count(40));
         let fragments = vec![secret.clone(), other];
 
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
-        assert!(result.iter().any(|f| f.id == secret.id));
-        for provenance in &outcome.summarized {
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        assert!(result.fragments.iter().any(|f| f.id == secret.id));
+        for provenance in &result.outcome.summarized {
             assert!(!provenance.covers.contains(&secret.id));
         }
-        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
     }
 
     #[test]
-    fn old_optional_history_is_summarized_and_the_summary_records_what_it_replaced() {
+    fn old_optional_history_is_bounded_but_never_fabricated_into_a_summary() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 200, 80);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let sys = required_system("sys", "be helpful");
         let old_a = history_fragment("old-a", 1, &text_for_token_count(100));
@@ -979,25 +935,38 @@ mod tests {
         let recent = history_fragment("recent", 5, &text_for_token_count(20));
 
         let fragments = vec![sys, old_a.clone(), old_b.clone(), recent.clone()];
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
 
-        assert_eq!(outcome.summarized.len(), 1);
-        let provenance = &outcome.summarized[0];
-        assert_eq!(
-            provenance.covers,
-            vec![FragmentId::new("old-a"), FragmentId::new("old-b")]
+        assert!(result.outcome.summarized.is_empty());
+        assert!(
+            !result
+                .fragments
+                .iter()
+                .any(|fragment| fragment.kind == FragmentKind::Summary)
         );
-        assert!(result.iter().any(|f| f.kind == FragmentKind::Summary));
-        assert!(!result.iter().any(|f| f.id == old_a.id || f.id == old_b.id));
-        assert!(result.iter().any(|f| f.id == recent.id));
-        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+        assert!(result.outcome.bounded.contains(&old_a.id));
+        assert!(result.outcome.bounded.contains(&old_b.id));
+        assert!(
+            result
+                .fragments
+                .iter()
+                .any(|fragment| fragment.id == old_a.id)
+        );
+        assert!(
+            result
+                .fragments
+                .iter()
+                .any(|fragment| fragment.id == old_b.id)
+        );
+        assert!(result.fragments.iter().any(|f| f.id == recent.id));
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
     }
 
     #[test]
-    fn oversized_optional_tool_results_are_bounded_before_being_summarized() {
+    fn a_paired_tool_result_is_not_bounded_independently_of_its_call() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 200, 100);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let call_id = ToolCallId::new("call-1");
         let call_message = Message::assistant(vec![ContentPart::ToolCall(ToolCall {
@@ -1035,19 +1004,19 @@ mod tests {
             call_fragment,
             result_fragment,
         ];
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
 
-        assert_eq!(outcome.bounded, vec![FragmentId::new("result")]);
-        assert!(outcome.summarized.is_empty());
-        assert!(total_input_tokens(&result, &sizer) <= 100);
-        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+        assert!(result.outcome.bounded.is_empty());
+        assert!(result.outcome.summarized.is_empty());
+        assert_eq!(result.fragments, fragments);
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
     }
 
     #[test]
     fn prior_turn_reasoning_is_stripped_first_and_the_rest_of_the_message_survives() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 50);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let old_assistant = message_history_fragment(
             "old-assistant",
@@ -1060,13 +1029,17 @@ mod tests {
         let user = message_history_fragment("user-msg", 2, Message::user("next question"));
 
         let fragments = vec![old_assistant, user];
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
 
-        assert_eq!(outcome.bounded, vec![FragmentId::new("old-assistant")]);
-        assert!(outcome.evicted.is_empty());
-        assert!(outcome.summarized.is_empty());
+        assert_eq!(
+            result.outcome.bounded,
+            vec![FragmentId::new("old-assistant")]
+        );
+        assert!(result.outcome.evicted.is_empty());
+        assert!(result.outcome.summarized.is_empty());
 
         let stripped = result
+            .fragments
             .iter()
             .find(|f| f.id == FragmentId::new("old-assistant"))
             .expect("the stripped fragment itself must survive");
@@ -1074,15 +1047,15 @@ mod tests {
             panic!("the stripped fragment must still be a message");
         };
         assert_eq!(message.content, vec![ContentPart::text("the old answer")]);
-        assert!(total_input_tokens(&result, &sizer) <= 50);
-        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+        assert!(total_input_tokens(&result.fragments, &sizer) <= 50);
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
     }
 
     #[test]
     fn reasoning_after_the_last_user_message_survives_compaction() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 50);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let current_reasoning = reasoning_part("current-turn thinking");
         let old_assistant = message_history_fragment(
@@ -1104,10 +1077,14 @@ mod tests {
         );
 
         let fragments = vec![old_assistant, user, current_assistant];
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
 
-        assert_eq!(outcome.bounded, vec![FragmentId::new("old-assistant")]);
+        assert_eq!(
+            result.outcome.bounded,
+            vec![FragmentId::new("old-assistant")]
+        );
         let current = result
+            .fragments
             .iter()
             .find(|f| f.id == FragmentId::new("current-assistant"))
             .expect("the current-turn fragment must survive");
@@ -1115,7 +1092,7 @@ mod tests {
             panic!("the current-turn fragment must still be a message");
         };
         assert!(message.content.contains(&current_reasoning));
-        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
     }
 
     #[test]
@@ -1148,7 +1125,7 @@ mod tests {
     fn stripping_reasoning_from_a_paired_tool_call_message_keeps_the_pairing_valid() {
         let sizer = CharRatioSizer::default();
         let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 50);
-        let compactor = SemanticCompactor::new(policy);
+        let compactor = StructuralCompactor::new(policy);
 
         let call_id = ToolCallId::new("call-1");
         let tool_call = ContentPart::ToolCall(ToolCall {
@@ -1166,6 +1143,7 @@ mod tests {
                 tool_call.clone(),
             ])),
         )
+        .optional()
         .paired_with(call_id.clone());
 
         let result_fragment = ContextFragment::new(
@@ -1186,10 +1164,11 @@ mod tests {
         let user = message_history_fragment("user-msg", 2, Message::user("next question"));
 
         let fragments = vec![call_fragment, result_fragment, user];
-        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
 
-        assert_eq!(outcome.bounded, vec![FragmentId::new("call")]);
+        assert_eq!(result.outcome.bounded, vec![FragmentId::new("call")]);
         let call = result
+            .fragments
             .iter()
             .find(|f| f.id == FragmentId::new("call"))
             .expect("the paired call fragment must survive");
@@ -1197,6 +1176,6 @@ mod tests {
             panic!("the paired call fragment must still be a message");
         };
         assert_eq!(message.content, vec![tool_call]);
-        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
     }
 }

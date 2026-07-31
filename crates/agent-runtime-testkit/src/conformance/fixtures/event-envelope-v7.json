@@ -1,0 +1,38 @@
+[
+  {
+    "schema_version": 7,
+    "seq": 0,
+    "id": "evt-v7-1",
+    "session": "parent-session",
+    "turn": "parent-turn",
+    "timestamp": 100,
+    "payload": {
+      "event": "child_needs_input",
+      "child": "child-1",
+      "child_session": "child-session",
+      "turn": "child-turn",
+      "call": "call-ask-user",
+      "request": "interaction-child-1",
+      "question_ids": [
+        "question-1",
+        "question-2"
+      ],
+      "sensitivity": "sensitive"
+    }
+  },
+  {
+    "schema_version": 7,
+    "seq": 1,
+    "id": "evt-v7-2",
+    "session": "child-session",
+    "turn": "child-turn",
+    "timestamp": 101,
+    "payload": {
+      "event": "turn_completed",
+      "finish": {
+        "outcome": "needs_input",
+        "request": "interaction-child-1"
+      }
+    }
+  }
+]

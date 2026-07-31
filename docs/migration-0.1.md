@@ -88,8 +88,12 @@ let runtime = RuntimeBuilder::new(model)
 ```
 
 Without a compactor attached, an over-budget plan fails rather than being
-silently reduced. Attach `SemanticCompactor` to opt into eviction, tool-result
-bounding, and history summarization under configured watermarks.
+silently reduced. Attach `StructuralCompactor` to opt into deterministic
+prior-turn reasoning removal, optional-fragment eviction, and unpaired
+tool-result/history bounding under configured watermarks. It deliberately
+does not invent semantic summaries or drop an old tool exchange merely to fit;
+use the runtime-level `SemanticSummaryCoordinator` when stored originals and a
+purpose-attributed summary model are available.
 
 ## 3. `agent-runtime-prompt` folded into `agent-runtime-context`
 
@@ -136,17 +140,114 @@ explicitly rather than substituting what happens to be installed. A host that
 wants to proceed anyway must opt in explicitly via
 `check_replay_as(&available, ReplayMode::LabeledNonEquivalent)`.
 
-## 6. Event schema version 2
+## 6. Event schema version 8
 
-`SCHEMA_VERSION` is now `2`. Nine planning-lifecycle events were added:
-registry sealing, scoped-view derivation, model resolution, capability
-retrieval and activation, context planning and compaction, cache-plan changes,
-and budget failures.
+`SCHEMA_VERSION` is now `8`. The current vocabulary includes registry sealing,
+scoped-view derivation, model resolution, capability retrieval and activation,
+context planning and compaction, cache-plan changes, budget failures,
+attempt-scoped speculative output, metadata-only interaction lifecycle,
+lossless child `needs_input`, and durability-aligned `PlanUpdated`.
 
-Existing variants are unchanged, and the committed v1 golden fixture still
-guards the v1 wire representation. A consumer that matches exhaustively on
-`RuntimeEvent` must handle the new variants; one that matches specific variants
-needs no change.
+Committed v5 through v8 fixtures guard the compatible wire representations.
+Pre-v5 output deltas are intentionally not accepted because they lack the
+request/attempt identity needed to discard retry output safely. A consumer
+that matches exhaustively on `RuntimeEvent` must handle the new variants.
+
+## 7. Turns are explicit and interruption is turn-local
+
+`send` and `run` now return a structured handle:
+
+```rust
+let turn = session.send(UserInput::text("inspect the project"))?;
+turn.interrupt(CancelReason::UserRequested); // this turn only
+turn.completed().await;
+```
+
+`SessionHandle::interrupt_current_turn` is the equivalent session-addressed
+operation. `cancel_session` permanently cancels the session and is appropriate
+for shutdown or revocation; the old `cancel` name remains a terminal
+compatibility alias. Submission after shutdown returns `RuntimeError` instead
+of minting an unusable turn ID.
+
+## 8. Exact recovery uses a protected checkpoint store
+
+`SessionStore` remains the host-policy view of completed session state.
+`CheckpointStore` is a separate protected record of exact, versioned mid-turn
+state. Inject both when crash recovery is required:
+
+```rust
+let runtime = RuntimeBuilder::new(model)
+    .provider(provider)
+    .model_profile(profile)
+    .session_store(session_store)
+    .checkpoint_store(checkpoint_store)
+    .build()?;
+```
+
+Checkpoints may contain prepared actions, pending interaction content, or raw
+tool outcomes and therefore require stronger storage policy than an ordinary
+redacted journal. Recovery never reconstructs these values from observability
+events and never implicitly replays an indeterminate provider call or tool
+side effect.
+
+`SessionSnapshot` now carries namespaced `extension_state`. Each value declares
+its schema revision and sensitivity. Unknown component state can be preserved;
+an incompatible revision fails explicitly.
+
+## 9. Tools prepare exact authority before approval
+
+New tools implement `Tool` directly:
+
+```rust
+#[async_trait]
+impl Tool for EditTool {
+    fn spec(&self) -> ToolSpec { /* conservative upper bound */ }
+
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        // Canonicalize the exact path/resource and required permissions.
+        # todo!()
+    }
+
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        # todo!()
+    }
+}
+```
+
+The runtime verifies that the prepared permission set is covered by
+`ToolSpec::permission_upper_bound`, authorizes and displays that exact action,
+and invokes the same fingerprinted object. If approval edits arguments, schema
+validation, preparation, authorization, and approval run again. `LegacyTool`
+is available during migration but maps unspecified reads/writes/process/network
+effects conservatively.
+
+## 10. Live abilities and harness components are opt-in
+
+Call `RuntimeBuilder::live_ability_routing()` (or register an ability/descriptor
+override) to replace the fixed all-tools-visible request surface with
+session-scoped retrieval and activation. The protected `registry.search`
+bootstrap is always retained. Its results are authorized, dependency-complete,
+and staged until the canonical tool result commits.
+
+Reusable behavior is composed with phase-specific builder methods such as
+`context_contributor`, `model_interceptor`, `tool_output_processor`, and
+`turn_commit_hook`. Components have stable IDs/revisions and ordering
+constraints, receive immutable views, and return explicit patches. Do not port
+middleware that mutates shared request or session dictionaries.
+
+The standard questionnaire is activated only when host interaction is ready.
+Large tool output can be moved to a session-private `ArtifactStore` and read
+back in bounded pages through `artifact.read`. Todos, memory, artifacts, and
+semantic summaries remain generic mechanism; hosts still own their sources,
+trust policy, persistence implementations, and presentation.
 
 ## Checklist
 
@@ -156,3 +257,10 @@ needs no change.
 - [ ] Wrap any foreign-type `Named` impl in a local newtype.
 - [ ] Handle the new `RuntimeEvent` variants if you match exhaustively.
 - [ ] Decide a `ContextPolicy` reserve, and whether to attach a compactor.
+- [ ] Update `send`/`run` call sites to handle `Result<TurnHandle, _>`.
+- [ ] Use turn interruption for normal user interrupts; reserve
+      `cancel_session` for terminal teardown.
+- [ ] Migrate authority-bearing tools to `prepare` + exact `invoke`.
+- [ ] Provide a protected `CheckpointStore` if mid-turn recovery is required.
+- [ ] Decide whether the host opts into live ability routing and which harness
+      components/sources it trusts.

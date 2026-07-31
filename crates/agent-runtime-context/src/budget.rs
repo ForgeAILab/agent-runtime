@@ -37,12 +37,13 @@ pub struct CategoryUsage {
 /// The complete preflight accounting for one candidate plan.
 ///
 /// Every fragment kind that contributed at least one fragment gets exactly
-/// one row, ordered by [`FragmentKind::order_rank`], so a reviewer — or a
-/// test — can always ask "which category is expensive" and get a real
-/// answer instead of a single opaque total.
+/// one row in stable accounting-key order, so a reviewer — or a test — can
+/// always ask "which category is expensive" and get a real answer instead
+/// of a single opaque total. This category order never controls wire
+/// placement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BudgetReport {
-    /// Token usage by [`FragmentKind`], ordered by [`FragmentKind::order_rank`].
+    /// Token usage by [`FragmentKind`] in stable accounting-key order.
     pub categories: Vec<CategoryUsage>,
     /// The complete accounted input token count: the sum of every category.
     pub total_input_tokens: u32,
@@ -60,8 +61,9 @@ pub struct BudgetReport {
 
 impl BudgetReport {
     /// Computes a report by sizing every fragment and grouping the result by
-    /// kind. Fragments do not need to be pre-sorted; category order is always
-    /// [`FragmentKind::order_rank`] regardless of input order.
+    /// kind. Fragments do not need to be pre-sorted; category order is the
+    /// enum's stable accounting order and has no relationship to provider
+    /// wire placement.
     pub fn compute(
         fragments: &[ContextFragment],
         sizer: &dyn RequestSizer,
@@ -74,7 +76,7 @@ impl BudgetReport {
             entry.0 = entry.0.saturating_add(tokens);
             entry.1 = entry.1.saturating_add(1);
         }
-        let mut categories: Vec<CategoryUsage> = totals
+        let categories: Vec<CategoryUsage> = totals
             .into_iter()
             .map(|(kind, (tokens, fragment_count))| CategoryUsage {
                 kind,
@@ -82,7 +84,6 @@ impl BudgetReport {
                 fragment_count,
             })
             .collect();
-        categories.sort_by_key(|category| category.kind.order_rank());
         let total_input_tokens = categories
             .iter()
             .fold(0u32, |acc, category| acc.saturating_add(category.tokens));
@@ -234,6 +235,10 @@ pub enum ContextErrorKind {
     MissingModelProfile,
     /// A tool call and its result could not be matched one-to-one.
     InvalidPairing,
+    /// Two context contributions claimed the same stable fragment identity.
+    DuplicateFragmentId,
+    /// A compactor produced or reported an invalid replacement.
+    Compaction,
 }
 
 impl ContextErrorKind {
@@ -243,6 +248,8 @@ impl ContextErrorKind {
             ContextErrorKind::BudgetExceeded => "budget_exceeded",
             ContextErrorKind::MissingModelProfile => "missing_model_profile",
             ContextErrorKind::InvalidPairing => "invalid_pairing",
+            ContextErrorKind::DuplicateFragmentId => "duplicate_fragment_id",
+            ContextErrorKind::Compaction => "compaction",
         }
     }
 }
@@ -297,6 +304,26 @@ impl ContextError {
             message: message.into(),
             report: None,
             call: Some(call),
+        }
+    }
+
+    /// Two fragments claimed the same stable identity.
+    pub fn duplicate_fragment_id(message: impl Into<String>) -> Self {
+        Self {
+            kind: ContextErrorKind::DuplicateFragmentId,
+            message: message.into(),
+            report: None,
+            call: None,
+        }
+    }
+
+    /// A compactor failed to produce a valid owned result.
+    pub fn compaction(message: impl Into<String>) -> Self {
+        Self {
+            kind: ContextErrorKind::Compaction,
+            message: message.into(),
+            report: None,
+            call: None,
         }
     }
 }

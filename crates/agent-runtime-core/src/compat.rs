@@ -3,7 +3,7 @@
 //! Default-deny (security-enforcement's "Central default-deny authorization")
 //! means a [`crate::check_set::SecurityCheckSet`] with no authoritative
 //! coverage for a permission denies every request for it — including every
-//! mutating, process-spawning, or network-effect tool call an existing host
+//! reading, mutating, process-spawning, or network-effect tool call an existing host
 //! already relied on working, gated only by its injected
 //! [`crate::approval::ApprovalPolicy`]. [`LegacyApprovalAuthority`] closes
 //! that coverage gap without inventing a permissive fallback: it is itself an
@@ -22,21 +22,22 @@ use crate::grant::{
 use crate::security::{AuthorizationRequest, PermissionSet};
 
 /// A migration aid, not a policy: reproduces the pre-existing
-/// approval-gated behavior for mutating, process-spawning, and
+/// approval-gated behavior for reading, mutating, process-spawning, and
 /// network-effect tool invocations, and grants no authority beyond what the
-/// runtime already enforced before composed authorization existed.
+/// runtime already enforced before prepared invocation authority existed.
 ///
 /// Registering this check (a host does so by name, via
 /// `RuntimeBuilder::legacy_approval_authority` in the `agent-runtime` crate)
 /// is what lets a host satisfy default-deny coverage without writing its own
-/// [`SecurityCheck`] on day one. It covers exactly [`Permission::FsWrite`],
+/// [`SecurityCheck`] on day one. It covers exactly [`Permission::FsRead`],
+/// [`Permission::FsWrite`],
 /// [`Permission::ProcessSpawn`], and [`Permission::NetHttp`] — the
 /// permissions `agent_runtime_core::tool::ToolEffects::authorization_request`
-/// ever derives from a tool's declared effects today — and for any request
-/// asking for one of them it always returns
-/// [`SecurityCheckOutcome::RequireApproval`], never `Allow`: the same
-/// mandatory-approval control tool-execution's "Fail-closed approval"
-/// migration clause requires be preserved. Every other permission is
+/// derives from legacy static effects today. A workspace-scoped `fs.read`-only
+/// request is allowed without HITL, preserving legacy read/list/search
+/// behavior while still passing through authoritative policy. Any covered
+/// write/process/network request (including one mixed with read) returns
+/// [`SecurityCheckOutcome::RequireApproval`]. Every other permission is
 /// [`SecurityCheckOutcome::NotApplicable`] to it.
 ///
 /// Hosts are expected to replace this with their own authoritative policy —
@@ -57,8 +58,9 @@ impl LegacyApprovalAuthority {
     pub fn new() -> Self {
         Self {
             id: SecurityCheckId::new("legacy-approval-authority"),
-            revision: SecurityCheckRevision::new("v1"),
+            revision: SecurityCheckRevision::new("v2"),
             coverage: PermissionSet::from_iter([
+                Permission::FsRead,
                 Permission::FsWrite,
                 Permission::ProcessSpawn,
                 Permission::NetHttp,
@@ -105,7 +107,17 @@ impl SecurityCheck for LegacyApprovalAuthority {
             .requested
             .iter()
             .any(|permission| self.coverage.contains(permission));
-        if applies {
+        let read_only = request.requested.len() == 1
+            && request.requested.contains(&Permission::FsRead)
+            && matches!(
+                request.resource,
+                crate::security::SecurityResource::Filesystem { .. }
+            );
+        if read_only {
+            SecurityCheckOutcome::Allow {
+                constraints: GrantConstraints::unconstrained(),
+            }
+        } else if applies {
             SecurityCheckOutcome::RequireApproval {
                 constraints: GrantConstraints::unconstrained(),
             }
@@ -127,6 +139,11 @@ mod tests {
     use agent_runtime_registry::{Fingerprint, TrustClass};
 
     fn request(requested: PermissionSet) -> AuthorizationRequest {
+        let resource = if requested.contains(&Permission::FsRead) {
+            SecurityResource::filesystem("/ws", Vec::new())
+        } else {
+            SecurityResource::other("tool", "write")
+        };
         AuthorizationRequest::new(
             SecurityContext::new(
                 SecuritySubject::new("s"),
@@ -135,7 +152,7 @@ mod tests {
                 CheckSetRevision::new("cs-1"),
             ),
             SecurityAction::new("tool.write"),
-            SecurityResource::other("tool", "write"),
+            resource,
             requested,
             Deadline::never(),
             SecurityEvidence::new(TrustClass::ExternalContent, Fingerprint::of("test")),
@@ -143,7 +160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn covered_permissions_always_require_approval() {
+    async fn mutating_process_and_network_permissions_require_approval() {
         let check = LegacyApprovalAuthority::new();
         for permission in [
             Permission::FsWrite,
@@ -161,6 +178,36 @@ mod tests {
                 SecurityCheckOutcome::RequireApproval { .. }
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_scoped_fs_read_only_is_allowed_without_hitl() {
+        let check = LegacyApprovalAuthority::new();
+        let outcome = check
+            .evaluate(
+                &request(PermissionSet::single(Permission::FsRead)),
+                &Cancellation::new(),
+            )
+            .await;
+        assert!(matches!(outcome, SecurityCheckOutcome::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn mixed_read_and_write_still_requires_approval() {
+        let check = LegacyApprovalAuthority::new();
+        let outcome = check
+            .evaluate(
+                &request(PermissionSet::from_iter([
+                    Permission::FsRead,
+                    Permission::FsWrite,
+                ])),
+                &Cancellation::new(),
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            SecurityCheckOutcome::RequireApproval { .. }
+        ));
     }
 
     #[tokio::test]
