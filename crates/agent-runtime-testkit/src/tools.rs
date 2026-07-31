@@ -71,6 +71,41 @@ impl Tool for WriteTool {
     }
 }
 
+/// A read-only echo tool with a caller-chosen name, for suites that need a
+/// specific tool name present (e.g. a host's delegation-facing tool).
+#[derive(Debug)]
+pub struct NamedEchoTool {
+    name: String,
+}
+
+/// A [`NamedEchoTool`] named `name`.
+pub fn named_echo(name: impl Into<String>) -> NamedEchoTool {
+    NamedEchoTool { name: name.into() }
+}
+
+#[async_trait]
+impl Tool for NamedEchoTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "Echoes the provided arguments back to the caller."
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "additionalProperties": true})
+    }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::read_only()
+    }
+    async fn invoke(
+        &self,
+        arguments: Value,
+        _ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        Ok(ToolOutcome::json(arguments))
+    }
+}
+
 /// A tool that always returns an error result.
 #[derive(Debug, Default)]
 pub struct FailingTool;

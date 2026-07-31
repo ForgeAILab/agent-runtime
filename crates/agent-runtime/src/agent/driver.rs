@@ -20,7 +20,7 @@ use agent_runtime_context::plan::ContextPlan;
 use agent_runtime_context::sizing::EstimationConfidence as SizerConfidence;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::clock::{Clock, Deadline};
-use agent_runtime_core::content::{ContentPart, Message, ToolCall, UserInput};
+use agent_runtime_core::content::{ContentPart, Message, Role, ToolCall, UserInput};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{
     BudgetCategory, EstimationConfidence, LimitKind, RuntimeEvent, TurnFinish,
@@ -41,6 +41,7 @@ use crate::agent::planning::RunPlanner;
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
 use crate::runtime::emitter::EventEmitter;
+use crate::runtime::inject::InjectionQueue;
 use crate::runtime::state::SessionState;
 use crate::tool::ToolExecutor;
 use crate::tool::registry::SealedToolRegistry;
@@ -80,12 +81,62 @@ fn map_confidence(confidence: SizerConfidence) -> EstimationConfidence {
 enum ProviderTurnOutcome {
     Success {
         text: String,
+        reasoning: Vec<ContentPart>,
         tool_calls: Vec<ToolCall>,
         finish: FinishReason,
     },
     Failed(ProviderError),
     Cancelled,
     LimitReached(LimitKind),
+}
+
+/// Accumulates streamed reasoning deltas into history-ready
+/// [`ContentPart::Reasoning`] parts, merging consecutive deltas that share a
+/// `redacted` flag so one contiguous thought is one part.
+#[derive(Default)]
+struct ReasoningAccumulator {
+    parts: Vec<(String, bool)>,
+}
+
+impl ReasoningAccumulator {
+    fn push(&mut self, text: &str, redacted: bool) {
+        if text.is_empty() {
+            return;
+        }
+        match self.parts.last_mut() {
+            Some((buffer, last_redacted)) if *last_redacted == redacted => buffer.push_str(text),
+            _ => self.parts.push((text.to_string(), redacted)),
+        }
+    }
+
+    fn into_parts(self) -> Vec<ContentPart> {
+        self.parts
+            .into_iter()
+            .map(|(text, redacted)| ContentPart::Reasoning {
+                text,
+                redacted,
+                // OpenAI-compatible streams carry no reasoning signature;
+                // adapters for providers that sign will populate this.
+                signature: None,
+            })
+            .collect()
+    }
+}
+
+/// Drops reasoning retained from earlier turns. Providers only need reasoning
+/// echoed back within the turn that produced it (the tool-call loop); once a
+/// new user turn starts it is dead weight in every subsequent request, so the
+/// canonical history — the exact model-facing view — sheds it here. Assistant
+/// messages left with no content (reasoning-only answers) are removed
+/// entirely rather than sent as empty messages.
+fn strip_stale_reasoning(history: &mut Vec<Message>) {
+    for message in history.iter_mut() {
+        message
+            .content
+            .retain(|part| !matches!(part, ContentPart::Reasoning { .. }));
+    }
+    history
+        .retain(|message| !(matches!(message.role, Role::Assistant) && message.content.is_empty()));
 }
 
 /// Drives turns for a session using injected services.
@@ -119,24 +170,46 @@ impl Driver {
         }
     }
 
+    pub(crate) fn executor(&self) -> &ToolExecutor {
+        &self.executor
+    }
+
+    /// Appends any safe-boundary injected content to the history. Called only
+    /// at provider/tool boundaries — at turn start and after a tool step —
+    /// never while a provider stream is in flight.
+    fn drain_injected(&self, state: &Arc<Mutex<SessionState>>, inbox: &Arc<Mutex<InjectionQueue>>) {
+        let messages = inbox
+            .lock()
+            .expect("session inbox poisoned")
+            .drain_messages();
+        if messages.is_empty() {
+            return;
+        }
+        let mut guard = state.lock().expect("session state poisoned");
+        guard.history.extend(messages);
+    }
+
     /// Runs one turn to completion, emitting all of its events.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_turn(
         &self,
         state: Arc<Mutex<SessionState>>,
         emitter: Arc<EventEmitter>,
         minter: Arc<IdMinter>,
         session_cancel: Cancellation,
+        inbox: Arc<Mutex<InjectionQueue>>,
         turn_id: TurnId,
         input: UserInput,
     ) {
         let turn = Some(turn_id.clone());
         emitter.emit(turn.clone(), RuntimeEvent::TurnStarted);
 
-        state
-            .lock()
-            .expect("session state poisoned")
-            .history
-            .push(input.into_message());
+        {
+            let mut guard = state.lock().expect("session state poisoned");
+            strip_stale_reasoning(&mut guard.history);
+            guard.history.push(input.into_message());
+        }
+        self.drain_injected(&state, &inbox);
 
         let turn_cancel = session_cancel.child();
         let turn_deadline = match self.config.turn_time_limit_ms {
@@ -145,9 +218,12 @@ impl Driver {
         };
 
         let mut step: u32 = 0;
+        // Whether any visible text was streamed this turn, reported on
+        // TurnCompleted so hosts can spot reasoning-only completions.
+        let mut visible_output = false;
         loop {
             if turn_cancel.is_cancelled() {
-                self.finish_cancelled(&emitter, &turn, &turn_cancel);
+                self.finish_cancelled(&emitter, &turn, &turn_cancel, visible_output);
                 return;
             }
             if turn_deadline.is_expired(self.clock.as_ref()) {
@@ -163,6 +239,7 @@ impl Driver {
                         finish: TurnFinish::LimitReached {
                             limit: LimitKind::Time,
                         },
+                        visible_output,
                     },
                 );
                 return;
@@ -180,6 +257,7 @@ impl Driver {
                         finish: TurnFinish::LimitReached {
                             limit: LimitKind::ToolSteps,
                         },
+                        visible_output,
                     },
                 );
                 return;
@@ -217,6 +295,7 @@ impl Driver {
                         turn.clone(),
                         RuntimeEvent::TurnCompleted {
                             finish: TurnFinish::Failed,
+                            visible_output,
                         },
                     );
                     return;
@@ -229,6 +308,7 @@ impl Driver {
                     turn.clone(),
                     RuntimeEvent::TurnCompleted {
                         finish: TurnFinish::Failed,
+                        visible_output,
                     },
                 );
                 return;
@@ -245,12 +325,13 @@ impl Driver {
                     &turn,
                     turn_deadline,
                     &state,
+                    &mut visible_output,
                 )
                 .await;
 
             match outcome {
                 ProviderTurnOutcome::Cancelled => {
-                    self.finish_cancelled(&emitter, &turn, &turn_cancel);
+                    self.finish_cancelled(&emitter, &turn, &turn_cancel, visible_output);
                     return;
                 }
                 ProviderTurnOutcome::Failed(err) => {
@@ -259,6 +340,7 @@ impl Driver {
                         turn.clone(),
                         RuntimeEvent::TurnCompleted {
                             finish: TurnFinish::Failed,
+                            visible_output,
                         },
                     );
                     return;
@@ -269,16 +351,21 @@ impl Driver {
                         turn.clone(),
                         RuntimeEvent::TurnCompleted {
                             finish: TurnFinish::LimitReached { limit },
+                            visible_output,
                         },
                     );
                     return;
                 }
                 ProviderTurnOutcome::Success {
                     text,
+                    reasoning,
                     tool_calls,
                     finish,
                 } => {
-                    let mut parts = Vec::new();
+                    // Reasoning precedes the visible answer, mirroring how the
+                    // model produced it; adapters rely on the parts to round-trip
+                    // reasoning during the tool-call continuation.
+                    let mut parts = reasoning;
                     if !text.is_empty() {
                         parts.push(ContentPart::text(text));
                     }
@@ -305,6 +392,7 @@ impl Driver {
                                     finish: TurnFinish::LimitReached {
                                         limit: LimitKind::Output,
                                     },
+                                    visible_output,
                                 },
                             );
                             return;
@@ -324,6 +412,7 @@ impl Driver {
                                 turn.clone(),
                                 RuntimeEvent::TurnCompleted {
                                     finish: TurnFinish::Failed,
+                                    visible_output,
                                 },
                             );
                             return;
@@ -333,6 +422,7 @@ impl Driver {
                                 turn.clone(),
                                 RuntimeEvent::TurnCompleted {
                                     finish: TurnFinish::Completed,
+                                    visible_output,
                                 },
                             );
                             return;
@@ -356,6 +446,7 @@ impl Driver {
                                 turn.clone(),
                                 RuntimeEvent::TurnCompleted {
                                     finish: TurnFinish::Failed,
+                                    visible_output,
                                 },
                             );
                             return;
@@ -406,6 +497,9 @@ impl Driver {
                             .history
                             .push(Message::tool_result(block.clone()));
                     }
+                    // A tool step just completed — a safe boundary for
+                    // host-injected content before the next provider request.
+                    self.drain_injected(&state, &inbox);
 
                     step += 1;
                 }
@@ -418,12 +512,14 @@ impl Driver {
         emitter: &EventEmitter,
         turn: &Option<TurnId>,
         turn_cancel: &Cancellation,
+        visible_output: bool,
     ) {
         let reason = turn_cancel.reason().unwrap_or(CancelReason::UserRequested);
         emitter.emit(
             turn.clone(),
             RuntimeEvent::TurnCompleted {
                 finish: TurnFinish::Cancelled { reason },
+                visible_output,
             },
         );
     }
@@ -462,7 +558,8 @@ impl Driver {
                     .unwrap_or_else(|| plan.fingerprint()),
                 segment_count: plan.segments().len() as u32,
                 totals: segment_totals(plan),
-                input_budget_tokens: plan.input_tokens(),
+                input_tokens: plan.input_tokens(),
+                input_budget_tokens: plan.input_budget(),
                 reserved_tokens: plan
                     .output_reserve()
                     .saturating_add(plan.reasoning_reserve()),
@@ -559,6 +656,7 @@ impl Driver {
         turn: &Option<TurnId>,
         turn_deadline: Deadline,
         state: &Arc<Mutex<SessionState>>,
+        visible_output: &mut bool,
     ) -> ProviderTurnOutcome {
         let mut attempt_index: u32 = 0;
         loop {
@@ -585,6 +683,7 @@ impl Driver {
             };
 
             let mut text = String::new();
+            let mut reasoning = ReasoningAccumulator::default();
             let mut usage = UsageDelta::new();
             let mut assembler = ToolCallAssembler::default();
             let mut error: Option<ProviderError> = None;
@@ -603,10 +702,14 @@ impl Driver {
                         }
                         match event {
                             ProviderStreamEvent::TextDelta { text: t } => {
+                                if !t.is_empty() {
+                                    *visible_output = true;
+                                }
                                 text.push_str(&t);
                                 emitter.emit(turn.clone(), RuntimeEvent::TextDelta { text: t });
                             }
                             ProviderStreamEvent::ReasoningDelta { text: t, redacted } => {
+                                reasoning.push(&t, redacted);
                                 emitter.emit(
                                     turn.clone(),
                                     RuntimeEvent::ReasoningDelta { text: t, redacted },
@@ -774,6 +877,7 @@ impl Driver {
                 )),
                 _ => ProviderTurnOutcome::Success {
                     text,
+                    reasoning: reasoning.into_parts(),
                     tool_calls,
                     finish,
                 },

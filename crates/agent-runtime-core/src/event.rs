@@ -22,10 +22,22 @@ use agent_runtime_registry::{Fingerprint, RegistryId, RegistryRevision};
 
 use crate::cancel::CancelReason;
 use crate::clock::Timestamp;
+use crate::delegation::WorkspacePolicy;
 use crate::error::RuntimeError;
-use crate::ids::{AttemptId, EventId, RequestId, SessionId, ToolCallId, TurnId};
+use crate::ids::{AttemptId, ChildId, EventId, RequestId, SessionId, ToolCallId, TurnId};
 use crate::manifest::{ActivatedCapability, SegmentId, SegmentKind, SummaryCoverage};
 use crate::metadata::Metadata;
+
+/// Serde default for flags that are absent on the wire unless notable.
+fn default_true() -> bool {
+    true
+}
+
+/// Serde skip predicate paired with [`default_true`].
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
 use crate::provider::{FinishReason, ModelId};
 use crate::usage::UsageRecord;
 
@@ -40,7 +52,11 @@ use crate::usage::UsageRecord;
 /// `argument_keys`/`argument_fingerprint` were added so raw values — which may
 /// echo secrets a model was induced to reveal, or host-configured data — reach
 /// the event stream only when a host explicitly opts in.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// Bumped to 4 for agent delegation: the child lifecycle variants
+/// ([`RuntimeEvent::ChildSpawned`] through [`RuntimeEvent::ChildFailed`])
+/// join the vocabulary, emitted on the parent session's stream.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// A configured limit the runtime enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +127,22 @@ pub enum BudgetCategory {
     Output,
 }
 
+/// A bounded description of what a delegated child is doing, carried by
+/// [`RuntimeEvent::ChildProgress`]. Identifiers only — never raw content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum ChildPhase {
+    /// The child began a turn.
+    TurnStarted,
+    /// The child completed a tool call.
+    ToolCall {
+        /// The tool's name.
+        name: String,
+    },
+    /// The child finished a turn (its task outcome follows separately).
+    TurnFinished,
+}
+
 /// The semantic payload of a runtime event. This is the canonical vocabulary
 /// every consumer receives regardless of presentation layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,7 +205,11 @@ pub enum RuntimeEvent {
         segment_count: u32,
         /// Token totals by segment kind.
         totals: BTreeMap<SegmentKind, u32>,
-        /// The enforced input token budget.
+        /// The counted input tokens the plan consumes. Defaults to zero when
+        /// replaying journals written before the field existed.
+        #[serde(default)]
+        input_tokens: u32,
+        /// The enforced input token budget the counted tokens were held to.
         input_budget_tokens: u32,
         /// Output/reasoning tokens reserved out of the context window.
         reserved_tokens: u32,
@@ -310,6 +346,63 @@ pub enum RuntimeEvent {
     TurnCompleted {
         /// How the turn ended.
         finish: TurnFinish,
+        /// Whether any visible text was streamed during the turn. `false`
+        /// flags a reasoning-only completion — the turn ended without a
+        /// user-facing answer — so hosts can react instead of showing
+        /// nothing. Serialized only when `false`; absent (older journals,
+        /// ordinary turns) means visible output was produced.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        visible_output: bool,
+    },
+    /// A delegated child session was spawned. Emitted on the parent session's
+    /// stream; the envelope's `session` is the parent, the payload names the
+    /// child.
+    ChildSpawned {
+        /// The stable child id.
+        child: ChildId,
+        /// The child's declared workspace posture.
+        workspace: WorkspacePolicy,
+        /// The maximum tasks (spawn plus follow-ups) the child may run.
+        max_turns: u32,
+        /// The child's total token budget, if one was declared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u64>,
+        /// The child's lifetime deadline in milliseconds from spawn, if one
+        /// was declared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_ms: Option<u64>,
+    },
+    /// A delegated child made bounded progress.
+    ChildProgress {
+        /// The child id.
+        child: ChildId,
+        /// What the child is doing.
+        phase: ChildPhase,
+    },
+    /// A delegated child completed a task. The child remains available for
+    /// follow-ups within its limits; this is not a terminal event.
+    ChildCompleted {
+        /// The child id.
+        child: ChildId,
+        /// The child's final answer for this task: its visible text, or its
+        /// non-redacted reasoning when the provider classified the entire
+        /// answer as reasoning. Carried in full — progress coalescing must
+        /// never drop a final result.
+        result: String,
+    },
+    /// A delegated child stopped. Terminal: emitted exactly once per child.
+    ChildStopped {
+        /// The child id.
+        child: ChildId,
+        /// Why the child stopped.
+        reason: CancelReason,
+    },
+    /// A delegated child failed. Terminal: emitted exactly once per child.
+    ChildFailed {
+        /// The child id.
+        child: ChildId,
+        /// The failure.
+        error: RuntimeError,
     },
     /// The session shut down.
     SessionShutdown,
@@ -452,6 +545,7 @@ mod tests {
                     (SegmentKind::new("tool_schema"), 120),
                     (SegmentKind::new("history"), 300),
                 ]),
+                input_tokens: 420,
                 input_budget_tokens: 8000,
                 reserved_tokens: 512,
                 confidence: EstimationConfidence::Estimated,

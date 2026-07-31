@@ -145,6 +145,11 @@ impl ContextPlan {
         self.budget.total_input_tokens
     }
 
+    /// The enforced input token budget the counted tokens were held to.
+    pub fn input_budget(&self) -> u32 {
+        self.budget.input_budget
+    }
+
     /// Tokens held back for the model's response.
     pub fn output_reserve(&self) -> u32 {
         self.budget.output_reserve

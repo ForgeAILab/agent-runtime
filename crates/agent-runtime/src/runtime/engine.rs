@@ -13,6 +13,7 @@ use crate::agent::driver::Driver;
 use crate::ids::IdMinter;
 use crate::runtime::command::{COMMAND_SCHEMA_VERSION, StartSession};
 use crate::runtime::emitter::EventEmitter;
+use crate::runtime::inject::InjectionQueue;
 use crate::runtime::session::{SessionHandle, SessionInner};
 use crate::runtime::state::SessionState;
 
@@ -26,6 +27,7 @@ pub struct RuntimeShared {
     pub(crate) observers: Arc<[Arc<dyn EventObserver>]>,
     pub(crate) event_buffer: usize,
     pub(crate) shutdown_timeout_ms: u64,
+    pub(crate) injection_queue_limit: usize,
 }
 
 /// An embeddable, in-process agent runtime.
@@ -53,6 +55,25 @@ impl Runtime {
         &self,
         request: StartSession,
     ) -> Result<SessionHandle, RuntimeError> {
+        self.start_session_with_parent(request, None).await
+    }
+
+    /// Starts a delegated child session attributed to `parent`. Children are
+    /// ephemeral: they never load or save snapshots, so a resumed parent can
+    /// never restart them.
+    pub(crate) async fn start_child_session(
+        &self,
+        request: StartSession,
+        parent: SessionId,
+    ) -> Result<SessionHandle, RuntimeError> {
+        self.start_session_with_parent(request, Some(parent)).await
+    }
+
+    async fn start_session_with_parent(
+        &self,
+        request: StartSession,
+        parent: Option<SessionId>,
+    ) -> Result<SessionHandle, RuntimeError> {
         if request.schema_version != COMMAND_SCHEMA_VERSION {
             return Err(RuntimeError::config(format!(
                 "unsupported StartSession schema version {}; expected {}",
@@ -66,10 +87,11 @@ impl Runtime {
 
         // Resume only when the caller explicitly supplied the identity. A
         // freshly minted id must never silently load an older snapshot.
+        // Child sessions never resume: they are ephemeral by contract.
         let mut state = SessionState::with_history(request.initial_history);
         let mut identity = Default::default();
-        let snapshot = match (explicit_id, &self.shared.session_store) {
-            (true, Some(store)) => store.load(&session_id).await?,
+        let snapshot = match (explicit_id, &self.shared.session_store, &parent) {
+            (true, Some(store), None) => store.load(&session_id).await?,
             _ => None,
         };
         if let Some(snapshot) = snapshot {
@@ -91,10 +113,14 @@ impl Runtime {
         let inner = Arc::new(SessionInner {
             shared: self.shared.clone(),
             id: session_id,
+            parent,
             cancel: agent_runtime_core::cancel::Cancellation::new(),
             emitter,
             minter,
             state: Arc::new(Mutex::new(state)),
+            inbox: Arc::new(Mutex::new(InjectionQueue::new(
+                self.shared.injection_queue_limit,
+            ))),
             turn_gate: tokio::sync::Mutex::new(()),
             turns: Mutex::new(Default::default()),
             turn_ready: tokio::sync::Notify::new(),

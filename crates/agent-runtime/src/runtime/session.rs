@@ -16,6 +16,7 @@ use agent_runtime_core::store::SessionSnapshot;
 use crate::ids::IdMinter;
 use crate::runtime::emitter::{EventEmitter, RuntimeEventStream};
 use crate::runtime::engine::RuntimeShared;
+use crate::runtime::inject::{InjectedContent, InjectionQueue};
 use crate::runtime::state::SessionState;
 
 /// The shared inner state of a session.
@@ -23,10 +24,14 @@ use crate::runtime::state::SessionState;
 pub struct SessionInner {
     pub(crate) shared: Arc<RuntimeShared>,
     pub(crate) id: SessionId,
+    /// The parent session, when this session is a delegated child. A child
+    /// session must never spawn children of its own (depth-one enforcement).
+    pub(crate) parent: Option<SessionId>,
     pub(crate) cancel: Cancellation,
     pub(crate) emitter: Arc<EventEmitter>,
     pub(crate) minter: Arc<IdMinter>,
     pub(crate) state: Arc<Mutex<SessionState>>,
+    pub(crate) inbox: Arc<Mutex<InjectionQueue>>,
     pub(crate) turn_gate: AsyncMutex<()>,
     pub(crate) turns: Mutex<ActiveTurns>,
     pub(crate) turn_ready: Notify,
@@ -58,6 +63,28 @@ impl SessionHandle {
     /// The session id.
     pub fn id(&self) -> &SessionId {
         &self.inner.id
+    }
+
+    /// The parent session id, when this session is a delegated child.
+    pub fn parent(&self) -> Option<&SessionId> {
+        self.inner.parent.as_ref()
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<SessionInner> {
+        &self.inner
+    }
+
+    /// Enqueues host content for this session, introduced to the model only
+    /// at the next safe provider/tool boundary — never by mutating an
+    /// in-flight provider stream. Coalescable content past the configured
+    /// queue bound returns a structured overflow error; content marked
+    /// must-deliver is always accepted.
+    pub fn inject(&self, content: InjectedContent) -> Result<(), RuntimeError> {
+        self.inner
+            .inbox
+            .lock()
+            .expect("session inbox poisoned")
+            .push(content)
     }
 
     /// Subscribes to this session's event stream. Multiple concurrent
@@ -127,6 +154,7 @@ impl SessionHandle {
                     inner.emitter.clone(),
                     inner.minter.clone(),
                     inner.cancel.clone(),
+                    inner.inbox.clone(),
                     tid,
                     input,
                 )

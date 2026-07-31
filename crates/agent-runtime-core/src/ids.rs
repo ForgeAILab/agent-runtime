@@ -92,6 +92,10 @@ neutral_id!(
     /// Identifies one emitted runtime event.
     EventId
 );
+neutral_id!(
+    /// Identifies one delegated child session, stable across its lifecycle.
+    ChildId
+);
 
 #[cfg(test)]
 mod tests {

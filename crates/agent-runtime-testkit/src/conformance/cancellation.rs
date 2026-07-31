@@ -22,7 +22,7 @@ pub async fn assert_cancel_terminates(session: &SessionHandle) {
                 session.cancel(CancelReason::UserRequested);
                 cancel_issued = true;
             }
-            RuntimeEvent::TurnCompleted { finish } => {
+            RuntimeEvent::TurnCompleted { finish, .. } => {
                 assert!(
                     matches!(finish, TurnFinish::Cancelled { .. }),
                     "expected a cancelled turn, got {finish:?}"

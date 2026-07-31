@@ -93,6 +93,14 @@ impl ToolExecutor {
         }
     }
 
+    pub(crate) fn security(&self) -> &SecurityConfig {
+        &self.security
+    }
+
+    pub(crate) fn approval_policy(&self) -> &Arc<dyn ApprovalPolicy> {
+        &self.approval
+    }
+
     /// Executes `calls`, returning one [`ToolResultBlock`] per call in request
     /// order. Overlapping writes are serialized; independent calls in a batch
     /// run concurrently.

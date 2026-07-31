@@ -41,6 +41,11 @@ pub enum ContentPart {
         /// Whether the reasoning content is redacted.
         #[serde(default)]
         redacted: bool,
+        /// A provider-issued integrity signature for the reasoning, kept so
+        /// adapters for providers that sign thinking blocks (e.g. Anthropic)
+        /// can send it back verbatim. Absent for providers that do not sign.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// An image reference.
     Image {
@@ -211,5 +216,37 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn reasoning_signature_is_optional_on_the_wire() {
+        // Unsigned reasoning keeps the pre-signature wire shape...
+        let unsigned = ContentPart::Reasoning {
+            text: "thought".into(),
+            redacted: false,
+            signature: None,
+        };
+        let json = serde_json::to_string(&unsigned).unwrap();
+        assert!(!json.contains("signature"));
+        // ...pre-signature payloads still deserialize...
+        let back: ContentPart =
+            serde_json::from_str(r#"{"type":"reasoning","text":"thought"}"#).unwrap();
+        assert_eq!(
+            back,
+            ContentPart::Reasoning {
+                text: "thought".into(),
+                redacted: false,
+                signature: None,
+            }
+        );
+        // ...and a signature round-trips verbatim when present.
+        let signed = ContentPart::Reasoning {
+            text: "thought".into(),
+            redacted: false,
+            signature: Some("sig-abc".into()),
+        };
+        let json = serde_json::to_string(&signed).unwrap();
+        let back: ContentPart = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, signed);
     }
 }

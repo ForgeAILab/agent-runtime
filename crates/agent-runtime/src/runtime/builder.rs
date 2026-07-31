@@ -51,6 +51,7 @@ pub struct RuntimeBuilder {
     config: LoopConfig,
     event_buffer: usize,
     shutdown_timeout_ms: u64,
+    injection_queue_limit: usize,
     provider_name: Option<String>,
     model_profile: Option<ResolvedModelProfile>,
     model_catalog: Option<Arc<dyn ModelCatalog>>,
@@ -87,6 +88,7 @@ impl RuntimeBuilder {
             config: LoopConfig::new(model),
             event_buffer: 1024,
             shutdown_timeout_ms: 5_000,
+            injection_queue_limit: 64,
             provider_name: None,
             model_profile: None,
             model_catalog: None,
@@ -360,6 +362,26 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Sets the bound on coalescable safe-boundary injected content queued
+    /// per session (see [`SessionHandle::inject`](crate::runtime::SessionHandle::inject)).
+    /// Must-deliver content is never bounded away. Defaults to 64.
+    pub fn injection_queue_limit(mut self, limit: usize) -> Self {
+        self.injection_queue_limit = limit;
+        self
+    }
+
+    /// Retains only the registered tools `keep` accepts. Used by the
+    /// delegation coordinator to derive a child's scoped tool view.
+    pub(crate) fn scope_tools(&mut self, keep: impl Fn(&Arc<dyn Tool>) -> bool) {
+        self.tools.retain(|tool| keep(tool));
+    }
+
+    /// Removes any session store so the built runtime's sessions are
+    /// ephemeral — a delegated child must never persist or resume.
+    pub(crate) fn clear_session_store(&mut self) {
+        self.session_store = None;
+    }
+
     /// Builds the runtime, sealing the tool registry, sealing the composed
     /// `SecurityCheckSet`, and applying fail-closed defaults for any omitted
     /// services.
@@ -516,6 +538,7 @@ impl RuntimeBuilder {
             observers: Arc::from(self.observers.into_boxed_slice()),
             event_buffer: self.event_buffer,
             shutdown_timeout_ms: self.shutdown_timeout_ms,
+            injection_queue_limit: self.injection_queue_limit,
         };
         Ok(Runtime::from_shared(Arc::new(shared)))
     }

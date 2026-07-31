@@ -54,6 +54,50 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- Agent delegation (`add-agent-delegation-runtime`): a neutral
+  `DelegationCoordinator` spawns children as full runtime sessions built by a
+  host `ChildRuntimeFactory`, with spawn/list/follow-up/wait/result/stop
+  addressed by stable `ChildId`. Depth-one is enforced fail-closed (child
+  views lose delegation tools; a child session cannot construct a
+  coordinator), spawn/follow-up/stop pass the composed authorization path
+  under the host-covered `agent.delegate` permission, per-parent and shared
+  capacity are reject-by-default with an explicit queue policy, and children
+  stop with their parent or process and never resume. Attributed child
+  lifecycle events (`ChildSpawned` … `ChildFailed`) join the event vocabulary
+  (`SCHEMA_VERSION` is now `4`); the completed event carries the child's
+  final result so coalescing can never drop it.
+- Safe-boundary content injection: `SessionHandle::inject` queues bounded
+  host content (`RuntimeBuilder::injection_queue_limit`, default 64) that the
+  driver introduces only at provider/tool boundaries — never mid-stream —
+  with structured overflow for coalescable items and guaranteed delivery for
+  must-deliver items (e.g. final child results).
+- Testkit: a delegation conformance suite (lifecycle ordering, depth
+  rejection, fail-closed coverage, capacity, scoped views, stop/teardown
+  cancellation propagation) and safe-boundary injection integration tests.
+- Reasoning preservation: the driver retains streamed reasoning as
+  `ContentPart::Reasoning` history parts for the turn that produced it
+  (merging consecutive same-`redacted` deltas, placed ahead of visible text
+  and tool calls) and sheds prior-turn reasoning when the next user turn
+  starts, dropping reasoning-only assistant messages rather than sending them
+  empty. The OpenAI-compatible adapter serializes non-redacted reasoning as
+  `reasoning_content` on assistant wire messages — required by
+  OpenAI-compatible thinking models (e.g. Z.AI GLM) during tool-call
+  continuations — and never serializes redacted reasoning. Compaction strips
+  prior-turn reasoning as its cheapest first stage and truncates reasoning
+  parts like text.
+- `ContextPlanned` gains `input_tokens` (the counted consumption,
+  `serde(default)` for journals written before the field existed) and
+  `ContextPlan::input_budget()` exposes the enforced budget.
+- `TurnCompleted` gains `visible_output`: `false` flags a reasoning-only
+  completion so hosts can react instead of showing nothing. Serialized only
+  when `false`; ordinary turns and old journals keep the previous wire shape.
+- `ContentPart::Reasoning` gains an optional `signature` for providers that
+  sign thinking blocks; absent from the wire when unset, and dropped by
+  tool-output truncation whenever the signed text is altered.
+- Provider conformance now covers reasoning: adapters must normalize
+  streamed reasoning identically and accept continuation requests carrying
+  reasoning history back (`assert_normalized_reasoning_stream`), and the
+  OpenAI adapter's wire echo of `reasoning_content` is asserted end to end.
 - `agent-runtime-registry`: the dependency-light registry kernel — namespaced
   `RegistryId`/`RegistryDomain` identity, `RegistryRevision`/`RegistrySource`/
   `EntryProvenance`, layered sealing with deterministic conflict/override
@@ -99,6 +143,11 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - `agent-runtime-testkit`: fake clock, event recorder, temporary workspace, and
   reusable conformance suites (provider, tool, runtime, cancellation,
   event-schema, shutdown) plus neutral consumer adapter fixtures.
+
+### Fixed
+- `ContextPlanned::input_budget_tokens` now reports the enforced input budget
+  it was always documented as, instead of the counted consumption (which
+  moved to the new `input_tokens` field).
 
 ### Provenance
 - Reusable provider, agent-loop, and tool mechanisms were adapted from the Nyx

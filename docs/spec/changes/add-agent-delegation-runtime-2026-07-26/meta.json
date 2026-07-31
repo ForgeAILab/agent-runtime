@@ -1,0 +1,12 @@
+{
+  "change_id": "add-agent-delegation-runtime",
+  "change_ref": "add-agent-delegation-runtime-2026-07-26",
+  "created_at": "2026-07-27T02:57:00Z",
+  "updated_at": "2026-07-27T04:06:20Z",
+  "completed_at": "2026-07-27T03:25:13Z",
+  "status": "implementing",
+  "depends_on": [
+    "add-runtime-security-boundary-2026-07-24"
+  ],
+  "implementation_started_at": "2026-07-27T03:06:42Z"
+}

@@ -112,6 +112,7 @@ async fn provider_tool_call_records_result_and_continues() {
     assert!(matches!(
         payloads.last(),
         Some(RuntimeEvent::TurnCompleted {
+            visible_output: _,
             finish: TurnFinish::Completed
         })
     ));
@@ -221,7 +222,7 @@ async fn provider_finish_reasons_reach_attempt_and_turn_terminals() {
         )));
         assert!(matches!(
             payloads.last(),
-            Some(RuntimeEvent::TurnCompleted { finish }) if finish == &expected_turn
+            Some(RuntimeEvent::TurnCompleted { finish, .. }) if finish == &expected_turn
         ));
     }
 }
@@ -282,6 +283,7 @@ async fn exhausted_provider_attempts_emit_structured_limit() {
     assert!(matches!(
         payloads.last(),
         Some(RuntimeEvent::TurnCompleted {
+            visible_output: _,
             finish: TurnFinish::LimitReached {
                 limit: LimitKind::ProviderAttempts
             }
@@ -330,7 +332,7 @@ async fn retry_backoff_stops_promptly_on_cancellation() {
     }
     let terminal = tokio::time::timeout(Duration::from_millis(200), async {
         while let Some(event) = stream.next().await {
-            if let RuntimeEvent::TurnCompleted { finish } = event.payload {
+            if let RuntimeEvent::TurnCompleted { finish, .. } = event.payload {
                 return finish;
             }
         }
@@ -577,6 +579,7 @@ async fn tool_step_limit_emits_structured_terminal() {
     assert!(matches!(
         payloads.last(),
         Some(RuntimeEvent::TurnCompleted {
+            visible_output: _,
             finish: TurnFinish::LimitReached {
                 limit: LimitKind::ToolSteps
             }
@@ -636,6 +639,7 @@ async fn unsupported_reasoning_fails_closed_when_strict() {
     assert!(matches!(
         payloads.last(),
         Some(RuntimeEvent::TurnCompleted {
+            visible_output: _,
             finish: TurnFinish::Failed
         })
     ));
@@ -700,6 +704,7 @@ async fn registered_tool_arguments_are_schema_validated_before_exposure() {
     assert!(matches!(
         payloads.last(),
         Some(RuntimeEvent::TurnCompleted {
+            visible_output: _,
             finish: TurnFinish::Failed
         })
     ));

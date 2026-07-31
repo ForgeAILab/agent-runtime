@@ -44,6 +44,7 @@ pub mod check_set;
 pub mod clock;
 pub mod compat;
 pub mod content;
+pub mod delegation;
 pub mod error;
 pub mod event;
 pub mod grant;
@@ -78,10 +79,13 @@ pub mod prelude {
     pub use crate::clock::{Clock, Deadline, SystemClock, Timestamp};
     pub use crate::compat::LegacyApprovalAuthority;
     pub use crate::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock, UserInput};
+    pub use crate::delegation::{
+        ChildLimits, ChildModelSelection, ChildSpec, ToolViewScope, WorkspacePolicy,
+    };
     pub use crate::error::{ErrorKind, Result, RuntimeError};
     pub use crate::event::{
-        BudgetCategory, CompactionReason, EstimationConfidence, EventEnvelope, LimitKind,
-        RuntimeEvent, SCHEMA_VERSION, TurnFinish,
+        BudgetCategory, ChildPhase, CompactionReason, EstimationConfidence, EventEnvelope,
+        LimitKind, RuntimeEvent, SCHEMA_VERSION, TurnFinish,
     };
     pub use crate::grant::{
         AuthorizationDecision, CapabilityGrant, ConstraintDimension, ConstraintValue, DecisionCode,
@@ -93,7 +97,9 @@ pub mod prelude {
         GuardRiskSignal, GuardedFragment, LeakBoundary, LeakCoverageRevision, LeakDetector,
         LeakDetectorId, LeakFinding, LeakScanResult,
     };
-    pub use crate::ids::{AttemptId, EventId, RequestId, SessionId, TenantId, ToolCallId, TurnId};
+    pub use crate::ids::{
+        AttemptId, ChildId, EventId, RequestId, SessionId, TenantId, ToolCallId, TurnId,
+    };
     pub use crate::isolation::{
         BackendConformance, BoundedRendering, DeclaredInterface, IsolationBackend,
         IsolationBackendId, IsolationBackendRevision, IsolationError, IsolationInvocation,

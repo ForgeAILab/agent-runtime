@@ -10,6 +10,7 @@ pub mod cancellation;
 pub mod catalog;
 pub mod compaction;
 pub mod context;
+pub mod delegation;
 pub mod event_schema;
 pub mod provider;
 pub mod registry;

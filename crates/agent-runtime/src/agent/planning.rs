@@ -29,7 +29,7 @@ use agent_runtime_context::plan::{ContextPlan, PlanInputs};
 use agent_runtime_context::planner::ContextPlanner;
 use agent_runtime_context::sizing::RequestSizer;
 use agent_runtime_core::catalog::ResolvedModelProfile;
-use agent_runtime_core::content::Message;
+use agent_runtime_core::content::{Message, Role};
 use agent_runtime_core::manifest::{
     CapabilityResolution, ContextSegmentRecord, ModelResolution, PolicyRevisions, RunManifest,
     SegmentId, SegmentSensitivity, SummaryCoverage,
@@ -224,20 +224,24 @@ impl RunPlanner {
             );
         }
 
+        let current_input = history
+            .iter()
+            .rposition(|message| message.role == Role::User);
         for (index, message) in history.iter().enumerate() {
             // History is optional so compaction has something it is allowed to
-            // work with; the current input is the last message and stays
-            // required, since dropping what the user just asked would make the
-            // turn meaningless.
-            let is_current_input = index + 1 == history.len();
+            // work with; the most recent user message stays required even
+            // after assistant tool calls and tool results have been appended
+            // for the same turn.
+            let is_current_input = Some(index) == current_input;
+            let kind = match message.role {
+                Role::Tool => FragmentKind::ToolResult,
+                Role::User if is_current_input => FragmentKind::UserInput,
+                _ => FragmentKind::History,
+            };
             let revision = RegistryRevision::from_content(message.joined_text());
             let fragment = ContextFragment::new(
                 format!("history:{index}"),
-                if is_current_input {
-                    FragmentKind::UserInput
-                } else {
-                    FragmentKind::History
-                },
+                kind,
                 FragmentSource::History,
                 revision,
                 FragmentContent::Message(message.clone()),
@@ -355,7 +359,8 @@ mod tests {
     use super::*;
     use agent_runtime_context::sizing::CharRatioSizer;
     use agent_runtime_core::catalog::ModelLimits;
-    use agent_runtime_core::content::UserInput;
+    use agent_runtime_core::content::{ContentPart, ToolCall, ToolResultBlock, UserInput};
+    use agent_runtime_core::ids::ToolCallId;
     use agent_runtime_core::provider::{Capabilities, ModelId};
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -493,6 +498,63 @@ mod tests {
         assert_eq!(
             second_plan.preserved_prefix_len, first_prefix,
             "the stable instruction and schema prefix must survive a new user message"
+        );
+    }
+
+    #[test]
+    fn tool_results_are_accounted_separately_from_the_current_user_input() {
+        let call_id = ToolCallId::new("call-1");
+        let history = vec![
+            Message::user("an earlier turn"),
+            Message::text(Role::Assistant, "an earlier answer"),
+            Message::user("now inspect the file"),
+            Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                id: call_id.clone(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            })]),
+            Message::tool_result(ToolResultBlock {
+                call_id,
+                name: "read".into(),
+                content: vec![ContentPart::text("large tool output ".repeat(200))],
+                is_error: false,
+            }),
+        ];
+
+        let planned = planner(16_000)
+            .plan_turn(None, &history, &[])
+            .expect("a tool-follow-up plan");
+        let kind_of = |id: &str| {
+            planned
+                .plan
+                .segments()
+                .iter()
+                .find(|segment| segment.fragment.as_str() == id)
+                .map(|segment| segment.kind)
+                .expect("a history segment")
+        };
+        assert_eq!(kind_of("history:0"), FragmentKind::History);
+        assert_eq!(kind_of("history:2"), FragmentKind::UserInput);
+        assert_eq!(kind_of("history:4"), FragmentKind::ToolResult);
+
+        let user_tokens = planned
+            .plan
+            .segments()
+            .iter()
+            .filter(|segment| segment.kind == FragmentKind::UserInput)
+            .map(|segment| segment.tokens)
+            .sum::<u32>();
+        let tool_tokens = planned
+            .plan
+            .segments()
+            .iter()
+            .filter(|segment| segment.kind == FragmentKind::ToolResult)
+            .map(|segment| segment.tokens)
+            .sum::<u32>();
+        assert!(user_tokens > 0);
+        assert!(
+            tool_tokens > user_tokens,
+            "large tool output should be visible in tool-result accounting"
         );
     }
 }

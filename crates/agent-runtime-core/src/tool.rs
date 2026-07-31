@@ -372,10 +372,20 @@ fn rendered_size(part: &ContentPart) -> usize {
 fn truncate_part(part: ContentPart, limit: usize) -> ContentPart {
     match part {
         ContentPart::Text { text } => ContentPart::text(truncate_text(&text, limit)),
-        ContentPart::Reasoning { text, redacted } => ContentPart::Reasoning {
-            text: truncate_text(&text, limit),
+        ContentPart::Reasoning {
+            text,
             redacted,
-        },
+            signature,
+        } => {
+            let truncated = truncate_text(&text, limit);
+            // A signature only vouches for the exact text it signed.
+            let signature = if truncated == text { signature } else { None };
+            ContentPart::Reasoning {
+                text: truncated,
+                redacted,
+                signature,
+            }
+        }
         ContentPart::Image { .. } | ContentPart::ToolCall(_) | ContentPart::ToolResult(_) => {
             ContentPart::text(truncation_marker(limit))
         }

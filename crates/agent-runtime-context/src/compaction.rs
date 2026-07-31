@@ -7,10 +7,13 @@
 //! at most the low watermark — deliberately lower than the trigger — so a
 //! turn that only adds a little new content does not retrigger compaction,
 //! and rewrite history again, on the very next request. [`SemanticCompactor`]
-//! applies four strategies in a fixed order, stopping as soon as the target
-//! is met: evict expired/optional fragments outright, bound oversized tool
-//! results, elide reproducible detail from older history, then summarize the
-//! oldest remaining eligible history. Every stage only ever touches
+//! applies five strategies in a fixed order, stopping as soon as the target
+//! is met: strip prior-turn reasoning from history messages, evict
+//! expired/optional fragments outright, bound oversized tool results, elide
+//! reproducible detail from older history, then summarize the oldest
+//! remaining eligible history. The reasoning strip removes only zero-value
+//! [`ContentPart::Reasoning`] parts from messages before the last user
+//! message and never drops a fragment; every other stage only ever touches
 //! [`Requirement::Optional`] fragments, so required content is preserved by
 //! construction; [`validate_compacted`] is the defense-in-depth check that
 //! rejects a candidate anyway if that invariant, or tool-call/result
@@ -36,7 +39,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use agent_runtime_core::content::ContentPart;
+use agent_runtime_core::content::{ContentPart, Role};
 use agent_runtime_registry::RegistryRevision;
 
 use crate::budget::{BudgetReport, ContextBudget};
@@ -75,8 +78,8 @@ pub struct SummaryProvenance {
 pub struct CompactionOutcome {
     /// Optional fragments evicted outright (never touched again).
     pub evicted: Vec<FragmentId>,
-    /// Optional tool-result or history fragments whose content was bounded
-    /// or elided in place.
+    /// Fragments whose content was shrunk in place: stripped of prior-turn
+    /// reasoning, or optional tool-result/history content bounded or elided.
     pub bounded: Vec<FragmentId>,
     /// Summaries created this pass, with their provenance.
     pub summarized: Vec<SummaryProvenance>,
@@ -284,7 +287,9 @@ fn truncate_fragment(fragment: &mut ContextFragment, max_chars: usize) {
         FragmentContent::Message(message) => {
             for part in &mut message.content {
                 match part {
-                    ContentPart::Text { text } => truncate_text(text, max_chars),
+                    ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+                        truncate_text(text, max_chars)
+                    }
                     ContentPart::ToolResult(block) => {
                         for inner in &mut block.content {
                             if let ContentPart::Text { text } = inner {
@@ -297,6 +302,42 @@ fn truncate_fragment(fragment: &mut ContextFragment, max_chars: usize) {
             }
         }
         FragmentContent::Tool(_) => {}
+    }
+}
+
+/// Stage 0: strips [`ContentPart::Reasoning`] parts from message fragments
+/// that precede the last `Role::User` message fragment — prior-turn
+/// reasoning, which has zero value to the model once its turn is over.
+/// Reasoning in messages at or after the last user message is never
+/// touched: OpenAI-compatible thinking models require the current turn's
+/// reasoning to be sent back during that turn's tool-call loop. Only the
+/// reasoning parts are removed; the fragment itself always survives, so a
+/// required fragment or a tool-call/result pairing cannot be lost here.
+fn stage_strip_prior_reasoning(
+    fragments: &mut [ContextFragment],
+    size_of: &dyn Fn(&ContextFragment) -> u32,
+    target: u32,
+    outcome: &mut CompactionOutcome,
+) {
+    let last_user = fragments.iter().rposition(
+        |f| matches!(&f.content, FragmentContent::Message(message) if message.role == Role::User),
+    );
+    let Some(last_user) = last_user else { return };
+    for index in 0..last_user {
+        if total_tokens_with(fragments, size_of) <= target {
+            return;
+        }
+        let fragment = &mut fragments[index];
+        let FragmentContent::Message(message) = &mut fragment.content else {
+            continue;
+        };
+        let parts_before = message.content.len();
+        message
+            .content
+            .retain(|part| !matches!(part, ContentPart::Reasoning { .. }));
+        if message.content.len() < parts_before {
+            outcome.bounded.push(fragment.id.clone());
+        }
     }
 }
 
@@ -508,8 +549,8 @@ fn stage_summarize(
     }
 }
 
-/// Runs the four compaction stages, in order, down to `target`, then
-/// validates the result via [`validate_compacted`].
+/// Runs the compaction stages (0 through 4), in order, down to `target`,
+/// then validates the result via [`validate_compacted`].
 fn compact_pipeline(
     fragments: &[ContextFragment],
     size_of: &dyn Fn(&ContextFragment) -> u32,
@@ -519,6 +560,7 @@ fn compact_pipeline(
     let mut candidate = fragments.to_vec();
     let mut outcome = CompactionOutcome::default();
 
+    stage_strip_prior_reasoning(&mut candidate, size_of, target, &mut outcome);
     stage_evict(&mut candidate, size_of, target, &mut outcome);
     stage_bound(
         &mut candidate,
@@ -546,10 +588,11 @@ fn compact_pipeline(
     Ok((candidate, outcome))
 }
 
-/// The policy-driven [`Compactor`]: evicts expired/optional fragments,
-/// bounds oversized tool results, elides reproducible detail, then
-/// summarizes older history — in that order — stopping as soon as the
-/// target is met. See the module documentation for the full contract.
+/// The policy-driven [`Compactor`]: strips prior-turn reasoning, evicts
+/// expired/optional fragments, bounds oversized tool results, elides
+/// reproducible detail, then summarizes older history — in that order —
+/// stopping as soon as the target is met. See the module documentation for
+/// the full contract.
 #[derive(Debug)]
 pub struct SemanticCompactor {
     policy: CompactionPolicy,
@@ -698,6 +741,26 @@ mod tests {
         )
         .optional()
         .with_priority(priority)
+    }
+
+    fn message_history_fragment(id: &str, priority: i32, message: Message) -> ContextFragment {
+        ContextFragment::new(
+            id,
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new(id),
+            FragmentContent::Message(message),
+        )
+        .optional()
+        .with_priority(priority)
+    }
+
+    fn reasoning_part(text: &str) -> ContentPart {
+        ContentPart::Reasoning {
+            text: text.to_owned(),
+            redacted: false,
+            signature: None,
+        }
     }
 
     fn text_for_token_count(tokens: u32) -> String {
@@ -977,6 +1040,163 @@ mod tests {
         assert_eq!(outcome.bounded, vec![FragmentId::new("result")]);
         assert!(outcome.summarized.is_empty());
         assert!(total_input_tokens(&result, &sizer) <= 100);
+        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+    }
+
+    #[test]
+    fn prior_turn_reasoning_is_stripped_first_and_the_rest_of_the_message_survives() {
+        let sizer = CharRatioSizer::default();
+        let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 50);
+        let compactor = SemanticCompactor::new(policy);
+
+        let old_assistant = message_history_fragment(
+            "old-assistant",
+            1,
+            Message::assistant(vec![
+                reasoning_part(&"r".repeat(2_000)),
+                ContentPart::text("the old answer"),
+            ]),
+        );
+        let user = message_history_fragment("user-msg", 2, Message::user("next question"));
+
+        let fragments = vec![old_assistant, user];
+        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+
+        assert_eq!(outcome.bounded, vec![FragmentId::new("old-assistant")]);
+        assert!(outcome.evicted.is_empty());
+        assert!(outcome.summarized.is_empty());
+
+        let stripped = result
+            .iter()
+            .find(|f| f.id == FragmentId::new("old-assistant"))
+            .expect("the stripped fragment itself must survive");
+        let FragmentContent::Message(message) = &stripped.content else {
+            panic!("the stripped fragment must still be a message");
+        };
+        assert_eq!(message.content, vec![ContentPart::text("the old answer")]);
+        assert!(total_input_tokens(&result, &sizer) <= 50);
+        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+    }
+
+    #[test]
+    fn reasoning_after_the_last_user_message_survives_compaction() {
+        let sizer = CharRatioSizer::default();
+        let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 50);
+        let compactor = SemanticCompactor::new(policy);
+
+        let current_reasoning = reasoning_part("current-turn thinking");
+        let old_assistant = message_history_fragment(
+            "old-assistant",
+            1,
+            Message::assistant(vec![
+                reasoning_part(&"r".repeat(2_000)),
+                ContentPart::text("old answer"),
+            ]),
+        );
+        let user = message_history_fragment("user-msg", 2, Message::user("next question"));
+        let current_assistant = message_history_fragment(
+            "current-assistant",
+            3,
+            Message::assistant(vec![
+                current_reasoning.clone(),
+                ContentPart::text("working on it"),
+            ]),
+        );
+
+        let fragments = vec![old_assistant, user, current_assistant];
+        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+
+        assert_eq!(outcome.bounded, vec![FragmentId::new("old-assistant")]);
+        let current = result
+            .iter()
+            .find(|f| f.id == FragmentId::new("current-assistant"))
+            .expect("the current-turn fragment must survive");
+        let FragmentContent::Message(message) = &current.content else {
+            panic!("the current-turn fragment must still be a message");
+        };
+        assert!(message.content.contains(&current_reasoning));
+        assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
+    }
+
+    #[test]
+    fn the_reasoning_strip_stage_is_a_no_op_when_already_at_or_under_target() {
+        let old_assistant = message_history_fragment(
+            "old-assistant",
+            1,
+            Message::assistant(vec![
+                reasoning_part("prior thinking"),
+                ContentPart::text("old answer"),
+            ]),
+        );
+        let user = message_history_fragment("user-msg", 2, Message::user("next question"));
+
+        let mut fragments = vec![old_assistant, user];
+        let before = fragments.clone();
+        let mut outcome = CompactionOutcome::default();
+        stage_strip_prior_reasoning(
+            &mut fragments,
+            &fallback_token_estimate,
+            u32::MAX,
+            &mut outcome,
+        );
+
+        assert_eq!(fragments, before);
+        assert!(outcome.is_noop());
+    }
+
+    #[test]
+    fn stripping_reasoning_from_a_paired_tool_call_message_keeps_the_pairing_valid() {
+        let sizer = CharRatioSizer::default();
+        let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 100, 50);
+        let compactor = SemanticCompactor::new(policy);
+
+        let call_id = ToolCallId::new("call-1");
+        let tool_call = ContentPart::ToolCall(ToolCall {
+            id: call_id.clone(),
+            name: "search".into(),
+            arguments: serde_json::json!({}),
+        });
+        let call_fragment = ContextFragment::new(
+            "call",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("h1"),
+            FragmentContent::Message(Message::assistant(vec![
+                reasoning_part(&"r".repeat(2_000)),
+                tool_call.clone(),
+            ])),
+        )
+        .paired_with(call_id.clone());
+
+        let result_fragment = ContextFragment::new(
+            "result",
+            FragmentKind::ToolResult,
+            FragmentSource::Tool,
+            RegistryRevision::new("r1"),
+            FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                call_id: call_id.clone(),
+                name: "search".into(),
+                content: vec![ContentPart::text("found it")],
+                is_error: false,
+            })),
+        )
+        .optional()
+        .paired_with(call_id);
+
+        let user = message_history_fragment("user-msg", 2, Message::user("next question"));
+
+        let fragments = vec![call_fragment, result_fragment, user];
+        let (result, outcome) = compactor.maybe_compact(&fragments, &sizer).unwrap();
+
+        assert_eq!(outcome.bounded, vec![FragmentId::new("call")]);
+        let call = result
+            .iter()
+            .find(|f| f.id == FragmentId::new("call"))
+            .expect("the paired call fragment must survive");
+        let FragmentContent::Message(message) = &call.content else {
+            panic!("the paired call fragment must still be a message");
+        };
+        assert_eq!(message.content, vec![tool_call]);
         assert!(validate_compacted(&fragments, &result, &outcome).is_ok());
     }
 }

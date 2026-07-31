@@ -39,6 +39,11 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::LimitReached { .. } => "limit_reached",
         RuntimeEvent::Error { .. } => "error",
         RuntimeEvent::TurnCompleted { .. } => "turn_completed",
+        RuntimeEvent::ChildSpawned { .. } => "child_spawned",
+        RuntimeEvent::ChildProgress { .. } => "child_progress",
+        RuntimeEvent::ChildCompleted { .. } => "child_completed",
+        RuntimeEvent::ChildStopped { .. } => "child_stopped",
+        RuntimeEvent::ChildFailed { .. } => "child_failed",
         RuntimeEvent::SessionShutdown => "session_shutdown",
     }
 }
@@ -115,6 +120,7 @@ fn summary(payload: &RuntimeEvent) -> String {
             cache_plan,
             segment_count,
             totals,
+            input_tokens,
             input_budget_tokens,
             reserved_tokens,
             confidence,
@@ -125,7 +131,7 @@ fn summary(payload: &RuntimeEvent) -> String {
                 .collect::<Vec<_>>()
                 .join(",");
             format!(
-                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}",
+                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_tokens={input_tokens} input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}",
                 totals_str
             )
         }
@@ -201,7 +207,41 @@ fn summary(payload: &RuntimeEvent) -> String {
         } => format!("provider_attempt_finished finish={finish:?} retryable={retryable}"),
         RuntimeEvent::LimitReached { limit } => format!("limit_reached {limit:?}"),
         RuntimeEvent::Error { error } => format!("error {error}"),
-        RuntimeEvent::TurnCompleted { finish } => format!("turn_completed {finish:?}"),
+        RuntimeEvent::TurnCompleted {
+            finish,
+            visible_output,
+        } => {
+            if *visible_output {
+                format!("turn_completed {finish:?}")
+            } else {
+                format!("turn_completed {finish:?} visible_output=false")
+            }
+        }
+        RuntimeEvent::ChildSpawned {
+            child,
+            workspace,
+            max_turns,
+            max_tokens,
+            deadline_ms,
+        } => {
+            let tokens = max_tokens.map_or("none".to_string(), |t| t.to_string());
+            let deadline = deadline_ms.map_or("none".to_string(), |d| d.to_string());
+            format!(
+                "child_spawned child={child} workspace={workspace:?} max_turns={max_turns} max_tokens={tokens} deadline_ms={deadline}"
+            )
+        }
+        RuntimeEvent::ChildProgress { child, phase } => {
+            format!("child_progress child={child} phase={phase:?}")
+        }
+        RuntimeEvent::ChildCompleted { child, result } => {
+            format!("child_completed child={child} {}", clip(result, 200))
+        }
+        RuntimeEvent::ChildStopped { child, reason } => {
+            format!("child_stopped child={child} reason={reason:?}")
+        }
+        RuntimeEvent::ChildFailed { child, error } => {
+            format!("child_failed child={child} {error}")
+        }
         RuntimeEvent::SessionStarted
         | RuntimeEvent::TurnStarted
         | RuntimeEvent::SessionShutdown => event_type(payload).to_string(),
@@ -342,6 +382,7 @@ mod tests {
                 cache_plan: Fingerprint::of("cache"),
                 segment_count: 3,
                 totals: BTreeMap::from([(SegmentKind::new("history"), 42)]),
+                input_tokens: 420,
                 input_budget_tokens: 8000,
                 reserved_tokens: 512,
                 confidence: EstimationConfidence::Estimated,
@@ -351,6 +392,7 @@ mod tests {
         assert_eq!(event_type(&env.payload), "context_planned");
         assert!(line.contains("segments=3"));
         assert!(line.contains("history=42"));
+        assert!(line.contains("input_tokens=420"));
         assert!(line.contains("input_budget=8000"));
         assert!(line.contains("reserved=512"));
     }

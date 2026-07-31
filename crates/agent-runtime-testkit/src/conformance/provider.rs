@@ -63,6 +63,29 @@ pub async fn assert_normalized_text_stream(provider: &dyn Provider, model: &Mode
     }
 }
 
+/// Asserts the provider normalizes streamed reasoning — at least one
+/// non-empty `ReasoningDelta` — and still terminates with a non-error
+/// `Finish`. `request` lets callers exercise the continuation shape (an
+/// assistant history message carrying reasoning back) as well as a plain
+/// prompt; the provider must accept either without error.
+pub async fn assert_normalized_reasoning_stream(provider: &dyn Provider, request: ProviderRequest) {
+    let events = collect(provider, request).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ProviderStreamEvent::ReasoningDelta { text, .. } if !text.is_empty()
+        )),
+        "expected at least one non-empty ReasoningDelta"
+    );
+    match events.last() {
+        Some(ProviderStreamEvent::Finish { reason }) => {
+            assert_ne!(*reason, FinishReason::Error, "must not finish in error");
+        }
+        other => panic!("expected a terminal Finish, got {other:?}"),
+    }
+}
+
 /// Asserts a blocking provider stops promptly when its call is cancelled and
 /// yields a terminal error rather than hanging.
 pub async fn assert_cancellation_stops_stream(provider: &dyn Provider, model: &ModelId) {

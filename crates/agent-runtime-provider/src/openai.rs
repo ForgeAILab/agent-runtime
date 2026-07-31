@@ -70,6 +70,11 @@ impl<T: HttpTransport> OpenAiProvider<T> {
         Self { transport, config }
     }
 
+    /// The underlying transport, for tests that inspect recorded requests.
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
     fn build_payload(&self, request: &ProviderRequest) -> Value {
         let mut messages = Vec::new();
         for msg in &request.messages {
@@ -198,6 +203,28 @@ fn reasoning_effort(cfg: &ReasoningConfig) -> String {
     }
 }
 
+/// Joins a message's non-redacted [`ContentPart::Reasoning`] texts with `\n`.
+///
+/// Redacted reasoning is policy-hidden and must never reach the wire, so
+/// those parts are skipped entirely rather than serialized in any form.
+fn joined_reasoning(msg: &Message) -> String {
+    let mut out = String::new();
+    for part in &msg.content {
+        if let ContentPart::Reasoning {
+            text,
+            redacted: false,
+            ..
+        } = part
+        {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    out
+}
+
 /// Renders one canonical message into one or more OpenAI wire messages.
 fn to_openai_messages(msg: &Message) -> Vec<Value> {
     match msg.role {
@@ -205,6 +232,14 @@ fn to_openai_messages(msg: &Message) -> Vec<Value> {
         Role::User => vec![json!({"role": "user", "content": msg.joined_text()})],
         Role::Assistant => {
             let mut wire = json!({"role": "assistant", "content": msg.joined_text()});
+            // Z.AI-style thinking endpoints require prior reasoning echoed
+            // back on tool-call continuations as `reasoning_content`.
+            let reasoning = joined_reasoning(msg);
+            if !reasoning.is_empty() {
+                wire.as_object_mut()
+                    .unwrap()
+                    .insert("reasoning_content".into(), Value::String(reasoning));
+            }
             let tool_calls: Vec<Value> = msg
                 .tool_calls()
                 .map(|tc| {
@@ -921,6 +956,65 @@ mod tests {
                 }
             }]
         ));
+    }
+
+    #[test]
+    fn assistant_reasoning_is_echoed_as_reasoning_content() {
+        use agent_runtime_core::content::ToolCall;
+        use agent_runtime_core::ids::ToolCallId;
+
+        let msg = Message::assistant(vec![
+            ContentPart::Reasoning {
+                text: "step one".into(),
+                redacted: false,
+                signature: None,
+            },
+            ContentPart::Reasoning {
+                text: "step two".into(),
+                redacted: false,
+                signature: None,
+            },
+            ContentPart::text("calling a tool"),
+            ContentPart::ToolCall(ToolCall {
+                id: ToolCallId::new("c1"),
+                name: "lookup".into(),
+                arguments: json!({"q": 1}),
+            }),
+        ]);
+        let wire = to_openai_messages(&msg);
+
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["reasoning_content"], "step one\nstep two");
+        assert_eq!(wire[0]["content"], "calling a tool");
+        assert_eq!(wire[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn redacted_reasoning_never_reaches_the_wire() {
+        let msg = Message::assistant(vec![
+            ContentPart::Reasoning {
+                text: "hidden".into(),
+                redacted: true,
+                signature: None,
+            },
+            ContentPart::text("visible"),
+        ]);
+        let wire = to_openai_messages(&msg);
+
+        assert_eq!(wire.len(), 1);
+        assert!(wire[0].get("reasoning_content").is_none());
+        assert!(!wire[0].to_string().contains("hidden"));
+    }
+
+    #[test]
+    fn assistant_without_reasoning_has_no_reasoning_content_key() {
+        let msg = Message::assistant(vec![ContentPart::text("plain answer")]);
+        let wire = to_openai_messages(&msg);
+
+        assert_eq!(wire.len(), 1);
+        assert!(wire[0].get("reasoning_content").is_none());
+        assert_eq!(wire[0]["content"], "plain answer");
     }
 
     #[tokio::test]

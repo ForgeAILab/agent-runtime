@@ -92,6 +92,7 @@
 
 pub mod agent;
 pub mod capability;
+pub mod delegation;
 pub mod hub;
 pub mod ids;
 pub mod runtime;
@@ -156,12 +157,17 @@ pub mod prelude {
 
     // -- provider adapters and the embeddable runtime facade -----------------
     pub use crate::agent::config::{DowngradePolicy, LoopConfig};
+    pub use crate::delegation::{
+        CapacityPolicy, ChildRuntimeFactory, ChildState, ChildStatus, DELEGATION_PERMISSION,
+        DelegationCapacity, DelegationConfig, DelegationCoordinator, DelegationLimits,
+        SpawnOutcome,
+    };
     pub use crate::provider::fake::FakeProvider;
     pub use crate::provider::openai::{OpenAiConfig, OpenAiProvider};
     pub use crate::provider::retry::RetryPolicy;
     pub use crate::provider::transport::{ByteStream, HttpRequest, HttpTransport};
     pub use crate::runtime::{
-        Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle, StartSession,
+        InjectedContent, Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle, StartSession,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};
