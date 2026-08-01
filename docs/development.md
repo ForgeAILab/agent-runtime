@@ -119,6 +119,6 @@ cargo +1.86.0 build \
   -p agent-runtime --all-features
 ```
 
-The current event schema is v8. Golden fixtures cover the compatible v5, v6,
-v7, and v8 forms; older unattributed provider-output deltas are rejected
+The current event schema is v9. Golden fixtures cover the compatible v5, v6,
+v7, v8, and v9 forms; older unattributed provider-output deltas are rejected
 deliberately.

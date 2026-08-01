@@ -11,10 +11,17 @@ use agent_runtime_core::ids::{InteractionRequestId, SessionId, TurnId};
 use agent_runtime_core::interaction::{InteractionDisposition, InteractionRequest};
 use agent_runtime_core::store::{TurnManifest, VersionedSessionState};
 use agent_runtime_core::usage::UsageLedger;
+use agent_runtime_registry::RegistryRevision;
 
 use crate::agent::planning::{PREVIOUS_CACHE_STATE_NAMESPACE, RunPlanner};
 use crate::capability::ActivationEpoch;
 use crate::harness::{ACTIVATION_STATE_NAMESPACE, SessionAbilities};
+
+/// Protected extension namespace for one child interaction returned to its
+/// parent. Ordinary redacted snapshots may omit it; exact checkpoints retain
+/// it so a parent restart can recover the same request without provider work.
+pub(crate) const RETURNED_INTERACTION_STATE_NAMESPACE: &str = "agent-runtime.returned-interaction";
+const RETURNED_INTERACTION_STATE_REVISION: &str = "returned-interaction-1";
 
 /// The serving turn and the first canonical history message it owns.
 ///
@@ -59,19 +66,20 @@ impl SessionExecutionContext {
     pub(crate) fn new(
         planner: RunPlanner,
         interaction_disposition: InteractionDisposition,
-        extension_state: BTreeMap<String, VersionedSessionState>,
+        mut extension_state: BTreeMap<String, VersionedSessionState>,
         abilities: Option<SessionAbilities>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RuntimeError> {
+        let returned_interaction = take_returned_interaction_state(&mut extension_state)?;
+        Ok(Self {
             planner,
             abilities,
             extension_state: Mutex::new(extension_state),
             current_turn: Mutex::new(None),
             completed_turns: Mutex::new(BTreeMap::new()),
             interaction_disposition,
-            returned_interaction: Mutex::new(None),
+            returned_interaction: Mutex::new(returned_interaction),
             artifacts: Mutex::new(BTreeMap::new()),
-        }
+        })
     }
 
     pub(crate) fn begin_turn(&self, id: TurnId, history_start: usize) {
@@ -129,6 +137,16 @@ impl SessionExecutionContext {
         }
         if let Some(cache) = self.planner.persisted_previous_cache() {
             state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
+        }
+        if let Some(request) = self.returned_interaction_value() {
+            state.insert(
+                RETURNED_INTERACTION_STATE_NAMESPACE.to_owned(),
+                VersionedSessionState::new(
+                    RegistryRevision::new(RETURNED_INTERACTION_STATE_REVISION),
+                    serde_json::to_value(request)
+                        .expect("validated interaction request must serialize"),
+                ),
+            );
         }
         state
     }
@@ -223,6 +241,38 @@ impl SessionExecutionContext {
             .map(|artifacts| artifacts.values().cloned().collect())
             .unwrap_or_default()
     }
+}
+
+/// Reads the protected returned-interaction component without mutating the
+/// supplied snapshot. Delegation recovery uses this before constructing a
+/// child runtime.
+pub(crate) fn returned_interaction_from_state(
+    extension_state: &BTreeMap<String, VersionedSessionState>,
+) -> Result<Option<InteractionRequest>, RuntimeError> {
+    let mut copy = extension_state.clone();
+    take_returned_interaction_state(&mut copy)
+}
+
+fn take_returned_interaction_state(
+    extension_state: &mut BTreeMap<String, VersionedSessionState>,
+) -> Result<Option<InteractionRequest>, RuntimeError> {
+    let Some(state) = extension_state.remove(RETURNED_INTERACTION_STATE_NAMESPACE) else {
+        return Ok(None);
+    };
+    let expected = RegistryRevision::new(RETURNED_INTERACTION_STATE_REVISION);
+    if state.revision != expected {
+        return Err(RuntimeError::conflict(format!(
+            "returned interaction state revision `{}` is incompatible with `{expected}`",
+            state.revision
+        )));
+    }
+    let request: InteractionRequest = serde_json::from_value(state.value).map_err(|error| {
+        RuntimeError::conflict(format!(
+            "returned interaction state could not be restored: {error}"
+        ))
+    })?;
+    request.validate()?;
+    Ok(Some(request))
 }
 
 /// The canonical mutable state of one session.

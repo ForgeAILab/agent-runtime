@@ -33,6 +33,14 @@ pub enum CheckpointRecoveryPolicy {
     /// non-interactive host inspect/hand off a pending question without racing
     /// a broker; it does not change live interaction behavior.
     DeferPendingInteraction,
+    /// Load the compatible snapshot and exact checkpoint but leave every
+    /// non-terminal checkpoint dormant.
+    ///
+    /// The delegation coordinator uses this policy while rebinding a durable
+    /// child so merely listing or inspecting it cannot execute provider/tool
+    /// work. An explicit child `resume` later continues the returned exact
+    /// checkpoint through the ordinary turn machine.
+    Defer,
 }
 
 fn checkpoint_recovery_is_resume(policy: &CheckpointRecoveryPolicy) -> bool {

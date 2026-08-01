@@ -553,8 +553,7 @@ impl RuntimeBuilder {
             .retain(|descriptor| retained.contains(descriptor.id()));
     }
 
-    /// Removes any session store so the built runtime's sessions are
-    /// ephemeral — a delegated child must never persist or resume.
+    /// Removes session/checkpoint stores for an explicitly ephemeral child.
     pub(crate) fn clear_session_store(&mut self) {
         self.session_store = None;
         self.checkpoint_store = None;

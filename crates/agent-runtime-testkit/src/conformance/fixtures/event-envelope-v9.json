@@ -1,0 +1,51 @@
+[
+  {
+    "schema_version": 9,
+    "seq": 0,
+    "id": "evt-v9-1",
+    "session": "parent-session",
+    "timestamp": 100,
+    "payload": {
+      "event": "child_progress",
+      "child": "child-1",
+      "phase": {
+        "phase": "recovered",
+        "child_session": "child-session-1",
+        "state": "idle",
+        "resumable": false
+      }
+    }
+  },
+  {
+    "schema_version": 9,
+    "seq": 1,
+    "id": "evt-v9-2",
+    "session": "parent-session",
+    "timestamp": 101,
+    "payload": {
+      "event": "child_progress",
+      "child": "child-2",
+      "phase": {
+        "phase": "interrupted",
+        "child_session": "child-session-2",
+        "resumable": true
+      }
+    }
+  },
+  {
+    "schema_version": 9,
+    "seq": 2,
+    "id": "evt-v9-3",
+    "session": "parent-session",
+    "turn": "turn-4",
+    "timestamp": 102,
+    "payload": {
+      "event": "child_progress",
+      "child": "child-2",
+      "phase": {
+        "phase": "resume_started",
+        "child_session": "child-session-2"
+      }
+    }
+  }
+]

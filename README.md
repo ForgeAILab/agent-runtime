@@ -65,6 +65,18 @@ and protected `CheckpointStore` implementations. The ordinary store receives
 completed session state; the protected store records exact versioned
 mid-turn states and pending interactions.
 
+Delegated children become durable when the host's `ChildRuntimeFactory`
+provides both stores. The parent snapshot then carries a bounded,
+redaction-safe child catalog while each child keeps its canonical history and
+exact checkpoint under a stable child session ID. Restoring a parent only
+rebinds metadata. After constructing its coordinator, a durable host calls
+`coordinator.recover().await` to reconcile the authoritative protected child
+checkpoints and any returned interactions without constructing providers.
+`follow_up` starts a new turn on an idle child, while `resume` explicitly
+continues one safe interrupted checkpoint. Neither path silently spawns a
+replacement, and a checkpoint at indeterminate provider I/O is deliberately
+non-resumable.
+
 Live capability routing is opt-in through
 `RuntimeBuilder::live_ability_routing()`. The runtime always retains the
 protected, authority-free `registry.search` bootstrap, derives a scoped view
@@ -100,7 +112,9 @@ This runtime seeds its reusable provider, agent-loop, and tool mechanisms from
 the Nyx project, with all product policy removed. The donor revision, path
 mappings, and retained notices are recorded in [`PROVENANCE.md`](PROVENANCE.md).
 
-The current stabilization specification lives under
-[`docs/spec/changes/stabilize-session-harness-pipeline-2026-07-31/`](docs/spec/changes/stabilize-session-harness-pipeline-2026-07-31/).
+The current stabilization and durable-child specifications live under
+[`docs/spec/changes/stabilize-session-harness-pipeline-2026-07-31/`](docs/spec/changes/stabilize-session-harness-pipeline-2026-07-31/)
+and
+[`docs/spec/changes/add-resumable-child-sessions-2026-07-31/`](docs/spec/changes/add-resumable-child-sessions-2026-07-31/).
 Adopting a breaking runtime revision in Nyx, Smith, or Open Forge requires a
 separate coordinated consumer change.

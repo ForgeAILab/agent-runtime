@@ -14,9 +14,12 @@
 //!   tool invocation uses, fail-closed when no authorizer covers them.
 //! - Attributed lifecycle events are emitted on the parent session's stream,
 //!   and a final child result is never dropped by progress coalescing.
-//! - Concurrency caps are enforced with reject-by-default capacity results;
-//!   children stop with their parent or the process and never restart on
-//!   resume.
+//! - Concurrency caps are enforced with reject-by-default capacity results.
+//!   Live child execution stops with its parent/process; durable child
+//!   sessions remain dormant and require explicit follow-up or resume.
+//! - A durable host calls [`DelegationCoordinator::recover`] after rebuilding
+//!   the parent. That provider-free pass reconciles exact checkpoint metadata
+//!   and returned interactions before delegation commands are accepted.
 //!
 //! The delegation surface is host-facing API, not a built-in tool: hosts
 //! register their own delegation tool (name, prompt text, schema) and call
@@ -36,11 +39,12 @@ use agent_runtime_core::approval::{
 };
 use agent_runtime_core::artifact::{ArtifactRef, ArtifactStore, ArtifactTransfer};
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
-use agent_runtime_core::clock::Deadline;
+use agent_runtime_core::checkpoint::{CheckpointStore, CheckpointWatermark, TurnState};
+use agent_runtime_core::clock::{Deadline, Timestamp};
 use agent_runtime_core::content::UserInput;
 use agent_runtime_core::delegation::{ChildSpec, ToolViewScope, WorkspacePolicy};
 use agent_runtime_core::error::{ErrorKind, RuntimeError};
-use agent_runtime_core::event::{ChildPhase, RuntimeEvent, TurnFinish};
+use agent_runtime_core::event::{ChildPhase, ChildRecoveryState, RuntimeEvent, TurnFinish};
 use agent_runtime_core::grant::AuthorizationDecision;
 use agent_runtime_core::ids::{ChildId, SessionId, ToolCallId};
 use agent_runtime_core::ids::{InteractionRequestId, QuestionId, TurnId};
@@ -48,13 +52,16 @@ use agent_runtime_core::interaction::{InteractionRequest, InteractionSensitivity
 use agent_runtime_core::security::{
     AuthorizationRequest, SecurityAction, SecurityContext, SecurityEvidence,
 };
+use agent_runtime_core::store::{SessionStore, VersionedSessionState};
 use agent_runtime_core::tool::{PreparedToolCall, ToolCallDisplay, ToolEffects};
 use agent_runtime_core::usage::CounterKind;
-use agent_runtime_registry::{Fingerprint, Permission, TrustClass};
+use agent_runtime_registry::{Fingerprint, Permission, RegistryRevision, TrustClass};
 
 use crate::runtime::builder::RuntimeBuilder;
+use crate::runtime::command::CheckpointRecoveryPolicy;
 use crate::runtime::engine::Runtime;
 use crate::runtime::session::{SessionHandle, TurnHandle};
+use crate::runtime::state::returned_interaction_from_state;
 use crate::tool::SecurityConfig;
 
 /// The host-defined permission delegation operations request from the
@@ -62,12 +69,16 @@ use crate::tool::SecurityConfig;
 /// with an authoritative check cannot delegate.
 pub const DELEGATION_PERMISSION: &str = "agent.delegate";
 
+/// Parent session extension-state namespace containing durable child records.
+pub const CHILD_CATALOG_NAMESPACE: &str = "agent-runtime.delegation.children";
+const CHILD_CATALOG_REVISION: &str = "resumable-child-catalog-1";
+const CHILD_CATALOG_SCHEMA_VERSION: u32 = 1;
+
 /// Builds the runtime a child session runs on.
 ///
 /// The host owns provider/model routing, tool registration, workspace
 /// adapters, and policy composition — the coordinator then applies the
-/// spec's tool-view scope, strips delegation-management tools, and clears
-/// any session store so children stay ephemeral.
+/// spec's tool-view scope and strips delegation-management tools.
 pub trait ChildRuntimeFactory: Send + Sync + fmt::Debug {
     /// A builder for the child described by `spec`.
     fn child_builder(&self, spec: &ChildSpec) -> Result<RuntimeBuilder, RuntimeError>;
@@ -80,6 +91,42 @@ pub trait ChildRuntimeFactory: Send + Sync + fmt::Debug {
     fn artifact_store(&self) -> Option<Arc<dyn ArtifactStore>> {
         None
     }
+
+    /// Redacted canonical child snapshots, when child continuity is durable.
+    fn session_store(&self) -> Option<Arc<dyn SessionStore>> {
+        None
+    }
+
+    /// Protected exact child checkpoints, when interrupted turns can resume.
+    fn checkpoint_store(&self) -> Option<Arc<dyn CheckpointStore>> {
+        None
+    }
+
+    /// Stable fingerprint of the host policy that reconstructs `spec`.
+    ///
+    /// Hosts should include provider/model, workspace identity, tool upper
+    /// bounds, trust/profile revisions, and any other value whose change could
+    /// widen or materially alter a recovered child. The default is the
+    /// serialized durable child specification.
+    fn policy_fingerprint(&self, spec: &DurableChildSpec) -> Result<Fingerprint, RuntimeError> {
+        let encoded = serde_json::to_vec(spec).map_err(|error| {
+            RuntimeError::new(
+                ErrorKind::Serialization,
+                format!("child policy could not be fingerprinted: {error}"),
+            )
+        })?;
+        Ok(Fingerprint::of_fields([encoded.as_slice()]))
+    }
+
+    /// Whether this composition can restore both canonical and exact child
+    /// state. Hosts missing either store remain explicitly ephemeral.
+    fn durability(&self) -> ChildDurability {
+        if self.session_store().is_some() && self.checkpoint_store().is_some() {
+            ChildDurability::Durable
+        } else {
+            ChildDurability::Ephemeral
+        }
+    }
 }
 
 /// Deterministic caps on delegated children.
@@ -88,6 +135,10 @@ pub struct DelegationLimits {
     /// The maximum children of this parent running (or idle-but-alive) at
     /// once.
     pub max_running_children: usize,
+    /// Maximum durable child records retained for one parent.
+    pub max_retained_children: usize,
+    /// Optional retention age for idle/interrupted durable children.
+    pub retention_ms: Option<u64>,
 }
 
 /// What happens when a spawn arrives at capacity.
@@ -167,17 +218,72 @@ impl Default for DelegationLimits {
     fn default() -> Self {
         Self {
             max_running_children: 4,
+            max_retained_children: 64,
+            retention_ms: None,
+        }
+    }
+}
+
+/// Whether one child can survive loss of its owning process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildDurability {
+    /// The child exists only while its current coordinator/process is alive.
+    Ephemeral,
+    /// Canonical state and exact checkpoints can be rebound after restart.
+    Durable,
+}
+
+/// The immutable child composition needed to rebuild an existing session.
+///
+/// The initial task is deliberately absent: it already belongs to canonical
+/// child history and must not be duplicated into the parent catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableChildSpec {
+    /// Provider/model selection.
+    pub model: agent_runtime_core::delegation::ChildModelSelection,
+    /// Cumulative limits.
+    pub limits: agent_runtime_core::delegation::ChildLimits,
+    /// Narrowed tool view.
+    pub tools: ToolViewScope,
+    /// Declared workspace posture.
+    pub workspace: WorkspacePolicy,
+}
+
+impl DurableChildSpec {
+    fn from_spawn(spec: &ChildSpec) -> Self {
+        Self {
+            model: spec.model.clone(),
+            limits: spec.limits,
+            tools: spec.tools.clone(),
+            workspace: spec.workspace.clone(),
+        }
+    }
+
+    fn rebuild_spec(&self) -> ChildSpec {
+        ChildSpec {
+            task: UserInput::text("resume existing child session"),
+            model: self.model.clone(),
+            limits: self.limits,
+            tools: self.tools.clone(),
+            workspace: self.workspace.clone(),
         }
     }
 }
 
 /// The lifecycle state of one child.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum ChildState {
     /// Executing a task.
     Running,
     /// Completed at least one task and available for follow-ups.
     Idle,
+    /// Its process-owned execution ended while durable state remained.
+    Interrupted {
+        /// Whether a compatible exact checkpoint was recorded.
+        resumable: bool,
+    },
     /// Stopped (terminal).
     Stopped {
         /// Why.
@@ -185,22 +291,38 @@ pub enum ChildState {
     },
     /// Failed (terminal).
     Failed,
+    /// Retention or absolute lifetime expired.
+    Expired,
 }
 
 impl ChildState {
     /// Whether the child can do no further work.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ChildState::Stopped { .. } | ChildState::Failed)
+        matches!(
+            self,
+            ChildState::Stopped { .. } | ChildState::Failed | ChildState::Expired
+        )
     }
 }
 
+fn checkpoint_can_resume(state: &TurnState) -> bool {
+    !matches!(
+        state,
+        TurnState::CallingModel { .. } | TurnState::Terminal { .. }
+    )
+}
+
 /// A structured snapshot of one child.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChildStatus {
     /// The stable child id.
     pub child: ChildId,
     /// The parent session.
     pub parent: SessionId,
+    /// The stable runtime session that owns this child's conversation.
+    pub session: SessionId,
+    /// Whether this child can be rebound after process loss.
+    pub durability: ChildDurability,
     /// The lifecycle state.
     pub state: ChildState,
     /// The declared workspace posture.
@@ -209,11 +331,83 @@ pub struct ChildStatus {
     pub turns_used: u32,
     /// The task cap.
     pub max_turns: u32,
+    /// Cumulative provider tokens attributed to this child.
+    pub tokens_used: u64,
     /// The latest completed task's final visible answer, if any.
     pub last_result: Option<String>,
     /// Parent-owned artifact references returned with the latest completed
     /// task.
     pub last_artifacts: Vec<ArtifactRef>,
+    /// Last durable lifecycle update.
+    pub updated_at: Timestamp,
+    /// Bounded compatibility reason when recovery cannot proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incompatibility: Option<String>,
+}
+
+impl ChildStatus {
+    /// Whether an explicit exact-turn resume is currently available.
+    pub fn resumable(&self) -> bool {
+        matches!(self.state, ChildState::Interrupted { resumable: true })
+            && self.incompatibility.is_none()
+    }
+}
+
+/// One versioned parent-owned durable child record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildSessionRecord {
+    /// Record schema.
+    pub schema_version: u32,
+    /// Stable parent-facing identity.
+    pub child: ChildId,
+    /// Stable child runtime session.
+    pub child_session: SessionId,
+    /// Exact owning parent.
+    pub parent_session: SessionId,
+    /// Immutable reconstruction inputs excluding raw task content.
+    pub spec: DurableChildSpec,
+    /// Host policy fingerprint captured at spawn.
+    pub policy_fingerprint: Fingerprint,
+    /// Durable lifecycle snapshot.
+    pub status: ChildStatus,
+    /// Latest exact checkpoint boundary referenced by the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_watermark: Option<CheckpointWatermark>,
+    /// Whether the recorded exact boundary is safe to continue without
+    /// replaying indeterminate provider I/O or a terminal turn.
+    #[serde(default)]
+    pub checkpoint_resumable: bool,
+    /// Monotonic record revision.
+    pub revision: u64,
+    /// Absolute child lifetime deadline, if configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DurableChildCatalog {
+    /// Catalog schema.
+    pub schema_version: u32,
+    /// Last allocated numeric child suffix.
+    pub next_child: u64,
+    /// Parent-owned records in stable child-id order.
+    pub children: Vec<ChildSessionRecord>,
+}
+
+impl DurableChildCatalog {
+    /// Creates a current-version catalog.
+    pub fn new(next_child: u64, children: Vec<ChildSessionRecord>) -> Self {
+        Self {
+            schema_version: CHILD_CATALOG_SCHEMA_VERSION,
+            next_child,
+            children,
+        }
+    }
+
+    /// Runtime-owned extension-state revision for this catalog schema.
+    pub fn revision() -> RegistryRevision {
+        RegistryRevision::new(CHILD_CATALOG_REVISION)
+    }
 }
 
 /// Exact typed result of one completed delegated child task.
@@ -385,11 +579,26 @@ pub enum SpawnOutcome {
     },
 }
 
+enum ChildBinding {
+    /// Durable metadata is loaded but no provider/runtime has been started.
+    Dormant,
+    /// Process-owned execution/session handle currently bound to the record.
+    Live {
+        handle: SessionHandle,
+        // Keeps the child's runtime composition alive for the binding.
+        _runtime: Runtime,
+    },
+}
+
 struct ChildEntry {
-    handle: SessionHandle,
-    // Keeps the child's runtime composition alive for the child's lifetime.
-    _runtime: Runtime,
+    binding: ChildBinding,
     status: watch::Sender<ChildStatus>,
+    spec: DurableChildSpec,
+    policy_fingerprint: Fingerprint,
+    checkpoint_watermark: Option<CheckpointWatermark>,
+    checkpoint_resumable: bool,
+    revision: u64,
+    deadline_at: Option<Timestamp>,
     max_turns: u32,
     uses_shared_capacity: bool,
 }
@@ -397,8 +606,34 @@ struct ChildEntry {
 impl fmt::Debug for ChildEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ChildEntry")
-            .field("session", self.handle.id())
+            .field("session", &self.status.borrow().session)
+            .field("bound", &matches!(self.binding, ChildBinding::Live { .. }))
             .finish_non_exhaustive()
+    }
+}
+
+impl ChildEntry {
+    fn handle(&self) -> Option<SessionHandle> {
+        match &self.binding {
+            ChildBinding::Dormant => None,
+            ChildBinding::Live { handle, .. } => Some(handle.clone()),
+        }
+    }
+
+    fn record(&self) -> ChildSessionRecord {
+        ChildSessionRecord {
+            schema_version: CHILD_CATALOG_SCHEMA_VERSION,
+            child: self.status.borrow().child.clone(),
+            child_session: self.status.borrow().session.clone(),
+            parent_session: self.status.borrow().parent.clone(),
+            spec: self.spec.clone(),
+            policy_fingerprint: self.policy_fingerprint.clone(),
+            status: self.status.borrow().clone(),
+            checkpoint_watermark: self.checkpoint_watermark,
+            checkpoint_resumable: self.checkpoint_resumable,
+            revision: self.revision,
+            deadline_at: self.deadline_at,
+        }
     }
 }
 
@@ -424,6 +659,14 @@ struct CoordinatorInner {
     ready_task_outcomes: Mutex<BTreeMap<(ChildId, TaskOutcomeKey), ChildTaskOutcome>>,
     returned_inputs_changed: Notify,
     next_child: AtomicU64,
+    bind_gate: tokio::sync::Mutex<()>,
+    catalog_save_gate: tokio::sync::Mutex<()>,
+}
+
+impl Drop for CoordinatorInner {
+    fn drop(&mut self) {
+        self.parent.release_delegation_coordinator();
+    }
 }
 
 /// Root-session delegation operations. Cheap to clone.
@@ -451,21 +694,150 @@ impl DelegationCoordinator {
         if parent.parent().is_some() {
             return Err(depth_violation());
         }
+        let mut restored = BTreeMap::new();
+        let mut next_child = 0_u64;
+        if let Some(state) = parent.extension_state(CHILD_CATALOG_NAMESPACE) {
+            if state.revision != RegistryRevision::new(CHILD_CATALOG_REVISION) {
+                return Err(RuntimeError::conflict(format!(
+                    "unsupported durable child catalog revision `{}`",
+                    state.revision
+                )));
+            }
+            let catalog: DurableChildCatalog =
+                serde_json::from_value(state.value).map_err(|error| {
+                    RuntimeError::new(
+                        ErrorKind::Serialization,
+                        format!("durable child catalog could not be restored: {error}"),
+                    )
+                })?;
+            if catalog.schema_version != CHILD_CATALOG_SCHEMA_VERSION {
+                return Err(RuntimeError::conflict(format!(
+                    "unsupported durable child catalog schema {}; expected {}",
+                    catalog.schema_version, CHILD_CATALOG_SCHEMA_VERSION
+                )));
+            }
+            next_child = catalog.next_child;
+            let now = parent.inner().shared.clock.now();
+            for mut record in catalog.children {
+                if record.schema_version != CHILD_CATALOG_SCHEMA_VERSION
+                    || record.parent_session != *parent.id()
+                    || record.status.parent != *parent.id()
+                    || record.status.child != record.child
+                    || record.status.session != record.child_session
+                {
+                    return Err(RuntimeError::conflict(
+                        "durable child catalog contains inconsistent ownership or identity",
+                    ));
+                }
+                let retention_expired = config.limits.retention_ms.is_some_and(|retention_ms| {
+                    now.as_millis()
+                        .saturating_sub(record.status.updated_at.as_millis())
+                        >= retention_ms
+                });
+                if retention_expired {
+                    record.status.state = ChildState::Expired;
+                    record.status.incompatibility = Some("retention expired".to_owned());
+                } else if record.deadline_at.is_some_and(|deadline| now >= deadline) {
+                    record.status.state = ChildState::Expired;
+                    record.status.incompatibility =
+                        Some("child lifetime deadline expired".to_owned());
+                } else if record.status.state == ChildState::Running {
+                    record.status.state = ChildState::Interrupted {
+                        resumable: record.checkpoint_resumable,
+                    };
+                    record.status.updated_at = now;
+                }
+
+                let current_fingerprint = factory.policy_fingerprint(&record.spec)?;
+                if factory.durability() != ChildDurability::Durable {
+                    record.status.incompatibility =
+                        Some("durable child stores are unavailable".to_owned());
+                    if matches!(record.status.state, ChildState::Interrupted { .. }) {
+                        record.status.state = ChildState::Interrupted { resumable: false };
+                    }
+                } else if current_fingerprint != record.policy_fingerprint {
+                    record.status.incompatibility =
+                        Some("child reconstruction policy changed".to_owned());
+                    if matches!(record.status.state, ChildState::Interrupted { .. }) {
+                        record.status.state = ChildState::Interrupted { resumable: false };
+                    }
+                }
+                let (status, _) = watch::channel(record.status.clone());
+                restored.insert(
+                    record.child.clone(),
+                    ChildEntry {
+                        binding: ChildBinding::Dormant,
+                        status,
+                        spec: record.spec,
+                        policy_fingerprint: record.policy_fingerprint,
+                        checkpoint_watermark: record.checkpoint_watermark,
+                        checkpoint_resumable: record.checkpoint_resumable,
+                        revision: record.revision.saturating_add(1),
+                        deadline_at: record.deadline_at,
+                        max_turns: record.status.max_turns,
+                        uses_shared_capacity: false,
+                    },
+                );
+            }
+        }
+        // The protected catalog is parent-session state. Two coordinators for
+        // one live parent could otherwise reserve the same child revision and
+        // start competing continuations. Hosts provide the cross-process
+        // parent-session lease; this closes the equivalent in-process race.
+        parent.acquire_delegation_coordinator()?;
         let coordinator = Self {
             inner: Arc::new(CoordinatorInner {
                 parent: parent.clone(),
                 factory,
                 config,
-                children: Mutex::new(BTreeMap::new()),
+                children: Mutex::new(restored),
                 queue: Mutex::new(Vec::new()),
                 spawn_reservations: Mutex::new(0),
                 returned_inputs: Mutex::new(BTreeMap::new()),
                 ready_task_outcomes: Mutex::new(BTreeMap::new()),
                 returned_inputs_changed: Notify::new(),
-                next_child: AtomicU64::new(0),
+                next_child: AtomicU64::new(next_child),
+                bind_gate: tokio::sync::Mutex::new(()),
+                catalog_save_gate: tokio::sync::Mutex::new(()),
             }),
         };
         coordinator.watch_parent_shutdown();
+        let recovered = coordinator.list();
+        for status in &recovered {
+            // Interrupted records require an asynchronous read of their exact
+            // protected checkpoint. `recover()` emits their one authoritative
+            // recovery transition after that reconciliation, so do not first
+            // publish a provisional catalog-only answer here.
+            if matches!(status.state, ChildState::Interrupted { .. }) {
+                continue;
+            }
+            let state = if status.incompatibility.is_some() {
+                ChildRecoveryState::Blocked
+            } else {
+                match &status.state {
+                    ChildState::Idle => ChildRecoveryState::Idle,
+                    ChildState::Interrupted { .. } | ChildState::Running => {
+                        ChildRecoveryState::Interrupted
+                    }
+                    ChildState::Expired => ChildRecoveryState::Expired,
+                    ChildState::Stopped { .. } | ChildState::Failed => ChildRecoveryState::Terminal,
+                }
+            };
+            coordinator.inner.parent.inner().emitter.emit(
+                None,
+                RuntimeEvent::ChildProgress {
+                    child: status.child.clone(),
+                    phase: ChildPhase::Recovered {
+                        child_session: status.session.clone(),
+                        state,
+                        resumable: status.resumable(),
+                    },
+                },
+            );
+        }
+        if !recovered.is_empty() {
+            coordinator.spawn_catalog_persist();
+        }
         Ok(coordinator)
     }
 
@@ -541,6 +913,217 @@ impl DelegationCoordinator {
             .values()
             .map(|entry| entry.status.borrow().clone())
             .collect()
+    }
+
+    /// Flushes the latest durable child checkpoints and parent-owned catalog.
+    /// Ephemeral coordinators treat this as a no-op.
+    pub async fn flush(&self) -> Result<(), RuntimeError> {
+        let children = self
+            .inner
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for child in children {
+            self.refresh_checkpoint_watermark(&child).await?;
+        }
+        self.persist_catalog().await
+    }
+
+    /// Reconciles dormant durable children against their authoritative exact
+    /// checkpoints without constructing a child runtime or provider.
+    ///
+    /// The parent catalog is committed independently from each child's turn
+    /// checkpoint. An abrupt process exit can therefore leave a running
+    /// catalog record whose watermark predates a newer safe checkpoint. Hosts
+    /// call this once after constructing a coordinator and before accepting
+    /// delegation commands. Missing, regressed, terminal, or indeterminate
+    /// checkpoints fail closed in metadata; safe checkpoints become available
+    /// only through an explicit [`Self::resume`]. Returned child interactions
+    /// are restored in the same protected recovery pass.
+    pub async fn recover(&self) -> Result<(), RuntimeError> {
+        let Some(store) = self.inner.factory.checkpoint_store() else {
+            return Ok(());
+        };
+        let candidates = {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            children
+                .iter()
+                .filter_map(|(child, entry)| {
+                    let status = entry.status.borrow();
+                    (status.durability == ChildDurability::Durable
+                        && matches!(status.state, ChildState::Interrupted { .. })
+                        && status.incompatibility.is_none())
+                    .then(|| {
+                        (
+                            child.clone(),
+                            status.session.clone(),
+                            entry.checkpoint_watermark,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (child, session, expected_watermark) in candidates {
+            let checkpoint = store.load_latest(&session).await?;
+            let (watermark, resumable, incompatibility) = match checkpoint {
+                Some(checkpoint) => {
+                    checkpoint.validate()?;
+                    if checkpoint.session != session {
+                        return Err(RuntimeError::conflict(format!(
+                            "child `{child}` checkpoint belongs to another session"
+                        )));
+                    }
+                    if expected_watermark.as_ref().is_some_and(|expected| {
+                        checkpoint.watermark.checkpoint_sequence < expected.checkpoint_sequence
+                    }) {
+                        return Err(RuntimeError::conflict(format!(
+                            "child `{child}` checkpoint regressed behind its catalog watermark"
+                        )));
+                    }
+                    let incompatibility = match checkpoint.state {
+                        TurnState::CallingModel { .. } => Some(
+                            "provider outcome was indeterminate at process exit; exact replay is refused"
+                                .to_owned(),
+                        ),
+                        TurnState::Terminal { .. } => Some(
+                            "child checkpoint is terminal but its catalog transition was not committed"
+                                .to_owned(),
+                        ),
+                        _ => None,
+                    };
+                    (
+                        Some(checkpoint.watermark),
+                        checkpoint_can_resume(&checkpoint.state),
+                        incompatibility,
+                    )
+                }
+                None => (
+                    None,
+                    false,
+                    Some("exact child checkpoint is unavailable".to_owned()),
+                ),
+            };
+
+            {
+                let mut children = self
+                    .inner
+                    .children
+                    .lock()
+                    .expect("delegation children poisoned");
+                let entry = children
+                    .get_mut(&child)
+                    .ok_or_else(|| unknown_child(&child))?;
+                entry.checkpoint_watermark = watermark;
+                entry.checkpoint_resumable = resumable;
+                entry.revision = entry.revision.saturating_add(1);
+                entry.status.send_modify(|status| {
+                    status.state = ChildState::Interrupted { resumable };
+                    status.incompatibility = incompatibility.clone();
+                    status.updated_at = self.inner.parent.inner().shared.clock.now();
+                });
+            }
+
+            let state = if incompatibility.is_some() {
+                ChildRecoveryState::Blocked
+            } else {
+                ChildRecoveryState::Interrupted
+            };
+            self.inner.parent.inner().emitter.emit(
+                None,
+                RuntimeEvent::ChildProgress {
+                    child: child.clone(),
+                    phase: ChildPhase::Recovered {
+                        child_session: session,
+                        state,
+                        resumable,
+                    },
+                },
+            );
+        }
+
+        if !self.list().is_empty() {
+            self.persist_catalog().await?;
+        }
+        self.recover_returned_interactions().await
+    }
+
+    /// Restores exact child task-information requests from protected terminal
+    /// checkpoints without constructing child runtimes or providers.
+    ///
+    /// Hosts call this once after rebuilding a parent coordinator and before
+    /// accepting new child operations. Ordinary catalog/list recovery remains
+    /// metadata-only; this separate protected pass is what makes an
+    /// unconsumed child questionnaire survive a process restart.
+    pub async fn recover_returned_interactions(&self) -> Result<(), RuntimeError> {
+        let Some(store) = self.inner.factory.checkpoint_store() else {
+            return Ok(());
+        };
+        let candidates = {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            children
+                .iter()
+                .filter_map(|(child, entry)| {
+                    let status = entry.status.borrow();
+                    (status.durability == ChildDurability::Durable
+                        && status.state == ChildState::Idle
+                        && status.incompatibility.is_none())
+                    .then(|| {
+                        (
+                            child.clone(),
+                            status.session.clone(),
+                            entry.checkpoint_watermark,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for (child, session, expected_watermark) in candidates {
+            let Some(checkpoint) = store.load_latest(&session).await? else {
+                continue;
+            };
+            if checkpoint.session != session {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` checkpoint belongs to another session"
+                )));
+            }
+            if expected_watermark.as_ref().is_some_and(|expected| {
+                checkpoint.watermark.checkpoint_sequence < expected.checkpoint_sequence
+            }) {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` checkpoint regressed behind its catalog watermark"
+                )));
+            }
+            let Some(request) =
+                returned_interaction_from_state(&checkpoint.snapshot.extension_state)?
+            else {
+                continue;
+            };
+            match &checkpoint.state {
+                TurnState::Terminal {
+                    finish: TurnFinish::NeedsInput { request: expected },
+                    ..
+                } if expected == request.id() => {}
+                _ => {
+                    return Err(RuntimeError::conflict(format!(
+                        "child `{child}` returned interaction is not bound to its terminal checkpoint"
+                    )));
+                }
+            }
+            record_returned_input_for_session(&self.inner, &child, &session, request)?;
+        }
+        Ok(())
     }
 
     /// The current snapshot of one child.
@@ -697,6 +1280,44 @@ impl DelegationCoordinator {
             }),
         )
         .await?;
+        // Refuse incompatible lifecycle states before lazily constructing a
+        // provider/runtime. In particular, an interrupted child is never
+        // rebound as an idle session merely because the caller used the
+        // follow-up operation instead of explicit checkpoint resume.
+        {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            let entry = children.get(child).ok_or_else(|| unknown_child(child))?;
+            let status = entry.status.borrow();
+            if let Some(reason) = &status.incompatibility {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` cannot be recovered: {reason}"
+                )));
+            }
+            if status.state.is_terminal() {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` has stopped and cannot accept follow-ups"
+                )));
+            }
+            if status.turns_used >= entry.max_turns {
+                return Err(RuntimeError::new(
+                    ErrorKind::Limit,
+                    format!(
+                        "child `{child}` reached its turn limit of {}",
+                        entry.max_turns
+                    ),
+                ));
+            }
+            if status.state != ChildState::Idle {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` is not idle; interrupted work requires explicit resume"
+                )));
+            }
+        }
+        let handle = self.bind_child(child, false).await?.0;
         let (handle, status_tx, previous_status) = {
             let children = self
                 .inner
@@ -705,6 +1326,11 @@ impl DelegationCoordinator {
                 .expect("delegation children poisoned");
             let entry = children.get(child).ok_or_else(|| unknown_child(child))?;
             let status = entry.status.borrow().clone();
+            if let Some(reason) = &status.incompatibility {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` cannot be recovered: {reason}"
+                )));
+            }
             if status.state.is_terminal() {
                 return Err(RuntimeError::new(
                     ErrorKind::Conflict,
@@ -720,19 +1346,30 @@ impl DelegationCoordinator {
                     ),
                 ));
             }
+            if status.state != ChildState::Idle {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` is not idle; interrupted work requires explicit resume"
+                )));
+            }
             let previous = status.clone();
             entry.status.send_modify(|status| {
                 status.turns_used += 1;
                 status.state = ChildState::Running;
+                status.updated_at = self.inner.parent.inner().shared.clock.now();
             });
-            (entry.handle.clone(), entry.status.clone(), previous)
+            (handle, entry.status.clone(), previous)
         };
+        if let Err(error) = self.persist_catalog().await {
+            status_tx.send_replace(previous_status);
+            return Err(error);
+        }
         let cleared = clear_returned_inputs_for_child(&self.inner, child, &handle);
         let turn = match handle.send(input) {
             Ok(turn) => turn,
             Err(error) => {
                 restore_returned_inputs_for_child(&self.inner, child, &handle, cleared)?;
                 status_tx.send_replace(previous_status);
+                let _ = self.persist_catalog().await;
                 return Err(error);
             }
         };
@@ -745,6 +1382,52 @@ impl DelegationCoordinator {
         );
         self.spawn_returned_input_collector(child.clone(), handle, turn);
         Ok(())
+    }
+
+    /// Explicitly resumes the exact checkpoint of an interrupted durable
+    /// child. This never creates a new task or falls back to spawning another
+    /// child identity.
+    pub async fn resume(&self, child: &ChildId) -> Result<(), RuntimeError> {
+        self.check_depth()?;
+        self.authorize(
+            "delegation.resume",
+            serde_json::json!({ "child_id": child.as_str() }),
+        )
+        .await?;
+        {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            let entry = children.get(child).ok_or_else(|| unknown_child(child))?;
+            let status = entry.status.borrow().clone();
+            if let Some(reason) = &status.incompatibility {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` cannot be resumed: {reason}"
+                )));
+            }
+            if !status.resumable() {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` has no compatible interrupted checkpoint"
+                )));
+            }
+        }
+        let (handle, turn) = self.bind_child(child, true).await?;
+        let turn = turn.ok_or_else(|| {
+            RuntimeError::internal("durable child resume did not return a tracked turn")
+        })?;
+        self.inner.parent.inner().emitter.emit(
+            None,
+            RuntimeEvent::ChildProgress {
+                child: child.clone(),
+                phase: ChildPhase::ResumeStarted {
+                    child_session: handle.id().clone(),
+                },
+            },
+        );
+        self.spawn_returned_input_collector(child.clone(), handle, turn);
+        self.persist_catalog().await
     }
 
     /// Waits until `child` is not running (idle after completing a task, or
@@ -786,11 +1469,24 @@ impl DelegationCoordinator {
                 .lock()
                 .expect("delegation children poisoned");
             let entry = children.get(child).ok_or_else(|| unknown_child(child))?;
-            entry.handle.clone()
+            entry.handle()
         };
-        handle.cancel(CancelReason::UserRequested);
-        let _ = handle.shutdown().await;
-        clear_returned_inputs_for_child(&self.inner, child, &handle);
+        let reason = CancelReason::UserRequested;
+        if mark_child_stopped(&self.inner, child, reason.clone()) {
+            self.inner.parent.inner().emitter.emit(
+                None,
+                RuntimeEvent::ChildStopped {
+                    child: child.clone(),
+                    reason: reason.clone(),
+                },
+            );
+        }
+        if let Some(handle) = handle {
+            handle.cancel(CancelReason::UserRequested);
+            let _ = handle.shutdown().await;
+            clear_returned_inputs_for_child(&self.inner, child, &handle);
+        }
+        self.persist_catalog().await?;
 
         // Wait for the *terminal* snapshot, not merely non-running: an idle
         // child is stopped through its monitor observing the shutdown, and
@@ -826,7 +1522,7 @@ impl DelegationCoordinator {
             children
                 .iter()
                 .filter(|(_, entry)| !entry.status.borrow().state.is_terminal())
-                .map(|(id, entry)| (id.clone(), entry.handle.clone()))
+                .filter_map(|(id, entry)| entry.handle().map(|handle| (id.clone(), handle)))
                 .collect()
         };
         for (_, handle) in &handles {
@@ -836,6 +1532,292 @@ impl DelegationCoordinator {
             let _ = handle.shutdown().await;
             clear_returned_inputs_for_child(&self.inner, child, handle);
         }
+        let _ = self.persist_catalog().await;
+    }
+
+    async fn bind_child(
+        &self,
+        child: &ChildId,
+        resume_checkpoint: bool,
+    ) -> Result<(SessionHandle, Option<TurnHandle>), RuntimeError> {
+        let _gate = self.inner.bind_gate.lock().await;
+        if let Some(handle) = self
+            .inner
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .get(child)
+            .and_then(ChildEntry::handle)
+        {
+            if resume_checkpoint {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` is already bound and cannot resume twice"
+                )));
+            }
+            return Ok((handle, None));
+        }
+
+        let (spec, session, expected_policy, expected_watermark, deadline_at) = {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            let entry = children.get(child).ok_or_else(|| unknown_child(child))?;
+            let status = entry.status.borrow();
+            if status.durability != ChildDurability::Durable {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` was process-ephemeral and cannot be rebound"
+                )));
+            }
+            if let Some(reason) = &status.incompatibility {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` cannot be rebound: {reason}"
+                )));
+            }
+            (
+                entry.spec.clone(),
+                status.session.clone(),
+                entry.policy_fingerprint.clone(),
+                entry.checkpoint_watermark,
+                entry.deadline_at,
+            )
+        };
+
+        if deadline_at
+            .is_some_and(|deadline| self.inner.parent.inner().shared.clock.now() >= deadline)
+        {
+            update_status(&self.inner, child, |status| {
+                status.state = ChildState::Expired;
+                status.incompatibility = Some("child lifetime deadline expired".to_owned());
+                status.updated_at = self.inner.parent.inner().shared.clock.now();
+            });
+            self.persist_catalog().await?;
+            return Err(RuntimeError::new(
+                ErrorKind::Limit,
+                format!("child `{child}` lifetime deadline expired"),
+            ));
+        }
+
+        let current_policy = self.inner.factory.policy_fingerprint(&spec)?;
+        if current_policy != expected_policy {
+            update_status(&self.inner, child, |status| {
+                status.incompatibility = Some("child reconstruction policy changed".to_owned());
+                if matches!(status.state, ChildState::Interrupted { .. }) {
+                    status.state = ChildState::Interrupted { resumable: false };
+                }
+                status.updated_at = self.inner.parent.inner().shared.clock.now();
+            });
+            self.persist_catalog().await?;
+            return Err(RuntimeError::conflict(format!(
+                "child `{child}` reconstruction policy is incompatible"
+            )));
+        }
+
+        // Validate the exact checkpoint before acquiring process capacity or
+        // constructing a child runtime. A missing, terminal, or regressed
+        // checkpoint therefore cannot leave a dormant record accidentally
+        // bound to a live provider composition.
+        let checkpoint = if resume_checkpoint {
+            let store = self.inner.factory.checkpoint_store().ok_or_else(|| {
+                RuntimeError::conflict("durable child runtime has no checkpoint store")
+            })?;
+            let checkpoint = store.load_latest(&session).await?.ok_or_else(|| {
+                RuntimeError::conflict(format!("child `{child}` has no exact checkpoint to resume"))
+            })?;
+            if matches!(checkpoint.state, TurnState::Terminal { .. }) {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` checkpoint is terminal and cannot be resumed"
+                )));
+            }
+            if !checkpoint_can_resume(&checkpoint.state) {
+                update_status(&self.inner, child, |status| {
+                    status.state = ChildState::Interrupted { resumable: false };
+                    status.incompatibility = Some(
+                        "provider outcome was indeterminate at process exit; exact replay is refused"
+                            .to_owned(),
+                    );
+                    status.updated_at = self.inner.parent.inner().shared.clock.now();
+                });
+                self.persist_catalog().await?;
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` checkpoint cannot be resumed without risking duplicate provider work"
+                )));
+            }
+            if expected_watermark.as_ref().is_some_and(|expected| {
+                checkpoint.watermark.checkpoint_sequence < expected.checkpoint_sequence
+            }) {
+                return Err(RuntimeError::conflict(format!(
+                    "child `{child}` checkpoint regressed behind its catalog watermark"
+                )));
+            }
+            Some(checkpoint)
+        } else {
+            None
+        };
+
+        let uses_shared_capacity = match &self.inner.config.shared_capacity {
+            Some(pool) => {
+                if !pool.try_acquire() {
+                    return Err(RuntimeError::new(
+                        ErrorKind::Limit,
+                        "shared delegation capacity is exhausted",
+                    ));
+                }
+                true
+            }
+            None => false,
+        };
+        let (runtime, handle) = match self.build_and_start(child, &spec, Some(&session)).await {
+            Ok(value) => value,
+            Err(error) => {
+                if let (true, Some(pool)) =
+                    (uses_shared_capacity, &self.inner.config.shared_capacity)
+                {
+                    pool.release();
+                }
+                return Err(error);
+            }
+        };
+
+        let events = handle.subscribe();
+        {
+            let mut children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            let entry = children
+                .get_mut(child)
+                .ok_or_else(|| unknown_child(child))?;
+            entry.binding = ChildBinding::Live {
+                handle: handle.clone(),
+                _runtime: runtime,
+            };
+            entry.uses_shared_capacity = uses_shared_capacity;
+            entry.revision = entry.revision.saturating_add(1);
+            if let Some(checkpoint) = &checkpoint {
+                entry.checkpoint_watermark = Some(checkpoint.watermark);
+                entry.checkpoint_resumable = checkpoint_can_resume(&checkpoint.state);
+                entry.status.send_modify(|status| {
+                    status.state = ChildState::Running;
+                    status.updated_at = self.inner.parent.inner().shared.clock.now();
+                });
+            }
+        }
+        self.spawn_monitor(
+            child.clone(),
+            handle.clone(),
+            events,
+            &spec,
+            ChildDurability::Durable,
+        );
+        if let Some(deadline_at) = deadline_at {
+            self.spawn_deadline_watchdog(handle.clone(), deadline_at);
+        }
+        let turn = match checkpoint {
+            Some(checkpoint) => Some(handle.spawn_checkpoint_resume(checkpoint)?),
+            None => None,
+        };
+        self.persist_catalog().await?;
+        Ok((handle, turn))
+    }
+
+    async fn refresh_checkpoint_watermark(&self, child: &ChildId) -> Result<(), RuntimeError> {
+        let Some(store) = self.inner.factory.checkpoint_store() else {
+            return Ok(());
+        };
+        let session = {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            let entry = children.get(child).ok_or_else(|| unknown_child(child))?;
+            if entry.status.borrow().durability != ChildDurability::Durable {
+                return Ok(());
+            }
+            entry.status.borrow().session.clone()
+        };
+        if let Some(checkpoint) = store.load_latest(&session).await? {
+            let mut children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            if let Some(entry) = children.get_mut(child) {
+                entry.checkpoint_watermark = Some(checkpoint.watermark);
+                entry.checkpoint_resumable = checkpoint_can_resume(&checkpoint.state);
+                entry.revision = entry.revision.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_child(&self, child: &ChildId) -> Result<(), RuntimeError> {
+        self.refresh_checkpoint_watermark(child).await?;
+        {
+            let children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            match children.get(child) {
+                Some(entry)
+                    if matches!(entry.status.borrow().state, ChildState::Interrupted { .. }) =>
+                {
+                    let resumable = entry.checkpoint_resumable;
+                    entry.status.send_modify(|status| {
+                        status.state = ChildState::Interrupted { resumable };
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.persist_catalog().await
+    }
+
+    async fn persist_catalog(&self) -> Result<(), RuntimeError> {
+        let _gate = self.inner.catalog_save_gate.lock().await;
+        if self.inner.factory.durability() != ChildDurability::Durable {
+            return Ok(());
+        }
+        let children = self
+            .inner
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .values()
+            .filter(|entry| entry.status.borrow().durability == ChildDurability::Durable)
+            .map(ChildEntry::record)
+            .collect::<Vec<_>>();
+        let catalog =
+            DurableChildCatalog::new(self.inner.next_child.load(Ordering::SeqCst), children);
+        let value = serde_json::to_value(catalog).map_err(|error| {
+            RuntimeError::new(
+                ErrorKind::Serialization,
+                format!("durable child catalog could not be serialized: {error}"),
+            )
+        })?;
+        self.inner.parent.set_extension_state(
+            CHILD_CATALOG_NAMESPACE,
+            VersionedSessionState::new(DurableChildCatalog::revision(), value).redaction_safe(),
+        );
+        self.inner.parent.persist().await
+    }
+
+    fn spawn_catalog_persist(&self) {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            let _ = coordinator.persist_catalog().await;
+        });
+    }
+
+    fn spawn_child_persist(&self, child: ChildId) {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            let _ = coordinator.persist_child(&child).await;
+        });
     }
 
     fn check_depth(&self) -> Result<(), RuntimeError> {
@@ -970,6 +1952,19 @@ impl DelegationCoordinator {
         child: ChildId,
         spec: ChildSpec,
     ) -> Result<SessionHandle, RuntimeError> {
+        if self
+            .inner
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .len()
+            >= self.inner.config.limits.max_retained_children
+        {
+            return Err(RuntimeError::new(
+                ErrorKind::Limit,
+                "retained child limit is exhausted",
+            ));
+        }
         let uses_shared_capacity = match &self.inner.config.shared_capacity {
             Some(pool) => {
                 if !pool.try_acquire() {
@@ -983,7 +1978,14 @@ impl DelegationCoordinator {
             None => false,
         };
 
-        let started = self.build_and_start(&child, &spec).await;
+        let durable_spec = DurableChildSpec::from_spawn(&spec);
+        let durability = self.inner.factory.durability();
+        let requested_session = (durability == ChildDurability::Durable)
+            .then(|| SessionId::new(format!("child-session-{}", uuid::Uuid::new_v4())));
+        let policy_fingerprint = self.inner.factory.policy_fingerprint(&durable_spec)?;
+        let started = self
+            .build_and_start(&child, &durable_spec, requested_session.as_ref())
+            .await;
         let (runtime, handle) = match started {
             Ok(pair) => pair,
             Err(err) => {
@@ -996,8 +1998,83 @@ impl DelegationCoordinator {
             }
         };
 
-        let parent_inner = self.inner.parent.inner();
-        parent_inner.emitter.emit(
+        let now = self.inner.parent.inner().shared.clock.now();
+        let deadline_at = spec
+            .limits
+            .deadline_ms
+            .map(|duration| now.plus_millis(duration));
+        let (status_tx, _) = watch::channel(ChildStatus {
+            child: child.clone(),
+            parent: self.inner.parent.id().clone(),
+            session: handle.id().clone(),
+            durability,
+            state: ChildState::Running,
+            workspace: spec.workspace.clone(),
+            turns_used: 1,
+            max_turns: spec.limits.max_turns,
+            tokens_used: 0,
+            last_result: None,
+            last_artifacts: Vec::new(),
+            updated_at: now,
+            incompatibility: None,
+        });
+
+        // Subscribe before sending the task so no lifecycle event is missed.
+        let events = handle.subscribe();
+        self.spawn_monitor(
+            child.clone(),
+            handle.clone(),
+            events,
+            &durable_spec,
+            durability,
+        );
+        if let Some(deadline_at) = deadline_at {
+            self.spawn_deadline_watchdog(handle.clone(), deadline_at);
+        }
+
+        self.inner
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .insert(
+                child.clone(),
+                ChildEntry {
+                    binding: ChildBinding::Live {
+                        handle: handle.clone(),
+                        _runtime: runtime,
+                    },
+                    status: status_tx,
+                    spec: durable_spec,
+                    policy_fingerprint,
+                    checkpoint_watermark: None,
+                    checkpoint_resumable: false,
+                    revision: 1,
+                    deadline_at,
+                    max_turns: spec.limits.max_turns,
+                    uses_shared_capacity,
+                },
+            );
+
+        let initial_persist = if durability == ChildDurability::Durable {
+            self.persist_catalog().await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = initial_persist {
+            self.inner
+                .children
+                .lock()
+                .expect("delegation children poisoned")
+                .remove(&child);
+            handle.cancel_session(CancelReason::Shutdown);
+            let _ = handle.shutdown().await;
+            if let (true, Some(pool)) = (uses_shared_capacity, &self.inner.config.shared_capacity) {
+                pool.release();
+            }
+            return Err(error);
+        }
+
+        self.inner.parent.inner().emitter.emit(
             None,
             RuntimeEvent::ChildSpawned {
                 child: child.clone(),
@@ -1008,40 +2085,17 @@ impl DelegationCoordinator {
             },
         );
 
-        let (status_tx, _) = watch::channel(ChildStatus {
-            child: child.clone(),
-            parent: self.inner.parent.id().clone(),
-            state: ChildState::Running,
-            workspace: spec.workspace.clone(),
-            turns_used: 1,
-            max_turns: spec.limits.max_turns,
-            last_result: None,
-            last_artifacts: Vec::new(),
-        });
-
-        // Subscribe before sending the task so no lifecycle event is missed.
-        let events = handle.subscribe();
-        self.spawn_monitor(child.clone(), handle.clone(), events, &spec);
-        if let Some(deadline_ms) = spec.limits.deadline_ms {
-            self.spawn_deadline_watchdog(handle.clone(), deadline_ms);
-        }
-
-        self.inner
-            .children
-            .lock()
-            .expect("delegation children poisoned")
-            .insert(
-                child.clone(),
-                ChildEntry {
-                    handle: handle.clone(),
-                    _runtime: runtime,
-                    status: status_tx,
-                    max_turns: spec.limits.max_turns,
-                    uses_shared_capacity,
-                },
-            );
-
-        let turn = handle.send(spec.task)?;
+        let turn = match handle.send(spec.task) {
+            Ok(turn) => turn,
+            Err(error) => {
+                update_status(&self.inner, &child, |status| {
+                    status.state = ChildState::Failed;
+                    status.updated_at = self.inner.parent.inner().shared.clock.now();
+                });
+                let _ = self.persist_catalog().await;
+                return Err(error);
+            }
+        };
         self.inner.parent.inner().emitter.emit(
             None,
             RuntimeEvent::ChildProgress {
@@ -1056,9 +2110,11 @@ impl DelegationCoordinator {
     async fn build_and_start(
         &self,
         child: &ChildId,
-        spec: &ChildSpec,
+        durable_spec: &DurableChildSpec,
+        session: Option<&SessionId>,
     ) -> Result<(Runtime, SessionHandle), RuntimeError> {
-        let mut builder = self.inner.factory.child_builder(spec)?;
+        let spec = durable_spec.rebuild_spec();
+        let mut builder = self.inner.factory.child_builder(&spec)?;
 
         // Delegation-management tools never reach a child view, whatever the
         // requested scope.
@@ -1094,15 +2150,18 @@ impl DelegationCoordinator {
         // exact request through this coordinator's protected outcome path.
         builder.return_child_interactions_to_parent();
 
-        // Children are ephemeral: no persistence, no resume.
-        builder.clear_session_store();
+        if self.inner.factory.durability() == ChildDurability::Ephemeral {
+            builder.clear_session_store();
+        }
 
         let runtime = builder.build()?;
+        let mut start = crate::runtime::command::StartSession::new()
+            .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer);
+        if let Some(session) = session {
+            start = start.with_id(session.clone());
+        }
         let handle = runtime
-            .start_child_session(
-                crate::runtime::command::StartSession::new(),
-                self.inner.parent.id().clone(),
-            )
+            .start_child_session(start, self.inner.parent.id().clone())
             .await
             .map_err(|err| {
                 RuntimeError::new(
@@ -1165,7 +2224,12 @@ impl DelegationCoordinator {
             if let Err(error) = result {
                 update_status(&coordinator, &child, |status| {
                     status.state = ChildState::Failed;
+                    status.updated_at = coordinator.parent.inner().shared.clock.now();
                 });
+                DelegationCoordinator {
+                    inner: coordinator.clone(),
+                }
+                .spawn_child_persist(child.clone());
                 coordinator
                     .parent
                     .inner()
@@ -1183,13 +2247,20 @@ impl DelegationCoordinator {
         child: ChildId,
         handle: SessionHandle,
         mut events: crate::runtime::emitter::RuntimeEventStream,
-        spec: &ChildSpec,
+        spec: &DurableChildSpec,
+        durability: ChildDurability,
     ) {
         let coordinator = self.inner.clone();
         let max_tokens = spec.limits.max_tokens;
         tokio::spawn(async move {
             let parent_emitter = coordinator.parent.inner().emitter.clone();
-            let mut tokens_used: u64 = 0;
+            let mut tokens_used = coordinator
+                .children
+                .lock()
+                .expect("delegation children poisoned")
+                .get(&child)
+                .map(|entry| entry.status.borrow().tokens_used)
+                .unwrap_or(0);
             let mut terminal = false;
             while let Some(envelope) = events.next().await {
                 match envelope.payload {
@@ -1209,6 +2280,10 @@ impl DelegationCoordinator {
                             .saturating_add(record.delta.get(CounterKind::InputCached))
                             .saturating_add(record.delta.get(CounterKind::Output))
                             .saturating_add(record.delta.get(CounterKind::Reasoning));
+                        update_status(&coordinator, &child, |status| {
+                            status.tokens_used = tokens_used;
+                            status.updated_at = coordinator.parent.inner().shared.clock.now();
+                        });
                         if let Some(budget) = max_tokens {
                             if tokens_used > budget {
                                 handle.cancel(CancelReason::LimitReached);
@@ -1227,25 +2302,40 @@ impl DelegationCoordinator {
                             // broadcast is observability only and may lag.
                             | TurnFinish::NeedsInput { .. } => {}
                             TurnFinish::Cancelled { reason } => {
-                                terminal = true;
-                                update_status(&coordinator, &child, |status| {
-                                    status.state = ChildState::Stopped {
-                                        reason: reason.clone(),
-                                    };
-                                });
-                                parent_emitter.emit(
-                                    None,
-                                    RuntimeEvent::ChildStopped {
-                                        child: child.clone(),
-                                        reason,
-                                    },
-                                );
+                                if durability == ChildDurability::Durable
+                                    && reason == CancelReason::Shutdown
+                                {
+                                    update_status(&coordinator, &child, |status| {
+                                        status.state = ChildState::Interrupted {
+                                            resumable: false,
+                                        };
+                                        status.updated_at =
+                                            coordinator.parent.inner().shared.clock.now();
+                                    });
+                                } else {
+                                    terminal = true;
+                                    if mark_child_stopped(
+                                        &coordinator,
+                                        &child,
+                                        reason.clone(),
+                                    ) {
+                                        parent_emitter.emit(
+                                            None,
+                                            RuntimeEvent::ChildStopped {
+                                                child: child.clone(),
+                                                reason,
+                                            },
+                                        );
+                                    }
+                                }
                                 break;
                             }
                             TurnFinish::Failed => {
                                 terminal = true;
                                 update_status(&coordinator, &child, |status| {
                                     status.state = ChildState::Failed;
+                                    status.updated_at =
+                                        coordinator.parent.inner().shared.clock.now();
                                 });
                                 parent_emitter.emit(
                                     None,
@@ -1262,25 +2352,29 @@ impl DelegationCoordinator {
                         }
                     }
                     RuntimeEvent::SessionShutdown => {
-                        if !terminal {
+                        if !terminal && durability == ChildDurability::Durable {
+                            update_status(&coordinator, &child, |status| {
+                                if status.state == ChildState::Running {
+                                    status.state = ChildState::Interrupted { resumable: false };
+                                }
+                                status.updated_at = coordinator.parent.inner().shared.clock.now();
+                            });
+                        } else if !terminal {
                             terminal = true;
                             let reason = handle
                                 .inner()
                                 .cancel
                                 .reason()
                                 .unwrap_or(CancelReason::Shutdown);
-                            update_status(&coordinator, &child, |status| {
-                                status.state = ChildState::Stopped {
-                                    reason: reason.clone(),
-                                };
-                            });
-                            parent_emitter.emit(
-                                None,
-                                RuntimeEvent::ChildStopped {
-                                    child: child.clone(),
-                                    reason,
-                                },
-                            );
+                            if mark_child_stopped(&coordinator, &child, reason.clone()) {
+                                parent_emitter.emit(
+                                    None,
+                                    RuntimeEvent::ChildStopped {
+                                        child: child.clone(),
+                                        reason,
+                                    },
+                                );
+                            }
                         }
                         break;
                     }
@@ -1290,23 +2384,61 @@ impl DelegationCoordinator {
             // The stream ended (child dropped or shut down). Resolve a
             // terminal state exactly once even without a SessionShutdown.
             if !terminal {
-                let reason = handle
-                    .inner()
-                    .cancel
-                    .reason()
-                    .unwrap_or(CancelReason::Shutdown);
-                update_status(&coordinator, &child, |status| {
-                    if !status.state.is_terminal() {
-                        status.state = ChildState::Stopped {
-                            reason: reason.clone(),
-                        };
+                if durability == ChildDurability::Durable {
+                    update_status(&coordinator, &child, |status| {
+                        if status.state == ChildState::Running {
+                            status.state = ChildState::Interrupted { resumable: false };
+                        }
+                        status.updated_at = coordinator.parent.inner().shared.clock.now();
+                    });
+                } else {
+                    let reason = handle
+                        .inner()
+                        .cancel
+                        .reason()
+                        .unwrap_or(CancelReason::Shutdown);
+                    if mark_child_stopped(&coordinator, &child, reason.clone()) {
+                        parent_emitter.emit(
+                            None,
+                            RuntimeEvent::ChildStopped {
+                                child: child.clone(),
+                                reason,
+                            },
+                        );
                     }
-                });
+                }
+            }
+            {
+                let mut children = coordinator
+                    .children
+                    .lock()
+                    .expect("delegation children poisoned");
+                if let Some(entry) = children.get_mut(&child) {
+                    entry.binding = ChildBinding::Dormant;
+                    entry.revision = entry.revision.saturating_add(1);
+                }
+            }
+            let durable = DelegationCoordinator {
+                inner: coordinator.clone(),
+            };
+            let _ = durable.persist_child(&child).await;
+            let interrupted = coordinator
+                .children
+                .lock()
+                .expect("delegation children poisoned")
+                .get(&child)
+                .map(|entry| entry.status.borrow().clone())
+                .filter(|status| matches!(status.state, ChildState::Interrupted { .. }));
+            if let Some(status) = interrupted {
+                let resumable = status.resumable();
                 parent_emitter.emit(
                     None,
-                    RuntimeEvent::ChildStopped {
+                    RuntimeEvent::ChildProgress {
                         child: child.clone(),
-                        reason,
+                        phase: ChildPhase::Interrupted {
+                            child_session: status.session,
+                            resumable,
+                        },
                     },
                 );
             }
@@ -1315,17 +2447,21 @@ impl DelegationCoordinator {
         });
     }
 
-    fn spawn_deadline_watchdog(&self, handle: SessionHandle, deadline_ms: u64) {
+    fn spawn_deadline_watchdog(&self, handle: SessionHandle, deadline_at: Timestamp) {
+        let clock = self.inner.parent.inner().shared.clock.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(deadline_ms)).await;
+            let remaining = deadline_at
+                .as_millis()
+                .saturating_sub(clock.now().as_millis());
+            tokio::time::sleep(std::time::Duration::from_millis(remaining)).await;
             handle.cancel(CancelReason::Timeout);
             let _ = handle.shutdown().await;
         });
     }
 
-    /// Watches the parent session and stops every child when it shuts down —
-    /// children never outlive their parent, and a later resume of the parent
-    /// session never restarts them.
+    /// Watches the parent session and stops every live execution when it shuts
+    /// down. Durable child sessions remain dormant for explicit recovery; an
+    /// ephemeral child cannot outlive or restart after its parent process.
     fn watch_parent_shutdown(&self) {
         let coordinator = self.clone();
         let mut events = self.inner.parent.subscribe();
@@ -1363,14 +2499,50 @@ fn update_status(
     }
 }
 
+/// Applies the one terminal stopped transition and reports whether the caller
+/// owns publication of the corresponding terminal event.
+fn mark_child_stopped(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    reason: CancelReason,
+) -> bool {
+    let children = coordinator
+        .children
+        .lock()
+        .expect("delegation children poisoned");
+    let Some(entry) = children.get(child) else {
+        return false;
+    };
+    let mut transitioned = false;
+    entry.status.send_modify(|status| {
+        if !status.state.is_terminal() {
+            status.state = ChildState::Stopped {
+                reason: reason.clone(),
+            };
+            status.updated_at = coordinator.parent.inner().shared.clock.now();
+            transitioned = true;
+        }
+    });
+    transitioned
+}
+
 fn record_returned_input(
     coordinator: &Arc<CoordinatorInner>,
     child: &ChildId,
     handle: &SessionHandle,
     request: InteractionRequest,
 ) -> Result<(), RuntimeError> {
+    record_returned_input_for_session(coordinator, child, handle.id(), request)
+}
+
+fn record_returned_input_for_session(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    child_session: &SessionId,
+    request: InteractionRequest,
+) -> Result<(), RuntimeError> {
     request.validate()?;
-    if request.origin().session() != handle.id() {
+    if request.origin().session() != child_session {
         return Err(RuntimeError::conflict(
             "returned child interaction did not preserve exact session attribution",
         ));
@@ -1411,12 +2583,13 @@ fn record_returned_input(
         status.state = ChildState::Idle;
         status.last_result = None;
         status.last_artifacts.clear();
+        status.updated_at = coordinator.parent.inner().shared.clock.now();
     });
     coordinator.parent.inner().emitter.emit(
         None,
         RuntimeEvent::ChildNeedsInput {
             child: child.clone(),
-            child_session: handle.id().clone(),
+            child_session: child_session.clone(),
             turn: request.origin().turn().clone(),
             call: request.origin().call().clone(),
             request: request.id().clone(),
@@ -1430,6 +2603,10 @@ fn record_returned_input(
         },
     );
     coordinator.returned_inputs_changed.notify_waiters();
+    DelegationCoordinator {
+        inner: coordinator.clone(),
+    }
+    .spawn_child_persist(child.clone());
     Ok(())
 }
 
@@ -1459,6 +2636,7 @@ fn record_completed_outcome(
         status.state = ChildState::Idle;
         status.last_result = Some(result.text.clone());
         status.last_artifacts = result.artifacts.clone();
+        status.updated_at = coordinator.parent.inner().shared.clock.now();
     });
     coordinator.parent.inner().emitter.emit(
         None,
@@ -1468,6 +2646,10 @@ fn record_completed_outcome(
         },
     );
     coordinator.returned_inputs_changed.notify_waiters();
+    DelegationCoordinator {
+        inner: coordinator.clone(),
+    }
+    .spawn_child_persist(child.clone());
     Ok(())
 }
 
@@ -1618,13 +2800,17 @@ fn restore_returned_inputs_for_child(
 
 fn release_capacity(coordinator: &Arc<CoordinatorInner>, child: &ChildId) {
     let uses_shared = {
-        let children = coordinator
+        let mut children = coordinator
             .children
             .lock()
             .expect("delegation children poisoned");
         children
-            .get(child)
-            .map(|entry| entry.uses_shared_capacity)
+            .get_mut(child)
+            .map(|entry| {
+                let used = entry.uses_shared_capacity;
+                entry.uses_shared_capacity = false;
+                used
+            })
             .unwrap_or(false)
     };
     if uses_shared {

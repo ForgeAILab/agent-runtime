@@ -2561,6 +2561,7 @@ async fn events_are_versioned_and_roundtrip() {
     event_schema::assert_versioned_and_roundtrips(&observer.events());
     event_schema::assert_v7_golden_fixture();
     event_schema::assert_v8_golden_fixture();
+    event_schema::assert_v9_golden_fixture();
     event_schema::assert_v6_golden_fixture();
     event_schema::assert_v5_golden_fixture();
     event_schema::assert_unattributed_output_fixtures_are_rejected();

@@ -191,9 +191,12 @@ impl Runtime {
         self.start_session_with_parent(request, None).await
     }
 
-    /// Starts a delegated child session attributed to `parent`. Children are
-    /// ephemeral: they never load or save snapshots, so a resumed parent can
-    /// never restart them.
+    /// Starts a delegated child session attributed to `parent`.
+    ///
+    /// A host may compose this runtime without stores for an ephemeral child,
+    /// or provide an explicit child session id plus stores for durable
+    /// rebinding. The private parent-bound entry point prevents arbitrary
+    /// callers from adopting another parent's child session.
     pub(crate) async fn start_child_session(
         &self,
         request: StartSession,
@@ -228,16 +231,15 @@ impl Runtime {
 
         // Resume only when the caller explicitly supplied the identity. A
         // freshly minted id must never silently load an older snapshot.
-        // Child sessions never resume: they are ephemeral by contract.
         let mut state = SessionState::with_history(request.initial_history);
         let mut identity = Default::default();
         let mut extension_state = Default::default();
-        let snapshot = match (explicit_id, &self.shared.session_store, &parent) {
-            (true, Some(store), None) => store.load(&session_id).await?,
+        let snapshot = match (explicit_id, &self.shared.session_store) {
+            (true, Some(store)) => store.load(&session_id).await?,
             _ => None,
         };
-        let checkpoint = match (explicit_id, &self.shared.checkpoint_store, &parent) {
-            (true, Some(store), None) => store.load_latest(&session_id).await?,
+        let checkpoint = match (explicit_id, &self.shared.checkpoint_store) {
+            (true, Some(store)) => store.load_latest(&session_id).await?,
             _ => None,
         };
         if let Some(checkpoint) = &checkpoint {
@@ -331,6 +333,7 @@ impl Runtime {
             turns_changed: tokio::sync::Notify::new(),
             shutdown_lock: tokio::sync::Mutex::new(false),
             active_session_lease,
+            delegation_coordinator_active: AtomicBool::new(false),
             recovery_deferred,
         });
 
@@ -339,12 +342,15 @@ impl Runtime {
             .driver
             .emit_session_composition(&inner.emitter, &inner.execution);
         let session = SessionHandle::new(inner);
-        if let Some(checkpoint) =
-            checkpoint.filter(|checkpoint| !matches!(checkpoint.state, TurnState::Terminal { .. }))
+        let checkpoint = if request.checkpoint_recovery != CheckpointRecoveryPolicy::Defer
+            && !recovery_deferred
         {
-            if !recovery_deferred {
-                session.spawn_checkpoint_resume(checkpoint)?;
-            }
+            checkpoint.filter(|checkpoint| !matches!(checkpoint.state, TurnState::Terminal { .. }))
+        } else {
+            None
+        };
+        if let Some(checkpoint) = checkpoint {
+            session.spawn_checkpoint_resume(checkpoint)?;
         }
         Ok(session)
     }

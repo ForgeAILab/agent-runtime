@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -15,14 +16,16 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use agent_runtime::delegation::{
-    CapacityPolicy, ChildRuntimeFactory, ChildState, ChildTaskOutcome, ChildTaskResult,
-    DELEGATION_PERMISSION, DelegationConfig, DelegationCoordinator, DelegationLimits, SpawnOutcome,
+    CHILD_CATALOG_NAMESPACE, CapacityPolicy, ChildDurability, ChildRuntimeFactory,
+    ChildSessionRecord, ChildState, ChildStatus, ChildTaskOutcome, ChildTaskResult,
+    DELEGATION_PERMISSION, DelegationConfig, DelegationCoordinator, DelegationLimits,
+    DurableChildCatalog, DurableChildSpec, SpawnOutcome,
 };
 use agent_runtime::harness::{ArtifactOffloader, QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
 use agent_runtime::provider::fake::{
     FakeProvider, ScriptedStream, tool_call_fragments, usage_event,
 };
-use agent_runtime::registry::Permission;
+use agent_runtime::registry::{Fingerprint, Permission};
 use agent_runtime::runtime::{Runtime, RuntimeBuilder, SessionHandle, StartSession};
 use agent_runtime_core::artifact::{
     ArtifactChunk, ArtifactDigest, ArtifactError, ArtifactId, ArtifactRead, ArtifactRef,
@@ -31,7 +34,8 @@ use agent_runtime_core::artifact::{
 use agent_runtime_core::cancel::Cancellation;
 use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
 use agent_runtime_core::check_set::ActionClass;
-use agent_runtime_core::clock::Deadline;
+use agent_runtime_core::checkpoint::{CheckpointStore, TurnCheckpoint, TurnState};
+use agent_runtime_core::clock::{Deadline, Timestamp};
 use agent_runtime_core::content::UserInput;
 use agent_runtime_core::delegation::{
     ChildLimits, ChildModelSelection, ChildSpec, ToolViewScope, WorkspacePolicy,
@@ -45,12 +49,16 @@ use agent_runtime_core::grant::{
 use agent_runtime_core::interaction::{InteractionOrigin, InteractionRequest, InteractionResponse};
 use agent_runtime_core::provider::{
     Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
-    ProviderError, ProviderStream, ProviderStreamEvent,
+    ProviderError, ProviderRequest, ProviderStream, ProviderStreamEvent,
 };
 use agent_runtime_core::security::{AuthorizationRequest, PermissionSet};
+use agent_runtime_core::store::{
+    SessionIdentityState, SessionSnapshot, SessionStore, VersionedSessionState,
+};
 use agent_runtime_core::tool::{
     InvocationContext, LegacyTool, PreparedToolCall, Tool, ToolEffects, ToolOutcome, ToolSpec,
 };
+use agent_runtime_core::usage::UsageLedger;
 
 use crate::tools::{EchoTool, WriteTool};
 
@@ -114,6 +122,34 @@ pub async fn parent_session(covered: bool) -> (Runtime, SessionHandle) {
     (runtime, session)
 }
 
+async fn durable_parent_session(
+    id: &str,
+    session_store: Arc<dyn SessionStore>,
+    checkpoint_store: Arc<dyn CheckpointStore>,
+) -> (Runtime, SessionHandle) {
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(Arc::new(FakeProvider::text_reply("parent")))
+        .model_profile(profile())
+        .session_store(session_store)
+        .checkpoint_store(checkpoint_store)
+        .security_check(
+            Arc::new(AllowAllCheck {
+                id: SecurityCheckId::new("allow-delegation"),
+                revision: SecurityCheckRevision::new("v1"),
+            }),
+            SecurityCheckMode::Authoritative,
+            PermissionSet::single(Permission::other(DELEGATION_PERMISSION.to_string())),
+            ActionClass::new("delegation"),
+        )
+        .build()
+        .expect("durable parent runtime builds");
+    let session = runtime
+        .start_session(StartSession::new().with_id(agent_runtime_core::ids::SessionId::new(id)))
+        .await
+        .expect("durable parent session starts");
+    (runtime, session)
+}
+
 /// A factory serving one scripted provider per child, in order, registering
 /// `tools` on every child builder. Keeps each child's provider so suites can
 /// assert what its scoped view advertised.
@@ -124,6 +160,9 @@ pub struct ScriptedChildFactory {
     tools: Vec<Arc<dyn Tool>>,
     event_buffer: usize,
     artifact_store: Option<Arc<dyn ArtifactStore>>,
+    session_store: Option<Arc<dyn SessionStore>>,
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    policy_salt: String,
 }
 
 impl ScriptedChildFactory {
@@ -135,6 +174,9 @@ impl ScriptedChildFactory {
             tools: Vec::new(),
             event_buffer: 1024,
             artifact_store: None,
+            session_store: None,
+            checkpoint_store: None,
+            policy_salt: "test-child-policy-v1".to_owned(),
         }
     }
 
@@ -155,6 +197,23 @@ impl ScriptedChildFactory {
     /// ownership transfer through one protected store.
     pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
+        self
+    }
+
+    /// Enables durable child snapshots and exact checkpoints.
+    pub fn with_durable_stores(
+        mut self,
+        session_store: Arc<dyn SessionStore>,
+        checkpoint_store: Arc<dyn CheckpointStore>,
+    ) -> Self {
+        self.session_store = Some(session_store);
+        self.checkpoint_store = Some(checkpoint_store);
+        self
+    }
+
+    /// Changes the host reconstruction fingerprint for incompatibility tests.
+    pub fn with_policy_salt(mut self, salt: impl Into<String>) -> Self {
+        self.policy_salt = salt.into();
         self
     }
 
@@ -203,11 +262,33 @@ impl ChildRuntimeFactory for ScriptedChildFactory {
                 .with_preview_chars(128)?;
             builder = builder.tool_output_processor(Arc::new(offloader));
         }
+        if let Some(store) = &self.session_store {
+            builder = builder.session_store(store.clone());
+        }
+        if let Some(store) = &self.checkpoint_store {
+            builder = builder.checkpoint_store(store.clone());
+        }
         Ok(builder)
     }
 
     fn artifact_store(&self) -> Option<Arc<dyn ArtifactStore>> {
         self.artifact_store.clone()
+    }
+
+    fn session_store(&self) -> Option<Arc<dyn SessionStore>> {
+        self.session_store.clone()
+    }
+
+    fn checkpoint_store(&self) -> Option<Arc<dyn CheckpointStore>> {
+        self.checkpoint_store.clone()
+    }
+
+    fn policy_fingerprint(
+        &self,
+        spec: &agent_runtime::delegation::DurableChildSpec,
+    ) -> Result<Fingerprint, RuntimeError> {
+        let encoded = serde_json::to_vec(&(self.policy_salt.as_str(), spec)).unwrap();
+        Ok(Fingerprint::of_fields([encoded.as_slice()]))
     }
 }
 
@@ -687,6 +768,100 @@ pub async fn assert_returned_input_pairs_and_is_lossless() {
     assert_eq!(factory.provider(0).requests().len(), 2);
 }
 
+/// A child questionnaire is exact protected state, not journal-only metadata:
+/// parent restart restores the same request and queues it for root delivery
+/// without constructing a provider, then an explicit follow-up reuses the
+/// same child session and clears that request transactionally.
+pub async fn assert_returned_input_survives_parent_restart_without_provider_work() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let (_runtime, parent) =
+        durable_parent_session("question-parent", sessions.clone(), checkpoints.clone()).await;
+    let edit_invocations = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![
+            read_ask_edit_script(),
+            text_child_script("continued after restart"),
+        ])
+        .with_tools(vec![
+            Arc::new(EchoTool),
+            Arc::new(RenamedQuestionnaireTool),
+            Arc::new(CountingEditTool {
+                invocations: edit_invocations.clone(),
+            }),
+        ])
+        .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default()).unwrap();
+    let (child, handle) = match coordinator
+        .spawn(child_spec("inspect, clarify, then edit"))
+        .await
+        .unwrap()
+    {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    let original = match coordinator.wait_task_outcome(&child).await.unwrap() {
+        ChildTaskOutcome::NeedsInput { request, .. } => request,
+        other => panic!("expected returned child input, got {other:?}"),
+    };
+    let child_session = handle.id().clone();
+    assert_eq!(edit_invocations.load(Ordering::Acquire), 0);
+    handle.shutdown().await.unwrap();
+    coordinator.flush().await.unwrap();
+    parent.shutdown().await.unwrap();
+
+    let (_runtime, resumed_parent) =
+        durable_parent_session("question-parent", sessions, checkpoints).await;
+    let resumed = DelegationCoordinator::new(
+        &resumed_parent,
+        factory.clone(),
+        DelegationConfig::default(),
+    )
+    .unwrap();
+    resumed.recover().await.unwrap();
+    assert_eq!(
+        factory.providers.lock().expect("providers poisoned").len(),
+        1,
+        "protected interaction recovery must not construct a provider"
+    );
+    assert_eq!(
+        resumed.task_outcome(&child).unwrap(),
+        Some(ChildTaskOutcome::NeedsInput {
+            child: child.clone(),
+            request: original.clone(),
+        })
+    );
+    assert_eq!(
+        resumed.take_ready_task_outcomes(),
+        [ChildTaskOutcome::NeedsInput {
+            child: child.clone(),
+            request: original,
+        }]
+    );
+
+    resumed
+        .follow_up(
+            &child,
+            UserInput::text("Use the recommended implementation"),
+        )
+        .await
+        .unwrap();
+    let completed = resumed.wait(&child).await.unwrap();
+    assert_eq!(completed.session, child_session);
+    assert_eq!(completed.turns_used, 2);
+    assert_eq!(
+        completed.last_result.as_deref(),
+        Some("continued after restart")
+    );
+    assert_eq!(edit_invocations.load(Ordering::Acquire), 0);
+    assert_eq!(
+        factory.providers.lock().expect("providers poisoned").len(),
+        2
+    );
+}
+
 /// Concurrent returned-input arrivals are delivered in canonical
 /// `(child_id, request_id)` order even when child two arrives first, and a
 /// simultaneous host waiter cannot consume the automatic delivery.
@@ -1140,6 +1315,33 @@ pub async fn assert_invalid_spec_rejected() {
     assert!(coordinator.list().is_empty());
 }
 
+/// One live parent session has one child-catalog owner. A second coordinator
+/// cannot acquire a competing execution lease or construct a child provider.
+pub async fn assert_competing_coordinator_lease_fails_closed() {
+    let (_runtime, parent) = parent_session(true).await;
+    let first_factory = Arc::new(ScriptedChildFactory::new(Vec::new()));
+    let _first =
+        DelegationCoordinator::new(&parent, first_factory, DelegationConfig::default()).unwrap();
+    let competing_factory = Arc::new(ScriptedChildFactory::new(vec![text_child_script(
+        "must not run",
+    )]));
+    let error = DelegationCoordinator::new(
+        &parent,
+        competing_factory.clone(),
+        DelegationConfig::default(),
+    )
+    .expect_err("a second coordinator must not own the same parent session");
+    assert!(error.message.contains("active delegation coordinator"));
+    assert!(
+        competing_factory
+            .providers
+            .lock()
+            .expect("providers poisoned")
+            .is_empty(),
+        "competing lease rejection must not construct a provider"
+    );
+}
+
 /// At the per-parent cap under the reject policy, spawn returns a structured
 /// capacity result and the cap is not exceeded.
 pub async fn assert_capacity_reject() {
@@ -1154,6 +1356,7 @@ pub async fn assert_capacity_reject() {
         DelegationConfig {
             limits: DelegationLimits {
                 max_running_children: 1,
+                ..DelegationLimits::default()
             },
             capacity_policy: CapacityPolicy::Reject,
             ..DelegationConfig::default()
@@ -1317,6 +1520,590 @@ pub async fn assert_follow_up_and_turn_limit() {
         .await
         .expect_err("the turn cap must reject a third task");
     assert!(err.message.contains("turn limit"), "{}", err.message);
+}
+
+/// A completed durable child is restored under the same child/session ids and
+/// its next provider request contains the prior child conversation.
+pub async fn assert_follow_up_after_parent_restart_reuses_child_session_and_history() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let (_runtime, parent) =
+        durable_parent_session("durable-parent", sessions.clone(), checkpoints.clone()).await;
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![
+            text_child_script("first answer"),
+            text_child_script("second answer"),
+        ])
+        .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default()).unwrap();
+
+    let (child, handle) = match coordinator.spawn(child_spec("first task")).await.unwrap() {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    let first = coordinator.wait(&child).await.unwrap();
+    assert_eq!(first.state, ChildState::Idle);
+    assert_eq!(
+        first.durability,
+        agent_runtime::delegation::ChildDurability::Durable
+    );
+    assert_eq!(first.tokens_used, 7);
+    let child_session = first.session.clone();
+    handle.shutdown().await.unwrap();
+    coordinator.flush().await.unwrap();
+    parent.shutdown().await.unwrap();
+
+    let (_runtime, resumed_parent) =
+        durable_parent_session("durable-parent", sessions.clone(), checkpoints.clone()).await;
+    let resumed = DelegationCoordinator::new(
+        &resumed_parent,
+        factory.clone(),
+        DelegationConfig::default(),
+    )
+    .unwrap();
+    let restored = resumed.status(&child).unwrap();
+    assert_eq!(restored.state, ChildState::Idle);
+    assert_eq!(restored.session, child_session);
+
+    resumed
+        .follow_up(&child, UserInput::text("continue with prior context"))
+        .await
+        .unwrap();
+    let second = resumed.wait(&child).await.unwrap();
+    assert_eq!(second.last_result.as_deref(), Some("second answer"));
+    assert_eq!(second.turns_used, 2);
+    assert_eq!(
+        second.tokens_used, 14,
+        "usage remains cumulative after restart"
+    );
+    assert_eq!(second.session, child_session);
+
+    let requests = factory.provider(1).requests();
+    assert_eq!(requests.len(), 1);
+    let texts = requests[0]
+        .messages
+        .iter()
+        .map(|message| message.joined_text())
+        .collect::<Vec<_>>();
+    assert!(
+        texts.iter().any(|text| text.contains("first task")),
+        "{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.contains("first answer")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("continue with prior context")),
+        "{texts:?}"
+    );
+}
+
+/// A stopped durable child remains terminal after restart and cannot be
+/// converted into a follow-up, resume, or replacement provider implicitly.
+pub async fn assert_stopped_durable_child_remains_terminal_after_restart() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let (_runtime, parent) =
+        durable_parent_session("stopped-parent", sessions.clone(), checkpoints.clone()).await;
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![
+            text_child_script("done"),
+            text_child_script("must not run"),
+        ])
+        .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default()).unwrap();
+    let (child, handle) = match coordinator.spawn(child_spec("one task")).await.unwrap() {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    coordinator.wait(&child).await.unwrap();
+    let stopped = coordinator.stop(&child).await.unwrap();
+    assert!(matches!(stopped.state, ChildState::Stopped { .. }));
+    handle.shutdown().await.unwrap();
+    coordinator.flush().await.unwrap();
+    parent.shutdown().await.unwrap();
+
+    let (_runtime, resumed_parent) =
+        durable_parent_session("stopped-parent", sessions, checkpoints).await;
+    let resumed = DelegationCoordinator::new(
+        &resumed_parent,
+        factory.clone(),
+        DelegationConfig::default(),
+    )
+    .unwrap();
+    let restored = resumed.status(&child).unwrap();
+    assert!(matches!(restored.state, ChildState::Stopped { .. }));
+    assert!(!restored.resumable());
+    assert!(
+        resumed
+            .follow_up(&child, UserInput::text("continue"))
+            .await
+            .is_err()
+    );
+    assert!(resumed.resume(&child).await.is_err());
+    assert_eq!(
+        factory.providers.lock().expect("providers poisoned").len(),
+        1,
+        "terminal recovery must not construct a replacement provider"
+    );
+}
+
+/// Retention expiry is reconciled during metadata-only recovery and cannot be
+/// bypassed by follow-up or resume.
+pub async fn assert_expired_durable_child_remains_non_resumable() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let (_runtime, parent) =
+        durable_parent_session("expired-parent", sessions.clone(), checkpoints.clone()).await;
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![
+            text_child_script("done"),
+            text_child_script("must not run"),
+        ])
+        .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default()).unwrap();
+    let (child, handle) = match coordinator.spawn(child_spec("one task")).await.unwrap() {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    coordinator.wait(&child).await.unwrap();
+    handle.shutdown().await.unwrap();
+    coordinator.flush().await.unwrap();
+    parent.shutdown().await.unwrap();
+
+    let (_runtime, resumed_parent) =
+        durable_parent_session("expired-parent", sessions, checkpoints).await;
+    let resumed = DelegationCoordinator::new(
+        &resumed_parent,
+        factory.clone(),
+        DelegationConfig {
+            limits: DelegationLimits {
+                retention_ms: Some(0),
+                ..DelegationLimits::default()
+            },
+            ..DelegationConfig::default()
+        },
+    )
+    .unwrap();
+    let expired = resumed.status(&child).unwrap();
+    assert_eq!(expired.state, ChildState::Expired);
+    assert!(!expired.resumable());
+    assert!(
+        resumed
+            .follow_up(&child, UserInput::text("continue"))
+            .await
+            .is_err()
+    );
+    assert!(resumed.resume(&child).await.is_err());
+    assert_eq!(
+        factory.providers.lock().expect("providers poisoned").len(),
+        1,
+        "expired recovery must not construct a replacement provider"
+    );
+}
+
+/// Durable records are bounded independently of live execution capacity.
+pub async fn assert_retained_child_limit_rejects_without_side_effects() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let (_runtime, parent) =
+        durable_parent_session("retained-parent", sessions.clone(), checkpoints.clone()).await;
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![
+            text_child_script("first"),
+            text_child_script("must not run"),
+        ])
+        .with_durable_stores(sessions, checkpoints),
+    );
+    let coordinator = DelegationCoordinator::new(
+        &parent,
+        factory.clone(),
+        DelegationConfig {
+            limits: DelegationLimits {
+                max_retained_children: 1,
+                ..DelegationLimits::default()
+            },
+            ..DelegationConfig::default()
+        },
+    )
+    .unwrap();
+    let child = match coordinator.spawn(child_spec("first")).await.unwrap() {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    coordinator.wait(&child).await.unwrap();
+    let error = coordinator
+        .spawn(child_spec("second"))
+        .await
+        .expect_err("retained child cap must reject another identity");
+    assert!(error.message.contains("retained child limit"));
+    assert_eq!(coordinator.list().len(), 1);
+    assert_eq!(
+        factory.providers.lock().expect("providers poisoned").len(),
+        1,
+        "retention rejection must happen before provider construction"
+    );
+}
+
+/// Process loss leaves a durable running child dormant. Exactly one explicit
+/// resume continues its checkpoint without consuming another task slot.
+pub async fn assert_interrupted_child_requires_explicit_idempotent_resume() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![text_child_script("resumed")])
+            .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let parent_id = agent_runtime_core::ids::SessionId::new("interrupted-parent");
+    let child = agent_runtime_core::ids::ChildId::new("child-1");
+    let child_session = agent_runtime_core::ids::SessionId::new("child-session-interrupted");
+    let child_snapshot = SessionSnapshot {
+        id: child_session.clone(),
+        history: vec![agent_runtime_core::content::Message::user("long task")],
+        usage: UsageLedger::new(),
+        identity: SessionIdentityState::default(),
+        manifests: Vec::new(),
+        extension_state: BTreeMap::new(),
+        updated: Timestamp::ZERO,
+    };
+    let checkpoint = TurnCheckpoint::accepted(
+        agent_runtime_core::ids::TurnId::new("turn-1"),
+        UserInput::text("long task"),
+        child_snapshot,
+        0,
+        Deadline::never(),
+        1,
+        0,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    checkpoints.seed(checkpoint.clone()).unwrap();
+    let durable_spec = DurableChildSpec {
+        model: ChildModelSelection::Inherit,
+        limits: ChildLimits::turns(2),
+        tools: ToolViewScope::All,
+        workspace: WorkspacePolicy::SharedProject,
+    };
+    let policy_fingerprint = factory.policy_fingerprint(&durable_spec).unwrap();
+    let status = ChildStatus {
+        child: child.clone(),
+        parent: parent_id.clone(),
+        session: child_session.clone(),
+        durability: ChildDurability::Durable,
+        state: ChildState::Running,
+        workspace: WorkspacePolicy::SharedProject,
+        turns_used: 1,
+        max_turns: 2,
+        tokens_used: 0,
+        last_result: None,
+        last_artifacts: Vec::new(),
+        updated_at: Timestamp::ZERO,
+        incompatibility: None,
+    };
+    let record = ChildSessionRecord {
+        schema_version: 1,
+        child: child.clone(),
+        child_session: child_session.clone(),
+        parent_session: parent_id.clone(),
+        spec: durable_spec,
+        policy_fingerprint,
+        status,
+        checkpoint_watermark: Some(checkpoint.watermark),
+        // The parent catalog can lag the child checkpoint at an abrupt
+        // process boundary. Recovery must derive exact resumability from the
+        // protected checkpoint without constructing a provider.
+        checkpoint_resumable: false,
+        revision: 1,
+        deadline_at: None,
+    };
+    let mut parent_extension = BTreeMap::new();
+    parent_extension.insert(
+        CHILD_CATALOG_NAMESPACE.to_owned(),
+        VersionedSessionState::new(
+            DurableChildCatalog::revision(),
+            serde_json::to_value(DurableChildCatalog::new(1, vec![record])).unwrap(),
+        )
+        .redaction_safe(),
+    );
+    sessions.seed(SessionSnapshot {
+        id: parent_id,
+        history: Vec::new(),
+        usage: UsageLedger::new(),
+        identity: SessionIdentityState::default(),
+        manifests: Vec::new(),
+        extension_state: parent_extension,
+        updated: Timestamp::ZERO,
+    });
+
+    let (_runtime, resumed_parent) =
+        durable_parent_session("interrupted-parent", sessions.clone(), checkpoints.clone()).await;
+    let mut recovery_events = resumed_parent.subscribe();
+    let resumed = DelegationCoordinator::new(
+        &resumed_parent,
+        factory.clone(),
+        DelegationConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        !resumed.status(&child).unwrap().resumable(),
+        "the stale catalog bit is deliberately non-resumable before reconciliation"
+    );
+    resumed.recover().await.unwrap();
+    let mut recovered = Vec::new();
+    while let Ok(Some(envelope)) =
+        tokio::time::timeout(Duration::from_millis(20), recovery_events.next()).await
+    {
+        match envelope.payload {
+            RuntimeEvent::ChildProgress {
+                child: event_child,
+                phase:
+                    ChildPhase::Recovered {
+                        state, resumable, ..
+                    },
+            } if event_child == child => recovered.push((state, resumable)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        recovered,
+        vec![(
+            agent_runtime_core::event::ChildRecoveryState::Interrupted,
+            true
+        )],
+        "checkpoint reconciliation emits one authoritative recovery transition"
+    );
+    let interrupted = resumed.status(&child).unwrap();
+    assert!(interrupted.resumable(), "{interrupted:?}");
+    assert_eq!(
+        factory.providers.lock().expect("providers poisoned").len(),
+        0
+    );
+
+    let (left, right) = tokio::join!(resumed.resume(&child), resumed.resume(&child));
+    assert_eq!(
+        usize::from(left.is_ok()) + usize::from(right.is_ok()),
+        1,
+        "left={left:?}, right={right:?}"
+    );
+    let completed = resumed.wait(&child).await.unwrap();
+    assert_eq!(completed.state, ChildState::Idle);
+    assert_eq!(completed.last_result.as_deref(), Some("resumed"));
+    assert_eq!(completed.turns_used, 1, "resume is not a new child task");
+    assert_eq!(completed.session, child_session);
+}
+
+/// A checkpoint written immediately before provider I/O cannot be replayed:
+/// the provider outcome is indeterminate after process loss, so explicit
+/// resume fails closed before constructing a replacement provider.
+pub async fn assert_calling_model_checkpoint_refuses_resume_without_provider() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![text_child_script("must not run")])
+            .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let parent_id = agent_runtime_core::ids::SessionId::new("calling-parent");
+    let child = agent_runtime_core::ids::ChildId::new("child-1");
+    let child_session = agent_runtime_core::ids::SessionId::new("calling-child-session");
+    let child_snapshot = SessionSnapshot {
+        id: child_session.clone(),
+        history: vec![agent_runtime_core::content::Message::user("long task")],
+        usage: UsageLedger::new(),
+        identity: SessionIdentityState::default(),
+        manifests: Vec::new(),
+        extension_state: BTreeMap::new(),
+        updated: Timestamp::ZERO,
+    };
+    let accepted = TurnCheckpoint::accepted(
+        agent_runtime_core::ids::TurnId::new("turn-1"),
+        UserInput::text("long task"),
+        child_snapshot.clone(),
+        0,
+        Deadline::never(),
+        1,
+        0,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    let planning = accepted
+        .transition(
+            TurnState::Planning { step: 0 },
+            child_snapshot.clone(),
+            1,
+            Timestamp(1),
+        )
+        .unwrap();
+    let calling = planning
+        .transition(
+            TurnState::CallingModel {
+                request_id: agent_runtime_core::ids::RequestId::new("request-1"),
+                request: ProviderRequest::new(ModelId::new("fake"), child_snapshot.history.clone()),
+                step: 0,
+            },
+            child_snapshot,
+            2,
+            Timestamp(2),
+        )
+        .unwrap();
+    checkpoints.seed(calling.clone()).unwrap();
+
+    let durable_spec = DurableChildSpec {
+        model: ChildModelSelection::Inherit,
+        limits: ChildLimits::turns(2),
+        tools: ToolViewScope::All,
+        workspace: WorkspacePolicy::SharedProject,
+    };
+    let policy_fingerprint = factory.policy_fingerprint(&durable_spec).unwrap();
+    let status = ChildStatus {
+        child: child.clone(),
+        parent: parent_id.clone(),
+        session: child_session.clone(),
+        durability: ChildDurability::Durable,
+        state: ChildState::Running,
+        workspace: WorkspacePolicy::SharedProject,
+        turns_used: 1,
+        max_turns: 2,
+        tokens_used: 0,
+        last_result: None,
+        last_artifacts: Vec::new(),
+        updated_at: Timestamp::ZERO,
+        incompatibility: None,
+    };
+    let record = ChildSessionRecord {
+        schema_version: 1,
+        child: child.clone(),
+        child_session,
+        parent_session: parent_id.clone(),
+        spec: durable_spec,
+        policy_fingerprint,
+        status,
+        checkpoint_watermark: Some(calling.watermark),
+        // Simulate an older/optimistic catalog bit. The exact checkpoint is
+        // authoritative and must still prevent the provider from being built.
+        checkpoint_resumable: true,
+        revision: 1,
+        deadline_at: None,
+    };
+    let mut parent_extension = BTreeMap::new();
+    parent_extension.insert(
+        CHILD_CATALOG_NAMESPACE.to_owned(),
+        VersionedSessionState::new(
+            DurableChildCatalog::revision(),
+            serde_json::to_value(DurableChildCatalog::new(1, vec![record])).unwrap(),
+        )
+        .redaction_safe(),
+    );
+    sessions.seed(SessionSnapshot {
+        id: parent_id,
+        history: Vec::new(),
+        usage: UsageLedger::new(),
+        identity: SessionIdentityState::default(),
+        manifests: Vec::new(),
+        extension_state: parent_extension,
+        updated: Timestamp::ZERO,
+    });
+
+    let (_runtime, parent) = durable_parent_session("calling-parent", sessions, checkpoints).await;
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default()).unwrap();
+    assert!(coordinator.status(&child).unwrap().resumable());
+
+    let error = coordinator
+        .resume(&child)
+        .await
+        .expect_err("calling-model checkpoint must not be replayed");
+    assert!(
+        error.message.contains("duplicate provider work"),
+        "{error:?}"
+    );
+    let refused = coordinator.status(&child).unwrap();
+    assert_eq!(refused.state, ChildState::Interrupted { resumable: false });
+    assert!(
+        refused
+            .incompatibility
+            .as_deref()
+            .is_some_and(|reason| reason.contains("indeterminate")),
+        "{refused:?}"
+    );
+    assert!(
+        factory
+            .providers
+            .lock()
+            .expect("providers poisoned")
+            .is_empty(),
+        "unsafe resume must fail before constructing a provider"
+    );
+}
+
+/// Durable child ids are parent-scoped and policy changes fail closed without
+/// consuming a replacement provider/script.
+pub async fn assert_durable_child_ownership_and_policy_fail_closed() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let (_runtime, parent) =
+        durable_parent_session("owner-parent", sessions.clone(), checkpoints.clone()).await;
+    let first_factory = Arc::new(
+        ScriptedChildFactory::new(vec![text_child_script("owned")])
+            .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, first_factory, DelegationConfig::default()).unwrap();
+    let (child, handle) = match coordinator.spawn(child_spec("owner task")).await.unwrap() {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    coordinator.wait(&child).await.unwrap();
+    handle.shutdown().await.unwrap();
+    coordinator.flush().await.unwrap();
+    parent.shutdown().await.unwrap();
+
+    let (_runtime, changed_parent) =
+        durable_parent_session("owner-parent", sessions.clone(), checkpoints.clone()).await;
+    let changed_factory = Arc::new(
+        ScriptedChildFactory::new(vec![text_child_script("must not run")])
+            .with_durable_stores(sessions.clone(), checkpoints.clone())
+            .with_policy_salt("changed-policy"),
+    );
+    let changed = DelegationCoordinator::new(
+        &changed_parent,
+        changed_factory.clone(),
+        DelegationConfig::default(),
+    )
+    .unwrap();
+    let error = changed
+        .follow_up(&child, UserInput::text("continue"))
+        .await
+        .expect_err("changed policy must fail closed");
+    assert!(error.message.contains("policy") || error.message.contains("recover"));
+    assert!(
+        changed_factory
+            .providers
+            .lock()
+            .expect("providers poisoned")
+            .is_empty(),
+        "an incompatible child must not construct a provider"
+    );
+
+    let (_runtime, other_parent) =
+        durable_parent_session("other-parent", sessions.clone(), checkpoints.clone()).await;
+    let other_factory =
+        Arc::new(ScriptedChildFactory::new(Vec::new()).with_durable_stores(sessions, checkpoints));
+    let other =
+        DelegationCoordinator::new(&other_parent, other_factory, DelegationConfig::default())
+            .unwrap();
+    assert!(
+        other.status(&child).is_err(),
+        "another parent cannot adopt the id"
+    );
 }
 
 /// Children stop when the parent session shuts down and never restart.

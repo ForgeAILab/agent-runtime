@@ -38,6 +38,11 @@ async fn an_invalid_spec_is_rejected_with_no_side_effects() {
 }
 
 #[tokio::test]
+async fn a_competing_coordinator_lease_fails_closed() {
+    delegation::assert_competing_coordinator_lease_fails_closed().await;
+}
+
+#[tokio::test]
 async fn capacity_is_a_structured_result_under_the_reject_policy() {
     delegation::assert_capacity_reject().await;
 }
@@ -58,6 +63,41 @@ async fn follow_ups_reuse_the_child_and_the_turn_cap_is_enforced() {
 }
 
 #[tokio::test]
+async fn follow_up_after_parent_restart_reuses_child_session_and_history() {
+    delegation::assert_follow_up_after_parent_restart_reuses_child_session_and_history().await;
+}
+
+#[tokio::test]
+async fn stopped_durable_child_remains_terminal_after_restart() {
+    delegation::assert_stopped_durable_child_remains_terminal_after_restart().await;
+}
+
+#[tokio::test]
+async fn expired_durable_child_remains_non_resumable() {
+    delegation::assert_expired_durable_child_remains_non_resumable().await;
+}
+
+#[tokio::test]
+async fn retained_child_limit_rejects_without_side_effects() {
+    delegation::assert_retained_child_limit_rejects_without_side_effects().await;
+}
+
+#[tokio::test]
+async fn interrupted_child_requires_explicit_idempotent_resume() {
+    delegation::assert_interrupted_child_requires_explicit_idempotent_resume().await;
+}
+
+#[tokio::test]
+async fn calling_model_checkpoint_refuses_resume_without_constructing_a_provider() {
+    delegation::assert_calling_model_checkpoint_refuses_resume_without_provider().await;
+}
+
+#[tokio::test]
+async fn durable_child_ownership_and_policy_fail_closed() {
+    delegation::assert_durable_child_ownership_and_policy_fail_closed().await;
+}
+
+#[tokio::test]
 async fn children_stop_with_their_parent() {
     delegation::assert_parent_teardown_stops_children().await;
 }
@@ -65,6 +105,11 @@ async fn children_stop_with_their_parent() {
 #[tokio::test]
 async fn returned_child_input_is_lossless_and_pairs_the_parallel_suffix() {
     delegation::assert_returned_input_pairs_and_is_lossless().await;
+}
+
+#[tokio::test]
+async fn returned_child_input_survives_parent_restart_without_provider_work() {
+    delegation::assert_returned_input_survives_parent_restart_without_provider_work().await;
 }
 
 #[tokio::test]

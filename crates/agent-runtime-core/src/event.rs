@@ -74,7 +74,11 @@ use crate::usage::UsageRecord;
 ///
 /// Bumped to 8 for the generic, durability-aligned
 /// [`RuntimeEvent::PlanUpdated`] projection.
-pub const SCHEMA_VERSION: u32 = 8;
+///
+/// Bumped to 9 for durable child recovery phases: recovered child sessions,
+/// explicit resume starts, and interrupted execution are now first-class
+/// metadata-only lifecycle events.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// A configured limit the runtime enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +208,43 @@ pub enum ChildPhase {
     },
     /// The child finished a turn (its task outcome follows separately).
     TurnFinished,
+    /// A durable child record was rebound to its parent without executing it.
+    Recovered {
+        /// Stable runtime session holding the child's canonical history.
+        child_session: SessionId,
+        /// Recovery disposition rendered by hosts without inspecting stores.
+        state: ChildRecoveryState,
+        /// Whether an exact interrupted turn can be explicitly resumed.
+        resumable: bool,
+    },
+    /// An explicit resume began for one interrupted exact checkpoint.
+    ResumeStarted {
+        /// Stable child runtime session.
+        child_session: SessionId,
+    },
+    /// A live child execution ended while its durable session remained.
+    Interrupted {
+        /// Stable child runtime session.
+        child_session: SessionId,
+        /// Whether an exact checkpoint is available for explicit resume.
+        resumable: bool,
+    },
+}
+
+/// Redaction-safe durable child recovery disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildRecoveryState {
+    /// Completed child session available for another follow-up.
+    Idle,
+    /// In-flight execution was lost and remains dormant.
+    Interrupted,
+    /// Stored child exists but current policy/store compatibility blocks use.
+    Blocked,
+    /// Lifetime or retention policy expired the record.
+    Expired,
+    /// The child is terminal and retained only for bounded evidence.
+    Terminal,
 }
 
 /// The semantic payload of a runtime event. This is the canonical vocabulary

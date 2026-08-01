@@ -142,13 +142,13 @@ wants to proceed anyway must opt in explicitly via
 
 ## 6. Event schema version 8
 
-`SCHEMA_VERSION` is now `8`. The current vocabulary includes registry sealing,
+`SCHEMA_VERSION` is now `9`. The current vocabulary includes registry sealing,
 scoped-view derivation, model resolution, capability retrieval and activation,
 context planning and compaction, cache-plan changes, budget failures,
 attempt-scoped speculative output, metadata-only interaction lifecycle,
 lossless child `needs_input`, and durability-aligned `PlanUpdated`.
 
-Committed v5 through v8 fixtures guard the compatible wire representations.
+Committed v5 through v9 fixtures guard the compatible wire representations.
 Pre-v5 output deltas are intentionally not accepted because they lack the
 request/attempt identity needed to discard retry output safely. A consumer
 that matches exhaustively on `RuntimeEvent` must handle the new variants.
@@ -249,6 +249,46 @@ back in bounded pages through `artifact.read`. Todos, memory, artifacts, and
 semantic summaries remain generic mechanism; hosts still own their sources,
 trust policy, persistence implementations, and presentation.
 
+## 11. Durable child sessions require both stores
+
+Delegation remains host-composed. A `ChildRuntimeFactory` that exposes both a
+`SessionStore` and a protected `CheckpointStore` creates durable child
+sessions; omitting either retains the compatible process-ephemeral behavior.
+The coordinator stores only bounded child identity, policy, status, limits,
+and checkpoint-watermark metadata in the parent session's redaction-safe
+`extension_state`. Exact task content remains in the child snapshot and
+checkpoint.
+
+After the parent is restored, construct `DelegationCoordinator`, then call
+`recover().await` before listing or accepting child operations. Recovery
+reconciles a catalog that may lag its protected child checkpoint after abrupt
+process loss, restores returned interactions, and constructs no providers.
+Then use:
+
+- `follow_up(child, input)` for a new task turn on an idle retained child;
+- `resume(child)` only for an interrupted exact checkpoint;
+- `spawn(spec)` only when a new child identity is intended.
+
+These operations never fall back to one another. Resume refuses missing,
+terminal, regressed, policy-incompatible, or unsafe checkpoints. In
+particular, `TurnState::CallingModel` is non-resumable because process loss
+cannot prove whether the provider completed the request; replay could duplicate
+provider work. Hosts must hold an exclusive lifecycle lease for the parent
+session across processes. The runtime additionally rejects a second
+coordinator for the same live `SessionHandle`.
+
+`RuntimeEvent` schema v9 adds child `recovered`, `interrupted`, and
+`resume_started` progress phases. Consumers matching `ChildPhase`
+exhaustively must handle them. The v5-v9 golden fixtures retain older readable
+wire forms.
+
+A child questionnaire returned to its parent is saved as sensitive
+session-extension state in the child's protected checkpoint. The same
+`recover().await` pass reloads and re-queues the exact attributed request;
+ordinary redacted snapshots may omit it. The narrower
+`recover_returned_interactions().await` method remains available to hosts that
+have already reconciled checkpoint metadata separately.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.
@@ -264,3 +304,7 @@ trust policy, persistence implementations, and presentation.
 - [ ] Provide a protected `CheckpointStore` if mid-turn recovery is required.
 - [ ] Decide whether the host opts into live ability routing and which harness
       components/sources it trusts.
+- [ ] Decide whether delegated children are durable; if so, provide both
+      stores and an exclusive cross-process parent-session lifecycle lease.
+- [ ] Keep child follow-up and exact interrupted-turn resume as separate user
+      operations; never replace a failed lookup with spawn.

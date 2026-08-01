@@ -98,9 +98,9 @@ pub mod prelude {
     };
     pub use crate::error::{ErrorKind, Result, RuntimeError};
     pub use crate::event::{
-        BudgetCategory, ChildPhase, CompactionReason, EstimationConfidence, EventEnvelope,
-        LimitKind, PlanItemProjection, PlanItemStatus, PlanSensitivity, RuntimeEvent,
-        SCHEMA_VERSION, TurnFinish,
+        BudgetCategory, ChildPhase, ChildRecoveryState, CompactionReason, EstimationConfidence,
+        EventEnvelope, LimitKind, PlanItemProjection, PlanItemStatus, PlanSensitivity,
+        RuntimeEvent, SCHEMA_VERSION, TurnFinish,
     };
     pub use crate::grant::{
         AuthorizationDecision, CapabilityGrant, ConstraintDimension, ConstraintValue, DecisionCode,

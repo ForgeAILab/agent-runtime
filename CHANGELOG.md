@@ -25,11 +25,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - `Named`/`Registry<T>`/`Sealed<T>` moved to `agent-runtime-registry`. A `Named`
   impl on a foreign type (e.g. `Arc<dyn YourTrait>`) is now an orphan impl and
   needs a local newtype.
-- Event `SCHEMA_VERSION` is now `8`. Since the registry-driven v2 baseline,
+- Event `SCHEMA_VERSION` is now `9`. Since the registry-driven v2 baseline,
   tool-call argument projection, delegation, attempt-scoped streaming,
   metadata-only host interaction, lossless child `needs_input`, and
-  durability-aligned `PlanUpdated` each advanced the vocabulary. Golden
-  fixtures retain the compatible v5 through v8 wire forms; pre-v5
+  durability-aligned `PlanUpdated`, and durable-child recovery/resume each
+  advanced the vocabulary. Golden fixtures retain the compatible v5 through
+  v9 wire forms; pre-v5
   unattributed output deltas are intentionally rejected.
 - `SessionHandle::send` and `run` return `Result<TurnHandle, RuntimeError>`.
   `TurnHandle` owns turn-local interruption and completion; use
@@ -115,10 +116,20 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   views lose delegation tools; a child session cannot construct a
   coordinator), spawn/follow-up/stop pass the composed authorization path
   under the host-covered `agent.delegate` permission, per-parent and shared
-  capacity are reject-by-default with an explicit queue policy, and children
-  stop with their parent or process and never resume. Attributed child
+  capacity are reject-by-default with an explicit queue policy. Hosts that do
+  not provide both child stores retain process-ephemeral behavior. With both
+  stores, bounded parent-owned records retain stable child/session identity,
+  cumulative limits, policy fingerprints, and safe checkpoint watermarks;
+  restored children remain dormant until an explicit new-turn `follow_up` or
+  exact-checkpoint `resume`. Unsafe in-flight provider checkpoints fail closed,
+  competing in-process coordinators are rejected, and host lifecycle leases
+  remain the cross-process boundary. The provider-free `recover()` pass
+  reconciles a protected child checkpoint newer than its parent catalog after
+  abrupt process loss before child commands are accepted. Returned child
+  questionnaires live in protected extension state and can be re-queued after
+  restart without provider work. Attributed child
   lifecycle events (`ChildSpawned` … `ChildFailed`) join the event vocabulary
-  (`SCHEMA_VERSION` is now `4`); the completed event carries the child's
+  (`SCHEMA_VERSION` is now `9`); the completed event carries the child's
   final result so coalescing can never drop it.
 - Safe-boundary content injection: `SessionHandle::inject` queues bounded
   host content (`RuntimeBuilder::injection_queue_limit`, default 64) that the

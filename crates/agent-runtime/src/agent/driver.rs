@@ -467,12 +467,7 @@ impl Driver {
                 }
             }
         }
-        Ok(SessionExecutionContext::new(
-            planner,
-            interaction_disposition,
-            extension_state,
-            abilities,
-        ))
+        SessionExecutionContext::new(planner, interaction_disposition, extension_state, abilities)
     }
 
     pub(crate) fn executor(&self) -> &ToolExecutor {

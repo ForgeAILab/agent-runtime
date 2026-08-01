@@ -1,6 +1,7 @@
 //! The session handle: send input, subscribe to events, cancel, and shut down.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
 use agent_runtime_core::ids::{SessionId, TurnId};
 use agent_runtime_core::interaction::InteractionRequest;
-use agent_runtime_core::store::SessionSnapshot;
+use agent_runtime_core::store::{SessionSnapshot, VersionedSessionState};
 use serde_json::Value;
 
 use crate::capability::ActivationEpoch;
@@ -46,6 +47,9 @@ pub struct SessionInner {
     pub(crate) turns_changed: Notify,
     pub(crate) shutdown_lock: AsyncMutex<bool>,
     pub(crate) active_session_lease: ActiveSessionLease,
+    /// Ensures one delegation coordinator owns this parent session's child
+    /// catalog and execution bindings at a time.
+    pub(crate) delegation_coordinator_active: AtomicBool,
     /// An unanswered interaction checkpoint was intentionally left dormant.
     pub(crate) recovery_deferred: bool,
 }
@@ -149,6 +153,25 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    pub(crate) fn acquire_delegation_coordinator(&self) -> Result<(), RuntimeError> {
+        self.inner
+            .delegation_coordinator_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| {
+                RuntimeError::conflict(format!(
+                    "session `{}` already has an active delegation coordinator",
+                    self.id()
+                ))
+            })
+    }
+
+    pub(crate) fn release_delegation_coordinator(&self) {
+        self.inner
+            .delegation_coordinator_active
+            .store(false, Ordering::Release);
+    }
+
     pub(crate) fn new(inner: Arc<SessionInner>) -> Self {
         Self { inner }
     }
@@ -500,6 +523,42 @@ impl SessionHandle {
             extension_state: self.inner.execution.snapshot_extension_state(),
             updated: self.inner.shared.clock.now(),
         }
+    }
+
+    /// Persists the current canonical snapshot when a session store exists.
+    ///
+    /// Runtime-owned background components use this at their own committed
+    /// lifecycle boundaries (for example, a child completing while its parent
+    /// is idle). It never changes canonical state and is a no-op for an
+    /// explicitly ephemeral session.
+    pub async fn persist(&self) -> Result<(), RuntimeError> {
+        match &self.inner.shared.session_store {
+            Some(store) => store.save(&self.snapshot()).await,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn extension_state(&self, namespace: &str) -> Option<VersionedSessionState> {
+        self.inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .get(namespace)
+            .cloned()
+    }
+
+    pub(crate) fn set_extension_state(
+        &self,
+        namespace: impl Into<String>,
+        state: VersionedSessionState,
+    ) {
+        self.inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .insert(namespace.into(), state);
     }
 
     /// Typed artifact references produced by one turn.

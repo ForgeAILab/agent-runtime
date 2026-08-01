@@ -10,6 +10,7 @@ const EVENT_ENVELOPE_V5: &str = include_str!("fixtures/event-envelope-v5.json");
 const EVENT_ENVELOPE_V6: &str = include_str!("fixtures/event-envelope-v6.json");
 const EVENT_ENVELOPE_V7: &str = include_str!("fixtures/event-envelope-v7.json");
 const EVENT_ENVELOPE_V8: &str = include_str!("fixtures/event-envelope-v8.json");
+const EVENT_ENVELOPE_V9: &str = include_str!("fixtures/event-envelope-v9.json");
 
 /// Asserts every envelope carries the current schema version, round-trips
 /// losslessly through JSON, and that sequence numbers are strictly increasing.
@@ -84,6 +85,19 @@ pub fn assert_v8_golden_fixture() {
     );
 }
 
+/// Asserts the current serializer exactly matches the v9 durable-child
+/// recovery, interruption, and explicit-resume lifecycle fixture.
+pub fn assert_v9_golden_fixture() {
+    let expected: Value = serde_json::from_str(EVENT_ENVELOPE_V9).expect("valid v9 fixture JSON");
+    let envelopes: Vec<EventEnvelope> =
+        serde_json::from_value(expected.clone()).expect("v9 fixture remains readable");
+    let actual = serde_json::to_value(envelopes).expect("serialize v9 fixture");
+    assert_eq!(
+        actual, expected,
+        "the v9 EventEnvelope JSON representation changed"
+    );
+}
+
 /// Asserts old unattributed delta fixtures remain rejected by v6 just as they
 /// were by v5; adding interaction events does not relax output attribution.
 pub fn assert_unattributed_output_fixtures_are_rejected() {
@@ -131,6 +145,11 @@ mod tests {
     #[test]
     fn v8_golden_fixture_is_exactly_compatible() {
         assert_v8_golden_fixture();
+    }
+
+    #[test]
+    fn v9_golden_fixture_is_exactly_compatible() {
+        assert_v9_golden_fixture();
     }
 
     #[test]
