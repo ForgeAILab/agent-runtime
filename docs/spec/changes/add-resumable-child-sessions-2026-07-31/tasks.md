@@ -1,7 +1,7 @@
 ---
 created_at: 2026-08-01T00:56:16Z
-updated_at: 2026-08-01T01:08:11Z
-completed_at:
+updated_at: 2026-08-01T03:24:02Z
+completed_at: 2026-08-01T03:24:02Z
 ---
 
 ## 0. Coordination and Baseline
@@ -80,6 +80,7 @@ completed_at:
   and runtime/testkit examples; label legacy and no-store children ephemeral.
 - [x] 6.2 Run fmt, warning-denied Clippy, workspace/all-feature tests, MSRV,
   store corruption/privacy tests, and delegation conformance.
-- [ ] 6.3 Pin and validate the coordinated Smith revision, including a
+- [x] 6.3 Pin and validate the coordinated Smith revision
+  `71ada9c5d3fc6bda37fb20f0b9f327fe39771573`, including a
   process-restart follow-up and an explicit interrupted-task resume, before
   release.
