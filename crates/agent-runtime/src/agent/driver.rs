@@ -65,8 +65,8 @@ use crate::runtime::inject::InjectionQueue;
 use crate::runtime::state::{SessionExecutionContext, SessionState};
 use crate::tool::ToolExecutor;
 use crate::tool::executor::{
-    PendingApprovalResolution, PendingToolApproval, PreparedAuthorization, PreparedToolBatch,
-    RawToolResult,
+    PendingApprovalResolution, PendingToolApproval, PreparationAuthorizationContext,
+    PreparedAuthorization, PreparedToolBatch, RawToolResult,
 };
 use crate::tool::registry::SealedToolRegistry;
 
@@ -90,6 +90,14 @@ fn argument_keys(arguments: &Value) -> Vec<String> {
         .as_object()
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+fn local_finish(result: &ToolResultBlock, cancel: &Cancellation) -> TurnFinish {
+    match cancel.reason() {
+        Some(reason) => TurnFinish::Cancelled { reason },
+        None if result.is_error => TurnFinish::Failed,
+        None => TurnFinish::Completed,
+    }
 }
 
 fn validate_history_projection(
@@ -549,6 +557,40 @@ impl Driver {
         .await;
     }
 
+    /// Runs one explicit host tool action through the checkpointed turn
+    /// machinery without constructing or calling a provider request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_local_tool(
+        &self,
+        state: Arc<Mutex<SessionState>>,
+        execution: Arc<SessionExecutionContext>,
+        emitter: Arc<EventEmitter>,
+        minter: Arc<IdMinter>,
+        turn_cancel: Cancellation,
+        inbox: Arc<Mutex<InjectionQueue>>,
+        turn_id: TurnId,
+        call: ToolCall,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let mut machine = TurnMachine::new(
+            self,
+            state,
+            execution,
+            emitter,
+            minter,
+            turn_cancel,
+            inbox,
+            turn_id,
+        );
+        match machine.run_local_action(call, deadline).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                machine.emit_non_durable_failure(error.clone(), false);
+                Err(error)
+            }
+        }
+    }
+
     /// Resumes one validated non-terminal checkpoint without minting a new
     /// turn or re-appending its accepted input.
     #[allow(clippy::too_many_arguments)]
@@ -690,6 +732,52 @@ impl<'a> TurnMachine<'a> {
             input,
             self.snapshot(),
             active_history_start,
+            deadline,
+            checkpoint_sequence,
+            self.emitter.next_sequence(),
+            self.driver.clock.now(),
+        )?;
+        if let Some(store) = &self.driver.checkpoint_store {
+            store.save(&checkpoint).await?;
+        }
+        self.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
+    async fn checkpoint_local_action(
+        &mut self,
+        request_id: RequestId,
+        call: ToolCall,
+        deadline: Deadline,
+    ) -> Result<(), RuntimeError> {
+        if self.checkpoint.is_some() {
+            return Err(RuntimeError::conflict(
+                "local-action checkpoint already exists for this turn",
+            ));
+        }
+        let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
+            match store.load_latest(self.emitter.session()).await? {
+                None => 1,
+                Some(previous)
+                    if previous.turn != self.turn_id
+                        && matches!(previous.state, TurnState::Terminal { .. }) =>
+                {
+                    previous.watermark.checkpoint_sequence.saturating_add(1)
+                }
+                Some(_) => {
+                    return Err(RuntimeError::conflict(
+                        "cannot accept a local action over a non-terminal checkpoint",
+                    ));
+                }
+            }
+        } else {
+            1
+        };
+        let checkpoint = TurnCheckpoint::local_action(
+            self.turn_id.clone(),
+            request_id,
+            call,
+            self.snapshot(),
             deadline,
             checkpoint_sequence,
             self.emitter.next_sequence(),
@@ -1144,10 +1232,13 @@ impl<'a> TurnMachine<'a> {
                 .prepare_and_authorize_once(
                     call,
                     call.arguments.clone(),
-                    request_id,
-                    self.emitter.session(),
-                    &self.cancel,
-                    deadline,
+                    PreparationAuthorizationContext::new(
+                        request_id,
+                        self.emitter.session(),
+                        Some(&self.turn_id),
+                        &self.cancel,
+                        deadline,
+                    ),
                 )
                 .await
             {
@@ -1254,10 +1345,13 @@ impl<'a> TurnMachine<'a> {
                             .prepare_and_authorize_once(
                                 &edited,
                                 edited.arguments.clone(),
-                                request_id,
-                                self.emitter.session(),
-                                &self.cancel,
-                                deadline,
+                                PreparationAuthorizationContext::new(
+                                    request_id,
+                                    self.emitter.session(),
+                                    Some(&self.turn_id),
+                                    &self.cancel,
+                                    deadline,
+                                ),
                             )
                             .await
                         {
@@ -1925,7 +2019,13 @@ impl<'a> TurnMachine<'a> {
             match self
                 .driver
                 .executor
-                .reauthorize_prepared(prepared, self.emitter.session(), &self.cancel, deadline)
+                .reauthorize_prepared(
+                    prepared,
+                    self.emitter.session(),
+                    Some(&self.turn_id),
+                    &self.cancel,
+                    deadline,
+                )
                 .await
             {
                 PreparedAuthorization::Ready(authorized) => {
@@ -1980,10 +2080,13 @@ impl<'a> TurnMachine<'a> {
                             .prepare_and_authorize_once(
                                 &edited,
                                 edited.arguments.clone(),
-                                request_id,
-                                self.emitter.session(),
-                                &self.cancel,
-                                deadline,
+                                PreparationAuthorizationContext::new(
+                                    request_id,
+                                    self.emitter.session(),
+                                    Some(&self.turn_id),
+                                    &self.cancel,
+                                    deadline,
+                                ),
                             )
                             .await
                         {
@@ -2070,6 +2173,7 @@ impl<'a> TurnMachine<'a> {
                         .reauthorize_prepared(
                             prepared.clone(),
                             self.emitter.session(),
+                            Some(&self.turn_id),
                             &self.cancel,
                             deadline,
                         )
@@ -2125,6 +2229,358 @@ impl<'a> TurnMachine<'a> {
         })
     }
 
+    async fn run_local_action(
+        &mut self,
+        call: ToolCall,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let request_id = self.minter.request();
+        let history_start = self
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .history
+            .len();
+        self.execution
+            .begin_turn(self.turn_id.clone(), history_start);
+        self.emitter
+            .emit(Some(self.turn_id.clone()), RuntimeEvent::TurnStarted);
+        self.checkpoint_local_action(request_id.clone(), call.clone(), deadline)
+            .await?;
+        self.emit_local_tool_requested(&call);
+        self.prepare_and_run_local(request_id, call, deadline).await
+    }
+
+    fn emit_local_tool_requested(&self, call: &ToolCall) {
+        self.emitter.emit(
+            Some(self.turn_id.clone()),
+            RuntimeEvent::ToolCallRequested {
+                call: call.id.clone(),
+                name: call.name.clone(),
+                argument_keys: argument_keys(&call.arguments),
+                argument_fingerprint: Fingerprint::of(
+                    serde_json::to_vec(&call.arguments).unwrap_or_default(),
+                ),
+                arguments: None,
+            },
+        );
+    }
+
+    async fn prepare_and_run_local(
+        &mut self,
+        request_id: RequestId,
+        mut call: ToolCall,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let mut approval_edits = 0usize;
+        loop {
+            match self
+                .driver
+                .executor
+                .prepare_and_authorize_once(
+                    &call,
+                    call.arguments.clone(),
+                    PreparationAuthorizationContext::new(
+                        &request_id,
+                        self.emitter.session(),
+                        Some(&self.turn_id),
+                        &self.cancel,
+                        deadline,
+                    ),
+                )
+                .await
+            {
+                PreparedAuthorization::Ready(ready) => {
+                    self.transition(TurnState::LocalActionPrepared {
+                        request_id: request_id.clone(),
+                        call: call.clone(),
+                        prepared: ready.prepared.clone(),
+                    })
+                    .await?;
+                    return self.invoke_local_ready(request_id, ready, deadline).await;
+                }
+                PreparedAuthorization::AwaitingApproval(pending) => {
+                    self.transition(TurnState::LocalActionPrepared {
+                        request_id: request_id.clone(),
+                        call: call.clone(),
+                        prepared: pending.prepared().clone(),
+                    })
+                    .await?;
+                    match self
+                        .driver
+                        .executor
+                        .decide_pending_approval(
+                            pending,
+                            &request_id,
+                            self.emitter.session(),
+                            &self.turn_id,
+                            &self.cancel,
+                            deadline,
+                        )
+                        .await
+                    {
+                        PendingApprovalResolution::Ready(ready) => {
+                            return self.invoke_local_ready(request_id, ready, deadline).await;
+                        }
+                        PendingApprovalResolution::Edited(edited) => {
+                            approval_edits = approval_edits.saturating_add(1);
+                            if approval_edits > 8 {
+                                let result = crate::tool::executor::error_block(
+                                    &edited,
+                                    "approval denied: too many edited action proposals",
+                                    self.driver.config.output_limit,
+                                );
+                                return self.commit_local_result(request_id, edited, result).await;
+                            }
+                            call = edited;
+                        }
+                        PendingApprovalResolution::Rejected(result) => {
+                            return self.commit_local_result(request_id, call, result).await;
+                        }
+                    }
+                }
+                PreparedAuthorization::Rejected(result) => {
+                    return self.commit_local_result(request_id, call, result).await;
+                }
+            }
+        }
+    }
+
+    async fn resume_local_prepared(
+        &mut self,
+        request_id: RequestId,
+        call: ToolCall,
+        prepared: agent_runtime_core::tool::PreparedToolCall,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        match self
+            .driver
+            .executor
+            .reauthorize_prepared(
+                prepared,
+                self.emitter.session(),
+                Some(&self.turn_id),
+                &self.cancel,
+                deadline,
+            )
+            .await
+        {
+            PreparedAuthorization::Ready(ready) => {
+                self.invoke_local_ready(request_id, ready, deadline).await
+            }
+            PreparedAuthorization::AwaitingApproval(pending) => {
+                match self
+                    .driver
+                    .executor
+                    .decide_pending_approval(
+                        pending,
+                        &request_id,
+                        self.emitter.session(),
+                        &self.turn_id,
+                        &self.cancel,
+                        deadline,
+                    )
+                    .await
+                {
+                    PendingApprovalResolution::Ready(ready) => {
+                        self.invoke_local_ready(request_id, ready, deadline).await
+                    }
+                    PendingApprovalResolution::Edited(edited) => {
+                        self.prepare_and_run_local(request_id, edited, deadline)
+                            .await
+                    }
+                    PendingApprovalResolution::Rejected(result) => {
+                        self.commit_local_result(request_id, call, result).await
+                    }
+                }
+            }
+            PreparedAuthorization::Rejected(result) => {
+                self.commit_local_result(request_id, call, result).await
+            }
+        }
+    }
+
+    async fn invoke_local_ready(
+        &mut self,
+        request_id: RequestId,
+        ready: crate::tool::executor::ReadyToolCall,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let call = ready.call.clone();
+        self.transition(TurnState::LocalActionExecuting {
+            request_id: request_id.clone(),
+            call: call.clone(),
+            prepared: ready.prepared.clone(),
+        })
+        .await?;
+        let raw = self
+            .driver
+            .executor
+            .invoke_one_raw(ready, &request_id, &self.cancel, deadline)
+            .await;
+        self.transition(TurnState::LocalActionOutcomeReady {
+            request_id: request_id.clone(),
+            call: raw.call.clone(),
+            outcome: raw.outcome.clone(),
+        })
+        .await?;
+        self.process_local_outcome(request_id, raw.call, raw.outcome, deadline)
+            .await
+    }
+
+    async fn process_local_outcome(
+        &mut self,
+        request_id: RequestId,
+        call: ToolCall,
+        mut outcome: ToolOutcome,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let mut updates = Vec::<(String, VersionedSessionState)>::new();
+        let mut component_events = Vec::new();
+        for processor in self.driver.harness.tool_output() {
+            let descriptor = processor.descriptor();
+            let current_state = self
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned")
+                .get(descriptor.id().as_str())
+                .cloned();
+            let patch = await_harness_phase(
+                processor.process(
+                    &ToolOutputView {
+                        session: self.emitter.session().clone(),
+                        turn: self.turn_id.clone(),
+                        request: request_id.clone(),
+                        call: call.clone(),
+                        state: current_state,
+                    },
+                    outcome,
+                ),
+                &self.cancel,
+                deadline,
+                self.driver.clock.clone(),
+                "running local tool-output processor",
+            )
+            .await?;
+            outcome = patch.outcome;
+            component_events.extend(patch.events);
+            if let Some(state) = patch.state {
+                if state.revision != *descriptor.revision() {
+                    return Err(RuntimeError::conflict(format!(
+                        "tool-output component `{}` returned state revision `{}` but declares `{}`",
+                        descriptor.id(),
+                        state.revision,
+                        descriptor.revision()
+                    )));
+                }
+                updates.push((descriptor.id().as_str().to_owned(), state.into_state()));
+            }
+        }
+
+        let artifact = outcome.content.artifact_reference().cloned();
+        let result = outcome.into_result_block(
+            call.id.clone(),
+            call.name.clone(),
+            self.driver.config.output_limit,
+        );
+        let previous = {
+            let mut extension = self
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            updates
+                .into_iter()
+                .map(|(namespace, state)| {
+                    let prior = extension.insert(namespace.clone(), state);
+                    (namespace, prior)
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Err(error) = self
+            .transition(TurnState::LocalActionResultReady {
+                request_id: request_id.clone(),
+                call: call.clone(),
+                result: result.clone(),
+            })
+            .await
+        {
+            let mut extension = self
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            for (namespace, prior) in previous {
+                match prior {
+                    Some(state) => {
+                        extension.insert(namespace, state);
+                    }
+                    None => {
+                        extension.remove(&namespace);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        if let Some(reference) = artifact {
+            self.execution
+                .record_artifact(self.emitter.session(), &self.turn_id, reference)?;
+        }
+        for event in component_events {
+            self.emitter
+                .emit(Some(self.turn_id.clone()), event.into_runtime_event());
+        }
+        self.publish_local_result(&result);
+        self.complete_local(local_finish(&result, &self.cancel))
+            .await?;
+        Ok(result)
+    }
+
+    async fn commit_local_result(
+        &mut self,
+        request_id: RequestId,
+        call: ToolCall,
+        result: ToolResultBlock,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        self.transition(TurnState::LocalActionResultReady {
+            request_id,
+            call,
+            result: result.clone(),
+        })
+        .await?;
+        self.publish_local_result(&result);
+        self.complete_local(local_finish(&result, &self.cancel))
+            .await?;
+        Ok(result)
+    }
+
+    fn publish_local_result(&self, result: &ToolResultBlock) {
+        self.emitter.emit(
+            Some(self.turn_id.clone()),
+            RuntimeEvent::ToolCallCompleted {
+                call: result.call_id.clone(),
+                name: result.name.clone(),
+                is_error: result.is_error,
+            },
+        );
+    }
+
+    async fn complete_local(&mut self, finish: TurnFinish) -> Result<(), RuntimeError> {
+        self.transition(TurnState::Completing {
+            finish: finish.clone(),
+            visible_output: false,
+        })
+        .await?;
+        self.transition(TurnState::PublishingTerminal {
+            finish: finish.clone(),
+            visible_output: false,
+        })
+        .await?;
+        self.publish_terminal(finish, false).await;
+        Ok(())
+    }
+
     fn emit_non_durable_failure(&self, error: RuntimeError, visible_output: bool) {
         let turn = Some(self.turn_id.clone());
         self.emitter
@@ -2166,6 +2622,60 @@ impl<'a> TurnMachine<'a> {
                     checkpoint.visible_output,
                 )
                 .await;
+            }
+            TurnState::LocalActionAccepted { request_id, call } => {
+                self.emit_local_tool_requested(&call);
+                if let Err(error) = self
+                    .prepare_and_run_local(request_id, call, checkpoint.deadline)
+                    .await
+                {
+                    self.emit_non_durable_failure(error, false);
+                }
+            }
+            TurnState::LocalActionPrepared {
+                request_id,
+                call,
+                prepared,
+            } => {
+                if let Err(error) = self
+                    .resume_local_prepared(request_id, call, prepared, checkpoint.deadline)
+                    .await
+                {
+                    self.emit_non_durable_failure(error, false);
+                }
+            }
+            TurnState::LocalActionExecuting {
+                request_id, call, ..
+            } => {
+                let result = crate::tool::executor::error_block(
+                    &call,
+                    "indeterminate local tool outcome after restart; the runtime did not replay this invocation",
+                    self.driver.config.output_limit,
+                );
+                if let Err(error) = self.commit_local_result(request_id, call, result).await {
+                    self.emit_non_durable_failure(error, false);
+                }
+            }
+            TurnState::LocalActionOutcomeReady {
+                request_id,
+                call,
+                outcome,
+            } => {
+                if let Err(error) = self
+                    .process_local_outcome(request_id, call, outcome, checkpoint.deadline)
+                    .await
+                {
+                    self.emit_non_durable_failure(error, false);
+                }
+            }
+            TurnState::LocalActionResultReady { result, .. } => {
+                self.publish_local_result(&result);
+                if let Err(error) = self
+                    .complete_local(local_finish(&result, &self.cancel))
+                    .await
+                {
+                    self.emit_non_durable_failure(error, false);
+                }
             }
             TurnState::Planning { step } => {
                 self.run_loop(
@@ -2463,7 +2973,13 @@ impl<'a> TurnMachine<'a> {
                 finish,
                 visible_output,
             } => {
-                self.complete(finish, visible_output).await;
+                if checkpoint.active_history_start == checkpoint.snapshot.history.len() {
+                    if let Err(error) = self.complete_local(finish).await {
+                        self.emit_non_durable_failure(error, false);
+                    }
+                } else {
+                    self.complete(finish, visible_output).await;
+                }
             }
             TurnState::PublishingTerminal {
                 finish,
@@ -2654,6 +3170,38 @@ impl<'a> TurnMachine<'a> {
         deadline: Deadline,
         visible_output: bool,
     ) {
+        let disposition = response_disposition(response.finish, &response.tool_calls);
+        if disposition == ResponseDisposition::OutputLimit {
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::ProviderAttemptOutputDiscarded {
+                    request: request_id,
+                    attempt: response.attempt.clone(),
+                },
+            );
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::ProviderAttemptFinished {
+                    attempt: response.attempt,
+                    finish: response.finish,
+                    retryable: false,
+                },
+            );
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::LimitReached {
+                    limit: LimitKind::Output,
+                },
+            );
+            self.complete(
+                TurnFinish::LimitReached {
+                    limit: LimitKind::Output,
+                },
+                visible_output,
+            )
+            .await;
+            return;
+        }
         // ModelResponseReady is durable before these two observer events.
         // A host truncates the journal at the checkpoint's next-sequence
         // watermark before recovery, so this is the one canonical commit of
@@ -2673,12 +3221,9 @@ impl<'a> TurnMachine<'a> {
                 retryable: false,
             },
         );
-        let disposition = response_disposition(response.finish, &response.tool_calls);
         if matches!(
             disposition,
-            ResponseDisposition::Complete
-                | ResponseDisposition::Continue
-                | ResponseDisposition::OutputLimit
+            ResponseDisposition::Complete | ResponseDisposition::Continue
         ) {
             let mut parts = response.reasoning;
             if !response.text.is_empty() {
@@ -2706,21 +3251,7 @@ impl<'a> TurnMachine<'a> {
             ResponseDisposition::Complete => {
                 self.complete(TurnFinish::Completed, visible_output).await;
             }
-            ResponseDisposition::OutputLimit => {
-                self.emitter.emit(
-                    Some(self.turn_id.clone()),
-                    RuntimeEvent::LimitReached {
-                        limit: LimitKind::Output,
-                    },
-                );
-                self.complete(
-                    TurnFinish::LimitReached {
-                        limit: LimitKind::Output,
-                    },
-                    visible_output,
-                )
-                .await;
-            }
+            ResponseDisposition::OutputLimit => unreachable!("handled before output commit"),
             ResponseDisposition::Continue => {
                 if let Err(error) = self
                     .execute_tool_step(
@@ -3841,11 +4372,11 @@ impl Driver {
 
             // A terminal finish reason decides whether speculative output is
             // canonical before any commit event or history mutation occurs.
-            // Length-delimited output is intentionally retained as a usable
-            // partial answer. Provider cancellation, explicit error, and
-            // content-filtered output are discarded: none may enter canonical
-            // history or set the turn's committed-visible-output flag.
+            // An output-limit response is not a completed answer and may also
+            // contain an incomplete tool call, so its text and reasoning are
+            // discarded just like filtered, cancelled, and errored output.
             let terminal_failure = match finish {
+                FinishReason::Length => Some(ProviderTurnOutcome::LimitReached(LimitKind::Output)),
                 FinishReason::Cancelled => Some(ProviderTurnOutcome::Cancelled),
                 FinishReason::Error => Some(ProviderTurnOutcome::Failed(ProviderError::new(
                     ProviderErrorKind::MalformedStream,
@@ -3857,7 +4388,7 @@ impl Driver {
                         "provider filtered the response",
                     )))
                 }
-                FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Length => None,
+                FinishReason::Stop | FinishReason::ToolCalls => None,
             };
             if let Some(outcome) = terminal_failure {
                 emitter.emit(

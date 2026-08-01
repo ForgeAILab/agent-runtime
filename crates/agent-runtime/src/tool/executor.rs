@@ -89,6 +89,36 @@ pub(crate) enum PreparedAuthorization {
     Rejected(ToolResultBlock),
 }
 
+/// Immutable request boundary used while preparing and authorizing one call.
+///
+/// Keeping these related values together prevents a caller from accidentally
+/// mixing request, session, turn, cancellation, and deadline state.
+pub(crate) struct PreparationAuthorizationContext<'a> {
+    request: &'a RequestId,
+    session: &'a SessionId,
+    turn: Option<&'a TurnId>,
+    cancel: &'a Cancellation,
+    deadline: Deadline,
+}
+
+impl<'a> PreparationAuthorizationContext<'a> {
+    pub(crate) fn new(
+        request: &'a RequestId,
+        session: &'a SessionId,
+        turn: Option<&'a TurnId>,
+        cancel: &'a Cancellation,
+        deadline: Deadline,
+    ) -> Self {
+        Self {
+            request,
+            session,
+            turn,
+            cancel,
+            deadline,
+        }
+    }
+}
+
 /// An exact prepared action plus its in-memory eligible grant.
 ///
 /// The grant itself is deliberately not checkpointed. Recovery reauthorizes
@@ -165,7 +195,7 @@ impl ToolExecutor {
             .await
     }
 
-    async fn execute_with_turn(
+    pub(crate) async fn execute_with_turn(
         &self,
         calls: &[ToolCall],
         request: &RequestId,
@@ -269,11 +299,15 @@ impl ToolExecutor {
         &self,
         call: &ToolCall,
         arguments: Value,
-        request: &RequestId,
-        session: &SessionId,
-        cancel: &Cancellation,
-        deadline: Deadline,
+        context: PreparationAuthorizationContext<'_>,
     ) -> PreparedAuthorization {
+        let PreparationAuthorizationContext {
+            request,
+            session,
+            turn,
+            cancel,
+            deadline,
+        } = context;
         let mut authoritative_call = call.clone();
         authoritative_call.arguments = arguments.clone();
         let Some(tool) = self.registry.get(&call.name) else {
@@ -308,7 +342,7 @@ impl ToolExecutor {
 
         let preparation_context = PreparationContext {
             session: session.clone(),
-            turn: None,
+            turn: turn.cloned(),
             call_id: call.id.clone(),
             request: request.clone(),
             workspace: self.workspace.clone(),
@@ -360,7 +394,7 @@ impl ToolExecutor {
                 tool,
                 prepared,
                 session: session.clone(),
-                turn: None,
+                turn: turn.cloned(),
             });
         }
 
@@ -418,7 +452,7 @@ impl ToolExecutor {
                     tool,
                     prepared,
                     session: session.clone(),
-                    turn: None,
+                    turn: turn.cloned(),
                 })
             }
         }
@@ -434,6 +468,7 @@ impl ToolExecutor {
         &self,
         prepared: PreparedToolCall,
         session: &SessionId,
+        turn: Option<&TurnId>,
         cancel: &Cancellation,
         deadline: Deadline,
     ) -> PreparedAuthorization {
@@ -471,7 +506,7 @@ impl ToolExecutor {
                 tool,
                 prepared,
                 session: session.clone(),
-                turn: None,
+                turn: turn.cloned(),
             });
         }
 
@@ -529,7 +564,7 @@ impl ToolExecutor {
                     tool,
                     prepared,
                     session: session.clone(),
-                    turn: None,
+                    turn: turn.cloned(),
                 })
             }
         }

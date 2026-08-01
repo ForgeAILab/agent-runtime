@@ -143,7 +143,10 @@ impl CheckpointStore for InMemoryCheckpointStore {
         match checkpoints.get(checkpoint.session.as_str()) {
             None => {
                 if checkpoint.state_revision != 0
-                    || !matches!(checkpoint.state, TurnState::Accepted { .. })
+                    || !matches!(
+                        checkpoint.state,
+                        TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. }
+                    )
                 {
                     return Err(RuntimeError::conflict(
                         "the first checkpoint for a session must be accepted revision zero",
@@ -176,7 +179,10 @@ impl CheckpointStore for InMemoryCheckpointStore {
             }
             Some(current)
                 if matches!(current.state, TurnState::Terminal { .. })
-                    && matches!(checkpoint.state, TurnState::Accepted { .. }) =>
+                    && matches!(
+                        checkpoint.state,
+                        TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. }
+                    ) =>
             {
                 if checkpoint.state_revision != 0
                     || checkpoint.watermark.checkpoint_sequence

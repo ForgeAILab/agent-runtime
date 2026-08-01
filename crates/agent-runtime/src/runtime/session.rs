@@ -10,12 +10,14 @@ use tokio::task::AbortHandle;
 use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::checkpoint::TurnCheckpoint;
-use agent_runtime_core::content::{Message, UserInput};
+use agent_runtime_core::clock::Deadline;
+use agent_runtime_core::content::{Message, ToolCall, ToolResultBlock, UserInput};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
 use agent_runtime_core::ids::{SessionId, TurnId};
 use agent_runtime_core::interaction::InteractionRequest;
 use agent_runtime_core::store::SessionSnapshot;
+use serde_json::Value;
 
 use crate::capability::ActivationEpoch;
 use crate::ids::IdMinter;
@@ -208,6 +210,73 @@ impl SessionHandle {
         let handle = self.spawn_turn(input)?;
         handle.completed().await;
         Ok(handle)
+    }
+
+    /// Runs one explicit host-requested tool action without making a provider
+    /// request.
+    ///
+    /// The call is serialized with ordinary turns and passes through the same
+    /// schema validation, preparation, exact-resource authorization, approval,
+    /// workspace enforcement, cancellation, deadline, scheduling, and output
+    /// bound as a model-requested tool call. It is intentionally unavailable
+    /// while another turn or local action is active.
+    pub async fn run_local_tool(
+        &self,
+        name: impl Into<String>,
+        arguments: Value,
+        timeout_ms: u64,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        if self.inner.recovery_deferred {
+            return Err(RuntimeError::conflict(
+                "session has a deferred pending interaction and cannot accept a local action",
+            ));
+        }
+
+        let turn = self.inner.minter.turn();
+        let cancel = self.inner.cancel.child();
+        {
+            let mut turns = self.inner.turns.lock().expect("session turns poisoned");
+            if turns.shutting_down {
+                return Err(RuntimeError::conflict(
+                    "session is shutting down and no longer accepts local actions",
+                ));
+            }
+            if turns.count != 0 {
+                return Err(RuntimeError::conflict(
+                    "a local tool action requires an idle session",
+                ));
+            }
+            turns.count = 1;
+            turns.current = Some(turn.clone());
+            turns.cancellations.insert(turn.clone(), cancel.clone());
+        }
+        let _active = LocalToolGuard {
+            inner: self.inner.clone(),
+            turn: turn.clone(),
+        };
+        let _turn_gate = self.inner.turn_gate.lock().await;
+
+        let call = ToolCall {
+            id: self.inner.minter.tool_call(),
+            name: name.into(),
+            arguments,
+        };
+        let deadline = Deadline::after(self.inner.shared.clock.as_ref(), timeout_ms.max(1));
+        self.inner
+            .shared
+            .driver
+            .run_local_tool(
+                self.inner.state.clone(),
+                self.inner.execution.clone(),
+                self.inner.emitter.clone(),
+                self.inner.minter.clone(),
+                cancel,
+                self.inner.inbox.clone(),
+                turn,
+                call,
+                deadline,
+            )
+            .await
     }
 
     fn spawn_turn(&self, input: UserInput) -> Result<TurnHandle, RuntimeError> {
@@ -494,6 +563,25 @@ impl SessionHandle {
         *shutdown_complete = true;
         self.inner.active_session_lease.release();
         save_result
+    }
+}
+
+struct LocalToolGuard {
+    inner: Arc<SessionInner>,
+    turn: TurnId,
+}
+
+impl Drop for LocalToolGuard {
+    fn drop(&mut self) {
+        let mut turns = self.inner.turns.lock().expect("session turns poisoned");
+        turns.count = turns.count.saturating_sub(1);
+        turns.cancellations.remove(&self.turn);
+        if turns.current.as_ref() == Some(&self.turn) {
+            turns.current = None;
+        }
+        drop(turns);
+        self.inner.execution.clear_turn(&self.turn);
+        self.inner.turns_changed.notify_waiters();
     }
 }
 

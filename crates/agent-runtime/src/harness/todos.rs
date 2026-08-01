@@ -20,7 +20,8 @@ use agent_runtime_registry::RegistryRevision;
 
 use super::pipeline::{
     ComponentDescriptor, ContextContributor, ContextPatch, ContextView, HarnessEvent,
-    SessionStatePatch, ToolOutputPatch, ToolOutputProcessor, ToolOutputView,
+    SessionStatePatch, ToolOutputPatch, ToolOutputProcessor, ToolOutputView, TurnCommitHook,
+    TurnCommitPatch, TurnCommitView,
 };
 
 /// Stable provider-advertised todo writer.
@@ -33,6 +34,8 @@ pub const MAX_TODO_ITEMS: usize = 64;
 pub const MAX_TODO_ID_CHARS: usize = 64;
 /// Maximum task-text length.
 pub const MAX_TODO_TEXT_CHARS: usize = 512;
+/// Stable reason assigned when a terminal turn leaves advisory work open.
+pub const TODO_TURN_ENDED_UNFINISHED: &str = "turn_ended_unfinished";
 
 /// Todo status reuses the canonical event vocabulary.
 pub type TodoStatus = PlanItemStatus;
@@ -68,6 +71,9 @@ pub struct TodoState {
     pub revision: u64,
     /// Canonically ordered items.
     pub items: Vec<TodoItem>,
+    /// Stable reason attached to harness-reconciled cancelled items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
 }
 
 impl std::fmt::Debug for TodoState {
@@ -88,6 +94,7 @@ impl TodoState {
             schema_version: TODO_STATE_SCHEMA_VERSION,
             revision,
             items,
+            terminal_reason: None,
         };
         state.validate()?;
         Ok(state)
@@ -165,6 +172,9 @@ impl TodoState {
                 id: item.id.clone(),
                 text: item.text.clone(),
                 status: item.status,
+                reason: (item.status == TodoStatus::Cancelled)
+                    .then(|| self.terminal_reason.clone())
+                    .flatten(),
             })
             .collect()
     }
@@ -410,6 +420,45 @@ impl ContextContributor for TodoComponent {
     }
 }
 
+#[async_trait]
+impl TurnCommitHook for TodoComponent {
+    fn descriptor(&self) -> ComponentDescriptor {
+        Self::descriptor_value()
+    }
+
+    async fn after_commit(&self, view: &TurnCommitView) -> Result<TurnCommitPatch, RuntimeError> {
+        let Some(persisted) = &view.state else {
+            return Ok(TurnCommitPatch::default());
+        };
+        let mut state = self.decode_state(persisted)?;
+        let mut changed = false;
+        for item in &mut state.items {
+            if matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress) {
+                item.status = TodoStatus::Cancelled;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(TurnCommitPatch::default());
+        }
+        state.revision = state.revision.saturating_add(1);
+        state.terminal_reason = Some(TODO_TURN_ENDED_UNFINISHED.to_owned());
+        state.validate()?;
+        let public_items =
+            (self.sensitivity == PlanSensitivity::Public).then(|| state.public_items());
+        Ok(TurnCommitPatch {
+            state: Some(self.state_patch(&state)?),
+            usage: Vec::new(),
+            events: vec![HarnessEvent::PlanUpdated {
+                revision: state.revision,
+                sensitivity: self.sensitivity,
+                counts: state.counts(),
+                items: public_items,
+            }],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -533,5 +582,64 @@ mod tests {
             patch.state.unwrap().sensitivity,
             SessionStateSensitivity::Sensitive
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_commit_cancels_unfinished_items_with_a_stable_reason() {
+        let component = TodoComponent::public();
+        let mutation = component
+            .process(
+                &ToolOutputView {
+                    session: SessionId::new("s"),
+                    turn: TurnId::new("t"),
+                    request: RequestId::new("r"),
+                    call: ToolCall {
+                        id: ToolCallId::new("c"),
+                        name: WRITE_TODOS_TOOL_NAME.into(),
+                        arguments: json!({}),
+                    },
+                    state: None,
+                },
+                ToolOutcome::json(json!({
+                    "schema_version": TODO_STATE_SCHEMA_VERSION,
+                    "items": items(),
+                })),
+            )
+            .await
+            .unwrap();
+        let committed = component
+            .after_commit(&TurnCommitView {
+                session: SessionId::new("s"),
+                turn: TurnId::new("t"),
+                finish: agent_runtime_core::event::TurnFinish::Completed,
+                visible_output: true,
+                history: Arc::from([]),
+                state: Some(mutation.state.unwrap().into_state()),
+            })
+            .await
+            .unwrap();
+        let state: TodoState = serde_json::from_value(
+            committed
+                .state
+                .as_ref()
+                .expect("terminal replacement")
+                .value
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(state.revision, 2);
+        assert_eq!(
+            state.terminal_reason.as_deref(),
+            Some(TODO_TURN_ENDED_UNFINISHED)
+        );
+        assert_eq!(state.items[0].status, TodoStatus::Completed);
+        assert_eq!(state.items[1].status, TodoStatus::Cancelled);
+        assert!(matches!(
+            &committed.events[0],
+            HarnessEvent::PlanUpdated { items: Some(items), counts, .. }
+                if items[1].reason.as_deref() == Some(TODO_TURN_ENDED_UNFINISHED)
+                    && counts["pending"] == 0
+                    && counts["in_progress"] == 0
+        ));
     }
 }

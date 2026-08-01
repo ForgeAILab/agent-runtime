@@ -39,5 +39,6 @@ pub use semantic_summary::{
 };
 pub use todos::{
     MAX_TODO_ID_CHARS, MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TODO_STATE_SCHEMA_VERSION,
-    TodoComponent, TodoItem, TodoState, TodoStatus, WRITE_TODOS_TOOL_NAME, WriteTodosTool,
+    TODO_TURN_ENDED_UNFINISHED, TodoComponent, TodoItem, TodoState, TodoStatus,
+    WRITE_TODOS_TOOL_NAME, WriteTodosTool,
 };

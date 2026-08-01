@@ -6,6 +6,7 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 use agent_runtime_registry::RegistryRevision;
 
@@ -44,6 +45,12 @@ impl fmt::Debug for Secret {
 impl fmt::Display for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[redacted]")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 

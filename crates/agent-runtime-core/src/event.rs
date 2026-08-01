@@ -172,6 +172,10 @@ pub struct PlanItemProjection {
     pub text: String,
     /// Current status.
     pub status: PlanItemStatus,
+    /// Stable terminal reconciliation reason, when the harness closed an
+    /// unfinished item rather than guessing it complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// A coarse context-budget category, used in budget-failure reporting.

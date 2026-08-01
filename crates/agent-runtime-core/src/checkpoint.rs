@@ -138,6 +138,56 @@ pub enum TurnState {
         /// Exact accepted input.
         input: UserInput,
     },
+    /// An explicit host-requested tool action was accepted without appending
+    /// model-facing conversation history.
+    LocalActionAccepted {
+        /// Stable local request identity.
+        request_id: RequestId,
+        /// Exact host-supplied call.
+        call: ToolCall,
+    },
+    /// A local action has an exact prepared invocation durably recorded before
+    /// approval or execution.
+    LocalActionPrepared {
+        /// Stable local request identity.
+        request_id: RequestId,
+        /// Exact host-supplied call.
+        call: ToolCall,
+        /// Canonical prepared action; recovery reauthorizes it before use.
+        prepared: PreparedToolCall,
+    },
+    /// A local action crossed its pre-invocation durability barrier.
+    ///
+    /// Recovery never replays this state because the external outcome is
+    /// indeterminate until a subsequent raw-outcome checkpoint exists.
+    LocalActionExecuting {
+        /// Stable local request identity.
+        request_id: RequestId,
+        /// Exact host-supplied call.
+        call: ToolCall,
+        /// Exact prepared action that may have executed.
+        prepared: PreparedToolCall,
+    },
+    /// A local action returned an exact raw outcome before fallible harness
+    /// processing or output bounding.
+    LocalActionOutcomeReady {
+        /// Stable local request identity.
+        request_id: RequestId,
+        /// Exact host-supplied call.
+        call: ToolCall,
+        /// Exact unbounded serializable outcome.
+        outcome: ToolOutcome,
+    },
+    /// A local action's canonical bounded result and component state are
+    /// durable and ready for terminal publication.
+    LocalActionResultReady {
+        /// Stable local request identity.
+        request_id: RequestId,
+        /// Exact host-supplied call.
+        call: ToolCall,
+        /// Canonical committed local result.
+        result: ToolResultBlock,
+    },
     /// Context planning is about to run.
     Planning {
         /// Zero-based tool-loop step.
@@ -269,6 +319,116 @@ impl TurnState {
         match (self, next) {
             (Self::Accepted { .. }, Self::Planning { step }) => *step == 0,
             (Self::Accepted { .. }, Self::Completing { .. }) => true,
+            (
+                Self::LocalActionAccepted { request_id, call },
+                Self::LocalActionPrepared {
+                    request_id: next_request,
+                    call: next_call,
+                    prepared,
+                },
+            ) => {
+                local_call_successor(request_id, call, next_request, next_call)
+                    && prepared_matches_call(prepared, next_call)
+            }
+            (
+                Self::LocalActionAccepted { request_id, call },
+                Self::LocalActionResultReady {
+                    request_id: next_request,
+                    call: next_call,
+                    result,
+                },
+            ) => {
+                local_call_successor(request_id, call, next_request, next_call)
+                    && result.call_id == next_call.id
+                    && result.name == next_call.name
+            }
+            (Self::LocalActionAccepted { .. }, Self::Completing { .. }) => true,
+            (
+                Self::LocalActionPrepared {
+                    request_id, call, ..
+                },
+                Self::LocalActionPrepared {
+                    request_id: next_request,
+                    call: next_call,
+                    prepared: next_prepared,
+                },
+            ) => {
+                local_call_successor(request_id, call, next_request, next_call)
+                    && next_call.id == call.id
+                    && next_call.name == call.name
+                    && prepared_matches_call(next_prepared, next_call)
+            }
+            (
+                Self::LocalActionPrepared {
+                    request_id,
+                    call,
+                    prepared,
+                },
+                Self::LocalActionExecuting {
+                    request_id: next_request,
+                    call: next_call,
+                    prepared: next_prepared,
+                },
+            ) => {
+                local_call_successor(request_id, call, next_request, next_call)
+                    && prepared == next_prepared
+            }
+            (
+                Self::LocalActionPrepared {
+                    request_id, call, ..
+                },
+                Self::LocalActionResultReady {
+                    request_id: next_request,
+                    call: next_call,
+                    result,
+                },
+            ) => {
+                local_call_successor(request_id, call, next_request, next_call)
+                    && result.call_id == next_call.id
+                    && result.name == next_call.name
+            }
+            (Self::LocalActionPrepared { .. }, Self::Completing { .. }) => true,
+            (
+                Self::LocalActionExecuting {
+                    request_id, call, ..
+                },
+                Self::LocalActionOutcomeReady {
+                    request_id: next_request,
+                    call: next_call,
+                    ..
+                },
+            ) => local_call_successor(request_id, call, next_request, next_call),
+            (
+                Self::LocalActionExecuting {
+                    request_id, call, ..
+                },
+                Self::LocalActionResultReady {
+                    request_id: next_request,
+                    call: next_call,
+                    result,
+                },
+            ) => {
+                local_call_successor(request_id, call, next_request, next_call)
+                    && result.call_id == next_call.id
+                    && result.name == next_call.name
+            }
+            (Self::LocalActionExecuting { .. }, Self::Completing { .. }) => true,
+            (
+                Self::LocalActionOutcomeReady {
+                    request_id, call, ..
+                },
+                Self::LocalActionResultReady {
+                    request_id: next_request,
+                    call: next_call,
+                    result,
+                },
+            ) => {
+                local_call_successor(request_id, call, next_request, next_call)
+                    && result.call_id == next_call.id
+                    && result.name == next_call.name
+            }
+            (Self::LocalActionOutcomeReady { .. }, Self::Completing { .. }) => true,
+            (Self::LocalActionResultReady { .. }, Self::Completing { .. }) => true,
             (
                 Self::Planning { step },
                 Self::CallingModel {
@@ -638,6 +798,19 @@ fn slots_correspond(source_calls: &[ToolCall], slots: &[ToolSlotCheckpoint]) -> 
     })
 }
 
+fn local_call_successor(
+    request: &RequestId,
+    call: &ToolCall,
+    next_request: &RequestId,
+    next_call: &ToolCall,
+) -> bool {
+    request == next_request && call.id == next_call.id && call.name == next_call.name
+}
+
+fn prepared_matches_call(prepared: &PreparedToolCall, call: &ToolCall) -> bool {
+    prepared.call_id() == &call.id && prepared.tool() == call.name && prepared.verify_fingerprint()
+}
+
 fn results_form_prefix(source_calls: &[ToolCall], completed: &[ToolResultBlock]) -> bool {
     completed.len() <= source_calls.len()
         && source_calls
@@ -801,6 +974,47 @@ impl TurnCheckpoint {
         Ok(checkpoint)
     }
 
+    /// Creates the first checkpoint for an explicit local tool action.
+    ///
+    /// Unlike a provider turn, this action owns the history boundary at the
+    /// end of the snapshot and appends no synthetic user message.
+    #[allow(clippy::too_many_arguments)]
+    pub fn local_action(
+        turn: TurnId,
+        request_id: RequestId,
+        call: ToolCall,
+        snapshot: SessionSnapshot,
+        deadline: Deadline,
+        checkpoint_sequence: u64,
+        event_sequence: u64,
+        updated: Timestamp,
+    ) -> Result<Self, RuntimeError> {
+        let session = snapshot.id.clone();
+        let active_history_start = snapshot.history.len();
+        let state = TurnState::LocalActionAccepted { request_id, call };
+        let checkpoint = Self {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            transition_revision: TURN_TRANSITION_REVISION,
+            session,
+            turn,
+            state_revision: 0,
+            operation_fingerprint: checkpoint_operation_fingerprint(
+                &state,
+                active_history_start,
+                false,
+            ),
+            active_history_start,
+            visible_output: false,
+            state,
+            snapshot,
+            deadline,
+            watermark: CheckpointWatermark::new(checkpoint_sequence, event_sequence),
+            updated,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
     /// Advances through the explicit transition table.
     ///
     /// Reapplying the exact current state is idempotent and returns the
@@ -916,7 +1130,11 @@ impl TurnCheckpoint {
                 "checkpoint sequence must start at one",
             ));
         }
-        if (self.state_revision == 0) != matches!(self.state, TurnState::Accepted { .. }) {
+        let initial = matches!(
+            self.state,
+            TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. }
+        );
+        if (self.state_revision == 0) != initial {
             return Err(RuntimeError::conflict(
                 "only an accepted checkpoint may have state revision zero",
             ));
@@ -926,7 +1144,27 @@ impl TurnCheckpoint {
                 "checkpoint snapshot/session identity mismatch",
             ));
         }
-        if self.active_history_start >= self.snapshot.history.len() {
+        let local_action = matches!(
+            self.state,
+            TurnState::LocalActionAccepted { .. }
+                | TurnState::LocalActionPrepared { .. }
+                | TurnState::LocalActionExecuting { .. }
+                | TurnState::LocalActionOutcomeReady { .. }
+                | TurnState::LocalActionResultReady { .. }
+        ) || (self.active_history_start == self.snapshot.history.len()
+            && matches!(
+                self.state,
+                TurnState::Completing { .. }
+                    | TurnState::PublishingTerminal { .. }
+                    | TurnState::Terminal { .. }
+            ));
+        if local_action {
+            if self.active_history_start != self.snapshot.history.len() {
+                return Err(RuntimeError::conflict(
+                    "local-action checkpoint changed canonical history",
+                ));
+            }
+        } else if self.active_history_start >= self.snapshot.history.len() {
             return Err(RuntimeError::conflict(
                 "checkpoint active history boundary is outside canonical history",
             ));
@@ -939,6 +1177,36 @@ impl TurnCheckpoint {
                     "accepted checkpoint input does not match canonical history",
                 ));
             }
+        }
+        match &self.state {
+            TurnState::LocalActionPrepared { call, prepared, .. }
+            | TurnState::LocalActionExecuting { call, prepared, .. } => {
+                if !prepared_matches_call(prepared, call) {
+                    return Err(RuntimeError::conflict(
+                        "local-action preparation does not match its source call",
+                    ));
+                }
+            }
+            TurnState::LocalActionResultReady { call, result, .. } => {
+                if result.call_id != call.id || result.name != call.name {
+                    return Err(RuntimeError::conflict(
+                        "local-action result does not match its source call",
+                    ));
+                }
+            }
+            TurnState::LocalActionAccepted { .. }
+            | TurnState::LocalActionOutcomeReady { .. }
+            | TurnState::Accepted { .. }
+            | TurnState::Planning { .. }
+            | TurnState::CallingModel { .. }
+            | TurnState::ModelResponseReady { .. }
+            | TurnState::AwaitingApproval { .. }
+            | TurnState::AwaitingInteraction { .. }
+            | TurnState::ToolOutcomeReady { .. }
+            | TurnState::ExecutingTools { .. }
+            | TurnState::Completing { .. }
+            | TurnState::PublishingTerminal { .. }
+            | TurnState::Terminal { .. } => {}
         }
         if matches!(
             &self.state,
@@ -1127,6 +1395,11 @@ fn checkpoint_operation_fingerprint(
 fn state_name(state: &TurnState) -> &'static str {
     match state {
         TurnState::Accepted { .. } => "accepted",
+        TurnState::LocalActionAccepted { .. } => "local_action_accepted",
+        TurnState::LocalActionPrepared { .. } => "local_action_prepared",
+        TurnState::LocalActionExecuting { .. } => "local_action_executing",
+        TurnState::LocalActionOutcomeReady { .. } => "local_action_outcome_ready",
+        TurnState::LocalActionResultReady { .. } => "local_action_result_ready",
         TurnState::Planning { .. } => "planning",
         TurnState::CallingModel { .. } => "calling_model",
         TurnState::ModelResponseReady { .. } => "model_response_ready",
