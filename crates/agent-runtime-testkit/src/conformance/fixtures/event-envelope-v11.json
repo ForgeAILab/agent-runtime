@@ -1,0 +1,29 @@
+[
+  {
+    "schema_version": 11,
+    "seq": 0,
+    "id": "evt-v11-1",
+    "session": "session-1",
+    "turn": "turn-2",
+    "timestamp": 100,
+    "payload": {
+      "event": "turn_steer_committed",
+      "steer": "steer-1",
+      "ordinal": 1
+    }
+  },
+  {
+    "schema_version": 11,
+    "seq": 1,
+    "id": "evt-v11-2",
+    "session": "session-1",
+    "turn": "turn-2",
+    "timestamp": 101,
+    "payload": {
+      "event": "turn_steer_discarded",
+      "steer": "steer-2",
+      "ordinal": 2,
+      "reason": "cancelled"
+    }
+  }
+]

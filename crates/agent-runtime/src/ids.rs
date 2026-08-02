@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_runtime_core::ids::{AttemptId, EventId, RequestId, ToolCallId, TurnId};
+use agent_runtime_core::ids::{AttemptId, EventId, RequestId, SteerId, ToolCallId, TurnId};
 use agent_runtime_core::store::SessionIdentityState;
 
 /// Mints monotonic ids for one session.
@@ -17,6 +17,7 @@ pub struct IdMinter {
     attempt: AtomicU64,
     event: AtomicU64,
     call: AtomicU64,
+    steer: AtomicU64,
 }
 
 impl IdMinter {
@@ -33,6 +34,7 @@ impl IdMinter {
             attempt: AtomicU64::new(state.attempt),
             event: AtomicU64::new(state.event),
             call: AtomicU64::new(state.tool_call),
+            steer: AtomicU64::new(state.steer),
         }
     }
 
@@ -44,6 +46,7 @@ impl IdMinter {
             attempt: self.attempt.load(Ordering::SeqCst),
             event: self.event.load(Ordering::SeqCst),
             tool_call: self.call.load(Ordering::SeqCst),
+            steer: self.steer.load(Ordering::SeqCst),
             event_seq,
         }
     }
@@ -77,6 +80,11 @@ impl IdMinter {
     pub fn tool_call(&self) -> ToolCallId {
         ToolCallId::new(format!("call-{}", Self::next(&self.call)))
     }
+
+    /// Mints the next active-turn steer id (`steer-N`).
+    pub fn steer(&self) -> SteerId {
+        SteerId::new(format!("steer-{}", Self::next(&self.steer)))
+    }
 }
 
 #[cfg(test)]
@@ -100,10 +108,12 @@ mod tests {
             attempt: 9,
             event: 12,
             tool_call: 2,
+            steer: 3,
             event_seq: 20,
         });
         assert_eq!(restored.turn().as_str(), "turn-5");
         assert_eq!(restored.request().as_str(), "req-9");
         assert_eq!(restored.event().as_str(), "evt-13");
+        assert_eq!(restored.steer().as_str(), "steer-4");
     }
 }

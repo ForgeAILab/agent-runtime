@@ -321,9 +321,14 @@ fn user_blocks(parts: &[ContentPart]) -> Vec<Value> {
 /// Splits a `data:` URI into the base64 source form the Messages API
 /// requires; anything else is forwarded as a URL source.
 fn image_source(url: &str) -> Value {
-    if let Some(rest) = url.strip_prefix("data:")
-        && let Some((header, data)) = rest.split_once(',')
-        && let Some(media_type) = header.strip_suffix(";base64")
+    if let Some((media_type, data)) = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+        .and_then(|(header, data)| {
+            header
+                .strip_suffix(";base64")
+                .map(|media_type| (media_type, data))
+        })
     {
         return json!({
             "type": "base64",
@@ -647,9 +652,7 @@ fn event_to_events(
             WireBlockDelta::Unknown => {}
         },
         WireEvent::MessageDelta { delta, usage } => {
-            if let Some(usage) = usage
-                && let Some(total) = usage.output_tokens
-            {
+            if let Some(total) = usage.and_then(|usage| usage.output_tokens) {
                 // `output_tokens` is cumulative; report only the growth.
                 let grown = total.saturating_sub(state.reported_output);
                 if grown > 0 {

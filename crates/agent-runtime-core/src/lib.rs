@@ -60,6 +60,7 @@ pub mod metadata;
 pub mod observer;
 pub mod provider;
 pub mod security;
+pub mod steer;
 pub mod store;
 pub mod tool;
 pub mod usage;
@@ -124,7 +125,7 @@ pub mod prelude {
     };
     pub use crate::ids::{
         AttemptId, ChildId, ChoiceId, EventId, GoalId, InteractionRequestId, QuestionId, RequestId,
-        SessionId, TenantId, ToolCallId, TurnId,
+        SessionId, SteerId, TenantId, ToolCallId, TurnId,
     };
     pub use crate::interaction::{
         Choice, INTERACTION_SCHEMA_VERSION, InteractionBroker, InteractionOrigin,
@@ -156,6 +157,10 @@ pub mod prelude {
     pub use crate::security::{
         ArgumentPath, AuthorizationRequest, CheckSetRevision, PermissionSet, SecurityAction,
         SecurityContext, SecurityEvidence, SecurityResource, SecuritySubject, TaintSource,
+    };
+    pub use crate::steer::{
+        DEFAULT_MAX_PENDING_STEERS, DEFAULT_MAX_STEER_INPUT_BYTES, DEFAULT_MAX_TURN_STEER_BYTES,
+        SteerDiscardReason, SteerLimits, SteerReceipt, SteerRejection, SteerRejectionReason,
     };
     pub use crate::store::{Secret, SecretStore, SessionSnapshot, SessionStore, TurnManifest};
     pub use crate::tool::{

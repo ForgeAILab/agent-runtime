@@ -46,6 +46,7 @@ use agent_runtime_core::provider::{
     FinishReason, Provider, ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest,
     ProviderStreamEvent, ToolChoice, UnsupportedFeature,
 };
+use agent_runtime_core::steer::{SteerDiscardReason, SteerLimits};
 use agent_runtime_core::store::{
     SessionSnapshot, SessionStore, TurnManifest, VersionedSessionState,
 };
@@ -65,6 +66,7 @@ use crate::provider::retry::is_retryable;
 use crate::runtime::emitter::EventEmitter;
 use crate::runtime::inject::InjectionQueue;
 use crate::runtime::state::{SessionExecutionContext, SessionState};
+use crate::runtime::steer::{DrainOrClose, SteerEntry, SteerMailbox};
 use crate::tool::ToolExecutor;
 use crate::tool::executor::{
     PendingApprovalResolution, PendingToolApproval, PreparationAuthorizationContext,
@@ -99,6 +101,19 @@ fn local_finish(result: &ToolResultBlock, cancel: &Cancellation) -> TurnFinish {
         Some(reason) => TurnFinish::Cancelled { reason },
         None if result.is_error => TurnFinish::Failed,
         None => TurnFinish::Completed,
+    }
+}
+
+fn discard_reason_for_finish(finish: &TurnFinish) -> SteerDiscardReason {
+    match finish {
+        TurnFinish::Completed => SteerDiscardReason::TurnClosed,
+        TurnFinish::Cancelled {
+            reason: CancelReason::Shutdown,
+        } => SteerDiscardReason::Shutdown,
+        TurnFinish::Cancelled { .. } => SteerDiscardReason::Cancelled,
+        TurnFinish::LimitReached { .. } => SteerDiscardReason::LimitReached,
+        TurnFinish::NeedsInput { .. } => SteerDiscardReason::NeedsInput,
+        TurnFinish::Failed => SteerDiscardReason::Failed,
     }
 }
 
@@ -334,11 +349,15 @@ impl ReasoningAccumulator {
         if text.is_empty() && signature.is_none() {
             return;
         }
-        if let Some(part) = self.parts.last_mut()
-            && !part.redacted
-            && !redacted
-            && part.signature.is_none()
-        {
+        let merge_with_last = self
+            .parts
+            .last()
+            .is_some_and(|part| !part.redacted && !redacted && part.signature.is_none());
+        if merge_with_last {
+            let part = self
+                .parts
+                .last_mut()
+                .expect("merge eligibility requires a final reasoning part");
             part.text.push_str(text);
             part.signature = signature;
             return;
@@ -401,6 +420,10 @@ pub struct Driver {
 }
 
 impl Driver {
+    pub(crate) fn steer_limits(&self) -> SteerLimits {
+        self.config.steer_limits
+    }
+
     /// Builds a driver from its injected services and configuration.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -576,6 +599,36 @@ impl Driver {
             minter,
             turn_cancel,
             inbox,
+            None,
+            turn_id,
+        )
+        .run(input)
+        .await;
+    }
+
+    /// Runs a session-facade turn with its registered steering mailbox.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_serving_turn(
+        &self,
+        state: Arc<Mutex<SessionState>>,
+        execution: Arc<SessionExecutionContext>,
+        emitter: Arc<EventEmitter>,
+        minter: Arc<IdMinter>,
+        turn_cancel: Cancellation,
+        inbox: Arc<Mutex<InjectionQueue>>,
+        steer_mailbox: Arc<SteerMailbox>,
+        turn_id: TurnId,
+        input: UserInput,
+    ) {
+        TurnMachine::new(
+            self,
+            state,
+            execution,
+            emitter,
+            minter,
+            turn_cancel,
+            inbox,
+            Some(steer_mailbox),
             turn_id,
         )
         .run(input)
@@ -593,6 +646,7 @@ impl Driver {
         minter: Arc<IdMinter>,
         turn_cancel: Cancellation,
         inbox: Arc<Mutex<InjectionQueue>>,
+        steer_mailbox: Arc<SteerMailbox>,
         turn_id: TurnId,
         input: InternalTurnInput,
     ) {
@@ -604,6 +658,7 @@ impl Driver {
             minter,
             turn_cancel,
             inbox,
+            Some(steer_mailbox),
             turn_id,
         )
         .run_internal(input)
@@ -633,6 +688,7 @@ impl Driver {
             minter,
             turn_cancel,
             inbox,
+            None,
             turn_id,
         );
         match machine.run_local_action(call, deadline).await {
@@ -655,6 +711,7 @@ impl Driver {
         minter: Arc<IdMinter>,
         turn_cancel: Cancellation,
         inbox: Arc<Mutex<InjectionQueue>>,
+        steer_mailbox: Option<Arc<SteerMailbox>>,
         checkpoint: TurnCheckpoint,
     ) {
         TurnMachine::from_checkpoint(
@@ -665,6 +722,7 @@ impl Driver {
             minter,
             turn_cancel,
             inbox,
+            steer_mailbox,
             checkpoint,
         )
         .resume()
@@ -685,6 +743,7 @@ struct TurnMachine<'a> {
     minter: Arc<IdMinter>,
     cancel: Cancellation,
     inbox: Arc<Mutex<InjectionQueue>>,
+    steer_mailbox: Option<Arc<SteerMailbox>>,
     turn_id: TurnId,
     checkpoint: Option<TurnCheckpoint>,
 }
@@ -699,6 +758,7 @@ impl<'a> TurnMachine<'a> {
         minter: Arc<IdMinter>,
         cancel: Cancellation,
         inbox: Arc<Mutex<InjectionQueue>>,
+        steer_mailbox: Option<Arc<SteerMailbox>>,
         turn_id: TurnId,
     ) -> Self {
         Self {
@@ -709,6 +769,7 @@ impl<'a> TurnMachine<'a> {
             minter,
             cancel,
             inbox,
+            steer_mailbox,
             turn_id,
             checkpoint: None,
         }
@@ -723,6 +784,7 @@ impl<'a> TurnMachine<'a> {
         minter: Arc<IdMinter>,
         cancel: Cancellation,
         inbox: Arc<Mutex<InjectionQueue>>,
+        steer_mailbox: Option<Arc<SteerMailbox>>,
         checkpoint: TurnCheckpoint,
     ) -> Self {
         Self {
@@ -733,6 +795,7 @@ impl<'a> TurnMachine<'a> {
             minter,
             cancel,
             inbox,
+            steer_mailbox,
             turn_id: checkpoint.turn.clone(),
             checkpoint: Some(checkpoint),
         }
@@ -749,6 +812,120 @@ impl<'a> TurnMachine<'a> {
             extension_state: self.execution.snapshot_extension_state(),
             updated: self.driver.clock.now(),
         }
+    }
+
+    fn emit_discarded_steers(
+        &self,
+        entries: impl IntoIterator<Item = SteerEntry>,
+        reason: SteerDiscardReason,
+    ) {
+        for entry in entries {
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::TurnSteerDiscarded {
+                    steer: entry.receipt.id,
+                    ordinal: entry.receipt.ordinal,
+                    reason,
+                },
+            );
+        }
+    }
+
+    fn close_and_discard_steers(&self, reason: SteerDiscardReason) {
+        let Some(mailbox) = &self.steer_mailbox else {
+            return;
+        };
+        self.emit_discarded_steers(mailbox.close_and_drain(), reason);
+    }
+
+    /// Appends drained steers after any already-committed tool result and
+    /// generic injection, checkpoints the next planning state, then publishes
+    /// privacy-safe dispositions. A failed checkpoint rolls back only the
+    /// steer suffix and reports those accepted entries discarded.
+    async fn commit_steers_for_planning(
+        &mut self,
+        entries: Vec<SteerEntry>,
+        step: u32,
+    ) -> Result<(), RuntimeError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let history_len = {
+            let mut state = self.state.lock().expect("session state poisoned");
+            let history_len = state.history.len();
+            state.history.extend(
+                entries
+                    .iter()
+                    .map(|entry| entry.input.clone().into_message()),
+            );
+            history_len
+        };
+        if let Err(error) = self.transition(TurnState::Planning { step }).await {
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .history
+                .truncate(history_len);
+            self.emit_discarded_steers(entries, SteerDiscardReason::Failed);
+            return Err(error);
+        }
+        for entry in entries {
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::TurnSteerCommitted {
+                    steer: entry.receipt.id,
+                    ordinal: entry.receipt.ordinal,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Runs the ordinary-completion mailbox fence. `true` means pending user
+    /// input committed and the same turn must perform another provider pass.
+    async fn continue_after_complete(&mut self, step: u32) -> Result<bool, RuntimeError> {
+        let Some(mailbox) = self.steer_mailbox.clone() else {
+            return Ok(false);
+        };
+        match mailbox.drain_or_close() {
+            DrainOrClose::Closed => Ok(false),
+            DrainOrClose::Pending(entries) => {
+                // Frozen cross-kind order at this boundary: committed model
+                // response, generic injected messages, FIFO real-user steers.
+                self.driver.drain_injected(&self.state, &self.inbox);
+                self.commit_steers_for_planning(entries, step).await?;
+                Ok(true)
+            }
+        }
+    }
+
+    async fn commit_tool_boundary_steers(&mut self, next_step: u32) -> Result<(), RuntimeError> {
+        let entries = self
+            .steer_mailbox
+            .as_ref()
+            .map(|mailbox| mailbox.drain_open())
+            .unwrap_or_default();
+        self.commit_steers_for_planning(entries, next_step).await
+    }
+
+    async fn resume_after_tool_boundary(
+        &mut self,
+        active_history_start: usize,
+        deadline: Deadline,
+        next_step: u32,
+        visible_output: bool,
+    ) {
+        if let Some(request) = self.execution.returned_interaction_id() {
+            self.complete(TurnFinish::NeedsInput { request }, visible_output)
+                .await;
+            return;
+        }
+        if let Err(error) = self.commit_tool_boundary_steers(next_step).await {
+            self.emit_non_durable_failure(error, visible_output);
+            return;
+        }
+        self.run_loop(active_history_start, deadline, next_step, visible_output)
+            .await;
     }
 
     async fn checkpoint_accepted(
@@ -936,6 +1113,7 @@ impl<'a> TurnMachine<'a> {
         visible_output: bool,
         provider_error_kind: Option<ProviderErrorKind>,
     ) {
+        self.close_and_discard_steers(discard_reason_for_finish(&finish));
         if let Err(error) = self
             .transition(TurnState::Completing {
                 finish: finish.clone(),
@@ -2739,6 +2917,7 @@ impl<'a> TurnMachine<'a> {
     }
 
     fn emit_non_durable_failure(&self, error: RuntimeError, visible_output: bool) {
+        self.close_and_discard_steers(SteerDiscardReason::Failed);
         let turn = Some(self.turn_id.clone());
         self.emitter
             .emit(turn.clone(), RuntimeEvent::Error { error });
@@ -2935,7 +3114,7 @@ impl<'a> TurnMachine<'a> {
                     self.emit_non_durable_failure(error, checkpoint.visible_output);
                     return;
                 }
-                self.run_loop(
+                self.resume_after_tool_boundary(
                     checkpoint.active_history_start,
                     checkpoint.deadline,
                     step.saturating_add(1),
@@ -3025,7 +3204,7 @@ impl<'a> TurnMachine<'a> {
                         return;
                     }
                 }
-                self.run_loop(
+                self.resume_after_tool_boundary(
                     checkpoint.active_history_start,
                     checkpoint.deadline,
                     step.saturating_add(1),
@@ -3139,7 +3318,7 @@ impl<'a> TurnMachine<'a> {
                     }
                 }
                 self.driver.drain_injected(&self.state, &self.inbox);
-                self.run_loop(
+                self.resume_after_tool_boundary(
                     checkpoint.active_history_start,
                     checkpoint.deadline,
                     step.saturating_add(1),
@@ -3319,7 +3498,7 @@ impl<'a> TurnMachine<'a> {
             self.emit_non_durable_failure(error, visible_output);
             return;
         }
-        self.run_loop(
+        self.resume_after_tool_boundary(
             active_history_start,
             deadline,
             step.saturating_add(1),
@@ -3430,9 +3609,16 @@ impl<'a> TurnMachine<'a> {
         }
 
         match disposition {
-            ResponseDisposition::Complete => {
-                self.complete(TurnFinish::Completed, visible_output).await;
-            }
+            ResponseDisposition::Complete => match self.continue_after_complete(step).await {
+                Ok(true) => {
+                    self.run_loop(active_history_start, deadline, step, visible_output)
+                        .await;
+                }
+                Ok(false) => {
+                    self.complete(TurnFinish::Completed, visible_output).await;
+                }
+                Err(error) => self.emit_non_durable_failure(error, visible_output),
+            },
             ResponseDisposition::OutputLimit => unreachable!("handled before output commit"),
             ResponseDisposition::Continue => {
                 if let Err(error) = self
@@ -3448,13 +3634,18 @@ impl<'a> TurnMachine<'a> {
                     self.emit_non_durable_failure(error, visible_output);
                     return;
                 }
-                self.run_loop(
-                    active_history_start,
-                    deadline,
-                    step.saturating_add(1),
-                    visible_output,
-                )
-                .await;
+                if let Some(request) = self.execution.returned_interaction_id() {
+                    self.complete(TurnFinish::NeedsInput { request }, visible_output)
+                        .await;
+                    return;
+                }
+                let next_step = step.saturating_add(1);
+                if let Err(error) = self.commit_tool_boundary_steers(next_step).await {
+                    self.emit_non_durable_failure(error, visible_output);
+                    return;
+                }
+                self.run_loop(active_history_start, deadline, next_step, visible_output)
+                    .await;
             }
             ResponseDisposition::Filtered | ResponseDisposition::Malformed => {
                 self.emitter.emit(
@@ -3485,6 +3676,9 @@ impl<'a> TurnMachine<'a> {
         // serving boundary. It still receives an attributed terminal event,
         // but its input must never contaminate canonical history.
         if turn_cancel.is_cancelled() {
+            self.close_and_discard_steers(discard_reason_for_finish(&TurnFinish::Cancelled {
+                reason: turn_cancel.reason().unwrap_or(CancelReason::UserRequested),
+            }));
             driver.finish_cancelled(&emitter, &turn, &turn_cancel, false);
             return;
         }
@@ -3536,6 +3730,9 @@ impl<'a> TurnMachine<'a> {
         );
 
         if turn_cancel.is_cancelled() {
+            self.close_and_discard_steers(discard_reason_for_finish(&TurnFinish::Cancelled {
+                reason: turn_cancel.reason().unwrap_or(CancelReason::UserRequested),
+            }));
             driver.finish_cancelled(&emitter, &turn, &turn_cancel, false);
             return;
         }
@@ -3891,8 +4088,17 @@ impl<'a> TurnMachine<'a> {
                             return;
                         }
                         ResponseDisposition::Complete => {
-                            self.complete(TurnFinish::Completed, visible_output).await;
-                            return;
+                            match self.continue_after_complete(step).await {
+                                Ok(true) => continue,
+                                Ok(false) => {
+                                    self.complete(TurnFinish::Completed, visible_output).await;
+                                    return;
+                                }
+                                Err(error) => {
+                                    self.emit_non_durable_failure(error, visible_output);
+                                    return;
+                                }
+                            }
                         }
                         ResponseDisposition::Continue => {}
                         ResponseDisposition::Malformed => {
@@ -3932,8 +4138,12 @@ impl<'a> TurnMachine<'a> {
                             .await;
                         return;
                     }
-
-                    step += 1;
+                    let next_step = step.saturating_add(1);
+                    if let Err(error) = self.commit_tool_boundary_steers(next_step).await {
+                        self.emit_non_durable_failure(error, visible_output);
+                        return;
+                    }
+                    step = next_step;
                 }
             }
         }

@@ -573,6 +573,7 @@ impl RuntimeBuilder {
     /// same reasoning that already makes a missing model profile a build
     /// failure above, not a guessed context window.
     pub fn build(mut self) -> Result<Runtime, RuntimeError> {
+        self.config.steer_limits.validate()?;
         let provider = self
             .provider
             .ok_or_else(|| RuntimeError::config("a provider is required"))?;

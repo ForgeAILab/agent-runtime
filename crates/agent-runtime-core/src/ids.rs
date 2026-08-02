@@ -97,6 +97,10 @@ neutral_id!(
     GoalId
 );
 neutral_id!(
+    /// Identifies one active-turn steering input.
+    SteerId
+);
+neutral_id!(
     /// Identifies one question within a structured interaction.
     QuestionId
 );

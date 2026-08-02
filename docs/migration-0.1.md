@@ -310,6 +310,37 @@ Event consumers must handle schema-v10 `InternalTurnStarted` and `GoalUpdated`.
 Protected checkpoint implementations must accept `TurnState::InternalAccepted`
 as a revision-zero successor to a terminal checkpoint.
 
+## 13. Active-turn steering has explicit disposition
+
+Hosts that previously called `send` while a turn was serving must now choose
+whether the input is a future whole turn or a correction to current work. Use
+`steer_current_turn` for the latter:
+
+```rust
+match session.steer_current_turn(Some(serving_turn.id()), input) {
+    Ok(receipt) => pending.insert(receipt.id, local_draft),
+    Err(rejection) => restore(rejection.input),
+}
+```
+
+Do not append canonical UI history at acceptance. Wait for schema-v11
+`TurnSteerCommitted`; remove or restore local state on
+`TurnSteerDiscarded`. Raw steer content is deliberately absent from both
+events. A `TurnMismatch` rejection reports the current identity and whether a
+single retry is eligible. `NoActiveTurn`, `NonSteerable`, close-fence, size,
+depth, cumulative-byte, and shutdown outcomes remain distinct.
+
+Steering is bounded by `LoopConfig::steer_limits`. Safe-boundary ordering is
+tool result, generic host injection, then real-user steer. Ordinary and
+attributed internal provider turns are eligible; local-tool-only work and
+returned interactions are not. Protected checkpoint stores contain a steer
+only after its commit boundary.
+
+Automatic goal controllers may receive a host-owned `GoalAdmissionGate` via
+`GoalControllerConfig::with_admission_gate`. Disable it while an interactive
+client owns pending real-user work, admit that work at the terminal boundary,
+then re-enable it. The gate affects only future idle admission.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.
@@ -317,6 +348,8 @@ as a revision-zero successor to a terminal checkpoint.
 - [ ] Replace `TokenEstimator`/`CharBasedEstimator` with a `RequestSizer`.
 - [ ] Wrap any foreign-type `Named` impl in a local newtype.
 - [ ] Handle the new `RuntimeEvent` variants if you match exhaustively.
+- [ ] Distinguish future whole-turn input from active-turn steering and retain
+      local drafts until a committed/discarded disposition.
 - [ ] Decide a `ContextPolicy` reserve, and whether to attach a compactor.
 - [ ] Update `send`/`run` call sites to handle `Result<TurnHandle, _>`.
 - [ ] Use turn interruption for normal user interrupts; reserve

@@ -13,12 +13,16 @@ pub mod goal;
 pub mod inject;
 pub mod session;
 pub mod state;
+pub(crate) mod steer;
 
+pub use agent_runtime_core::steer::{
+    SteerLimits, SteerReceipt, SteerRejection, SteerRejectionReason,
+};
 pub use builder::RuntimeBuilder;
 pub use command::{COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession};
 pub use emitter::{EventEmitter, RuntimeEventStream};
 pub use engine::Runtime;
-pub use goal::{GoalController, GoalControllerConfig};
+pub use goal::{GoalAdmissionGate, GoalController, GoalControllerConfig};
 pub use inject::InjectedContent;
 pub use session::{InternalTurnAdmission, SessionHandle, TurnHandle};
 pub use state::{SessionExecutionContext, SessionState};

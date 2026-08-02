@@ -27,7 +27,7 @@ use crate::delegation::WorkspacePolicy;
 use crate::error::RuntimeError;
 use crate::goal::GoalProjection;
 use crate::ids::{
-    AttemptId, ChildId, EventId, InteractionRequestId, QuestionId, RequestId, SessionId,
+    AttemptId, ChildId, EventId, InteractionRequestId, QuestionId, RequestId, SessionId, SteerId,
     ToolCallId, TurnId,
 };
 use crate::interaction::{InteractionOutcomeKind, InteractionSensitivity};
@@ -45,6 +45,7 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 use crate::provider::{FinishReason, ModelId};
+use crate::steer::SteerDiscardReason;
 use crate::usage::UsageRecord;
 
 /// The schema version of the event vocabulary. Bumped on any breaking change to
@@ -83,7 +84,9 @@ use crate::usage::UsageRecord;
 ///
 /// Bumped to 10 for attributed internal turns and durability-aligned
 /// persistent-goal projections.
-pub const SCHEMA_VERSION: u32 = 10;
+///
+/// Bumped to 11 for privacy-safe active-turn steering dispositions.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +280,24 @@ pub enum RuntimeEvent {
     SessionStarted,
     /// A turn began.
     TurnStarted,
+    /// Accepted real-user steering input entered canonical history at a
+    /// protected provider/tool boundary. Raw input is deliberately absent.
+    TurnSteerCommitted {
+        /// Stable steer identity returned at admission.
+        steer: SteerId,
+        /// One-based FIFO admission ordinal within the serving turn.
+        ordinal: u64,
+    },
+    /// Accepted real-user steering input was discarded during graceful turn
+    /// closure before it entered canonical history.
+    TurnSteerDiscarded {
+        /// Stable steer identity returned at admission.
+        steer: SteerId,
+        /// One-based FIFO admission ordinal within the serving turn.
+        ordinal: u64,
+        /// Metadata-only terminal disposition.
+        reason: SteerDiscardReason,
+    },
     /// A provenance-bearing internal turn began without a user-role message.
     InternalTurnStarted {
         /// Metadata-only source attribution; turn content is absent.

@@ -37,7 +37,7 @@ pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 /// execute equivalently. Silent best-effort recovery could repeat a provider
 /// call or tool side effect. Revision 1 is the initial transition table from
 /// the same unreleased change and includes interaction barriers.
-pub const TURN_TRANSITION_REVISION: u32 = 2;
+pub const TURN_TRANSITION_REVISION: u32 = 3;
 
 /// Event/checkpoint progress connecting protected state to the redacted
 /// observability stream.
@@ -497,6 +497,10 @@ impl TurnState {
                     && slots_correspond(&response.tool_calls, slots)
             }
             (Self::ModelResponseReady { .. }, Self::Completing { .. }) => true,
+            (
+                Self::ModelResponseReady { response, step, .. },
+                Self::Planning { step: next_step },
+            ) => response.tool_calls.is_empty() && step == next_step,
             (
                 Self::AwaitingApproval {
                     request_id,

@@ -25,12 +25,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - `Named`/`Registry<T>`/`Sealed<T>` moved to `agent-runtime-registry`. A `Named`
   impl on a foreign type (e.g. `Arc<dyn YourTrait>`) is now an orphan impl and
   needs a local newtype.
-- Event `SCHEMA_VERSION` is now `9`. Since the registry-driven v2 baseline,
+- Event `SCHEMA_VERSION` is now `11`. Since the registry-driven v2 baseline,
   tool-call argument projection, delegation, attempt-scoped streaming,
   metadata-only host interaction, lossless child `needs_input`, and
   durability-aligned `PlanUpdated`, and durable-child recovery/resume each
   advanced the vocabulary. Golden fixtures retain the compatible v5 through
-  v9 wire forms; pre-v5
+  v11 wire forms; pre-v5
   unattributed output deltas are intentionally rejected.
 - `SessionHandle::send` and `run` return `Result<TurnHandle, RuntimeError>`.
   `TurnHandle` owns turn-local interruption and completion; use
@@ -89,6 +89,17 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- Typed active-turn steering: `SessionHandle::steer_current_turn` admits
+  bounded FIFO `UserInput` against an optional expected `TurnId`, returns a
+  stable `SteerReceipt`, and retains caller input in structured rejection.
+  Inputs commit only at protected provider/tool boundaries and continue under
+  the same logical turn; metadata-only `TurnSteerCommitted` and
+  `TurnSteerDiscarded` events make disposition explicit without exposing raw
+  content. Atomic drain-or-close prevents acceptance after a terminal fence,
+  while cancellation discards before `TurnCompleted`.
+- `GoalAdmissionGate` lets an interactive host defer idle-only automatic goal
+  continuation while process-local real-user work is pending. It does not
+  interrupt or pause an already-serving goal turn.
 - Protected `CheckpointStore` records for accepted input, assembled model
   responses, pending approvals/interactions, raw tool outcomes, every
   canonical tool result, and terminal publication. Recovery never implicitly
@@ -138,6 +149,10 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   durability-aligned `GoalUpdated` projections. Checkpoint schema/revision v2
   records attributed internal accepted input while retaining ordinary user
   turn compatibility.
+- Event schema v11 adds metadata-only active-turn steering dispositions and a
+  persisted steer identity floor. Existing snapshot reads default the new
+  counter safely; consumers matching `RuntimeEvent` exhaustively must handle
+  both disposition variants.
 - Safe-boundary content injection: `SessionHandle::inject` queues bounded
   host content (`RuntimeBuilder::injection_queue_limit`, default 64) that the
   driver introduces only at provider/tool boundaries — never mid-stream —

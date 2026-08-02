@@ -67,6 +67,9 @@ pub struct SessionIdentityState {
     pub event: u64,
     /// Last minted synthetic tool-call number.
     pub tool_call: u64,
+    /// Last minted active-turn steer number.
+    #[serde(default)]
+    pub steer: u64,
     /// The next event-envelope sequence number.
     pub event_seq: u64,
 }
@@ -84,6 +87,7 @@ impl SessionIdentityState {
         self.attempt = self.attempt.max(floor.attempt);
         self.event = self.event.max(floor.event);
         self.tool_call = self.tool_call.max(floor.tool_call);
+        self.steer = self.steer.max(floor.steer);
         self.event_seq = self.event_seq.max(floor.event_seq);
     }
 
@@ -95,6 +99,7 @@ impl SessionIdentityState {
             && self.attempt >= floor.attempt
             && self.event >= floor.event
             && self.tool_call >= floor.tool_call
+            && self.steer >= floor.steer
             && self.event_seq >= floor.event_seq
     }
 }
@@ -264,6 +269,7 @@ mod tests {
             attempt: 8,
             event: 5,
             tool_call: 7,
+            steer: 4,
             event_seq: 9,
         };
         identity.advance_to_floor(&SessionIdentityState {
@@ -272,6 +278,7 @@ mod tests {
             attempt: 1,
             event: 10,
             tool_call: 7,
+            steer: 6,
             event_seq: 12,
         });
         assert_eq!(
@@ -282,6 +289,7 @@ mod tests {
                 attempt: 8,
                 event: 10,
                 tool_call: 7,
+                steer: 6,
                 event_seq: 12,
             }
         );

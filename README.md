@@ -65,6 +65,23 @@ and protected `CheckpointStore` implementations. The ordinary store receives
 completed session state; the protected store records exact versioned
 mid-turn states and pending interactions.
 
+Eligible provider-backed work can accept additional real-user input without
+starting a later whole turn:
+
+```rust
+let receipt = session.steer_current_turn(
+    Some(turn.id()),
+    UserInput::text("also cover the cancellation race"),
+)?;
+```
+
+Acceptance is process-local. The input becomes canonical only when the event
+stream emits the matching `TurnSteerCommitted`; `TurnSteerDiscarded` means the
+host still owns any locally retained draft. Rejections are typed and retain
+the exact `UserInput`. Steering never mutates an in-flight provider request:
+the driver drains FIFO input only at a protected provider/tool boundary and
+continues under the same `TurnId`.
+
 Delegated children become durable when the host's `ChildRuntimeFactory`
 provides both stores. The parent snapshot then carries a bounded,
 redaction-safe child catalog while each child keeps its canonical history and
@@ -89,6 +106,9 @@ Persistent goals are an opt-in reusable harness component. Hosts register
 at most one process-scoped `GoalController` per eligible session. Automatic
 continuations use `try_send_internal_if_idle`: they carry typed provenance,
 create no user-role history message, and lose atomically to real user input.
+Interactive hosts with a separate process-local input queue can attach a
+`GoalAdmissionGate` to the controller and disable idle-only admission until
+their real-user turn is admitted.
 Goal state is durable in versioned extension state, while scheduling remains
 strictly process-scoped—there is no daemon or restart-time execution.
 

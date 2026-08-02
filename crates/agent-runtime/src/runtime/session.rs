@@ -10,7 +10,7 @@ use tokio::task::AbortHandle;
 
 use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
-use agent_runtime_core::checkpoint::TurnCheckpoint;
+use agent_runtime_core::checkpoint::{TurnCheckpoint, TurnState};
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::{
     InternalTurnInput, Message, ToolCall, ToolResultBlock, UserInput,
@@ -20,6 +20,7 @@ use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
 use agent_runtime_core::goal::{GoalCommand, GoalCommandResult, GoalProjection, GoalStatus};
 use agent_runtime_core::ids::{SessionId, TurnId};
 use agent_runtime_core::interaction::InteractionRequest;
+use agent_runtime_core::steer::{SteerReceipt, SteerRejection, SteerRejectionReason};
 use agent_runtime_core::store::{SessionSnapshot, VersionedSessionState};
 use serde_json::Value;
 
@@ -30,6 +31,7 @@ use crate::runtime::emitter::{EventEmitter, RuntimeEventStream};
 use crate::runtime::engine::{ActiveSessionLease, RuntimeShared};
 use crate::runtime::inject::{InjectedContent, InjectionQueue};
 use crate::runtime::state::{SessionExecutionContext, SessionState};
+use crate::runtime::steer::SteerMailbox;
 
 /// The shared inner state of a session.
 #[derive(Debug)]
@@ -69,8 +71,15 @@ pub(crate) struct ActiveTurns {
     cancellations: BTreeMap<TurnId, Cancellation>,
     internal_goals: BTreeMap<TurnId, agent_runtime_core::content::InternalGoalBinding>,
     current: Option<TurnId>,
+    steering: Option<ServingSteer>,
     next_ticket: u64,
     serving_ticket: u64,
+}
+
+#[derive(Debug)]
+struct ServingSteer {
+    turn: TurnId,
+    mailbox: Arc<SteerMailbox>,
 }
 
 #[derive(Debug, Default)]
@@ -250,6 +259,54 @@ impl SessionHandle {
         self.spawn_turn(input)
     }
 
+    /// Targets additional real-user input to the eligible provider-backed
+    /// turn that is currently serving.
+    ///
+    /// Acceptance is process-local until a matching
+    /// [`RuntimeEvent::TurnSteerCommitted`] event. Rejection retains exact
+    /// caller ownership of `input` and never queues a later whole turn.
+    pub fn steer_current_turn(
+        &self,
+        expected_turn: Option<&TurnId>,
+        input: UserInput,
+    ) -> Result<SteerReceipt, SteerRejection> {
+        let turns = self.inner.turns.lock().expect("session turns poisoned");
+        if turns.shutting_down {
+            return Err(SteerRejection::new(SteerRejectionReason::Shutdown, input));
+        }
+        let Some(current) = turns.current.as_ref() else {
+            return Err(SteerRejection::new(
+                SteerRejectionReason::NoActiveTurn,
+                input,
+            ));
+        };
+        let serving = turns
+            .steering
+            .as_ref()
+            .filter(|serving| &serving.turn == current);
+        if let Some(expected) = expected_turn {
+            if expected != current {
+                return Err(SteerRejection::new(
+                    SteerRejectionReason::TurnMismatch {
+                        expected: expected.clone(),
+                        active_turn: current.clone(),
+                        steerable: serving.is_some_and(|serving| serving.mailbox.is_open()),
+                    },
+                    input,
+                ));
+            }
+        }
+        let Some(serving) = serving else {
+            return Err(SteerRejection::new(
+                SteerRejectionReason::NonSteerable {
+                    active_turn: current.clone(),
+                },
+                input,
+            ));
+        };
+        serving.mailbox.admit(input, || self.inner.minter.steer())
+    }
+
     /// Queues a turn, waits for its tracked task to complete, and returns its
     /// handle. Convenient for headless hosts that consume events through an
     /// observer.
@@ -298,6 +355,10 @@ impl SessionHandle {
         let turn_id = self.inner.minter.turn();
         let turn_cancel = self.inner.cancel.child();
         let completion = Arc::new(TurnCompletion::default());
+        let steer_mailbox = Arc::new(SteerMailbox::new(
+            turn_id.clone(),
+            self.inner.shared.driver.steer_limits(),
+        ));
         turns.aborts.retain(|handle| !handle.is_finished());
         turns.count = 1;
         let ticket = turns.next_ticket;
@@ -314,6 +375,7 @@ impl SessionHandle {
         let tid = turn_id.clone();
         let task_cancel = turn_cancel.clone();
         let task_completion = completion.clone();
+        let task_steer_mailbox = steer_mailbox.clone();
         let active = ActiveTurnGuard {
             inner: inner.clone(),
             ticket,
@@ -326,6 +388,10 @@ impl SessionHandle {
             {
                 let mut turns = inner.turns.lock().expect("session turns poisoned");
                 turns.current = Some(tid.clone());
+                turns.steering = Some(ServingSteer {
+                    turn: tid.clone(),
+                    mailbox: task_steer_mailbox.clone(),
+                });
             }
             inner
                 .shared
@@ -337,6 +403,7 @@ impl SessionHandle {
                     inner.minter.clone(),
                     task_cancel,
                     inner.inbox.clone(),
+                    task_steer_mailbox,
                     tid.clone(),
                     input,
                 )
@@ -575,6 +642,7 @@ impl SessionHandle {
             }
             turns.count = 1;
             turns.current = Some(turn.clone());
+            turns.steering = None;
             turns.cancellations.insert(turn.clone(), cancel.clone());
         }
         let _active = LocalToolGuard {
@@ -621,6 +689,10 @@ impl SessionHandle {
         let turn_id = self.inner.minter.turn();
         let turn_cancel = self.inner.cancel.child();
         let completion = Arc::new(TurnCompletion::default());
+        let steer_mailbox = Arc::new(SteerMailbox::new(
+            turn_id.clone(),
+            self.inner.shared.driver.steer_limits(),
+        ));
         turns.aborts.retain(|handle| !handle.is_finished());
         turns.count += 1;
         let ticket = turns.next_ticket;
@@ -633,6 +705,7 @@ impl SessionHandle {
         let tid = turn_id.clone();
         let task_cancel = turn_cancel.clone();
         let task_completion = completion.clone();
+        let task_steer_mailbox = steer_mailbox.clone();
         let active = ActiveTurnGuard {
             inner: inner.clone(),
             ticket,
@@ -658,17 +731,22 @@ impl SessionHandle {
             {
                 let mut turns = inner.turns.lock().expect("session turns poisoned");
                 turns.current = Some(tid.clone());
+                turns.steering = Some(ServingSteer {
+                    turn: tid.clone(),
+                    mailbox: task_steer_mailbox.clone(),
+                });
             }
             inner
                 .shared
                 .driver
-                .run_turn(
+                .run_serving_turn(
                     inner.state.clone(),
                     inner.execution.clone(),
                     inner.emitter.clone(),
                     inner.minter.clone(),
                     task_cancel,
                     inner.inbox.clone(),
+                    task_steer_mailbox,
                     tid.clone(),
                     input,
                 )
@@ -706,6 +784,12 @@ impl SessionHandle {
         let turn_id = checkpoint.turn.clone();
         let turn_cancel = self.inner.cancel.child();
         let completion = Arc::new(TurnCompletion::default());
+        let steer_mailbox = checkpoint_is_steerable(&checkpoint).then(|| {
+            Arc::new(SteerMailbox::new(
+                turn_id.clone(),
+                self.inner.shared.driver.steer_limits(),
+            ))
+        });
         turns.aborts.retain(|handle| !handle.is_finished());
         turns.count += 1;
         let ticket = turns.next_ticket;
@@ -719,6 +803,7 @@ impl SessionHandle {
         let completion_turn = turn_id.clone();
         let task_cancel = turn_cancel.clone();
         let task_completion = completion.clone();
+        let task_steer_mailbox = steer_mailbox.clone();
         let active = ActiveTurnGuard {
             inner: inner.clone(),
             ticket,
@@ -743,7 +828,11 @@ impl SessionHandle {
             let _turn = inner.turn_gate.lock().await;
             {
                 let mut turns = inner.turns.lock().expect("session turns poisoned");
-                turns.current = Some(tid);
+                turns.current = Some(tid.clone());
+                turns.steering = task_steer_mailbox.as_ref().map(|mailbox| ServingSteer {
+                    turn: tid,
+                    mailbox: mailbox.clone(),
+                });
             }
             inner
                 .shared
@@ -755,6 +844,7 @@ impl SessionHandle {
                     inner.minter.clone(),
                     task_cancel,
                     inner.inbox.clone(),
+                    task_steer_mailbox,
                     checkpoint,
                 )
                 .await;
@@ -929,6 +1019,20 @@ impl SessionHandle {
     }
 }
 
+fn checkpoint_is_steerable(checkpoint: &TurnCheckpoint) -> bool {
+    !matches!(
+        checkpoint.state,
+        TurnState::LocalActionAccepted { .. }
+            | TurnState::LocalActionPrepared { .. }
+            | TurnState::LocalActionExecuting { .. }
+            | TurnState::LocalActionOutcomeReady { .. }
+            | TurnState::LocalActionResultReady { .. }
+            | TurnState::Completing { .. }
+            | TurnState::PublishingTerminal { .. }
+            | TurnState::Terminal { .. }
+    )
+}
+
 struct LocalToolGuard {
     inner: Arc<SessionInner>,
     turn: TurnId,
@@ -956,6 +1060,13 @@ impl Drop for LocalToolGuard {
         if turns.current.as_ref() == Some(&self.turn) {
             turns.current = None;
         }
+        if turns
+            .steering
+            .as_ref()
+            .is_some_and(|serving| serving.turn == self.turn)
+        {
+            turns.steering = None;
+        }
         drop(turns);
         self.inner.execution.clear_turn(&self.turn);
         self.inner.turns_changed.notify_waiters();
@@ -974,8 +1085,16 @@ impl Drop for ActiveTurnGuard {
         let mut turns = self.inner.turns.lock().expect("session turns poisoned");
         turns.count = turns.count.saturating_sub(1);
         turns.cancellations.remove(&self.turn);
+        turns.internal_goals.remove(&self.turn);
         if turns.current.as_ref() == Some(&self.turn) {
             turns.current = None;
+        }
+        if turns
+            .steering
+            .as_ref()
+            .is_some_and(|serving| serving.turn == self.turn)
+        {
+            turns.steering = None;
         }
         if self.ticket >= turns.serving_ticket {
             turns.serving_ticket = self.ticket + 1;

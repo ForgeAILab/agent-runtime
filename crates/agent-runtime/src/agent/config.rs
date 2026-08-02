@@ -5,6 +5,7 @@
 //! `system_prompt` text and injected adapters — the loop hard-codes none of it.
 
 use agent_runtime_core::provider::{ModelId, ReasoningConfig, Sampling, StructuredOutputConfig};
+use agent_runtime_core::steer::SteerLimits;
 
 use crate::provider::retry::RetryPolicy;
 use crate::tool::scheduler::ConflictPolicy;
@@ -76,6 +77,10 @@ pub struct LoopConfig {
     /// sourced from host configuration, so the event carries only argument
     /// key names and a content fingerprint unless a host opts in here.
     pub emit_raw_tool_arguments: bool,
+    /// Bounds for real-user input targeted to the serving provider-backed
+    /// turn. Accepted input remains process-local until a safe-boundary
+    /// checkpoint commits it.
+    pub steer_limits: SteerLimits,
 }
 
 impl LoopConfig {
@@ -96,6 +101,7 @@ impl LoopConfig {
             conflict_policy: ConflictPolicy::ScopeOverlap,
             downgrade: DowngradePolicy::strict(),
             emit_raw_tool_arguments: false,
+            steer_limits: SteerLimits::default(),
         }
     }
 }

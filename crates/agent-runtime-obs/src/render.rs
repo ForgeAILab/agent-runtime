@@ -18,6 +18,8 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
     match payload {
         RuntimeEvent::SessionStarted => "session_started",
         RuntimeEvent::TurnStarted => "turn_started",
+        RuntimeEvent::TurnSteerCommitted { .. } => "turn_steer_committed",
+        RuntimeEvent::TurnSteerDiscarded { .. } => "turn_steer_discarded",
         RuntimeEvent::InternalTurnStarted { .. } => "internal_turn_started",
         RuntimeEvent::RegistrySnapshotSealed { .. } => "registry_snapshot_sealed",
         RuntimeEvent::ScopedViewDerived { .. } => "scoped_view_derived",
@@ -272,6 +274,14 @@ fn summary(payload: &RuntimeEvent) -> String {
         } => format!("provider_attempt_finished finish={finish:?} retryable={retryable}"),
         RuntimeEvent::LimitReached { limit } => format!("limit_reached {limit:?}"),
         RuntimeEvent::Error { error } => format!("error {error}"),
+        RuntimeEvent::TurnSteerCommitted { steer, ordinal } => {
+            format!("turn_steer_committed steer={steer} ordinal={ordinal}")
+        }
+        RuntimeEvent::TurnSteerDiscarded {
+            steer,
+            ordinal,
+            reason,
+        } => format!("turn_steer_discarded steer={steer} ordinal={ordinal} reason={reason:?}"),
         RuntimeEvent::TurnCompleted {
             finish,
             visible_output,
