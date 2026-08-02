@@ -225,11 +225,46 @@ fn joined_reasoning(msg: &Message) -> String {
     out
 }
 
+/// Renders a user message's content, preserving text/image part order.
+///
+/// Text-only messages keep the plain-string `content` shape: it is what every
+/// Chat Completions endpoint accepts, including non-multimodal ones that
+/// reject content arrays. Only a message actually carrying an image switches
+/// to the array form.
+fn user_content(msg: &Message) -> Value {
+    let has_image = msg
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }));
+    if !has_image {
+        return Value::String(msg.joined_text());
+    }
+    let parts: Vec<Value> = msg
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(json!({"type": "text", "text": text})),
+            ContentPart::Image { url, detail } => {
+                let mut image_url = json!({"url": url});
+                if let Some(detail) = detail {
+                    image_url
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("detail".into(), Value::String(detail.clone()));
+                }
+                Some(json!({"type": "image_url", "image_url": image_url}))
+            }
+            _ => None,
+        })
+        .collect();
+    Value::Array(parts)
+}
+
 /// Renders one canonical message into one or more OpenAI wire messages.
 fn to_openai_messages(msg: &Message) -> Vec<Value> {
     match msg.role {
         Role::System => vec![json!({"role": "system", "content": msg.joined_text()})],
-        Role::User => vec![json!({"role": "user", "content": msg.joined_text()})],
+        Role::User => vec![json!({"role": "user", "content": user_content(msg)})],
         Role::Assistant => {
             let mut wire = json!({"role": "assistant", "content": msg.joined_text()});
             // Z.AI-style thinking endpoints require prior reasoning echoed
@@ -988,6 +1023,45 @@ mod tests {
         assert_eq!(wire[0]["content"], "calling a tool");
         assert_eq!(wire[0]["tool_calls"][0]["id"], "c1");
         assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn user_images_become_ordered_multimodal_content() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentPart::text("what is in this screenshot?"),
+                ContentPart::Image {
+                    url: "data:image/png;base64,AAAA".into(),
+                    detail: Some("high".into()),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,BBBB".into(),
+                    detail: None,
+                },
+            ],
+        };
+        let wire = to_openai_messages(&msg);
+
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["role"], "user");
+        let content = wire[0]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is in this screenshot?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(content[1]["image_url"]["detail"], "high");
+        assert_eq!(content[2]["image_url"]["url"], "data:image/png;base64,BBBB");
+        assert!(content[2]["image_url"].get("detail").is_none());
+    }
+
+    #[test]
+    fn text_only_user_messages_keep_the_plain_string_shape() {
+        let msg = Message::user("no images here");
+        let wire = to_openai_messages(&msg);
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["content"], "no images here");
     }
 
     #[test]
