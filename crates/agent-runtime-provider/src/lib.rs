@@ -14,12 +14,15 @@
 //! - [`fake::FakeProvider`] — a deterministic, scriptable provider.
 //! - [`openai::OpenAiProvider`] — a configurable OpenAI-compatible adapter over
 //!   an injectable [`transport::HttpTransport`].
+//! - [`anthropic::AnthropicProvider`] — a configurable Anthropic Messages API
+//!   adapter over the same transport, with multimodal (image) user content.
 //! - [`retry`] — retryability classification and backoff used by the agent loop
 //!   to record every provider attempt.
 //! - [`catalog`] — optional remote model-catalog sources. Resolution reads a
 //!   host-owned cache and never the network; refresh is control-plane work.
 #![forbid(unsafe_code)]
 
+pub mod anthropic;
 pub mod catalog;
 pub mod fake;
 pub mod openai;
