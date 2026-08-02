@@ -1,0 +1,20 @@
+{
+  "change_id": "refactor-runtime-module-boundaries",
+  "change_ref": "refactor-runtime-module-boundaries-2026-08-02",
+  "created_at": "2026-08-02T16:32:19Z",
+  "updated_at": "2026-08-02T17:02:37Z",
+  "completed_at": "2026-08-02T17:02:37Z",
+  "status": "implemented",
+  "approved_at": "2026-08-02T16:34:02Z",
+  "implementation_started_at": "2026-08-02T16:34:02Z",
+  "reapproval_required": false,
+  "depends_on": [
+    "add-active-turn-steering-2026-08-02"
+  ],
+  "coordinates_with": [
+    "stabilize-session-harness-pipeline-2026-07-31",
+    "add-persistent-session-goals-2026-08-02",
+    "add-resumable-child-sessions-2026-07-31"
+  ],
+  "coordinated_changes": []
+}
