@@ -11,7 +11,7 @@ use zeroize::Zeroize;
 use agent_runtime_registry::RegistryRevision;
 
 use crate::clock::Timestamp;
-use crate::content::Message;
+use crate::content::{InternalTurnSource, Message};
 use crate::error::RuntimeError;
 use crate::ids::{SessionId, TurnId};
 use crate::manifest::RunManifest;
@@ -110,12 +110,25 @@ pub struct TurnManifest {
     pub turn: TurnId,
     /// The recorded manifest.
     pub manifest: RunManifest,
+    /// Metadata-only attribution when this was an internal turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_source: Option<InternalTurnSource>,
 }
 
 impl TurnManifest {
     /// Pairs `manifest` with the turn it describes.
     pub fn new(turn: TurnId, manifest: RunManifest) -> Self {
-        Self { turn, manifest }
+        Self {
+            turn,
+            manifest,
+            internal_source: None,
+        }
+    }
+
+    /// Attaches validated internal-turn attribution.
+    pub fn with_internal_source(mut self, source: InternalTurnSource) -> Self {
+        self.internal_source = Some(source);
+        self
     }
 }
 

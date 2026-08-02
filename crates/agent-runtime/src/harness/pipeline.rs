@@ -15,11 +15,17 @@ use serde_json::Value;
 
 use agent_runtime_context::ContextFragment;
 use agent_runtime_context::compaction::SummaryProvenance;
+use agent_runtime_core::clock::Timestamp;
 use agent_runtime_core::content::{Message, ToolCall};
 use agent_runtime_core::error::RuntimeError;
-use agent_runtime_core::event::{PlanItemProjection, PlanSensitivity, RuntimeEvent, TurnFinish};
+use agent_runtime_core::event::{
+    GoalUpdateCause, PlanItemProjection, PlanSensitivity, RuntimeEvent, TurnFinish,
+};
+use agent_runtime_core::goal::GoalProjection;
 use agent_runtime_core::ids::{SessionId, TurnId};
-use agent_runtime_core::provider::{ProviderRequest, ReasoningConfig, Sampling, ToolChoice};
+use agent_runtime_core::provider::{
+    ProviderErrorKind, ProviderRequest, ReasoningConfig, Sampling, ToolChoice,
+};
 use agent_runtime_core::store::{SessionStateSensitivity, VersionedSessionState};
 use agent_runtime_core::tool::ToolOutcome;
 use agent_runtime_core::usage::UsageRecord;
@@ -326,10 +332,14 @@ pub struct ModelView {
     pub turn: TurnId,
     /// Zero-based tool-loop step.
     pub step: u32,
+    /// Whether this provider boundary belongs to an attributed internal turn.
+    pub internal: bool,
     /// Frozen activation epoch.
     pub activation: Fingerprint,
     /// Fully planned request before non-context option patches.
     pub request: ProviderRequest,
+    /// This interceptor's own versioned state namespace, if initialized.
+    pub state: Option<VersionedSessionState>,
 }
 
 impl fmt::Debug for ModelView {
@@ -339,9 +349,11 @@ impl fmt::Debug for ModelView {
             .field("session", &self.session)
             .field("turn", &self.turn)
             .field("step", &self.step)
+            .field("internal", &self.internal)
             .field("activation", &self.activation)
             .field("message_count", &self.request.messages.len())
             .field("tool_count", &self.request.tools.len())
+            .field("has_state", &self.state.is_some())
             .finish()
     }
 }
@@ -463,6 +475,10 @@ pub struct ToolOutputView {
     pub call: ToolCall,
     /// This processor's own versioned state namespace, if initialized.
     pub state: Option<VersionedSessionState>,
+    /// Canonical append-only usage ledger at this exact tool boundary.
+    pub usage: Arc<[UsageRecord]>,
+    /// Host clock at this exact tool boundary.
+    pub now: Timestamp,
 }
 
 impl fmt::Debug for ToolOutputView {
@@ -475,6 +491,8 @@ impl fmt::Debug for ToolOutputView {
             .field("call", &self.call.id)
             .field("tool", &self.call.name)
             .field("has_state", &self.state.is_some())
+            .field("usage_records", &self.usage.len())
+            .field("now", &self.now)
             .finish()
     }
 }
@@ -539,6 +557,15 @@ pub enum HarnessEvent {
         /// Bounded public items; absent for sensitive plans.
         items: Option<Vec<PlanItemProjection>>,
     },
+    /// A persistent goal changed at a durability-aligned boundary.
+    GoalUpdated {
+        /// Stable cause of this projection.
+        cause: GoalUpdateCause,
+        /// Content posture selected by the component.
+        sensitivity: PlanSensitivity,
+        /// Public projection. Sensitive components emit metadata-only absence.
+        goal: Option<GoalProjection>,
+    },
     /// Optional semantic summarization fell back to unchanged structural
     /// planning. The reason is a bounded category, never model/store content.
     SemanticSummaryFallback {
@@ -560,6 +587,15 @@ impl HarnessEvent {
                 sensitivity,
                 counts,
                 items,
+            },
+            Self::GoalUpdated {
+                cause,
+                sensitivity,
+                goal,
+            } => RuntimeEvent::GoalUpdated {
+                cause,
+                sensitivity,
+                goal,
             },
             Self::SemanticSummaryFallback { reason } => RuntimeEvent::Downgrade {
                 capability: "semantic_summary".into(),
@@ -592,12 +628,20 @@ pub struct TurnCommitView {
     pub turn: TurnId,
     /// Terminal result.
     pub finish: TurnFinish,
+    /// Typed provider failure responsible for the terminal result, if any.
+    pub provider_error_kind: Option<ProviderErrorKind>,
     /// Whether committed provider output was visible.
     pub visible_output: bool,
     /// Canonical history after the turn.
     pub history: Arc<[Message]>,
     /// This hook's own versioned state namespace, if initialized.
     pub state: Option<VersionedSessionState>,
+    /// Canonical append-only usage ledger after the turn.
+    pub usage: Arc<[UsageRecord]>,
+    /// Current-process time when this turn began serving.
+    pub started_at: Timestamp,
+    /// Host clock at this commit boundary.
+    pub committed_at: Timestamp,
 }
 
 impl fmt::Debug for TurnCommitView {
@@ -607,9 +651,13 @@ impl fmt::Debug for TurnCommitView {
             .field("session", &self.session)
             .field("turn", &self.turn)
             .field("finish", &self.finish)
+            .field("provider_error_kind", &self.provider_error_kind)
             .field("visible_output", &self.visible_output)
             .field("history_messages", &self.history.len())
             .field("has_state", &self.state.is_some())
+            .field("usage_records", &self.usage.len())
+            .field("started_at", &self.started_at)
+            .field("committed_at", &self.committed_at)
             .finish()
     }
 }

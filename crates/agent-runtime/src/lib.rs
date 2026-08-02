@@ -171,8 +171,9 @@ pub mod prelude {
     pub use crate::provider::retry::RetryPolicy;
     pub use crate::provider::transport::{ByteStream, HttpRequest, HttpTransport};
     pub use crate::runtime::{
-        CheckpointRecoveryPolicy, InjectedContent, Runtime, RuntimeBuilder, RuntimeEventStream,
-        SessionHandle, StartSession, TurnHandle,
+        CheckpointRecoveryPolicy, GoalController, GoalControllerConfig, InjectedContent,
+        InternalTurnAdmission, Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle,
+        StartSession, TurnHandle,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};

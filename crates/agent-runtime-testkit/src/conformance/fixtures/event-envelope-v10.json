@@ -1,0 +1,77 @@
+[
+  {
+    "schema_version": 10,
+    "seq": 0,
+    "id": "evt-v10-1",
+    "session": "session-1",
+    "turn": "turn-2",
+    "timestamp": 100,
+    "payload": {
+      "event": "internal_turn_started",
+      "source": {
+        "kind": "goal",
+        "id": "agent-runtime.goal-controller",
+        "revision": "goal-controller-v1",
+        "sensitivity": "public",
+        "goal": {
+          "id": "goal-1",
+          "generation": 3
+        }
+      }
+    }
+  },
+  {
+    "schema_version": 10,
+    "seq": 1,
+    "id": "evt-v10-2",
+    "session": "session-1",
+    "turn": "turn-2",
+    "timestamp": 101,
+    "payload": {
+      "event": "goal_updated",
+      "cause": "turn_commit",
+      "sensitivity": "public",
+      "goal": {
+        "id": "goal-1",
+        "generation": 4,
+        "objective": "Finish the goal system",
+        "status": "budget_limited",
+        "token_budget": 100,
+        "usage": {
+          "charged_tokens": 104,
+          "provenance": "provider_reported",
+          "active_elapsed_ms": 250
+        },
+        "created_at": 10,
+        "updated_at": 101,
+        "stopped_reason": {
+          "code": "budget_reached"
+        }
+      }
+    }
+  },
+  {
+    "schema_version": 10,
+    "seq": 2,
+    "id": "evt-v10-3",
+    "session": "session-1",
+    "timestamp": 102,
+    "payload": {
+      "event": "goal_updated",
+      "cause": "restored",
+      "sensitivity": "sensitive"
+    }
+  },
+  {
+    "schema_version": 10,
+    "seq": 3,
+    "id": "evt-v10-4",
+    "session": "session-1",
+    "timestamp": 103,
+    "payload": {
+      "event": "goal_updated",
+      "cause": "cleared",
+      "sensitivity": "public"
+    }
+  }
+]

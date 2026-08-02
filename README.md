@@ -84,6 +84,14 @@ per session, and advertises only the current activation epoch. Reusable
 behavior above the neutral kernel is composed through ordered, phase-specific
 harness components rather than an unrestricted mutable middleware chain.
 
+Persistent goals are an opt-in reusable harness component. Hosts register
+`get_goal`, `create_goal`, and `update_goal`, the `GoalComponent` phases, and
+at most one process-scoped `GoalController` per eligible session. Automatic
+continuations use `try_send_internal_if_idle`: they carry typed provenance,
+create no user-role history message, and lose atomically to real user input.
+Goal state is durable in versioned extension state, while scheduling remains
+strictly process-scoped—there is no daemon or restart-time execution.
+
 ## Development
 
 ```sh

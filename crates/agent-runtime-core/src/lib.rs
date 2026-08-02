@@ -49,6 +49,7 @@ pub mod content;
 pub mod delegation;
 pub mod error;
 pub mod event;
+pub mod goal;
 pub mod grant;
 pub mod guard;
 pub mod ids;
@@ -92,15 +93,24 @@ pub mod prelude {
     };
     pub use crate::clock::{Clock, Deadline, SystemClock, Timestamp};
     pub use crate::compat::LegacyApprovalAuthority;
-    pub use crate::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock, UserInput};
+    pub use crate::content::{
+        ContentPart, InternalGoalBinding, InternalTurnInput, InternalTurnSensitivity,
+        InternalTurnSource, MAX_INTERNAL_SOURCE_CHARS, MAX_INTERNAL_TURN_CHARS, Message, Role,
+        ToolCall, ToolResultBlock, UserInput,
+    };
     pub use crate::delegation::{
         ChildLimits, ChildModelSelection, ChildSpec, ToolViewScope, WorkspacePolicy,
     };
     pub use crate::error::{ErrorKind, Result, RuntimeError};
     pub use crate::event::{
         BudgetCategory, ChildPhase, ChildRecoveryState, CompactionReason, EstimationConfidence,
-        EventEnvelope, LimitKind, PlanItemProjection, PlanItemStatus, PlanSensitivity,
-        RuntimeEvent, SCHEMA_VERSION, TurnFinish,
+        EventEnvelope, GoalUpdateCause, LimitKind, PlanItemProjection, PlanItemStatus,
+        PlanSensitivity, RuntimeEvent, SCHEMA_VERSION, TurnFinish,
+    };
+    pub use crate::goal::{
+        GOAL_STATE_SCHEMA_VERSION, GoalAccountingState, GoalCommand, GoalCommandResult,
+        GoalProjection, GoalState, GoalStatus, GoalStoppedReason, GoalTokenUsage,
+        GoalUsageProvenance, MAX_GOAL_OBJECTIVE_CHARS, MAX_GOAL_REASON_CHARS,
     };
     pub use crate::grant::{
         AuthorizationDecision, CapabilityGrant, ConstraintDimension, ConstraintValue, DecisionCode,
@@ -113,7 +123,7 @@ pub mod prelude {
         LeakDetectorId, LeakFinding, LeakScanResult,
     };
     pub use crate::ids::{
-        AttemptId, ChildId, ChoiceId, EventId, InteractionRequestId, QuestionId, RequestId,
+        AttemptId, ChildId, ChoiceId, EventId, GoalId, InteractionRequestId, QuestionId, RequestId,
         SessionId, TenantId, ToolCallId, TurnId,
     };
     pub use crate::interaction::{

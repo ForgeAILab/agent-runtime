@@ -18,6 +18,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
     match payload {
         RuntimeEvent::SessionStarted => "session_started",
         RuntimeEvent::TurnStarted => "turn_started",
+        RuntimeEvent::InternalTurnStarted { .. } => "internal_turn_started",
         RuntimeEvent::RegistrySnapshotSealed { .. } => "registry_snapshot_sealed",
         RuntimeEvent::ScopedViewDerived { .. } => "scoped_view_derived",
         RuntimeEvent::ModelProfileResolved { .. } => "model_profile_resolved",
@@ -26,6 +27,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ContextPlanned { .. } => "context_planned",
         RuntimeEvent::ContextCompacted { .. } => "context_compacted",
         RuntimeEvent::PlanUpdated { .. } => "plan_updated",
+        RuntimeEvent::GoalUpdated { .. } => "goal_updated",
         RuntimeEvent::CachePlanChanged { .. } => "cache_plan_changed",
         RuntimeEvent::BudgetFailure { .. } => "budget_failure",
         RuntimeEvent::ProviderAttemptStarted { .. } => "provider_attempt_started",
@@ -162,6 +164,19 @@ fn summary(payload: &RuntimeEvent) -> String {
             compact(&serde_json::to_value(counts).unwrap_or(Value::Null)),
             items.as_ref().map_or(0, Vec::len)
         ),
+        RuntimeEvent::GoalUpdated {
+            cause,
+            sensitivity,
+            goal,
+        } => match goal {
+            Some(goal) => format!(
+                "goal_updated cause={cause:?} sensitivity={sensitivity:?} id={} generation={} status={:?} charged_tokens={:?} budget={:?}",
+                goal.id, goal.generation, goal.status, goal.usage.charged_tokens, goal.token_budget
+            ),
+            None => format!(
+                "goal_updated cause={cause:?} sensitivity={sensitivity:?} projection=metadata_only"
+            ),
+        },
         RuntimeEvent::CachePlanChanged {
             cache_plan,
             preserved_prefix_tokens,
@@ -310,6 +325,17 @@ fn summary(payload: &RuntimeEvent) -> String {
         RuntimeEvent::SessionStarted
         | RuntimeEvent::TurnStarted
         | RuntimeEvent::SessionShutdown => event_type(payload).to_string(),
+        RuntimeEvent::InternalTurnStarted { source } => format!(
+            "internal_turn_started kind={} source={} revision={} sensitivity={:?} goal={}",
+            source.kind,
+            source.id,
+            source.revision,
+            source.sensitivity,
+            source.goal.as_ref().map_or_else(
+                || "none".to_owned(),
+                |goal| format!("{}@{}", goal.id, goal.generation)
+            )
+        ),
     }
 }
 

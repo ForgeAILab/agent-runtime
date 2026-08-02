@@ -22,8 +22,10 @@ use agent_runtime_registry::{Fingerprint, RegistryId, RegistryRevision};
 
 use crate::cancel::CancelReason;
 use crate::clock::Timestamp;
+use crate::content::InternalTurnSource;
 use crate::delegation::WorkspacePolicy;
 use crate::error::RuntimeError;
+use crate::goal::GoalProjection;
 use crate::ids::{
     AttemptId, ChildId, EventId, InteractionRequestId, QuestionId, RequestId, SessionId,
     ToolCallId, TurnId,
@@ -78,7 +80,26 @@ use crate::usage::UsageRecord;
 /// Bumped to 9 for durable child recovery phases: recovered child sessions,
 /// explicit resume starts, and interrupted execution are now first-class
 /// metadata-only lifecycle events.
-pub const SCHEMA_VERSION: u32 = 9;
+///
+/// Bumped to 10 for attributed internal turns and durability-aligned
+/// persistent-goal projections.
+pub const SCHEMA_VERSION: u32 = 10;
+
+/// Why a canonical persistent goal projection changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalUpdateCause {
+    /// A model tool created or updated goal state.
+    ModelTool,
+    /// A typed host control changed goal state.
+    HostControl,
+    /// Turn completion reconciled usage, time, or terminal status.
+    TurnCommit,
+    /// A restored projection was published to an attached host/controller.
+    Restored,
+    /// The current goal was explicitly cleared.
+    Cleared,
+}
 
 /// A configured limit the runtime enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +277,11 @@ pub enum RuntimeEvent {
     SessionStarted,
     /// A turn began.
     TurnStarted,
+    /// A provenance-bearing internal turn began without a user-role message.
+    InternalTurnStarted {
+        /// Metadata-only source attribution; turn content is absent.
+        source: InternalTurnSource,
+    },
     /// A sealed registry snapshot was produced for this run.
     RegistrySnapshotSealed {
         /// The sealed snapshot's fingerprint.
@@ -347,6 +373,16 @@ pub enum RuntimeEvent {
         /// Bounded items, present only for a public plan.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         items: Option<Vec<PlanItemProjection>>,
+    },
+    /// A persistent goal reached a durability-aligned state boundary.
+    GoalUpdated {
+        /// Why this projection changed.
+        cause: GoalUpdateCause,
+        /// Whether bounded objective content is present.
+        sensitivity: PlanSensitivity,
+        /// Current bounded projection, or `None` after explicit clear.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<GoalProjection>,
     },
     /// The cache plan changed.
     CachePlanChanged {

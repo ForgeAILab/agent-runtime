@@ -289,6 +289,27 @@ ordinary redacted snapshots may omit it. The narrower
 `recover_returned_interactions().await` method remains available to hosts that
 have already reconciled checkpoint metadata separately.
 
+## 12. Persistent goals and internal turns are opt-in
+
+Register the three standard goal tools and the same `GoalComponent` as a
+context contributor, model interceptor, tool-output processor, and turn-commit
+hook. Use `SessionHandle::control_goal` for typed host mutations and
+`SessionHandle::goal` for the bounded projection. A host that wants automatic
+work may attach one `GoalController`; its continuations are admitted only by
+`try_send_internal_if_idle`, carry an `InternalTurnSource`, and append no
+user-role message.
+
+Goal token accounting charges provider-reported uncached input plus output and
+labels missing evidence unknown. A budgeted goal stops when required evidence
+is unavailable; observed budgets are post-response limits and may overshoot by
+one request. Controller lifetime is process-scoped. Restoring an active goal
+does not create work until a host explicitly attaches a controller, and no
+daemon, fork inheritance, or remote scheduler is implied.
+
+Event consumers must handle schema-v10 `InternalTurnStarted` and `GoalUpdated`.
+Protected checkpoint implementations must accept `TurnState::InternalAccepted`
+as a revision-zero successor to a terminal checkpoint.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.

@@ -105,7 +105,10 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   descriptor-first lazily verified skills, bounded memory contribution,
   session-private artifact offloading plus authorized paginated
   `artifact.read`, structured questionnaire interaction, and
-  purpose-attributed semantic summary coordination.
+  purpose-attributed semantic summary coordination. Persistent goals add
+  descriptor-first `get_goal`/`create_goal`/`update_goal`, optimistic typed
+  host controls, provider-evidence accounting, and a process-scoped conditional
+  continuation controller with no synthetic user history.
 - Lossless delegated task outcomes, including typed child `needs_input`
   handoff without a root broker, deterministic multi-child delivery, and
   follow-up reuse of the same child session.
@@ -129,8 +132,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   questionnaires live in protected extension state and can be re-queued after
   restart without provider work. Attributed child
   lifecycle events (`ChildSpawned` … `ChildFailed`) join the event vocabulary
-  (`SCHEMA_VERSION` is now `9`); the completed event carries the child's
+  (`SCHEMA_VERSION` is now `10`); the completed event carries the child's
   final result so coalescing can never drop it.
+- Event schema v10 adds metadata-only `InternalTurnStarted` and
+  durability-aligned `GoalUpdated` projections. Checkpoint schema/revision v2
+  records attributed internal accepted input while retaining ordinary user
+  turn compatibility.
 - Safe-boundary content injection: `SessionHandle::inject` queues bounded
   host content (`RuntimeBuilder::injection_queue_limit`, default 64) that the
   driver introduces only at provider/tool boundaries — never mid-stream —

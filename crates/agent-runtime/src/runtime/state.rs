@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use agent_runtime_core::artifact::{ArtifactId, ArtifactRef};
-use agent_runtime_core::content::Message;
+use agent_runtime_core::clock::Timestamp;
+use agent_runtime_core::content::{InternalTurnInput, Message};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::TurnFinish;
 use agent_runtime_core::ids::{InteractionRequestId, SessionId, TurnId};
@@ -34,6 +35,10 @@ pub struct ActiveTurn {
     pub id: TurnId,
     /// Index of the accepted input in canonical session history.
     pub history_start: usize,
+    /// Current-process clock when serving began or resumed.
+    pub started_at: Timestamp,
+    /// Exact attributed instruction for an internal turn.
+    pub internal_input: Option<InternalTurnInput>,
 }
 
 /// Mutable execution metadata owned by exactly one session.
@@ -82,9 +87,28 @@ impl SessionExecutionContext {
         })
     }
 
-    pub(crate) fn begin_turn(&self, id: TurnId, history_start: usize) {
-        *self.current_turn.lock().expect("current turn poisoned") =
-            Some(ActiveTurn { id, history_start });
+    pub(crate) fn begin_turn(&self, id: TurnId, history_start: usize, started_at: Timestamp) {
+        *self.current_turn.lock().expect("current turn poisoned") = Some(ActiveTurn {
+            id,
+            history_start,
+            started_at,
+            internal_input: None,
+        });
+    }
+
+    pub(crate) fn begin_internal_turn(
+        &self,
+        id: TurnId,
+        history_start: usize,
+        started_at: Timestamp,
+        input: InternalTurnInput,
+    ) {
+        *self.current_turn.lock().expect("current turn poisoned") = Some(ActiveTurn {
+            id,
+            history_start,
+            started_at,
+            internal_input: Some(input),
+        });
     }
 
     pub(crate) fn clear_turn(&self, id: &TurnId) {
@@ -101,6 +125,24 @@ impl SessionExecutionContext {
             .as_ref()
             .filter(|active| &active.id == id)
             .map(|active| active.history_start)
+    }
+
+    pub(crate) fn active_turn_started_at(&self, id: &TurnId) -> Option<Timestamp> {
+        self.current_turn
+            .lock()
+            .expect("current turn poisoned")
+            .as_ref()
+            .filter(|active| &active.id == id)
+            .map(|active| active.started_at)
+    }
+
+    pub(crate) fn active_internal_input(&self, id: &TurnId) -> Option<InternalTurnInput> {
+        self.current_turn
+            .lock()
+            .expect("current turn poisoned")
+            .as_ref()
+            .filter(|active| &active.id == id)
+            .and_then(|active| active.internal_input.clone())
     }
 
     pub(crate) fn activation_epoch(&self) -> Option<ActivationEpoch> {

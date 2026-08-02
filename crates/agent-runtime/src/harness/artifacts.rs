@@ -378,6 +378,7 @@ mod tests {
     use std::sync::Mutex;
 
     use agent_runtime_core::artifact::{ArtifactChunk, ArtifactDigest, ArtifactRef};
+    use agent_runtime_core::clock::Timestamp;
     use agent_runtime_core::content::ToolCall;
     use agent_runtime_core::ids::{RequestId, SessionId, ToolCallId, TurnId};
 
@@ -444,6 +445,8 @@ mod tests {
                 arguments: json!({"command": "build"}),
             },
             state: None,
+            usage: Arc::from([]),
+            now: Timestamp::ZERO,
         }
     }
 

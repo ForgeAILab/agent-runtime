@@ -93,6 +93,10 @@ neutral_id!(
     InteractionRequestId
 );
 neutral_id!(
+    /// Identifies one persistent session goal.
+    GoalId
+);
+neutral_id!(
     /// Identifies one question within a structured interaction.
     QuestionId
 );

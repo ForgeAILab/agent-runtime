@@ -39,10 +39,10 @@ fn merge_terminal_checkpoint_snapshot(
             "canonical session and terminal checkpoint identities differ",
         ));
     }
-    if canonical.identity.turn != protected.identity.turn
-        || canonical.identity.request != protected.identity.request
-        || canonical.identity.attempt != protected.identity.attempt
-        || canonical.identity.tool_call != protected.identity.tool_call
+    if canonical.identity.turn < protected.identity.turn
+        || canonical.identity.request < protected.identity.request
+        || canonical.identity.attempt < protected.identity.attempt
+        || canonical.identity.tool_call < protected.identity.tool_call
         || canonical.identity.event < protected.identity.event
         || canonical.identity.event_seq < protected.identity.event_seq
     {
@@ -82,9 +82,13 @@ fn merge_terminal_checkpoint_snapshot(
                 )));
             }
         }
-        canonical
-            .extension_state
-            .insert(namespace.clone(), exact.clone());
+        if canonical.updated <= protected.updated
+            || !canonical.extension_state.contains_key(namespace)
+        {
+            canonical
+                .extension_state
+                .insert(namespace.clone(), exact.clone());
+        }
     }
     // Ordinary stores may redact registered credential literals in otherwise
     // structurally identical history. That redacted completed-turn history
@@ -334,6 +338,7 @@ impl Runtime {
             shutdown_lock: tokio::sync::Mutex::new(false),
             active_session_lease,
             delegation_coordinator_active: AtomicBool::new(false),
+            goal_controller_active: AtomicBool::new(false),
             recovery_deferred,
         });
 

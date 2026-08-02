@@ -512,6 +512,7 @@ mod tests {
         ArtifactChunk, ArtifactDigest, ArtifactError, ArtifactId, ArtifactRead, ArtifactRef,
     };
     use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
+    use agent_runtime_core::clock::Timestamp;
     use agent_runtime_core::content::UserInput;
     use agent_runtime_core::ids::{SessionId, TurnId};
     use agent_runtime_core::provider::{Capabilities, FinishReason, ModelId, ProviderStreamEvent};
@@ -620,9 +621,13 @@ mod tests {
                 session: SessionId::new("s"),
                 turn: TurnId::new("t4"),
                 finish: TurnFinish::Completed,
+                provider_error_kind: None,
                 visible_output: true,
                 history: Arc::from(history.clone()),
                 state: None,
+                usage: Arc::from([]),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
             })
             .await
             .unwrap();
@@ -793,9 +798,13 @@ mod tests {
                 session: SessionId::new("s"),
                 turn: TurnId::new("t4"),
                 finish: TurnFinish::Completed,
+                provider_error_kind: None,
                 visible_output: true,
                 history: Arc::from(history(4)),
                 state: None,
+                usage: Arc::from([]),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
             })
             .await
             .unwrap();

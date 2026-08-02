@@ -8,7 +8,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ids::ToolCallId;
+use agent_runtime_registry::RegistryRevision;
+
+use crate::error::RuntimeError;
+use crate::ids::{GoalId, ToolCallId};
+
+/// Maximum bounded text carried by one internal turn.
+pub const MAX_INTERNAL_TURN_CHARS: usize = 4_096;
+/// Maximum stable internal source kind/id length.
+pub const MAX_INTERNAL_SOURCE_CHARS: usize = 128;
 
 /// Who authored a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +200,96 @@ impl UserInput {
     }
 }
 
+/// Content-handling posture of an internal turn instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalTurnSensitivity {
+    /// Bounded content may be persisted under ordinary session policy.
+    Public,
+    /// Content requires protected session/checkpoint handling.
+    Sensitive,
+}
+
+/// Optional persistent-goal generation bound to an internal turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InternalGoalBinding {
+    /// Expected goal identity.
+    pub id: GoalId,
+    /// Expected active state generation.
+    pub generation: u64,
+}
+
+/// Metadata-only provenance for an internal turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InternalTurnSource {
+    /// Stable source category such as `goal`.
+    pub kind: String,
+    /// Stable source/component identity.
+    pub id: String,
+    /// Source contract revision.
+    pub revision: RegistryRevision,
+    /// Required content handling.
+    pub sensitivity: InternalTurnSensitivity,
+    /// Optional expected persistent goal generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<InternalGoalBinding>,
+}
+
+impl InternalTurnSource {
+    /// Validates bounded stable source metadata.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        for (field, value) in [("kind", &self.kind), ("id", &self.id)] {
+            let chars = value.chars().count();
+            if value.trim().is_empty() || chars > MAX_INTERNAL_SOURCE_CHARS {
+                return Err(RuntimeError::config(format!(
+                    "internal turn source {field} must contain 1..={MAX_INTERNAL_SOURCE_CHARS} characters"
+                )));
+            }
+        }
+        if self.goal.as_ref().is_some_and(|goal| goal.generation == 0) {
+            return Err(RuntimeError::config(
+                "internal goal generation must start at one",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact bounded content and provenance for one internal turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InternalTurnInput {
+    /// Required turn-scoped instruction content.
+    pub content: String,
+    /// Metadata-only attribution.
+    pub source: InternalTurnSource,
+}
+
+impl InternalTurnInput {
+    /// Creates and validates internal turn input.
+    pub fn new(
+        content: impl Into<String>,
+        source: InternalTurnSource,
+    ) -> Result<Self, RuntimeError> {
+        let input = Self {
+            content: content.into(),
+            source,
+        };
+        input.validate()?;
+        Ok(input)
+    }
+
+    /// Validates content and source bounds.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        let chars = self.content.chars().count();
+        if self.content.trim().is_empty() || chars > MAX_INTERNAL_TURN_CHARS {
+            return Err(RuntimeError::config(format!(
+                "internal turn content must contain 1..={MAX_INTERNAL_TURN_CHARS} characters"
+            )));
+        }
+        self.source.validate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +346,26 @@ mod tests {
         let json = serde_json::to_string(&signed).unwrap();
         let back: ContentPart = serde_json::from_str(&json).unwrap();
         assert_eq!(back, signed);
+    }
+
+    #[test]
+    fn internal_turn_input_is_bounded_and_roundtrips() {
+        let input = InternalTurnInput::new(
+            "Continue the current goal.",
+            InternalTurnSource {
+                kind: "goal".into(),
+                id: "harness.goal.state".into(),
+                revision: RegistryRevision::new("goal-controller-v1"),
+                sensitivity: InternalTurnSensitivity::Public,
+                goal: Some(InternalGoalBinding {
+                    id: GoalId::new("goal-1"),
+                    generation: 2,
+                }),
+            },
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&input).unwrap();
+        let decoded: InternalTurnInput = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, input);
     }
 }

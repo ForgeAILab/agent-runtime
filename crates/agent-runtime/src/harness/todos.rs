@@ -463,6 +463,7 @@ impl TurnCommitHook for TodoComponent {
 mod tests {
     use std::sync::Arc;
 
+    use agent_runtime_core::clock::Timestamp;
     use agent_runtime_core::content::{Message, ToolCall};
     use agent_runtime_core::ids::{RequestId, SessionId, ToolCallId, TurnId};
     use agent_runtime_registry::Fingerprint;
@@ -514,6 +515,8 @@ mod tests {
                         arguments: json!({}),
                     },
                     state: None,
+                    usage: Arc::from([]),
+                    now: Timestamp::ZERO,
                 },
                 outcome,
             )
@@ -562,6 +565,8 @@ mod tests {
                         arguments: json!({}),
                     },
                     state: None,
+                    usage: Arc::from([]),
+                    now: Timestamp::ZERO,
                 },
                 ToolOutcome::json(json!({
                     "schema_version": TODO_STATE_SCHEMA_VERSION,
@@ -599,6 +604,8 @@ mod tests {
                         arguments: json!({}),
                     },
                     state: None,
+                    usage: Arc::from([]),
+                    now: Timestamp::ZERO,
                 },
                 ToolOutcome::json(json!({
                     "schema_version": TODO_STATE_SCHEMA_VERSION,
@@ -612,9 +619,13 @@ mod tests {
                 session: SessionId::new("s"),
                 turn: TurnId::new("t"),
                 finish: agent_runtime_core::event::TurnFinish::Completed,
+                provider_error_kind: None,
                 visible_output: true,
                 history: Arc::from([]),
                 state: Some(mutation.state.unwrap().into_state()),
+                usage: Arc::from([]),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
             })
             .await
             .unwrap();

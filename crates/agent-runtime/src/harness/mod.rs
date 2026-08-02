@@ -2,6 +2,7 @@
 
 mod artifacts;
 mod capability_search;
+mod goals;
 mod live_abilities;
 mod memory;
 mod pipeline;
@@ -16,6 +17,10 @@ pub use artifacts::{
 };
 pub use capability_search::{
     CAPABILITY_SEARCH_TOOL_NAME, CapabilitySearchTool, MAX_CAPABILITY_SEARCH_RESULTS,
+};
+pub use goals::{
+    CREATE_GOAL_TOOL_NAME, CreateGoalTool, GET_GOAL_TOOL_NAME, GetGoalTool, GoalComponent,
+    UPDATE_GOAL_TOOL_NAME, UpdateGoalTool,
 };
 pub(crate) use live_abilities::{
     ACTIVATION_STATE_NAMESPACE, LiveAbilityRuntime, SessionAbilities, emit_activation_epoch,

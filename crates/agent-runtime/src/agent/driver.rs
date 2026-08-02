@@ -20,7 +20,8 @@ use agent_runtime_context::cache::CachePlan;
 use agent_runtime_context::plan::ContextPlan;
 use agent_runtime_context::sizing::EstimationConfidence as SizerConfidence;
 use agent_runtime_context::{
-    ContextFragment, ContextLane, FragmentContent, FragmentKind, FragmentSource,
+    CacheClass, ContextFragment, ContextLane, ContextPosition, FragmentContent, FragmentKind,
+    FragmentSource, Sensitivity,
 };
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::checkpoint::{
@@ -28,7 +29,8 @@ use agent_runtime_core::checkpoint::{
 };
 use agent_runtime_core::clock::{Clock, Deadline};
 use agent_runtime_core::content::{
-    ContentPart, Message, Role, ToolCall, ToolResultBlock, UserInput,
+    ContentPart, InternalTurnInput, InternalTurnSensitivity, Message, Role, ToolCall,
+    ToolResultBlock, UserInput,
 };
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{
@@ -49,7 +51,7 @@ use agent_runtime_core::store::{
 };
 use agent_runtime_core::tool::ToolOutcome;
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
-use agent_runtime_registry::Fingerprint;
+use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
 use crate::agent::assembler::ToolCallAssembler;
 use crate::agent::config::LoopConfig;
@@ -278,7 +280,10 @@ enum ProviderTurnOutcome {
     },
     Failed(ProviderError),
     Cancelled,
-    LimitReached(LimitKind),
+    LimitReached {
+        limit: LimitKind,
+        provider_error_kind: Option<ProviderErrorKind>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -552,6 +557,34 @@ impl Driver {
         .await;
     }
 
+    /// Runs one attributed internal turn without appending a user message to
+    /// canonical history.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_internal_turn(
+        &self,
+        state: Arc<Mutex<SessionState>>,
+        execution: Arc<SessionExecutionContext>,
+        emitter: Arc<EventEmitter>,
+        minter: Arc<IdMinter>,
+        turn_cancel: Cancellation,
+        inbox: Arc<Mutex<InjectionQueue>>,
+        turn_id: TurnId,
+        input: InternalTurnInput,
+    ) {
+        TurnMachine::new(
+            self,
+            state,
+            execution,
+            emitter,
+            minter,
+            turn_cancel,
+            inbox,
+            turn_id,
+        )
+        .run_internal(input)
+        .await;
+    }
+
     /// Runs one explicit host tool action through the checkpointed turn
     /// machinery without constructing or calling a provider request.
     #[allow(clippy::too_many_arguments)]
@@ -739,6 +772,52 @@ impl<'a> TurnMachine<'a> {
         Ok(())
     }
 
+    async fn checkpoint_internal_accepted(
+        &mut self,
+        input: InternalTurnInput,
+        active_history_start: usize,
+        deadline: Deadline,
+    ) -> Result<(), RuntimeError> {
+        if self.checkpoint.is_some() {
+            return Err(RuntimeError::conflict(
+                "accepted checkpoint already exists for this turn",
+            ));
+        }
+        let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
+            match store.load_latest(self.emitter.session()).await? {
+                None => 1,
+                Some(previous)
+                    if previous.turn != self.turn_id
+                        && matches!(previous.state, TurnState::Terminal { .. }) =>
+                {
+                    previous.watermark.checkpoint_sequence.saturating_add(1)
+                }
+                Some(_) => {
+                    return Err(RuntimeError::conflict(
+                        "cannot accept a new turn over a non-terminal checkpoint",
+                    ));
+                }
+            }
+        } else {
+            1
+        };
+        let checkpoint = TurnCheckpoint::internal_accepted(
+            self.turn_id.clone(),
+            input,
+            self.snapshot(),
+            active_history_start,
+            deadline,
+            checkpoint_sequence,
+            self.emitter.next_sequence(),
+            self.driver.clock.now(),
+        )?;
+        if let Some(store) = &self.driver.checkpoint_store {
+            store.save(&checkpoint).await?;
+        }
+        self.checkpoint = Some(checkpoint);
+        Ok(())
+    }
+
     async fn checkpoint_local_action(
         &mut self,
         request_id: RequestId,
@@ -822,10 +901,21 @@ impl<'a> TurnMachine<'a> {
     }
 
     async fn complete(&mut self, finish: TurnFinish, visible_output: bool) {
+        self.complete_with_provider_error(finish, visible_output, None)
+            .await;
+    }
+
+    async fn complete_with_provider_error(
+        &mut self,
+        finish: TurnFinish,
+        visible_output: bool,
+        provider_error_kind: Option<ProviderErrorKind>,
+    ) {
         if let Err(error) = self
             .transition(TurnState::Completing {
                 finish: finish.clone(),
                 visible_output,
+                provider_error_kind,
             })
             .await
         {
@@ -833,7 +923,10 @@ impl<'a> TurnMachine<'a> {
             return;
         }
 
-        if let Err(error) = self.run_turn_commit_hooks(&finish, visible_output).await {
+        if let Err(error) = self
+            .run_turn_commit_hooks(&finish, visible_output, provider_error_kind)
+            .await
+        {
             self.emit_non_durable_failure(error, visible_output);
             return;
         }
@@ -898,6 +991,7 @@ impl<'a> TurnMachine<'a> {
         &self,
         finish: &TurnFinish,
         visible_output: bool,
+        provider_error_kind: Option<ProviderErrorKind>,
     ) -> Result<(), RuntimeError> {
         let deadline = self
             .checkpoint
@@ -912,6 +1006,20 @@ impl<'a> TurnMachine<'a> {
                 .clone()
                 .into_boxed_slice(),
         );
+        let usage: Arc<[UsageRecord]> = Arc::from(
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .usage
+                .records()
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let committed_at = self.driver.clock.now();
+        let started_at = self
+            .execution
+            .active_turn_started_at(&self.turn_id)
+            .unwrap_or(committed_at);
         let mut updates = Vec::new();
         let mut hook_usage = Vec::new();
         let mut hook_events = Vec::new();
@@ -929,9 +1037,13 @@ impl<'a> TurnMachine<'a> {
                     session: self.emitter.session().clone(),
                     turn: self.turn_id.clone(),
                     finish: finish.clone(),
+                    provider_error_kind,
                     visible_output,
                     history: history.clone(),
                     state: component_state,
+                    usage: usage.clone(),
+                    started_at,
+                    committed_at,
                 }),
                 &self.cancel,
                 deadline,
@@ -1089,6 +1201,16 @@ impl<'a> TurnMachine<'a> {
                 .expect("session extension state poisoned")
                 .get(descriptor.id().as_str())
                 .cloned();
+            let usage = Arc::from(
+                self.state
+                    .lock()
+                    .expect("session state poisoned")
+                    .usage
+                    .records()
+                    .to_vec()
+                    .into_boxed_slice(),
+            );
+            let now = self.driver.clock.now();
             let patch = await_harness_phase(
                 processor.process(
                     &ToolOutputView {
@@ -1097,6 +1219,8 @@ impl<'a> TurnMachine<'a> {
                         request: request_id.clone(),
                         call: call.clone(),
                         state: current_state,
+                        usage,
+                        now,
                     },
                     outcome,
                 ),
@@ -2237,7 +2361,7 @@ impl<'a> TurnMachine<'a> {
             .history
             .len();
         self.execution
-            .begin_turn(self.turn_id.clone(), history_start);
+            .begin_turn(self.turn_id.clone(), history_start, self.driver.clock.now());
         self.emitter
             .emit(Some(self.turn_id.clone()), RuntimeEvent::TurnStarted);
         self.checkpoint_local_action(request_id.clone(), call.clone(), deadline)
@@ -2441,6 +2565,16 @@ impl<'a> TurnMachine<'a> {
                 .expect("session extension state poisoned")
                 .get(descriptor.id().as_str())
                 .cloned();
+            let usage = Arc::from(
+                self.state
+                    .lock()
+                    .expect("session state poisoned")
+                    .usage
+                    .records()
+                    .to_vec()
+                    .into_boxed_slice(),
+            );
+            let now = self.driver.clock.now();
             let patch = await_harness_phase(
                 processor.process(
                     &ToolOutputView {
@@ -2449,6 +2583,8 @@ impl<'a> TurnMachine<'a> {
                         request: request_id.clone(),
                         call: call.clone(),
                         state: current_state,
+                        usage,
+                        now,
                     },
                     outcome,
                 ),
@@ -2565,6 +2701,7 @@ impl<'a> TurnMachine<'a> {
         self.transition(TurnState::Completing {
             finish: finish.clone(),
             visible_output: false,
+            provider_error_kind: None,
         })
         .await?;
         self.transition(TurnState::PublishingTerminal {
@@ -2603,8 +2740,20 @@ impl<'a> TurnMachine<'a> {
             self.emit_non_durable_failure(error, checkpoint.visible_output);
             return;
         }
-        self.execution
-            .begin_turn(self.turn_id.clone(), checkpoint.active_history_start);
+        if let Some(input) = checkpoint.internal_input.clone() {
+            self.execution.begin_internal_turn(
+                self.turn_id.clone(),
+                checkpoint.active_history_start,
+                self.driver.clock.now(),
+                input,
+            );
+        } else {
+            self.execution.begin_turn(
+                self.turn_id.clone(),
+                checkpoint.active_history_start,
+                self.driver.clock.now(),
+            );
+        }
 
         match checkpoint.state {
             TurnState::Accepted { .. } => {
@@ -2692,6 +2841,15 @@ impl<'a> TurnMachine<'a> {
                 );
                 self.complete(TurnFinish::Failed, checkpoint.visible_output)
                     .await;
+            }
+            TurnState::InternalAccepted { .. } => {
+                self.run_loop(
+                    checkpoint.active_history_start,
+                    checkpoint.deadline,
+                    0,
+                    checkpoint.visible_output,
+                )
+                .await;
             }
             TurnState::ModelResponseReady {
                 request_id,
@@ -2967,13 +3125,17 @@ impl<'a> TurnMachine<'a> {
             TurnState::Completing {
                 finish,
                 visible_output,
+                provider_error_kind,
             } => {
-                if checkpoint.active_history_start == checkpoint.snapshot.history.len() {
+                if checkpoint.internal_input.is_none()
+                    && checkpoint.active_history_start == checkpoint.snapshot.history.len()
+                {
                     if let Err(error) = self.complete_local(finish).await {
                         self.emit_non_durable_failure(error, false);
                     }
                 } else {
-                    self.complete(finish, visible_output).await;
+                    self.complete_with_provider_error(finish, visible_output, provider_error_kind)
+                        .await;
                 }
             }
             TurnState::PublishingTerminal {
@@ -3314,7 +3476,7 @@ impl<'a> TurnMachine<'a> {
             guard.history.push(input.into_message());
             history_start
         };
-        execution.begin_turn(turn_id.clone(), active_history_start);
+        execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
         driver.drain_injected(&state, &inbox);
 
         if let Err(error) = self
@@ -3327,6 +3489,55 @@ impl<'a> TurnMachine<'a> {
             return;
         }
 
+        self.run_loop(active_history_start, turn_deadline, 0, false)
+            .await;
+    }
+
+    async fn run_internal(mut self, input: InternalTurnInput) {
+        let driver = self.driver;
+        let state = self.state.clone();
+        let execution = self.execution.clone();
+        let emitter = self.emitter.clone();
+        let turn_cancel = self.cancel.clone();
+        let inbox = self.inbox.clone();
+        let turn_id = self.turn_id.clone();
+        let turn = Some(turn_id.clone());
+        emitter.emit(turn.clone(), RuntimeEvent::TurnStarted);
+        emitter.emit(
+            turn.clone(),
+            RuntimeEvent::InternalTurnStarted {
+                source: input.source.clone(),
+            },
+        );
+
+        if turn_cancel.is_cancelled() {
+            driver.finish_cancelled(&emitter, &turn, &turn_cancel, false);
+            return;
+        }
+        let turn_deadline = match driver.config.turn_time_limit_ms {
+            Some(ms) => Deadline::after(driver.clock.as_ref(), ms),
+            None => Deadline::never(),
+        };
+        let active_history_start = {
+            let mut guard = state.lock().expect("session state poisoned");
+            strip_stale_reasoning(&mut guard.history);
+            guard.history.len()
+        };
+        execution.begin_internal_turn(
+            turn_id,
+            active_history_start,
+            driver.clock.now(),
+            input.clone(),
+        );
+        driver.drain_injected(&state, &inbox);
+
+        if let Err(error) = self
+            .checkpoint_internal_accepted(input, active_history_start, turn_deadline)
+            .await
+        {
+            self.emit_non_durable_failure(error, false);
+            return;
+        }
         self.run_loop(active_history_start, turn_deadline, 0, false)
             .await;
     }
@@ -3509,14 +3720,27 @@ impl<'a> TurnMachine<'a> {
                     return;
                 }
                 ProviderTurnOutcome::Failed(err) => {
+                    let provider_error_kind = err.kind;
                     emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
-                    self.complete(TurnFinish::Failed, visible_output).await;
+                    self.complete_with_provider_error(
+                        TurnFinish::Failed,
+                        visible_output,
+                        Some(provider_error_kind),
+                    )
+                    .await;
                     return;
                 }
-                ProviderTurnOutcome::LimitReached(limit) => {
+                ProviderTurnOutcome::LimitReached {
+                    limit,
+                    provider_error_kind,
+                } => {
                     emitter.emit(turn.clone(), RuntimeEvent::LimitReached { limit });
-                    self.complete(TurnFinish::LimitReached { limit }, visible_output)
-                        .await;
+                    self.complete_with_provider_error(
+                        TurnFinish::LimitReached { limit },
+                        visible_output,
+                        provider_error_kind,
+                    )
+                    .await;
                     return;
                 }
                 ProviderTurnOutcome::Success {
@@ -3808,6 +4032,7 @@ impl Driver {
             Some(active_history_start),
             "the active turn boundary must remain stable across provider calls"
         );
+        let internal_input = execution.active_internal_input(turn_id);
         let interaction_ready = match execution.interaction_disposition {
             InteractionDisposition::DirectHost => {
                 self.interaction_broker.readiness() == InteractionReadiness::Ready
@@ -3823,9 +4048,10 @@ impl Driver {
             (&self.live_abilities, &execution.abilities)
         {
             runtime.apply_pending(abilities, emitter, turn);
-            let user_text = history
-                .get(active_history_start)
-                .map(Message::joined_text)
+            let user_text = internal_input
+                .as_ref()
+                .map(|input| input.content.clone())
+                .or_else(|| history.get(active_history_start).map(Message::joined_text))
                 .unwrap_or_default();
             runtime
                 .ensure_initial_activation(abilities, &user_text, emitter, turn)
@@ -3886,6 +4112,30 @@ impl Driver {
         }
         let projected_history = &history[history_offset..];
 
+        if let Some(input) = &internal_input {
+            let rendered = serde_json::to_string(input).map_err(|error| {
+                ContextError::compaction(format!(
+                    "internal turn input could not be rendered: {error}"
+                ))
+            })?;
+            let sensitivity = match input.source.sensitivity {
+                InternalTurnSensitivity::Public => Sensitivity::Public,
+                InternalTurnSensitivity::Sensitive => Sensitivity::Sensitive,
+            };
+            contributed.push(
+                ContextFragment::new(
+                    format!("internal-turn:{}", turn_id.as_str()),
+                    FragmentKind::Continuation,
+                    FragmentSource::Host,
+                    RegistryRevision::from_content(rendered.as_bytes()),
+                    FragmentContent::Text(rendered),
+                )
+                .with_position(ContextPosition::new(ContextLane::TailContext, 0))
+                .with_cache_class(CacheClass::NoCache)
+                .with_sensitivity(sensitivity),
+            );
+        }
+
         let mut fragment_ids = std::collections::BTreeSet::new();
         if self.config.system_prompt.is_some() {
             fragment_ids.insert("system".to_owned());
@@ -3936,7 +4186,21 @@ impl Driver {
                 contributed.push(fragment);
             }
         }
-        let planned = if history_offset == 0 {
+        let planned = if internal_input.is_some() {
+            let active_suffix_start = (projected_active_start < projected_history.len())
+                .then_some(projected_active_start);
+            execution.planner.plan_internal_turn_from(
+                self.config.system_prompt.as_deref(),
+                projected_history,
+                history_offset,
+                &schemas,
+                &contributed,
+                active_suffix_start,
+                &semantic_provenance,
+                &revisions,
+                &activation,
+            )?
+        } else if history_offset == 0 {
             execution.planner.plan_activated_turn_from(
                 self.config.system_prompt.as_deref(),
                 projected_history,
@@ -4023,11 +4287,16 @@ impl Driver {
             );
         }
 
+        let internal = internal_input.is_some();
+        let mut turn_manifest = TurnManifest::new(turn_id.clone(), planned.manifest);
+        if let Some(input) = internal_input {
+            turn_manifest = turn_manifest.with_internal_source(input.source);
+        }
         state
             .lock()
             .expect("session state poisoned")
             .manifests
-            .push(TurnManifest::new(turn_id.clone(), planned.manifest));
+            .push(turn_manifest);
 
         let mut request = plan.to_provider_request(self.config.model.clone());
         request.sampling = self.config.sampling.clone();
@@ -4035,13 +4304,22 @@ impl Driver {
         request.structured_output = self.config.structured_output.clone();
         request.max_output_tokens = self.config.max_output_tokens;
         for interceptor in self.harness.model() {
+            let descriptor = interceptor.descriptor();
+            let component_state = execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned")
+                .get(descriptor.id().as_str())
+                .cloned();
             let patch = await_harness_phase(
                 interceptor.before_model(&ModelView {
                     session: emitter.session().clone(),
                     turn: turn_id.clone(),
                     step,
+                    internal,
                     activation: revisions.activation.clone(),
                     request: request.clone(),
+                    state: component_state,
                 }),
                 cancel,
                 deadline,
@@ -4344,7 +4622,10 @@ impl Driver {
                         let remaining = turn_deadline.remaining_millis(self.clock.as_ref());
                         let wait_ms = remaining.map_or(delay, |remaining| remaining.min(delay));
                         if wait_ms == 0 {
-                            return ProviderTurnOutcome::LimitReached(LimitKind::Time);
+                            return ProviderTurnOutcome::LimitReached {
+                                limit: LimitKind::Time,
+                                provider_error_kind: None,
+                            };
                         }
                         tokio::select! {
                             _ = turn_cancel.cancelled() => {
@@ -4353,14 +4634,20 @@ impl Driver {
                             _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
                         }
                         if remaining.is_some_and(|remaining| remaining <= delay) {
-                            return ProviderTurnOutcome::LimitReached(LimitKind::Time);
+                            return ProviderTurnOutcome::LimitReached {
+                                limit: LimitKind::Time,
+                                provider_error_kind: None,
+                            };
                         }
                     }
                     attempt_index += 1;
                     continue;
                 }
                 if retryable {
-                    return ProviderTurnOutcome::LimitReached(LimitKind::ProviderAttempts);
+                    return ProviderTurnOutcome::LimitReached {
+                        limit: LimitKind::ProviderAttempts,
+                        provider_error_kind: Some(perr.kind),
+                    };
                 }
                 return ProviderTurnOutcome::Failed(perr);
             }
@@ -4371,7 +4658,10 @@ impl Driver {
             // contain an incomplete tool call, so its text and reasoning are
             // discarded just like filtered, cancelled, and errored output.
             let terminal_failure = match finish {
-                FinishReason::Length => Some(ProviderTurnOutcome::LimitReached(LimitKind::Output)),
+                FinishReason::Length => Some(ProviderTurnOutcome::LimitReached {
+                    limit: LimitKind::Output,
+                    provider_error_kind: None,
+                }),
                 FinishReason::Cancelled => Some(ProviderTurnOutcome::Cancelled),
                 FinishReason::Error => Some(ProviderTurnOutcome::Failed(ProviderError::new(
                     ProviderErrorKind::MalformedStream,

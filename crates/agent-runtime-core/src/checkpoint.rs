@@ -13,25 +13,23 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use agent_runtime_registry::Fingerprint;
+use agent_runtime_registry::{Fingerprint, FingerprintHasher};
 
 use crate::clock::{Deadline, Timestamp};
-use crate::content::{ContentPart, ToolCall, ToolResultBlock, UserInput};
+use crate::content::{ContentPart, InternalTurnInput, ToolCall, ToolResultBlock, UserInput};
 use crate::error::RuntimeError;
 use crate::event::TurnFinish;
 use crate::ids::{AttemptId, RequestId, SessionId, ToolCallId, TurnId};
 use crate::interaction::{InteractionRequest, InteractionResponse};
-use crate::provider::{FinishReason, ProviderRequest};
+use crate::provider::{FinishReason, ProviderErrorKind, ProviderRequest};
 use crate::store::SessionSnapshot;
 use crate::tool::{PreparedToolCall, ToolOutcome};
 
 /// The protected-checkpoint wire schema.
 ///
-/// Version 1 is the first, not-yet-released schema introduced by the
-/// `stabilize-session-harness-pipeline` change. It intentionally includes
-/// `ToolSlotCheckpoint` and `AwaitingInteraction`; there is no published
-/// pre-interaction v1 checkpoint contract to accept.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds exact attributed internal-turn input and terminal provider
+/// error classification to the same unreleased protected contract.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 /// The direct turn-machine transition-table revision.
 ///
@@ -39,7 +37,7 @@ pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 /// execute equivalently. Silent best-effort recovery could repeat a provider
 /// call or tool side effect. Revision 1 is the initial transition table from
 /// the same unreleased change and includes interaction barriers.
-pub const TURN_TRANSITION_REVISION: u32 = 1;
+pub const TURN_TRANSITION_REVISION: u32 = 2;
 
 /// Event/checkpoint progress connecting protected state to the redacted
 /// observability stream.
@@ -137,6 +135,13 @@ pub enum TurnState {
     Accepted {
         /// Exact accepted input.
         input: UserInput,
+    },
+    /// Attributed internal input was accepted without appending a fabricated
+    /// user-role message to canonical history.
+    InternalAccepted {
+        /// Exact bounded input, also retained on the checkpoint while the
+        /// state machine advances beyond this initial state.
+        input: InternalTurnInput,
     },
     /// An explicit host-requested tool action was accepted without appending
     /// model-facing conversation history.
@@ -281,6 +286,10 @@ pub enum TurnState {
         finish: TurnFinish,
         /// Whether a committed provider attempt produced visible text.
         visible_output: bool,
+        /// Typed provider failure that caused this terminal result, when one
+        /// exists. Persisted so post-commit policy is identical after restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_error_kind: Option<ProviderErrorKind>,
     },
     /// Protected post-hook terminal state is durable and its one terminal
     /// event is ready to be published.
@@ -319,6 +328,8 @@ impl TurnState {
         match (self, next) {
             (Self::Accepted { .. }, Self::Planning { step }) => *step == 0,
             (Self::Accepted { .. }, Self::Completing { .. }) => true,
+            (Self::InternalAccepted { .. }, Self::Planning { step }) => *step == 0,
+            (Self::InternalAccepted { .. }, Self::Completing { .. }) => true,
             (
                 Self::LocalActionAccepted { request_id, call },
                 Self::LocalActionPrepared {
@@ -749,6 +760,7 @@ impl TurnState {
                 Self::Completing {
                     finish,
                     visible_output,
+                    ..
                 },
                 Self::PublishingTerminal {
                     finish: next_finish,
@@ -910,6 +922,10 @@ pub struct TurnCheckpoint {
     pub operation_fingerprint: Fingerprint,
     /// Exact canonical-history index owned by the accepted input.
     pub active_history_start: usize,
+    /// Exact attributed input for an internal turn. Retained after the
+    /// initial state so any later checkpoint resumes with identical context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_input: Option<InternalTurnInput>,
     /// Whether committed provider output in this turn contains visible text.
     pub visible_output: bool,
     /// Current direct-machine state.
@@ -960,9 +976,53 @@ impl TurnCheckpoint {
             operation_fingerprint: checkpoint_operation_fingerprint(
                 &state,
                 active_history_start,
+                None,
                 false,
             ),
             active_history_start,
+            internal_input: None,
+            visible_output: false,
+            state,
+            snapshot,
+            deadline,
+            watermark: CheckpointWatermark::new(checkpoint_sequence, event_sequence),
+            updated,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Creates the first checkpoint for an attributed internal turn.
+    #[allow(clippy::too_many_arguments)]
+    pub fn internal_accepted(
+        turn: TurnId,
+        input: InternalTurnInput,
+        snapshot: SessionSnapshot,
+        active_history_start: usize,
+        deadline: Deadline,
+        checkpoint_sequence: u64,
+        event_sequence: u64,
+        updated: Timestamp,
+    ) -> Result<Self, RuntimeError> {
+        input.validate()?;
+        let session = snapshot.id.clone();
+        let state = TurnState::InternalAccepted {
+            input: input.clone(),
+        };
+        let checkpoint = Self {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            transition_revision: TURN_TRANSITION_REVISION,
+            session,
+            turn,
+            state_revision: 0,
+            operation_fingerprint: checkpoint_operation_fingerprint(
+                &state,
+                active_history_start,
+                Some(&input),
+                false,
+            ),
+            active_history_start,
+            internal_input: Some(input),
             visible_output: false,
             state,
             snapshot,
@@ -1001,9 +1061,11 @@ impl TurnCheckpoint {
             operation_fingerprint: checkpoint_operation_fingerprint(
                 &state,
                 active_history_start,
+                None,
                 false,
             ),
             active_history_start,
+            internal_input: None,
             visible_output: false,
             state,
             snapshot,
@@ -1097,9 +1159,11 @@ impl TurnCheckpoint {
             operation_fingerprint: checkpoint_operation_fingerprint(
                 &next,
                 active_history_start,
+                self.internal_input.as_ref(),
                 visible_output,
             ),
             active_history_start,
+            internal_input: self.internal_input.clone(),
             visible_output,
             state: next,
             snapshot,
@@ -1132,7 +1196,9 @@ impl TurnCheckpoint {
         }
         let initial = matches!(
             self.state,
-            TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. }
+            TurnState::Accepted { .. }
+                | TurnState::InternalAccepted { .. }
+                | TurnState::LocalActionAccepted { .. }
         );
         if (self.state_revision == 0) != initial {
             return Err(RuntimeError::conflict(
@@ -1144,24 +1210,50 @@ impl TurnCheckpoint {
                 "checkpoint snapshot/session identity mismatch",
             ));
         }
-        let local_action = matches!(
-            self.state,
-            TurnState::LocalActionAccepted { .. }
-                | TurnState::LocalActionPrepared { .. }
-                | TurnState::LocalActionExecuting { .. }
-                | TurnState::LocalActionOutcomeReady { .. }
-                | TurnState::LocalActionResultReady { .. }
-        ) || (self.active_history_start == self.snapshot.history.len()
-            && matches!(
+        let internal_turn = self.internal_input.is_some();
+        if let Some(input) = &self.internal_input {
+            input.validate()?;
+        }
+        match &self.state {
+            TurnState::InternalAccepted { input }
+                if self.internal_input.as_ref() != Some(input) =>
+            {
+                return Err(RuntimeError::conflict(
+                    "internal accepted state does not match checkpoint input",
+                ));
+            }
+            TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. } if internal_turn => {
+                return Err(RuntimeError::conflict(
+                    "ordinary accepted state cannot carry internal input",
+                ));
+            }
+            _ => {}
+        }
+        let local_action = !internal_turn
+            && (matches!(
                 self.state,
-                TurnState::Completing { .. }
-                    | TurnState::PublishingTerminal { .. }
-                    | TurnState::Terminal { .. }
-            ));
+                TurnState::LocalActionAccepted { .. }
+                    | TurnState::LocalActionPrepared { .. }
+                    | TurnState::LocalActionExecuting { .. }
+                    | TurnState::LocalActionOutcomeReady { .. }
+                    | TurnState::LocalActionResultReady { .. }
+            ) || (self.active_history_start == self.snapshot.history.len()
+                && matches!(
+                    self.state,
+                    TurnState::Completing { .. }
+                        | TurnState::PublishingTerminal { .. }
+                        | TurnState::Terminal { .. }
+                )));
         if local_action {
             if self.active_history_start != self.snapshot.history.len() {
                 return Err(RuntimeError::conflict(
                     "local-action checkpoint changed canonical history",
+                ));
+            }
+        } else if internal_turn {
+            if self.active_history_start > self.snapshot.history.len() {
+                return Err(RuntimeError::conflict(
+                    "internal-turn history boundary exceeds canonical history",
                 ));
             }
         } else if self.active_history_start >= self.snapshot.history.len() {
@@ -1197,6 +1289,7 @@ impl TurnCheckpoint {
             TurnState::LocalActionAccepted { .. }
             | TurnState::LocalActionOutcomeReady { .. }
             | TurnState::Accepted { .. }
+            | TurnState::InternalAccepted { .. }
             | TurnState::Planning { .. }
             | TurnState::CallingModel { .. }
             | TurnState::ModelResponseReady { .. }
@@ -1231,6 +1324,7 @@ impl TurnCheckpoint {
             != checkpoint_operation_fingerprint(
                 &self.state,
                 self.active_history_start,
+                self.internal_input.as_ref(),
                 self.visible_output,
             )
         {
@@ -1339,7 +1433,9 @@ impl TurnCheckpoint {
                 "checkpoint successor changed schema or transition revision",
             ));
         }
-        if self.deadline != next.deadline || self.active_history_start != next.active_history_start
+        if self.deadline != next.deadline
+            || self.active_history_start != next.active_history_start
+            || self.internal_input != next.internal_input
         {
             return Err(RuntimeError::conflict(
                 "checkpoint successor changed immutable turn progress",
@@ -1377,24 +1473,33 @@ impl TurnCheckpoint {
 fn checkpoint_operation_fingerprint(
     state: &TurnState,
     active_history_start: usize,
+    internal_input: Option<&InternalTurnInput>,
     visible_output: bool,
 ) -> Fingerprint {
-    Fingerprint::of_fields([
-        b"turn_checkpoint_operation".as_slice(),
-        TURN_TRANSITION_REVISION.to_string().as_bytes(),
-        active_history_start.to_string().as_bytes(),
-        if visible_output {
-            b"visible".as_slice()
+    let mut hasher = FingerprintHasher::new();
+    hasher
+        .field("turn_checkpoint_operation")
+        .field(TURN_TRANSITION_REVISION.to_string())
+        .field(active_history_start.to_string())
+        .field(if visible_output {
+            "visible"
         } else {
-            b"not_visible".as_slice()
-        },
-        state.operation_fingerprint().as_str().as_bytes(),
-    ])
+            "not_visible"
+        })
+        .nested(&state.operation_fingerprint());
+    match internal_input {
+        Some(input) => hasher.field(
+            serde_json::to_vec(input).expect("validated internal turn input must serialize"),
+        ),
+        None => hasher.field([]),
+    };
+    hasher.finish()
 }
 
 fn state_name(state: &TurnState) -> &'static str {
     match state {
         TurnState::Accepted { .. } => "accepted",
+        TurnState::InternalAccepted { .. } => "internal_accepted",
         TurnState::LocalActionAccepted { .. } => "local_action_accepted",
         TurnState::LocalActionPrepared { .. } => "local_action_prepared",
         TurnState::LocalActionExecuting { .. } => "local_action_executing",
@@ -1632,6 +1737,7 @@ mod tests {
         step_splice.operation_fingerprint = checkpoint_operation_fingerprint(
             &step_splice.state,
             step_splice.active_history_start,
+            step_splice.internal_input.as_ref(),
             step_splice.visible_output,
         );
         step_splice.validate().unwrap();
@@ -1658,6 +1764,7 @@ mod tests {
         outside.operation_fingerprint = checkpoint_operation_fingerprint(
             &outside.state,
             outside.active_history_start,
+            outside.internal_input.as_ref(),
             outside.visible_output,
         );
         assert!(outside.validate().is_err());
@@ -1708,6 +1815,7 @@ mod tests {
                     TurnState::Completing {
                         finish: TurnFinish::Completed,
                         visible_output: true,
+                        provider_error_kind: None,
                     },
                     snapshot(),
                     0,
@@ -1723,6 +1831,7 @@ mod tests {
                     TurnState::Completing {
                         finish: TurnFinish::Completed,
                         visible_output: false,
+                        provider_error_kind: None,
                     },
                     snapshot(),
                     0,
@@ -1840,6 +1949,7 @@ mod tests {
                 TurnState::Completing {
                     finish: TurnFinish::Completed,
                     visible_output: false,
+                    provider_error_kind: None,
                 },
                 snapshot(),
                 4,

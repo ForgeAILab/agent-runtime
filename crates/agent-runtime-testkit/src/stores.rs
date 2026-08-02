@@ -145,7 +145,9 @@ impl CheckpointStore for InMemoryCheckpointStore {
                 if checkpoint.state_revision != 0
                     || !matches!(
                         checkpoint.state,
-                        TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. }
+                        TurnState::Accepted { .. }
+                            | TurnState::InternalAccepted { .. }
+                            | TurnState::LocalActionAccepted { .. }
                     )
                 {
                     return Err(RuntimeError::conflict(
@@ -181,7 +183,9 @@ impl CheckpointStore for InMemoryCheckpointStore {
                 if matches!(current.state, TurnState::Terminal { .. })
                     && matches!(
                         checkpoint.state,
-                        TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. }
+                        TurnState::Accepted { .. }
+                            | TurnState::InternalAccepted { .. }
+                            | TurnState::LocalActionAccepted { .. }
                     ) =>
             {
                 if checkpoint.state_revision != 0
@@ -290,6 +294,7 @@ mod tests {
                 TurnState::Completing {
                     finish: TurnFinish::Completed,
                     visible_output: false,
+                    provider_error_kind: None,
                 },
                 accepted.snapshot.clone(),
                 3,

@@ -276,6 +276,41 @@ impl RunPlanner {
         )
     }
 
+    /// Plans an attributed internal turn whose required instruction is a
+    /// contributed tail fragment rather than a canonical user-history item.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_internal_turn_from(
+        &self,
+        system_prompt: Option<&str>,
+        history: &[Message],
+        history_index_offset: usize,
+        tools: &[ToolSchema],
+        contributed: &[ContextFragment],
+        active_suffix_start: Option<usize>,
+        semantic_provenance: &[SummaryProvenance],
+        revisions: &RunRevisions,
+        activation: &[ActivatedCapability],
+    ) -> Result<PlannedTurn, ContextError> {
+        if active_suffix_start.is_some_and(|start| start >= history.len()) {
+            return Err(ContextError::compaction(format!(
+                "internal active suffix start {:?} is outside history length {}",
+                active_suffix_start,
+                history.len()
+            )));
+        }
+        self.plan_turn_with_start(
+            system_prompt,
+            history,
+            tools,
+            contributed,
+            active_suffix_start,
+            history_index_offset,
+            semantic_provenance,
+            revisions,
+            activation,
+        )
+    }
+
     /// Plans a history view whose complete old prefix was replaced by
     /// checkpointed semantic summaries.
     #[allow(clippy::too_many_arguments)]
