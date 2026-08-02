@@ -443,6 +443,8 @@ fn chunk_to_events(chunk: StreamChunk, out: &mut Vec<ProviderStreamEvent>) -> Op
                 out.push(ProviderStreamEvent::ReasoningDelta {
                     text: reasoning,
                     redacted: false,
+                    // OpenAI-compatible streams carry no reasoning signature.
+                    signature: None,
                 });
             }
         }

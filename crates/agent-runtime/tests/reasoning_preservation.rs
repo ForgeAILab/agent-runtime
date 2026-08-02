@@ -58,6 +58,7 @@ fn reasoning_delta(text: &str, redacted: bool) -> ProviderStreamEvent {
     ProviderStreamEvent::ReasoningDelta {
         text: text.into(),
         redacted,
+        signature: None,
     }
 }
 
@@ -190,6 +191,80 @@ async fn redacted_reasoning_stays_a_separate_flagged_part() {
             ("plain thought".to_string(), false),
             ("hidden thought".to_string(), true),
         ]
+    );
+}
+
+/// A provider-issued signature seals the reasoning block it trails, lands on
+/// the assembled part, and rides the continuation request verbatim — the
+/// contract signing providers (Anthropic) demand for replay.
+#[tokio::test]
+async fn a_signature_seals_its_block_and_round_trips() {
+    let mut first = vec![
+        reasoning_delta("signed ", false),
+        reasoning_delta("thought", false),
+        ProviderStreamEvent::ReasoningDelta {
+            text: String::new(),
+            redacted: false,
+            signature: Some("sig-1".into()),
+        },
+        // A block after the seal must not merge into the signed text.
+        reasoning_delta("post-signature thought", false),
+    ];
+    first.extend(tool_call_fragments(0, "call-1", "probe", r#"{"k":"v"}"#));
+    first.push(usage_event(9, 2));
+    first.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let second = vec![
+        ProviderStreamEvent::TextDelta {
+            text: "done".into(),
+        },
+        usage_event(4, 2),
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ];
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(first), ScriptedStream::new(second)],
+    ));
+
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider.clone())
+        .model_profile(profile())
+        .tool(Arc::new(ProbeTool))
+        .build()
+        .expect("runtime builds");
+    let session = runtime
+        .start_session(StartSession::new())
+        .await
+        .expect("session starts");
+    session
+        .run(UserInput::text("call the probe tool"))
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    let continuation: Vec<(String, Option<String>)> = requests[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::Reasoning {
+                text, signature, ..
+            } => Some((text.clone(), signature.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        continuation,
+        vec![
+            ("signed thought".to_string(), Some("sig-1".to_string())),
+            ("post-signature thought".to_string(), None),
+        ],
+        "the signature seals the merged block and later deltas start a new part"
     );
 }
 

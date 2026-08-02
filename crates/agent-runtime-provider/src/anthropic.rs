@@ -12,16 +12,17 @@
 //! URIs), while `http(s)` URLs use the `url` source form. Images inside tool
 //! results are forwarded the same way.
 //!
-//! Known v1 limitations, stated rather than hidden:
+//! Thinking round-trips faithfully: a `signature_delta` frame is forwarded as
+//! a text-less [`ProviderStreamEvent::ReasoningDelta`] carrying the optional
+//! signature, which the runtime attaches to the assembled
+//! [`ContentPart::Reasoning`] — so signed thinking blocks replay verbatim,
+//! and redacted thinking replays as `redacted_thinking`. An *unsigned*
+//! reasoning part is omitted on replay, because Anthropic rejects thinking
+//! blocks without their integrity signature.
 //!
-//! - **Thinking signatures are not captured.** The neutral stream vocabulary
-//!   has no signature event, so `signature_delta` frames are dropped. On
-//!   replay, an unsigned [`ContentPart::Reasoning`] is omitted (Anthropic
-//!   rejects tampered or unsigned thinking blocks); a signed one — e.g.
-//!   restored from a host that captured it out of band — is sent verbatim,
-//!   and redacted thinking replays as `redacted_thinking`.
-//! - **System placement is top-level only.** Every `Role::System` message is
-//!   folded, in order, into the request's `system` field.
+//! Known v1 limitation, stated rather than hidden: **system placement is
+//! top-level only** — every `Role::System` message is folded, in order, into
+//! the request's `system` field.
 
 use std::future::pending;
 use std::time::Duration;
@@ -444,8 +445,10 @@ enum WireBlockDelta {
         #[serde(default)]
         thinking: String,
     },
-    /// Dropped: the neutral stream vocabulary carries no signature yet.
-    SignatureDelta,
+    SignatureDelta {
+        #[serde(default)]
+        signature: String,
+    },
     InputJsonDelta {
         #[serde(default)]
         partial_json: String,
@@ -581,6 +584,7 @@ fn event_to_events(
                     out.push(ProviderStreamEvent::ReasoningDelta {
                         text: thinking,
                         redacted: false,
+                        signature: None,
                     });
                 }
             }
@@ -590,6 +594,7 @@ fn event_to_events(
                 out.push(ProviderStreamEvent::ReasoningDelta {
                     text: data,
                     redacted: true,
+                    signature: None,
                 });
             }
             WireContentBlock::ToolUse { id, name } => {
@@ -613,6 +618,19 @@ fn event_to_events(
                     out.push(ProviderStreamEvent::ReasoningDelta {
                         text: thinking,
                         redacted: false,
+                        signature: None,
+                    });
+                }
+            }
+            WireBlockDelta::SignatureDelta { signature } => {
+                // The signature closes the thinking block it trails; it rides
+                // a text-less delta so the runtime can seal the assembled
+                // reasoning part for verbatim replay.
+                if !signature.is_empty() {
+                    out.push(ProviderStreamEvent::ReasoningDelta {
+                        text: String::new(),
+                        redacted: false,
+                        signature: Some(signature),
                     });
                 }
             }
@@ -626,7 +644,7 @@ fn event_to_events(
                     });
                 }
             }
-            WireBlockDelta::SignatureDelta | WireBlockDelta::Unknown => {}
+            WireBlockDelta::Unknown => {}
         },
         WireEvent::MessageDelta { delta, usage } => {
             if let Some(usage) = usage
@@ -1196,11 +1214,22 @@ mod tests {
                 ProviderStreamEvent::ReasoningDelta {
                     text,
                     redacted: false,
+                    ..
                 } => Some(text.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(reasoning, "hmm");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProviderStreamEvent::ReasoningDelta {
+                    signature: Some(signature),
+                    ..
+                } if signature == "sig"
+            )),
+            "the signature_delta seals the thinking block"
+        );
 
         let fragments: Vec<_> = events
             .iter()
@@ -1335,6 +1364,7 @@ mod tests {
             ProviderStreamEvent::ReasoningDelta {
                 text,
                 redacted: true,
+                ..
             } if text == "ENCRYPTED"
         )));
     }

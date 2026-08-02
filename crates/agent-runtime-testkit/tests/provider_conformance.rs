@@ -106,6 +106,7 @@ fn fake_reasoning_then_text() -> FakeProvider {
             ProviderStreamEvent::ReasoningDelta {
                 text: "thinking".into(),
                 redacted: false,
+                signature: None,
             },
             ProviderStreamEvent::TextDelta { text: "Hi".into() },
             usage_event(10, 2),

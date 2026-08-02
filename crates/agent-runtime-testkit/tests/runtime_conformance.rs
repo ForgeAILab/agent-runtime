@@ -1076,6 +1076,7 @@ async fn retryable_partial_stream_is_discarded_from_transcript() {
         ProviderStreamEvent::ReasoningDelta {
             text: "successful reasoning-only answer".into(),
             redacted: false,
+            signature: None,
         },
         agent_runtime::provider::fake::usage_event(4, 1),
         ProviderStreamEvent::Finish {

@@ -313,29 +313,54 @@ fn response_disposition(finish: FinishReason, tool_calls: &[ToolCall]) -> Respon
 /// `redacted` flag so one contiguous thought is one part.
 #[derive(Default)]
 struct ReasoningAccumulator {
-    parts: Vec<(String, bool)>,
+    parts: Vec<AccumulatedReasoning>,
+}
+
+struct AccumulatedReasoning {
+    text: String,
+    redacted: bool,
+    signature: Option<String>,
 }
 
 impl ReasoningAccumulator {
-    fn push(&mut self, text: &str, redacted: bool) {
-        if text.is_empty() {
+    /// Appends a reasoning fragment, sealing blocks at provider boundaries.
+    ///
+    /// A signature closes the block it trails — signed providers require the
+    /// exact signed text back on replay, so nothing may merge into a sealed
+    /// part. Redacted parts are sealed on arrival for the same reason: each
+    /// carries one complete encrypted payload, and concatenating two payloads
+    /// would corrupt both.
+    fn push(&mut self, text: &str, redacted: bool, signature: Option<String>) {
+        if text.is_empty() && signature.is_none() {
             return;
         }
-        match self.parts.last_mut() {
-            Some((buffer, last_redacted)) if *last_redacted == redacted => buffer.push_str(text),
-            _ => self.parts.push((text.to_string(), redacted)),
+        if let Some(part) = self.parts.last_mut()
+            && !part.redacted
+            && !redacted
+            && part.signature.is_none()
+        {
+            part.text.push_str(text);
+            part.signature = signature;
+            return;
         }
+        if text.is_empty() && signature.is_some() {
+            // A signature with no open block has nothing to seal.
+            return;
+        }
+        self.parts.push(AccumulatedReasoning {
+            text: text.to_string(),
+            redacted,
+            signature,
+        });
     }
 
     fn into_parts(self) -> Vec<ContentPart> {
         self.parts
             .into_iter()
-            .map(|(text, redacted)| ContentPart::Reasoning {
-                text,
-                redacted,
-                // OpenAI-compatible streams carry no reasoning signature;
-                // adapters for providers that sign will populate this.
-                signature: None,
+            .map(|part| ContentPart::Reasoning {
+                text: part.text,
+                redacted: part.redacted,
+                signature: part.signature,
             })
             .collect()
     }
@@ -4470,17 +4495,26 @@ impl Driver {
                                     },
                                 );
                             }
-                            ProviderStreamEvent::ReasoningDelta { text: t, redacted } => {
-                                reasoning.push(&t, redacted);
-                                emitter.emit(
-                                    turn.clone(),
-                                    RuntimeEvent::ReasoningDelta {
-                                        request: request_id.clone(),
-                                        attempt: attempt_id.clone(),
-                                        text: t,
-                                        redacted,
-                                    },
-                                );
+                            ProviderStreamEvent::ReasoningDelta {
+                                text: t,
+                                redacted,
+                                signature,
+                            } => {
+                                reasoning.push(&t, redacted, signature);
+                                // The signature is provider integrity data for
+                                // canonical replay; the UI event stream never
+                                // needs it.
+                                if !t.is_empty() {
+                                    emitter.emit(
+                                        turn.clone(),
+                                        RuntimeEvent::ReasoningDelta {
+                                            request: request_id.clone(),
+                                            attempt: attempt_id.clone(),
+                                            text: t,
+                                            redacted,
+                                        },
+                                    );
+                                }
                             }
                             ProviderStreamEvent::ToolCallDelta {
                                 index,

@@ -440,6 +440,7 @@ pub fn reasoning_only_child_script(text: &str) -> Vec<ScriptedStream> {
         ProviderStreamEvent::ReasoningDelta {
             text: text.into(),
             redacted: false,
+            signature: None,
         },
         usage_event(5, 2),
         ProviderStreamEvent::Finish {

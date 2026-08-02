@@ -140,6 +140,7 @@ async fn provider_boundary_injection_keeps_accepted_turn_suffix_required() {
         ProviderStreamEvent::ReasoningDelta {
             text: "current-turn reasoning must survive".into(),
             redacted: false,
+            signature: None,
         },
     );
     first.push(ProviderStreamEvent::Finish {

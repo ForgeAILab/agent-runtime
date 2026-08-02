@@ -429,6 +429,14 @@ pub enum ProviderStreamEvent {
         /// Whether the reasoning is redacted.
         #[serde(default)]
         redacted: bool,
+        /// A provider-issued integrity signature for the reasoning block the
+        /// fragment closes, sent by adapters for providers that sign thinking
+        /// (e.g. Anthropic) so the assembled [`ContentPart::Reasoning`] can be
+        /// replayed verbatim. Absent for providers that do not sign.
+        ///
+        /// [`ContentPart::Reasoning`]: crate::content::ContentPart::Reasoning
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// A fragment of a tool call. Fragments with the same `index` are assembled
     /// by the runtime into one validated call.
