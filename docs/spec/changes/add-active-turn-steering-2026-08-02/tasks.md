@@ -1,7 +1,7 @@
 ---
 created_at: 2026-08-02T07:15:49Z
-updated_at: 2026-08-02T16:15:36Z
-completed_at:
+updated_at: 2026-08-02T16:29:54Z
+completed_at: 2026-08-02T16:29:54Z
 ---
 
 ## 1. Public Contracts
@@ -63,5 +63,5 @@ completed_at:
 
 - [x] 5.1 Update runtime API/architecture documentation and changelog with the
   distinction between whole-turn send, generic injection, and active steering.
-- [ ] 5.2 Record compatibility evidence and provide the exact revision to the
+- [x] 5.2 Record compatibility evidence and provide the exact revision to the
   coordinated Smith `add-turn-steering-and-input-queue-2026-08-02` change.

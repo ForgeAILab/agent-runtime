@@ -19,8 +19,8 @@ and Rust 1.86 all pass afterward.
 
 ## Revision handoff
 
-An immutable runtime revision is not yet available because this implementation
-is still an uncommitted working tree and no commit was authorized. The exact
-revision must be recorded here and in Smith's workspace dependency after the
-runtime changes are committed. Until then Smith's ignored `.cargo/config.toml`
-patch exercises this sibling checkout without weakening the committed pin.
+The verified active-turn steering implementation is immutable at runtime
+revision `b24cc1bec22ffca106591feee9eb4f5bb2a9a9d3`. This is the exact revision
+provided to Smith for its committed workspace dependency pin. Smith's ignored
+`.cargo/config.toml` patch may still be used for sibling development without
+weakening that committed pin.
