@@ -341,6 +341,55 @@ Automatic goal controllers may receive a host-owned `GoalAdmissionGate` via
 client owns pending real-user work, admit that work at the terminal boundary,
 then re-enable it. The gate affects only future idle admission.
 
+## 14. Renewable provider authorization is source-based
+
+Existing `OpenAiConfig::api_key` callers continue to work; the adapter wraps
+that `Secret` in a non-expiring `StaticProviderCredentialSource` and acquires it
+through the same per-attempt path as renewable authorization. A host that owns
+refreshable credentials instead constructs the adapter with
+`OpenAiProvider::with_credential_source`, a bounded
+`ProviderCredentialTarget`, and an `Arc<dyn ProviderCredentialSource>`.
+
+The source receives the attempt cancellation, deadline, and requested minimum
+validity. It may refresh before returning a lease, but the adapter rejects an
+expired or insufficiently valid result before provider I/O. On a pre-output
+authentication rejection, the adapter invalidates the exact lease revision.
+Only a `ReplacementPossible` outcome marks the failed attempt for one immediate
+credential-recovery replay. The replacement has a new `AttemptId`, consumes
+normal total-attempt capacity, and cannot recur after a second rejection or
+after text, reasoning, tool-call, usage, cache, downgrade, or finish semantics.
+
+Do not move OAuth endpoints, client identifiers, PKCE/device-code state,
+refresh-token persistence, browser presentation, or account/logout policy into
+the runtime source contract. Those remain host responsibilities. Likewise, do
+not adapt consumer-subscription credentials into the direct provider path when
+their supported integration is an external managed agent backend.
+
+## 15. Native Gemini uses exact stateless continuation
+
+Hosts can construct `GeminiInteractionsProvider` from the facade or the
+provider crate. Supply a reviewed absolute HTTPS API-version base URL and a
+host-resolved `Capabilities` value; the adapter appends `/interactions` and
+does not discover endpoints, models, or credentials. Static keys use
+`GeminiInteractionsConfig::api_key`; renewable keys use
+`GeminiInteractionsProvider::with_credential_source`.
+
+Every request is streamed and sets `store=false`. Do not supply
+`previous_interaction_id`, background execution, hosted tools, or provider
+state through `vendor_extensions`: the adapter rejects all such overrides
+before credential or transport I/O. Native `thought` steps are retained as
+signed `ContentPart::Reasoning`, including the valid empty-summary form. Signed
+blocks are not stripped or lossily elided by later-turn history handling, so
+session persistence and replay keep provider-required ordering exact. Missing
+or reordered signed function continuation fails locally instead of sending a
+degraded request.
+
+The adapter emits only the existing neutral event vocabulary. Interaction and
+event IDs, raw backend messages, signatures, prompts, API keys, lease revisions,
+and response bodies do not become events, metadata, errors, manifests, or
+diagnostics. Google model catalogs, defaults, setup UX, credential persistence,
+Vertex AI, and live-provider validation remain consumer responsibilities.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.
@@ -362,3 +411,10 @@ then re-enable it. The gate affects only future idle admission.
       stores and an exclusive cross-process parent-session lifecycle lease.
 - [ ] Keep child follow-up and exact interrupted-turn resume as separate user
       operations; never replace a failed lookup with spawn.
+- [ ] Keep static API keys on the compatibility path or supply a bounded,
+      cancellation-aware `ProviderCredentialSource` for renewable provider
+      authorization.
+- [ ] Keep OAuth ceremony, refresh-token storage, and account/logout policy in
+      the host rather than Agent Runtime.
+- [ ] For native Gemini, retain signed canonical history and configure a
+      reviewed HTTPS Interactions base URL plus host-resolved capabilities.

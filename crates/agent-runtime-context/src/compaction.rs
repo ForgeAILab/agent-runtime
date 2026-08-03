@@ -37,7 +37,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use agent_runtime_core::artifact::ArtifactRef;
-use agent_runtime_core::content::{ContentPart, Role};
+use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_registry::RegistryRevision;
 
 use crate::budget::{BudgetReport, ContextBudget};
@@ -377,14 +377,12 @@ fn truncate_fragment(fragment: &mut ContextFragment, max_chars: usize) {
     }
 }
 
-/// Stage 0: strips [`ContentPart::Reasoning`] parts from message fragments
-/// that precede the last `Role::User` message fragment — prior-turn
-/// reasoning, which has zero value to the model once its turn is over.
-/// Reasoning in messages at or after the last user message is never
-/// touched: OpenAI-compatible thinking models require the current turn's
-/// reasoning to be sent back during that turn's tool-call loop. Only the
-/// reasoning parts are removed; the fragment itself always survives, so a
-/// required fragment or a tool-call/result pairing cannot be lost here.
+/// Stage 0: strips unsigned [`ContentPart::Reasoning`] parts from message
+/// fragments that precede the last `Role::User` message fragment. Signed
+/// blocks are provider-required continuation content and remain exact.
+/// Reasoning in messages at or after the last user message is never touched.
+/// The fragment itself always survives, so a required fragment or a
+/// tool-call/result pairing cannot be lost here.
 fn stage_strip_prior_reasoning(
     fragments: &mut [ContextFragment],
     size_of: &dyn Fn(&ContextFragment) -> u32,
@@ -407,9 +405,15 @@ fn stage_strip_prior_reasoning(
             continue;
         };
         let parts_before = message.content.len();
-        message
-            .content
-            .retain(|part| !matches!(part, ContentPart::Reasoning { .. }));
+        message.content.retain(|part| {
+            !matches!(
+                part,
+                ContentPart::Reasoning {
+                    signature: None,
+                    ..
+                }
+            )
+        });
         if message.content.len() < parts_before {
             outcome.bounded.push(fragment.id.clone());
         }
@@ -477,6 +481,7 @@ fn truncate_oversized(
                 f.requirement == Requirement::Optional
                     && f.kind == kind
                     && f.pairing_ids().is_empty()
+                    && !(kind == FragmentKind::History && contains_signed_reasoning(f))
                     && text_len(f) > max_chars
                     && !bounded.contains(&f.id)
             })
@@ -490,6 +495,23 @@ fn truncate_oversized(
             None => return,
         }
     }
+}
+
+/// Signed reasoning is opaque provider continuation data: truncating its text
+/// or signature would make replay non-equivalent. A history fragment carrying
+/// one is therefore ineligible for lossy history elision.
+fn contains_signed_reasoning(fragment: &ContextFragment) -> bool {
+    matches!(
+        &fragment.content,
+        FragmentContent::Message(Message { content, .. })
+            if content.iter().any(|part| matches!(
+                part,
+                ContentPart::Reasoning {
+                    signature: Some(_),
+                    ..
+                }
+            ))
+    )
 }
 
 fn stage_bound(
@@ -557,7 +579,7 @@ fn compact_pipeline(
     Ok((candidate, outcome))
 }
 
-/// The policy-driven [`Compactor`]: strips prior-turn reasoning, evicts
+/// The policy-driven [`Compactor`]: strips prior-turn unsigned reasoning, evicts
 /// expired/optional fragments, bounds oversized tool results, elides
 /// reproducible detail — in that order — stopping as soon as the target is
 /// met or no safe structural operation remains. It never claims to summarize
@@ -706,6 +728,14 @@ mod tests {
             text: text.to_owned(),
             redacted: false,
             signature: None,
+        }
+    }
+
+    fn signed_reasoning_part(text: &str, signature: &str) -> ContentPart {
+        ContentPart::Reasoning {
+            text: text.to_owned(),
+            redacted: true,
+            signature: Some(signature.to_owned()),
         }
     }
 
@@ -1049,6 +1079,47 @@ mod tests {
         assert_eq!(message.content, vec![ContentPart::text("the old answer")]);
         assert!(total_input_tokens(&result.fragments, &sizer) <= 50);
         assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
+    }
+
+    #[test]
+    fn prior_signed_reasoning_is_not_stripped_or_elided() {
+        let signed = signed_reasoning_part("", "opaque-signature");
+        let old_assistant = message_history_fragment(
+            "old-assistant",
+            1,
+            Message::assistant(vec![
+                reasoning_part(&"u".repeat(2_000)),
+                signed.clone(),
+                ContentPart::text("the old answer"),
+            ]),
+        );
+        let user = message_history_fragment("user-msg", 2, Message::user("next question"));
+        let mut fragments = vec![old_assistant, user];
+        let mut outcome = CompactionOutcome::default();
+
+        stage_strip_prior_reasoning(&mut fragments, &fallback_token_estimate, 50, &mut outcome);
+
+        let FragmentContent::Message(message) = &fragments[0].content else {
+            panic!("history remains a message");
+        };
+        assert!(message.content.contains(&signed));
+        assert!(message.content.iter().all(|part| {
+            !matches!(
+                part,
+                ContentPart::Reasoning {
+                    signature: None,
+                    ..
+                }
+            )
+        }));
+        assert!(contains_signed_reasoning(&fragments[0]));
+
+        let signed_before_elision = fragments[0].clone();
+        stage_elide(&mut fragments, &fallback_token_estimate, 0, &mut outcome, 1);
+        assert_eq!(
+            fragments[0], signed_before_elision,
+            "signed history is never truncated"
+        );
     }
 
     #[test]

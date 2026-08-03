@@ -89,6 +89,18 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- Native Google Gemini Interactions adapter over injected `HttpTransport`, with
+  stateless `store=false` history replay, renewable `x-goog-api-key`
+  credentials, bounded native request/stream types, function and multimodal
+  result translation, structured output, usage/cache normalization, and exact
+  signed-thought continuation. Vertex AI, hosted tools, provider storage, and
+  live-network tests remain outside the shared runtime.
+- Host-injected renewable provider credentials through
+  `ProviderCredentialSource`, with optional lease expiry, opaque exact-revision
+  invalidation, static API-key compatibility, cancellation/deadline bounds,
+  and one attempt-visible pre-output authentication recovery replay. OAuth
+  ceremony and credential persistence remain host policy, and credential
+  material is excluded from runtime observability and persistence.
 - Typed active-turn steering: `SessionHandle::steer_current_turn` admits
   bounded FIFO `UserInput` against an optional expected `TurnId`, returns a
   stable `SteerReceipt`, and retains caller input in structured rejection.
@@ -164,14 +176,14 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - Reasoning preservation: the driver retains streamed reasoning as
   `ContentPart::Reasoning` history parts for the turn that produced it
   (merging consecutive same-`redacted` deltas, placed ahead of visible text
-  and tool calls) and sheds prior-turn reasoning when the next user turn
-  starts, dropping reasoning-only assistant messages rather than sending them
-  empty. The OpenAI-compatible adapter serializes non-redacted reasoning as
+  and tool calls), sheds prior-turn unsigned reasoning when the next user turn
+  starts, and retains signed provider continuation—including signature-only
+  blocks—across serialization and replay. The OpenAI-compatible adapter serializes non-redacted reasoning as
   `reasoning_content` on assistant wire messages — required by
   OpenAI-compatible thinking models (e.g. Z.AI GLM) during tool-call
   continuations — and never serializes redacted reasoning. Compaction strips
-  prior-turn reasoning as its cheapest first stage and truncates reasoning
-  parts like text.
+  prior-turn unsigned reasoning as its cheapest first stage but never
+  truncates signed continuation content.
 - `ContextPlanned` gains `input_tokens` (the counted consumption,
   `serde(default)` for journals written before the field existed) and
   `ContextPlan::input_budget()` exposes the enforced budget.

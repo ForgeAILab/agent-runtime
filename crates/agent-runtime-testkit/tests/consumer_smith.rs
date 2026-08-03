@@ -5,8 +5,26 @@ use std::sync::Arc;
 use serde_json::json;
 
 use agent_runtime::prelude::*;
+use agent_runtime_core::store::Secret;
 use agent_runtime_testkit::conformance::{event_schema, runtime as rt};
-use agent_runtime_testkit::{RecordingObserver, consumers, scenarios};
+use agent_runtime_testkit::{RecordingObserver, ReplayTransport, consumers, scenarios};
+
+#[test]
+fn smith_can_compose_the_native_gemini_facade_types() {
+    let mut config = GeminiInteractionsConfig::new(
+        "https://generativelanguage.googleapis.com/v1beta",
+        "gemini-test",
+    );
+    config.api_key = Some(Secret::new("compile-only-fixture"));
+    let provider = GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config)
+        .expect("Smith can construct the exported native adapter");
+
+    assert!(
+        provider
+            .capabilities(&ModelId::new("gemini-test"))
+            .is_some()
+    );
+}
 
 #[tokio::test]
 async fn smith_adapter_passes_shared_conformance() {

@@ -21,7 +21,7 @@ types.
 | `agent-runtime-registry` | The dependency-light registry kernel: namespaced identities, revisions, provenance, layered sealing, scoped views, fingerprints, and the generic `Named`/`Registry<T>`/`Sealed<T>` collection. Std-only by default. |
 | `agent-runtime-core` | Host-neutral contracts: IDs, messages/content, structured errors, cancellation, deadlines, redaction-safe metadata, versioned events, disjoint usage counters, and the provider/tool/approval/workspace/store/observer/clock traits. |
 | `agent-runtime-ability` | Descriptor-first abilities on the registry kernel: bounded `AbilityDescriptor`s, dependency/conflict/readiness metadata, lazy policy-checked activation, and the unified `Ability`/`AbilityKind` view. Registry-only by default; `tool` bridges the runtime's `Tool`. |
-| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, a configurable OpenAI-compatible adapter, a deterministic fake, and the attempt-recording retry/backoff classifier. |
+| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, configurable OpenAI-compatible and native Gemini Interactions adapters, a deterministic fake, and the attempt-recording retry/backoff classifier. |
 | `agent-runtime-context` | The authoritative context engine: versioned and positioned `ContextFragment`s (including composable system-prompt sections), complete token accounting (`RequestSizer`/`CharRatioSizer`), deterministic structural compaction, and cache-aware planning through `ContextPlanner`. Deterministic and network-free. |
 | `agent-runtime-obs` | Observability facade over the event envelope: an async `EventSink`, `FanoutSink`, a `SinkObserver` bridge, an event-stream pump, an `ObsRow` SQL projection, and feature-gated CLI/file/SQLite sinks. |
 | `agent-runtime` | The embeddable runtime: session-scoped registry views and activation epochs, the checkpointable direct turn machine, prepared tool execution, host interaction, delegation, and reusable harness components for todos, memory, artifacts, and semantic summaries. Re-exports `registry`, `ability`, `provider`, and `context`, and `obs` behind an opt-in feature. |
@@ -30,6 +30,67 @@ types.
 All crates except `agent-runtime-testkit` are intended as production
 dependencies; pick just the mechanism each consumer needs. Minimum supported
 Rust version: **1.86** (edition 2024). License: **MIT**.
+
+## Renewable provider credentials
+
+Direct adapters can use a host-owned renewable credential source without
+teaching Agent Runtime how login or token storage works:
+
+```rust
+let provider = OpenAiProvider::with_credential_source(
+    transport,
+    OpenAiConfig::new("https://openrouter.ai/api/v1", "model-id"),
+    ProviderCredentialTarget::new("openrouter")?,
+    credential_source,
+)?
+.with_credential_minimum_validity_ms(30_000);
+```
+
+`ProviderCredentialSource` acquires a lease with optional expiry and an opaque
+revision, under the provider attempt's cancellation and deadline. A classified
+pre-output authentication rejection invalidates that exact revision and may
+produce one visible replacement attempt, subject to the normal total-attempt
+ceiling. Existing `OpenAiConfig::api_key` callers remain supported through the
+non-expiring static source path.
+
+The host owns refresh policy, protected access/refresh-token storage, and any
+browser, callback, authorization-code, or device-code ceremony. Lease secrets,
+revisions, expiry, raw authentication bodies, and source references are absent
+from runtime events, snapshots, checkpoints, manifests, errors, and debug
+renderings. This provider contract does not turn consumer-subscription login
+credentials into provider API keys.
+
+## Native Gemini Interactions
+
+`GeminiInteractionsProvider` implements Google's native Interactions REST/SSE
+protocol without a Google SDK or OpenAI-compatibility translation. Hosts supply
+an absolute reviewed API-version base URL, one resolved model/capability
+profile, and either a static API key or `ProviderCredentialSource`:
+
+```rust
+let mut config = GeminiInteractionsConfig::new(
+    "https://generativelanguage.googleapis.com/v1beta",
+    "gemini-3.6-flash",
+)
+.with_supported_thinking_levels(["minimal", "low", "medium", "high"]);
+config.capabilities = resolved_capabilities;
+
+let provider = GeminiInteractionsProvider::with_credential_source(
+    transport,
+    config,
+    ProviderCredentialTarget::new("google")?,
+    credential_source,
+)?;
+```
+
+The adapter always sends `stream=true` and `store=false`, injects the key only
+as `x-goog-api-key`, rejects provider storage/background/hosted-tool overrides,
+and reconstructs complete input steps from canonical local history. Signed
+thought blocks—including signature-only thoughts—remain opaque, durable
+continuation content across tool loops and later local replay. Endpoint choice,
+model catalogs, defaults, credential persistence, and provider UX remain host
+policy. Vertex AI, provider-hosted tools, and `previous_interaction_id` are not
+supported by this adapter.
 
 ## Quick start
 

@@ -16,6 +16,8 @@
 //!   an injectable [`transport::HttpTransport`].
 //! - [`anthropic::AnthropicProvider`] — a configurable Anthropic Messages API
 //!   adapter over the same transport, with multimodal (image) user content.
+//! - [`gemini::GeminiInteractionsProvider`] — Google's native stateless
+//!   Interactions API with exact signed-thought replay.
 //! - [`retry`] — retryability classification and backoff used by the agent loop
 //!   to record every provider attempt.
 //! - [`catalog`] — optional remote model-catalog sources. Resolution reads a
@@ -25,6 +27,7 @@
 pub mod anthropic;
 pub mod catalog;
 pub mod fake;
+pub mod gemini;
 pub mod openai;
 pub mod retry;
 pub mod sse;

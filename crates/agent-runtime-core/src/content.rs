@@ -346,6 +346,17 @@ mod tests {
         let json = serde_json::to_string(&signed).unwrap();
         let back: ContentPart = serde_json::from_str(&json).unwrap();
         assert_eq!(back, signed);
+
+        // A provider may issue a thought signature without a summary. The
+        // empty text is intentional continuation state, not an absent part.
+        let signature_only = ContentPart::Reasoning {
+            text: String::new(),
+            redacted: true,
+            signature: Some("sig-only".into()),
+        };
+        let json = serde_json::to_string(&signature_only).unwrap();
+        let back: ContentPart = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, signature_only);
     }
 
     #[test]

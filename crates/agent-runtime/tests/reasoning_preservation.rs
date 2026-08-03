@@ -1,11 +1,9 @@
 //! Reasoning preservation across the provider/tool loop.
 //!
-//! OpenAI-compatible thinking models (Z.AI GLM among them) require the
-//! reasoning they streamed to be echoed back on the assistant message during
-//! the same turn's tool-call continuation. The driver therefore retains
-//! streamed reasoning as [`ContentPart::Reasoning`] history parts for the
-//! duration of the turn, and sheds it — the model never needs it again — when
-//! the next user turn starts.
+//! OpenAI-compatible thinking models (Z.AI GLM among them) require reasoning
+//! during the same turn's tool-call continuation. Signed providers additionally
+//! require opaque continuation after later turns. The driver therefore sheds
+//! prior unsigned reasoning while preserving signed blocks exactly.
 
 use std::sync::Arc;
 
@@ -268,6 +266,81 @@ async fn a_signature_seals_its_block_and_round_trips() {
     );
 }
 
+/// A signature-only provider thought is durable canonical content and remains
+/// on a later turn's provider request. This is the stateless Gemini replay
+/// shape: the summary may be empty while the opaque signature is mandatory.
+#[tokio::test]
+async fn signature_only_reasoning_survives_serialization_and_a_later_turn() {
+    let first = vec![
+        ProviderStreamEvent::ReasoningDelta {
+            text: String::new(),
+            redacted: true,
+            signature: Some("signature-only-canary".into()),
+        },
+        ProviderStreamEvent::TextDelta {
+            text: "first answer".into(),
+        },
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ];
+    let second = vec![
+        ProviderStreamEvent::TextDelta {
+            text: "second answer".into(),
+        },
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ];
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(first), ScriptedStream::new(second)],
+    ));
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider.clone())
+        .model_profile(profile())
+        .build()
+        .expect("runtime builds");
+    let session = runtime
+        .start_session(StartSession::new())
+        .await
+        .expect("session starts");
+
+    session.run(UserInput::text("first")).await.unwrap();
+    let snapshot = session.snapshot();
+    let encoded = serde_json::to_vec(&snapshot).expect("snapshot serializes");
+    let restored: SessionSnapshot =
+        serde_json::from_slice(&encoded).expect("snapshot remains backward-compatible");
+    assert!(restored.history.iter().any(|message| {
+        message.content.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::Reasoning {
+                    text,
+                    redacted: true,
+                    signature: Some(signature),
+                } if text.is_empty() && signature == "signature-only-canary"
+            )
+        })
+    }));
+
+    session.run(UserInput::text("second")).await.unwrap();
+    let requests = provider.requests();
+    assert!(requests[1].messages.iter().any(|message| {
+        message.content.iter().any(|part| {
+            matches!(
+                part,
+                ContentPart::Reasoning {
+                    text,
+                    signature: Some(signature),
+                    ..
+                } if text.is_empty() && signature == "signature-only-canary"
+            )
+        })
+    }));
+}
+
 /// A reasoning-only completion is flagged on `TurnCompleted` so hosts can
 /// react to a turn that ended without a user-facing answer.
 #[tokio::test]
@@ -333,8 +406,8 @@ async fn a_reasoning_only_completion_reports_no_visible_output() {
     );
 }
 
-/// A new user turn strips prior-turn reasoning from the model-facing history,
-/// and an assistant message that was reasoning-only disappears with it.
+/// A new user turn strips prior-turn unsigned reasoning from model-facing
+/// history, and an unsigned reasoning-only assistant message disappears.
 #[tokio::test]
 async fn a_new_turn_sheds_prior_reasoning() {
     let turn_one = vec![

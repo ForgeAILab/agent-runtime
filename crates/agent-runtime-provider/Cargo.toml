@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Provider adapters (deterministic fake + OpenAI-compatible) and retry helpers for the shared agent runtime"
+description = "Provider adapters (fake, OpenAI-compatible, native Gemini Interactions) and retry helpers"
 keywords.workspace = true
 categories.workspace = true
 

@@ -1,0 +1,17 @@
+event: interaction.created
+data: {"event_type":"interaction.created","interaction":{"id":"fixture-interaction","status":"in_progress"}}
+
+event: step.start
+data: {"event_type":"step.start","index":0,"step":{"type":"model_output","content":[{"type":"text","text":"Hel"}]}}
+
+event: step.delta
+data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"lo"}}
+
+event: step.stop
+data: {"event_type":"step.stop","index":0}
+
+event: interaction.completed
+data: {"event_type":"interaction.completed","interaction":{"status":"completed","usage":{"total_input_tokens":10,"total_output_tokens":2,"total_thought_tokens":0,"total_cached_tokens":0}}}
+
+event: done
+data: [DONE]

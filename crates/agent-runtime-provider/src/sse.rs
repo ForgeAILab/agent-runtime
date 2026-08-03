@@ -55,6 +55,11 @@ impl SseFrameParser {
         }
     }
 
+    /// Current buffered byte length, for adapter-owned stream bounds.
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Drains all complete frames (those terminated by a blank line).
     pub fn drain_frames(&mut self) -> Vec<SseFrame> {
         let mut frames = Vec::new();

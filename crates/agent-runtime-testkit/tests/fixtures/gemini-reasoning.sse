@@ -1,0 +1,26 @@
+event: step.start
+data: {"event_type":"step.start","index":0,"step":{"type":"thought"}}
+
+event: step.delta
+data: {"event_type":"step.delta","index":0,"delta":{"type":"thought_summary","content":{"type":"text","text":"thinking"}}}
+
+event: step.delta
+data: {"event_type":"step.delta","index":0,"delta":{"type":"thought_signature","signature":"fixture-signature"}}
+
+event: step.stop
+data: {"event_type":"step.stop","index":0}
+
+event: step.start
+data: {"event_type":"step.start","index":1,"step":{"type":"model_output"}}
+
+event: step.delta
+data: {"event_type":"step.delta","index":1,"delta":{"type":"text","text":"Hi"}}
+
+event: step.stop
+data: {"event_type":"step.stop","index":1}
+
+event: interaction.completed
+data: {"event_type":"interaction.completed","interaction":{"status":"completed","usage":{"total_input_tokens":10,"total_output_tokens":2,"total_thought_tokens":3,"total_cached_tokens":0}}}
+
+event: done
+data: [DONE]

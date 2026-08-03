@@ -363,10 +363,10 @@ impl ReasoningAccumulator {
             part.signature = signature;
             return;
         }
-        if text.is_empty() && signature.is_some() {
-            // A signature with no open block has nothing to seal.
-            return;
-        }
+        // Some providers (notably Gemini Interactions) emit a valid thought
+        // step containing only its opaque signature. Keep that zero-summary
+        // block as canonical continuation content instead of treating it as
+        // an orphaned trailer.
         self.parts.push(AccumulatedReasoning {
             text: text.to_string(),
             redacted,
@@ -386,17 +386,21 @@ impl ReasoningAccumulator {
     }
 }
 
-/// Drops reasoning retained from earlier turns. Providers only need reasoning
-/// echoed back within the turn that produced it (the tool-call loop); once a
-/// new user turn starts it is dead weight in every subsequent request, so the
-/// canonical history — the exact model-facing view — sheds it here. Assistant
-/// messages left with no content (reasoning-only answers) are removed
-/// entirely rather than sent as empty messages.
+/// Drops unsigned reasoning retained from earlier turns. Signed reasoning is
+/// provider-required continuation content and remains in canonical history;
+/// unsigned reasoning is dead weight once the producing turn ends. Assistant
+/// messages left with no content are removed rather than sent empty.
 fn strip_stale_reasoning(history: &mut Vec<Message>) {
     for message in history.iter_mut() {
-        message
-            .content
-            .retain(|part| !matches!(part, ContentPart::Reasoning { .. }));
+        message.content.retain(|part| {
+            !matches!(
+                part,
+                ContentPart::Reasoning {
+                    signature: None,
+                    ..
+                }
+            )
+        });
     }
     history
         .retain(|message| !(matches!(message.role, Role::Assistant) && message.content.is_empty()));
