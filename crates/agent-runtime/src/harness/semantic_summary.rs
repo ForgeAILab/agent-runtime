@@ -23,7 +23,7 @@ use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::TurnFinish;
 use agent_runtime_core::store::VersionedSessionState;
-use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
+use agent_runtime_core::usage::{CounterKind, Provenance, UsageDelta, UsageRecord, UsageSource};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
 use super::pipeline::{
@@ -35,8 +35,10 @@ use super::pipeline::{
 pub const SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION: u32 = 1;
 /// Stable separately attributed purpose.
 pub const SEMANTIC_SUMMARY_PURPOSE: &str = "context.semantic_summary";
-/// Default number of complete turns required before summarization.
-pub const DEFAULT_SUMMARY_TRIGGER_TURNS: usize = 6;
+/// Default completed-turn floor below which a session is never summarized.
+pub const DEFAULT_SUMMARY_MIN_TURNS: usize = 4;
+/// Default share of the post-opening input budget that triggers summarization.
+pub const DEFAULT_SUMMARY_TRIGGER_PERCENT: u8 = 85;
 /// Default number of recent complete turns retained verbatim.
 pub const DEFAULT_SUMMARY_RETAIN_TURNS: usize = 2;
 /// Default maximum summary length.
@@ -107,8 +109,21 @@ pub trait SummaryModel: Send + Sync + fmt::Debug {
 pub struct SemanticSummaryPolicy {
     /// Policy revision.
     pub revision: RegistryRevision,
-    /// Complete-turn trigger.
-    pub trigger_turns: usize,
+    /// Completed-turn floor below which a session is never summarized.
+    ///
+    /// This is an eligibility floor, not a trigger. Reaching it does nothing on
+    /// its own; it only prevents summarizing a session too young to have
+    /// anything worth summarizing.
+    pub min_turns: usize,
+    /// Share of the post-opening input budget at which summarization fires,
+    /// as a percentage.
+    pub trigger_percent: u8,
+    /// Resolved input budget the trigger share applies to.
+    ///
+    /// The host supplies this from its resolved model limits; the coordinator
+    /// has no way to discover it. A zero budget is rejected rather than
+    /// silently disabling summarization.
+    pub input_budget_tokens: u64,
     /// Recent complete turns retained verbatim.
     pub retain_turns: usize,
     /// Maximum accepted summary length.
@@ -126,7 +141,9 @@ impl SemanticSummaryPolicy {
     pub fn new(revision: RegistryRevision) -> Self {
         Self {
             revision,
-            trigger_turns: DEFAULT_SUMMARY_TRIGGER_TURNS,
+            min_turns: DEFAULT_SUMMARY_MIN_TURNS,
+            trigger_percent: DEFAULT_SUMMARY_TRIGGER_PERCENT,
+            input_budget_tokens: 0,
             retain_turns: DEFAULT_SUMMARY_RETAIN_TURNS,
             max_summary_chars: DEFAULT_MAX_SUMMARY_CHARS,
             max_usage_tokens: 32_000,
@@ -137,14 +154,26 @@ impl SemanticSummaryPolicy {
 
     /// Validates policy invariants.
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        if self.trigger_turns < 2
+        if self.min_turns < 2
             || self.retain_turns == 0
-            || self.retain_turns >= self.trigger_turns
+            || self.retain_turns >= self.min_turns
             || self.max_summary_chars < 256
             || self.max_usage_tokens == 0
         {
             return Err(RuntimeError::config(
-                "semantic summary policy needs trigger>=2, 0<retain<trigger, max_summary_chars>=256, and a positive usage ceiling",
+                "semantic summary policy needs min_turns>=2, 0<retain<min_turns, max_summary_chars>=256, and a positive usage ceiling",
+            ));
+        }
+        // A zero budget would make every pressure comparison vacuous, which
+        // reads as "summarization configured" while never summarizing.
+        if self.input_budget_tokens == 0 {
+            return Err(RuntimeError::config(
+                "semantic summary policy needs a positive input budget to measure pressure against",
+            ));
+        }
+        if self.trigger_percent == 0 || self.trigger_percent > 100 {
+            return Err(RuntimeError::config(
+                "semantic summary trigger percent must be between 1 and 100",
             ));
         }
         if self.sensitivity == Sensitivity::Secret {
@@ -189,6 +218,14 @@ impl fmt::Debug for SemanticSummaryState {
     }
 }
 
+/// Input tokens one attempt charged, cached and uncached together.
+///
+/// A cache read still occupies the window, so both counters belong in a measure
+/// of how full the context is; they differ in price, not in size.
+fn attempt_input_tokens(record: &UsageRecord) -> u64 {
+    record.delta.get(CounterKind::InputUncached) + record.delta.get(CounterKind::InputCached)
+}
+
 /// Standard coordinator: protected original store + dedicated model +
 /// deterministic projection.
 #[derive(Clone)]
@@ -210,6 +247,43 @@ impl fmt::Debug for SemanticSummaryCoordinator {
 }
 
 impl SemanticSummaryCoordinator {
+    /// Whether the committed ledger shows enough context growth to summarize.
+    ///
+    /// Growth is measured from the session's opening provider attempt rather
+    /// than from zero. That opening cost is dominated by the stable prefix —
+    /// instructions, tool schemas, activated skills — which does not grow as
+    /// the conversation does. Comparing total usage against the budget instead
+    /// would summarize *earlier* on sessions carrying more instructions, which
+    /// is backwards: those are the sessions whose cached prefix is most worth
+    /// keeping, and rewriting history is what throws it away.
+    ///
+    /// A provider that reports no input usage leaves nothing to measure. That
+    /// falls back to the completed-turn floor the caller has already checked,
+    /// rather than to "never": silently losing semantic summarization on an
+    /// adapter without usage reporting would be a regression disguised as a
+    /// policy. Structural compaction still guards the window either way.
+    fn under_context_pressure(&self, usage: &[UsageRecord]) -> bool {
+        // The coordinator's own spend is separately attributed. Counting it
+        // would let one summary argue for the next.
+        let mut attempts = usage
+            .iter()
+            .filter(|record| record.source == UsageSource::ProviderAttempt)
+            .map(attempt_input_tokens)
+            .filter(|tokens| *tokens > 0);
+        let Some(baseline) = attempts.next() else {
+            return true;
+        };
+        let latest = attempts.next_back().unwrap_or(baseline);
+        let headroom = self.policy.input_budget_tokens.saturating_sub(baseline);
+        if headroom == 0 {
+            // The opening turn already fills the budget. Nothing the
+            // conversation does can improve that, and waiting cannot help.
+            return true;
+        }
+        let growth = latest.saturating_sub(baseline);
+        growth.saturating_mul(100) >= u64::from(self.policy.trigger_percent) * headroom
+    }
+
     /// Creates and validates a coordinator.
     pub fn new(
         store: Arc<dyn ArtifactStore>,
@@ -300,7 +374,10 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
             .enumerate()
             .filter_map(|(index, message)| (message.role == Role::User).then_some(index))
             .collect::<Vec<_>>();
-        if user_starts.len() < self.policy.trigger_turns {
+        if user_starts.len() < self.policy.min_turns {
+            return Ok(TurnCommitPatch::default());
+        }
+        if !self.under_context_pressure(&view.usage) {
             return Ok(TurnCommitPatch::default());
         }
         let retain_index = user_starts.len().saturating_sub(self.policy.retain_turns);
@@ -603,14 +680,141 @@ mod tests {
             .collect()
     }
 
+    /// A ledger of provider attempts with the given input costs.
+    fn ledger(inputs: &[u64]) -> Vec<UsageRecord> {
+        inputs
+            .iter()
+            .map(|tokens| UsageRecord {
+                source: UsageSource::ProviderAttempt,
+                provenance: Provenance::default(),
+                delta: UsageDelta::new().with(CounterKind::InputUncached, *tokens),
+            })
+            .collect()
+    }
+
+    fn pressure_coordinator(budget: u64) -> SemanticSummaryCoordinator {
+        SemanticSummaryCoordinator::new(
+            Arc::new(MemoryArtifacts::default()),
+            Arc::new(FixedSummary),
+            SemanticSummaryPolicy {
+                min_turns: 4,
+                retain_turns: 2,
+                trigger_percent: 85,
+                input_budget_tokens: budget,
+                ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
+            },
+        )
+        .expect("a valid policy")
+    }
+
+    async fn summarized(coordinator: &SemanticSummaryCoordinator, usage: Vec<UsageRecord>) -> bool {
+        let commit = coordinator
+            .after_commit(&TurnCommitView {
+                session: SessionId::new("s"),
+                turn: TurnId::new("t"),
+                finish: TurnFinish::Completed,
+                provider_error_kind: None,
+                visible_output: true,
+                history: Arc::from(history(6)),
+                state: None,
+                usage: Arc::from(usage),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
+            })
+            .await
+            .expect("a commit patch");
+        commit.state.is_some()
+    }
+
+    #[tokio::test]
+    async fn a_long_session_of_small_turns_is_not_summarized() {
+        // Six turns, well past the floor, but the conversation has barely grown
+        // against a 100k budget. The old turn-count trigger would have fired a
+        // paid model call here and reclaimed nearly nothing.
+        let coordinator = pressure_coordinator(100_000);
+        assert!(!summarized(&coordinator, ledger(&[2_000, 2_100, 2_300])).await);
+    }
+
+    #[tokio::test]
+    async fn one_large_tool_result_triggers_summarization() {
+        let coordinator = pressure_coordinator(100_000);
+        assert!(summarized(&coordinator, ledger(&[2_000, 2_100, 95_000])).await);
+    }
+
+    #[tokio::test]
+    async fn a_larger_prefix_does_not_advance_the_trigger() {
+        // Two sessions whose conversation bodies cost identically; one simply
+        // starts with far more instructions and skills activated. Measuring
+        // total usage would summarize the second one earlier for no reason
+        // related to how much conversation it is actually holding.
+        let coordinator = pressure_coordinator(100_000);
+        let lean = summarized(&coordinator, ledger(&[2_000, 2_000 + 40_000])).await;
+        let heavy = summarized(&coordinator, ledger(&[40_000, 40_000 + 40_000])).await;
+        assert_eq!(lean, heavy, "prefix size changed the decision");
+        assert!(!lean, "40k of growth is under 85% of either headroom");
+    }
+
+    #[tokio::test]
+    async fn the_floor_protects_a_young_session() {
+        let coordinator = pressure_coordinator(100_000);
+        let commit = coordinator
+            .after_commit(&TurnCommitView {
+                session: SessionId::new("s"),
+                turn: TurnId::new("t"),
+                finish: TurnFinish::Completed,
+                provider_error_kind: None,
+                visible_output: true,
+                // Three user turns, below the floor of four.
+                history: Arc::from(history(3)),
+                state: None,
+                usage: Arc::from(ledger(&[2_000, 99_000])),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
+            })
+            .await
+            .expect("a commit patch");
+        assert!(commit.state.is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_spend_does_not_feed_the_trigger() {
+        let coordinator = pressure_coordinator(100_000);
+        let mut usage = ledger(&[2_000, 2_100]);
+        // A previous summary call, separately attributed. If this counted, one
+        // summary would argue for the next.
+        usage.push(UsageRecord {
+            source: UsageSource::SemanticSummary,
+            provenance: Provenance::default(),
+            delta: UsageDelta::new().with(CounterKind::InputUncached, 95_000),
+        });
+        assert!(!summarized(&coordinator, usage).await);
+    }
+
+    #[tokio::test]
+    async fn an_unmeasurable_ledger_falls_back_to_the_turn_floor() {
+        // A provider adapter that reports no usage must not silently lose
+        // semantic summarization.
+        let coordinator = pressure_coordinator(100_000);
+        assert!(summarized(&coordinator, Vec::new()).await);
+    }
+
+    #[test]
+    fn a_policy_without_an_input_budget_is_rejected() {
+        let policy = SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"));
+        assert_eq!(policy.input_budget_tokens, 0);
+        let error = policy.validate().expect_err("a zero budget is not usable");
+        assert!(error.to_string().contains("input budget"), "{error}");
+    }
+
     #[tokio::test]
     async fn originals_are_stored_before_a_summary_is_projected() {
         let coordinator = SemanticSummaryCoordinator::new(
             Arc::new(MemoryArtifacts::default()),
             Arc::new(FixedSummary),
             SemanticSummaryPolicy {
-                trigger_turns: 4,
+                min_turns: 4,
                 retain_turns: 2,
+                input_budget_tokens: 100_000,
                 ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
             },
         )
@@ -665,8 +869,9 @@ mod tests {
                 artifacts.clone(),
                 Arc::new(FixedSummary),
                 SemanticSummaryPolicy {
-                    trigger_turns: 4,
+                    min_turns: 4,
                     retain_turns: 2,
+                    input_budget_tokens: 100_000,
                     ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
                 },
             )
@@ -787,8 +992,9 @@ mod tests {
             Arc::new(MemoryArtifacts::default()),
             Arc::new(FailingSummary),
             SemanticSummaryPolicy {
-                trigger_turns: 4,
+                min_turns: 4,
                 retain_turns: 2,
+                input_budget_tokens: 100_000,
                 ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
             },
         )

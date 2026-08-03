@@ -997,8 +997,9 @@ async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_with
             artifacts,
             summary_model.clone(),
             SemanticSummaryPolicy {
-                trigger_turns: 2,
+                min_turns: 2,
                 retain_turns: 1,
+                input_budget_tokens: 100_000,
                 ..SemanticSummaryPolicy::new(RegistryRevision::new("durable-summary-v1"))
             },
         )

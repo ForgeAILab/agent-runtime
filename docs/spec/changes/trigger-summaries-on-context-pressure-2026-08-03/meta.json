@@ -1,0 +1,15 @@
+{
+  "change_id": "trigger-summaries-on-context-pressure",
+  "change_ref": "trigger-summaries-on-context-pressure-2026-08-03",
+  "created_at": "2026-08-03T21:05:00Z",
+  "updated_at": "2026-08-03T22:10:00Z",
+  "completed_at": null,
+  "status": "implemented",
+  "approved_at": "2026-08-03T21:05:00Z",
+  "implementation_started_at": "2026-08-03T21:05:00Z",
+  "reapproval_required": false,
+  "depends_on": [
+    "stabilize-session-harness-pipeline-2026-07-31"
+  ],
+  "external_dependencies": []
+}
