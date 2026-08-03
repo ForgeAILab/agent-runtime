@@ -19,6 +19,7 @@ use agent_runtime::harness::{
 };
 use agent_runtime::prelude::*;
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, tool_call_fragments};
+use agent_runtime::provider::transport::{ByteStream, HttpRequest, HttpTransport};
 use agent_runtime::registry::Permission;
 use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
 use agent_runtime_core::clock::{Deadline, Timestamp};
@@ -102,6 +103,41 @@ impl Provider for UnresponsiveProvider {
         _ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
         Ok(Box::pin(futures_util::stream::pending()))
+    }
+}
+
+struct AuthRejectingHttpTransport {
+    requests: Mutex<Vec<HttpRequest>>,
+}
+
+impl AuthRejectingHttpTransport {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<HttpRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl std::fmt::Debug for AuthRejectingHttpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRejectingHttpTransport")
+            .field("request_count", &self.requests.lock().unwrap().len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl HttpTransport for AuthRejectingHttpTransport {
+    async fn post_stream(&self, request: HttpRequest) -> Result<ByteStream, ProviderError> {
+        self.requests.lock().unwrap().push(request);
+        Err(ProviderError::new(
+            agent_runtime_core::provider::ProviderErrorKind::Auth,
+            "sensitive-auth-body-canary",
+        ))
     }
 }
 

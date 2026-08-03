@@ -12,6 +12,8 @@
 //! A host embeds the runtime by injecting implementations of these traits:
 //!
 //! - [`provider::Provider`] — an LLM backend.
+//! - [`provider_credential::ProviderCredentialSource`] — renewable direct
+//!   provider authorization leases.
 //! - [`tool::Tool`] — a callable tool.
 //! - [`approval::ApprovalPolicy`] — the fail-closed approval gate.
 //! - [`workspace::Workspace`] — the write boundary.
@@ -59,6 +61,7 @@ pub mod manifest;
 pub mod metadata;
 pub mod observer;
 pub mod provider;
+pub mod provider_credential;
 pub mod security;
 pub mod steer;
 pub mod store;
@@ -153,6 +156,12 @@ pub mod prelude {
         ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
         ProviderStreamEvent, ReasoningConfig, ReasoningSupport, Sampling, ToolChoice, ToolSchema,
         UnsupportedFeature,
+    };
+    pub use crate::provider_credential::{
+        CredentialInvalidation, MAX_PROVIDER_CREDENTIAL_REVISION_CHARS,
+        MAX_PROVIDER_CREDENTIAL_TARGET_CHARS, ProviderAuthRejection, ProviderCredentialError,
+        ProviderCredentialLease, ProviderCredentialRecovery, ProviderCredentialRevision,
+        ProviderCredentialSource, ProviderCredentialTarget, StaticProviderCredentialSource,
     };
     pub use crate::security::{
         ArgumentPath, AuthorizationRequest, CheckSetRevision, PermissionSet, SecurityAction,

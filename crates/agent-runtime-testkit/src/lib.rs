@@ -12,6 +12,7 @@
 pub mod clock;
 pub mod conformance;
 pub mod consumers;
+pub mod credentials;
 pub mod recorder;
 pub mod scenarios;
 pub mod stores;
@@ -19,7 +20,12 @@ pub mod tools;
 pub mod transport;
 pub mod workspace;
 
+pub use agent_runtime_core::provider_credential::StaticProviderCredentialSource;
 pub use clock::ManualClock;
+pub use credentials::{
+    CredentialAcquireRecord, CredentialBarrier, CredentialInvalidationRecord,
+    CredentialLeaseFixture, RenewableProviderCredentialSource,
+};
 pub use recorder::RecordingObserver;
 pub use stores::{InMemoryCheckpointStore, InMemorySecretStore, InMemorySessionStore};
 pub use transport::ReplayTransport;

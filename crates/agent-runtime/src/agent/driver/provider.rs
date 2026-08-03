@@ -428,6 +428,7 @@ impl Driver {
         state: &Arc<Mutex<SessionState>>,
     ) -> ProviderTurnOutcome {
         let mut attempt_index: u32 = 0;
+        let mut credential_recovery_used = false;
         loop {
             let attempt_id = minter.attempt();
             emitter.emit(
@@ -453,6 +454,7 @@ impl Driver {
 
             let mut text = String::new();
             let mut attempt_visible_output = false;
+            let mut accepted_semantic_event = false;
             let mut reasoning = ReasoningAccumulator::default();
             let mut usage = UsageDelta::new();
             let mut assembler = ToolCallAssembler::default();
@@ -472,6 +474,7 @@ impl Driver {
                         }
                         match event {
                             ProviderStreamEvent::TextDelta { text: t } => {
+                                accepted_semantic_event = true;
                                 if !t.is_empty() {
                                     attempt_visible_output = true;
                                 }
@@ -490,6 +493,7 @@ impl Driver {
                                 redacted,
                                 signature,
                             } => {
+                                accepted_semantic_event = true;
                                 reasoning.push(&t, redacted, signature);
                                 // The signature is provider integrity data for
                                 // canonical replay; the UI event stream never
@@ -511,22 +515,37 @@ impl Driver {
                                 id,
                                 name,
                                 arguments_fragment,
-                            } => assembler.push(index, id, name, &arguments_fragment),
-                            ProviderStreamEvent::Usage { delta } => usage.merge(&delta),
+                            } => {
+                                accepted_semantic_event = true;
+                                assembler.push(index, id, name, &arguments_fragment);
+                            }
+                            ProviderStreamEvent::Usage { delta } => {
+                                accepted_semantic_event = true;
+                                usage.merge(&delta);
+                            }
                             ProviderStreamEvent::CacheObservation {
                                 read_tokens,
                                 write_tokens,
-                            } => emitter.emit(
-                                turn.clone(),
-                                RuntimeEvent::CacheObservation {
-                                    read_tokens,
-                                    write_tokens,
-                                },
-                            ),
-                            ProviderStreamEvent::Downgrade { capability, detail } => emitter
-                                .emit(turn.clone(), RuntimeEvent::Downgrade { capability, detail }),
+                            } => {
+                                accepted_semantic_event = true;
+                                emitter.emit(
+                                    turn.clone(),
+                                    RuntimeEvent::CacheObservation {
+                                        read_tokens,
+                                        write_tokens,
+                                    },
+                                );
+                            }
+                            ProviderStreamEvent::Downgrade { capability, detail } => {
+                                accepted_semantic_event = true;
+                                emitter.emit(
+                                    turn.clone(),
+                                    RuntimeEvent::Downgrade { capability, detail },
+                                );
+                            }
                             ProviderStreamEvent::VendorMetadata { .. } => {}
                             ProviderStreamEvent::Finish { reason } => {
+                                accepted_semantic_event = true;
                                 provider_finish = Some(reason);
                                 break;
                             }
@@ -621,7 +640,17 @@ impl Driver {
             }
 
             if let Some(perr) = error {
-                let retryable = is_retryable(&perr);
+                let credential_recovery = !credential_recovery_used
+                    && !accepted_semantic_event
+                    && perr.credential_recovery
+                        == Some(ProviderCredentialRecovery::RetryWithRenewedCredential);
+                // Authentication failures are retryable only through the
+                // exact-revision credential recovery contract. This prevents
+                // an adapter from turning static or post-output auth failures
+                // into ordinary retry loops.
+                let ordinary_retryable =
+                    perr.kind != ProviderErrorKind::Auth && is_retryable(&perr);
+                let retryable = credential_recovery || ordinary_retryable;
                 emitter.emit(
                     turn.clone(),
                     RuntimeEvent::ProviderAttemptOutputDiscarded {
@@ -640,7 +669,12 @@ impl Driver {
                 if perr.kind == ProviderErrorKind::Cancelled {
                     return ProviderTurnOutcome::Cancelled;
                 }
-                if retryable && self.config.retry.allows_retry(attempt_index) {
+                if credential_recovery && self.config.retry.allows_retry(attempt_index) {
+                    credential_recovery_used = true;
+                    attempt_index += 1;
+                    continue;
+                }
+                if ordinary_retryable && self.config.retry.allows_retry(attempt_index) {
                     let delay = self.config.retry.backoff_ms(attempt_index, &perr);
                     if delay > 0 {
                         let remaining = turn_deadline.remaining_millis(self.clock.as_ref());

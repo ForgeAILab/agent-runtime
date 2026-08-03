@@ -8,7 +8,9 @@
 //! [`ProviderStreamEvent`] vocabulary and talks to the network only through the
 //! injected [`HttpTransport`], so it is fully offline-testable.
 
+use std::fmt;
 use std::future::pending;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
@@ -17,20 +19,28 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use agent_runtime_core::clock::{Deadline, SystemClock};
+use agent_runtime_core::cancel::Cancellation;
+use agent_runtime_core::clock::{Clock, Deadline, SystemClock};
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::provider::{
     Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
     ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent,
     ReasoningConfig, ToolChoice,
 };
+use agent_runtime_core::provider_credential::{
+    CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,
+    ProviderCredentialLease, ProviderCredentialRecovery, ProviderCredentialRevision,
+    ProviderCredentialSource, ProviderCredentialTarget, StaticProviderCredentialSource,
+};
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
 use super::transport::{HttpRequest, HttpTransport};
 
+/// Default validity requested from renewable credentials before provider I/O.
+pub const DEFAULT_CREDENTIAL_MINIMUM_VALIDITY_MS: u64 = 30_000;
+
 /// Configuration for an [`OpenAiProvider`].
-#[derive(Debug)]
 pub struct OpenAiConfig {
     /// The API base URL (e.g. `https://api.openai.com/v1`).
     pub base_url: String,
@@ -42,6 +52,23 @@ pub struct OpenAiConfig {
     pub api_key: Option<Secret>,
     /// Additional headers to send with every request.
     pub extra_headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for OpenAiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let header_names = self
+            .extra_headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        f.debug_struct("OpenAiConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("capabilities", &self.capabilities)
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("extra_header_names", &header_names)
+            .finish()
+    }
 }
 
 impl OpenAiConfig {
@@ -58,16 +85,86 @@ impl OpenAiConfig {
 }
 
 /// A provider over the OpenAI Chat-Completions streaming API.
-#[derive(Debug)]
 pub struct OpenAiProvider<T: HttpTransport> {
     transport: T,
     config: OpenAiConfig,
+    credential_source: Option<Arc<dyn ProviderCredentialSource>>,
+    credential_target: ProviderCredentialTarget,
+    credential_minimum_validity_ms: u64,
+    clock: Arc<dyn Clock>,
+}
+
+impl<T: HttpTransport> fmt::Debug for OpenAiProvider<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiProvider")
+            .field("config", &self.config)
+            .field("credential_configured", &self.credential_source.is_some())
+            .field(
+                "credential_minimum_validity_ms",
+                &self.credential_minimum_validity_ms,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: HttpTransport> OpenAiProvider<T> {
     /// Builds an adapter over `transport` with `config`.
-    pub fn new(transport: T, config: OpenAiConfig) -> Self {
-        Self { transport, config }
+    ///
+    /// A configured static API key is adapted to a non-expiring credential
+    /// source so static and renewable authorization share one attempt path.
+    pub fn new(transport: T, mut config: OpenAiConfig) -> Self {
+        let credential_source = config.api_key.take().map(|secret| {
+            Arc::new(StaticProviderCredentialSource::new(secret))
+                as Arc<dyn ProviderCredentialSource>
+        });
+        Self {
+            transport,
+            config,
+            credential_source,
+            credential_target: ProviderCredentialTarget::new("openai-compatible")
+                .expect("static provider credential target is valid"),
+            credential_minimum_validity_ms: DEFAULT_CREDENTIAL_MINIMUM_VALIDITY_MS,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Builds an adapter using a host-injected renewable credential source.
+    ///
+    /// Supplying both `config.api_key` and `credential_source` is rejected
+    /// before either credential or provider I/O.
+    pub fn with_credential_source(
+        transport: T,
+        config: OpenAiConfig,
+        credential_target: ProviderCredentialTarget,
+        credential_source: Arc<dyn ProviderCredentialSource>,
+    ) -> Result<Self, ProviderError> {
+        if config.api_key.is_some() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "conflicting provider credential configuration",
+            ));
+        }
+        Ok(Self {
+            transport,
+            config,
+            credential_source: Some(credential_source),
+            credential_target,
+            credential_minimum_validity_ms: DEFAULT_CREDENTIAL_MINIMUM_VALIDITY_MS,
+            clock: Arc::new(SystemClock),
+        })
+    }
+
+    /// Overrides the clock used for lease validity and deadline enforcement.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Overrides the minimum remaining credential validity requested per
+    /// provider attempt.
+    pub fn with_credential_minimum_validity_ms(mut self, minimum_validity_ms: u64) -> Self {
+        self.credential_minimum_validity_ms = minimum_validity_ms;
+        self
     }
 
     /// The underlying transport, for tests that inspect recorded requests.
@@ -153,13 +250,130 @@ impl<T: HttpTransport> OpenAiProvider<T> {
         }
         payload
     }
+
+    fn chat_completions_url(&self) -> Result<String, ProviderError> {
+        let base = self.config.base_url.trim_end_matches('/');
+        let authority_and_path = base
+            .strip_prefix("https://")
+            .or_else(|| base.strip_prefix("http://"))
+            .ok_or_else(|| {
+                ProviderError::new(ProviderErrorKind::BadRequest, "invalid provider base URL")
+            })?;
+        let authority = authority_and_path.split('/').next().unwrap_or_default();
+        if authority.is_empty()
+            || authority.contains('@')
+            || base.contains(char::is_whitespace)
+            || base.contains('?')
+            || base.contains('#')
+        {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "invalid provider base URL",
+            ));
+        }
+        Ok(format!("{base}/chat/completions"))
+    }
+
+    async fn acquire_credential(
+        &self,
+        ctx: &ProviderCallContext,
+    ) -> Result<Option<ProviderCredentialLease>, ProviderError> {
+        let Some(source) = self.credential_source.as_ref() else {
+            return Ok(None);
+        };
+        let acquire = source.acquire(
+            &self.credential_target,
+            self.credential_minimum_validity_ms,
+            &ctx.cancel,
+            ctx.deadline,
+        );
+        tokio::pin!(acquire);
+        let lease = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return Err(credential_error(ProviderCredentialError::Cancelled));
+            }
+            _ = wait_for_deadline(ctx.deadline, self.clock.as_ref()) => {
+                return Err(credential_error(ProviderCredentialError::Timeout));
+            }
+            result = &mut acquire => result.map_err(credential_error)?,
+        };
+        if lease.expires_at().is_some_and(|expiry| {
+            expiry
+                < self
+                    .clock
+                    .now()
+                    .plus_millis(self.credential_minimum_validity_ms)
+        }) {
+            return Err(credential_error(ProviderCredentialError::InvalidLease));
+        }
+        Ok(Some(lease))
+    }
 }
 
-async fn wait_for_deadline(deadline: Deadline) {
-    match deadline.remaining_millis(&SystemClock) {
+async fn wait_for_deadline(deadline: Deadline, clock: &dyn Clock) {
+    match deadline.remaining_millis(clock) {
         Some(0) => {}
         Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
         None => pending::<()>().await,
+    }
+}
+
+fn credential_error(error: ProviderCredentialError) -> ProviderError {
+    let kind = match error {
+        ProviderCredentialError::Cancelled => ProviderErrorKind::Cancelled,
+        ProviderCredentialError::Timeout => ProviderErrorKind::Timeout,
+        ProviderCredentialError::InvalidTarget
+        | ProviderCredentialError::InvalidRevision
+        | ProviderCredentialError::Unavailable
+        | ProviderCredentialError::RefreshFailed
+        | ProviderCredentialError::InvalidLease => ProviderErrorKind::Auth,
+    };
+    ProviderError::new(kind, error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn classify_auth_rejection(
+    error: ProviderError,
+    source: Option<Arc<dyn ProviderCredentialSource>>,
+    target: ProviderCredentialTarget,
+    rejected_revision: Option<ProviderCredentialRevision>,
+    cancel: &Cancellation,
+    deadline: Deadline,
+    clock: Arc<dyn Clock>,
+) -> ProviderError {
+    if error.kind != ProviderErrorKind::Auth {
+        return error;
+    }
+    let (Some(source), Some(rejected_revision)) = (source, rejected_revision) else {
+        return ProviderError::new(ProviderErrorKind::Auth, "provider authentication rejected");
+    };
+    let invalidate = source.invalidate(
+        &target,
+        &rejected_revision,
+        ProviderAuthRejection::Unauthorized,
+        cancel,
+        deadline,
+    );
+    tokio::pin!(invalidate);
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return credential_error(ProviderCredentialError::Cancelled);
+        }
+        _ = wait_for_deadline(deadline, clock.as_ref()) => {
+            return credential_error(ProviderCredentialError::Timeout);
+        }
+        result = &mut invalidate => match result {
+            Ok(outcome) => outcome,
+            Err(error) => return credential_error(error),
+        },
+    };
+    let error = ProviderError::new(ProviderErrorKind::Auth, "provider authentication rejected");
+    if outcome == CredentialInvalidation::ReplacementPossible {
+        error.with_credential_recovery(ProviderCredentialRecovery::RetryWithRenewedCredential)
+    } else {
+        error
     }
 }
 
@@ -492,23 +706,25 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        let url = self.chat_completions_url()?;
         let payload = self.build_payload(&request);
         let body = serde_json::to_vec(&payload)
             .map_err(|e| ProviderError::new(ProviderErrorKind::BadRequest, e.to_string()))?;
+        let lease = self.acquire_credential(&ctx).await?;
         let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
-        if let Some(key) = &self.config.api_key {
-            headers.push(("authorization".into(), format!("Bearer {}", key.expose())));
+        if let Some(lease) = lease.as_ref() {
+            headers.push((
+                "authorization".into(),
+                format!("Bearer {}", lease.secret().expose()),
+            ));
         }
         headers.extend(self.config.extra_headers.iter().cloned());
 
-        let http = HttpRequest {
-            url: format!(
-                "{}/chat/completions",
-                self.config.base_url.trim_end_matches('/')
-            ),
-            headers,
-            body,
-        };
+        let http = HttpRequest { url, headers, body };
+        let credential_source = self.credential_source.clone();
+        let credential_target = self.credential_target.clone();
+        let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
+        let clock = self.clock.clone();
         let post = self.transport.post_stream(http);
         tokio::pin!(post);
         let mut bytes = tokio::select! {
@@ -516,21 +732,39 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             _ = ctx.cancel.cancelled() => {
                 return Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"));
             }
-            _ = wait_for_deadline(ctx.deadline) => {
+            _ = wait_for_deadline(ctx.deadline, clock.as_ref()) => {
                 return Err(ProviderError::new(
                     ProviderErrorKind::Timeout,
                     "provider deadline elapsed",
                 ));
             }
-            result = &mut post => result?,
+            result = &mut post => match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(classify_auth_rejection(
+                        error,
+                        credential_source,
+                        credential_target,
+                        rejected_revision,
+                        &ctx.cancel,
+                        ctx.deadline,
+                        clock,
+                    ).await);
+                }
+            },
         };
         let cancel = ctx.cancel.clone();
         let deadline = ctx.deadline;
+        let credential_source = self.credential_source.clone();
+        let credential_target = self.credential_target.clone();
+        let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
+        let clock = self.clock.clone();
 
         let out = stream! {
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
             let mut saw_chunk = false;
+            let mut saw_semantic_event = false;
             let mut emitted_finish = false;
             let mut pending_finish = None;
 
@@ -543,7 +777,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         };
                         return;
                     }
-                    _ = wait_for_deadline(deadline) => {
+                    _ = wait_for_deadline(deadline, clock.as_ref()) => {
                         yield ProviderStreamEvent::Error {
                             error: ProviderError::new(
                                 ProviderErrorKind::Timeout,
@@ -559,8 +793,28 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 };
                 let chunk = match chunk {
                     Ok(c) => c,
-                    Err(e) => {
-                        yield ProviderStreamEvent::Error { error: e };
+                    Err(error) => {
+                        let error = if saw_semantic_event {
+                            if error.kind == ProviderErrorKind::Auth {
+                                ProviderError::new(
+                                    ProviderErrorKind::Auth,
+                                    "provider authentication rejected",
+                                )
+                            } else {
+                                error
+                            }
+                        } else {
+                            classify_auth_rejection(
+                                error,
+                                credential_source.clone(),
+                                credential_target.clone(),
+                                rejected_revision.clone(),
+                                &cancel,
+                                deadline,
+                                clock.clone(),
+                            ).await
+                        };
+                        yield ProviderStreamEvent::Error { error };
                         return;
                     }
                 };
@@ -596,6 +850,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                             saw_chunk = true;
                             let mut events = Vec::new();
                             let finish = chunk_to_events(parsed, &mut events);
+                            saw_semantic_event |= !events.is_empty() || finish.is_some();
                             for ev in events {
                                 yield ev;
                             }
@@ -677,14 +932,17 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
 mod tests {
     use super::*;
     use agent_runtime_core::cancel::Cancellation;
-    use agent_runtime_core::clock::Deadline;
+    use agent_runtime_core::clock::{Deadline, Timestamp};
     use agent_runtime_core::ids::{AttemptId, RequestId};
+    use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A transport that replays fixed SSE byte chunks.
     #[derive(Debug)]
     struct ReplayTransport {
         chunks: Mutex<Option<Vec<Vec<u8>>>>,
+        requests: Mutex<Vec<HttpRequest>>,
     }
     impl ReplayTransport {
         fn new(chunks: Vec<&str>) -> Self {
@@ -699,15 +957,21 @@ mod tests {
         fn new_bytes(chunks: Vec<Vec<u8>>) -> Self {
             Self {
                 chunks: Mutex::new(Some(chunks)),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<HttpRequest> {
+            self.requests.lock().unwrap().clone()
         }
     }
     #[async_trait]
     impl HttpTransport for ReplayTransport {
         async fn post_stream(
             &self,
-            _request: HttpRequest,
+            request: HttpRequest,
         ) -> Result<super::super::transport::ByteStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
             let chunks = self.chunks.lock().unwrap().take().unwrap_or_default();
             let out = stream! {
                 for c in chunks {
@@ -731,6 +995,139 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FixedClock(Timestamp);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Timestamp {
+            self.0
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedCredentialSource {
+        acquisitions: Mutex<VecDeque<Result<ProviderCredentialLease, ProviderCredentialError>>>,
+        invalidations: Mutex<VecDeque<Result<CredentialInvalidation, ProviderCredentialError>>>,
+        acquire_calls: AtomicUsize,
+        invalidated: Mutex<Vec<ProviderCredentialRevision>>,
+    }
+
+    impl ScriptedCredentialSource {
+        fn new(
+            acquisitions: Vec<Result<ProviderCredentialLease, ProviderCredentialError>>,
+            invalidations: Vec<Result<CredentialInvalidation, ProviderCredentialError>>,
+        ) -> Self {
+            Self {
+                acquisitions: Mutex::new(acquisitions.into()),
+                invalidations: Mutex::new(invalidations.into()),
+                acquire_calls: AtomicUsize::new(0),
+                invalidated: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProviderCredentialSource for ScriptedCredentialSource {
+        async fn acquire(
+            &self,
+            _target: &ProviderCredentialTarget,
+            _minimum_validity_ms: u64,
+            _cancel: &Cancellation,
+            _deadline: Deadline,
+        ) -> Result<ProviderCredentialLease, ProviderCredentialError> {
+            self.acquire_calls.fetch_add(1, Ordering::SeqCst);
+            self.acquisitions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(ProviderCredentialError::Unavailable))
+        }
+
+        async fn invalidate(
+            &self,
+            _target: &ProviderCredentialTarget,
+            rejected_revision: &ProviderCredentialRevision,
+            _rejection: ProviderAuthRejection,
+            _cancel: &Cancellation,
+            _deadline: Deadline,
+        ) -> Result<CredentialInvalidation, ProviderCredentialError> {
+            self.invalidated
+                .lock()
+                .unwrap()
+                .push(rejected_revision.clone());
+            self.invalidations
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(CredentialInvalidation::NoReplacement))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingCredentialSource;
+
+    #[async_trait]
+    impl ProviderCredentialSource for PendingCredentialSource {
+        async fn acquire(
+            &self,
+            _target: &ProviderCredentialTarget,
+            _minimum_validity_ms: u64,
+            _cancel: &Cancellation,
+            _deadline: Deadline,
+        ) -> Result<ProviderCredentialLease, ProviderCredentialError> {
+            pending().await
+        }
+
+        async fn invalidate(
+            &self,
+            _target: &ProviderCredentialTarget,
+            _rejected_revision: &ProviderCredentialRevision,
+            _rejection: ProviderAuthRejection,
+            _cancel: &Cancellation,
+            _deadline: Deadline,
+        ) -> Result<CredentialInvalidation, ProviderCredentialError> {
+            pending().await
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct AuthRejectingTransport {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HttpTransport for AuthRejectingTransport {
+        async fn post_stream(
+            &self,
+            _request: HttpRequest,
+        ) -> Result<super::super::transport::ByteStream, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::new(
+                ProviderErrorKind::Auth,
+                "sensitive upstream rejection body",
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SemanticThenAuthTransport;
+
+    #[async_trait]
+    impl HttpTransport for SemanticThenAuthTransport {
+        async fn post_stream(
+            &self,
+            _request: HttpRequest,
+        ) -> Result<super::super::transport::ByteStream, ProviderError> {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_vec()),
+                Err(ProviderError::new(
+                    ProviderErrorKind::Auth,
+                    "sensitive late rejection",
+                )),
+            ])))
+        }
+    }
+
     fn ctx() -> ProviderCallContext {
         ProviderCallContext {
             request_id: RequestId::new("r"),
@@ -746,6 +1143,277 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    fn target() -> ProviderCredentialTarget {
+        ProviderCredentialTarget::new("openrouter").expect("valid target")
+    }
+
+    fn lease(
+        secret: &str,
+        expires_at: Option<Timestamp>,
+        revision: &str,
+    ) -> ProviderCredentialLease {
+        let revision = ProviderCredentialRevision::new(revision).expect("valid revision");
+        match expires_at {
+            Some(expiry) => {
+                ProviderCredentialLease::expiring(Secret::new(secret), expiry, revision)
+            }
+            None => ProviderCredentialLease::non_expiring(Secret::new(secret), revision),
+        }
+    }
+
+    #[tokio::test]
+    async fn static_api_key_uses_the_credential_source_attempt_path() {
+        let transport = ReplayTransport::new(vec![]);
+        let mut config = OpenAiConfig::new("http://x/v1", "gpt-x");
+        config.api_key = Some(Secret::new("static-key-canary"));
+        let provider = OpenAiProvider::new(transport, config);
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+
+        collect(provider.stream(request, ctx()).await.unwrap()).await;
+
+        let requests = provider.transport().requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.iter().any(|(name, value)| {
+            name == "authorization" && value == "Bearer static-key-canary"
+        }));
+        assert!(!format!("{provider:?}").contains("static-key-canary"));
+    }
+
+    #[tokio::test]
+    async fn renewable_lease_is_acquired_and_injected_per_attempt() {
+        let source = Arc::new(ScriptedCredentialSource::new(
+            vec![Ok(lease(
+                "renewable-canary",
+                Some(Timestamp(90_000)),
+                "revision-canary",
+            ))],
+            vec![],
+        ));
+        let provider = OpenAiProvider::with_credential_source(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+            target(),
+            source.clone(),
+        )
+        .unwrap()
+        .with_clock(Arc::new(FixedClock(Timestamp(0))));
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+
+        collect(provider.stream(request, ctx()).await.unwrap()).await;
+
+        assert_eq!(source.acquire_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            provider.transport().requests()[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "authorization" && value == "Bearer renewable-canary")
+        );
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("renewable-canary"));
+        assert!(!debug.contains("revision-canary"));
+        assert!(!debug.contains("90000"));
+    }
+
+    #[tokio::test]
+    async fn short_lease_is_rejected_before_provider_io() {
+        let source = Arc::new(ScriptedCredentialSource::new(
+            vec![Ok(lease(
+                "too-short-canary",
+                Some(Timestamp(120)),
+                "short-revision",
+            ))],
+            vec![],
+        ));
+        let provider = OpenAiProvider::with_credential_source(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+            target(),
+            source,
+        )
+        .unwrap()
+        .with_clock(Arc::new(FixedClock(Timestamp(100))))
+        .with_credential_minimum_validity_ms(30);
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("short lease is rejected");
+
+        assert_eq!(error.kind, ProviderErrorKind::Auth);
+        assert_eq!(
+            error.message,
+            "provider credential lease is not sufficiently valid"
+        );
+        assert!(provider.transport().requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_acquisition_observes_cancellation_and_deadline() {
+        let cancelled = Cancellation::new();
+        cancelled.cancel(agent_runtime_core::cancel::CancelReason::UserRequested);
+        let cancelled_provider = OpenAiProvider::with_credential_source(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+            target(),
+            Arc::new(PendingCredentialSource),
+        )
+        .unwrap();
+        let mut cancelled_ctx = ctx();
+        cancelled_ctx.cancel = cancelled;
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+        let error = cancelled_provider
+            .stream(request, cancelled_ctx)
+            .await
+            .err()
+            .expect("cancelled acquisition fails");
+        assert_eq!(error.kind, ProviderErrorKind::Cancelled);
+        assert!(cancelled_provider.transport().requests().is_empty());
+
+        let timed_provider = OpenAiProvider::with_credential_source(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+            target(),
+            Arc::new(PendingCredentialSource),
+        )
+        .unwrap();
+        let mut timed_ctx = ctx();
+        timed_ctx.deadline = Deadline::after(&SystemClock, 1);
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            timed_provider.stream(request, timed_ctx),
+        )
+        .await
+        .expect("credential deadline is enforced")
+        .err()
+        .expect("timed acquisition fails");
+        assert_eq!(error.kind, ProviderErrorKind::Timeout);
+        assert!(timed_provider.transport().requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_output_auth_rejection_invalidates_exact_revision() {
+        let source = Arc::new(ScriptedCredentialSource::new(
+            vec![Ok(lease("first-token", None, "revision-one"))],
+            vec![Ok(CredentialInvalidation::ReplacementPossible)],
+        ));
+        let provider = OpenAiProvider::with_credential_source(
+            AuthRejectingTransport::default(),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+            target(),
+            source.clone(),
+        )
+        .unwrap();
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("authentication rejection fails the attempt");
+
+        assert_eq!(error.kind, ProviderErrorKind::Auth);
+        assert_eq!(error.message, "provider authentication rejected");
+        assert_eq!(
+            error.credential_recovery,
+            Some(ProviderCredentialRecovery::RetryWithRenewedCredential)
+        );
+        assert_eq!(source.invalidated.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_rejection_after_output_does_not_invalidate_or_recover() {
+        let source = Arc::new(ScriptedCredentialSource::new(
+            vec![Ok(lease("first-token", None, "revision-one"))],
+            vec![Ok(CredentialInvalidation::ReplacementPossible)],
+        ));
+        let provider = OpenAiProvider::with_credential_source(
+            SemanticThenAuthTransport,
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+            target(),
+            source.clone(),
+        )
+        .unwrap();
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+
+        let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ProviderStreamEvent::TextDelta { .. },
+                ProviderStreamEvent::Error {
+                    error: ProviderError {
+                        kind: ProviderErrorKind::Auth,
+                        credential_recovery: None,
+                        ..
+                    }
+                }
+            ]
+        ));
+        assert!(source.invalidated.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflicting_static_and_renewable_credentials_fail_before_io() {
+        let mut config = OpenAiConfig::new("http://x/v1", "gpt-x");
+        config.api_key = Some(Secret::new("static-canary"));
+        let source = Arc::new(ScriptedCredentialSource::new(vec![], vec![]));
+
+        let error = OpenAiProvider::with_credential_source(
+            ReplayTransport::new(vec![]),
+            config,
+            target(),
+            source.clone(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert_eq!(source.acquire_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_destination_fails_before_credential_or_provider_io() {
+        let source = Arc::new(ScriptedCredentialSource::new(
+            vec![Ok(lease("unused", None, "unused-revision"))],
+            vec![],
+        ));
+        let provider = OpenAiProvider::with_credential_source(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("provider.example/v1", "gpt-x"),
+            target(),
+            source.clone(),
+        )
+        .unwrap();
+        let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("invalid destination fails");
+
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert_eq!(source.acquire_calls.load(Ordering::SeqCst), 0);
+        assert!(provider.transport().requests().is_empty());
+    }
+
+    #[test]
+    fn configuration_debug_redacts_static_and_custom_header_values() {
+        let mut config = OpenAiConfig::new("https://provider.example/v1", "gpt-x");
+        config.api_key = Some(Secret::new("api-key-canary"));
+        config
+            .extra_headers
+            .push(("x-private".into(), "header-canary".into()));
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("x-private"));
+        assert!(!rendered.contains("api-key-canary"));
+        assert!(!rendered.contains("header-canary"));
     }
 
     #[tokio::test]

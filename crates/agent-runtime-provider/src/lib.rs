@@ -31,3 +31,8 @@ pub mod sse;
 pub mod transport;
 
 pub use agent_runtime_core as core;
+pub use agent_runtime_core::provider_credential::{
+    CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,
+    ProviderCredentialLease, ProviderCredentialRecovery, ProviderCredentialRevision,
+    ProviderCredentialSource, ProviderCredentialTarget, StaticProviderCredentialSource,
+};

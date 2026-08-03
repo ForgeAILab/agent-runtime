@@ -203,6 +203,248 @@ async fn retries_keep_both_attempts_visible() {
 }
 
 #[tokio::test]
+async fn pre_output_credential_recovery_replays_once_as_a_visible_attempt() {
+    let first = ScriptedStream::new(vec![ProviderStreamEvent::Error {
+        error: ProviderError::new(
+            agent_runtime_core::provider::ProviderErrorKind::Auth,
+            "provider authentication rejected",
+        )
+        .with_credential_recovery(ProviderCredentialRecovery::RetryWithRenewedCredential),
+    }]);
+    let second = ScriptedStream::new(vec![
+        ProviderStreamEvent::TextDelta {
+            text: "renewed credential worked".into(),
+        },
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]);
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![first, second],
+    ));
+    let observer = RecordingObserver::shared();
+    let runtime = build(provider.clone(), observer.clone());
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    assert_eq!(provider.requests().len(), 2);
+    let payloads = observer.payloads();
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|event| matches!(event, RuntimeEvent::ProviderAttemptStarted { .. }))
+            .count(),
+        2
+    );
+    assert!(payloads.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ProviderAttemptFinished {
+            retryable: true,
+            ..
+        }
+    )));
+    assert!(
+        session
+            .history()
+            .iter()
+            .any(|message| message.joined_text().contains("renewed credential worked"))
+    );
+}
+
+#[tokio::test]
+async fn credential_recovery_is_denied_after_semantic_output() {
+    let first = ScriptedStream::new(vec![
+        ProviderStreamEvent::TextDelta {
+            text: "speculative text".into(),
+        },
+        ProviderStreamEvent::Error {
+            error: ProviderError::new(
+                agent_runtime_core::provider::ProviderErrorKind::Auth,
+                "provider authentication rejected",
+            )
+            .with_credential_recovery(ProviderCredentialRecovery::RetryWithRenewedCredential),
+        },
+    ]);
+    let unused = ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+        reason: FinishReason::Stop,
+    }]);
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![first, unused],
+    ));
+    let observer = RecordingObserver::shared();
+    let runtime = build(provider.clone(), observer.clone());
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    assert_eq!(provider.requests().len(), 1);
+    assert!(matches!(
+        observer.payloads().last(),
+        Some(RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::Failed,
+            ..
+        })
+    ));
+    assert!(
+        session
+            .history()
+            .iter()
+            .all(|message| message.joined_text() != "speculative text")
+    );
+}
+
+#[tokio::test]
+async fn replacement_auth_rejection_is_terminal_without_a_third_attempt() {
+    let auth_error = || ProviderStreamEvent::Error {
+        error: ProviderError::new(
+            agent_runtime_core::provider::ProviderErrorKind::Auth,
+            "provider authentication rejected",
+        )
+        .with_credential_recovery(ProviderCredentialRecovery::RetryWithRenewedCredential),
+    };
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![
+            ScriptedStream::new(vec![auth_error()]),
+            ScriptedStream::new(vec![auth_error()]),
+            ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }]),
+        ],
+    ));
+    let observer = RecordingObserver::shared();
+    let runtime = build(provider.clone(), observer.clone());
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    assert_eq!(provider.requests().len(), 2);
+    assert!(matches!(
+        observer.payloads().last(),
+        Some(RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::Failed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn one_attempt_policy_does_not_hide_a_credential_replay() {
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![ProviderStreamEvent::Error {
+            error: ProviderError::new(
+                agent_runtime_core::provider::ProviderErrorKind::Auth,
+                "provider authentication rejected",
+            )
+            .with_credential_recovery(ProviderCredentialRecovery::RetryWithRenewedCredential),
+        }])],
+    ));
+    let observer = RecordingObserver::shared();
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(provider.clone())
+        .observer(observer.clone())
+        .retry(RetryPolicy::none())
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    assert_eq!(provider.requests().len(), 1);
+    assert!(matches!(
+        observer.payloads().last(),
+        Some(RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::LimitReached {
+                limit: LimitKind::ProviderAttempts
+            },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn renewable_credentials_never_cross_observable_or_persisted_boundaries() {
+    let source = Arc::new(
+        agent_runtime_testkit::RenewableProviderCredentialSource::new(
+            agent_runtime_testkit::ManualClock::shared(0),
+            agent_runtime_testkit::CredentialLeaseFixture::non_expiring(
+                "sekret",
+                "revision-canary",
+            )
+            .unwrap(),
+            [agent_runtime_testkit::CredentialLeaseFixture::non_expiring(
+                "sekret-new",
+                "replacement-revision-canary",
+            )
+            .unwrap()],
+        ),
+    );
+    let provider = Arc::new(
+        agent_runtime::provider::openai::OpenAiProvider::with_credential_source(
+            AuthRejectingHttpTransport::new(),
+            agent_runtime::provider::openai::OpenAiConfig::new(
+                "https://provider.example/v1",
+                "gpt-x",
+            ),
+            ProviderCredentialTarget::new("openrouter").unwrap(),
+            source.clone(),
+        )
+        .unwrap(),
+    );
+    let observer = RecordingObserver::shared();
+    let runtime = RuntimeBuilder::new(ModelId::new("gpt-x"))
+        .model_profile(ResolvedModelProfile::explicit(
+            "openrouter",
+            ModelId::new("gpt-x"),
+            ModelLimits::new(128_000, 128_000, 4_096),
+        ))
+        .provider(provider.clone())
+        .observer(observer.clone())
+        .retry(RetryPolicy::immediate(3))
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    assert_eq!(provider.transport().requests().len(), 2);
+    let observable = format!(
+        "{}\n{}\n{:?}\n{:?}\n{:?}",
+        serde_json::to_string(&observer.events()).unwrap(),
+        serde_json::to_string(&session.snapshot()).unwrap(),
+        provider,
+        source,
+        provider.transport().requests(),
+    );
+    for forbidden in [
+        "sekret",
+        "c2VrcmV0",
+        "73656b726574",
+        "%73%65%6b%72%65%74",
+        "\\u0073\\u0065\\u006b\\u0072\\u0065\\u0074",
+        "revision-canary",
+        "replacement-revision-canary",
+        "sensitive-auth-body-canary",
+    ] {
+        assert!(
+            !observable.contains(forbidden),
+            "credential material escaped through an observable boundary: {forbidden}"
+        );
+    }
+    assert!(matches!(
+        observer.payloads().last(),
+        Some(RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::Failed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn retryable_partial_stream_is_discarded_from_transcript() {
     let first = ScriptedStream::new(vec![
         ProviderStreamEvent::TextDelta {

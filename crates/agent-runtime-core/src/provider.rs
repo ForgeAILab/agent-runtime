@@ -22,6 +22,7 @@ use crate::content::Message;
 use crate::error::{ErrorKind, RuntimeError};
 use crate::ids::{AttemptId, RequestId};
 use crate::metadata::Metadata;
+use crate::provider_credential::ProviderCredentialRecovery;
 use crate::usage::UsageDelta;
 
 /// A model identifier (opaque to the runtime).
@@ -351,6 +352,9 @@ pub struct ProviderError {
     /// A provider-suggested minimum delay before retrying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// A fixed, redaction-safe credential recovery classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_recovery: Option<ProviderCredentialRecovery>,
     /// Redaction-safe context.
     #[serde(default, skip_serializing_if = "Metadata::is_empty")]
     pub metadata: Metadata,
@@ -364,6 +368,7 @@ impl ProviderError {
             message: message.into(),
             retryable: false,
             retry_after_ms: None,
+            credential_recovery: None,
             metadata: Metadata::new(),
         }
     }
@@ -376,6 +381,12 @@ impl ProviderError {
     pub fn retry_after(mut self, ms: u64) -> Self {
         self.retry_after_ms = Some(ms);
         self.retryable = true;
+        self
+    }
+    /// Marks a classified provider authentication failure as eligible for the
+    /// canonical renewed-credential replay fence.
+    pub fn with_credential_recovery(mut self, recovery: ProviderCredentialRecovery) -> Self {
+        self.credential_recovery = Some(recovery);
         self
     }
     /// An `Unsupported` error naming the features that could not be satisfied.

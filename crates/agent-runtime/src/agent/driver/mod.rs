@@ -46,6 +46,7 @@ use agent_runtime_core::provider::{
     FinishReason, Provider, ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest,
     ProviderStreamEvent, ToolChoice, UnsupportedFeature,
 };
+use agent_runtime_core::provider_credential::ProviderCredentialRecovery;
 use agent_runtime_core::steer::{SteerDiscardReason, SteerLimits};
 use agent_runtime_core::store::{
     SessionSnapshot, SessionStore, TurnManifest, VersionedSessionState,
