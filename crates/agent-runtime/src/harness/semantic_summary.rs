@@ -23,7 +23,7 @@ use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::TurnFinish;
 use agent_runtime_core::store::VersionedSessionState;
-use agent_runtime_core::usage::{CounterKind, Provenance, UsageDelta, UsageRecord, UsageSource};
+use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
 use super::pipeline::{
@@ -218,14 +218,6 @@ impl fmt::Debug for SemanticSummaryState {
     }
 }
 
-/// Input tokens one attempt charged, cached and uncached together.
-///
-/// A cache read still occupies the window, so both counters belong in a measure
-/// of how full the context is; they differ in price, not in size.
-fn attempt_input_tokens(record: &UsageRecord) -> u64 {
-    record.delta.get(CounterKind::InputUncached) + record.delta.get(CounterKind::InputCached)
-}
-
 /// Standard coordinator: protected original store + dedicated model +
 /// deterministic projection.
 #[derive(Clone)]
@@ -268,7 +260,7 @@ impl SemanticSummaryCoordinator {
         let mut attempts = usage
             .iter()
             .filter(|record| record.source == UsageSource::ProviderAttempt)
-            .map(attempt_input_tokens)
+            .map(|record| record.delta.input_tokens())
             .filter(|tokens| *tokens > 0);
         let Some(baseline) = attempts.next() else {
             return true;
@@ -788,6 +780,35 @@ mod tests {
             delta: UsageDelta::new().with(CounterKind::InputUncached, 95_000),
         });
         assert!(!summarized(&coordinator, usage).await);
+    }
+
+    #[tokio::test]
+    async fn cache_written_tokens_count_toward_context_size() {
+        // Anthropic reports the cacheable prefix as `cache_creation_input_tokens`
+        // on the request that first writes it. Omitting that counter would
+        // measure a session's opening turn as nearly empty and then read the
+        // whole prefix back as conversation growth on the next one.
+        let coordinator = pressure_coordinator(100_000);
+        let write_heavy = vec![
+            UsageRecord {
+                source: UsageSource::ProviderAttempt,
+                provenance: Provenance::default(),
+                delta: UsageDelta::new()
+                    .with(CounterKind::InputUncached, 50)
+                    .with(CounterKind::CacheWrite, 40_000),
+            },
+            UsageRecord {
+                source: UsageSource::ProviderAttempt,
+                provenance: Provenance::default(),
+                delta: UsageDelta::new()
+                    .with(CounterKind::InputUncached, 150)
+                    .with(CounterKind::InputCached, 40_000),
+            },
+        ];
+        // Real growth is ~100 tokens against a ~60k headroom. Counting only
+        // uncached+cached would score this as 40k of growth from a 50-token
+        // baseline — the prefix mistaken for conversation.
+        assert!(!summarized(&coordinator, write_heavy).await);
     }
 
     #[tokio::test]

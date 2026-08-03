@@ -67,6 +67,24 @@ impl UsageDelta {
         self.counters.values().copied().fold(0, u64::saturating_add)
     }
 
+    /// Every token that occupied the context window on this request.
+    ///
+    /// All three input categories count. A provider bills them differently —
+    /// a cache read is cheap and a cache write carries a premium — but price
+    /// is not size: each one was sent, and each one takes up the window.
+    /// Anthropic in particular reports the cacheable prefix as
+    /// `cache_creation_input_tokens` on the request that first writes it, so
+    /// omitting [`CounterKind::CacheWrite`] undercounts precisely the turn
+    /// that establishes a session's baseline.
+    ///
+    /// This exists so the several places that measure context pressure cannot
+    /// disagree about what "input" means.
+    pub fn input_tokens(&self) -> u64 {
+        self.get(CounterKind::InputUncached)
+            .saturating_add(self.get(CounterKind::InputCached))
+            .saturating_add(self.get(CounterKind::CacheWrite))
+    }
+
     /// Whether every counter is zero.
     pub fn is_empty(&self) -> bool {
         self.counters.is_empty()
