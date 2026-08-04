@@ -436,9 +436,11 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the maximum tool-execution steps in a turn.
+    /// Sets the maximum tool-execution steps in a turn. Unset, the turn is
+    /// unbounded and ends when the model stops calling tools or another
+    /// limit trips.
     pub fn max_tool_steps(mut self, steps: u32) -> Self {
-        self.config.max_tool_steps = steps;
+        self.config.max_tool_steps = Some(steps);
         self
     }
 

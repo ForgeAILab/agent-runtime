@@ -47,8 +47,10 @@ pub struct LoopConfig {
     /// Host-supplied system instructions, prepended to the request. Neutral:
     /// the runtime never adds its own product prompt.
     pub system_prompt: Option<String>,
-    /// The maximum number of tool-execution steps in a turn.
-    pub max_tool_steps: u32,
+    /// The maximum number of tool-execution steps in a turn. `None` leaves
+    /// the turn unbounded: it ends when the model stops calling tools or
+    /// another limit (time, cancellation) trips.
+    pub max_tool_steps: Option<u32>,
     /// The provider retry policy.
     pub retry: RetryPolicy,
     /// An optional wall-clock budget for the whole turn.
@@ -89,7 +91,7 @@ impl LoopConfig {
         Self {
             model,
             system_prompt: None,
-            max_tool_steps: 16,
+            max_tool_steps: None,
             retry: RetryPolicy::default(),
             turn_time_limit_ms: None,
             attempt_time_limit_ms: None,
