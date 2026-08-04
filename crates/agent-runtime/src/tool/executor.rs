@@ -148,6 +148,10 @@ pub(crate) enum PendingApprovalResolution {
     Rejected(ToolResultBlock),
 }
 
+/// The refusal for a workspace escape that no approval decision covered.
+const UNATTENDED_ESCAPE: &str = "an out-of-workspace filesystem resource requires an explicit \
+     approval decision; the composed checks allowed it unattended";
+
 impl ToolExecutor {
     const MAX_APPROVAL_EDITS: usize = 8;
 
@@ -447,6 +451,13 @@ impl ToolExecutor {
                 })
             }
             AuthorizationDecision::Allow { grant: _ } => {
+                if self.escapes_workspace(&prepared) {
+                    return PreparedAuthorization::Rejected(error_block(
+                        &authoritative_call,
+                        UNATTENDED_ESCAPE,
+                        self.output_limit,
+                    ));
+                }
                 PreparedAuthorization::Ready(ReadyToolCall {
                     call: authoritative_call,
                     tool,
@@ -559,6 +570,13 @@ impl ToolExecutor {
                 })
             }
             AuthorizationDecision::Allow { grant: _ } => {
+                if self.escapes_workspace(&prepared) {
+                    return PreparedAuthorization::Rejected(error_block(
+                        &call,
+                        UNATTENDED_ESCAPE,
+                        self.output_limit,
+                    ));
+                }
                 PreparedAuthorization::Ready(ReadyToolCall {
                     call,
                     tool,
@@ -802,6 +820,9 @@ impl ToolExecutor {
                     }
                 }
                 AuthorizationDecision::Allow { grant: _ } => {
+                    if self.escapes_workspace(&prepared) {
+                        return Err(UNATTENDED_ESCAPE.into());
+                    }
                     return Ok(ReadyToolCall {
                         call: call.clone(),
                         tool,
@@ -893,6 +914,42 @@ impl ToolExecutor {
 
     fn enforce_workspace(&self, prepared: &PreparedToolCall) -> Result<(), String> {
         for scope in prepared.effects().write_scopes() {
+            let SecurityResource::Filesystem { mount, .. } = prepared.resource() else {
+                return Err(
+                    "prepared filesystem write effect requires a filesystem resource".into(),
+                );
+            };
+            if mount != self.workspace.root() {
+                // An out-of-workspace write never runs unattended (see
+                // `escapes_workspace`), but even an approved one stays bound
+                // to the exact resource the approval reviewed: the scope must
+                // sit under the resource mount and inside its segments.
+                let trimmed = mount.trim_end_matches('/');
+                let relative = match scope.as_str().strip_prefix(trimmed) {
+                    Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+                    _ => {
+                        return Err(format!(
+                            "prepared write scope `{}` is outside its resource mount `{mount}`",
+                            scope.as_str()
+                        ));
+                    }
+                };
+                let scope_resource = SecurityResource::filesystem(
+                    mount.clone(),
+                    relative
+                        .split('/')
+                        .filter(|segment| !segment.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                );
+                if !prepared.resource().contains(&scope_resource) {
+                    return Err(format!(
+                        "prepared write scope `{}` is not covered by the authorized resource",
+                        scope.as_str()
+                    ));
+                }
+                continue;
+            }
             if !self.workspace.contains(scope.as_str()) {
                 return Err(format!(
                     "workspace violation: `{}` is outside `{}`",
@@ -900,11 +957,6 @@ impl ToolExecutor {
                     self.workspace.root()
                 ));
             }
-            let SecurityResource::Filesystem { .. } = prepared.resource() else {
-                return Err(
-                    "prepared filesystem write effect requires a filesystem resource".into(),
-                );
-            };
             let relative = scope
                 .as_str()
                 .strip_prefix(self.workspace.root())
@@ -938,18 +990,16 @@ impl ToolExecutor {
             let SecurityResource::Filesystem { mount, segments } = prepared.resource() else {
                 return Err("prepared filesystem permission requires a filesystem resource".into());
             };
-            if mount != self.workspace.root()
-                || segments.iter().any(|segment| {
-                    segment.is_empty()
-                        || segment == "."
-                        || segment == ".."
-                        || segment.contains('/')
-                        || segment.contains('\\')
-                })
-            {
-                return Err("prepared filesystem resource is outside the workspace".into());
+            if segments.iter().any(|segment| {
+                segment.is_empty()
+                    || segment == "."
+                    || segment == ".."
+                    || segment.contains('/')
+                    || segment.contains('\\')
+            }) {
+                return Err("prepared filesystem resource is not structurally canonical".into());
             }
-            if !segments.is_empty() {
+            if mount == self.workspace.root() && !segments.is_empty() {
                 let path = format!("{}/{}", mount.trim_end_matches('/'), segments.join("/"));
                 if !self.workspace.contains(&path) {
                     return Err(format!(
@@ -958,8 +1008,35 @@ impl ToolExecutor {
                     ));
                 }
             }
+            // A resource on any other mount is not rejected here: it is an
+            // out-of-workspace claim, and `escapes_workspace` pins it to an
+            // explicit approval decision instead of an unattended allow.
         }
         Ok(())
+    }
+
+    /// Whether the prepared action claims filesystem authority on a resource
+    /// mounted outside the session workspace.
+    ///
+    /// Such an action is never allowed unattended: even when the composed
+    /// checks answer `Allow`, the executor refuses it unless the decision
+    /// came through an approval. The boundary stays fail-closed while a host
+    /// that wants "ask the user" semantics for escapes gets exactly that.
+    fn escapes_workspace(&self, prepared: &PreparedToolCall) -> bool {
+        let filesystem_authority = prepared.required_permissions().iter().any(|permission| {
+            matches!(
+                permission,
+                agent_runtime_registry::Permission::FsRead
+                    | agent_runtime_registry::Permission::FsWrite
+                    | agent_runtime_registry::Permission::FsCreate
+                    | agent_runtime_registry::Permission::FsDelete
+            )
+        });
+        filesystem_authority
+            && matches!(
+                prepared.resource(),
+                SecurityResource::Filesystem { mount, .. } if mount != self.workspace.root()
+            )
     }
 
     pub(crate) async fn invoke_one(

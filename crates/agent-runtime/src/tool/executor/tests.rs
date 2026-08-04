@@ -1333,3 +1333,185 @@ async fn invalid_prepared_authority_fails_closed_before_invocation() {
         );
     }
 }
+
+/// Reads one exact file outside the workspace: prepares a host-mounted
+/// resource so authorization sees the escape.
+#[derive(Debug)]
+struct EscapedReadTool;
+
+#[async_trait]
+impl Tool for EscapedReadTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "escaped_read",
+            "reads one exact file outside the workspace",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            ToolEffects::read_only(),
+        )
+        .with_permission_upper_bound(PermissionSet::single(Permission::FsRead))
+    }
+
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        Ok(PreparedToolCall::new(
+            ctx.call_id.clone(),
+            "escaped_read",
+            arguments,
+            PermissionSet::single(Permission::FsRead),
+            SecurityResource::filesystem("/", vec!["etc".into(), "hosts".into()]),
+            ToolEffects::read_only(),
+            ToolCallDisplay::new("Read /etc/hosts"),
+        ))
+    }
+
+    async fn invoke(
+        &self,
+        _prepared: PreparedToolCall,
+        _ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        Ok(ToolOutcome::text("escaped content"))
+    }
+}
+
+/// Allows everything it covers without requiring approval.
+#[derive(Debug)]
+struct UnattendedAllowCheck {
+    id: SecurityCheckId,
+    revision: SecurityCheckRevision,
+}
+
+#[async_trait]
+impl SecurityCheck for UnattendedAllowCheck {
+    fn id(&self) -> &SecurityCheckId {
+        &self.id
+    }
+    fn revision(&self) -> &SecurityCheckRevision {
+        &self.revision
+    }
+    async fn evaluate(
+        &self,
+        _request: &AuthorizationRequest,
+        _cancel: &Cancellation,
+    ) -> SecurityCheckOutcome {
+        SecurityCheckOutcome::Allow {
+            constraints: GrantConstraints::unconstrained(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_out_of_workspace_resource_is_never_allowed_unattended() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EscapedReadTool)).unwrap();
+
+    let mut builder =
+        SecurityCheckSetBuilder::new(EnforcementLimits::default(), Arc::new(SystemClock));
+    builder.register(
+        Arc::new(UnattendedAllowCheck {
+            id: SecurityCheckId::new("allow-everything"),
+            revision: SecurityCheckRevision::new("v1"),
+        }),
+        SecurityCheckMode::Authoritative,
+        PermissionSet::single(Permission::FsRead),
+        ActionClass::new("test"),
+    );
+    let security = SecurityConfig {
+        check_set: Arc::new(builder.seal().unwrap()),
+        subject: SecuritySubject::new("test-subject"),
+        tenant: TenantId::new("test-tenant"),
+    };
+
+    let ex = ToolExecutor::new(
+        reg.seal(),
+        // A permissive approval policy is irrelevant: the check set answered
+        // `Allow`, so no approval decision exists to sanction the escape.
+        Arc::new(AllowAll),
+        Arc::new(WsRoot),
+        Arc::new(SystemClock),
+        10_000,
+        ConflictPolicy::ScopeOverlap,
+        security,
+    );
+    let out = ex
+        .execute(
+            &[call("escaped_read", "c1", json!({}))],
+            &RequestId::new("r"),
+            &SessionId::new("s1"),
+            &Cancellation::new(),
+            Deadline::never(),
+        )
+        .await;
+
+    assert!(out[0].is_error);
+    assert!(
+        out[0]
+            .content[0]
+            .as_text()
+            .unwrap()
+            .contains("approval decision"),
+        "an unattended allow must not sanction a workspace escape: {:?}",
+        out[0].content
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_workspace_resource_runs_only_through_approval() {
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(EscapedReadTool)).unwrap();
+
+    let resources = Arc::new(Mutex::new(Vec::new()));
+    let mut builder =
+        SecurityCheckSetBuilder::new(EnforcementLimits::default(), Arc::new(SystemClock));
+    builder.register(
+        Arc::new(RecordingApprovalCheck {
+            id: SecurityCheckId::new("recording-approval"),
+            revision: SecurityCheckRevision::new("v1"),
+            resources: resources.clone(),
+        }),
+        SecurityCheckMode::Authoritative,
+        PermissionSet::single(Permission::FsRead),
+        ActionClass::new("test"),
+    );
+    let security = SecurityConfig {
+        check_set: Arc::new(builder.seal().unwrap()),
+        subject: SecuritySubject::new("test-subject"),
+        tenant: TenantId::new("test-tenant"),
+    };
+
+    let ex = ToolExecutor::new(
+        reg.seal(),
+        Arc::new(AllowAll),
+        Arc::new(WsRoot),
+        Arc::new(SystemClock),
+        10_000,
+        ConflictPolicy::ScopeOverlap,
+        security,
+    );
+    let out = ex
+        .execute(
+            &[call("escaped_read", "c1", json!({}))],
+            &RequestId::new("r"),
+            &SessionId::new("s1"),
+            &Cancellation::new(),
+            Deadline::never(),
+        )
+        .await;
+
+    assert!(!out[0].is_error, "{:?}", out[0].content);
+    assert_eq!(out[0].content[0].as_text().unwrap(), "escaped content");
+    assert_eq!(
+        resources.lock().expect("resources poisoned").as_slice(),
+        [SecurityResource::filesystem(
+            "/",
+            vec!["etc".into(), "hosts".into()]
+        )],
+        "approval-routed authorization must have seen the escaped resource"
+    );
+}
