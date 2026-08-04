@@ -631,10 +631,63 @@ impl<'a> TurnMachine<'a> {
         deadline: Deadline,
     ) -> Result<(), RuntimeError> {
         for batch in batches {
+            // Registry search runs inline before the executor calls: it
+            // stages abilities locally and can fail the whole turn, so it
+            // must not race a batch that already produced external effects.
+            let mut outcomes: Vec<(usize, RawToolResult)> = Vec::new();
+            let mut invocations: Vec<(usize, ReadyToolCall)> = Vec::new();
             for &index in batch {
                 if index < start || index >= end {
                     continue;
                 }
+                let Some(ready) = prepared_batch.ready[index].take() else {
+                    continue;
+                };
+                if ready.call.name == CAPABILITY_SEARCH_TOOL_NAME {
+                    let raw = match (&self.driver.live_abilities, &self.execution.abilities) {
+                        (Some(runtime), Some(abilities)) => RawToolResult {
+                            call: ready.call.clone(),
+                            outcome: runtime.search_and_stage(
+                                abilities,
+                                &ready.call.id,
+                                ready.prepared.arguments(),
+                                &self.emitter,
+                                &Some(self.turn_id.clone()),
+                            )?,
+                        },
+                        _ => RawToolResult {
+                            call: ready.call,
+                            outcome: ToolOutcome::error(
+                                "registry.search is unavailable without live ability routing",
+                            ),
+                        },
+                    };
+                    outcomes.push((index, raw));
+                } else {
+                    invocations.push((index, ready));
+                }
+            }
+
+            // The scheduler serialized conflicting effects into separate
+            // batches, so what remains of this batch may run concurrently.
+            // Results still commit strictly in request order below, keeping
+            // canonical history and durable checkpoints deterministic.
+            let executor = &self.driver.executor;
+            let cancel = &self.cancel;
+            outcomes.extend(
+                futures_util::future::join_all(invocations.into_iter().map(
+                    |(index, ready)| async move {
+                        let raw = executor
+                            .invoke_one_raw(ready, request_id, cancel, deadline)
+                            .await;
+                        (index, raw)
+                    },
+                ))
+                .await,
+            );
+            outcomes.sort_unstable_by_key(|(index, _)| *index);
+
+            for (index, raw) in outcomes {
                 while *next_commit < index {
                     let Some(block) = prepared_batch.results[*next_commit].take() else {
                         return Err(RuntimeError::internal(
@@ -652,34 +705,6 @@ impl<'a> TurnMachine<'a> {
                     .await?;
                     *next_commit = (*next_commit).saturating_add(1);
                 }
-                let Some(ready) = prepared_batch.ready[index].take() else {
-                    continue;
-                };
-                let raw = if ready.call.name == CAPABILITY_SEARCH_TOOL_NAME {
-                    match (&self.driver.live_abilities, &self.execution.abilities) {
-                        (Some(runtime), Some(abilities)) => RawToolResult {
-                            call: ready.call.clone(),
-                            outcome: runtime.search_and_stage(
-                                abilities,
-                                &ready.call.id,
-                                ready.prepared.arguments(),
-                                &self.emitter,
-                                &Some(self.turn_id.clone()),
-                            )?,
-                        },
-                        _ => RawToolResult {
-                            call: ready.call,
-                            outcome: ToolOutcome::error(
-                                "registry.search is unavailable without live ability routing",
-                            ),
-                        },
-                    }
-                } else {
-                    self.driver
-                        .executor
-                        .invoke_one_raw(ready, request_id, &self.cancel, deadline)
-                        .await
-                };
                 self.process_and_commit_tool_outcome(
                     request_id,
                     &prepared_batch.calls,

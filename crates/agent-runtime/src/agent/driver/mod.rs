@@ -71,7 +71,7 @@ use crate::runtime::steer::{DrainOrClose, SteerEntry, SteerMailbox};
 use crate::tool::ToolExecutor;
 use crate::tool::executor::{
     PendingApprovalResolution, PendingToolApproval, PreparationAuthorizationContext,
-    PreparedAuthorization, PreparedToolBatch, RawToolResult,
+    PreparedAuthorization, PreparedToolBatch, RawToolResult, ReadyToolCall,
 };
 use crate::tool::registry::SealedToolRegistry;
 
