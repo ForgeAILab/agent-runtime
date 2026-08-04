@@ -446,6 +446,9 @@ impl Driver {
                 None => turn_deadline,
             };
             let ctx = ProviderCallContext {
+                // Stable for the life of the session, which is what a
+                // provider-side prefix cache has to be partitioned by.
+                session: emitter.session().clone(),
                 request_id: request_id.clone(),
                 attempt_id: attempt_id.clone(),
                 cancel: turn_cancel.child(),

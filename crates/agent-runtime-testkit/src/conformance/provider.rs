@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::Message;
-use agent_runtime_core::ids::{AttemptId, RequestId};
+use agent_runtime_core::ids::{AttemptId, RequestId, SessionId};
 use agent_runtime_core::provider::{
     FinishReason, ModelId, Provider, ProviderCallContext, ProviderRequest, ProviderStreamEvent,
 };
@@ -15,6 +15,7 @@ use agent_runtime_core::provider::{
 pub fn call_ctx() -> (ProviderCallContext, Cancellation) {
     let cancel = Cancellation::new();
     let ctx = ProviderCallContext {
+        session: SessionId::new("session-test"),
         request_id: RequestId::new("req-conformance"),
         attempt_id: AttemptId::new("att-conformance"),
         cancel: cancel.clone(),
@@ -91,6 +92,7 @@ pub async fn assert_normalized_reasoning_stream(provider: &dyn Provider, request
 pub async fn assert_cancellation_stops_stream(provider: &dyn Provider, model: &ModelId) {
     let cancel = Cancellation::new();
     let ctx = ProviderCallContext {
+        session: SessionId::new("session-test"),
         request_id: RequestId::new("req-cancel"),
         attempt_id: AttemptId::new("att-cancel"),
         cancel: cancel.clone(),

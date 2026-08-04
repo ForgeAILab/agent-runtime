@@ -36,9 +36,9 @@ use serde_json::{Map, Value, json};
 use agent_runtime_core::clock::{Deadline, SystemClock};
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::provider::{
-    Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
-    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent,
-    ReasoningConfig, ToolChoice,
+    Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
+    ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
+    ProviderStreamEvent, ReasoningConfig, ToolChoice,
 };
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
@@ -73,7 +73,12 @@ impl AnthropicConfig {
         Self {
             base_url: base_url.into(),
             model: ModelId::new(model),
-            capabilities: Capabilities::basic_streaming(),
+            capabilities: Capabilities {
+                // Anthropic caches only what the request explicitly marks, and
+                // allows four breakpoints per request.
+                prompt_cache: PromptCacheControl::Explicit { max_breakpoints: 4 },
+                ..Capabilities::basic_streaming()
+            },
             api_key: None,
             extra_headers: Vec::new(),
         }
@@ -125,22 +130,55 @@ impl<T: HttpTransport> AnthropicProvider<T> {
             "messages": messages,
         });
         let obj = payload.as_object_mut().expect("payload is an object");
-        if !system_parts.is_empty() {
-            obj.insert("system".into(), json!(system_parts.join("\n\n")));
-        }
+
+        // Anthropic caches everything up to and including a marked block, and
+        // serializes tools before system before messages. So a single
+        // breakpoint on the trailing system block covers the tool schemas too
+        // — the whole stable prefix for one of the four breakpoints a request
+        // may carry. Without a marker the provider caches nothing at all and
+        // every turn re-reads the entire prefix at full price.
+        let marks = self
+            .config
+            .capabilities
+            .prompt_cache
+            .caches_ephemeral_segment();
+        let breakpoint = json!({"type": "ephemeral"});
+
         if !request.tools.is_empty() {
+            let last = request.tools.len() - 1;
             let tools: Vec<Value> = request
                 .tools
                 .iter()
-                .map(|t| {
-                    json!({
+                .enumerate()
+                .map(|(index, t)| {
+                    let mut tool = json!({
                         "name": t.name,
                         "description": t.description,
                         "input_schema": t.input_schema,
-                    })
+                    });
+                    // Only when there is no system block to carry the marker
+                    // instead; two breakpoints for one contiguous prefix would
+                    // spend a scarce slot for nothing.
+                    if marks && system_parts.is_empty() && index == last {
+                        tool["cache_control"] = breakpoint.clone();
+                    }
+                    tool
                 })
                 .collect();
             obj.insert("tools".into(), Value::Array(tools));
+        }
+
+        if !system_parts.is_empty() {
+            if marks {
+                let mut block = json!({
+                    "type": "text",
+                    "text": system_parts.join("\n\n"),
+                });
+                block["cache_control"] = breakpoint;
+                obj.insert("system".into(), Value::Array(vec![block]));
+            } else {
+                obj.insert("system".into(), json!(system_parts.join("\n\n")));
+            }
         }
         if !request.tools.is_empty() || request.tool_choice != ToolChoice::Auto {
             let choice = match &request.tool_choice {
@@ -886,7 +924,7 @@ mod tests {
     use super::*;
     use agent_runtime_core::cancel::Cancellation;
     use agent_runtime_core::content::{ToolCall, ToolResultBlock};
-    use agent_runtime_core::ids::{AttemptId, RequestId, ToolCallId};
+    use agent_runtime_core::ids::{AttemptId, RequestId, SessionId, ToolCallId};
     use agent_runtime_core::provider::ToolSchema;
     use std::sync::Mutex;
 
@@ -933,6 +971,7 @@ mod tests {
 
     fn ctx() -> ProviderCallContext {
         ProviderCallContext {
+            session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
             cancel: Cancellation::new(),
@@ -1033,7 +1072,15 @@ mod tests {
         request.stop = vec!["END".into()];
         let payload = sent_payload(request).await;
 
-        assert_eq!(payload["system"], "be terse\n\ncite sources");
+        // The trailing system block carries the one cache breakpoint, which
+        // also covers the tool schemas serialized ahead of it.
+        assert_eq!(payload["system"][0]["type"], "text");
+        assert_eq!(payload["system"][0]["text"], "be terse\n\ncite sources");
+        assert_eq!(payload["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            payload["tools"][0].get("cache_control").is_none(),
+            "a system breakpoint already covers the tools; a second would waste a slot"
+        );
         assert_eq!(payload["max_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(payload["stream"], true);
         assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
@@ -1344,6 +1391,28 @@ mod tests {
                 reason: FinishReason::Stop
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn tools_carry_the_breakpoint_when_there_is_no_system_block() {
+        let mut request = ProviderRequest::new(ModelId::new("claude"), vec![Message::user("hi")]);
+        request.tools = vec![ToolSchema {
+            name: "read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let payload = sent_payload(request).await;
+        assert_eq!(payload["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert!(payload.get("system").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_request_with_nothing_stable_carries_no_breakpoint() {
+        let request = ProviderRequest::new(ModelId::new("claude"), vec![Message::user("hi")]);
+        let payload = sent_payload(request).await;
+        assert!(payload.get("tools").is_none());
+        assert!(payload.get("system").is_none());
+        assert!(!payload.to_string().contains("cache_control"));
     }
 
     #[tokio::test]

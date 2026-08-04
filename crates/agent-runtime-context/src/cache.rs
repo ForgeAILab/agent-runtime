@@ -35,6 +35,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use agent_runtime_core::provider::PromptCacheControl;
 use agent_runtime_registry::{Fingerprint, FingerprintHasher, RegistryRevision};
 
 use crate::fragment::{CacheClass, FragmentId};
@@ -104,6 +105,24 @@ impl ProviderCacheCapability {
             provider: provider.into(),
             supports_stable: true,
             supports_ephemeral: true,
+        }
+    }
+
+    /// The capability implied by an adapter's own declaration.
+    ///
+    /// This is the seam that was missing: the planner classified segments and
+    /// the adapters knew what they could cache, and nothing joined the two, so
+    /// every plan was checked against a capability nobody had declared.
+    pub fn from_control(
+        revision: RegistryRevision,
+        provider: impl Into<String>,
+        control: PromptCacheControl,
+    ) -> Self {
+        Self {
+            revision,
+            provider: provider.into(),
+            supports_stable: control.caches_stable_prefix(),
+            supports_ephemeral: control.caches_ephemeral_segment(),
         }
     }
 

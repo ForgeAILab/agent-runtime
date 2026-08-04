@@ -29,7 +29,8 @@ use agent_runtime_core::catalog::{
 };
 use agent_runtime_core::clock::Clock;
 use agent_runtime_core::provider::{
-    AuthKind, Capabilities, ModelId, ProviderError, ProviderErrorKind, ReasoningSupport,
+    AuthKind, Capabilities, ModelId, PromptCacheControl, ProviderError, ProviderErrorKind,
+    ReasoningSupport,
 };
 
 use super::{CachedCatalog, CatalogCache, CatalogResponse, CatalogTransport, StalePolicy};
@@ -259,6 +260,9 @@ fn parse_model(document: &Value, provider: &str, model: &str) -> Option<ModelRec
         structured_output: false,
         usage: true,
         cache: false,
+        // The catalog describes a model, not the adapter that will serve it,
+        // and only the adapter knows how it drives a prompt cache.
+        prompt_cache: PromptCacheControl::None,
         auth: AuthKind::ApiKey,
         continuation: false,
         max_output_tokens: (output > 0).then_some(output),

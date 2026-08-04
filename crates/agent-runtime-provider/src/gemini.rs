@@ -21,9 +21,9 @@ use agent_runtime_core::cancel::Cancellation;
 use agent_runtime_core::clock::{Clock, Deadline, SystemClock};
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::provider::{
-    Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
-    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent,
-    ReasoningSupport, ToolChoice,
+    Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
+    ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
+    ProviderStreamEvent, ReasoningSupport, ToolChoice,
 };
 use agent_runtime_core::provider_credential::{
     CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,
@@ -85,7 +85,12 @@ impl GeminiInteractionsConfig {
         Self {
             base_url: base_url.into(),
             model: ModelId::new(model),
-            capabilities: Capabilities::basic_streaming(),
+            capabilities: Capabilities {
+                // Gemini serves a matching prefix from its own implicit cache;
+                // the adapter places no markers of its own.
+                prompt_cache: PromptCacheControl::Implicit,
+                ..Capabilities::basic_streaming()
+            },
             api_key: None,
             supported_thinking_levels: Vec::new(),
         }
@@ -1509,7 +1514,7 @@ mod tests {
     use agent_runtime_core::cancel::{CancelReason, Cancellation};
     use agent_runtime_core::clock::Deadline;
     use agent_runtime_core::content::{ToolCall, ToolResultBlock};
-    use agent_runtime_core::ids::{AttemptId, RequestId, ToolCallId};
+    use agent_runtime_core::ids::{AttemptId, RequestId, SessionId, ToolCallId};
     use agent_runtime_core::provider::{
         AuthKind, ReasoningConfig, StructuredOutputConfig, ToolSchema,
     };
@@ -1648,6 +1653,9 @@ mod tests {
             structured_output: true,
             usage: true,
             cache: true,
+            // Gemini serves a matching prefix from its own implicit cache; the
+            // adapter places no markers.
+            prompt_cache: PromptCacheControl::Implicit,
             auth: AuthKind::ApiKey,
             continuation: false,
             max_output_tokens: Some(8_192),
@@ -1667,6 +1675,7 @@ mod tests {
 
     fn ctx() -> ProviderCallContext {
         ProviderCallContext {
+            session: SessionId::new("session-test"),
             request_id: RequestId::new("request-1"),
             attempt_id: AttemptId::new("attempt-1"),
             cancel: Cancellation::new(),

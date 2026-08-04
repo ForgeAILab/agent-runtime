@@ -189,12 +189,13 @@ mod tests {
     use super::*;
     use agent_runtime_core::cancel::Cancellation;
     use agent_runtime_core::clock::Deadline;
-    use agent_runtime_core::ids::{AttemptId, RequestId};
+    use agent_runtime_core::ids::{AttemptId, RequestId, SessionId};
     use agent_runtime_core::provider::ModelId;
     use futures_util::StreamExt;
 
     fn ctx() -> ProviderCallContext {
         ProviderCallContext {
+            session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
             cancel: Cancellation::new(),

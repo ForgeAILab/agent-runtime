@@ -22,10 +22,11 @@ use serde_json::{Value, json};
 use agent_runtime_core::cancel::Cancellation;
 use agent_runtime_core::clock::{Clock, Deadline, SystemClock};
 use agent_runtime_core::content::{ContentPart, Message, Role};
+use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::provider::{
-    Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
-    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent,
-    ReasoningConfig, ToolChoice,
+    Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
+    ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
+    ProviderStreamEvent, ReasoningConfig, ToolChoice,
 };
 use agent_runtime_core::provider_credential::{
     CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,
@@ -77,7 +78,12 @@ impl OpenAiConfig {
         Self {
             base_url: base_url.into(),
             model: ModelId::new(model),
-            capabilities: Capabilities::basic_streaming(),
+            capabilities: Capabilities {
+                // OpenAI matches a repeated prefix on its own; the adapter's
+                // only job is to keep it byte-identical and keyed.
+                prompt_cache: PromptCacheControl::Implicit,
+                ..Capabilities::basic_streaming()
+            },
             api_key: None,
             extra_headers: Vec::new(),
         }
@@ -172,7 +178,15 @@ impl<T: HttpTransport> OpenAiProvider<T> {
         &self.transport
     }
 
-    fn build_payload(&self, request: &ProviderRequest) -> Value {
+    /// Serializes the request, keying the provider's prefix cache to the
+    /// session when the adapter declares it drives one.
+    ///
+    /// The key matters more than it looks: OpenAI partitions its prefix cache
+    /// by this value, so leaving it unset scatters a single conversation's
+    /// turns across partitions and forfeits the reuse the stable prefix exists
+    /// to earn. Keying by request id would be just as bad — it changes every
+    /// turn.
+    fn build_payload(&self, request: &ProviderRequest, session: &SessionId) -> Value {
         let mut messages = Vec::new();
         for msg in &request.messages {
             messages.extend(to_openai_messages(msg));
@@ -184,6 +198,12 @@ impl<T: HttpTransport> OpenAiProvider<T> {
             "messages": messages,
         });
         let obj = payload.as_object_mut().expect("payload is an object");
+        if self.config.capabilities.prompt_cache.caches_stable_prefix() {
+            obj.insert(
+                "prompt_cache_key".into(),
+                Value::String(session.as_str().to_owned()),
+            );
+        }
         if !request.tools.is_empty() {
             let tools: Vec<Value> = request
                 .tools
@@ -707,7 +727,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
         let url = self.chat_completions_url()?;
-        let payload = self.build_payload(&request);
+        let payload = self.build_payload(&request, &ctx.session);
         let body = serde_json::to_vec(&payload)
             .map_err(|e| ProviderError::new(ProviderErrorKind::BadRequest, e.to_string()))?;
         let lease = self.acquire_credential(&ctx).await?;
@@ -1130,6 +1150,7 @@ mod tests {
 
     fn ctx() -> ProviderCallContext {
         ProviderCallContext {
+            session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
             cancel: Cancellation::new(),
@@ -1527,7 +1548,7 @@ mod tests {
         });
         req.vendor_extensions = json!({"service_tier": "priority"});
 
-        let payload = p.build_payload(&req);
+        let payload = p.build_payload(&req, &SessionId::new("session-test"));
         assert_eq!(payload["tool_choice"]["function"]["name"], "lookup");
         assert_eq!(
             payload["response_format"]["json_schema"]["name"],
@@ -1543,6 +1564,7 @@ mod tests {
         let p = OpenAiProvider::new(PendingTransport, OpenAiConfig::new("http://x/v1", "gpt-x"));
         let cancel = Cancellation::new();
         let call_ctx = ProviderCallContext {
+            session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
             cancel: cancel.clone(),
@@ -1570,6 +1592,7 @@ mod tests {
     async fn deadline_interrupts_an_idle_byte_stream() {
         let p = OpenAiProvider::new(PendingTransport, OpenAiConfig::new("http://x/v1", "gpt-x"));
         let call_ctx = ProviderCallContext {
+            session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
             cancel: Cancellation::new(),
@@ -1759,6 +1782,39 @@ mod tests {
         assert_eq!(wire.len(), 1);
         assert!(wire[0].get("reasoning_content").is_none());
         assert_eq!(wire[0]["content"], "plain answer");
+    }
+
+    #[test]
+    fn a_prompt_cache_key_is_stable_across_turns_and_distinct_across_sessions() {
+        // The cache key decides which partition a prefix lands in. Keying by
+        // request would put every turn of one conversation in a different
+        // partition and waste the stable prefix entirely.
+        let p = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let req = ProviderRequest::new(ModelId::new("gpt"), vec![Message::user("hi")]);
+
+        let first = p.build_payload(&req, &SessionId::new("session-a"));
+        let second = p.build_payload(&req, &SessionId::new("session-a"));
+        let other = p.build_payload(&req, &SessionId::new("session-b"));
+
+        assert_eq!(first["prompt_cache_key"], "session-a");
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_ne!(first["prompt_cache_key"], other["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn an_adapter_without_a_prompt_cache_sends_no_key() {
+        let mut cfg = OpenAiConfig::new("http://x/v1", "gpt-x");
+        cfg.capabilities.prompt_cache = PromptCacheControl::None;
+        let p = OpenAiProvider::new(ReplayTransport::new(vec![]), cfg);
+        let req = ProviderRequest::new(ModelId::new("gpt"), vec![Message::user("hi")]);
+        assert!(
+            p.build_payload(&req, &SessionId::new("s"))
+                .get("prompt_cache_key")
+                .is_none()
+        );
     }
 
     #[tokio::test]

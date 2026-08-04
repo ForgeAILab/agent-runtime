@@ -20,7 +20,7 @@ use crate::cancel::Cancellation;
 use crate::clock::{Deadline, Timestamp};
 use crate::content::Message;
 use crate::error::{ErrorKind, RuntimeError};
-use crate::ids::{AttemptId, RequestId};
+use crate::ids::{AttemptId, RequestId, SessionId};
 use crate::metadata::Metadata;
 use crate::provider_credential::ProviderCredentialRecovery;
 use crate::usage::UsageDelta;
@@ -73,6 +73,45 @@ pub enum AuthKind {
     Custom(String),
 }
 
+/// How an adapter drives a provider-side prompt cache.
+///
+/// Keeping a prefix byte-identical, which the context planner already
+/// guarantees, is necessary but not sufficient: something has to tell the
+/// provider to cache it. This is the declaration of who does that and how.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheControl {
+    /// The adapter cannot ask for anything to be cached.
+    #[default]
+    None,
+    /// The provider matches a repeated prefix by itself. The adapter's job is
+    /// to keep that prefix byte-identical and to key it to the session, not to
+    /// mark segments.
+    Implicit,
+    /// The adapter marks cache breakpoints in the request itself, up to
+    /// `max_breakpoints` of them.
+    Explicit {
+        /// How many breakpoints one request may carry.
+        max_breakpoints: u8,
+    },
+}
+
+impl PromptCacheControl {
+    /// Whether a repeated stable prefix can be reused at all.
+    pub fn caches_stable_prefix(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether a short-lived segment can be cached independently of the prefix.
+    ///
+    /// Only an adapter placing its own breakpoints can do this. An implicit
+    /// prefix cache reuses a *prefix*: a block that changes turn to turn ends
+    /// the match rather than being cached beside it.
+    pub fn caches_ephemeral_segment(self) -> bool {
+        matches!(self, Self::Explicit { .. })
+    }
+}
+
 /// The capabilities of a specific model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -87,7 +126,13 @@ pub struct Capabilities {
     /// Whether the provider reports token usage.
     pub usage: bool,
     /// Whether the provider reports cache observations.
+    ///
+    /// This is the *reporting* side. Whether the adapter can ask the provider
+    /// to cache anything in the first place is [`Capabilities::prompt_cache`].
     pub cache: bool,
+    /// How this adapter drives a provider-side prompt cache.
+    #[serde(default)]
+    pub prompt_cache: PromptCacheControl,
     /// The authentication scheme.
     pub auth: AuthKind,
     /// Whether the provider supports server-side continuation.
@@ -107,6 +152,7 @@ impl Capabilities {
             structured_output: false,
             usage: true,
             cache: false,
+            prompt_cache: PromptCacheControl::None,
             auth: AuthKind::ApiKey,
             continuation: false,
             max_output_tokens: None,
@@ -506,6 +552,13 @@ pub type ProviderStream = Pin<Box<dyn Stream<Item = ProviderStreamEvent> + Send>
 /// The per-attempt context handed to a [`Provider`].
 #[derive(Debug, Clone)]
 pub struct ProviderCallContext {
+    /// The owning session.
+    ///
+    /// A provider-side prompt cache has to be keyed by something that outlives
+    /// a turn. `request_id` changes on every one, so keying by it would put
+    /// each turn in a separate cache partition and waste the stable prefix the
+    /// planner works to preserve.
+    pub session: SessionId,
     /// The logical request id.
     pub request_id: RequestId,
     /// This attempt's id.
