@@ -32,6 +32,7 @@ fn kind(event: &ProviderStreamEvent) -> &'static str {
         ProviderStreamEvent::Error { .. } => "error",
         ProviderStreamEvent::Usage { .. } => "usage",
         ProviderStreamEvent::CacheObservation { .. } => "cache",
+        ProviderStreamEvent::RateLimit { .. } => "rate_limit",
         ProviderStreamEvent::Downgrade { .. } => "downgrade",
         ProviderStreamEvent::VendorMetadata { .. } => "vendor",
     }

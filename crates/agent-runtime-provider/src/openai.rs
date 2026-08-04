@@ -36,6 +36,7 @@ use agent_runtime_core::provider_credential::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
 
 /// Default validity requested from renewable credentials before provider I/O.
@@ -745,9 +746,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
         let clock = self.clock.clone();
-        let post = self.transport.post_stream(http);
+        let post = self.transport.post_response(http);
         tokio::pin!(post);
-        let mut bytes = tokio::select! {
+        let response = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
                 return Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"));
@@ -759,7 +760,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 ));
             }
             result = &mut post => match result {
-                Ok(bytes) => bytes,
+                Ok(response) => response,
                 Err(error) => {
                     return Err(classify_auth_rejection(
                         error,
@@ -773,6 +774,11 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 }
             },
         };
+        // Read before the body moves: these headers describe the credential
+        // that served this attempt, and nothing downstream can recover them
+        // once the stream is running.
+        let rate_limits = ratelimit::snapshot_from_headers(&response.headers);
+        let mut bytes = response.body;
         let cancel = ctx.cancel.clone();
         let deadline = ctx.deadline;
         let credential_source = self.credential_source.clone();
@@ -781,6 +787,11 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         let clock = self.clock.clone();
 
         let out = stream! {
+            // Emitted first so a consumer sees the limit state that governed
+            // this attempt before any of its output.
+            if !rate_limits.is_empty() {
+                yield ProviderStreamEvent::RateLimit { snapshot: rate_limits };
+            }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
             let mut saw_chunk = false;
@@ -1468,6 +1479,120 @@ mod tests {
         )));
         assert!(events.iter().any(|e| matches!(
             e,
+            ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop
+            }
+        )));
+    }
+
+    /// A replay transport that also reports response headers.
+    #[derive(Debug)]
+    struct HeaderTransport {
+        body: &'static str,
+        headers: Vec<(String, String)>,
+    }
+
+    impl HeaderTransport {
+        fn new(body: &'static str, headers: &[(&str, &str)]) -> Self {
+            Self {
+                body,
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for HeaderTransport {
+        async fn post_stream(
+            &self,
+            _request: HttpRequest,
+        ) -> Result<super::super::transport::ByteStream, ProviderError> {
+            let body = self.body;
+            Ok(Box::pin(stream! { yield Ok(body.as_bytes().to_vec()); }))
+        }
+
+        async fn post_response(
+            &self,
+            request: HttpRequest,
+        ) -> Result<super::super::transport::HttpResponse, ProviderError> {
+            Ok(super::super::transport::HttpResponse {
+                status: 200,
+                headers: self.headers.clone(),
+                body: self.post_stream(request).await?,
+            })
+        }
+    }
+
+    const MINIMAL_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[tokio::test]
+    async fn reported_rate_limit_headers_reach_the_stream_before_any_output() {
+        let p = OpenAiProvider::new(
+            HeaderTransport::new(
+                MINIMAL_SSE,
+                &[
+                    ("x-ratelimit-limit-tokens", "1000"),
+                    ("x-ratelimit-remaining-tokens", "180"),
+                    ("x-ratelimit-reset-tokens", "6m0s"),
+                ],
+            ),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let req = ProviderRequest::new(ModelId::new("gpt-x"), vec![Message::user("hi")]);
+        let events = collect(p.stream(req, ctx()).await.unwrap()).await;
+
+        let ProviderStreamEvent::RateLimit { snapshot } = &events[0] else {
+            panic!("the snapshot must arrive before any output, got {:?}", events[0]);
+        };
+        let window = snapshot.most_consumed().expect("a reported window");
+        assert_eq!(window.used_percent_or_derived(), Some(82.0));
+        assert_eq!(window.resets_in_ms, Some(360_000));
+        // Nothing about the credential travels with the observation.
+        assert!(!format!("{snapshot:?}").contains("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn a_response_without_limit_headers_emits_no_snapshot() {
+        let p = OpenAiProvider::new(
+            HeaderTransport::new(MINIMAL_SSE, &[("content-type", "text/event-stream")]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let req = ProviderRequest::new(ModelId::new("gpt-x"), vec![Message::user("hi")]);
+        let events = collect(p.stream(req, ctx()).await.unwrap()).await;
+
+        // Absence stays absence: no zeroed meter is invented for the consumer.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::RateLimit { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_that_reports_no_headers_still_streams() {
+        // The default `post_response` path: `ReplayTransport` implements only
+        // the byte-stream method.
+        let p = OpenAiProvider::new(
+            ReplayTransport::new(vec![MINIMAL_SSE]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let req = ProviderRequest::new(ModelId::new("gpt-x"), vec![Message::user("hi")]);
+        let events = collect(p.stream(req, ctx()).await.unwrap()).await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::RateLimit { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
             ProviderStreamEvent::Finish {
                 reason: FinishReason::Stop
             }

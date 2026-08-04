@@ -44,12 +44,72 @@ impl fmt::Debug for HttpRequest {
 /// A stream of response body byte chunks.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>;
 
+/// A streaming response: what the server said about itself, plus its body.
+///
+/// Response headers exist only inside a transport implementation, so an
+/// adapter that wants to observe what the provider reported about limit state
+/// needs them carried back out. Header *values* are as sensitive as request
+/// ones (a provider may echo a token), so this type redacts them from `Debug`
+/// exactly as [`HttpRequest`] does.
+pub struct HttpResponse {
+    /// The response status code.
+    pub status: u16,
+    /// The response headers, with lowercase names.
+    pub headers: Vec<(String, String)>,
+    /// The response body.
+    pub body: ByteStream,
+}
+
+impl fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "[redacted]"))
+            .collect();
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("headers", &headers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpResponse {
+    /// A response carrying a body and nothing observed about its headers.
+    pub fn body_only(body: ByteStream) -> Self {
+        Self {
+            status: 200,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    /// The first value of `name`, matched case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 /// A transport that performs a streaming POST and yields response bytes.
 #[async_trait]
 pub trait HttpTransport: Send + Sync + fmt::Debug {
     /// Sends `request` and returns a stream of response body chunks. The
     /// returned stream must observe cancellation by being dropped.
     async fn post_stream(&self, request: HttpRequest) -> Result<ByteStream, ProviderError>;
+
+    /// Sends `request` and returns the response headers alongside the body.
+    ///
+    /// Defaults to [`HttpTransport::post_stream`] with nothing observed, so a
+    /// transport that cannot surface headers — a replay fixture, say — keeps
+    /// working and its attempts simply produce no limit observation. That is
+    /// the honest degradation: a transport reporting no headers has not
+    /// reported that a budget is untouched.
+    async fn post_response(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
+        Ok(HttpResponse::body_only(self.post_stream(request).await?))
+    }
 }
 
 #[cfg(test)]

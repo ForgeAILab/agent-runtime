@@ -78,7 +78,15 @@ impl RetryPolicy {
 }
 
 /// Whether a provider error is worth retrying.
+///
+/// [`ProviderErrorKind::LimitExhausted`] is excluded unconditionally, ahead of
+/// the `retryable` flag: a spent usage window does not reopen because a
+/// backoff elapsed, so every attempt spent on it is wasted. Recovering means
+/// changing the credential, which is a policy decision for the host.
 pub fn is_retryable(err: &ProviderError) -> bool {
+    if err.kind == ProviderErrorKind::LimitExhausted {
+        return false;
+    }
     if err.retryable {
         return true;
     }
@@ -101,6 +109,16 @@ mod tests {
         assert!(is_retryable(&e));
         let bad = ProviderError::new(ProviderErrorKind::BadRequest, "nope");
         assert!(!is_retryable(&bad));
+    }
+
+    #[test]
+    fn a_spent_window_is_never_retried_even_if_flagged() {
+        let spent = ProviderError::new(ProviderErrorKind::LimitExhausted, "spent");
+        assert!(!is_retryable(&spent));
+        // The flag does not override the kind: waiting cannot reopen a window.
+        let flagged =
+            ProviderError::new(ProviderErrorKind::LimitExhausted, "spent").retry_after(5_000);
+        assert!(!is_retryable(&flagged));
     }
 
     #[test]

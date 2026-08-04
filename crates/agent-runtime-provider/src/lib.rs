@@ -20,6 +20,8 @@
 //!   Interactions API with exact signed-thought replay.
 //! - [`responses::ResponsesProvider`] — a native stateless OpenAI Responses
 //!   protocol adapter, first fixture-verified against xAI's Grok deployment.
+//! - [`ratelimit`] — normalization of the provider rate-limit header families
+//!   into one snapshot, and the transient-throttle/spent-window split.
 //! - [`retry`] — retryability classification and backoff used by the agent loop
 //!   to record every provider attempt.
 //! - [`catalog`] — optional remote model-catalog sources. Resolution reads a
@@ -31,6 +33,7 @@ pub mod catalog;
 pub mod fake;
 pub mod gemini;
 pub mod openai;
+pub mod ratelimit;
 pub mod responses;
 pub mod retry;
 pub mod sse;

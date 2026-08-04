@@ -44,6 +44,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::Downgrade { .. } => "downgrade",
         RuntimeEvent::Usage { .. } => "usage",
         RuntimeEvent::CacheObservation { .. } => "cache_observation",
+        RuntimeEvent::RateLimitObservation { .. } => "rate_limit_observation",
         RuntimeEvent::ProviderAttemptFinished { .. } => "provider_attempt_finished",
         RuntimeEvent::LimitReached { .. } => "limit_reached",
         RuntimeEvent::Error { .. } => "error",
@@ -269,6 +270,18 @@ fn summary(payload: &RuntimeEvent) -> String {
             read_tokens,
             write_tokens,
         } => format!("cache_observation read={read_tokens} write={write_tokens}"),
+        RuntimeEvent::RateLimitObservation { attempt, snapshot } => {
+            // Rendered from the most-consumed window: an observer line reports
+            // the number that matters, and "unknown" when none was reported.
+            let used = snapshot
+                .most_consumed()
+                .and_then(|window| window.used_percent_or_derived())
+                .map_or_else(|| "unknown".to_owned(), |percent| format!("{percent:.1}%"));
+            format!(
+                "rate_limit_observation attempt={attempt} windows={} used={used}",
+                snapshot.windows.len()
+            )
+        }
         RuntimeEvent::ProviderAttemptFinished {
             finish, retryable, ..
         } => format!("provider_attempt_finished finish={finish:?} retryable={retryable}"),

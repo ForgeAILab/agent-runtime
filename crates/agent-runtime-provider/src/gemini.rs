@@ -33,6 +33,7 @@ use agent_runtime_core::provider_credential::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
 
 /// The reviewed REST path appended to the configured API-version base URL.
@@ -743,6 +744,7 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::Server => "Gemini provider service failure",
         ProviderErrorKind::Cancelled => "Gemini provider request cancelled",
         ProviderErrorKind::Unsupported => "Gemini provider feature is unsupported",
+        ProviderErrorKind::LimitExhausted => "Gemini provider usage limit exhausted",
     };
     let mut sanitized = ProviderError::new(error.kind, message);
     sanitized.retryable = error.retryable;
@@ -1315,9 +1317,9 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.revision().clone();
         let clock = self.clock.clone();
-        let post = self.transport.post_stream(http);
+        let post = self.transport.post_response(http);
         tokio::pin!(post);
-        let mut bytes = tokio::select! {
+        let response = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
                 return Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"));
@@ -1329,7 +1331,7 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
                 ));
             }
             result = &mut post => match result {
-                Ok(bytes) => bytes,
+                Ok(response) => response,
                 Err(error) if error.kind == ProviderErrorKind::Auth => {
                     return Err(classify_auth_rejection(
                         credential_source,
@@ -1344,6 +1346,11 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
             },
         };
 
+        // Read before the body moves: these headers describe the credential
+        // that served this attempt, and nothing downstream can recover them
+        // once the stream is running.
+        let rate_limits = ratelimit::snapshot_from_headers(&response.headers);
+        let mut bytes = response.body;
         let cancel = ctx.cancel.clone();
         let deadline = ctx.deadline;
         let clock = self.clock.clone();
@@ -1351,6 +1358,11 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.revision().clone();
         let out = stream! {
+            // Emitted first so a consumer sees the limit state that governed
+            // this attempt before any of its output.
+            if !rate_limits.is_empty() {
+                yield ProviderStreamEvent::RateLimit { snapshot: rate_limits };
+            }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
             let mut state = StreamState::default();

@@ -44,7 +44,7 @@ fn default_true() -> bool {
 fn is_true(value: &bool) -> bool {
     *value
 }
-use crate::provider::{FinishReason, ModelId};
+use crate::provider::{FinishReason, ModelId, RateLimitSnapshot};
 use crate::steer::SteerDiscardReason;
 use crate::usage::UsageRecord;
 
@@ -543,6 +543,15 @@ pub enum RuntimeEvent {
         read_tokens: u64,
         /// Tokens written to cache.
         write_tokens: u64,
+    },
+    /// A server-reported limit-state observation for the credential that
+    /// served an attempt. Absent windows mean the provider reported nothing,
+    /// never that a budget is untouched.
+    RateLimitObservation {
+        /// The attempt whose response carried the report.
+        attempt: AttemptId,
+        /// The normalized snapshot.
+        snapshot: RateLimitSnapshot,
     },
     /// A provider attempt finished.
     ProviderAttemptFinished {

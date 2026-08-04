@@ -43,6 +43,7 @@ use agent_runtime_core::provider::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
 
 /// The Messages API version header sent with every request.
@@ -751,9 +752,9 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
             headers,
             body,
         };
-        let post = self.transport.post_stream(http);
+        let post = self.transport.post_response(http);
         tokio::pin!(post);
-        let mut bytes = tokio::select! {
+        let response = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => {
                 return Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"));
@@ -766,10 +767,20 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
             }
             result = &mut post => result?,
         };
+        // Read before the body moves: these headers describe the credential
+        // that served this attempt, and nothing downstream can recover them
+        // once the stream is running.
+        let rate_limits = ratelimit::snapshot_from_headers(&response.headers);
+        let mut bytes = response.body;
         let cancel = ctx.cancel.clone();
         let deadline = ctx.deadline;
 
         let out = stream! {
+            // Emitted first so a consumer sees the limit state that governed
+            // this attempt before any of its output.
+            if !rate_limits.is_empty() {
+                yield ProviderStreamEvent::RateLimit { snapshot: rate_limits };
+            }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
             let mut state = StreamState::default();

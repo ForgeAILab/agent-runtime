@@ -546,6 +546,18 @@ impl Driver {
                                     RuntimeEvent::Downgrade { capability, detail },
                                 );
                             }
+                            ProviderStreamEvent::RateLimit { snapshot } => {
+                                // Server-reported limit metadata, not model
+                                // output: surfaced to observers without
+                                // counting as semantic progress.
+                                emitter.emit(
+                                    turn.clone(),
+                                    RuntimeEvent::RateLimitObservation {
+                                        attempt: attempt_id.clone(),
+                                        snapshot,
+                                    },
+                                );
+                            }
                             ProviderStreamEvent::VendorMetadata { .. } => {}
                             ProviderStreamEvent::Finish { reason } => {
                                 accepted_semantic_event = true;

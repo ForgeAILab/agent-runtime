@@ -384,6 +384,14 @@ pub enum ProviderErrorKind {
     Cancelled,
     /// A requested capability is unsupported.
     Unsupported,
+    /// The credential's usage window is spent until it resets.
+    ///
+    /// Distinct from [`ProviderErrorKind::RateLimited`], which is a momentary
+    /// throttle another attempt may clear. This one will not clear by waiting
+    /// out a backoff, so it is not retryable by kind: recovering from it means
+    /// changing something (a credential, a plan, the clock), which is a policy
+    /// decision belonging to the host.
+    LimitExhausted,
 }
 
 /// A structured provider error, carried both out-of-band and as a stream event.
@@ -398,6 +406,12 @@ pub struct ProviderError {
     /// A provider-suggested minimum delay before retrying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// When the exhausted usage window resets, in Unix milliseconds, as the
+    /// server reported it. Only meaningful with
+    /// [`ProviderErrorKind::LimitExhausted`], and absent when the provider
+    /// said nothing — a host must not read absence as "resets now".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_resets_at_ms: Option<u64>,
     /// A fixed, redaction-safe credential recovery classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_recovery: Option<ProviderCredentialRecovery>,
@@ -414,6 +428,7 @@ impl ProviderError {
             message: message.into(),
             retryable: false,
             retry_after_ms: None,
+            limit_resets_at_ms: None,
             credential_recovery: None,
             metadata: Metadata::new(),
         }
@@ -427,6 +442,14 @@ impl ProviderError {
     pub fn retry_after(mut self, ms: u64) -> Self {
         self.retry_after_ms = Some(ms);
         self.retryable = true;
+        self
+    }
+    /// Records when the exhausted usage window resets, in Unix milliseconds.
+    ///
+    /// Deliberately does not imply retryable: the window reopening is not the
+    /// same claim as "another attempt now might work".
+    pub fn limit_resets_at(mut self, unix_ms: u64) -> Self {
+        self.limit_resets_at_ms = Some(unix_ms);
         self
     }
     /// Marks a classified provider authentication failure as eligible for the
@@ -459,6 +482,7 @@ impl From<ProviderError> for RuntimeError {
             ProviderErrorKind::Cancelled => ErrorKind::Cancelled,
             ProviderErrorKind::Timeout => ErrorKind::Timeout,
             ProviderErrorKind::Unsupported | ProviderErrorKind::BadRequest => ErrorKind::Config,
+            ProviderErrorKind::LimitExhausted => ErrorKind::Limit,
             _ => ErrorKind::Provider,
         };
         RuntimeError {
@@ -467,6 +491,156 @@ impl From<ProviderError> for RuntimeError {
             retryable: err.retryable,
             metadata: err.metadata,
         }
+    }
+}
+
+/// One server-reported rate-limit window.
+///
+/// Every field is optional and every one of them means "the provider reported
+/// this". A window that arrives with only a reset time is a faithful record of
+/// a provider that reported only a reset time; filling the rest with zeroes
+/// would turn silence into a claim about a budget nobody measured.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitWindow {
+    /// The provider's own identifier for the window (e.g. `"primary"`,
+    /// `"requests"`, `"tokens"`), when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// How much of the window is consumed, 0.0–100.0, when the provider
+    /// reported a percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    /// The window's total duration in seconds, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u64>,
+    /// The quota ceiling, when reported as a count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// What remains of the ceiling, when reported as a count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u64>,
+    /// When the window resets, in Unix milliseconds, when the provider gave an
+    /// absolute time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    /// How long until the window resets, in milliseconds, when the provider
+    /// gave a relative delay instead.
+    ///
+    /// Adapters have no clock, so a relative reset is carried as-is rather
+    /// than converted against a fabricated "now".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_in_ms: Option<u64>,
+}
+
+impl RateLimitWindow {
+    /// A window identified by `id` and otherwise unreported.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: Some(id.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the provider reported nothing beyond the window's name.
+    pub fn is_empty(&self) -> bool {
+        self.used_percent.is_none()
+            && self.window_seconds.is_none()
+            && self.limit.is_none()
+            && self.remaining.is_none()
+            && self.resets_at_ms.is_none()
+            && self.resets_in_ms.is_none()
+    }
+
+    /// The absolute reset time, resolving a relative one against `now_ms`.
+    ///
+    /// Prefers what the provider stated absolutely. Returns `None` when it
+    /// stated neither, which a caller must not read as "already reset".
+    pub fn resets_at_ms_from(&self, now_ms: u64) -> Option<u64> {
+        self.resets_at_ms
+            .or_else(|| self.resets_in_ms.map(|delay| now_ms.saturating_add(delay)))
+    }
+
+    /// The consumed percentage, deriving it from a limit/remaining pair when
+    /// the provider did not state one.
+    ///
+    /// Kept separate from [`RateLimitWindow::used_percent`] so that a derived
+    /// number is never mistaken for a reported one at rest.
+    pub fn used_percent_or_derived(&self) -> Option<f64> {
+        if let Some(percent) = self.used_percent {
+            return Some(percent);
+        }
+        let (limit, remaining) = (self.limit?, self.remaining?);
+        if limit == 0 {
+            return None;
+        }
+        let used = limit.saturating_sub(remaining) as f64;
+        Some((used / limit as f64) * 100.0)
+    }
+
+    /// Whether the window is spent, by the percentage the provider reported.
+    pub fn is_exhausted(&self) -> bool {
+        self.used_percent_or_derived()
+            .is_some_and(|percent| percent >= 100.0)
+    }
+}
+
+/// A normalized, redaction-safe view of what a provider reported about the
+/// active credential's limit state.
+///
+/// Carries no credential material by construction: it is built only from the
+/// rate-limit header families, never from an authorization header or body.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RateLimitSnapshot {
+    /// The reported windows, in the order the parser found them.
+    pub windows: Vec<RateLimitWindow>,
+}
+
+impl RateLimitSnapshot {
+    /// An empty snapshot, meaning the provider reported nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a window, ignoring one that carries no reported facts.
+    pub fn push(&mut self, window: RateLimitWindow) {
+        if !window.is_empty() {
+            self.windows.push(window);
+        }
+    }
+
+    /// Whether the provider reported nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    /// The window with the highest reported consumption, which is the one a
+    /// meter should show when only one can be shown.
+    pub fn most_consumed(&self) -> Option<&RateLimitWindow> {
+        self.windows
+            .iter()
+            .filter(|window| window.used_percent_or_derived().is_some())
+            .max_by(|a, b| {
+                let (a, b) = (
+                    a.used_percent_or_derived().unwrap_or(0.0),
+                    b.used_percent_or_derived().unwrap_or(0.0),
+                );
+                a.total_cmp(&b)
+            })
+    }
+
+    /// Whether any reported window is spent.
+    pub fn is_exhausted(&self) -> bool {
+        self.windows.iter().any(RateLimitWindow::is_exhausted)
+    }
+
+    /// The soonest reset across the reported windows, resolved against
+    /// `now_ms` for windows that reported a relative delay.
+    pub fn soonest_reset_ms(&self, now_ms: u64) -> Option<u64> {
+        self.windows
+            .iter()
+            .filter_map(|window| window.resets_at_ms_from(now_ms))
+            .min()
     }
 }
 
@@ -531,6 +705,12 @@ pub enum ProviderStreamEvent {
         read_tokens: u64,
         /// Tokens written to cache.
         write_tokens: u64,
+    },
+    /// A server-reported limit-state observation for the credential that
+    /// served this attempt. Emitted only when the provider reported one.
+    RateLimit {
+        /// The normalized snapshot.
+        snapshot: RateLimitSnapshot,
     },
     /// An explicit, configured capability downgrade was applied.
     Downgrade {
