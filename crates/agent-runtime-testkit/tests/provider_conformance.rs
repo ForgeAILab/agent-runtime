@@ -7,6 +7,11 @@ use agent_runtime::provider::ProviderCredentialTarget;
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, usage_event};
 use agent_runtime::provider::gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider};
 use agent_runtime::provider::openai::{OpenAiConfig, OpenAiProvider};
+use agent_runtime::provider::responses::{ResponsesConfig, ResponsesProvider};
+use agent_runtime_core::catalog::{
+    CatalogSource, LayeredModelCatalog, ModelCatalog, ModelLimits, ModelRecord, ProfileField,
+    StaticSource,
+};
 use agent_runtime_core::clock::Timestamp;
 use agent_runtime_core::content::Message;
 use agent_runtime_core::provider::{
@@ -79,6 +84,48 @@ fn gemini_two_chunk_text() -> GeminiInteractionsProvider<ReplayTransport> {
     .expect("Gemini fixture config")
 }
 
+fn responses_config() -> ResponsesConfig {
+    let mut config = ResponsesConfig::new("https://api.x.ai/v1", "grok-4.5");
+    config.api_key = Some(Secret::new("fixture-key"));
+    config
+}
+
+fn responses_two_chunk_text() -> ResponsesProvider<ReplayTransport> {
+    ResponsesProvider::new(
+        ReplayTransport::single(include_str!("fixtures/responses-text.sse")),
+        responses_config(),
+    )
+    .expect("Responses fixture config")
+}
+
+#[test]
+fn responses_model_policy_is_resolved_from_the_host_catalog() {
+    let config = responses_config();
+    assert_eq!(config.capabilities.max_output_tokens, None);
+
+    let catalog = LayeredModelCatalog::new().with_source(Arc::new(
+        StaticSource::new("xai-host", CatalogSource::ProviderLocal)
+            .for_provider("responses")
+            .with_model(
+                "grok-4.5",
+                ModelRecord::new()
+                    .with_limits(ModelLimits::new(500_000, 499_000, 32_000))
+                    .with_capabilities(config.capabilities.clone()),
+            ),
+    ));
+    let profile = catalog
+        .resolve("responses", &ModelId::new("grok-4.5"))
+        .expect("host catalog metadata resolves");
+    assert_eq!(profile.limits.max_output_tokens, 32_000);
+    assert_eq!(
+        profile
+            .provenance_of(ProfileField::MaxOutputTokens)
+            .expect("limit provenance")
+            .source,
+        CatalogSource::ProviderLocal
+    );
+}
+
 #[tokio::test]
 async fn fake_adapter_meets_normalized_contract() {
     let provider = fake_two_chunk_text();
@@ -95,6 +142,12 @@ async fn openai_adapter_meets_normalized_contract() {
 async fn gemini_adapter_meets_normalized_contract() {
     let provider = gemini_two_chunk_text();
     pc::assert_normalized_text_stream(&provider, &ModelId::new("gemini-x")).await;
+}
+
+#[tokio::test]
+async fn responses_adapter_meets_normalized_contract() {
+    let provider = responses_two_chunk_text();
+    pc::assert_normalized_text_stream(&provider, &ModelId::new("grok-4.5")).await;
 }
 
 #[tokio::test]
@@ -278,6 +331,135 @@ async fn gemini_adapter_normalizes_signed_reasoning() {
         ProviderRequest::new(ModelId::new("gemini-x"), vec![Message::user("think")]),
     )
     .await;
+}
+
+#[tokio::test]
+async fn responses_adapter_normalizes_encrypted_reasoning() {
+    let provider = ResponsesProvider::new(
+        ReplayTransport::single(include_str!("fixtures/responses-reasoning.sse")),
+        responses_config(),
+    )
+    .expect("Responses fixture config");
+    pc::assert_normalized_reasoning_stream(
+        &provider,
+        ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("think")]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn responses_adapter_preserves_unsigned_signed_and_encrypted_only_reasoning() {
+    let provider = ResponsesProvider::new(
+        ReplayTransport::single(include_str!("fixtures/responses-reasoning-signatures.sse")),
+        responses_config(),
+    )
+    .expect("Responses fixture config");
+    let events = pc::collect(
+        &provider,
+        ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("think")]),
+    )
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderStreamEvent::ReasoningDelta {
+            text,
+            redacted: false,
+            signature: None,
+        } if text == "plain"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderStreamEvent::ReasoningDelta {
+            text,
+            redacted: false,
+            signature: Some(signature),
+        } if text.is_empty() && signature == "sig-signed"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderStreamEvent::ReasoningDelta {
+            text,
+            redacted: true,
+            signature: Some(signature),
+        } if text.is_empty() && signature == "sig-redacted"
+    )));
+}
+
+#[tokio::test]
+async fn responses_adapter_normalizes_parallel_function_calls() {
+    let provider = ResponsesProvider::new(
+        ReplayTransport::single(include_str!("fixtures/responses-tools.sse")),
+        responses_config(),
+    )
+    .expect("Responses fixture config");
+    let mut request = ProviderRequest::new(
+        ModelId::new("grok-4.5"),
+        vec![Message::user("use both tools")],
+    );
+    request.tools = vec![
+        agent_runtime_core::provider::ToolSchema {
+            name: "read".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        },
+        agent_runtime_core::provider::ToolSchema {
+            name: "write".into(),
+            description: "write".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        },
+    ];
+    let events = pc::collect(&provider, request).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderStreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some(id),
+            name: Some(name),
+            ..
+        } if id == "call_1" && name == "read"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderStreamEvent::ToolCallDelta {
+            index: 1,
+            id: Some(id),
+            name: Some(name),
+            ..
+        } if id == "call_2" && name == "write"
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(ProviderStreamEvent::Finish {
+            reason: FinishReason::ToolCalls
+        })
+    ));
+}
+
+#[tokio::test]
+async fn responses_adapter_redacts_auth_failure_details() {
+    let provider = ResponsesProvider::new(
+        ReplayTransport::single(include_str!("fixtures/responses-auth.sse")),
+        responses_config(),
+    )
+    .expect("Responses fixture config");
+    let events = pc::collect(
+        &provider,
+        ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("hi")]),
+    )
+    .await;
+
+    match events.last() {
+        Some(ProviderStreamEvent::Error { error }) => {
+            assert_eq!(
+                error.kind,
+                agent_runtime_core::provider::ProviderErrorKind::Auth
+            );
+            assert!(!error.message.contains("api-key-canary"));
+        }
+        other => panic!("expected redacted auth error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

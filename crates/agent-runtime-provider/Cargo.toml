@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Provider adapters (fake, OpenAI-compatible, native Gemini Interactions) and retry helpers"
+description = "Provider adapters (fake, OpenAI-compatible, native Responses, native Gemini Interactions) and retry helpers"
 keywords.workspace = true
 categories.workspace = true
 

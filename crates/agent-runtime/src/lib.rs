@@ -169,6 +169,7 @@ pub mod prelude {
     pub use crate::provider::fake::FakeProvider;
     pub use crate::provider::gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider};
     pub use crate::provider::openai::{OpenAiConfig, OpenAiProvider};
+    pub use crate::provider::responses::{ResponsesConfig, ResponsesProvider};
     pub use crate::provider::retry::RetryPolicy;
     pub use crate::provider::transport::{ByteStream, HttpRequest, HttpTransport};
     pub use crate::runtime::{

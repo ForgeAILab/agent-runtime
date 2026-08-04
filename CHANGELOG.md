@@ -89,6 +89,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- Native stateless OpenAI Responses provider, first fixture-verified against
+  xAI Grok: bounded input-item encoding, session-keyed implicit prompt caching,
+  encrypted reasoning replay, function-call streaming, structured output,
+  usage/cache normalization, terminal fencing, and renewable bearer
+  credentials. Provider-side storage, background responses, and hosted tools
+  remain rejected before I/O.
 - Native Google Gemini Interactions adapter over injected `HttpTransport`, with
   stateless `store=false` history replay, renewable `x-goog-api-key`
   credentials, bounded native request/stream types, function and multimodal

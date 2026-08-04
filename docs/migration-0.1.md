@@ -390,6 +390,28 @@ and response bodies do not become events, metadata, errors, manifests, or
 diagnostics. Google model catalogs, defaults, setup UX, credential persistence,
 Vertex AI, and live-provider validation remain consumer responsibilities.
 
+## 16. Native Responses uses local stateless history
+
+Hosts serving xAI Grok or another compatible Responses deployment can opt into
+`ResponsesProvider` from `agent_runtime::provider::responses`. Configure an
+absolute base URL, a host-resolved `Capabilities` value, and either
+`ResponsesConfig::api_key` or a renewable `ProviderCredentialSource`.
+
+The adapter always sends `stream=true`, `store=false`,
+`include=["reasoning.encrypted_content"]`, and the session-derived
+`prompt_cache_key`. It reconstructs Responses input items from canonical local
+history, including images, function calls/results, structured output, and
+named `low`/`medium`/`high` reasoning effort. Signed and signature-only
+reasoning survives continuation in source order. Provider storage,
+`previous_response_id`, background execution, hosted tools, and arbitrary
+vendor overrides fail before credential or transport I/O.
+
+The adapter normalizes text/reasoning deltas, fragmented function arguments,
+cached/reasoning usage, and `completed`/`incomplete`/`failed` terminals into
+the existing provider event vocabulary. Grok model limits and product
+defaults remain host/catalog policy; no live provider call is required by the
+shared conformance fixtures.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.

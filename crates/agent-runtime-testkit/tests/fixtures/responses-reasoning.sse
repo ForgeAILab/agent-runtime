@@ -1,0 +1,12 @@
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_fixture","summary":[]}}
+
+data: {"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"checking"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_fixture","summary":[{"type":"summary_text","text":"checking"}],"encrypted_content":"encrypted-fixture"}}
+
+data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"done"}
+
+data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":6,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":1}}}}
+
+data: [DONE]
+

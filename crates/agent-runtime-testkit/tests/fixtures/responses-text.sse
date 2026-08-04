@@ -1,0 +1,10 @@
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"Hel"}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"lo"}
+
+data: {"type":"response.output_text.done","output_index":0,"content_index":0,"text":"Hello"}
+
+data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0}}}}
+
+data: [DONE]
+

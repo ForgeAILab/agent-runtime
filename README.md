@@ -21,7 +21,7 @@ types.
 | `agent-runtime-registry` | The dependency-light registry kernel: namespaced identities, revisions, provenance, layered sealing, scoped views, fingerprints, and the generic `Named`/`Registry<T>`/`Sealed<T>` collection. Std-only by default. |
 | `agent-runtime-core` | Host-neutral contracts: IDs, messages/content, structured errors, cancellation, deadlines, redaction-safe metadata, versioned events, disjoint usage counters, and the provider/tool/approval/workspace/store/observer/clock traits. |
 | `agent-runtime-ability` | Descriptor-first abilities on the registry kernel: bounded `AbilityDescriptor`s, dependency/conflict/readiness metadata, lazy policy-checked activation, and the unified `Ability`/`AbilityKind` view. Registry-only by default; `tool` bridges the runtime's `Tool`. |
-| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, configurable OpenAI-compatible and native Gemini Interactions adapters, a deterministic fake, and the attempt-recording retry/backoff classifier. |
+| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, configurable OpenAI-compatible, native Responses, and native Gemini Interactions adapters, a deterministic fake, and the attempt-recording retry/backoff classifier. |
 | `agent-runtime-context` | The authoritative context engine: versioned and positioned `ContextFragment`s (including composable system-prompt sections), complete token accounting (`RequestSizer`/`CharRatioSizer`), deterministic structural compaction, and cache-aware planning through `ContextPlanner`. Deterministic and network-free. |
 | `agent-runtime-obs` | Observability facade over the event envelope: an async `EventSink`, `FanoutSink`, a `SinkObserver` bridge, an event-stream pump, an `ObsRow` SQL projection, and feature-gated CLI/file/SQLite sinks. |
 | `agent-runtime` | The embeddable runtime: session-scoped registry views and activation epochs, the checkpointable direct turn machine, prepared tool execution, host interaction, delegation, and reusable harness components for todos, memory, artifacts, and semantic summaries. Re-exports `registry`, `ability`, `provider`, and `context`, and `obs` behind an opt-in feature. |
@@ -91,6 +91,27 @@ continuation content across tool loops and later local replay. Endpoint choice,
 model catalogs, defaults, credential persistence, and provider UX remain host
 policy. Vertex AI, provider-hosted tools, and `previous_interaction_id` are not
 supported by this adapter.
+
+## Native Responses / xAI Grok
+
+`ResponsesProvider` implements the stateless OpenAI Responses wire protocol
+over the same injected transport. The first fixture-verified deployment is
+xAI's Grok Responses endpoint:
+
+```rust
+let mut config = ResponsesConfig::new("https://api.x.ai/v1", "grok-4.5");
+config.api_key = Some(Secret::new("xai-api-key"));
+let provider = ResponsesProvider::new(transport, config)?;
+```
+
+Every request sends complete local history with `stream=true`, `store=false`,
+`include=["reasoning.encrypted_content"]`, and a session-derived
+`prompt_cache_key`. Signed reasoning summaries and encrypted-only reasoning
+items remain ordered continuation content around function calls. Provider
+storage, `previous_response_id`, background responses, and hosted tools are
+rejected before credentials or network I/O. Model limits and reasoning effort
+availability remain host/catalog policy; the adapter does not embed Grok Build
+defaults.
 
 ## Quick start
 

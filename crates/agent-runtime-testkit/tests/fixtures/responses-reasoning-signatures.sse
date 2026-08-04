@@ -1,0 +1,17 @@
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_unsigned","summary":[]}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_unsigned","summary":[{"type":"summary_text","text":"plain"}]}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_signed","summary":[]}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_signed","summary":[{"type":"summary_text","text":"signed"}],"encrypted_content":"sig-signed"}}
+
+data: {"type":"response.output_item.added","output_index":2,"item":{"type":"reasoning","id":"rs_redacted","summary":[]}}
+
+data: {"type":"response.output_item.done","output_index":2,"item":{"type":"reasoning","id":"rs_redacted","summary":[],"encrypted_content":"sig-redacted"}}
+
+data: {"type":"response.output_text.delta","output_index":3,"delta":"answer"}
+
+data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":8,"output_tokens":4,"output_tokens_details":{"reasoning_tokens":2}}}}
+
+data: [DONE]

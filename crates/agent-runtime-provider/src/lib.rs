@@ -18,6 +18,8 @@
 //!   adapter over the same transport, with multimodal (image) user content.
 //! - [`gemini::GeminiInteractionsProvider`] — Google's native stateless
 //!   Interactions API with exact signed-thought replay.
+//! - [`responses::ResponsesProvider`] — a native stateless OpenAI Responses
+//!   protocol adapter, first fixture-verified against xAI's Grok deployment.
 //! - [`retry`] — retryability classification and backoff used by the agent loop
 //!   to record every provider attempt.
 //! - [`catalog`] — optional remote model-catalog sources. Resolution reads a
@@ -29,6 +31,7 @@ pub mod catalog;
 pub mod fake;
 pub mod gemini;
 pub mod openai;
+pub mod responses;
 pub mod retry;
 pub mod sse;
 pub mod transport;
