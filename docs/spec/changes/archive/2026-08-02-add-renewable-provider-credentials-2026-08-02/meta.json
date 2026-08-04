@@ -6,7 +6,7 @@
   "approved_at": "2026-08-02T18:28:54Z",
   "implementation_started_at": "2026-08-02T18:28:54Z",
   "completed_at": null,
-  "status": "approved",
+  "status": "archived",
   "reapproval_required": false,
   "depends_on": [
     "stabilize-session-harness-pipeline-2026-07-31"

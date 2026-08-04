@@ -4,6 +4,6 @@
   "created_at": "2026-07-26T00:00:00Z",
   "updated_at": "2026-07-26T20:56:34Z",
   "completed_at": null,
-  "status": "in-progress",
+  "status": "archived",
   "depends_on": []
 }

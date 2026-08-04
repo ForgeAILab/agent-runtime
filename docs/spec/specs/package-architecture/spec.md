@@ -75,3 +75,78 @@ package appropriate to their integration.
 - **WHEN** their dependencies are resolved
 - **THEN** the host can use the runtime facade for complete composition
 - **AND** the extension avoids pulling the runtime and provider dependency graph
+
+### Requirement: Generic harness composition layer
+
+The runtime facade SHALL provide a reusable harness composition layer above
+the core execution/security/checkpoint mechanisms and below product policy.
+It MAY begin as `agent_runtime::harness` and SHALL become a separate crate only
+after independent reuse justifies the package boundary.
+
+#### Scenario: Two products use standard todo state
+- **GIVEN** two hosts need the same checkpointed todo mechanism
+- **WHEN** they compose the generic harness component
+- **THEN** both reuse its state schema, events, and tool contract
+- **AND** each host supplies its own prompt guidance and presentation
+
+### Requirement: Ordered phase-specific components
+
+Harness extension points SHALL be narrow phase-specific traits with stable
+identity/revision and before/after constraints. Build time MUST reject cycles,
+missing dependencies, and attempts to replace protected authorization or
+context-planning phases.
+
+#### Scenario: Two context contributors declare an ordering cycle
+- **GIVEN** each contributor declares itself after the other
+- **WHEN** the harness pipeline is sealed
+- **THEN** construction fails with a structured cycle error
+- **AND** no session starts with an ambiguous order
+
+### Requirement: Component mutations are explicit and namespaced
+
+Components SHALL receive immutable phase views and return typed patches.
+Mutable component state MUST be namespaced, versioned, and session scoped
+rather than stored in shared runtime globals.
+
+#### Scenario: Memory contributor updates state
+- **GIVEN** a memory component commits a versioned state patch
+- **WHEN** another session uses the same runtime
+- **THEN** it cannot observe the first session's mutable state
+- **AND** the patch identity participates in checkpoint compatibility
+
+### Requirement: Responsibility-aligned source modules
+
+The runtime workspace SHALL organize oversized production and conformance
+modules around cohesive responsibilities while preserving supported module
+paths and public contracts through stable roots or re-exports. A source-only
+decomposition MUST NOT change runtime semantics, serialized representations,
+event ordering, checkpoint transitions, conformance coverage, or dependency
+boundaries.
+
+#### Scenario: Oversized runtime module is decomposed
+
+- **GIVEN** a production module contains several independently changing
+  lifecycle, provider, execution, persistence, or recovery responsibilities
+- **WHEN** the module is decomposed
+- **THEN** each extracted module owns a cohesive responsibility with the
+  narrowest practical visibility
+- **AND** existing callers continue to compile through the same supported path
+- **AND** focused and workspace conformance remain behaviorally unchanged
+
+#### Scenario: Exhaustive or security-critical logic remains cohesive
+
+- **GIVEN** a large function centralizes an exhaustive state transition or a
+  security-critical prepared-execution pipeline
+- **WHEN** surrounding source is reorganized
+- **THEN** the exhaustive match or ordered pipeline remains together in one
+  responsibility-focused module
+- **AND** the refactor does not duplicate, reorder, or weaken its checks
+
+#### Scenario: Test-heavy source is cleaned without fragmenting production
+
+- **GIVEN** a cohesive production module is large mainly because it embeds an
+  extensive test suite
+- **WHEN** maintainability cleanup is applied
+- **THEN** the tests move into private responsibility-focused test modules
+- **AND** the production implementation remains centralized
+- **AND** the test and public conformance inventories do not shrink

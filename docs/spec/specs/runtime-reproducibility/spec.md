@@ -80,3 +80,115 @@ limit enforcement.
 - **WHEN** the provider reports a different authoritative input count
 - **THEN** both planned and observed counts remain attributable to their source
 - **AND** the completed turn retains the original plan fingerprint
+
+### Requirement: Completed turns are durably persisted
+
+When a session store is configured, the runtime SHALL persist canonical
+history, usage, identity, and all ordered manifests after every completed turn,
+not only during orderly session shutdown.
+
+#### Scenario: Process exits after a completed turn
+- **GIVEN** a turn reached its terminal event
+- **WHEN** the process exits before explicit session shutdown
+- **THEN** a resumed session retains that turn and every earlier manifest
+- **AND** the snapshot does not regress to its pre-turn state
+
+### Requirement: Protected checkpoints are distinct from audit journals
+
+Exact resumable turn state SHALL be stored through a protected checkpoint
+contract with a journal/checkpoint watermark. Redacted observability journals
+MUST NOT be treated as sufficient to reconstruct raw pending arguments,
+sensitive content, or completed side effects.
+
+#### Scenario: Approval is pending at restart
+- **GIVEN** an exact prepared action was checkpointed while awaiting approval
+- **WHEN** the host restarts and resumes the session
+- **THEN** it can present that same preparation fingerprint for a decision
+- **AND** does not reconstruct arguments from a redacted event record
+
+### Requirement: Boundary recovery is idempotent
+
+Every checkpointed transition SHALL carry enough identity and fingerprints to
+resume without repeating committed provider calls, user answers, approvals, or
+tool side effects. A revision mismatch MUST fail explicitly or require a
+labeled non-equivalent recovery policy.
+
+#### Scenario: Tool result was committed before a crash
+- **GIVEN** a tool result and its transition watermark were persisted
+- **WHEN** the process resumes the turn
+- **THEN** the runtime reuses the committed result
+- **AND** does not invoke the tool again
+
+### Requirement: Child catalog and checkpoint recovery are atomic and idempotent
+
+Durable child lifecycle transitions SHALL connect a parent-scoped child record
+to the exact child session checkpoint with versioned identities, revisions,
+and watermarks. The runtime MUST publish a record watermark only after the
+referenced child state is durable, MUST reconcile partial commits
+deterministically, and MUST use an exclusive execution lease or equivalent
+compare-and-swap guard before continuing a child.
+
+#### Scenario: Crash occurs between child checkpoint and catalog commit
+
+- **GIVEN** a newer child checkpoint is durable but its catalog transition did
+  not commit before process loss
+- **WHEN** the parent coordinator recovers
+- **THEN** it reconciles the compatible checkpoint and record without executing
+  provider or tool work
+- **AND** emits at most one recovery transition for the resulting state
+
+#### Scenario: Two processes attempt the same child resume
+
+- **GIVEN** two hosts can read the same durable parent and child records
+- **WHEN** both attempt to resume the same interrupted child
+- **THEN** only one acquires the execution lease and commits progress
+- **AND** the other receives a structured conflict without duplicating work
+
+### Requirement: Child recovery preserves canonical accounting
+
+Resuming or following up a durable child SHALL restore its ordered history,
+manifests, identity counters, extension state, artifact ownership, usage, task
+count, and checkpoint boundary. Recovery MUST NOT derive exact execution state
+from a redacted parent journal or reset accounting because the child runtime
+was reconstructed.
+
+#### Scenario: Idle child receives a post-restart follow-up
+
+- **GIVEN** an idle child has two completed turns, artifacts, and cumulative
+  usage before process exit
+- **WHEN** the parent resumes and follows up that child
+- **THEN** the third turn is planned from both prior turns and the restored
+  child state
+- **AND** its manifest order, identities, artifact ownership, usage, and task
+  count remain monotonic
+
+### Requirement: Reproducible provider continuation content
+
+Canonical persistence and equivalent replay SHALL retain bounded
+provider-required continuation content, including signed reasoning blocks,
+without rendering opaque signatures or treating them as host presentation
+metadata. Missing required continuation MUST fail explicitly rather than
+silently producing a non-equivalent provider request.
+
+#### Scenario: Resume signature-only reasoning
+
+- **GIVEN** a completed provider step contains redacted reasoning with an
+  opaque signature and no summary text
+- **WHEN** the session is saved, loaded, and equivalently replayed
+- **THEN** the signed reasoning block remains in the same canonical position
+- **AND** its signature is available only to provider request reconstruction
+
+#### Scenario: Replay record predates signed continuation
+
+- **GIVEN** an older valid session contains no signed provider continuation
+- **WHEN** it is loaded for a provider that does not require signed history
+- **THEN** the session remains backward compatible
+- **AND** no empty or invented signature is added
+
+#### Scenario: Required continuation cannot be restored
+
+- **GIVEN** an equivalent replay targets a provider whose current-turn history
+  requires signed continuation that is absent
+- **WHEN** request preparation validates the history
+- **THEN** replay fails with a structured incompatibility before provider I/O
+- **AND** does not substitute provider-side state or an unsigned request

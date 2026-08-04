@@ -33,44 +33,46 @@ MUST NOT add uncounted context.
 
 ### Requirement: Complete preflight accounting
 
-Context accounting SHALL include message framing, roles, tool schemas, tool
-calls/results, multimodal content, continuation state, provider adapter
-overhead, and configured output/reasoning reserve. Counts MUST identify their
-tokenizer/request-sizer revision and exact or estimated confidence.
+Every planned request SHALL carry a complete budget report: token counts per
+category, the total counted input tokens, the enforced input budget, and the
+output/reasoning reserves, produced by a versioned sizer whose confidence is
+recorded. The planning event SHALL report the counted consumption
+(`input_tokens`) and the enforced budget (`input_budget_tokens`) as distinct
+values that match the budget report.
 
-#### Scenario: Large tool schema exceeds the budget
+#### Scenario: Telemetry separates consumption from the enforced budget
 
-- **GIVEN** selected tool schemas plus required messages and output reserve
-  exceed the model input limit
-- **WHEN** the context plan is compiled
-- **THEN** planning fails or invokes approved compaction before network I/O
-- **AND** the budget report attributes tokens to the tool-schema category
+- **GIVEN** a plan whose counted input is below its enforced budget
+- **WHEN** the planning event is emitted
+- **THEN** `input_tokens` equals the counted consumption
+- **AND** `input_budget_tokens` equals the enforced budget rather than the
+  consumption
 
 ### Requirement: Semantic context compaction
 
-Compaction SHALL preserve required system/developer constraints, the current
-user request, unresolved decisions, required ability instructions, and valid
-tool-call/result pairs. It MAY remove expired optional fragments, bound tool
-results, or summarize older history, but every summary MUST retain provenance,
-covered identifiers, policy revision, sensitivity, content hash, and token
-count.
+Compaction SHALL reclaim tokens in cost order, treating retained reasoning
+from turns before the last user message as the cheapest reclaim: a first
+stage SHALL remove such reasoning parts from message fragments before any
+fragment eviction, truncation, elision, or summarization runs, while
+reasoning at or after the last user message MUST be preserved for the
+provider's same-turn continuation contract. Bounded truncation SHALL treat
+reasoning parts like text parts.
 
-#### Scenario: Old history is summarized
+#### Scenario: Prior-turn reasoning is reclaimed first
 
-- **GIVEN** required content and recent turns approach the configured high
-  watermark
-- **WHEN** older eligible history is compacted
-- **THEN** the plan targets the configured lower watermark
-- **AND** the summary records exactly which messages it replaces
-- **AND** no unmatched tool call or result remains
+- **GIVEN** an over-budget history whose older assistant messages retain
+  reasoning parts
+- **WHEN** compaction runs
+- **THEN** the prior-turn reasoning parts are removed before other content is
+  evicted or summarized
+- **AND** the containing messages and their other parts survive
 
-#### Scenario: Required content cannot fit
+#### Scenario: Current-turn reasoning survives compaction
 
-- **GIVEN** required fragments and output/reasoning reserve exceed the model
-  limits even after permitted compaction
-- **WHEN** planning completes
-- **THEN** it fails with a structured cannot-fit report
-- **AND** no required fragment is silently discarded
+- **GIVEN** an over-budget history whose assistant reasoning follows the last
+  user message
+- **WHEN** compaction runs
+- **THEN** that reasoning is preserved
 
 ### Requirement: Cache-aware stable planning
 
@@ -108,3 +110,117 @@ truncate selected schemas to make them fit.
 - **THEN** the resolver chooses a bounded dependency-complete set
 - **AND** the remaining entries stay discoverable through bounded registry
   search without entering the provider context
+
+### Requirement: Conversation placement is independent of classification
+
+The context planner SHALL use fragment kind for accounting and compaction
+policy without using it to reorder canonical conversation messages. Messages
+within the conversation lane MUST reach the provider in their original
+sequence.
+
+#### Scenario: Tool continuation is planned
+- **GIVEN** canonical history contains a user message, an assistant tool call,
+  and its tool result in that order
+- **WHEN** the next provider request is planned
+- **THEN** the provider request retains exactly that role and message order
+- **AND** accounting still classifies user input, history, and tool results
+  separately
+
+### Requirement: Active tool exchanges are atomic
+
+The planner and compactor SHALL represent every assistant tool-call message and
+all matching results as one exchange supporting multiple call IDs. Every
+message from the latest user input through the active continuation MUST remain
+required until the turn reaches a terminal state.
+
+#### Scenario: Assistant requests parallel tools
+- **GIVEN** one assistant message contains several tool calls
+- **AND** matching results are appended in canonical order
+- **WHEN** context pressure requires compaction
+- **THEN** the complete assistant message and all matching results survive
+  together or are removed together as part of an older completed turn
+- **AND** the active-turn exchange is never compacted
+
+### Requirement: Planning state is session scoped
+
+Mutable planning metadata SHALL belong to one session execution context,
+including prior cache plans, compaction state, and activation revisions.
+Planning in one session MUST NOT affect cache or compaction outcomes in another
+session.
+
+#### Scenario: Two sessions share one runtime
+- **GIVEN** two sessions execute interleaved turns through one runtime
+- **WHEN** one session compacts and changes its cache prefix
+- **THEN** the other session observes neither outcome
+- **AND** each plan is compared only with its own preceding plan
+
+### Requirement: Compaction results are returned atomically
+
+A compactor SHALL return compacted fragments and their outcome as one owned
+result. A plan that did not invoke compaction MUST receive a fresh no-op
+outcome and MUST NOT read metadata through shared mutable side channels.
+
+#### Scenario: A compacted plan is followed by a fitting plan
+- **GIVEN** one plan invoked compaction
+- **WHEN** a later plan already fits without compaction
+- **THEN** the later plan records no compaction outcome
+- **AND** no prior session or turn outcome is reused
+
+### Requirement: Structural and semantic compaction are distinct
+
+The deterministic context package SHALL perform only structural selection,
+bounding, provenance validation, and budget enforcement. Model-assisted
+semantic summaries MUST be coordinated above it and re-enter planning as
+explicit provenance-carrying summary fragments.
+
+#### Scenario: Old history receives a semantic summary
+- **GIVEN** a harness coordinator selects complete old turn groups
+- **WHEN** it stores originals and obtains a model-generated summary
+- **THEN** the deterministic planner validates the summary's coverage,
+  sensitivity, hash, and budget
+- **AND** the context package performs no provider or network call itself
+
+### Requirement: Semantic summarization responds to context pressure
+
+The semantic summary coordinator SHALL decide to summarize from observed input
+usage measured against a configured input budget, not from a count of completed
+turns. A configured minimum completed-turn count SHALL remain as an eligibility
+floor, and reaching it MUST NOT by itself cause summarization. Growth MUST be
+measured relative to the session's opening input cost so that a larger stable
+prefix does not advance the trigger. Only provider-attempt usage MAY inform the
+decision; the coordinator's own summary spend MUST be excluded.
+
+#### Scenario: A long session of small turns is not summarized
+- **GIVEN** a session past the minimum turn floor
+- **AND** input usage well below the configured share of the budget
+- **WHEN** a turn commits
+- **THEN** no summary is produced
+- **AND** no summary model call is made
+
+#### Scenario: A single large tool result triggers summarization
+- **GIVEN** a session past the minimum turn floor
+- **WHEN** one turn's input usage crosses the configured share of the budget
+- **THEN** a summary is produced at that commit
+
+#### Scenario: The floor protects a young session
+- **GIVEN** a session below the minimum completed-turn floor
+- **AND** input usage above the configured share of the budget
+- **WHEN** a turn commits
+- **THEN** no summary is produced
+
+#### Scenario: A larger prefix does not advance the trigger
+- **GIVEN** two sessions whose conversation bodies cost identically
+- **AND** one begins with a substantially larger opening input cost
+- **WHEN** both commit the same number of equivalent turns
+- **THEN** neither summarizes before the other
+
+#### Scenario: Summary spend does not feed the trigger
+- **GIVEN** a session that has already produced a semantic summary
+- **WHEN** the decision is evaluated again
+- **THEN** the separately attributed summary usage is excluded from it
+
+#### Scenario: A policy without an input budget is rejected
+- **GIVEN** a policy whose input budget is zero
+- **WHEN** it is validated
+- **THEN** validation fails
+- **AND** the trigger is not silently disabled
