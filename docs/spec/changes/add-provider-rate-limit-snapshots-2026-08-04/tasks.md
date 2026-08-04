@@ -36,4 +36,4 @@ completed_at:
 ## 4. Validation
 
 - [x] 4.1 `cargo test --workspace`.
-- [ ] 4.2 Re-validate the change with the spec toolkit.
+- [x] 4.2 Re-validate the change with the spec toolkit.
