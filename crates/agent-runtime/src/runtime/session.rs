@@ -902,6 +902,15 @@ impl SessionHandle {
             .clone()
     }
 
+    /// Runs `f` over the current conversation history without cloning it.
+    ///
+    /// The session state lock is held while `f` runs, so `f` must stay a
+    /// short synchronous projection — a tail scan, not a blocking wait.
+    pub fn with_history<R>(&self, f: impl FnOnce(&[Message]) -> R) -> R {
+        let state = self.inner.state.lock().expect("session state poisoned");
+        f(&state.history)
+    }
+
     /// A snapshot of the session's canonical state.
     pub fn snapshot(&self) -> SessionSnapshot {
         let state = self.inner.state.lock().expect("session state poisoned");
