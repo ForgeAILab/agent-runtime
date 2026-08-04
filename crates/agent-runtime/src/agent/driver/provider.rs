@@ -297,7 +297,13 @@ impl Driver {
                     cache_plan: cache_plan.fingerprint(),
                     preserved_prefix_tokens: cache_plan.preserved_prefix_tokens,
                     invalidated_prefix_tokens: cache_plan.invalidated_tokens,
-                    provider_cache_supported: cache_plan.provider_cache.unsupported.is_empty(),
+                    // The signal that matters for this event is prefix reuse:
+                    // an implicit-prefix provider that cannot honor a stray
+                    // ephemeral hint still reuses the stable prefix, and
+                    // reporting it as unsupported hid exactly the caching it
+                    // was doing. Unhonored classes remain observable through
+                    // the plan manifest.
+                    provider_cache_supported: cache_plan.provider_cache.capability.supports_stable,
                 },
             );
         }

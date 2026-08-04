@@ -497,7 +497,12 @@ impl RunPlanner {
                     .unwrap_or_else(|| "preamble".to_owned())
             )))
             .paired_with_many(conversation_pairings[index].iter().cloned())
-            .with_cache_class(CacheClass::Ephemeral);
+            // Committed history is immutable and append-only, which is
+            // exactly what a prefix cache reuses: each attempt's request is
+            // the previous one plus new tail items. Compaction that drops or
+            // replaces a message changes hashes at that index, and cache
+            // planning ends the preserved prefix there on its own.
+            .with_cache_class(CacheClass::Stable);
             fragments.push(if is_active_continuation {
                 fragment
             } else {
@@ -840,14 +845,31 @@ mod tests {
             .preserved_prefix_len;
 
         let second = planner
-            .plan_turn(Some("be helpful"), &history(&["something else"]), &tools)
+            .plan_turn(
+                Some("be helpful"),
+                &history(&["hello", "something else"]),
+                &tools,
+            )
             .expect("plan");
         let second_plan = second.plan.cache_plan().expect("cache plan");
 
         assert!(first_prefix > 0);
         assert_eq!(
             second_plan.preserved_prefix_len, first_prefix,
-            "the stable instruction and schema prefix must survive a new user message"
+            "an appended user message must preserve everything before it, \
+             committed history included"
+        );
+
+        // A message that *changes* rather than appends ends the preserved
+        // prefix exactly at the instruction and schema run before it.
+        let replaced = planner
+            .plan_turn(Some("be helpful"), &history(&["hello", "rewritten"]), &tools)
+            .expect("plan");
+        let replaced_plan = replaced.plan.cache_plan().expect("cache plan");
+        assert_eq!(
+            replaced_plan.preserved_prefix_len,
+            second_plan.preserved_prefix_len,
+            "replacing the newest message must not invalidate the prefix before it"
         );
     }
 

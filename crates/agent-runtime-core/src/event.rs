@@ -413,7 +413,9 @@ pub enum RuntimeEvent {
         preserved_prefix_tokens: u32,
         /// Tokens whose cache prefix was invalidated.
         invalidated_prefix_tokens: u32,
-        /// Whether the provider supports cache hints at all.
+        /// Whether the provider can reuse this plan's stable prefix (either
+        /// implicitly or via explicit breakpoints). Individual unhonored
+        /// cache classes are recorded in the plan manifest, not here.
         provider_cache_supported: bool,
     },
     /// A context or output budget could not be satisfied.

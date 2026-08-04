@@ -545,12 +545,19 @@ impl ContextFragment {
         let mut hasher = FingerprintHasher::new();
         hasher
             .pair("id", self.id.as_str())
-            .pair("kind", self.kind.as_str())
             .pair("lane", format!("{:?}", self.position.lane))
             .pair("sequence", self.position.sequence.to_string())
             .pair("revision", self.revision.as_str())
             .pair("cache_class", self.cache_class.as_str())
             .pair("content", self.content.text_for_sizing());
+        // For text and tool content the kind can decide the rendered role, so
+        // it stays in the hash. A conversation message carries its own role:
+        // its accounting kind flips from user-input to history on the next
+        // turn without changing a byte on the wire, and hashing the kind
+        // would spuriously invalidate the cache prefix at that message.
+        if !matches!(self.content, FragmentContent::Message(_)) {
+            hasher.pair("kind", self.kind.as_str());
+        }
         if let Some(group) = &self.conversation_group {
             hasher.pair("conversation_group", group.as_str());
         }
