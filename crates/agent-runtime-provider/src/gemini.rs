@@ -776,7 +776,7 @@ fn push_utf8(pending_bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<String>
     }
 }
 
-fn malformed(message: &'static str) -> ProviderError {
+fn malformed(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedStream, message)
 }
 
@@ -1124,13 +1124,27 @@ fn event_to_events(
                 emit_usage(usage, out);
                 state.saw_semantic_event = true;
             }
+            // What the turn *did* decides the finish reason; the terminal word
+            // only has to be one we recognize. A stream that carried function
+            // calls ends in tool calls whichever of `completed` or
+            // `requires_action` the server chose to label it, and pinning each
+            // word to exactly one outcome made a legal pairing unrepresentable.
             let reason = match interaction.status.as_str() {
-                "completed" if !state.saw_function_call => FinishReason::Stop,
-                "requires_action" if state.saw_function_call => FinishReason::ToolCalls,
+                "completed" | "requires_action" if state.saw_function_call => {
+                    FinishReason::ToolCalls
+                }
+                "completed" => FinishReason::Stop,
                 "incomplete" | "budget_exceeded" => FinishReason::Length,
                 "cancelled" => FinishReason::Cancelled,
                 "failed" => FinishReason::Error,
-                _ => return Err(malformed("invalid Gemini interaction terminal status")),
+                // Name the status. An adapter that refuses a terminal it does
+                // not know, without saying which, cannot be fixed from a
+                // report of the failure.
+                other => {
+                    return Err(malformed(format!(
+                        "invalid Gemini interaction terminal status `{other}`"
+                    )));
+                }
             };
             state.pending_terminal = Some(PendingTerminal::Finish(reason));
         }
@@ -2167,6 +2181,53 @@ mod tests {
         ));
         assert!(!format!("{events:?}").contains("secret-canary"));
         assert_eq!(source.invalidated.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_completed_interaction_carrying_tool_calls_finishes_as_tool_calls() {
+        // The server may label a tool-calling turn `completed` rather than
+        // `requires_action`. What the stream carried is what decides.
+        let mut state = StreamState {
+            saw_function_call: true,
+            ..StreamState::default()
+        };
+        let mut out = Vec::new();
+        event_to_events(
+            WireEvent::InteractionCompleted {
+                interaction: WireInteraction {
+                    status: "completed".to_owned(),
+                    usage: None,
+                },
+            },
+            &mut state,
+            &mut out,
+        )
+        .expect("a completed tool-calling interaction is legal");
+        assert!(matches!(
+            state.pending_terminal,
+            Some(PendingTerminal::Finish(FinishReason::ToolCalls))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_terminal_status_is_named_in_the_error() {
+        let mut state = StreamState::default();
+        let mut out = Vec::new();
+        let error = event_to_events(
+            WireEvent::InteractionCompleted {
+                interaction: WireInteraction {
+                    status: "surprising".to_owned(),
+                    usage: None,
+                },
+            },
+            &mut state,
+            &mut out,
+        )
+        .expect_err("an unknown terminal is refused");
+        assert!(
+            error.to_string().contains("surprising"),
+            "the error must name the status it refused: {error}"
+        );
     }
 
     #[tokio::test]
