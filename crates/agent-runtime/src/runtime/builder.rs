@@ -110,7 +110,13 @@ impl RuntimeBuilder {
             observers: Vec::new(),
             clock: Arc::new(SystemClock),
             config: LoopConfig::new(model),
-            event_buffer: 1024,
+            // A single socket read's SSE decode can burst over a thousand
+            // provider deltas within one millisecond (measured from real
+            // session journals). Even with delta coalescing shrinking event
+            // count, a lagged subscriber silently drops events past this
+            // capacity (see `emitter.rs`'s `RecvError::Lagged` handling), so
+            // the default has headroom above the largest measured burst.
+            event_buffer: 8192,
             shutdown_timeout_ms: 5_000,
             injection_queue_limit: 64,
             provider_name: None,
@@ -504,6 +510,20 @@ impl RuntimeBuilder {
     /// Sets the event broadcast buffer capacity.
     pub fn event_buffer(mut self, buffer: usize) -> Self {
         self.event_buffer = buffer;
+        self
+    }
+
+    /// Sets the presentation-delta coalescing byte threshold (see
+    /// [`LoopConfig::delta_coalesce_bytes`]).
+    pub fn delta_coalesce_bytes(mut self, bytes: usize) -> Self {
+        self.config.delta_coalesce_bytes = bytes;
+        self
+    }
+
+    /// Sets the presentation-delta coalescing time window in milliseconds
+    /// (see [`LoopConfig::delta_coalesce_window_ms`]).
+    pub fn delta_coalesce_window_ms(mut self, ms: u64) -> Self {
+        self.config.delta_coalesce_window_ms = ms;
         self
     }
 

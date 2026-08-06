@@ -27,7 +27,7 @@ use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::checkpoint::{
     AssembledModelResponse, CheckpointStore, ToolSlotCheckpoint, TurnCheckpoint, TurnState,
 };
-use agent_runtime_core::clock::{Clock, Deadline};
+use agent_runtime_core::clock::{Clock, Deadline, Timestamp};
 use agent_runtime_core::content::{
     ContentPart, InternalTurnInput, InternalTurnSensitivity, Message, Role, ToolCall,
     ToolResultBlock, UserInput,

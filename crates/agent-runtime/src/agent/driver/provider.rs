@@ -1,6 +1,228 @@
 use super::turn::await_harness_phase;
 use super::*;
 
+/// A pending coalesced `TextDelta` buffer, anchored to the clock instant its
+/// first byte since the last flush arrived (used to test the coalescing
+/// window).
+struct PendingDelta {
+    text: String,
+    started_at: Timestamp,
+}
+
+/// As [`PendingDelta`], plus the `redacted` flag every byte in the buffer
+/// shares. A buffer never mixes redacted and plain reasoning — see
+/// [`DeltaCoalescer::push_reasoning`].
+struct PendingReasoning {
+    text: String,
+    redacted: bool,
+    started_at: Timestamp,
+}
+
+/// One coalesced presentation delta ready to become a `RuntimeEvent`.
+enum CoalescedDelta {
+    Text(String),
+    Reasoning { text: String, redacted: bool },
+}
+
+/// Whether `started_at` is far enough behind `now` to force a flush
+/// regardless of accumulated size — the mechanism that lets a slow trickle
+/// (deltas further apart than the window) emit promptly with no added
+/// latency, since it is re-checked on every arriving delta rather than by a
+/// timer task.
+fn window_elapsed(started_at: Timestamp, now: Timestamp, window_ms: u64) -> bool {
+    now.as_millis().saturating_sub(started_at.as_millis()) >= window_ms
+}
+
+/// Batches per-token `TextDelta`/`ReasoningDelta` provider events into fewer,
+/// larger `RuntimeEvent`s before they reach the broadcast channel.
+///
+/// Measured from real session journals: a provider's SSE decode can flush
+/// over a thousand sub-5-byte deltas within one millisecond (one per model
+/// token), and one `RuntimeEvent` per delta overruns the bounded broadcast
+/// buffer — a lagged subscriber silently drops events (see `emitter.rs`'s
+/// `RecvError::Lagged` handling). Coalescing changes only what is *emitted*;
+/// canonical accumulation (`text`, `reasoning`, `assembler`, `usage`) stays
+/// per-delta exactly as before, in the caller.
+///
+/// Invariant: after any `push_text`/`push_reasoning` call returns, at most
+/// one of the two pending buffers is non-empty — each push flushes the
+/// *other* kind first, so a provider that interleaves text and reasoning
+/// keeps their exact relative order in the emitted stream.
+struct DeltaCoalescer {
+    bytes_threshold: usize,
+    window_ms: u64,
+    pending_text: Option<PendingDelta>,
+    pending_reasoning: Option<PendingReasoning>,
+}
+
+impl DeltaCoalescer {
+    fn new(bytes_threshold: usize, window_ms: u64) -> Self {
+        Self {
+            bytes_threshold,
+            window_ms,
+            pending_text: None,
+            pending_reasoning: None,
+        }
+    }
+
+    /// Whether a buffer holding `len` bytes since `started_at` is already due
+    /// for a flush as of `now` — checked on the *existing* pending buffer
+    /// before a new same-kind delta is allowed to merge into it. Without this
+    /// pre-merge check, a trickle (each delta arriving after the window has
+    /// already elapsed on the previous one) would keep absorbing new text
+    /// into a buffer that was already due, adding latency a slow stream is
+    /// never supposed to see; checking before merging instead flushes the
+    /// prior delta on its own and starts a fresh buffer for the new one.
+    fn due(&self, len: usize, started_at: Timestamp, now: Timestamp) -> bool {
+        len >= self.bytes_threshold || window_elapsed(started_at, now, self.window_ms)
+    }
+
+    /// Accepts one `TextDelta`'s text, returning zero or more deltas ready to
+    /// emit, in order. A pending reasoning buffer always flushes first, even
+    /// on an empty `text`, so relative order survives a kind switch.
+    fn push_text(&mut self, text: &str, now: Timestamp) -> Vec<CoalescedDelta> {
+        let mut out = Vec::new();
+        if let Some(pending) = self.pending_reasoning.take() {
+            out.push(CoalescedDelta::Reasoning {
+                text: pending.text,
+                redacted: pending.redacted,
+            });
+        }
+        if text.is_empty() {
+            return out;
+        }
+        if self
+            .pending_text
+            .as_ref()
+            .is_some_and(|pending| self.due(pending.text.len(), pending.started_at, now))
+        {
+            if let Some(pending) = self.pending_text.take() {
+                out.push(CoalescedDelta::Text(pending.text));
+            }
+        }
+        match &mut self.pending_text {
+            Some(pending) => pending.text.push_str(text),
+            None => {
+                self.pending_text = Some(PendingDelta {
+                    text: text.to_string(),
+                    started_at: now,
+                })
+            }
+        }
+        // The delta just merged in may itself have crossed the byte
+        // threshold (including a single delta at or past it on its own);
+        // the window cannot have moved within this same synchronous call, so
+        // only the size half of `due` needs rechecking here.
+        if self
+            .pending_text
+            .as_ref()
+            .is_some_and(|pending| pending.text.len() >= self.bytes_threshold)
+        {
+            if let Some(pending) = self.pending_text.take() {
+                out.push(CoalescedDelta::Text(pending.text));
+            }
+        }
+        out
+    }
+
+    /// Accepts one `ReasoningDelta`'s text and `redacted` flag, returning
+    /// zero or more deltas ready to emit, in order. A pending text buffer
+    /// always flushes first (kind switch), and a pending reasoning buffer
+    /// whose `redacted` flag differs — or that is already due per
+    /// [`DeltaCoalescer::due`] — flushes before the new delta can merge into
+    /// it. Merging across a `redacted` change would blur an encrypted
+    /// payload into plain text, or vice versa, in the emitted stream.
+    fn push_reasoning(
+        &mut self,
+        text: &str,
+        redacted: bool,
+        now: Timestamp,
+    ) -> Vec<CoalescedDelta> {
+        let mut out = Vec::new();
+        if let Some(pending) = self.pending_text.take() {
+            out.push(CoalescedDelta::Text(pending.text));
+        }
+        if text.is_empty() {
+            return out;
+        }
+        let must_flush = self.pending_reasoning.as_ref().is_some_and(|pending| {
+            pending.redacted != redacted || self.due(pending.text.len(), pending.started_at, now)
+        });
+        if must_flush {
+            if let Some(pending) = self.pending_reasoning.take() {
+                out.push(CoalescedDelta::Reasoning {
+                    text: pending.text,
+                    redacted: pending.redacted,
+                });
+            }
+        }
+        match &mut self.pending_reasoning {
+            Some(pending) => pending.text.push_str(text),
+            None => {
+                self.pending_reasoning = Some(PendingReasoning {
+                    text: text.to_string(),
+                    redacted,
+                    started_at: now,
+                })
+            }
+        }
+        if self
+            .pending_reasoning
+            .as_ref()
+            .is_some_and(|pending| pending.text.len() >= self.bytes_threshold)
+        {
+            if let Some(pending) = self.pending_reasoning.take() {
+                out.push(CoalescedDelta::Reasoning {
+                    text: pending.text,
+                    redacted: pending.redacted,
+                });
+            }
+        }
+        out
+    }
+
+    /// Milliseconds left before a pending buffer is due, or `None` when
+    /// nothing is pending.
+    ///
+    /// The window is otherwise only re-examined when the *next* delta
+    /// arrives, which is fine for a stream that keeps producing and wrong for
+    /// one that stalls: a provider that emits a sentence and then goes quiet
+    /// mid-stream would leave that sentence's tail invisible until the stream
+    /// finally ended. The caller waits at most this long for the next event
+    /// before flushing, which bounds the tail's latency by the window instead
+    /// of by the provider's silence.
+    fn pending_window_remaining_ms(&self, now: Timestamp) -> Option<u64> {
+        let started_at = match (&self.pending_text, &self.pending_reasoning) {
+            (Some(pending), _) => pending.started_at,
+            (None, Some(pending)) => pending.started_at,
+            (None, None) => return None,
+        };
+        let elapsed = now.as_millis().saturating_sub(started_at.as_millis());
+        Some(self.window_ms.saturating_sub(elapsed))
+    }
+
+    /// Flushes both buffers unconditionally, in order. Called before any
+    /// non-delta `RuntimeEvent` and on every stream exit path (end, error,
+    /// cancellation) so pending text is never silently dropped.
+    fn drain(&mut self) -> Vec<CoalescedDelta> {
+        let mut out = Vec::new();
+        if let Some(pending) = self.pending_text.take() {
+            if !pending.text.is_empty() {
+                out.push(CoalescedDelta::Text(pending.text));
+            }
+        }
+        if let Some(pending) = self.pending_reasoning.take() {
+            if !pending.text.is_empty() {
+                out.push(CoalescedDelta::Reasoning {
+                    text: pending.text,
+                    redacted: pending.redacted,
+                });
+            }
+        }
+        out
+    }
+}
+
 impl Driver {
     pub(super) fn finish_cancelled(
         &self,
@@ -469,11 +691,67 @@ impl Driver {
             let mut assembler = ToolCallAssembler::default();
             let mut error: Option<ProviderError> = None;
             let mut provider_finish: Option<FinishReason> = None;
+            let mut coalescer = DeltaCoalescer::new(
+                self.config.delta_coalesce_bytes,
+                self.config.delta_coalesce_window_ms,
+            );
+            // Turns a coalescer flush into the `RuntimeEvent`s it represents,
+            // in order. A closure (not a free function) so it can borrow
+            // `emitter`/`turn`/`request_id`/`attempt_id` from this attempt's
+            // scope instead of threading them through every call site.
+            let emit_coalesced = |deltas: Vec<CoalescedDelta>| {
+                for delta in deltas {
+                    match delta {
+                        CoalescedDelta::Text(text) => emitter.emit(
+                            turn.clone(),
+                            RuntimeEvent::TextDelta {
+                                request: request_id.clone(),
+                                attempt: attempt_id.clone(),
+                                text,
+                            },
+                        ),
+                        CoalescedDelta::Reasoning { text, redacted } => emitter.emit(
+                            turn.clone(),
+                            RuntimeEvent::ReasoningDelta {
+                                request: request_id.clone(),
+                                attempt: attempt_id.clone(),
+                                text,
+                                redacted,
+                            },
+                        ),
+                    }
+                }
+            };
 
             match self.provider.stream(request.clone(), ctx).await {
                 Err(perr) => error = Some(perr),
                 Ok(mut stream) => {
-                    while let Some(event) = stream.next().await {
+                    loop {
+                        // Waiting only for the next stream event would let a
+                        // provider that stalls mid-answer hold the pending
+                        // tail invisible for as long as it stayed quiet. When
+                        // a buffer is pending, wait at most the rest of its
+                        // window: on expiry it flushes and the loop returns to
+                        // an ordinary await. `Next` is cancel-safe, so a
+                        // timed-out poll consumes nothing.
+                        let next = match coalescer.pending_window_remaining_ms(self.clock.now()) {
+                            Some(remaining) => {
+                                let waited = tokio::time::timeout(
+                                    Duration::from_millis(remaining),
+                                    stream.next(),
+                                )
+                                .await;
+                                match waited {
+                                    Ok(next) => next,
+                                    Err(_) => {
+                                        emit_coalesced(coalescer.drain());
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => stream.next().await,
+                        };
+                        let Some(event) = next else { break };
                         if turn_cancel.is_cancelled() {
                             error = Some(ProviderError::new(
                                 ProviderErrorKind::Cancelled,
@@ -488,14 +766,10 @@ impl Driver {
                                     attempt_visible_output = true;
                                 }
                                 text.push_str(&t);
-                                emitter.emit(
-                                    turn.clone(),
-                                    RuntimeEvent::TextDelta {
-                                        request: request_id.clone(),
-                                        attempt: attempt_id.clone(),
-                                        text: t,
-                                    },
-                                );
+                                // Canonical accumulation above is unchanged;
+                                // only the emitted `RuntimeEvent`s are
+                                // coalesced. See `DeltaCoalescer`.
+                                emit_coalesced(coalescer.push_text(&t, self.clock.now()));
                             }
                             ProviderStreamEvent::ReasoningDelta {
                                 text: t,
@@ -507,17 +781,11 @@ impl Driver {
                                 // The signature is provider integrity data for
                                 // canonical replay; the UI event stream never
                                 // needs it.
-                                if !t.is_empty() {
-                                    emitter.emit(
-                                        turn.clone(),
-                                        RuntimeEvent::ReasoningDelta {
-                                            request: request_id.clone(),
-                                            attempt: attempt_id.clone(),
-                                            text: t,
-                                            redacted,
-                                        },
-                                    );
-                                }
+                                emit_coalesced(coalescer.push_reasoning(
+                                    &t,
+                                    redacted,
+                                    self.clock.now(),
+                                ));
                             }
                             ProviderStreamEvent::ToolCallDelta {
                                 index,
@@ -526,6 +794,14 @@ impl Driver {
                                 arguments_fragment,
                             } => {
                                 accepted_semantic_event = true;
+                                // A tool call is a content switch as much as
+                                // text↔reasoning is. Without this, the prose
+                                // that introduces a call ("let me read the
+                                // file") stays pending for the whole argument
+                                // stream. Draining an empty coalescer costs
+                                // nothing, so a call's later fragments pay no
+                                // price for it.
+                                emit_coalesced(coalescer.drain());
                                 assembler.push(index, id, name, &arguments_fragment);
                             }
                             ProviderStreamEvent::Usage { delta } => {
@@ -537,6 +813,10 @@ impl Driver {
                                 write_tokens,
                             } => {
                                 accepted_semantic_event = true;
+                                // A pending coalesced delta must land before
+                                // this non-delta event so emission order
+                                // matches stream arrival order.
+                                emit_coalesced(coalescer.drain());
                                 emitter.emit(
                                     turn.clone(),
                                     RuntimeEvent::CacheObservation {
@@ -547,6 +827,7 @@ impl Driver {
                             }
                             ProviderStreamEvent::Downgrade { capability, detail } => {
                                 accepted_semantic_event = true;
+                                emit_coalesced(coalescer.drain());
                                 emitter.emit(
                                     turn.clone(),
                                     RuntimeEvent::Downgrade { capability, detail },
@@ -556,6 +837,7 @@ impl Driver {
                                 // Server-reported limit metadata, not model
                                 // output: surfaced to observers without
                                 // counting as semantic progress.
+                                emit_coalesced(coalescer.drain());
                                 emitter.emit(
                                     turn.clone(),
                                     RuntimeEvent::RateLimitObservation {
@@ -578,6 +860,11 @@ impl Driver {
                     }
                 }
             }
+            // Every stream exit path — natural end, `Finish`, `Error`, or the
+            // `turn_cancel.is_cancelled()` break above — falls through to
+            // here, so one flush covers all of them: pending text is never
+            // silently dropped on any exit.
+            emit_coalesced(coalescer.drain());
 
             let mut tool_calls = Vec::new();
             if error.is_none() {
