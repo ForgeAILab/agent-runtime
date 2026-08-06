@@ -1451,8 +1451,7 @@ async fn an_out_of_workspace_resource_is_never_allowed_unattended() {
 
     assert!(out[0].is_error);
     assert!(
-        out[0]
-            .content[0]
+        out[0].content[0]
             .as_text()
             .unwrap()
             .contains("approval decision"),

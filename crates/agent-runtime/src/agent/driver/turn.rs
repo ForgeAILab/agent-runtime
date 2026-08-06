@@ -911,11 +911,7 @@ impl<'a> TurnMachine<'a> {
                 .await;
                 return;
             }
-            if driver
-                .config
-                .max_tool_steps
-                .is_some_and(|max| step >= max)
-            {
+            if driver.config.max_tool_steps.is_some_and(|max| step >= max) {
                 emitter.emit(
                     turn.clone(),
                     RuntimeEvent::LimitReached {

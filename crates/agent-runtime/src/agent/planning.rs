@@ -863,12 +863,15 @@ mod tests {
         // A message that *changes* rather than appends ends the preserved
         // prefix exactly at the instruction and schema run before it.
         let replaced = planner
-            .plan_turn(Some("be helpful"), &history(&["hello", "rewritten"]), &tools)
+            .plan_turn(
+                Some("be helpful"),
+                &history(&["hello", "rewritten"]),
+                &tools,
+            )
             .expect("plan");
         let replaced_plan = replaced.plan.cache_plan().expect("cache plan");
         assert_eq!(
-            replaced_plan.preserved_prefix_len,
-            second_plan.preserved_prefix_len,
+            replaced_plan.preserved_prefix_len, second_plan.preserved_prefix_len,
             "replacing the newest message must not invalidate the prefix before it"
         );
     }

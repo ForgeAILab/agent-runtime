@@ -443,10 +443,8 @@ mod tests {
 
     #[test]
     fn a_distant_reset_is_exhaustion() {
-        let snapshot = snapshot_from_headers(&headers(&[(
-            "x-codex-primary-reset-after-seconds",
-            "3600",
-        )]));
+        let snapshot =
+            snapshot_from_headers(&headers(&[("x-codex-primary-reset-after-seconds", "3600")]));
         let verdict = classify_rejection(429, &snapshot, None, 1_000).expect("exhaustion");
         assert_eq!(verdict.resets_at_ms, Some(3_601_000));
     }
@@ -473,7 +471,8 @@ mod tests {
 
     #[test]
     fn applying_exhaustion_clears_retryability_and_keeps_metadata() {
-        let mut original = ProviderError::new(ProviderErrorKind::RateLimited, "429").retry_after(30);
+        let mut original =
+            ProviderError::new(ProviderErrorKind::RateLimited, "429").retry_after(30);
         original.metadata.insert("http.status", 429i64);
 
         let error = apply_exhaustion(
