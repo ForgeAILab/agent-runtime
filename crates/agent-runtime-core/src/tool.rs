@@ -682,6 +682,47 @@ impl From<Vec<ContentPart>> for ToolContent {
     }
 }
 
+/// Sanitizes and simplifies tool error messages for model consumption.
+///
+/// Removes raw OS error code suffixes (e.g. `(os error 2)`), translates verbose
+/// system error phrases like "No such file or directory" into concise phrases like
+/// "file not found", and cleans up trailing whitespace.
+pub fn sanitize_tool_error_message(message: impl AsRef<str>) -> String {
+    let mut s = message.as_ref().trim().to_string();
+
+    if let Some(pos) = s.find(" (os error ") {
+        if let Some(end) = s[pos..].find(')') {
+            s.replace_range(pos..pos + end + 1, "");
+        }
+    } else if let Some(pos) = s.find(" [os error ") {
+        if let Some(end) = s[pos..].find(']') {
+            s.replace_range(pos..pos + end + 1, "");
+        }
+    }
+
+    let replacements = [
+        ("No such file or directory", "file not found"),
+        ("no such file or directory", "file not found"),
+        ("Permission denied", "permission denied"),
+        ("Is a directory", "is a directory"),
+        ("is a directory", "is a directory"),
+        ("No space left on device", "disk full"),
+        ("Directory not empty", "directory not empty"),
+        ("Connection refused", "connection refused"),
+        ("Operation timed out", "timed out"),
+        ("Text file busy", "file busy"),
+        ("File exists", "file already exists"),
+    ];
+
+    for (from, to) in replacements {
+        if s.contains(from) {
+            s = s.replace(from, to);
+        }
+    }
+
+    s.trim().to_string()
+}
+
 /// The machine + model-facing result of a tool invocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolOutcome {
@@ -716,13 +757,22 @@ impl ToolOutcome {
     }
 
     /// An error outcome (the model still sees the message).
+    ///
+    /// Error messages are automatically sanitized and simplified for model
+    /// consumption (e.g. stripping raw `(os error N)` codes and mapping verbose
+    /// system phrases like "No such file or directory" to "file not found").
     pub fn error(message: impl Into<String>) -> Self {
-        let message = message.into();
+        let message = sanitize_tool_error_message(message.into());
         Self {
             value: Value::String(message.clone()),
             content: ToolContent::inline(vec![ContentPart::text(message)]),
             is_error: true,
         }
+    }
+
+    /// Explicit constructor for a concise error outcome.
+    pub fn concise_error(message: impl Into<String>) -> Self {
+        Self::error(message)
     }
 
     /// Renders this outcome into a canonical, model-facing [`ToolResultBlock`],
@@ -1171,5 +1221,20 @@ mod tests {
         let rendered: usize = block.content.iter().map(rendered_size).sum();
         assert!(rendered <= 32);
         assert!(matches!(block.content[0], ContentPart::Text { .. }));
+    }
+
+    #[test]
+    fn sanitize_tool_error_message_simplifies_os_errors() {
+        let raw = "cannot read /path/to/file: No such file or directory (os error 2)";
+        let cleaned = sanitize_tool_error_message(raw);
+        assert_eq!(cleaned, "cannot read /path/to/file: file not found");
+
+        let raw_perm = "cannot write /path/to/file: Permission denied (os error 13)";
+        let cleaned_perm = sanitize_tool_error_message(raw_perm);
+        assert_eq!(cleaned_perm, "cannot write /path/to/file: permission denied");
+
+        let outcome = ToolOutcome::error("cannot read /lib.rs: No such file or directory (os error 2)");
+        let Value::String(msg) = &outcome.value else { panic!("expected string"); };
+        assert_eq!(msg, "cannot read /lib.rs: file not found");
     }
 }
