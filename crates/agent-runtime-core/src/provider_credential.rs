@@ -84,6 +84,7 @@ pub struct ProviderCredentialLease {
     secret: Secret,
     expires_at: Option<Timestamp>,
     revision: ProviderCredentialRevision,
+    account: Option<String>,
 }
 
 impl ProviderCredentialLease {
@@ -93,6 +94,7 @@ impl ProviderCredentialLease {
             secret,
             expires_at: None,
             revision,
+            account: None,
         }
     }
 
@@ -106,7 +108,19 @@ impl ProviderCredentialLease {
             secret,
             expires_at: Some(expires_at),
             revision,
+            account: None,
         }
+    }
+
+    /// Names the account this lease authorizes.
+    ///
+    /// For adapters whose wire protocol carries the account identity alongside
+    /// the bearer. It must come from the lease rather than from adapter
+    /// configuration: a source that can switch accounts between acquisitions
+    /// would otherwise pair one account's token with another's identity.
+    pub fn with_account(mut self, account: impl Into<String>) -> Self {
+        self.account = Some(account.into());
+        self
     }
 
     /// Reveals the wrapped secret only to the trusted provider adapter.
@@ -122,6 +136,11 @@ impl ProviderCredentialLease {
     /// The opaque revision used for exact invalidation.
     pub fn revision(&self) -> &ProviderCredentialRevision {
         &self.revision
+    }
+
+    /// The account identity bound to this lease, when the source knows it.
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
     }
 }
 
