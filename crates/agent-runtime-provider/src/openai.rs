@@ -1549,7 +1549,10 @@ mod tests {
         let events = collect(p.stream(req, ctx()).await.unwrap()).await;
 
         let ProviderStreamEvent::RateLimit { snapshot } = &events[0] else {
-            panic!("the snapshot must arrive before any output, got {:?}", events[0]);
+            panic!(
+                "the snapshot must arrive before any output, got {:?}",
+                events[0]
+            );
         };
         let window = snapshot.most_consumed().expect("a reported window");
         assert_eq!(window.used_percent_or_derived(), Some(82.0));
