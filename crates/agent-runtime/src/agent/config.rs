@@ -83,6 +83,18 @@ pub struct LoopConfig {
     /// turn. Accepted input remains process-local until a safe-boundary
     /// checkpoint commits it.
     pub steer_limits: SteerLimits,
+    /// Byte threshold at which a pending coalesced `TextDelta`/
+    /// `ReasoningDelta` buffer is flushed as one `RuntimeEvent`. A
+    /// provider's SSE decode can flush hundreds of sub-5-byte deltas within
+    /// a single millisecond; emitting one event per delta overruns the
+    /// bounded broadcast channel, so consecutive same-kind deltas are
+    /// batched up to this size before they reach it.
+    pub delta_coalesce_bytes: usize,
+    /// Time window, measured against the injected `Clock`, since a pending
+    /// coalesced delta buffer's first byte before it is flushed regardless
+    /// of size. Keeps a slow trickle (deltas arriving further apart than
+    /// this) emitting promptly instead of waiting on the byte threshold.
+    pub delta_coalesce_window_ms: u64,
 }
 
 impl LoopConfig {
@@ -104,6 +116,8 @@ impl LoopConfig {
             downgrade: DowngradePolicy::strict(),
             emit_raw_tool_arguments: false,
             steer_limits: SteerLimits::default(),
+            delta_coalesce_bytes: 512,
+            delta_coalesce_window_ms: 16,
         }
     }
 }
