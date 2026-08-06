@@ -6,6 +6,9 @@ Cargo.lock.bak
 .codegraph/
 .cursor/
 
+# macOS Finder metadata
+.DS_Store
+
 # Uncommitted local cross-repository development override (see docs/development.md).
 # The path-override file MUST NOT be committed; released builds resolve the
 # shared runtime from a tagged version, never a sibling relative path.
