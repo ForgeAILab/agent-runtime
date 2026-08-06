@@ -1,6 +1,6 @@
 //! Live, session-scoped ability views and activation epochs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 

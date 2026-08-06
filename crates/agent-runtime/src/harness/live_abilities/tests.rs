@@ -218,6 +218,116 @@ async fn capability_search_stages_only_authorized_materialized_cards_transaction
 }
 
 #[tokio::test]
+async fn concurrent_capability_searches_never_stage_the_same_ability_twice() {
+    let runtime = live_runtime_with_context(ActivationContext::new());
+    let pipeline = HarnessPipelineBuilder::new()
+        .seal()
+        .expect("empty pipeline seals");
+    let session = runtime
+        .derive_session(
+            SessionId::new("session-search-batch"),
+            None,
+            true,
+            &pipeline,
+            &BTreeMap::new(),
+            false,
+        )
+        .await
+        .expect("interactive scope derives");
+    let emitter = EventEmitter::new(
+        SessionId::new("session-search-batch"),
+        Arc::new(crate::ids::IdMinter::new()),
+        Arc::new(agent_runtime_core::clock::SystemClock),
+        Arc::from(Vec::<Arc<dyn agent_runtime_core::observer::EventObserver>>::new()),
+        1,
+        0,
+    );
+    let ask_id = RegistryId::tool(crate::harness::QUESTIONNAIRE_TOOL_NAME);
+
+    // One assistant message can emit several searches. They stage inline,
+    // before any of them commits, so the second must observe the first.
+    let first_call = ToolCallId::new("search-batch-1");
+    let second_call = ToolCallId::new("search-batch-2");
+    runtime
+        .search_and_stage(
+            &session,
+            &first_call,
+            &serde_json::json!({"query": "ask_user"}),
+            &emitter,
+            &None,
+        )
+        .expect("the first search of the batch stages");
+    let outcome = runtime
+        .search_and_stage(
+            &session,
+            &second_call,
+            &serde_json::json!({"query": "ask_user"}),
+            &emitter,
+            &None,
+        )
+        .expect("the second search of the batch succeeds");
+    assert_eq!(
+        outcome.value["staged"],
+        serde_json::json!([]),
+        "an ability another open transaction holds must not be staged again"
+    );
+    assert_eq!(
+        outcome.value["already_available"],
+        serde_json::json!([ask_id.qualified()])
+    );
+
+    // Both results commit in canonical order; neither conflicts.
+    let mut first_stage = session
+        .search_stage_guard(&first_call)
+        .expect("first staging guard exists");
+    first_stage
+        .commit()
+        .expect("first commit promotes the stage");
+    first_stage.finish();
+    let mut second_stage = session
+        .search_stage_guard(&second_call)
+        .expect("second staging guard exists");
+    second_stage
+        .commit()
+        .expect("a search that staged nothing new must not conflict with pending");
+    second_stage.finish();
+    {
+        let state = session.state.lock().expect("activation state poisoned");
+        assert!(state.staged.is_empty());
+        assert!(state.pending.contains_key(&ask_id));
+    }
+
+    // Once pending becomes active, a later search reports it as available
+    // rather than re-activating it into a duplicate epoch entry.
+    runtime.apply_pending(&session, &emitter, &None);
+    let third_call = ToolCallId::new("search-batch-3");
+    let outcome = runtime
+        .search_and_stage(
+            &session,
+            &third_call,
+            &serde_json::json!({"query": "ask_user"}),
+            &emitter,
+            &None,
+        )
+        .expect("searching for an active ability succeeds");
+    assert_eq!(outcome.value["staged"], serde_json::json!([]));
+    assert_eq!(
+        outcome.value["already_available"],
+        serde_json::json!([ask_id.qualified()])
+    );
+    let mut third_stage = session
+        .search_stage_guard(&third_call)
+        .expect("third staging guard exists");
+    third_stage
+        .commit()
+        .expect("an already-active result commits cleanly");
+    third_stage.finish();
+    let state = session.state.lock().expect("activation state poisoned");
+    assert!(state.pending.is_empty());
+    assert!(state.epochs.current().unwrap().contains(&ask_id));
+}
+
+#[tokio::test]
 async fn capability_search_returns_no_cards_or_stage_when_policy_denies_activation() {
     let ask_id = RegistryId::tool(crate::harness::QUESTIONNAIRE_TOOL_NAME);
     let runtime = live_runtime_with_context(ActivationContext::new().with_denied([ask_id.clone()]));

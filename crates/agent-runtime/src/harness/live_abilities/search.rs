@@ -63,7 +63,34 @@ impl LiveAbilityRuntime {
         );
         emit_retrieval(emitter, turn, &retrieval);
         let materialized = self.authorize_and_materialize(session, &plan, &already_active)?;
+
+        // Selection scores an ability on its own merits: `already_active` only
+        // guards conflicts and dependencies there, so a retrieval can name an
+        // ability this session already holds — including one another search in
+        // the same batch just staged. Staging it a second time would collide
+        // with the first transaction at commit and fail the whole turn, so it
+        // is reported as already available instead.
+        let held = already_active.iter().collect::<BTreeSet<_>>();
         let mut staged = BTreeMap::new();
+        let mut cards = Vec::new();
+        let mut staged_ids = Vec::new();
+        let mut already_available = Vec::new();
+        for binding in &plan.bindings {
+            let id = binding.descriptor.id();
+            let Some(payload) = materialized.get(id).cloned() else {
+                continue;
+            };
+            cards.push(binding.descriptor.card().clone());
+            if held.contains(id) {
+                already_available.push(id.qualified());
+                continue;
+            }
+            staged_ids.push(id.qualified());
+            staged.insert(
+                id.clone(),
+                (binding.descriptor.content_revision().clone(), payload),
+            );
+        }
         {
             let mut state = session.state.lock().expect("activation state poisoned");
             if state.staged.contains_key(call) {
@@ -71,30 +98,13 @@ impl LiveAbilityRuntime {
                     "search staging transaction `{call}` already exists"
                 )));
             }
-            for binding in &plan.bindings {
-                let id = binding.descriptor.id().clone();
-                if let Some(payload) = materialized.get(&id).cloned() {
-                    staged.insert(id, (binding.descriptor.content_revision().clone(), payload));
-                }
-            }
             state.staged.insert(call.clone(), staged);
         }
 
-        let cards = plan
-            .bindings
-            .iter()
-            .filter(|binding| materialized.contains_key(binding.descriptor.id()))
-            .map(|binding| binding.descriptor.card().clone())
-            .collect::<Vec<_>>();
-        let staged_ids = plan
-            .bindings
-            .iter()
-            .filter(|binding| materialized.contains_key(binding.descriptor.id()))
-            .map(|binding| binding.descriptor.id().qualified())
-            .collect::<Vec<_>>();
         Ok(ToolOutcome::json(serde_json::json!({
             "cards": cards,
             "staged": staged_ids,
+            "already_available": already_available,
             "available_on": "next_provider_request"
         })))
     }
