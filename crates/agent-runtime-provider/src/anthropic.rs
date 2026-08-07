@@ -84,6 +84,37 @@ impl AnthropicConfig {
             extra_headers: Vec::new(),
         }
     }
+
+    /// Sets the static API key for authentication.
+    pub fn with_api_key(mut self, api_key: Secret) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    /// Adds an extra HTTP header sent with every request.
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Sets the capabilities for the model.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Adds standard interleaved-thinking and fine-grained tool streaming beta headers.
+    pub fn with_interleaved_thinking(self) -> Self {
+        self.with_extra_header(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+        )
+    }
+
+    /// Preset config for Anthropic (`https://api.anthropic.com/v1`).
+    pub fn anthropic(model: impl Into<String>) -> Self {
+        Self::new("https://api.anthropic.com/v1", model)
+    }
 }
 
 /// A provider over the Anthropic Messages streaming API.
@@ -1468,5 +1499,20 @@ mod tests {
             image_source("https://example.test/a.png"),
             json!({"type": "url", "url": "https://example.test/a.png"})
         );
+    }
+
+    #[test]
+    fn anthropic_config_preset_and_builders() {
+        let cfg = AnthropicConfig::anthropic("claude-3-7-sonnet-20250219")
+            .with_api_key(Secret::new("test-key"))
+            .with_interleaved_thinking();
+
+        assert_eq!(cfg.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(cfg.model.as_str(), "claude-3-7-sonnet-20250219");
+        assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
+        assert!(cfg.extra_headers.contains(&(
+            "anthropic-beta".to_string(),
+            "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".to_string()
+        )));
     }
 }

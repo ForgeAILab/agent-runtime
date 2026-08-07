@@ -97,6 +97,24 @@ impl GeminiInteractionsConfig {
         }
     }
 
+    /// Sets the static API key for authentication.
+    pub fn with_api_key(mut self, api_key: Secret) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    /// Sets the capabilities for the model.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Overrides the prompt cache control declared in capabilities.
+    pub fn with_prompt_cache(mut self, cache: PromptCacheControl) -> Self {
+        self.capabilities.prompt_cache = cache;
+        self
+    }
+
     /// Sets the bounded native thinking levels resolved by the host catalog.
     pub fn with_supported_thinking_levels(
         mut self,
@@ -104,6 +122,11 @@ impl GeminiInteractionsConfig {
     ) -> Self {
         self.supported_thinking_levels = levels.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Preset config for Google AI Studio (`https://generativelanguage.googleapis.com/v1beta`).
+    pub fn google(model: impl Into<String>) -> Self {
+        Self::new("https://generativelanguage.googleapis.com/v1beta", model)
     }
 }
 
@@ -2303,5 +2326,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn gemini_config_preset_and_builders() {
+        let cfg = GeminiInteractionsConfig::google("gemini-2.5-flash")
+            .with_api_key(Secret::new("test-key"))
+            .with_supported_thinking_levels(["low", "high"]);
+
+        assert_eq!(cfg.base_url, "https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(cfg.model.as_str(), "gemini-2.5-flash");
+        assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
+        assert_eq!(cfg.supported_thinking_levels, vec!["low", "high"]);
     }
 }

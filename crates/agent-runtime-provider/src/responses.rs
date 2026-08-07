@@ -117,6 +117,35 @@ impl ResponsesConfig {
             extra_headers: Vec::new(),
         }
     }
+
+    /// Sets the static API key for authentication.
+    pub fn with_api_key(mut self, api_key: Secret) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    /// Adds an extra HTTP header sent with every request.
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Sets the capabilities for the model.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Overrides the prompt cache control declared in capabilities.
+    pub fn with_prompt_cache(mut self, cache: PromptCacheControl) -> Self {
+        self.capabilities.prompt_cache = cache;
+        self
+    }
+
+    /// Preset config for xAI Grok Responses (`https://api.x.ai/v1`).
+    pub fn xai(model: impl Into<String>) -> Self {
+        Self::new("https://api.x.ai/v1", model)
+    }
 }
 
 /// A native, stateless OpenAI Responses provider over injected HTTP.
@@ -2230,5 +2259,17 @@ mod tests {
         assert!(
             matches!(stream.next().await, Some(ProviderStreamEvent::Error { error }) if error.kind == ProviderErrorKind::Cancelled)
         );
+    }
+
+    #[test]
+    fn responses_config_preset_and_builders() {
+        let cfg = ResponsesConfig::xai("grok-4.5")
+            .with_api_key(Secret::new("test-key"))
+            .with_extra_header("X-Custom", "value");
+
+        assert_eq!(cfg.base_url, "https://api.x.ai/v1");
+        assert_eq!(cfg.model.as_str(), "grok-4.5");
+        assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
+        assert!(cfg.extra_headers.contains(&("X-Custom".to_string(), "value".to_string())));
     }
 }

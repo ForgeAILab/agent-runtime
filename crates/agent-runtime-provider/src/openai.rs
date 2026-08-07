@@ -89,6 +89,151 @@ impl OpenAiConfig {
             extra_headers: Vec::new(),
         }
     }
+
+    /// Sets the static API key for authentication.
+    pub fn with_api_key(mut self, api_key: Secret) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    /// Adds an extra HTTP header sent with every request.
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Sets the capabilities for the model.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Overrides the prompt cache control declared in capabilities.
+    pub fn with_prompt_cache(mut self, cache: PromptCacheControl) -> Self {
+        self.capabilities.prompt_cache = cache;
+        self
+    }
+
+    /// Preset config for OpenAI (`https://api.openai.com/v1`).
+    pub fn openai(model: impl Into<String>) -> Self {
+        Self::new("https://api.openai.com/v1", model)
+    }
+
+    /// Preset config for OpenRouter (`https://openrouter.ai/api/v1`).
+    pub fn openrouter(model: impl Into<String>) -> Self {
+        Self::new("https://openrouter.ai/api/v1", model)
+            .with_extra_header("HTTP-Referer", "https://opencode.ai/")
+            .with_extra_header("X-Title", "opencode")
+    }
+
+    /// Preset config for Groq (`https://api.groq.com/openai/v1`).
+    pub fn groq(model: impl Into<String>) -> Self {
+        Self::new("https://api.groq.com/openai/v1", model)
+    }
+
+    /// Preset config for DeepSeek (`https://api.deepseek.com/v1`).
+    pub fn deepseek(model: impl Into<String>) -> Self {
+        Self::new("https://api.deepseek.com/v1", model)
+    }
+
+    /// Preset config for DeepInfra (`https://api.deepinfra.com/v1/openai`).
+    pub fn deepinfra(model: impl Into<String>) -> Self {
+        Self::new("https://api.deepinfra.com/v1/openai", model)
+    }
+
+    /// Preset config for Together AI (`https://api.together.xyz/v1`).
+    pub fn togetherai(model: impl Into<String>) -> Self {
+        Self::new("https://api.together.xyz/v1", model)
+    }
+
+    /// Preset config for Fireworks AI (`https://api.fireworks.ai/inference/v1`).
+    pub fn fireworks(model: impl Into<String>) -> Self {
+        Self::new("https://api.fireworks.ai/inference/v1", model)
+    }
+
+    /// Preset config for Cerebras (`https://api.cerebras.ai/v1`).
+    pub fn cerebras(model: impl Into<String>) -> Self {
+        Self::new("https://api.cerebras.ai/v1", model)
+            .with_extra_header("X-Cerebras-3rd-Party-Integration", "opencode")
+    }
+
+    /// Preset config for Perplexity (`https://api.perplexity.ai`).
+    pub fn perplexity(model: impl Into<String>) -> Self {
+        Self::new("https://api.perplexity.ai", model)
+    }
+
+    /// Preset config for Mistral AI (`https://api.mistral.ai/v1`).
+    pub fn mistral(model: impl Into<String>) -> Self {
+        Self::new("https://api.mistral.ai/v1", model)
+    }
+
+    /// Preset config for Baseten (`https://inference.baseten.co/v1`).
+    pub fn baseten(model: impl Into<String>) -> Self {
+        Self::new("https://inference.baseten.co/v1", model)
+    }
+
+    /// Preset config for Nvidia NIM (`https://integrate.api.nvidia.com/v1`).
+    pub fn nvidia(model: impl Into<String>) -> Self {
+        Self::new("https://integrate.api.nvidia.com/v1", model)
+            .with_extra_header("X-BILLING-INVOKE-ORIGIN", "OpenCode")
+    }
+
+    /// Preset config for Kilo AI (`https://api.kilo.ai/api/gateway`).
+    pub fn kilo(model: impl Into<String>) -> Self {
+        Self::new("https://api.kilo.ai/api/gateway", model)
+            .with_extra_header("HTTP-Referer", "https://opencode.ai/")
+            .with_extra_header("X-Title", "opencode")
+    }
+
+    /// Preset config for ZenMux (`https://zenmux.ai/api/v1`).
+    pub fn zenmux(model: impl Into<String>) -> Self {
+        Self::new("https://zenmux.ai/api/v1", model)
+            .with_extra_header("HTTP-Referer", "https://opencode.ai/")
+            .with_extra_header("X-Title", "opencode")
+    }
+
+    /// Preset config for LLM Gateway (`https://api.llmgateway.io/v1`).
+    pub fn llmgateway(model: impl Into<String>) -> Self {
+        Self::new("https://api.llmgateway.io/v1", model)
+            .with_extra_header("HTTP-Referer", "https://opencode.ai/")
+            .with_extra_header("X-Title", "opencode")
+            .with_extra_header("X-Source", "opencode")
+    }
+
+    /// Preset config for Cloudflare AI Gateway.
+    pub fn cloudflare_ai_gateway(
+        account_id: impl AsRef<str>,
+        gateway_id: impl AsRef<str>,
+        model: impl Into<String>,
+    ) -> Self {
+        let url = format!(
+            "https://gateway.ai.cloudflare.com/v1/{}/{}/compat",
+            account_id.as_ref(),
+            gateway_id.as_ref()
+        );
+        Self::new(url, model)
+    }
+
+    /// Preset config for Cloudflare Workers AI.
+    pub fn cloudflare_workers_ai(
+        account_id: impl AsRef<str>,
+        model: impl Into<String>,
+    ) -> Self {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1",
+            account_id.as_ref()
+        );
+        Self::new(url, model)
+    }
+
+    /// Preset config for Azure OpenAI (`https://{resource_name}.openai.azure.com/openai/v1`).
+    pub fn azure(resource_name: impl AsRef<str>, model: impl Into<String>) -> Self {
+        let url = format!(
+            "https://{}.openai.azure.com/openai/v1",
+            resource_name.as_ref().trim()
+        );
+        Self::new(url, model)
+    }
 }
 
 /// A provider over the OpenAI Chat-Completions streaming API.
@@ -1972,5 +2117,43 @@ mod tests {
                 reason: FinishReason::ToolCalls
             }
         )));
+    }
+
+    #[test]
+    fn openai_config_presets_and_fluent_builders() {
+        let cfg = OpenAiConfig::openrouter("anthropic/claude-3.7-sonnet")
+            .with_api_key(Secret::new("test-key"))
+            .with_prompt_cache(PromptCacheControl::None);
+
+        assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cfg.model.as_str(), "anthropic/claude-3.7-sonnet");
+        assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
+        assert_eq!(cfg.capabilities.prompt_cache, PromptCacheControl::None);
+        assert!(cfg.extra_headers.contains(&("HTTP-Referer".to_string(), "https://opencode.ai/".to_string())));
+        assert!(cfg.extra_headers.contains(&("X-Title".to_string(), "opencode".to_string())));
+
+        assert_eq!(OpenAiConfig::openai("gpt-4o").base_url, "https://api.openai.com/v1");
+        assert_eq!(OpenAiConfig::groq("llama3").base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(OpenAiConfig::deepseek("deepseek-chat").base_url, "https://api.deepseek.com/v1");
+        assert_eq!(OpenAiConfig::deepinfra("meta-llama/Llama-3-70b-instruct").base_url, "https://api.deepinfra.com/v1/openai");
+        assert_eq!(OpenAiConfig::togetherai("mistralai/Mixtral-8x7B-Instruct-v0.1").base_url, "https://api.together.xyz/v1");
+        assert_eq!(OpenAiConfig::fireworks("accounts/fireworks/models/llama-v3-70b-instruct").base_url, "https://api.fireworks.ai/inference/v1");
+        assert_eq!(OpenAiConfig::cerebras("llama3.1-70b").base_url, "https://api.cerebras.ai/v1");
+        assert_eq!(OpenAiConfig::perplexity("sonar").base_url, "https://api.perplexity.ai");
+        assert_eq!(OpenAiConfig::mistral("mistral-large-latest").base_url, "https://api.mistral.ai/v1");
+        assert_eq!(OpenAiConfig::baseten("model-id").base_url, "https://inference.baseten.co/v1");
+        assert_eq!(OpenAiConfig::nvidia("nvidia/llama-3.1-nemotron-70b-instruct").base_url, "https://integrate.api.nvidia.com/v1");
+        assert_eq!(OpenAiConfig::kilo("kilo-model").base_url, "https://api.kilo.ai/api/gateway");
+        assert_eq!(OpenAiConfig::zenmux("zen-model").base_url, "https://zenmux.ai/api/v1");
+        assert_eq!(OpenAiConfig::llmgateway("llm-model").base_url, "https://api.llmgateway.io/v1");
+
+        let cf_gateway = OpenAiConfig::cloudflare_ai_gateway("acc123", "gw456", "model");
+        assert_eq!(cf_gateway.base_url, "https://gateway.ai.cloudflare.com/v1/acc123/gw456/compat");
+
+        let cf_workers = OpenAiConfig::cloudflare_workers_ai("acc123", "@cf/meta/llama-3-8b-instruct");
+        assert_eq!(cf_workers.base_url, "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1");
+
+        let azure = OpenAiConfig::azure("my-resource", "gpt-4o");
+        assert_eq!(azure.base_url, "https://my-resource.openai.azure.com/openai/v1");
     }
 }
