@@ -1231,10 +1231,16 @@ mod tests {
 
         let raw_perm = "cannot write /path/to/file: Permission denied (os error 13)";
         let cleaned_perm = sanitize_tool_error_message(raw_perm);
-        assert_eq!(cleaned_perm, "cannot write /path/to/file: permission denied");
+        assert_eq!(
+            cleaned_perm,
+            "cannot write /path/to/file: permission denied"
+        );
 
-        let outcome = ToolOutcome::error("cannot read /lib.rs: No such file or directory (os error 2)");
-        let Value::String(msg) = &outcome.value else { panic!("expected string"); };
+        let outcome =
+            ToolOutcome::error("cannot read /lib.rs: No such file or directory (os error 2)");
+        let Value::String(msg) = &outcome.value else {
+            panic!("expected string");
+        };
         assert_eq!(msg, "cannot read /lib.rs: file not found");
     }
 }
