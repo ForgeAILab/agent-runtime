@@ -38,7 +38,9 @@ tokio = { version = "1", default-features = false, features = ["sync", "rt", "ma
 tokio-util = { version = "0.7", default-features = false }
 pin-project-lite = "0.2"
 jsonschema = { version = "=0.28.3", default-features = false }
-uuid = { version = "=1.19.0", features = ["v4"] }
+# A caret requirement, not `=`: an exact pin here propagates to every embedding
+# host's lock file and forces their whole workspace onto one uuid patch release.
+uuid = { version = "1.19", features = ["v4"] }
 sha2 = { version = "0.10", default-features = false }
 
 # Internal workspace crates (path + version so a future tagged release resolves).
