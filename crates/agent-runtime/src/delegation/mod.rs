@@ -41,7 +41,7 @@ use agent_runtime_core::artifact::{ArtifactRef, ArtifactStore, ArtifactTransfer}
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::checkpoint::{CheckpointStore, CheckpointWatermark, TurnState};
 use agent_runtime_core::clock::{Deadline, Timestamp};
-use agent_runtime_core::content::UserInput;
+use agent_runtime_core::content::{Message, UserInput};
 use agent_runtime_core::delegation::{ChildSpec, ToolViewScope, WorkspacePolicy};
 use agent_runtime_core::error::{ErrorKind, RuntimeError};
 use agent_runtime_core::event::{ChildPhase, ChildRecoveryState, RuntimeEvent, TurnFinish};
@@ -59,6 +59,7 @@ use agent_runtime_registry::{Fingerprint, Permission, RegistryRevision, TrustCla
 
 use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::command::CheckpointRecoveryPolicy;
+use crate::runtime::emitter::RuntimeEventStream;
 use crate::runtime::engine::Runtime;
 use crate::runtime::session::{SessionHandle, TurnHandle};
 use crate::runtime::state::returned_interaction_from_state;

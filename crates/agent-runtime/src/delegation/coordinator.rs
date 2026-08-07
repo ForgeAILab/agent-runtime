@@ -249,6 +249,65 @@ impl DelegationCoordinator {
         Ok(self.status(child)?.last_result)
     }
 
+    /// Subscribes to one live child's own event stream.
+    ///
+    /// A child is a full runtime session, and this is its stream — the same
+    /// vocabulary the parent's own subscribers receive, for the child. It is
+    /// the presentation channel [`SpawnOutcome::Spawned`] hands out at spawn
+    /// time, reachable afterwards by id, because a host that renders children
+    /// learns about them from the parent stream rather than from the tool
+    /// call that created them.
+    ///
+    /// The parent stream stays what it is: delegation's boundaries, attributed
+    /// to the child. Neither channel is a summary of the other.
+    ///
+    /// `None` for an unknown child and for a durable one with no live binding.
+    /// A subscriber joins at the current position, so events emitted before it
+    /// subscribed are not replayed; [`Self::with_child_history`] is the
+    /// canonical record for what came before.
+    pub fn child_events(&self, child: &ChildId) -> Option<RuntimeEventStream> {
+        let handle = self
+            .inner
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .get(child)
+            .and_then(ChildEntry::handle)?;
+        Some(handle.subscribe())
+    }
+
+    /// Runs `f` over one live child's canonical history without cloning it.
+    ///
+    /// Lifecycle events about a child are identifiers only, by design: a
+    /// parent that wants to *show* what its child did — a tool call's
+    /// arguments, a result's text — resolves those identifiers here, against
+    /// the child's own canonical history, and applies its own redaction.
+    /// Exactly how a host resolves its own session's events.
+    ///
+    /// `None` for an unknown child and for a durable one with no live
+    /// binding: a dormant record's history lives in the session store, not in
+    /// this process, and inventing one here would be a lie.
+    ///
+    /// The child's session state lock is held while `f` runs, so `f` must
+    /// stay a short synchronous projection.
+    pub fn with_child_history<R>(
+        &self,
+        child: &ChildId,
+        f: impl FnOnce(&[Message]) -> R,
+    ) -> Option<R> {
+        // The handle is cloned out from under the children lock rather than
+        // used beneath it: `with_history` takes the child session's state
+        // lock, and nesting the two is how a deadlock gets written.
+        let handle = self
+            .inner
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .get(child)
+            .and_then(ChildEntry::handle)?;
+        Some(handle.with_history(f))
+    }
+
     /// Observes the current exact task outcome for `child` without consuming
     /// either host-waiter or automatic model-delivery readiness.
     pub fn task_outcome(&self, child: &ChildId) -> Result<Option<ChildTaskOutcome>, RuntimeError> {

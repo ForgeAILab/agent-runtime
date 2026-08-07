@@ -93,16 +93,15 @@ impl DelegationCoordinator {
             let mut terminal = false;
             while let Some(envelope) = events.next().await {
                 match envelope.payload {
+                    // A child's tool activity is deliberately not mirrored
+                    // here. The parent stream carries delegation's
+                    // boundaries; what the child *did* is presentation, and
+                    // presentation has its own channel — the child's own
+                    // event stream, which a host takes with
+                    // [`DelegationCoordinator::child_events`]. Re-narrating
+                    // it here would mean re-deriving, event by event, a
+                    // vocabulary the child already speaks in full.
                     RuntimeEvent::TurnStarted => {}
-                    RuntimeEvent::ToolCallCompleted { name, .. } => {
-                        parent_emitter.emit(
-                            None,
-                            RuntimeEvent::ChildProgress {
-                                child: child.clone(),
-                                phase: ChildPhase::ToolCall { name },
-                            },
-                        );
-                    }
                     RuntimeEvent::Usage { record } => {
                         tokens_used = tokens_used
                             .saturating_add(record.delta.get(CounterKind::InputUncached))

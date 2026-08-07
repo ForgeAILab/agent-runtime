@@ -86,7 +86,14 @@ use crate::usage::UsageRecord;
 /// persistent-goal projections.
 ///
 /// Bumped to 11 for privacy-safe active-turn steering dispositions.
-pub const SCHEMA_VERSION: u32 = 11;
+///
+/// Bumped to 12 because a delegated child's tool activity left the parent
+/// stream: `ChildPhase::ToolCall` is gone. The parent stream carries
+/// delegation's boundaries, and a host that wants to show what a child did
+/// subscribes to the child's own stream through
+/// `DelegationCoordinator::child_events` — the full vocabulary, rather than a
+/// summary of it re-derived one variant at a time.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,11 +232,6 @@ pub enum BudgetCategory {
 pub enum ChildPhase {
     /// The child began a turn.
     TurnStarted,
-    /// The child completed a tool call.
-    ToolCall {
-        /// The tool's name.
-        name: String,
-    },
     /// The child finished a turn (its task outcome follows separately).
     TurnFinished,
     /// A durable child record was rebound to its parent without executing it.
