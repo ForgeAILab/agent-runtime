@@ -215,10 +215,7 @@ impl OpenAiConfig {
     }
 
     /// Preset config for Cloudflare Workers AI.
-    pub fn cloudflare_workers_ai(
-        account_id: impl AsRef<str>,
-        model: impl Into<String>,
-    ) -> Self {
+    pub fn cloudflare_workers_ai(account_id: impl AsRef<str>, model: impl Into<String>) -> Self {
         let url = format!(
             "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1",
             account_id.as_ref()
@@ -2129,31 +2126,89 @@ mod tests {
         assert_eq!(cfg.model.as_str(), "anthropic/claude-3.7-sonnet");
         assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
         assert_eq!(cfg.capabilities.prompt_cache, PromptCacheControl::None);
-        assert!(cfg.extra_headers.contains(&("HTTP-Referer".to_string(), "https://opencode.ai/".to_string())));
-        assert!(cfg.extra_headers.contains(&("X-Title".to_string(), "opencode".to_string())));
+        assert!(cfg.extra_headers.contains(&(
+            "HTTP-Referer".to_string(),
+            "https://opencode.ai/".to_string()
+        )));
+        assert!(
+            cfg.extra_headers
+                .contains(&("X-Title".to_string(), "opencode".to_string()))
+        );
 
-        assert_eq!(OpenAiConfig::openai("gpt-4o").base_url, "https://api.openai.com/v1");
-        assert_eq!(OpenAiConfig::groq("llama3").base_url, "https://api.groq.com/openai/v1");
-        assert_eq!(OpenAiConfig::deepseek("deepseek-chat").base_url, "https://api.deepseek.com/v1");
-        assert_eq!(OpenAiConfig::deepinfra("meta-llama/Llama-3-70b-instruct").base_url, "https://api.deepinfra.com/v1/openai");
-        assert_eq!(OpenAiConfig::togetherai("mistralai/Mixtral-8x7B-Instruct-v0.1").base_url, "https://api.together.xyz/v1");
-        assert_eq!(OpenAiConfig::fireworks("accounts/fireworks/models/llama-v3-70b-instruct").base_url, "https://api.fireworks.ai/inference/v1");
-        assert_eq!(OpenAiConfig::cerebras("llama3.1-70b").base_url, "https://api.cerebras.ai/v1");
-        assert_eq!(OpenAiConfig::perplexity("sonar").base_url, "https://api.perplexity.ai");
-        assert_eq!(OpenAiConfig::mistral("mistral-large-latest").base_url, "https://api.mistral.ai/v1");
-        assert_eq!(OpenAiConfig::baseten("model-id").base_url, "https://inference.baseten.co/v1");
-        assert_eq!(OpenAiConfig::nvidia("nvidia/llama-3.1-nemotron-70b-instruct").base_url, "https://integrate.api.nvidia.com/v1");
-        assert_eq!(OpenAiConfig::kilo("kilo-model").base_url, "https://api.kilo.ai/api/gateway");
-        assert_eq!(OpenAiConfig::zenmux("zen-model").base_url, "https://zenmux.ai/api/v1");
-        assert_eq!(OpenAiConfig::llmgateway("llm-model").base_url, "https://api.llmgateway.io/v1");
+        assert_eq!(
+            OpenAiConfig::openai("gpt-4o").base_url,
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::groq("llama3").base_url,
+            "https://api.groq.com/openai/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::deepseek("deepseek-chat").base_url,
+            "https://api.deepseek.com/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::deepinfra("meta-llama/Llama-3-70b-instruct").base_url,
+            "https://api.deepinfra.com/v1/openai"
+        );
+        assert_eq!(
+            OpenAiConfig::togetherai("mistralai/Mixtral-8x7B-Instruct-v0.1").base_url,
+            "https://api.together.xyz/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::fireworks("accounts/fireworks/models/llama-v3-70b-instruct").base_url,
+            "https://api.fireworks.ai/inference/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::cerebras("llama3.1-70b").base_url,
+            "https://api.cerebras.ai/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::perplexity("sonar").base_url,
+            "https://api.perplexity.ai"
+        );
+        assert_eq!(
+            OpenAiConfig::mistral("mistral-large-latest").base_url,
+            "https://api.mistral.ai/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::baseten("model-id").base_url,
+            "https://inference.baseten.co/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::nvidia("nvidia/llama-3.1-nemotron-70b-instruct").base_url,
+            "https://integrate.api.nvidia.com/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::kilo("kilo-model").base_url,
+            "https://api.kilo.ai/api/gateway"
+        );
+        assert_eq!(
+            OpenAiConfig::zenmux("zen-model").base_url,
+            "https://zenmux.ai/api/v1"
+        );
+        assert_eq!(
+            OpenAiConfig::llmgateway("llm-model").base_url,
+            "https://api.llmgateway.io/v1"
+        );
 
         let cf_gateway = OpenAiConfig::cloudflare_ai_gateway("acc123", "gw456", "model");
-        assert_eq!(cf_gateway.base_url, "https://gateway.ai.cloudflare.com/v1/acc123/gw456/compat");
+        assert_eq!(
+            cf_gateway.base_url,
+            "https://gateway.ai.cloudflare.com/v1/acc123/gw456/compat"
+        );
 
-        let cf_workers = OpenAiConfig::cloudflare_workers_ai("acc123", "@cf/meta/llama-3-8b-instruct");
-        assert_eq!(cf_workers.base_url, "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1");
+        let cf_workers =
+            OpenAiConfig::cloudflare_workers_ai("acc123", "@cf/meta/llama-3-8b-instruct");
+        assert_eq!(
+            cf_workers.base_url,
+            "https://api.cloudflare.com/client/v4/accounts/acc123/ai/v1"
+        );
 
         let azure = OpenAiConfig::azure("my-resource", "gpt-4o");
-        assert_eq!(azure.base_url, "https://my-resource.openai.azure.com/openai/v1");
+        assert_eq!(
+            azure.base_url,
+            "https://my-resource.openai.azure.com/openai/v1"
+        );
     }
 }

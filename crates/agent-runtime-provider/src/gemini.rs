@@ -2334,7 +2334,10 @@ mod tests {
             .with_api_key(Secret::new("test-key"))
             .with_supported_thinking_levels(["low", "high"]);
 
-        assert_eq!(cfg.base_url, "https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(
+            cfg.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
         assert_eq!(cfg.model.as_str(), "gemini-2.5-flash");
         assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
         assert_eq!(cfg.supported_thinking_levels, vec!["low", "high"]);

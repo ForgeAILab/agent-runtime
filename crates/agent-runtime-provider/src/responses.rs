@@ -2270,6 +2270,9 @@ mod tests {
         assert_eq!(cfg.base_url, "https://api.x.ai/v1");
         assert_eq!(cfg.model.as_str(), "grok-4.5");
         assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
-        assert!(cfg.extra_headers.contains(&("X-Custom".to_string(), "value".to_string())));
+        assert!(
+            cfg.extra_headers
+                .contains(&("X-Custom".to_string(), "value".to_string()))
+        );
     }
 }
