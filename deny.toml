@@ -18,6 +18,11 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # Covers `webpki-root-certs`, the Mozilla CA root bundle reached through
+    # reqwest when `agent-runtime-mcp/http` is enabled. CDLA-Permissive-2.0 is a
+    # permissive *data* license with no copyleft and no attribution burden; it
+    # applies to the certificate bundle, not to any code in this workspace.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

@@ -8,6 +8,7 @@ members = [
     "crates/agent-runtime-context",
     "crates/agent-runtime-obs",
     "crates/agent-runtime",
+    "crates/agent-runtime-mcp",
     "crates/agent-runtime-testkit",
 ]
 
@@ -51,6 +52,7 @@ agent-runtime-provider = { path = "crates/agent-runtime-provider", version = "0.
 agent-runtime-context = { path = "crates/agent-runtime-context", version = "0.1.0" }
 agent-runtime-obs = { path = "crates/agent-runtime-obs", version = "0.1.0" }
 agent-runtime = { path = "crates/agent-runtime", version = "0.1.0" }
+agent-runtime-mcp = { path = "crates/agent-runtime-mcp", version = "0.1.0" }
 agent-runtime-testkit = { path = "crates/agent-runtime-testkit", version = "0.1.0" }
 
 # Clippy-as-error at the workspace level. CI additionally runs

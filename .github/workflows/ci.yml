@@ -47,6 +47,9 @@ jobs:
   # Every production package is listed explicitly. A partial list is how an
   # MSRV violation reaches a release: a `let`-chain in a package nobody built
   # on 1.86 compiles fine on stable and fails only for the consumer.
+  #
+  # `agent-runtime-mcp` is deliberately absent: `rmcp` declares 1.88, so the
+  # package declares 1.88 too and is verified by the `msrv-mcp` job below.
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -72,6 +75,17 @@ jobs:
           -p agent-runtime-context
           -p agent-runtime-obs
           -p agent-runtime
+
+  # The MCP client's own declared minimum, which its MCP protocol dependency
+  # pushes above the workspace's. Verified separately so the 1.86 promise the
+  # rest of the workspace makes stays a promise nobody quietly broke.
+  msrv-mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: build the MCP client on its declared MSRV
+        run: cargo build --all-features -p agent-runtime-mcp
 
   # Default-feature dependency boundaries (package-architecture: "Dependency-light
   # registry and ability packages"). These are contracts, not preferences: a

@@ -1,0 +1,58 @@
+[package]
+name = "agent-runtime-mcp"
+description = "Model Context Protocol client that publishes a server's tools as agent-runtime abilities."
+version.workspace = true
+edition.workspace = true
+# Above the workspace's 1.86: `rmcp` declares 1.88, and a package cannot promise
+# a compiler older than the one its dependency needs. The contract asks for
+# "1.86 or newer", so this is a declaration, not a violation — but it does mean
+# a host that pins 1.86 can take every other package here and not this one.
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The local child-process transport is the default: nearly every MCP server is
+# a local command, and it carries the lighter dependency set.
+default = ["stdio"]
+# Spawn a server as a child process and speak the protocol over its stdio.
+stdio = ["rmcp/transport-child-process"]
+# Reach a server over streamable HTTP. Pulls a TLS-capable HTTP client, so it
+# stays opt-in. `dep:http` is only for building the header names and values the
+# transport config takes.
+http = [
+    "rmcp/transport-streamable-http-client-reqwest",
+    "rmcp/reqwest",
+    "dep:http",
+]
+
+[dependencies]
+agent-runtime-ability = { workspace = true, features = ["tool", "serde"] }
+agent-runtime-core = { workspace = true }
+agent-runtime-registry = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+# `default-features = false` drops rmcp's server, macro, and schemars surface:
+# this package is a client and nothing else. Transports arrive through the
+# feature table above, so a host that never enables one never builds one.
+rmcp = { version = "3.1", default-features = false, features = ["client"] }
+http = { version = "1", optional = true }
+
+[dev-dependencies]
+# The in-process fake server the conformance suite runs against. `server` and
+# `transport-async-rw` are dev-only: a duplex stream needs no child process and
+# no socket, which is what keeps the default test run hermetic.
+rmcp = { version = "3.1", default-features = false, features = [
+    "client",
+    "server",
+    "transport-async-rw",
+] }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }
