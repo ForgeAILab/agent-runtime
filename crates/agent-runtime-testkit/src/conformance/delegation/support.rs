@@ -1,4 +1,3 @@
-
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,13 +6,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 
 use agent_runtime::delegation::{
-    CHILD_CATALOG_NAMESPACE, CapacityPolicy, ChildDurability, ChildRuntimeFactory,
-    ChildSessionRecord, ChildState, ChildStatus, ChildTaskOutcome, ChildTaskResult,
+    CHILD_CATALOG_NAMESPACE, CapacityPolicy, ChildCompletionAdmission,
+    ChildCompletionAdmissionRequest, ChildDurability, ChildRuntimeFactory, ChildSessionRecord,
+    ChildState, ChildStatus, ChildTaskOutcome, ChildTaskResult, DEFAULT_DELEGATION_WAIT,
     DELEGATION_PERMISSION, DelegationConfig, DelegationCoordinator, DelegationLimits,
-    DurableChildCatalog, DurableChildSpec, SpawnOutcome,
+    DurableChildCatalog, DurableChildSpec, HARD_MAX_DELEGATION_WAIT, SpawnOutcome,
 };
 use agent_runtime::harness::{ArtifactOffloader, QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
 use agent_runtime::provider::fake::{
@@ -22,15 +22,16 @@ use agent_runtime::provider::fake::{
 use agent_runtime::registry::{Fingerprint, Permission};
 use agent_runtime::runtime::{Runtime, RuntimeBuilder, SessionHandle, StartSession};
 use agent_runtime_core::artifact::{
-    ArtifactChunk, ArtifactDigest, ArtifactError, ArtifactId, ArtifactRead, ArtifactRef,
-    ArtifactStore, ArtifactWrite, MAX_ARTIFACT_READ_BYTES,
+    ArtifactChunk, ArtifactDigest, ArtifactError, ArtifactId, ArtifactLineage, ArtifactProvenance,
+    ArtifactRead, ArtifactRef, ArtifactRetention, ArtifactSensitivity, ArtifactStore,
+    ArtifactTransfer, ArtifactWrite, MAX_ARTIFACT_READ_BYTES,
 };
-use agent_runtime_core::cancel::Cancellation;
+use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
 use agent_runtime_core::check_set::ActionClass;
 use agent_runtime_core::checkpoint::{CheckpointStore, TurnCheckpoint, TurnState};
-use agent_runtime_core::clock::{Deadline, Timestamp};
-use agent_runtime_core::content::UserInput;
+use agent_runtime_core::clock::{Clock, Deadline, SystemClock, Timestamp};
+use agent_runtime_core::content::{ContentPart, UserInput};
 use agent_runtime_core::delegation::{
     ChildLimits, ChildModelSelection, ChildSpec, ToolViewScope, WorkspacePolicy,
 };
@@ -40,6 +41,7 @@ use agent_runtime_core::grant::{
     GrantConstraints, SecurityCheck, SecurityCheckId, SecurityCheckMode, SecurityCheckOutcome,
     SecurityCheckRevision,
 };
+use agent_runtime_core::ids::{SessionId, TurnId};
 use agent_runtime_core::interaction::{InteractionOrigin, InteractionRequest, InteractionResponse};
 use agent_runtime_core::provider::{
     Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
@@ -50,7 +52,8 @@ use agent_runtime_core::store::{
     SessionIdentityState, SessionSnapshot, SessionStore, VersionedSessionState,
 };
 use agent_runtime_core::tool::{
-    InvocationContext, LegacyTool, PreparedToolCall, Tool, ToolEffects, ToolOutcome, ToolSpec,
+    InvocationContext, LegacyTool, PreparedToolCall, Tool, ToolContent, ToolEffects, ToolOutcome,
+    ToolSpec,
 };
 use agent_runtime_core::usage::UsageLedger;
 
@@ -94,9 +97,48 @@ impl SecurityCheck for AllowAllCheck {
 /// check set has authoritative coverage for the delegation permission —
 /// withholding it proves the default-deny posture.
 pub async fn parent_session(covered: bool) -> (Runtime, SessionHandle) {
+    parent_session_with_provider_and_clock(
+        covered,
+        Arc::new(FakeProvider::text_reply("parent")),
+        Arc::new(SystemClock),
+    )
+    .await
+}
+
+/// A parent runtime and session using an injected clock.  Delegation wait
+/// tests use this seam so a configured timeout can be advanced without
+/// sleeping for the production default.
+pub async fn parent_session_with_clock(
+    covered: bool,
+    clock: Arc<dyn Clock>,
+) -> (Runtime, SessionHandle) {
+    parent_session_with_provider_and_clock(
+        covered,
+        Arc::new(FakeProvider::text_reply("parent")),
+        clock,
+    )
+    .await
+}
+
+/// A parent runtime and session using a test-supplied provider.  Admission
+/// race fixtures use a blocking provider so the winning user turn remains
+/// active while the lower-priority child continuation evaluates the boundary.
+pub async fn parent_session_with_provider(
+    covered: bool,
+    provider: Arc<dyn Provider>,
+) -> (Runtime, SessionHandle) {
+    parent_session_with_provider_and_clock(covered, provider, Arc::new(SystemClock)).await
+}
+
+async fn parent_session_with_provider_and_clock(
+    covered: bool,
+    provider: Arc<dyn Provider>,
+    clock: Arc<dyn Clock>,
+) -> (Runtime, SessionHandle) {
     let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
-        .provider(Arc::new(FakeProvider::text_reply("parent")))
-        .model_profile(profile());
+        .provider(provider)
+        .model_profile(profile())
+        .clock(clock);
     if covered {
         builder = builder.security_check(
             Arc::new(AllowAllCheck {
@@ -144,6 +186,71 @@ async fn durable_parent_session(
     (runtime, session)
 }
 
+/// Parent-scoped SessionStore failure injection used by bind rollback tests.
+/// Child-session writes pass through normally, so the failure lands on the
+/// parent catalog save after a provider/runtime has been reconstructed.
+#[derive(Debug)]
+pub struct FailNextParentSessionStore {
+    pub inner: Arc<crate::InMemorySessionStore>,
+    parent: agent_runtime_core::ids::SessionId,
+    remaining_failures: AtomicUsize,
+}
+
+impl FailNextParentSessionStore {
+    pub fn new(
+        inner: Arc<crate::InMemorySessionStore>,
+        parent: agent_runtime_core::ids::SessionId,
+    ) -> Self {
+        Self {
+            inner,
+            parent,
+            remaining_failures: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn fail_next_parent_save(&self) {
+        self.fail_parent_saves(1);
+    }
+
+    pub fn fail_parent_saves(&self, count: usize) {
+        self.remaining_failures.store(count, Ordering::Release);
+    }
+
+    pub fn clear_failures(&self) {
+        self.remaining_failures.store(0, Ordering::Release);
+    }
+}
+
+#[async_trait]
+impl SessionStore for FailNextParentSessionStore {
+    async fn load(
+        &self,
+        id: &agent_runtime_core::ids::SessionId,
+    ) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        self.inner.load(id).await
+    }
+
+    async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+        let should_fail = snapshot.id == self.parent
+            && self
+                .remaining_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+        if should_fail {
+            return Err(RuntimeError::conflict(
+                "injected parent SessionStore save failure",
+            ));
+        }
+        self.inner.save(snapshot).await
+    }
+}
+
 /// A factory serving one scripted provider per child, in order, registering
 /// `tools` on every child builder. Keeps each child's provider so suites can
 /// assert what its scoped view advertised.
@@ -157,6 +264,7 @@ pub struct ScriptedChildFactory {
     session_store: Option<Arc<dyn SessionStore>>,
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     policy_salt: String,
+    policy_fingerprint_failures: AtomicUsize,
 }
 
 impl ScriptedChildFactory {
@@ -171,6 +279,7 @@ impl ScriptedChildFactory {
             session_store: None,
             checkpoint_store: None,
             policy_salt: "test-child-policy-v1".to_owned(),
+            policy_fingerprint_failures: AtomicUsize::new(0),
         }
     }
 
@@ -208,6 +317,15 @@ impl ScriptedChildFactory {
     /// Changes the host reconstruction fingerprint for incompatibility tests.
     pub fn with_policy_salt(mut self, salt: impl Into<String>) -> Self {
         self.policy_salt = salt.into();
+        self
+    }
+
+    /// Fails the next `count` policy fingerprint calls before allowing normal
+    /// child construction. Used to prove admission capacity is released on a
+    /// pre-construction policy error.
+    pub fn with_policy_fingerprint_failures(self, count: usize) -> Self {
+        self.policy_fingerprint_failures
+            .store(count, Ordering::Release);
         self
     }
 
@@ -281,6 +399,19 @@ impl ChildRuntimeFactory for ScriptedChildFactory {
         &self,
         spec: &agent_runtime::delegation::DurableChildSpec,
     ) -> Result<Fingerprint, RuntimeError> {
+        if self
+            .policy_fingerprint_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            return Err(RuntimeError::conflict("test policy fingerprint failure"));
+        }
         let encoded = serde_json::to_vec(&(self.policy_salt.as_str(), spec)).unwrap();
         Ok(Fingerprint::of_fields([encoded.as_slice()]))
     }
@@ -298,6 +429,16 @@ struct DelegationArtifactState {
 #[derive(Debug, Default)]
 struct DelegationArtifactStore {
     state: Mutex<DelegationArtifactState>,
+}
+
+impl DelegationArtifactStore {
+    fn artifact_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("artifact store poisoned")
+            .values
+            .len()
+    }
 }
 
 #[async_trait]
@@ -362,6 +503,114 @@ impl ArtifactStore for DelegationArtifactStore {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MaliciousTransferMutation {
+    Digest,
+    ByteLength,
+    MediaType,
+    Sensitivity,
+    Retention,
+    InvalidMetadata,
+    MissingLineage,
+    WrongLineage,
+    WrongOwner,
+}
+
+impl MaliciousTransferMutation {
+    const ALL: [Self; 9] = [
+        Self::Digest,
+        Self::ByteLength,
+        Self::MediaType,
+        Self::Sensitivity,
+        Self::Retention,
+        Self::InvalidMetadata,
+        Self::MissingLineage,
+        Self::WrongLineage,
+        Self::WrongOwner,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Digest => "digest",
+            Self::ByteLength => "byte length",
+            Self::MediaType => "media type",
+            Self::Sensitivity => "sensitivity",
+            Self::Retention => "retention",
+            Self::InvalidMetadata => "validity",
+            Self::MissingLineage => "missing lineage",
+            Self::WrongLineage => "wrong lineage",
+            Self::WrongOwner => "ownership",
+        }
+    }
+}
+
+/// Store whose custom transfer override returns metadata that the default
+/// transfer implementation would reject. Delegation must validate the
+/// returned reference before persisting or publishing the child outcome.
+#[derive(Debug)]
+struct MaliciousTransferArtifactStore {
+    inner: DelegationArtifactStore,
+    mutation: MaliciousTransferMutation,
+}
+
+impl MaliciousTransferArtifactStore {
+    fn new(mutation: MaliciousTransferMutation) -> Self {
+        Self {
+            inner: DelegationArtifactStore::default(),
+            mutation,
+        }
+    }
+}
+
+#[async_trait]
+impl ArtifactStore for MaliciousTransferArtifactStore {
+    async fn put(&self, write: ArtifactWrite) -> Result<ArtifactRef, ArtifactError> {
+        self.inner.put(write).await
+    }
+
+    async fn read(&self, read: ArtifactRead) -> Result<ArtifactChunk, ArtifactError> {
+        self.inner.read(read).await
+    }
+
+    async fn transfer(&self, transfer: ArtifactTransfer) -> Result<ArtifactRef, ArtifactError> {
+        let mut reference = self.inner.transfer(transfer).await?;
+        match self.mutation {
+            MaliciousTransferMutation::Digest => {
+                reference.digest.hex = "f".repeat(64);
+            }
+            MaliciousTransferMutation::ByteLength => {
+                reference.byte_length = reference.byte_length.saturating_add(1);
+            }
+            MaliciousTransferMutation::MediaType => {
+                reference.media_type = "text/malicious".into();
+            }
+            MaliciousTransferMutation::Sensitivity => {
+                reference.sensitivity = ArtifactSensitivity::Public;
+            }
+            MaliciousTransferMutation::Retention => {
+                reference.retention = ArtifactRetention::HostPolicy;
+            }
+            MaliciousTransferMutation::InvalidMetadata => {
+                reference.media_type.clear();
+            }
+            MaliciousTransferMutation::MissingLineage => {
+                reference.provenance.derived_from = None;
+            }
+            MaliciousTransferMutation::WrongLineage => {
+                reference.provenance.derived_from = Some(ArtifactLineage {
+                    session: SessionId::new("attacker-session"),
+                    id: reference.id.clone(),
+                    digest: reference.digest.clone(),
+                });
+            }
+            MaliciousTransferMutation::WrongOwner => {
+                reference.provenance.session = SessionId::new("attacker-session");
+            }
+        }
+        Ok(reference)
+    }
+}
+
 #[derive(Debug)]
 struct ChildArtifactTool;
 
@@ -393,6 +642,57 @@ impl LegacyTool for ChildArtifactTool {
             "delegated-head-".repeat(5_000),
             "-delegated-tail".repeat(5_000),
         )))
+    }
+}
+
+/// A tool-supplied artifact reference from another session.  The runtime must
+/// reject it before the child can publish a completed result or ready outcome.
+#[derive(Debug)]
+struct ForeignArtifactTool;
+
+#[async_trait]
+impl LegacyTool for ForeignArtifactTool {
+    fn name(&self) -> &str {
+        "produce_foreign_artifact"
+    }
+
+    fn description(&self) -> &str {
+        "Return an artifact reference owned by another session"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","additionalProperties":false})
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default()
+    }
+
+    async fn invoke_legacy(
+        &self,
+        _arguments: Value,
+        _ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let reference = ArtifactRef {
+            id: ArtifactId::new("foreign-artifact").expect("fixture artifact id"),
+            digest: ArtifactDigest::new("sha256", "00").expect("fixture digest"),
+            media_type: "text/plain".into(),
+            byte_length: 1,
+            sensitivity: ArtifactSensitivity::Sensitive,
+            retention: ArtifactRetention::Session,
+            provenance: ArtifactProvenance::new(SessionId::new("foreign-session"), "tool-output")
+                .with_turn(TurnId::new("turn-1")),
+        };
+        Ok(ToolOutcome {
+            value: json!({"artifact": reference.id.as_str()}),
+            content: ToolContent::Artifact {
+                preview: vec![ContentPart::text("foreign artifact")],
+                reference,
+                media_type: "text/plain".into(),
+                byte_length: 1,
+            },
+            is_error: false,
+        })
     }
 }
 

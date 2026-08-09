@@ -35,7 +35,9 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use agent_runtime_core::provider::PromptCacheControl;
+use agent_runtime_core::provider::{
+    CacheIdentity, CacheResourceIdentity, ModelId, PromptCacheControl, ProviderCacheContract,
+};
 use agent_runtime_registry::{Fingerprint, FingerprintHasher, RegistryRevision};
 
 use crate::fragment::{CacheClass, FragmentId};
@@ -85,6 +87,13 @@ pub struct ProviderCacheCapability {
     /// Whether the provider can mark a `CacheClass::Ephemeral` segment for
     /// short-lived reuse.
     pub supports_ephemeral: bool,
+    /// The richer model/adapter cache contract. Legacy constructors fill this
+    /// from `PromptCacheControl` and remain observation-only for maintenance.
+    #[serde(default)]
+    pub contract: ProviderCacheContract,
+    /// Selected opaque explicit-resource identity, when one is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_identity: Option<CacheResourceIdentity>,
 }
 
 impl ProviderCacheCapability {
@@ -95,6 +104,8 @@ impl ProviderCacheCapability {
             provider: provider.into(),
             supports_stable: false,
             supports_ephemeral: false,
+            contract: ProviderCacheContract::default(),
+            resource_identity: None,
         }
     }
 
@@ -105,6 +116,10 @@ impl ProviderCacheCapability {
             provider: provider.into(),
             supports_stable: true,
             supports_ephemeral: true,
+            contract: ProviderCacheContract::from_control(PromptCacheControl::Explicit {
+                max_breakpoints: u8::MAX,
+            }),
+            resource_identity: None,
         }
     }
 
@@ -118,12 +133,49 @@ impl ProviderCacheCapability {
         provider: impl Into<String>,
         control: PromptCacheControl,
     ) -> Self {
+        Self::from_contract(
+            revision,
+            provider,
+            ProviderCacheContract::from_control(control),
+        )
+    }
+
+    /// Builds a planner capability from a complete provider cache contract.
+    pub fn from_contract(
+        revision: RegistryRevision,
+        provider: impl Into<String>,
+        contract: ProviderCacheContract,
+    ) -> Self {
+        let contract = contract.validated_or_default();
+        let supports_stable = contract.behavior.supports_stable_prefix();
+        let supports_ephemeral = matches!(
+            contract.behavior,
+            agent_runtime_core::provider::ProviderCacheBehavior::ExplicitBreakpoint { .. }
+        );
         Self {
             revision,
             provider: provider.into(),
-            supports_stable: control.caches_stable_prefix(),
-            supports_ephemeral: control.caches_ephemeral_segment(),
+            supports_stable,
+            supports_ephemeral,
+            contract,
+            resource_identity: None,
         }
+    }
+
+    /// Selects the exact opaque explicit-resource identity for this plan.
+    /// Incompatible behavior/action declarations clear the identity rather
+    /// than projecting resource metadata that the provider cannot address.
+    pub fn with_resource_identity(mut self, identity: CacheResourceIdentity) -> Self {
+        self.resource_identity = if self.contract.behavior.supports_resource_operations()
+            && self.contract.evidence.resource_operations
+            && !self.contract.resource_operations.is_empty()
+            && identity.validate().is_ok()
+        {
+            Some(identity)
+        } else {
+            None
+        };
+        self
     }
 
     /// Whether this capability can honor `class`.
@@ -132,6 +184,46 @@ impl ProviderCacheCapability {
             CacheClass::Stable => self.supports_stable,
             CacheClass::Ephemeral => self.supports_ephemeral,
             CacheClass::NoCache => true,
+        }
+    }
+
+    /// Validates the planner projection before it is used to derive a cache
+    /// plan. Legacy support booleans must agree with the normalized contract;
+    /// otherwise a caller could advertise a stable prefix that the adapter
+    /// contract rejects.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.provider.trim().is_empty() {
+            return Err("cache capability provider must not be empty".to_owned());
+        }
+        self.contract.validate()?;
+        let expected_stable = self.contract.behavior.supports_stable_prefix();
+        let expected_ephemeral = matches!(
+            self.contract.behavior,
+            agent_runtime_core::provider::ProviderCacheBehavior::ExplicitBreakpoint { .. }
+        );
+        if self.supports_stable != expected_stable || self.supports_ephemeral != expected_ephemeral
+        {
+            return Err("cache capability booleans contradict the normalized contract".to_owned());
+        }
+        if let Some(identity) = &self.resource_identity {
+            identity.validate()?;
+            if !self.contract.behavior.supports_resource_operations()
+                || !self.contract.evidence.resource_operations
+                || self.contract.resource_operations.is_empty()
+            {
+                return Err("resource identity requires explicit resource support".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a conservative unsupported projection when this public
+    /// capability was assembled manually with contradictory fields.
+    pub fn validated_or_none(&self) -> Self {
+        if self.validate().is_ok() {
+            self.clone()
+        } else {
+            Self::none(self.revision.clone(), self.provider.clone())
         }
     }
 }
@@ -174,6 +266,11 @@ pub struct CachePlan {
     /// tokenizer revision, request-adapter revision, and provider
     /// cache-policy revision.
     pub identity: Fingerprint,
+    /// The exact opaque provider cache identity. `None` is retained only when
+    /// reading pre-adaptive serialized plans; newly-built plans always carry
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_identity: Option<CacheIdentity>,
     /// Ordered per-segment fingerprints.
     pub segments: Vec<SegmentFingerprint>,
     /// How many leading segments are declared `CacheClass::Stable`,
@@ -194,6 +291,18 @@ pub struct CachePlan {
     /// expected read of zero.
     #[serde(default)]
     pub has_comparable_predecessor: bool,
+    /// Whether this plan is eligible to establish the next provider-cache
+    /// baseline once its request crosses the provider-start boundary.
+    ///
+    /// A structurally stable plan can still be unrepresentable on an
+    /// explicit provider's wire (for example, lane reordering can prevent
+    /// one exact breakpoint). Such a request is deliberately unmarked and
+    /// must not become the predecessor for a later read expectation. The
+    /// value is persisted with the plan so a restart cannot turn that
+    /// evidence gap into false warmth. Missing values from pre-adaptive
+    /// serialized plans fail closed.
+    #[serde(default)]
+    pub provider_baseline_available: bool,
     /// The summed token cost of the preserved prefix.
     pub preserved_prefix_tokens: u32,
     /// The summed token cost of everything at or after the preserved
@@ -213,6 +322,28 @@ pub struct CachePlan {
 }
 
 impl CachePlan {
+    /// Suppresses a structural prefix from becoming a provider read
+    /// expectation when an explicit adapter cannot place one exact wire
+    /// breakpoint for it. Local reuse and the declared structural prefix are
+    /// retained; the provider identity, evidence projection, and expectation
+    /// are cleared together because the prefix is not addressable on wire.
+    pub(crate) fn suppress_provider_expectation(&mut self) {
+        self.preserved_prefix_len = 0;
+        self.has_comparable_predecessor = false;
+        self.provider_baseline_available = false;
+        self.preserved_prefix_tokens = 0;
+        self.cache_identity = None;
+        self.invalidated_tokens = self
+            .segments
+            .iter()
+            .fold(0u32, |acc, segment| acc.saturating_add(segment.tokens));
+        self.changed_segments = self
+            .segments
+            .iter()
+            .map(|segment| segment.fragment.clone())
+            .collect();
+    }
+
     /// Builds a cache plan from one plan's ordered segments, the model
     /// identity fingerprint they were sized against, the previous turn's
     /// cache plan (`None` for the first turn), and the provider's declared
@@ -223,6 +354,39 @@ impl CachePlan {
         previous: Option<&CachePlan>,
         capability: &ProviderCacheCapability,
     ) -> Self {
+        let cache_identity = CacheIdentity::legacy(
+            identity.clone(),
+            capability.provider.clone(),
+            ModelId::new(capability.provider.clone()),
+            // The compatibility constructor predates exact identity inputs;
+            // preserve its structural-prefix behavior. The authoritative
+            // planner path uses `build_with_identity` and includes stable
+            // fragment hashes, registry revisions, tools, and endpoint data.
+            std::iter::empty(),
+            capability.contract.behavior.to_prompt_cache_control(),
+        );
+        // The legacy constructor predates the request model and exact endpoint
+        // partition. Keep its structural comparison behavior, but never
+        // attach an identity that can be rejected when a caller later chooses
+        // a different request model.
+        let mut plan =
+            Self::build_with_identity(identity, cache_identity, segments, previous, capability);
+        plan.cache_identity = None;
+        plan
+    }
+
+    /// Builds a cache plan with an exact opaque identity supplied by the
+    /// Runtime/context planner.
+    pub fn build_with_identity(
+        identity: Fingerprint,
+        cache_identity: CacheIdentity,
+        segments: &[PlanSegment],
+        previous: Option<&CachePlan>,
+        capability: &ProviderCacheCapability,
+    ) -> Self {
+        let capability = capability.validated_or_none();
+        let provider_identity_supported = capability.contract.behavior.supports_stable_prefix();
+        let cache_identity_for_comparison = provider_identity_supported.then_some(cache_identity);
         let segments: Vec<SegmentFingerprint> =
             segments.iter().map(SegmentFingerprint::from).collect();
         let declared_stable_prefix_len = segments
@@ -230,16 +394,38 @@ impl CachePlan {
             .take_while(|segment| segment.cache_class == CacheClass::Stable)
             .count();
 
-        let has_comparable_predecessor = previous.is_some();
+        let capability_can_represent_stable = capability.supports(CacheClass::Stable)
+            && capability.contract.behavior.supports_stable_prefix();
+        let has_comparable_predecessor = declared_stable_prefix_len > 0
+            && capability_can_represent_stable
+            && previous.is_some_and(|plan| plan.provider_baseline_available);
         let preserved_prefix_len = match previous {
-            Some(previous) if previous.identity == identity => segments
-                .iter()
-                .zip(previous.segments.iter())
-                .take(declared_stable_prefix_len)
-                .take_while(|(current, prior)| {
-                    current.fragment == prior.fragment && current.content_hash == prior.content_hash
-                })
-                .count(),
+            Some(previous)
+                if previous
+                    .cache_identity
+                    .as_ref()
+                    .zip(cache_identity_for_comparison.as_ref())
+                    .is_some_and(|(prior, current)| current.comparable_with(prior))
+                    || (previous.cache_identity.is_none() && previous.identity == identity) =>
+            {
+                segments
+                    .iter()
+                    .zip(previous.segments.iter())
+                    .take(declared_stable_prefix_len)
+                    // A newly sealed tail was not part of the prior request's
+                    // declared stable boundary, so it becomes eligible only
+                    // after one request has carried it under that boundary.
+                    // Use the predecessor's declared boundary (not its own
+                    // earlier expectation) so the baseline can grow one
+                    // append-only promotion at a time instead of remaining
+                    // permanently capped at the first turn's prefix.
+                    .take(previous.declared_stable_prefix_len)
+                    .take_while(|(current, prior)| {
+                        current.fragment == prior.fragment
+                            && current.content_hash == prior.content_hash
+                    })
+                    .count()
+            }
             Some(_) => 0,
             None => declared_stable_prefix_len,
         };
@@ -255,7 +441,16 @@ impl CachePlan {
             .map(|segment| segment.fragment.clone())
             .collect();
         let local_compiled_context_key = local_key(&segments);
-        let provider_cache = ProviderCachePlan::build(&segments, capability);
+        let provider_cache = ProviderCachePlan::build(&segments, &capability);
+        // A plan can establish a provider baseline only when it contains an
+        // actual stable prefix and the selected capability can represent that
+        // prefix. Unsupported capabilities still retain structural/local
+        // reuse information, but they must not become predecessors for a
+        // future provider read expectation. Explicit-wire representability is
+        // checked beside rendering by `ContextPlanner`, which can further
+        // suppress this flag when lane reordering makes the boundary absent.
+        let provider_baseline_available =
+            declared_stable_prefix_len > 0 && capability_can_represent_stable;
 
         Self {
             identity,
@@ -263,18 +458,21 @@ impl CachePlan {
             declared_stable_prefix_len,
             preserved_prefix_len,
             has_comparable_predecessor,
+            provider_baseline_available,
             preserved_prefix_tokens,
             invalidated_tokens,
             changed_segments,
             local_compiled_context_key,
             provider_cache,
+            cache_identity: cache_identity_for_comparison,
         }
     }
 
     /// The expected provider cache read for this request. A first provider
-    /// request has no baseline and therefore returns `None`; every later plan
-    /// has a comparable predecessor, even when identity or prefix changes
-    /// reduce the expectation to `Some(0)`.
+    /// request has no baseline and therefore returns `None`. An unmarked or
+    /// otherwise unrepresentable predecessor also returns `None`; an
+    /// identity/prefix change after a valid predecessor remains comparable
+    /// and reduces the expectation to `Some(0)`.
     pub fn expected_read_tokens(&self) -> Option<u64> {
         self.has_comparable_predecessor
             .then_some(u64::from(self.preserved_prefix_tokens))
@@ -283,6 +481,12 @@ impl CachePlan {
     /// Whether this plan was compared against a prior provider request.
     pub fn has_comparable_predecessor(&self) -> bool {
         self.has_comparable_predecessor
+    }
+
+    /// Returns the exact opaque identity when this plan was built by the
+    /// adaptive planner.
+    pub fn cache_identity(&self) -> Option<&CacheIdentity> {
+        self.cache_identity.as_ref()
     }
 
     /// This plan's own fingerprint, recorded in run manifests and cache-plan
@@ -307,9 +511,16 @@ impl CachePlan {
                 "provider_supported",
                 self.provider_cache.capability.revision.as_str(),
             );
+        if let Some(identity) = &self.cache_identity {
+            hasher.pair("cache_identity", identity.digest().as_str());
+        }
         hasher.pair(
             "has_predecessor",
             self.has_comparable_predecessor.to_string(),
+        );
+        hasher.pair(
+            "provider_baseline_available",
+            self.provider_baseline_available.to_string(),
         );
         for segment in &self.segments {
             hasher.pair(segment.fragment.as_str(), segment.cache_class.as_str());
@@ -332,7 +543,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use agent_runtime_core::catalog::{ComponentRef, Modality, ModelLimits, ResolvedModelProfile};
-    use agent_runtime_core::provider::{Capabilities, ModelId};
+    use agent_runtime_core::provider::{
+        CacheResourceIdentity, CacheResourceOperationKind, Capabilities, ModelId,
+        ProviderCacheBehavior, ProviderCacheContract,
+    };
     use agent_runtime_registry::RegistryId;
 
     use crate::fragment::{FragmentKind, Sensitivity};
@@ -356,6 +570,55 @@ mod tests {
 
     fn full_capability() -> ProviderCacheCapability {
         ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test-provider")
+    }
+
+    #[test]
+    fn resource_identity_requires_explicit_resource_actions() {
+        let identity = CacheResourceIdentity::new(
+            Fingerprint::from_hex("0123456789abcdef0123456789abcdef"),
+            RegistryRevision::new("resource-1"),
+        );
+        let implicit = ProviderCacheCapability::from_contract(
+            RegistryRevision::new("cache-1"),
+            "test-provider",
+            ProviderCacheContract {
+                behavior: ProviderCacheBehavior::ImplicitPrefix,
+                ..ProviderCacheContract::default()
+            },
+        )
+        .with_resource_identity(identity.clone());
+        assert!(implicit.resource_identity.is_none());
+
+        let explicit = ProviderCacheCapability::from_contract(
+            RegistryRevision::new("cache-1"),
+            "test-provider",
+            ProviderCacheContract {
+                behavior: ProviderCacheBehavior::ExplicitResource,
+                evidence: agent_runtime_core::provider::CacheEvidenceCapabilities {
+                    resource_operations: true,
+                    ..Default::default()
+                },
+                resource_operations: [CacheResourceOperationKind::Inspect].into_iter().collect(),
+                ..ProviderCacheContract::default()
+            },
+        )
+        .with_resource_identity(identity);
+        assert!(explicit.resource_identity.is_some());
+
+        let contradictory = ProviderCacheCapability::from_contract(
+            RegistryRevision::new("cache-1"),
+            "test-provider",
+            ProviderCacheContract {
+                behavior: ProviderCacheBehavior::ExplicitResource,
+                resource_operations: [CacheResourceOperationKind::Inspect].into_iter().collect(),
+                ..ProviderCacheContract::default()
+            },
+        )
+        .with_resource_identity(CacheResourceIdentity::new(
+            Fingerprint::from_hex("0123456789abcdef0123456789abcdef"),
+            RegistryRevision::new("resource-1"),
+        ));
+        assert!(contradictory.resource_identity.is_none());
     }
 
     fn base_profile() -> ResolvedModelProfile {
@@ -459,6 +722,109 @@ mod tests {
         assert!(plan2.has_comparable_predecessor());
         assert_eq!(plan2.expected_read_tokens(), Some(30));
         assert_eq!(plan2.changed_segments, vec![FragmentId::new("input-2")]);
+        assert_eq!(
+            plan1.cache_identity().map(|identity| identity.digest()),
+            plan2.cache_identity().map(|identity| identity.digest()),
+            "changing conversation tail must not change provider cache identity"
+        );
+    }
+
+    #[test]
+    fn append_only_history_promotion_expands_after_one_sealed_request() {
+        let identity = base_profile().fingerprint();
+        let capability = full_capability();
+        let turn = |stable_history: &[(&str, &str, u32)], tail: (&str, &str, u32)| {
+            let mut segments = vec![segment(
+                "sys",
+                FragmentKind::SystemInstruction,
+                CacheClass::Stable,
+                "sys-body",
+                10,
+            )];
+            segments.extend(stable_history.iter().map(|(id, hash, tokens)| {
+                segment(id, FragmentKind::History, CacheClass::Stable, hash, *tokens)
+            }));
+            segments.push(segment(
+                tail.0,
+                FragmentKind::UserInput,
+                CacheClass::Ephemeral,
+                tail.1,
+                tail.2,
+            ));
+            segments
+        };
+
+        let plan1 = CachePlan::build(
+            identity.clone(),
+            &turn(&[], ("history:0", "turn-0", 5)),
+            None,
+            &capability,
+        );
+        let plan2 = CachePlan::build(
+            identity.clone(),
+            &turn(&[("history:0", "turn-0", 5)], ("history:1", "turn-1", 6)),
+            Some(&plan1),
+            &capability,
+        );
+        let plan3 = CachePlan::build(
+            identity,
+            &turn(
+                &[("history:0", "turn-0", 5), ("history:1", "turn-1", 6)],
+                ("history:2", "turn-2", 7),
+            ),
+            Some(&plan2),
+            &capability,
+        );
+
+        assert_eq!(plan1.declared_stable_prefix_len, 1);
+        assert_eq!(plan2.declared_stable_prefix_len, 2);
+        assert_eq!(plan2.preserved_prefix_len, 1);
+        assert_eq!(plan2.expected_read_tokens(), Some(10));
+        assert_eq!(plan3.declared_stable_prefix_len, 3);
+        assert_eq!(plan3.preserved_prefix_len, 2);
+        assert_eq!(plan3.expected_read_tokens(), Some(15));
+    }
+
+    #[test]
+    fn an_unmarked_explicit_plan_does_not_seed_a_future_baseline() {
+        let identity = base_profile().fingerprint();
+        let capability = full_capability();
+        let unrepresentable = vec![
+            segment(
+                "system",
+                FragmentKind::SystemInstruction,
+                CacheClass::Stable,
+                "system",
+                10,
+            ),
+            segment(
+                "changing-tool",
+                FragmentKind::ToolSchema,
+                CacheClass::NoCache,
+                "tool",
+                5,
+            ),
+        ];
+        let representable = vec![segment(
+            "system",
+            FragmentKind::SystemInstruction,
+            CacheClass::Stable,
+            "system",
+            10,
+        )];
+
+        let mut first = CachePlan::build(identity.clone(), &unrepresentable, None, &capability);
+        first.suppress_provider_expectation();
+        assert!(!first.provider_baseline_available);
+        assert!(first.cache_identity().is_none());
+        assert_eq!(first.expected_read_tokens(), None);
+
+        let second = CachePlan::build(identity.clone(), &representable, Some(&first), &capability);
+        assert!(second.provider_baseline_available);
+        assert_eq!(second.expected_read_tokens(), None);
+
+        let third = CachePlan::build(identity, &representable, Some(&second), &capability);
+        assert_eq!(third.expected_read_tokens(), Some(10));
     }
 
     /// Requirement "Cache-aware stable planning", scenario "Tool schema
@@ -616,13 +982,34 @@ mod tests {
         let plan = CachePlan::build(identity.clone(), &segments, None, &no_stable);
         assert_eq!(plan.provider_cache.unsupported, vec![CacheClass::Stable]);
         assert_eq!(plan.expected_read_tokens(), None);
+        assert!(!plan.provider_baseline_available);
 
         let comparable = CachePlan::build(identity.clone(), &segments, Some(&plan), &no_stable);
-        assert_eq!(comparable.expected_read_tokens(), Some(10));
+        assert_eq!(comparable.expected_read_tokens(), None);
+        assert!(!comparable.provider_baseline_available);
         assert_eq!(
             comparable.provider_cache.unsupported,
             vec![CacheClass::Stable]
         );
+
+        // Moving back to a supported provider does not infer a read from the
+        // unsupported predecessor. The first supported request establishes a
+        // new baseline; only the following request may compare against it.
+        let supported = CachePlan::build(
+            identity.clone(),
+            &segments,
+            Some(&comparable),
+            &full_capability(),
+        );
+        assert_eq!(supported.expected_read_tokens(), None);
+        assert!(supported.provider_baseline_available);
+        let next = CachePlan::build(
+            identity.clone(),
+            &segments,
+            Some(&supported),
+            &full_capability(),
+        );
+        assert_eq!(next.expected_read_tokens(), Some(10));
 
         let full = full_capability();
         let plan2 = CachePlan::build(identity, &segments, None, &full);

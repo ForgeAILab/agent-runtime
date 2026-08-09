@@ -20,6 +20,7 @@ dependencies = [
  "pin-project-lite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "uuid",
@@ -58,6 +59,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -101,6 +103,7 @@ name = "agent-runtime-provider"
 version = "0.1.0"
 dependencies = [
  "agent-runtime-core",
+ "agent-runtime-registry",
  "async-stream",
  "async-trait",
  "futures-core",

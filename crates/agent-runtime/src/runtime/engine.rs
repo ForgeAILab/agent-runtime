@@ -1,6 +1,6 @@
 //! The immutable [`Runtime`] and its shared composition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -11,8 +11,11 @@ use agent_runtime_core::event::RuntimeEvent;
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::observer::EventObserver;
 use agent_runtime_core::store::{SecretStore, SessionSnapshot, SessionStore};
+use serde_json::Value;
 
 use crate::agent::driver::Driver;
+use crate::cache::CacheMechanism;
+use crate::delegation::{CHILD_CATALOG_NAMESPACE, CHILD_OUTCOME_CURSOR_NAMESPACE};
 use crate::ids::IdMinter;
 use crate::runtime::command::{COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession};
 use crate::runtime::emitter::EventEmitter;
@@ -97,10 +100,233 @@ fn merge_terminal_checkpoint_snapshot(
     Ok(())
 }
 
+/// Merges only delegation-owned protected state from a newer ordinary
+/// session snapshot into a non-terminal checkpoint snapshot.
+///
+/// A child can finish while the parent is serving an unrelated turn. The
+/// child collector persists the protected catalog through `SessionStore`,
+/// while the parent's non-terminal `TurnCheckpoint` cannot be rewritten by
+/// that collector. On restart the checkpoint remains authoritative for the
+/// canonical turn state, but the delegation namespaces must not regress to
+/// the older checkpoint view. No history, usage, manifest, or identity state
+/// is copied from the ordinary snapshot here.
+fn merge_newer_nonterminal_delegation_state(
+    protected: &mut SessionSnapshot,
+    ordinary: &SessionSnapshot,
+) -> Result<(), RuntimeError> {
+    if protected.id != ordinary.id {
+        return Err(RuntimeError::conflict(
+            "canonical session and non-terminal checkpoint identities differ",
+        ));
+    }
+
+    for namespace in [CHILD_CATALOG_NAMESPACE, CHILD_OUTCOME_CURSOR_NAMESPACE] {
+        let Some(state) = ordinary.extension_state.get(namespace) else {
+            continue;
+        };
+        let replace = match protected.extension_state.get(namespace) {
+            None => true,
+            Some(current) => {
+                if current.revision != state.revision {
+                    return Err(RuntimeError::conflict(format!(
+                        "delegation extension namespace `{namespace}` has incompatible revisions \
+                         (checkpoint `{}`, session store `{}`)",
+                        current.revision, state.revision
+                    )));
+                }
+                match namespace {
+                    CHILD_CATALOG_NAMESPACE => {
+                        delegation_catalog_is_newer(&current.value, &state.value)?
+                    }
+                    CHILD_OUTCOME_CURSOR_NAMESPACE => {
+                        protected_outcome_state_is_newer(&current.value, &state.value)?
+                    }
+                    _ => false,
+                }
+            }
+        };
+        if replace {
+            protected
+                .extension_state
+                .insert(namespace.to_owned(), state.clone());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogRecordProgress {
+    revision: u64,
+    turns_used: u64,
+    state_rank: u8,
+    updated_at: u64,
+    content: String,
+}
+
+fn delegation_catalog_is_newer(current: &Value, candidate: &Value) -> Result<bool, RuntimeError> {
+    let current = parse_catalog_progress(current)?;
+    let candidate = parse_catalog_progress(candidate)?;
+    if candidate.next_child < current.next_child {
+        return Ok(false);
+    }
+
+    let mut strictly_newer = candidate.next_child > current.next_child;
+    for (child, current_record) in &current.children {
+        let Some(candidate_record) = candidate.children.get(child) else {
+            return Ok(false);
+        };
+        if candidate_record.revision < current_record.revision
+            || candidate_record.turns_used < current_record.turns_used
+            || candidate_record.updated_at < current_record.updated_at
+        {
+            return Ok(false);
+        }
+        if candidate_record.revision > current_record.revision
+            || candidate_record.turns_used > current_record.turns_used
+            || candidate_record.state_rank > current_record.state_rank
+            || candidate_record.updated_at > current_record.updated_at
+        {
+            strictly_newer = true;
+        } else if candidate_record == current_record {
+            // Equal semantic watermarks must be byte-for-byte equivalent;
+            // otherwise neither store can prove which protected catalog is
+            // authoritative.
+            continue;
+        } else if candidate_record.content != current_record.content {
+            return Err(RuntimeError::conflict(
+                "delegation catalog snapshots have equal semantic watermarks but differ",
+            ));
+        }
+    }
+    if candidate.children.len() > current.children.len() {
+        strictly_newer = true;
+    }
+    Ok(strictly_newer)
+}
+
+fn parse_catalog_progress(value: &Value) -> Result<CatalogProgress, RuntimeError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| RuntimeError::conflict("durable child catalog is not a JSON object"))?;
+    let next_child = object
+        .get("next_child")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| RuntimeError::conflict("durable child catalog has no next_child"))?;
+    let children = object
+        .get("children")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RuntimeError::conflict("durable child catalog has no children"))?;
+    let mut parsed = BTreeMap::new();
+    for child in children {
+        let child_object = child.as_object().ok_or_else(|| {
+            RuntimeError::conflict("durable child catalog contains a non-object child")
+        })?;
+        let child_id = child_object
+            .get("child")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::conflict("durable child catalog child has no id"))?;
+        let status = child_object
+            .get("status")
+            .and_then(Value::as_object)
+            .ok_or_else(|| RuntimeError::conflict("durable child catalog child has no status"))?;
+        let revision = child_object
+            .get("revision")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RuntimeError::conflict("durable child catalog child has no revision"))?;
+        let turns_used = status
+            .get("turns_used")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RuntimeError::conflict("durable child status has no turns_used"))?;
+        let updated_at = status
+            .get("updated_at")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RuntimeError::conflict("durable child status has no updated_at"))?;
+        let state_rank = match status.get("state").and_then(Value::as_str) {
+            Some("running") => 1,
+            Some("idle") => 2,
+            Some("interrupted") => 3,
+            Some("stopped" | "failed" | "expired") => 4,
+            _ => 0,
+        };
+        let progress = CatalogRecordProgress {
+            revision,
+            turns_used,
+            state_rank,
+            updated_at,
+            content: child.to_string(),
+        };
+        if parsed.insert(child_id.to_owned(), progress).is_some() {
+            return Err(RuntimeError::conflict(
+                "durable child catalog contains duplicate child identities",
+            ));
+        }
+    }
+    Ok(CatalogProgress {
+        next_child,
+        children: parsed,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CatalogProgress {
+    next_child: u64,
+    children: BTreeMap<String, CatalogRecordProgress>,
+}
+
+fn protected_outcome_state_is_newer(
+    current: &Value,
+    candidate: &Value,
+) -> Result<bool, RuntimeError> {
+    let current_object = current
+        .as_object()
+        .ok_or_else(|| RuntimeError::conflict("protected child outcomes are not a JSON object"))?;
+    let candidate_object = candidate
+        .as_object()
+        .ok_or_else(|| RuntimeError::conflict("protected child outcomes are not a JSON object"))?;
+    let current_revision = current_object
+        .get("revision")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let candidate_revision = candidate_object
+        .get("revision")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if candidate_revision != current_revision {
+        return Ok(candidate_revision > current_revision);
+    }
+    if current == candidate {
+        return Ok(false);
+    }
+
+    // Snapshots written before the explicit protected-state revision can still
+    // be compared by the cursor's own monotonic revision. If both semantic
+    // watermarks are equal but the protected payload differs, selecting one
+    // would be guesswork; fail closed instead of resurrecting or dropping a
+    // result.
+    let current_cursor_revision = current_object
+        .get("cursor")
+        .and_then(|cursor| cursor.get("revision"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let candidate_cursor_revision = candidate_object
+        .get("cursor")
+        .and_then(|cursor| cursor.get("revision"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if candidate_cursor_revision != current_cursor_revision {
+        return Ok(candidate_cursor_revision > current_cursor_revision);
+    }
+    Err(RuntimeError::conflict(
+        "protected child outcome snapshots have equal semantic revisions but differ",
+    ))
+}
+
 /// The shared, immutable composition behind a [`Runtime`].
 #[derive(Debug)]
 pub struct RuntimeShared {
     pub(crate) driver: Driver,
+    /// Provider-bound cache mechanism shared by the Runtime's sessions.
+    pub(crate) cache: Arc<CacheMechanism>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) session_store: Option<Arc<dyn SessionStore>>,
     pub(crate) checkpoint_store: Option<Arc<dyn CheckpointStore>>,
@@ -187,6 +413,12 @@ impl Runtime {
         self.shared.secret_store.as_ref()
     }
 
+    /// The neutral provider-cache mechanism facade. Hosts decide whether and
+    /// when to submit an operation; Runtime only enforces its safety contract.
+    pub fn cache(&self) -> &Arc<CacheMechanism> {
+        &self.shared.cache
+    }
+
     /// Starts (or resumes) a session.
     pub async fn start_session(
         &self,
@@ -253,6 +485,20 @@ impl Runtime {
                     "checkpoint store returned another session's state",
                 ));
             }
+            if matches!(checkpoint.state, TurnState::CacheOperationTerminal { .. })
+                && !checkpoint
+                    .snapshot
+                    .extension_state
+                    .contains_key(crate::cache::CACHE_MECHANISM_STATE_NAMESPACE)
+            {
+                // A terminal cache checkpoint without its idempotency
+                // extension cannot prove that a later operation id was
+                // already completed.  Fail closed at startup rather than
+                // allowing a host to replay provider work after a crash.
+                return Err(RuntimeError::conflict(
+                    "terminal cache checkpoint is missing its protected cache extension",
+                ));
+            }
         }
         let recovery_deferred = matches!(
             (&checkpoint_recovery, &checkpoint),
@@ -266,7 +512,7 @@ impl Runtime {
         );
         let rebase_completed_activation = !recovery_deferred
             && match checkpoint.as_ref() {
-                Some(checkpoint) => matches!(checkpoint.state, TurnState::Terminal { .. }),
+                Some(checkpoint) => checkpoint.state.is_terminal(),
                 None => snapshot.is_some(),
             };
         // A protected non-terminal checkpoint is newer and more exact than
@@ -283,7 +529,37 @@ impl Runtime {
                 merge_terminal_checkpoint_snapshot(&mut snapshot, &checkpoint.snapshot)?;
                 Some(snapshot)
             }
-            (Some(checkpoint), _) => Some(checkpoint.snapshot.clone()),
+            (Some(checkpoint), Some(snapshot))
+                if matches!(checkpoint.state, TurnState::CacheOperationTerminal { .. }) =>
+            {
+                // A cache terminal checkpoint is the canonical protected
+                // boundary for the cache operation. The ordinary SessionStore
+                // may still lag because its final save follows the protected
+                // lifecycle barrier; retain only newer delegation namespaces
+                // and never require stale usage/history equality here.
+                let mut protected = checkpoint.snapshot.clone();
+                merge_newer_nonterminal_delegation_state(&mut protected, &snapshot)?;
+                // The ordinary store may have durably minted unrelated
+                // request/event identities after the cache ResultReady
+                // boundary. Preserve that monotonic floor without allowing
+                // its stale cache extension or usage projection to override
+                // the protected terminal operation.
+                protected.identity.advance_to_floor(&snapshot.identity);
+                Some(protected)
+            }
+            (Some(checkpoint), Some(snapshot)) => {
+                let mut protected = checkpoint.snapshot.clone();
+                merge_newer_nonterminal_delegation_state(&mut protected, &snapshot)?;
+                // The protected cache projection owns lifecycle/result state,
+                // but an ordinary save may have minted unrelated request,
+                // turn, attempt, tool, or event identities while the cache
+                // checkpoint was in flight. Preserve that monotonic floor
+                // without allowing stale ordinary cache/usage fields to
+                // override the protected snapshot.
+                protected.identity.advance_to_floor(&snapshot.identity);
+                Some(protected)
+            }
+            (Some(checkpoint), None) => Some(checkpoint.snapshot.clone()),
             (None, snapshot) => snapshot,
         };
         if let Some(snapshot) = snapshot {
@@ -296,6 +572,11 @@ impl Runtime {
         if let Some(floor) = &resume_identity_floor {
             identity.advance_to_floor(floor);
         }
+
+        self.shared.cache.restore_session(
+            &session_id,
+            extension_state.get(crate::cache::CACHE_MECHANISM_STATE_NAMESPACE),
+        )?;
 
         let minter = Arc::new(IdMinter::from_state(&identity));
         let emitter = Arc::new(EventEmitter::new(
@@ -318,6 +599,7 @@ impl Runtime {
                 )
                 .await?,
         );
+        let persist_gate = execution.persist_gate();
 
         let inner = Arc::new(SessionInner {
             shared: self.shared.clone(),
@@ -332,6 +614,11 @@ impl Runtime {
                 self.shared.injection_queue_limit,
             ))),
             turn_gate: tokio::sync::Mutex::new(()),
+            admission_gate: Mutex::new(()),
+            cache_gate: tokio::sync::Mutex::new(()),
+            persist_gate,
+            cache_active: std::sync::atomic::AtomicUsize::new(0),
+            cache_start_repairable: Mutex::new(Default::default()),
             turns: Mutex::new(Default::default()),
             turn_ready: tokio::sync::Notify::new(),
             turns_changed: tokio::sync::Notify::new(),
@@ -339,6 +626,7 @@ impl Runtime {
             active_session_lease,
             delegation_coordinator_active: AtomicBool::new(false),
             goal_controller_active: AtomicBool::new(false),
+            user_submission_pending: std::sync::atomic::AtomicUsize::new(0),
             recovery_deferred,
         });
 
@@ -350,12 +638,21 @@ impl Runtime {
         let checkpoint = if request.checkpoint_recovery != CheckpointRecoveryPolicy::Defer
             && !recovery_deferred
         {
-            checkpoint.filter(|checkpoint| !matches!(checkpoint.state, TurnState::Terminal { .. }))
+            checkpoint.filter(|checkpoint| !checkpoint.state.is_terminal())
         } else {
             None
         };
         if let Some(checkpoint) = checkpoint {
-            session.spawn_checkpoint_resume(checkpoint)?;
+            if matches!(
+                checkpoint.state,
+                TurnState::CacheOperationPrepared { .. }
+                    | TurnState::CacheOperationStarted { .. }
+                    | TurnState::CacheOperationResultReady { .. }
+            ) {
+                session.recover_cache_checkpoint(checkpoint).await?;
+            } else {
+                session.spawn_checkpoint_resume(checkpoint)?;
+            }
         }
         Ok(session)
     }
@@ -411,6 +708,82 @@ mod tests {
         assert_ne!(
             opted_in_child.inner().execution.interaction_disposition,
             agent_runtime_core::interaction::InteractionDisposition::Unavailable
+        );
+    }
+
+    #[test]
+    fn equal_timestamp_merges_newer_delegation_semantic_revisions_only() {
+        let id = SessionId::new("merge-equal-time");
+        let mut checkpoint = SessionSnapshot {
+            id: id.clone(),
+            history: vec![agent_runtime_core::content::Message::user(
+                "checkpoint history",
+            )],
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: Vec::new(),
+            extension_state: Default::default(),
+            updated: agent_runtime_core::clock::Timestamp::ZERO,
+        };
+        let cursor_revision =
+            agent_runtime_registry::RegistryRevision::new("child-outcome-cursor-2");
+        checkpoint.extension_state.insert(
+            CHILD_OUTCOME_CURSOR_NAMESPACE.to_owned(),
+            agent_runtime_core::store::VersionedSessionState::new(
+                cursor_revision.clone(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "parent": id,
+                    "revision": 7,
+                    "cursor": {"parent": "merge-equal-time", "revision": 0, "consumed": []},
+                    "outcomes": [],
+                    "ready": []
+                }),
+            ),
+        );
+        checkpoint.extension_state.insert(
+            CHILD_CATALOG_NAMESPACE.to_owned(),
+            agent_runtime_core::store::VersionedSessionState::new(
+                agent_runtime_registry::RegistryRevision::new("resumable-child-catalog-1"),
+                serde_json::json!({"schema_version": 1, "next_child": 2, "children": []}),
+            ),
+        );
+
+        let mut ordinary = checkpoint.clone();
+        ordinary.history = vec![agent_runtime_core::content::Message::user(
+            "ordinary history",
+        )];
+        ordinary.extension_state.insert(
+            CHILD_OUTCOME_CURSOR_NAMESPACE.to_owned(),
+            agent_runtime_core::store::VersionedSessionState::new(
+                cursor_revision,
+                serde_json::json!({
+                    "schema_version": 1,
+                    "parent": "merge-equal-time",
+                    "revision": 8,
+                    "cursor": {"parent": "merge-equal-time", "revision": 0, "consumed": []},
+                    "outcomes": [],
+                    "ready": []
+                }),
+            ),
+        );
+        ordinary.extension_state.insert(
+            CHILD_CATALOG_NAMESPACE.to_owned(),
+            agent_runtime_core::store::VersionedSessionState::new(
+                agent_runtime_registry::RegistryRevision::new("resumable-child-catalog-1"),
+                serde_json::json!({"schema_version": 1, "next_child": 3, "children": []}),
+            ),
+        );
+
+        merge_newer_nonterminal_delegation_state(&mut checkpoint, &ordinary).unwrap();
+        assert_eq!(checkpoint.history[0].joined_text(), "checkpoint history");
+        assert_eq!(
+            checkpoint.extension_state[CHILD_OUTCOME_CURSOR_NAMESPACE].value["revision"],
+            serde_json::json!(8)
+        );
+        assert_eq!(
+            checkpoint.extension_state[CHILD_CATALOG_NAMESPACE].value["next_child"],
+            serde_json::json!(3)
         );
     }
 }

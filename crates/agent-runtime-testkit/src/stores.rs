@@ -96,9 +96,10 @@ impl InMemoryCheckpointStore {
 
     /// Seeds an exact non-terminal boundary for a crash/restart fixture.
     ///
-    /// Normal [`CheckpointStore::save`] intentionally accepts only an initial
-    /// `Accepted` revision. Tests that model a process exiting at a later
-    /// durable boundary must opt into that exceptional setup explicitly.
+    /// Normal [`CheckpointStore::save`] accepts only an initial admission
+    /// revision (`Accepted`, `InternalAccepted`, `LocalActionAccepted`, or
+    /// `CacheOperationPrepared`). Tests that model a process exiting at a
+    /// later durable boundary must opt into that exceptional setup explicitly.
     pub fn seed(&self, checkpoint: TurnCheckpoint) -> Result<(), RuntimeError> {
         checkpoint.validate()?;
         let mut checkpoints = self.checkpoints.lock().expect("store poisoned");
@@ -148,10 +149,11 @@ impl CheckpointStore for InMemoryCheckpointStore {
                         TurnState::Accepted { .. }
                             | TurnState::InternalAccepted { .. }
                             | TurnState::LocalActionAccepted { .. }
+                            | TurnState::CacheOperationPrepared { .. }
                     )
                 {
                     return Err(RuntimeError::conflict(
-                        "the first checkpoint for a session must be accepted revision zero",
+                        "the first checkpoint for a session must be an admission state at revision zero",
                     ));
                 }
                 checkpoints.insert(checkpoint.session.as_str().to_owned(), checkpoint.clone());
@@ -180,12 +182,13 @@ impl CheckpointStore for InMemoryCheckpointStore {
                 return Ok(());
             }
             Some(current)
-                if matches!(current.state, TurnState::Terminal { .. })
+                if current.state.is_terminal()
                     && matches!(
                         checkpoint.state,
                         TurnState::Accepted { .. }
                             | TurnState::InternalAccepted { .. }
                             | TurnState::LocalActionAccepted { .. }
+                            | TurnState::CacheOperationPrepared { .. }
                     ) =>
             {
                 if checkpoint.state_revision != 0

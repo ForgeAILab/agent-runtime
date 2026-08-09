@@ -466,6 +466,50 @@ impl TurnState {
                     visible_output: next_visible,
                 },
             ) => finish == next_finish && visible_output == next_visible,
+            (
+                Self::CacheOperationPrepared { operation },
+                Self::CacheOperationStarted {
+                    operation: next_operation,
+                },
+            ) => cache_operation_started_successor(operation, next_operation),
+            (
+                Self::CacheOperationPrepared { operation },
+                Self::CacheOperationResultReady {
+                    operation: next_operation,
+                    result,
+                },
+            ) => {
+                cache_operation_same_identity(operation, next_operation)
+                    && operation.request == next_operation.request
+                    && operation.attempt == next_operation.attempt
+                    && result.outcome == CacheOperationOutcome::Rejected
+            }
+            (
+                Self::CacheOperationStarted { operation },
+                Self::CacheOperationResultReady {
+                    operation: next_operation,
+                    result,
+                },
+            ) => {
+                cache_operation_same_identity(operation, next_operation)
+                    && operation.request == next_operation.request
+                    && operation.attempt == next_operation.attempt
+                    && result.outcome != CacheOperationOutcome::Rejected
+                    && next_operation.request.is_some()
+                    && next_operation.attempt.is_some()
+            }
+            (
+                Self::CacheOperationResultReady { operation, result },
+                Self::CacheOperationTerminal {
+                    operation: next_operation,
+                    result: next_result,
+                },
+            ) => {
+                cache_operation_same_identity(operation, next_operation)
+                    && operation.request == next_operation.request
+                    && operation.attempt == next_operation.attempt
+                    && result == next_result
+            }
             _ => false,
         }
     }
@@ -479,4 +523,35 @@ impl TurnState {
             &serde_json::to_vec(self).unwrap_or_default(),
         ])
     }
+
+    /// Whether this state has crossed its terminal protected boundary and
+    /// therefore permits a subsequent turn checkpoint in the same session.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Terminal { .. } | Self::CacheOperationTerminal { .. }
+        )
+    }
+}
+
+fn cache_operation_same_identity(
+    current: &CacheOperationCheckpoint,
+    next: &CacheOperationCheckpoint,
+) -> bool {
+    current.operation == next.operation
+        && current.identity == next.identity
+        && current.purpose == next.purpose
+        && current.fingerprint == next.fingerprint
+        && current.expected_read_tokens == next.expected_read_tokens
+}
+
+fn cache_operation_started_successor(
+    current: &CacheOperationCheckpoint,
+    next: &CacheOperationCheckpoint,
+) -> bool {
+    cache_operation_same_identity(current, next)
+        && current.request == next.request
+        && current.attempt.is_none()
+        && next.request.is_some()
+        && next.attempt.is_some()
 }

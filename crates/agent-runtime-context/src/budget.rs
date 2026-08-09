@@ -239,6 +239,10 @@ pub enum ContextErrorKind {
     DuplicateFragmentId,
     /// A compactor produced or reported an invalid replacement.
     Compaction,
+    /// The planner produced a cache identity that is not safe to expose or
+    /// persist. Cache planning fails closed before a cache plan can be
+    /// attached to the authoritative context plan.
+    InvalidCacheIdentity,
 }
 
 impl ContextErrorKind {
@@ -250,6 +254,7 @@ impl ContextErrorKind {
             ContextErrorKind::InvalidPairing => "invalid_pairing",
             ContextErrorKind::DuplicateFragmentId => "duplicate_fragment_id",
             ContextErrorKind::Compaction => "compaction",
+            ContextErrorKind::InvalidCacheIdentity => "invalid_cache_identity",
         }
     }
 }
@@ -321,6 +326,17 @@ impl ContextError {
     pub fn compaction(message: impl Into<String>) -> Self {
         Self {
             kind: ContextErrorKind::Compaction,
+            message: message.into(),
+            report: None,
+            call: None,
+        }
+    }
+
+    /// The cache identity assembled from the plan contains a component that
+    /// is outside the bounded redaction-safe identity contract.
+    pub fn invalid_cache_identity(message: impl Into<String>) -> Self {
+        Self {
+            kind: ContextErrorKind::InvalidCacheIdentity,
             message: message.into(),
             report: None,
             call: None,

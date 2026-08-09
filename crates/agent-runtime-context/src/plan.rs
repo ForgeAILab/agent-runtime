@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use agent_runtime_core::catalog::ComponentRef;
 use agent_runtime_core::content::Message;
-use agent_runtime_core::provider::{ModelId, ProviderRequest, ToolSchema};
+use agent_runtime_core::provider::{ModelId, ProviderCacheBoundary, ProviderRequest, ToolSchema};
 use agent_runtime_registry::{Fingerprint, FingerprintHasher};
 
 use crate::budget::BudgetReport;
@@ -68,6 +68,13 @@ impl PlanInputs {
         self
     }
 
+    /// Iterates the redaction-safe named revisions folded into this plan.
+    pub fn revisions(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.revisions
+            .iter()
+            .map(|(name, revision)| (name.as_str(), revision.as_str()))
+    }
+
     fn fingerprint_into(&self, hasher: &mut FingerprintHasher) {
         for (name, revision) in &self.revisions {
             hasher.pair(name, revision);
@@ -92,6 +99,11 @@ pub struct ContextPlan {
     compaction: CompactionOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_plan: Option<CachePlan>,
+    /// The planner-derived, count-only stable-prefix boundary used by
+    /// provider adapters when placing cache markers. It contains no prompt
+    /// text or fragment identifiers; `None` is retained for legacy plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_boundary: Option<ProviderCacheBoundary>,
 }
 
 impl ContextPlan {
@@ -116,6 +128,7 @@ impl ContextPlan {
             extra: PlanInputs::new(),
             compaction: CompactionOutcome::default(),
             cache_plan: None,
+            cache_boundary: None,
         }
     }
 
@@ -175,6 +188,11 @@ impl ContextPlan {
         &self.model_profile_fingerprint
     }
 
+    /// The named redaction-safe revisions attached by the runtime planner.
+    pub fn plan_inputs(&self) -> &PlanInputs {
+        &self.extra
+    }
+
     /// Attaches extra named revisions (registry, activation, compaction,
     /// cache policy) so a later stage's fingerprint mixes them in without
     /// needing a new plan type. Returns a new plan; the receiver is
@@ -213,6 +231,21 @@ impl ContextPlan {
         self.cache_plan.as_ref()
     }
 
+    /// The planner-derived stable-prefix boundary, when this plan was built
+    /// by a current planner. Counts are redaction-safe wire-lane ordinals;
+    /// callers must not reconstruct them from prompt content.
+    pub fn cache_boundary(&self) -> Option<ProviderCacheBoundary> {
+        self.cache_boundary
+    }
+
+    /// Attaches the planner-derived stable-prefix boundary. This is exposed
+    /// for the context planner's immutable decoration step; ordinary callers
+    /// should obtain it from [`ContextPlan::to_provider_request`].
+    pub(crate) fn with_cache_boundary(mut self, boundary: ProviderCacheBoundary) -> Self {
+        self.cache_boundary = Some(boundary);
+        self
+    }
+
     /// The plan's complete fingerprint: the model-profile fingerprint, the
     /// sizer's revision and confidence, every ordered segment's content
     /// hash, and any extra revisions attached by a later stage. Two plans
@@ -238,6 +271,11 @@ impl ContextPlan {
     pub fn to_provider_request(&self, model: ModelId) -> ProviderRequest {
         let mut request = ProviderRequest::new(model, self.messages.clone());
         request.tools = self.tools.clone();
+        request.cache_identity = self
+            .cache_plan
+            .as_ref()
+            .and_then(|cache| cache.cache_identity.clone());
+        request.cache_boundary = self.cache_boundary;
         request
     }
 }
@@ -245,6 +283,7 @@ impl ContextPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::ProviderCacheCapability;
     use crate::fragment::{CacheClass, FragmentKind, Sensitivity};
     use agent_runtime_core::catalog::ComponentRef;
     use agent_runtime_core::provider::ModelId;
@@ -349,5 +388,34 @@ mod tests {
         assert_eq!(request.messages, messages);
         assert_eq!(request.tools, tools);
         assert_eq!(request.model, ModelId::new("m1"));
+    }
+
+    #[test]
+    fn legacy_cache_plan_does_not_attach_a_model_bound_identity() {
+        let capability = ProviderCacheCapability::full(
+            RegistryRevision::new("legacy-cache-1"),
+            "legacy-provider",
+        );
+        let cache_plan = CachePlan::build(
+            Fingerprint::of("profile"),
+            &[sample_segment("sys", "one")],
+            None,
+            &capability,
+        );
+        assert!(cache_plan.cache_identity().is_none());
+
+        let request = ContextPlan::new(
+            vec![Message::system("stable")],
+            Vec::new(),
+            vec![sample_segment("sys", "one")],
+            sample_budget(),
+            Fingerprint::of("profile"),
+        )
+        .with_cache_plan(cache_plan)
+        .to_provider_request(ModelId::new("m1"));
+        assert!(request.cache_identity.is_none());
+        request
+            .validate_cache_identity()
+            .expect("legacy plans remain model-agnostic at the provider boundary");
     }
 }

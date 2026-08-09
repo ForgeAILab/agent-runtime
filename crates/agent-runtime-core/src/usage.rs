@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AttemptId, RequestId, ToolCallId};
+use crate::provider::{CacheIdentity, ProviderAttemptPurpose};
 
 /// A disjoint token category. Categories never overlap, so the total token
 /// count for a delta is the sum across all categories.
@@ -139,6 +140,13 @@ pub struct Provenance {
     /// Stable host-neutral purpose label for separately attributed work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    /// Typed provider-attempt purpose when this record came from provider
+    /// work. The legacy string remains for backward-readable journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_purpose: Option<ProviderAttemptPurpose>,
+    /// Exact opaque cache identity correlated with this provider attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_identity: Option<CacheIdentity>,
     /// Whether the producing attempt failed (kept so failures stay visible).
     #[serde(default)]
     pub failed: bool,

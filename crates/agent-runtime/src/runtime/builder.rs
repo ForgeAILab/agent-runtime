@@ -24,7 +24,10 @@ use agent_runtime_core::grant::{SecurityCheck, SecurityCheckMode};
 use agent_runtime_core::ids::TenantId;
 use agent_runtime_core::interaction::{InteractionBroker, UnavailableInteractionBroker};
 use agent_runtime_core::observer::EventObserver;
-use agent_runtime_core::provider::{ModelId, Provider, ReasoningConfig, StructuredOutputConfig};
+use agent_runtime_core::provider::{
+    CacheEndpointIdentity, Capabilities, ModelId, Provider, ProviderCacheBehavior, ReasoningConfig,
+    StructuredOutputConfig,
+};
 use agent_runtime_core::security::{PermissionSet, SecuritySubject};
 use agent_runtime_core::store::{SecretStore, SessionStore};
 use agent_runtime_core::tool::Tool;
@@ -32,6 +35,7 @@ use agent_runtime_core::workspace::{DenyAllWorkspace, Workspace};
 use agent_runtime_registry::RegistryRevision;
 
 use crate::agent::planning::{RunPlanner, RunRevisions};
+use crate::cache::CacheMechanism;
 
 use crate::agent::config::{DowngradePolicy, LoopConfig};
 use crate::agent::driver::Driver;
@@ -70,6 +74,7 @@ pub struct RuntimeBuilder {
     context_policy: Option<ContextPolicy>,
     compactor: Option<StructuralCompactor>,
     cache_capability: Option<ProviderCacheCapability>,
+    cache_endpoint_identity: Option<CacheEndpointIdentity>,
     revisions: RunRevisions,
     security_checks: Vec<(
         Arc<dyn SecurityCheck>,
@@ -126,6 +131,7 @@ impl RuntimeBuilder {
             context_policy: None,
             compactor: None,
             cache_capability: None,
+            cache_endpoint_identity: None,
             revisions: RunRevisions::empty(),
             security_checks: Vec::new(),
             has_authoritative_check: false,
@@ -199,6 +205,14 @@ impl RuntimeBuilder {
     /// to none, so an unsupported hint is reported rather than assumed.
     pub fn cache_capability(mut self, capability: ProviderCacheCapability) -> Self {
         self.cache_capability = Some(capability);
+        self
+    }
+
+    /// Supplies the host-owned opaque endpoint/tenant partition identity used
+    /// for provider prompt-cache keys. URLs, credentials, and raw tenant
+    /// labels never enter Runtime state.
+    pub fn cache_endpoint_identity(mut self, identity: CacheEndpointIdentity) -> Self {
+        self.cache_endpoint_identity = Some(identity);
         self
     }
 
@@ -627,6 +641,13 @@ impl RuntimeBuilder {
             }
         };
 
+        if profile.model != self.config.model {
+            return Err(RuntimeError::config(format!(
+                "model profile `{}` does not match RuntimeBuilder target model `{}`",
+                profile.model, self.config.model
+            )));
+        }
+
         let context_policy = self.context_policy.take().unwrap_or_else(|| {
             ContextPolicy::new(
                 RegistryRevision::new("default-context-policy-1"),
@@ -745,26 +766,58 @@ impl RuntimeBuilder {
         let provider_name = self
             .provider_name
             .unwrap_or_else(|| profile.provider.clone());
-        let planner = Arc::new(RunPlanner::new(
+        if let Some(endpoint) = self.cache_endpoint_identity.as_ref() {
+            endpoint.validate().map_err(|error| {
+                RuntimeError::config(format!("invalid cache endpoint identity: {error}"))
+            })?;
+        }
+        let requested_cache_capability = self
+            .cache_capability
+            .unwrap_or_else(|| {
+                ProviderCacheCapability::none(
+                    RegistryRevision::new("no-provider-cache-1"),
+                    "unspecified",
+                )
+            })
+            .validated_or_none();
+        let cache_capability = reconcile_cache_capability(
+            requested_cache_capability,
+            provider_name.as_str(),
+            provider.capabilities(&config.model),
+        )
+        .validated_or_none();
+        if let Some(resource) = cache_capability.resource_identity.as_ref() {
+            resource.validate().map_err(|error| {
+                RuntimeError::config(format!("invalid cache resource identity: {error}"))
+            })?;
+        }
+        let requires_cache_partition = cache_capability.contract.behavior.supports_stable_prefix();
+        if requires_cache_partition && self.cache_endpoint_identity.is_none() {
+            return Err(RuntimeError::config(
+                "synthetic or resource cache capability requires a host-supplied cache endpoint identity",
+            ));
+        }
+        let mut planner = RunPlanner::new(
             profile,
             provider_name,
             self.sizer
                 .unwrap_or_else(|| Arc::new(CharRatioSizer::default())),
             context_policy,
             self.compactor,
-            self.cache_capability.unwrap_or_else(|| {
-                ProviderCacheCapability::none(
-                    RegistryRevision::new("no-provider-cache-1"),
-                    "unspecified",
-                )
-            }),
+            cache_capability,
             self.revisions,
-        ));
+        );
+        if let Some(endpoint) = self.cache_endpoint_identity {
+            planner = planner.with_cache_endpoint_identity(endpoint);
+        }
+        let planner = Arc::new(planner);
 
         let session_store = self.session_store;
         let checkpoint_store = self.checkpoint_store;
+        let cache = Arc::new(CacheMechanism::new(provider.clone(), self.clock.clone()));
         let driver = Driver::new(
             provider,
+            cache.clone(),
             registry,
             executor,
             self.clock.clone(),
@@ -781,6 +834,7 @@ impl RuntimeBuilder {
 
         let shared = RuntimeShared {
             driver,
+            cache,
             clock: self.clock,
             session_store,
             checkpoint_store,
@@ -795,6 +849,94 @@ impl RuntimeBuilder {
     }
 }
 
+/// Intersects the host's cache projection with the provider adapter's
+/// model-scoped contract.  Cache planning is an optimization and must fail
+/// closed when the two declarations disagree; ordinary provider execution is
+/// intentionally unaffected and continues through the normal capability
+/// validation path.
+fn reconcile_cache_capability(
+    requested: ProviderCacheCapability,
+    provider_name: &str,
+    actual: Option<Capabilities>,
+) -> ProviderCacheCapability {
+    let Some(actual) = actual else {
+        return ProviderCacheCapability::none(requested.revision, requested.provider);
+    };
+    if requested.provider != provider_name {
+        return ProviderCacheCapability::none(requested.revision, requested.provider);
+    }
+
+    let actual_contract = actual.cache_contract();
+    if requested.contract.behavior != actual_contract.behavior {
+        return ProviderCacheCapability::none(requested.revision, requested.provider);
+    }
+
+    let mut contract = requested.contract.clone();
+    let exact_provider_metadata = requested.contract.retention == actual_contract.retention
+        && requested.contract.key_revision == actual_contract.key_revision;
+    if !exact_provider_metadata {
+        // A host declaration that omits or changes provider retention/key
+        // metadata cannot authorize synthetic maintenance. Keep ordinary
+        // prefix evidence only; the provider contract remains the authority
+        // for any future exact declaration.
+        contract.retention = Default::default();
+        contract.key_revision = None;
+        contract.maintenance.clear();
+        contract.resource_operations.clear();
+        contract.conformance = None;
+    }
+    contract.evidence.stream &= actual_contract.evidence.stream;
+    contract.evidence.resource_operations &= actual_contract.evidence.resource_operations;
+    contract.evidence.cache_scoped_errors &= actual_contract.evidence.cache_scoped_errors;
+    contract.maintenance = contract
+        .maintenance
+        .intersection(&actual_contract.maintenance)
+        .copied()
+        .collect();
+    contract.resource_operations = contract
+        .resource_operations
+        .intersection(&actual_contract.resource_operations)
+        .copied()
+        .collect();
+    // Maintenance streams and resource actions are only useful when their
+    // corresponding evidence channel is present. Keep the ordinary provider
+    // capability intact, but make cache projection fail closed instead of
+    // authorizing an operation whose result Runtime cannot observe.
+    if !contract.evidence.stream {
+        contract.maintenance.clear();
+        contract.conformance = None;
+    }
+    if !contract.evidence.resource_operations {
+        contract.resource_operations.clear();
+    }
+    if contract.conformance != actual_contract.conformance {
+        contract.conformance = None;
+    }
+    let resource_identity = if matches!(
+        actual_contract.behavior,
+        agent_runtime_core::provider::ProviderCacheBehavior::ExplicitResource
+    ) && !contract.resource_operations.is_empty()
+    {
+        requested.resource_identity
+    } else {
+        None
+    };
+
+    ProviderCacheCapability {
+        revision: requested.revision,
+        provider: requested.provider,
+        supports_stable: requested.supports_stable
+            && actual_contract.behavior.supports_stable_prefix(),
+        supports_ephemeral: requested.supports_ephemeral
+            && matches!(
+                actual_contract.behavior,
+                ProviderCacheBehavior::ExplicitBreakpoint { .. }
+            ),
+        contract,
+        resource_identity,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +944,9 @@ mod tests {
     use agent_runtime_core::catalog::ModelLimits;
     use agent_runtime_core::grant::{
         GrantConstraints, SecurityCheckId, SecurityCheckOutcome, SecurityCheckRevision,
+    };
+    use agent_runtime_core::provider::{
+        CacheResourceIdentity, CacheResourceOperationKind, ProviderCacheContract,
     };
     use agent_runtime_core::security::AuthorizationRequest;
     use agent_runtime_core::tool::{InvocationContext, LegacyTool, ToolEffects, ToolOutcome};
@@ -979,5 +1124,172 @@ mod tests {
             )
             .build()
             .expect("a host-registered authoritative check must satisfy the coverage gate");
+    }
+
+    #[test]
+    fn build_rejects_a_profile_for_a_different_loop_model() {
+        let error = RuntimeBuilder::new(ModelId::new("loop-model"))
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("profile-model"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .build()
+            .expect_err("a profile for another model must not drive this loop");
+        assert!(error.message.contains("does not match"));
+        assert!(error.message.contains("loop-model"));
+    }
+
+    #[test]
+    fn cache_capability_reconciliation_fails_closed_without_blocking_ordinary_provider_use() {
+        let requested =
+            ProviderCacheCapability::full(RegistryRevision::new("host-cache-1"), "fake");
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("ordinary")))
+            .cache_capability(requested.clone())
+            .build()
+            .expect("ordinary provider execution must remain buildable");
+        let actual = Capabilities {
+            cache: true,
+            prompt_cache: agent_runtime_core::provider::PromptCacheControl::Implicit,
+            ..Capabilities::basic_streaming()
+        };
+        let reconciled = reconcile_cache_capability(requested, "fake", Some(actual));
+        assert!(!reconciled.supports_stable);
+        assert_eq!(
+            reconciled.contract.behavior,
+            ProviderCacheBehavior::Unsupported
+        );
+    }
+
+    #[test]
+    fn stable_cache_capability_requires_a_host_endpoint_partition() {
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities {
+                cache: true,
+                prompt_cache: agent_runtime_core::provider::PromptCacheControl::Implicit,
+                ..Capabilities::basic_streaming()
+            },
+            Vec::new(),
+        ));
+        let error = RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(provider)
+            .cache_capability(ProviderCacheCapability::from_control(
+                RegistryRevision::new("stable-cache"),
+                "fake",
+                agent_runtime_core::provider::PromptCacheControl::Implicit,
+            ))
+            .build()
+            .expect_err("stable provider cache identity needs a host partition");
+        assert!(error.message.contains("endpoint identity"));
+    }
+
+    #[test]
+    fn cache_reconciliation_clears_resource_identity_without_explicit_resource_actions() {
+        let resource = CacheResourceIdentity::new(
+            agent_runtime_registry::Fingerprint::from_hex("0123456789abcdef0123456789abcdef"),
+            RegistryRevision::new("resource-1"),
+        );
+        let mut requested_contract = ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ExplicitResource,
+            ..ProviderCacheContract::default()
+        };
+        requested_contract
+            .resource_operations
+            .insert(CacheResourceOperationKind::Inspect);
+        let requested = ProviderCacheCapability::from_contract(
+            RegistryRevision::new("host-cache-1"),
+            "fake",
+            requested_contract.clone(),
+        )
+        .with_resource_identity(resource.clone());
+        let actual = Capabilities {
+            cache: true,
+            prompt_cache: agent_runtime_core::provider::PromptCacheControl::Implicit,
+            cache_contract: Some(ProviderCacheContract {
+                behavior: ProviderCacheBehavior::ImplicitPrefix,
+                ..ProviderCacheContract::default()
+            }),
+            ..Capabilities::basic_streaming()
+        };
+        let reconciled = reconcile_cache_capability(requested, "fake", Some(actual));
+        assert!(reconciled.resource_identity.is_none());
+        assert!(reconciled.contract.resource_operations.is_empty());
+    }
+
+    #[test]
+    fn cache_reconciliation_clears_maintenance_without_stream_evidence() {
+        let requested_contract = ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ImplicitPrefix,
+            evidence: agent_runtime_core::provider::CacheEvidenceCapabilities {
+                stream: true,
+                ..Default::default()
+            },
+            maintenance: [agent_runtime_core::provider::ProviderAttemptPurpose::CacheKeepalive]
+                .into_iter()
+                .collect(),
+            conformance: Some(agent_runtime_core::provider::SyntheticConformance::complete()),
+            ..ProviderCacheContract::default()
+        };
+        let requested = ProviderCacheCapability::from_contract(
+            RegistryRevision::new("host-cache-1"),
+            "fake",
+            requested_contract.clone(),
+        );
+        let actual_contract = ProviderCacheContract {
+            evidence: agent_runtime_core::provider::CacheEvidenceCapabilities::default(),
+            ..requested_contract
+        };
+        let actual = Capabilities {
+            cache: true,
+            cache_contract: Some(actual_contract),
+            ..Capabilities::basic_streaming()
+        };
+
+        let reconciled = reconcile_cache_capability(requested, "fake", Some(actual));
+
+        assert!(reconciled.contract.maintenance.is_empty());
+        assert!(reconciled.contract.conformance.is_none());
+        assert!(!reconciled.contract.supports_synthetic(
+            agent_runtime_core::provider::ProviderAttemptPurpose::CacheKeepalive
+        ));
+    }
+
+    #[test]
+    fn cache_reconciliation_clears_resource_actions_without_resource_evidence() {
+        let mut requested_contract = ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ExplicitResource,
+            evidence: agent_runtime_core::provider::CacheEvidenceCapabilities {
+                resource_operations: true,
+                ..Default::default()
+            },
+            ..ProviderCacheContract::default()
+        };
+        requested_contract
+            .resource_operations
+            .insert(CacheResourceOperationKind::Create);
+        let requested = ProviderCacheCapability::from_contract(
+            RegistryRevision::new("host-cache-1"),
+            "fake",
+            requested_contract.clone(),
+        );
+        let actual_contract = ProviderCacheContract {
+            evidence: agent_runtime_core::provider::CacheEvidenceCapabilities::default(),
+            ..requested_contract
+        };
+        let actual = Capabilities {
+            cache: true,
+            cache_contract: Some(actual_contract),
+            ..Capabilities::basic_streaming()
+        };
+
+        let reconciled = reconcile_cache_capability(requested, "fake", Some(actual));
+
+        assert!(reconciled.contract.resource_operations.is_empty());
+        assert!(!reconciled.contract.evidence.resource_operations);
     }
 }

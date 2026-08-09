@@ -440,6 +440,17 @@ impl<'a> TurnMachine<'a> {
                 )
                 .await;
             }
+            TurnState::CacheOperationPrepared { .. }
+            | TurnState::CacheOperationStarted { .. }
+            | TurnState::CacheOperationResultReady { .. }
+            | TurnState::CacheOperationTerminal { .. } => {
+                self.emit_non_durable_failure(
+                    RuntimeError::conflict(
+                        "cache checkpoints must be recovered by the session cache mechanism",
+                    ),
+                    checkpoint.visible_output,
+                );
+            }
             TurnState::Terminal { .. } => {}
         }
     }

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use agent_runtime_registry::{Fingerprint, FingerprintHasher, RegistryId, RegistryRevision};
 
 use crate::catalog::{ComponentRef, FieldProvenance, ProfileField};
-use crate::provider::ModelId;
+use crate::provider::{CacheIdentity, ModelId};
 
 /// The schema version of the run-manifest vocabulary. Bumped on any breaking
 /// change to [`RunManifest`]'s shape.
@@ -457,6 +457,10 @@ pub struct RunManifest {
     pub context_fingerprint: Fingerprint,
     /// The fingerprint of the cache plan.
     pub cache_plan_fingerprint: Fingerprint,
+    /// The exact redaction-safe cache identity used for this plan, when the
+    /// adaptive cache planner was active. Legacy manifests omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_identity: Option<CacheIdentity>,
     /// Structured reasons for filtering, downgrade, compaction, or budget
     /// failure recorded during this run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -486,6 +490,7 @@ impl RunManifest {
             summaries: Vec::new(),
             context_fingerprint,
             cache_plan_fingerprint,
+            cache_identity: None,
             reasons: Vec::new(),
         }
     }
@@ -511,6 +516,12 @@ impl RunManifest {
     /// Attaches compaction summary coverage.
     pub fn with_summaries(mut self, summaries: Vec<SummaryCoverage>) -> Self {
         self.summaries = summaries;
+        self
+    }
+
+    /// Attaches the exact redaction-safe cache identity used by the plan.
+    pub fn with_cache_identity(mut self, identity: Option<CacheIdentity>) -> Self {
+        self.cache_identity = identity;
         self
     }
 
@@ -579,6 +590,11 @@ impl RunManifest {
         }
         hasher.nested(&self.context_fingerprint);
         hasher.nested(&self.cache_plan_fingerprint);
+        if let Some(identity) = &self.cache_identity {
+            hasher.nested(identity.digest());
+        } else {
+            hasher.field("");
+        }
         hasher.finish()
     }
 

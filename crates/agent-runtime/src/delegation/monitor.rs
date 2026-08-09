@@ -27,7 +27,7 @@ impl DelegationCoordinator {
                 (Some(TurnFinish::NeedsInput { request }), Some(exact))
                     if exact.id() == &request =>
                 {
-                    record_returned_input(&coordinator, &child, &handle, exact)
+                    record_returned_input(&coordinator, &child, &handle, exact).await
                 }
                 (Some(TurnFinish::NeedsInput { .. }), _) => Err(RuntimeError::conflict(
                     "child completed with needs_input but its protected request was unavailable",
@@ -43,7 +43,7 @@ impl DelegationCoordinator {
                     .await
                     {
                         Ok(result) => {
-                            record_completed_outcome(&coordinator, &child, turn_id, result)
+                            record_completed_outcome(&coordinator, &child, turn_id, result).await
                         }
                         Err(error) => Err(error),
                     }
@@ -51,19 +51,35 @@ impl DelegationCoordinator {
                 _ => return,
             };
             if let Err(error) = result {
-                update_status(&coordinator, &child, |status| {
-                    status.state = ChildState::Failed;
-                    status.updated_at = coordinator.parent.inner().shared.clock.now();
-                });
-                DelegationCoordinator {
-                    inner: coordinator.clone(),
+                if coordinator.factory.durability() == ChildDurability::Durable {
+                    // A terminal checkpoint already exists, but the parent
+                    // outcome/catalog save may have failed after the provider
+                    // crossed its terminal boundary. Keep the child in a
+                    // retryable metadata-only recovery state rather than
+                    // converting an indeterminate persistence result into an
+                    // irreversible child failure. `recover()` can reduce the
+                    // protected checkpoint in this same process without
+                    // rebuilding the provider or replaying the turn.
+                    mark_terminal_recovery_pending(&coordinator, &child);
+                    DelegationCoordinator {
+                        inner: coordinator.clone(),
+                    }
+                    .spawn_child_persist(child.clone());
+                } else {
+                    update_status(&coordinator, &child, |status| {
+                        status.state = ChildState::Failed;
+                        status.updated_at = coordinator.parent.inner().shared.clock.now();
+                    });
+                    DelegationCoordinator {
+                        inner: coordinator.clone(),
+                    }
+                    .spawn_child_persist(child.clone());
+                    coordinator
+                        .parent
+                        .inner()
+                        .emitter
+                        .emit(None, RuntimeEvent::ChildFailed { child, error });
                 }
-                .spawn_child_persist(child.clone());
-                coordinator
-                    .parent
-                    .inner()
-                    .emitter
-                    .emit(None, RuntimeEvent::ChildFailed { child, error });
             }
         });
     }
@@ -326,51 +342,125 @@ pub(super) fn release_capacity(coordinator: &Arc<CoordinatorInner>, child: &Chil
     }
 }
 
+/// Releases one retained-record admission reservation.  This is separate
+/// from running capacity: a queued child holds the former while waiting for
+/// the latter, and a failed construction must return both independently.
+pub(super) fn release_retained_reservation(coordinator: &Arc<CoordinatorInner>) {
+    let mut retained = coordinator
+        .retained_reservations
+        .lock()
+        .expect("delegation retained reservations poisoned");
+    *retained = retained.saturating_sub(1);
+}
+
 /// Starts the next queued spawn if a slot is free (queue policy only).
 pub(super) async fn start_queued(coordinator: &Arc<CoordinatorInner>) {
-    let next = {
+    // One queue-drain invocation owns a bounded FIFO pass. If construction or
+    // initial send fails for one item, advance to the next item while the
+    // newly freed slot is still available; do not leave later queued work
+    // stranded behind a failed head, and do not retry the same failed item in
+    // a tight loop.
+    loop {
+        let next = {
+            let mut reservations = coordinator
+                .spawn_reservations
+                .lock()
+                .expect("delegation spawn reservations poisoned");
+            let alive = coordinator
+                .children
+                .lock()
+                .expect("delegation children poisoned")
+                .values()
+                .filter(|entry| {
+                    !entry.status.borrow().state.is_terminal()
+                        && matches!(entry.binding, ChildBinding::Live { .. })
+                })
+                .count();
+            if alive.saturating_add(*reservations) >= coordinator.config.limits.max_running_children
+            {
+                return;
+            }
+            let mut queue = coordinator.queue.lock().expect("delegation queue poisoned");
+            if queue.is_empty() {
+                return;
+            }
+            *reservations = (*reservations).saturating_add(1);
+            queue.remove(0)
+        };
+        let handle = DelegationCoordinator {
+            inner: coordinator.clone(),
+        };
+        // A queued spawn was validated and authorized at submission; a
+        // failure to start it now surfaces as a ChildFailed event so it is
+        // not silently lost. `start_child` releases retained/shared capacity
+        // for every pre-bind failure and terminates/releases a bound child if
+        // its initial send fails.
+        let started = handle
+            .start_child(next.child.clone(), next.spec.clone(), true, true)
+            .await;
         let mut reservations = coordinator
             .spawn_reservations
             .lock()
             .expect("delegation spawn reservations poisoned");
-        let alive = coordinator
-            .children
-            .lock()
-            .expect("delegation children poisoned")
-            .values()
-            .filter(|entry| !entry.status.borrow().state.is_terminal())
-            .count();
-        if alive.saturating_add(*reservations) >= coordinator.config.limits.max_running_children {
-            return;
+        *reservations = (*reservations).saturating_sub(1);
+        drop(reservations);
+        if let Err(err) = started {
+            let shared_capacity_limit = err.kind == ErrorKind::Limit
+                && err.message == "shared delegation capacity is exhausted";
+            if shared_capacity_limit {
+                // Another coordinator may own the process-wide slot. Keep
+                // this item at the FIFO head with its retained reservation;
+                // a later local slot release will retry it once, while this
+                // invocation returns instead of spinning on the same Limit.
+                coordinator
+                    .queue
+                    .lock()
+                    .expect("delegation queue poisoned")
+                    .insert(
+                        0,
+                        QueuedSpawn {
+                            child: next.child,
+                            spec: next.spec,
+                        },
+                    );
+                schedule_shared_capacity_retry(coordinator);
+                return;
+            }
+            coordinator.parent.inner().emitter.emit(
+                None,
+                RuntimeEvent::ChildFailed {
+                    child: next.child,
+                    error: err,
+                },
+            );
         }
-        let mut queue = coordinator.queue.lock().expect("delegation queue poisoned");
-        if queue.is_empty() {
-            return;
-        }
-        *reservations = (*reservations).saturating_add(1);
-        queue.remove(0)
-    };
-    let handle = DelegationCoordinator {
-        inner: coordinator.clone(),
-    };
-    // A queued spawn was validated and authorized at submission; a failure to
-    // start it now surfaces as a ChildFailed event so it is not silently lost.
-    let started = handle.start_child(next.child.clone(), next.spec).await;
-    let mut reservations = coordinator
-        .spawn_reservations
-        .lock()
-        .expect("delegation spawn reservations poisoned");
-    *reservations = (*reservations).saturating_sub(1);
-    drop(reservations);
-    if let Err(err) = started {
-        coordinator.parent.inner().emitter.emit(
-            None,
-            RuntimeEvent::ChildFailed {
-                child: next.child,
-                error: err,
-            },
-        );
     }
+}
+
+/// Arms one edge-triggered retry for a queue head blocked by process-wide
+/// capacity. Keeping task creation outside `start_queued` avoids making that
+/// async function recursively depend on its own `Send` bound.
+fn schedule_shared_capacity_retry(coordinator: &Arc<CoordinatorInner>) {
+    if coordinator
+        .shared_capacity_retry_waiting
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    let Some(pool) = coordinator.config.shared_capacity.clone() else {
+        coordinator
+            .shared_capacity_retry_waiting
+            .store(false, Ordering::Release);
+        return;
+    };
+    let retry_coordinator = coordinator.clone();
+    tokio::spawn(async move {
+        pool.wait_for_release().await;
+        retry_coordinator
+            .shared_capacity_retry_waiting
+            .store(false, Ordering::Release);
+        start_queued(&retry_coordinator).await;
+    });
 }
 
 /// The child's final answer: the last assistant message's visible text, or —

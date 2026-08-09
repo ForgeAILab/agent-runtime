@@ -25,6 +25,8 @@ struct PendingReasoning {
 pub(super) struct ProviderCacheProjection {
     /// The exact cache-plan fingerprint.
     pub(super) cache_plan: Fingerprint,
+    /// Exact opaque identity used by the provider request.
+    pub(super) cache_identity: Option<CacheIdentity>,
     /// The comparable provider-request expectation, if a predecessor exists.
     pub(super) expected_read_tokens: Option<u64>,
     /// Confidence in the planner's token count.
@@ -36,6 +38,10 @@ pub(super) struct ProviderCacheProjection {
 /// A request plus the cache-plan projection from which it was built.
 #[derive(Debug, Clone)]
 pub(super) struct PlannedProviderRequest {
+    /// The immutable plan that produced the request. Retained only until the
+    /// provider-start boundary so cache maintenance can be bound to exactly
+    /// the plan Runtime committed, never to a rebuilt prompt.
+    pub(super) plan: ContextPlan,
     pub(super) request: ProviderRequest,
     pub(super) cache: Option<ProviderCacheProjection>,
     pub(super) cache_plan: Option<CachePlan>,
@@ -100,6 +106,29 @@ fn resolve_cache_state(
         observed_write_tokens,
         missed_tokens,
     )
+}
+
+/// Selects one explicit refresh cause from presence-aware provider fields.
+/// When both fields are present, prefer a cause whose model contract declares
+/// it refreshing retention; otherwise retain the provider's write/read
+/// ordering without inventing a touch for explicit zero values.
+fn correlated_refresh_cause(
+    contract: &agent_runtime_core::provider::ProviderCacheContract,
+    read_tokens: Option<u64>,
+    write_tokens: Option<u64>,
+) -> Option<CacheRefreshCause> {
+    let read = read_tokens.is_some_and(|tokens| tokens > 0);
+    let write = write_tokens.is_some_and(|tokens| tokens > 0);
+    match (
+        read && contract.retention.refreshes(CacheRefreshCause::Read),
+        write && contract.retention.refreshes(CacheRefreshCause::Write),
+    ) {
+        (true, _) => Some(CacheRefreshCause::Read),
+        (_, true) => Some(CacheRefreshCause::Write),
+        (false, false) if write => Some(CacheRefreshCause::Write),
+        (false, false) if read => Some(CacheRefreshCause::Read),
+        _ => None,
+    }
 }
 
 /// One coalesced presentation delta ready to become a `RuntimeEvent`.
@@ -674,12 +703,14 @@ impl Driver {
         }
         let cache = plan.cache_plan().map(|cache_plan| ProviderCacheProjection {
             cache_plan: cache_plan.fingerprint(),
+            cache_identity: cache_plan.cache_identity.clone(),
             expected_read_tokens: cache_plan.expected_read_tokens(),
             confidence: map_confidence(plan.confidence()),
             provider_cache_supported: cache_plan.provider_cache.capability.supports_stable,
         });
         let cache_plan = plan.cache_plan().cloned();
         Ok(PlannedProviderRequest {
+            plan: plan.clone(),
             request,
             cache,
             cache_plan,
@@ -736,6 +767,25 @@ impl Driver {
         Ok(())
     }
 
+    /// Removes provider-cache projections after a permissive tool downgrade.
+    /// The immutable context plan was compiled with the schemas present, so
+    /// clearing the request's identity/boundary and the associated expected
+    /// evidence is the safe fail-closed outcome when recomputing a plan is no
+    /// longer possible at this boundary.
+    pub(super) fn suppress_cache_after_tool_downgrade(
+        planned_with_tools: bool,
+        request: &mut ProviderRequest,
+        cache: &mut Option<ProviderCacheProjection>,
+        cache_plan: &mut Option<CachePlan>,
+    ) {
+        if planned_with_tools && request.tools.is_empty() {
+            request.cache_identity = None;
+            request.cache_boundary = None;
+            *cache = None;
+            *cache_plan = None;
+        }
+    }
+
     /// Runs a single provider request across its retry attempts, recording each
     /// attempt's usage and never hiding a failed attempt.
     #[allow(clippy::too_many_arguments)]
@@ -744,6 +794,7 @@ impl Driver {
         request: ProviderRequest,
         request_id: &RequestId,
         cache: Option<&ProviderCacheProjection>,
+        provider_plan: Option<(&RunPlanner, &ContextPlan)>,
         emitter: &EventEmitter,
         minter: &IdMinter,
         turn_cancel: &Cancellation,
@@ -753,6 +804,12 @@ impl Driver {
     ) -> ProviderTurnOutcome {
         let mut attempt_index: u32 = 0;
         let mut credential_recovery_used = false;
+        // The plan becomes a provider-cache predecessor only after an adapter
+        // accepts the normalized request and returns a stream. Adapter-local
+        // payload validation may fail synchronously before any provider I/O;
+        // committing earlier would seed a false baseline for a request the
+        // provider never received. Retries share this one-shot boundary.
+        let mut provider_plan = provider_plan;
         loop {
             let attempt_id = minter.attempt();
             emitter.emit(
@@ -775,6 +832,8 @@ impl Driver {
                 session: emitter.session().clone(),
                 request_id: request_id.clone(),
                 attempt_id: attempt_id.clone(),
+                cache_identity: cache.and_then(|projection| projection.cache_identity.clone()),
+                purpose: ProviderAttemptPurpose::Ordinary,
                 cancel: turn_cancel.child(),
                 deadline: attempt_deadline,
             };
@@ -825,6 +884,9 @@ impl Driver {
             match self.provider.stream(request.clone(), ctx).await {
                 Err(perr) => error = Some(perr),
                 Ok(mut stream) => {
+                    if let Some((planner, plan)) = provider_plan.take() {
+                        planner.commit_provider_plan(plan);
+                    }
                     loop {
                         // Waiting only for the next stream event would let a
                         // provider that stalls mid-answer hold the pending
@@ -1048,6 +1110,9 @@ impl Driver {
                         attempt: Some(attempt_id.clone()),
                         tool_call: None,
                         purpose: None,
+                        attempt_purpose: Some(ProviderAttemptPurpose::Ordinary),
+                        cache_identity: cache
+                            .and_then(|projection| projection.cache_identity.clone()),
                         failed,
                     },
                     delta: usage.clone(),
@@ -1060,6 +1125,17 @@ impl Driver {
                 emitter.emit(turn.clone(), RuntimeEvent::Usage { record });
             }
 
+            let cache_contract = self
+                .provider
+                .capabilities(&request.model)
+                .map(|capabilities| capabilities.cache_contract())
+                .unwrap_or_default();
+            let cache_expired = error
+                .as_ref()
+                .is_some_and(|error| error.kind == ProviderErrorKind::CacheExpired);
+            let cache_expiry_supported =
+                cache_expired && cache_contract.evidence.cache_scoped_errors;
+
             if let Some((read_tokens, write_tokens)) = cache_observation {
                 emitter.emit(
                     turn.clone(),
@@ -1067,18 +1143,106 @@ impl Driver {
                         request: Some(request_id.clone()),
                         attempt: Some(attempt_id.clone()),
                         cache_plan: cache.map(|projection| projection.cache_plan.clone()),
+                        cache_identity: cache
+                            .and_then(|projection| projection.cache_identity.clone()),
                         read_tokens,
                         write_tokens,
                     },
                 );
+                if let Some(identity) =
+                    cache.and_then(|projection| projection.cache_identity.clone())
+                    && cache_contract.evidence.stream
+                {
+                    let mut evidence = CacheAvailabilityEvidence::stream(
+                        identity,
+                        request_id.clone(),
+                        attempt_id.clone(),
+                        0,
+                        read_tokens,
+                        write_tokens,
+                    );
+                    let miss_observed = cache
+                        .and_then(|projection| projection.expected_read_tokens)
+                        .zip(read_tokens)
+                        .is_some_and(|(expected, observed)| observed < expected);
+                    if miss_observed {
+                        evidence = evidence.with_kind(CacheEvidenceKind::Miss);
+                    }
+                    if !miss_observed
+                        && let Some(cause) =
+                            correlated_refresh_cause(&cache_contract, read_tokens, write_tokens)
+                    {
+                        evidence = evidence.with_contract_refresh(
+                            &cache_contract,
+                            self.clock.now(),
+                            cause,
+                        );
+                    }
+                    // Do not promote an adapter-local malformed observation
+                    // into canonical evidence or an event. Raw observation
+                    // remains available for diagnostics above.
+                    if evidence.validate().is_ok()
+                        && self
+                            .cache
+                            .record_evidence(emitter.session(), evidence.clone())
+                            .is_ok()
+                    {
+                        emitter.emit(
+                            turn.clone(),
+                            RuntimeEvent::CacheAvailabilityEvidenceRecorded { evidence },
+                        );
+                    }
+                }
             }
 
-            if reached_cache_evidence_boundary {
+            if cache_expiry_supported {
+                if let Some(identity) =
+                    cache.and_then(|projection| projection.cache_identity.clone())
+                {
+                    let evidence = CacheAvailabilityEvidence::cache_scoped_expiry(
+                        identity.clone(),
+                        Some(request_id.clone()),
+                        Some(attempt_id.clone()),
+                        None,
+                        u32::from(cache_observation.is_some()),
+                    );
+                    if self
+                        .cache
+                        .record_evidence(emitter.session(), evidence.clone())
+                        .is_ok()
+                    {
+                        emitter.emit(
+                            turn.clone(),
+                            RuntimeEvent::CacheAvailabilityEvidenceRecorded { evidence },
+                        );
+                        emitter.emit(
+                            turn.clone(),
+                            RuntimeEvent::CacheStateChanged {
+                                request: request_id.clone(),
+                                attempt: attempt_id.clone(),
+                                cache_plan: cache
+                                    .map(|projection| projection.cache_plan.clone())
+                                    .unwrap_or_else(|| Fingerprint::of_fields(["no-cache-plan"])),
+                                cache_identity: Some(identity),
+                                state: CacheState::Expired,
+                                expected_read_tokens: cache
+                                    .and_then(|projection| projection.expected_read_tokens),
+                                observed_read_tokens: cache_observation
+                                    .and_then(|observation| observation.0),
+                                observed_write_tokens: cache_observation
+                                    .and_then(|observation| observation.1),
+                                missed_tokens: None,
+                                confidence: cache
+                                    .map(|projection| projection.confidence)
+                                    .unwrap_or(EstimationConfidence::Estimated),
+                            },
+                        );
+                    }
+                }
+            }
+
+            if reached_cache_evidence_boundary && !cache_expiry_supported {
                 if let Some(projection) = cache {
-                    let cache_reporting_supported = self
-                        .provider
-                        .capabilities(&request.model)
-                        .is_some_and(|capabilities| capabilities.cache);
                     let (
                         state,
                         expected_read_tokens,
@@ -1088,7 +1252,7 @@ impl Driver {
                     ) = resolve_cache_state(
                         projection,
                         cache_observation,
-                        cache_reporting_supported,
+                        cache_contract.evidence.stream,
                     );
                     emitter.emit(
                         turn.clone(),
@@ -1096,6 +1260,7 @@ impl Driver {
                             request: request_id.clone(),
                             attempt: attempt_id.clone(),
                             cache_plan: projection.cache_plan.clone(),
+                            cache_identity: projection.cache_identity.clone(),
                             state,
                             expected_read_tokens,
                             observed_read_tokens,
@@ -1258,6 +1423,7 @@ mod tests {
     fn projection(expected_read_tokens: Option<u64>) -> ProviderCacheProjection {
         ProviderCacheProjection {
             cache_plan: Fingerprint::of("plan"),
+            cache_identity: None,
             expected_read_tokens,
             confidence: EstimationConfidence::Exact,
             provider_cache_supported: true,
@@ -1324,5 +1490,46 @@ mod tests {
             resolve_cache_state(&projection(Some(100)), Some((Some(0), None)), false).0,
             CacheState::Unknown
         );
+    }
+
+    #[test]
+    fn tool_downgrade_clears_cache_identity_boundary_and_evidence_projection() {
+        let mut request = ProviderRequest::new(
+            agent_runtime_core::provider::ModelId::new("model"),
+            Vec::new(),
+        );
+        request
+            .tools
+            .push(agent_runtime_core::provider::ToolSchema {
+                name: "read".into(),
+                description: "read a file".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            });
+        request.cache_identity = Some(CacheIdentity::legacy(
+            Fingerprint::of("profile"),
+            "provider",
+            agent_runtime_core::provider::ModelId::new("model"),
+            std::iter::empty(),
+            agent_runtime_core::provider::PromptCacheControl::Implicit,
+        ));
+        request.cache_boundary = Some(agent_runtime_core::provider::ProviderCacheBoundary::new(
+            0, 1, 0,
+        ));
+        request.tools.clear();
+        request.tool_choice = ToolChoice::None;
+        let mut cache = Some(projection(Some(100)));
+        let mut cache_plan = None;
+
+        Driver::suppress_cache_after_tool_downgrade(
+            true,
+            &mut request,
+            &mut cache,
+            &mut cache_plan,
+        );
+
+        assert!(request.cache_identity.is_none());
+        assert!(request.cache_boundary.is_none());
+        assert!(cache.is_none());
+        assert!(cache_plan.is_none());
     }
 }

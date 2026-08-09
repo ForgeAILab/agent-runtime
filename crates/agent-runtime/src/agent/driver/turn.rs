@@ -1,6 +1,12 @@
 use super::*;
 
 impl<'a> TurnMachine<'a> {
+    fn resolve_acceptance(&self, result: Result<(), RuntimeError>) {
+        if let Some(acceptance) = &self.acceptance {
+            acceptance.resolve(result);
+        }
+    }
+
     pub(super) fn new(driver: &'a Driver, context: TurnMachineContext) -> Self {
         let TurnMachineContext {
             state,
@@ -11,6 +17,7 @@ impl<'a> TurnMachine<'a> {
             inbox,
             steer_mailbox,
             turn_id,
+            acceptance,
         } = context;
         Self {
             driver,
@@ -22,6 +29,7 @@ impl<'a> TurnMachine<'a> {
             inbox,
             steer_mailbox,
             turn_id,
+            acceptance,
             checkpoint: None,
         }
     }
@@ -40,6 +48,7 @@ impl<'a> TurnMachine<'a> {
             inbox,
             steer_mailbox,
             turn_id,
+            acceptance: _,
         } = context;
         debug_assert_eq!(turn_id, checkpoint.turn);
         Self {
@@ -52,19 +61,27 @@ impl<'a> TurnMachine<'a> {
             inbox,
             steer_mailbox,
             turn_id,
+            acceptance: None,
             checkpoint: Some(checkpoint),
         }
     }
 
     pub(super) fn snapshot(&self) -> SessionSnapshot {
         let state = self.state.lock().expect("session state poisoned");
+        let mut extension_state = self.execution.snapshot_extension_state_with_staged();
+        if let Some(cache) = self.driver.cache.persisted_session(self.emitter.session()) {
+            extension_state.insert(
+                crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),
+                cache,
+            );
+        }
         SessionSnapshot {
             id: self.emitter.session().clone(),
             history: state.history.clone(),
             usage: state.usage.clone(),
             manifests: state.manifests.clone(),
             identity: self.minter.snapshot(self.emitter.next_sequence()),
-            extension_state: self.execution.snapshot_extension_state(),
+            extension_state,
             updated: self.driver.clock.now(),
         }
     }
@@ -203,10 +220,7 @@ impl<'a> TurnMachine<'a> {
         let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
             match store.load_latest(self.emitter.session()).await? {
                 None => 1,
-                Some(previous)
-                    if previous.turn != self.turn_id
-                        && matches!(previous.state, TurnState::Terminal { .. }) =>
-                {
+                Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
                     previous.watermark.checkpoint_sequence.saturating_add(1)
                 }
                 Some(_) => {
@@ -249,10 +263,7 @@ impl<'a> TurnMachine<'a> {
         let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
             match store.load_latest(self.emitter.session()).await? {
                 None => 1,
-                Some(previous)
-                    if previous.turn != self.turn_id
-                        && matches!(previous.state, TurnState::Terminal { .. }) =>
-                {
+                Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
                     previous.watermark.checkpoint_sequence.saturating_add(1)
                 }
                 Some(_) => {
@@ -295,10 +306,7 @@ impl<'a> TurnMachine<'a> {
         let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
             match store.load_latest(self.emitter.session()).await? {
                 None => 1,
-                Some(previous)
-                    if previous.turn != self.turn_id
-                        && matches!(previous.state, TurnState::Terminal { .. }) =>
-                {
+                Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
                     previous.watermark.checkpoint_sequence.saturating_add(1)
                 }
                 Some(_) => {
@@ -421,6 +429,8 @@ impl<'a> TurnMachine<'a> {
                 visible_output,
             },
         );
+        let persist_gate = self.execution.persist_gate();
+        let _persist_gate = persist_gate.lock().await;
         let terminal_snapshot = self.snapshot();
         if let Some(store) = &self.driver.session_store {
             if let Err(error) = store.save(&terminal_snapshot).await {
@@ -783,6 +793,9 @@ impl<'a> TurnMachine<'a> {
         // serving boundary. It still receives an attributed terminal event,
         // but its input must never contaminate canonical history.
         if turn_cancel.is_cancelled() {
+            self.resolve_acceptance(Err(RuntimeError::cancelled(
+                "internal turn was cancelled before its acceptance checkpoint",
+            )));
             self.close_and_discard_steers(discard_reason_for_finish(&TurnFinish::Cancelled {
                 reason: turn_cancel.reason().unwrap_or(CancelReason::UserRequested),
             }));
@@ -837,6 +850,9 @@ impl<'a> TurnMachine<'a> {
         );
 
         if turn_cancel.is_cancelled() {
+            self.resolve_acceptance(Err(RuntimeError::cancelled(
+                "internal turn was cancelled before its acceptance checkpoint",
+            )));
             self.close_and_discard_steers(discard_reason_for_finish(&TurnFinish::Cancelled {
                 reason: turn_cancel.reason().unwrap_or(CancelReason::UserRequested),
             }));
@@ -860,12 +876,16 @@ impl<'a> TurnMachine<'a> {
         );
         driver.drain_injected(&state, &inbox);
 
-        if let Err(error) = self
+        match self
             .checkpoint_internal_accepted(input, active_history_start, turn_deadline)
             .await
         {
-            self.emit_non_durable_failure(error, false);
-            return;
+            Ok(()) => self.resolve_acceptance(Ok(())),
+            Err(error) => {
+                self.resolve_acceptance(Err(error.clone()));
+                self.emit_non_durable_failure(error, false);
+                return;
+            }
         }
         self.run_loop(active_history_start, turn_deadline, 0, false)
             .await;
@@ -939,7 +959,7 @@ impl<'a> TurnMachine<'a> {
                 .expect("session state poisoned")
                 .history
                 .clone();
-            let planned_request = match driver
+            let mut planned_request = match driver
                 .build_request(
                     &history,
                     &emitter,
@@ -1006,11 +1026,26 @@ impl<'a> TurnMachine<'a> {
                 }
             };
 
+            let planned_with_tools = !planned_request.request.tools.is_empty();
             let mut request = planned_request.request;
             if let Err(err) = driver.validate_and_downgrade(&mut request, &emitter, &turn) {
                 emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
                 self.complete(TurnFinish::Failed, visible_output).await;
                 return;
+            }
+            Driver::suppress_cache_after_tool_downgrade(
+                planned_with_tools,
+                &mut request,
+                &mut planned_request.cache,
+                &mut planned_request.cache_plan,
+            );
+            let cache_downgraded = planned_with_tools && request.tools.is_empty();
+            if cache_downgraded {
+                // The downgrade changes the provider-visible prefix after
+                // planning. Retire both the comparison predecessor and the
+                // maintenance seam; a stale committed plan must never be
+                // reused by a later turn or synthetic cache operation.
+                execution.planner.retire_cache_baseline();
             }
             let advertised_tools = request
                 .tools
@@ -1035,18 +1070,17 @@ impl<'a> TurnMachine<'a> {
                 self.complete_cancelled(visible_output).await;
                 return;
             }
-            if let Some(cache_plan) = planned_request.cache_plan.as_ref() {
-                // The predecessor boundary is the provider-request start,
-                // not plan construction. A request rejected by preflight or
-                // cancelled before this point must not seed the next cache
-                // comparison.
-                execution.planner.commit_cache_plan(cache_plan);
-            }
+            let provider_plan = planned_request
+                .cache_plan
+                .as_ref()
+                .filter(|_| !cache_downgraded)
+                .map(|_| (&execution.planner, &planned_request.plan));
             let outcome = driver
                 .run_provider(
                     request,
                     &request_id,
                     planned_request.cache.as_ref(),
+                    provider_plan,
                     &emitter,
                     &minter,
                     &turn_cancel,

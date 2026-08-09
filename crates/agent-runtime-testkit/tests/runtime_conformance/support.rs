@@ -876,12 +876,18 @@ fn reconciled_payloads(
     checkpoint: &TurnCheckpoint,
     recovery: &[agent_runtime_core::event::EventEnvelope],
 ) -> Vec<RuntimeEvent> {
-    let truncation = checkpoint
-        .journal_truncation_sequence()
+    let scope = checkpoint
+        .journal_truncation_scope()
         .expect("fixture resumes a non-terminal checkpoint");
     before_crash
         .iter()
-        .filter(|event| event.seq < truncation)
+        .filter(|event| {
+            event.seq < scope.event_sequence
+                && scope
+                    .turn
+                    .as_ref()
+                    .is_none_or(|turn| event.turn.as_ref() == Some(turn))
+        })
         .chain(recovery)
         .map(|event| event.payload.clone())
         .collect()

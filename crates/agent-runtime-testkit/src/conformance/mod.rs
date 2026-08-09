@@ -5,6 +5,7 @@
 //! consumer adapter fixtures also run.
 
 pub mod ability;
+pub mod adaptive_cache;
 pub mod cache;
 pub mod cancellation;
 pub mod catalog;

@@ -21,7 +21,7 @@ pub mod transport;
 pub mod workspace;
 
 pub use agent_runtime_core::provider_credential::StaticProviderCredentialSource;
-pub use clock::ManualClock;
+pub use clock::{ManualClock, ManualClockSnapshot};
 pub use credentials::{
     CredentialAcquireRecord, CredentialBarrier, CredentialInvalidationRecord,
     CredentialLeaseFixture, RenewableProviderCredentialSource,

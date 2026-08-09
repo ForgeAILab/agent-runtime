@@ -46,6 +46,14 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::Usage { .. } => "usage",
         RuntimeEvent::CacheObservation { .. } => "cache_observation",
         RuntimeEvent::CacheStateChanged { .. } => "cache_state_changed",
+        RuntimeEvent::CacheOperationPrepared { .. } => "cache_operation_prepared",
+        RuntimeEvent::CacheOperationRejected { .. } => "cache_operation_rejected",
+        RuntimeEvent::CacheOperationStarted { .. } => "cache_operation_started",
+        RuntimeEvent::CacheOperationCompleted { .. } => "cache_operation_completed",
+        RuntimeEvent::CacheAvailabilityEvidenceRecorded { .. } => {
+            "cache_availability_evidence_recorded"
+        }
+        RuntimeEvent::CacheOperationSuspended { .. } => "cache_operation_suspended",
         RuntimeEvent::RateLimitObservation { .. } => "rate_limit_observation",
         RuntimeEvent::ProviderAttemptFinished { .. } => "provider_attempt_finished",
         RuntimeEvent::LimitReached { .. } => "limit_reached",
@@ -272,13 +280,15 @@ fn summary(payload: &RuntimeEvent) -> String {
             request,
             attempt,
             cache_plan,
+            cache_identity,
             read_tokens,
             write_tokens,
         } => format!(
-            "cache_observation request={} attempt={} cache_plan={} read={} write={}",
+            "cache_observation request={} attempt={} cache_plan={} cache_identity={} read={} write={}",
             optional_display(request),
             optional_display(attempt),
             optional_display(cache_plan),
+            optional_display(&cache_identity.as_ref().map(|identity| identity.digest())),
             optional_display(read_tokens),
             optional_display(write_tokens),
         ),
@@ -286,6 +296,7 @@ fn summary(payload: &RuntimeEvent) -> String {
             request,
             attempt,
             cache_plan,
+            cache_identity,
             state,
             expected_read_tokens,
             observed_read_tokens,
@@ -293,11 +304,72 @@ fn summary(payload: &RuntimeEvent) -> String {
             missed_tokens,
             confidence,
         } => format!(
-            "cache_state_changed request={request} attempt={attempt} cache_plan={cache_plan} state={state:?} expected={} observed_read={} observed_write={} missed={} confidence={confidence:?}",
+            "cache_state_changed request={request} attempt={attempt} cache_plan={cache_plan} cache_identity={} state={state:?} expected={} observed_read={} observed_write={} missed={} confidence={confidence:?}",
+            optional_display(&cache_identity.as_ref().map(|identity| identity.digest())),
             optional_display(expected_read_tokens),
             optional_display(observed_read_tokens),
             optional_display(observed_write_tokens),
             optional_display(missed_tokens),
+        ),
+        RuntimeEvent::CacheOperationPrepared {
+            operation,
+            identity,
+            purpose,
+            ..
+        } => format!(
+            "cache_operation_prepared operation={operation} identity={} purpose={purpose:?}",
+            identity.digest()
+        ),
+        RuntimeEvent::CacheOperationRejected {
+            operation,
+            request,
+            attempt,
+            identity,
+            purpose,
+            reason,
+        } => format!(
+            "cache_operation_rejected operation={operation} request={} attempt={} identity={} purpose={purpose:?} reason={reason:?}",
+            optional_display(request),
+            optional_display(attempt),
+            identity.digest()
+        ),
+        RuntimeEvent::CacheOperationStarted {
+            operation,
+            identity,
+            purpose,
+            ..
+        } => format!(
+            "cache_operation_started operation={operation} identity={} purpose={purpose:?}",
+            identity.digest()
+        ),
+        RuntimeEvent::CacheOperationCompleted {
+            operation,
+            identity,
+            purpose,
+            outcome,
+            ..
+        } => format!(
+            "cache_operation_completed operation={operation} identity={} purpose={purpose:?} outcome={outcome:?}",
+            identity.digest()
+        ),
+        RuntimeEvent::CacheAvailabilityEvidenceRecorded { evidence } => format!(
+            "cache_availability_evidence_recorded identity={} source={:?} kind={:?}",
+            evidence.identity.digest(),
+            evidence.source,
+            evidence.kind
+        ),
+        RuntimeEvent::CacheOperationSuspended {
+            request,
+            attempt,
+            identity,
+            operation,
+            reason,
+        } => format!(
+            "cache_operation_suspended operation={} request={} attempt={} identity={} reason={reason:?}",
+            optional_display(operation),
+            optional_display(request),
+            optional_display(attempt),
+            identity.digest()
         ),
         RuntimeEvent::RateLimitObservation { attempt, snapshot } => {
             // Rendered from the most-consumed window: an observer line reports
@@ -562,6 +634,7 @@ mod tests {
                 request: Some(RequestId::new("req-1")),
                 attempt: Some(AttemptId::new("att-2")),
                 cache_plan: Some(Fingerprint::of("plan-1")),
+                cache_identity: None,
                 read_tokens: Some(0),
                 write_tokens: None,
             },
@@ -580,6 +653,7 @@ mod tests {
                 request: RequestId::new("req-1"),
                 attempt: AttemptId::new("att-2"),
                 cache_plan: Fingerprint::of("plan-1"),
+                cache_identity: None,
                 state: CacheState::MissObserved,
                 expected_read_tokens: Some(105_000),
                 observed_read_tokens: Some(0),

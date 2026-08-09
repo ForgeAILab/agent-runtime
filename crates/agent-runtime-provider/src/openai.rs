@@ -25,8 +25,9 @@ use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::provider::{
     Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
-    ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
-    ProviderStreamEvent, ReasoningConfig, ToolChoice,
+    ProviderCacheBehavior, ProviderCacheContract, ProviderCallContext, ProviderError,
+    ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent, ReasoningConfig,
+    ToolChoice,
 };
 use agent_runtime_core::provider_credential::{
     CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,
@@ -82,6 +83,7 @@ impl OpenAiConfig {
             capabilities: Capabilities {
                 // OpenAI matches a repeated prefix on its own; the adapter's
                 // only job is to keep it byte-identical and keyed.
+                cache: true,
                 prompt_cache: PromptCacheControl::Implicit,
                 ..Capabilities::basic_streaming()
             },
@@ -108,9 +110,14 @@ impl OpenAiConfig {
         self
     }
 
-    /// Overrides the prompt cache control declared in capabilities.
+    /// Overrides the legacy prompt-cache declaration.
+    ///
+    /// This generic adapter currently emits only OpenAI's implicit routing
+    /// key. Explicit breakpoint/resource declarations are normalized to
+    /// `ImplicitPrefix` when the provider is constructed until a
+    /// model-gated wire implementation is added.
     pub fn with_prompt_cache(mut self, cache: PromptCacheControl) -> Self {
-        self.capabilities.prompt_cache = cache;
+        self.capabilities.override_prompt_cache(cache);
         self
     }
 
@@ -262,6 +269,7 @@ impl<T: HttpTransport> OpenAiProvider<T> {
     /// A configured static API key is adapted to a non-expiring credential
     /// source so static and renewable authorization share one attempt path.
     pub fn new(transport: T, mut config: OpenAiConfig) -> Self {
+        normalize_cache_capabilities(&mut config.capabilities);
         let credential_source = config.api_key.take().map(|secret| {
             Arc::new(StaticProviderCredentialSource::new(secret))
                 as Arc<dyn ProviderCredentialSource>
@@ -283,10 +291,11 @@ impl<T: HttpTransport> OpenAiProvider<T> {
     /// before either credential or provider I/O.
     pub fn with_credential_source(
         transport: T,
-        config: OpenAiConfig,
+        mut config: OpenAiConfig,
         credential_target: ProviderCredentialTarget,
         credential_source: Arc<dyn ProviderCredentialSource>,
     ) -> Result<Self, ProviderError> {
+        normalize_cache_capabilities(&mut config.capabilities);
         if config.api_key.is_some() {
             return Err(ProviderError::new(
                 ProviderErrorKind::BadRequest,
@@ -321,8 +330,11 @@ impl<T: HttpTransport> OpenAiProvider<T> {
         &self.transport
     }
 
-    /// Serializes the request, keying the provider's prefix cache to the
-    /// session when the adapter declares it drives one.
+    /// Serializes the request, keying the provider's routing partition to the
+    /// exact plan's redaction-safe routing key when the adapter declares it
+    /// drives one. OpenAI combines this value with the exact prompt-prefix
+    /// hash; it is deliberately not the full CacheIdentity digest because a
+    /// stable-history append must keep the same routing locality.
     ///
     /// The key matters more than it looks: OpenAI partitions its prefix cache
     /// by this value, so leaving it unset scatters a single conversation's
@@ -341,10 +353,21 @@ impl<T: HttpTransport> OpenAiProvider<T> {
             "messages": messages,
         });
         let obj = payload.as_object_mut().expect("payload is an object");
-        if self.config.capabilities.prompt_cache.caches_stable_prefix() {
+        if self
+            .config
+            .capabilities
+            .cache_contract()
+            .behavior
+            .supports_stable_prefix()
+        {
+            let cache_key = request
+                .cache_identity
+                .as_ref()
+                .map(|identity| identity.wire_cache_key().as_str())
+                .unwrap_or_else(|| session.as_str());
             obj.insert(
                 "prompt_cache_key".into(),
-                Value::String(session.as_str().to_owned()),
+                Value::String(cache_key.to_owned()),
             );
         }
         if !request.tools.is_empty() {
@@ -472,6 +495,51 @@ impl<T: HttpTransport> OpenAiProvider<T> {
         }
         Ok(Some(lease))
     }
+}
+
+/// OpenAI-compatible adapters currently implement the implicit routing-key
+/// contract only. Explicit breakpoint fields are model- and endpoint-scoped
+/// (for example, GPT-5.6's newer wire mode) and are deliberately not emitted
+/// by this generic adapter. Normalize an explicit declaration to implicit so
+/// Runtime cannot plan explicit-breakpoint or synthetic behavior against a
+/// wire shape this adapter does not support.
+fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
+    // This generic adapter emits only an implicit routing key.  Normalize all
+    // declarations through that one wire shape so an explicit/resource
+    // contract cannot smuggle unsupported retention, key, maintenance, or
+    // resource claims into Runtime's cache projection.
+    let configured = capabilities.cache_contract.take();
+    let behavior = configured
+        .as_ref()
+        .map(|contract| contract.behavior)
+        .unwrap_or_else(|| capabilities.prompt_cache.behavior());
+    let mut contract = configured.unwrap_or_else(|| {
+        let mut contract = ProviderCacheContract::from_control(capabilities.prompt_cache);
+        contract.evidence.stream = capabilities.cache;
+        contract
+    });
+    contract.retention = Default::default();
+    contract.key_revision = None;
+    contract.maintenance.clear();
+    contract.resource_operations.clear();
+    contract.conformance = None;
+    contract.evidence.resource_operations = false;
+    contract.evidence.cache_scoped_errors = false;
+    contract.evidence.stream &= capabilities.cache;
+    match behavior {
+        ProviderCacheBehavior::Unsupported => {
+            contract.behavior = ProviderCacheBehavior::Unsupported;
+            capabilities.prompt_cache = PromptCacheControl::None;
+        }
+        ProviderCacheBehavior::ImplicitPrefix
+        | ProviderCacheBehavior::ExplicitBreakpoint { .. }
+        | ProviderCacheBehavior::ExplicitResource => {
+            contract.behavior = ProviderCacheBehavior::ImplicitPrefix;
+            capabilities.prompt_cache = PromptCacheControl::Implicit;
+        }
+    }
+    capabilities.cache_contract = Some(contract);
+    capabilities.normalize_cache_contract();
 }
 
 async fn wait_for_deadline(deadline: Deadline, clock: &dyn Clock) {
@@ -635,6 +703,56 @@ fn user_content(msg: &Message) -> Value {
         })
         .collect();
     Value::Array(parts)
+}
+
+/// Validates that every canonical content part has an OpenAI Chat
+/// Completions projection. The serializer intentionally remains a small,
+/// compatibility-oriented renderer, so parts it does not understand would
+/// otherwise disappear silently. Rejecting them at the adapter boundary is
+/// especially important for cache identities: an omitted stable part would
+/// make the provider baseline describe a different prefix than Runtime
+/// planned.
+fn validate_openai_messages(request: &ProviderRequest) -> Result<(), ProviderError> {
+    for message in &request.messages {
+        let supported = match message.role {
+            Role::System => message
+                .content
+                .iter()
+                .all(|part| matches!(part, ContentPart::Text { .. })),
+            Role::User => message
+                .content
+                .iter()
+                .all(|part| matches!(part, ContentPart::Text { .. } | ContentPart::Image { .. })),
+            Role::Assistant => message.content.iter().all(|part| {
+                matches!(
+                    part,
+                    ContentPart::Text { .. }
+                        | ContentPart::Reasoning {
+                            redacted: false,
+                            ..
+                        }
+                        | ContentPart::ToolCall(_)
+                )
+            }),
+            Role::Tool => {
+                !message.content.is_empty()
+                    && message.content.iter().all(|part| {
+                        matches!(part, ContentPart::ToolResult(result)
+                            if result
+                                .content
+                                .iter()
+                                .all(|nested| matches!(nested, ContentPart::Text { .. })))
+                    })
+            }
+        };
+        if !supported {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "OpenAI Chat Completions cannot represent one or more message content parts",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Renders one canonical message into one or more OpenAI wire messages.
@@ -947,6 +1065,16 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        if request.model != self.config.model {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "OpenAI request model does not match adapter model",
+            ));
+        }
+        request
+            .validate_cache_identity()
+            .map_err(|error| ProviderError::new(ProviderErrorKind::BadRequest, error))?;
+        validate_openai_messages(&request)?;
         let url = self.chat_completions_url()?;
         let payload = self.build_payload(&request, &ctx.session);
         let body = serde_json::to_vec(&payload)
@@ -1225,7 +1353,15 @@ mod tests {
     use super::*;
     use agent_runtime_core::cancel::Cancellation;
     use agent_runtime_core::clock::{Deadline, Timestamp};
+    use agent_runtime_core::content::ToolResultBlock;
+    use agent_runtime_core::ids::ToolCallId;
     use agent_runtime_core::ids::{AttemptId, RequestId};
+    use agent_runtime_core::provider::ProviderAttemptPurpose;
+    use agent_runtime_core::provider::{
+        CacheEndpointIdentity, CacheIdentity, CacheIdentityFragment, CacheRetentionContract,
+        ProviderCacheBehavior, ProviderCacheContract,
+    };
+    use agent_runtime_registry::{Fingerprint, RegistryRevision};
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1425,6 +1561,8 @@ mod tests {
             session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
+            cache_identity: None,
+            purpose: ProviderAttemptPurpose::Ordinary,
             cancel: Cancellation::new(),
             deadline: Deadline::never(),
         }
@@ -2086,6 +2224,8 @@ mod tests {
             session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
+            cache_identity: None,
+            purpose: ProviderAttemptPurpose::Ordinary,
             cancel: cancel.clone(),
             deadline: Deadline::never(),
         };
@@ -2114,6 +2254,8 @@ mod tests {
             session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
+            cache_identity: None,
+            purpose: ProviderAttemptPurpose::Ordinary,
             cancel: Cancellation::new(),
             deadline: Deadline::after(&SystemClock, 1),
         };
@@ -2276,6 +2418,20 @@ mod tests {
         assert_eq!(wire[0]["content"], "no images here");
     }
 
+    #[tokio::test]
+    async fn request_model_mismatch_is_rejected_before_openai_transport() {
+        let transport = ReplayTransport::new(vec![MINIMAL_SSE]);
+        let provider = OpenAiProvider::new(transport, OpenAiConfig::new("http://x/v1", "gpt-x"));
+        let request = ProviderRequest::new(ModelId::new("gpt-other"), vec![Message::user("hi")]);
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("adapter must reject a request for another model");
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(provider.transport().requests().is_empty());
+    }
+
     #[test]
     fn redacted_reasoning_never_reaches_the_wire() {
         let msg = Message::assistant(vec![
@@ -2291,6 +2447,60 @@ mod tests {
         assert_eq!(wire.len(), 1);
         assert!(wire[0].get("reasoning_content").is_none());
         assert!(!wire[0].to_string().contains("hidden"));
+    }
+
+    #[tokio::test]
+    async fn stable_assistant_image_is_rejected_before_transport_or_cache_baseline() {
+        let transport = ReplayTransport::new(vec![]);
+        let provider = OpenAiProvider::new(transport, OpenAiConfig::new("http://x/v1", "gpt-x"));
+        let request = ProviderRequest::new(
+            ModelId::new("gpt-x"),
+            vec![Message::assistant(vec![ContentPart::Image {
+                url: "https://example.test/image.png".into(),
+                detail: None,
+            }])],
+        )
+        .with_cache_identity(cache_identity("route-a", "stable-v1"))
+        .with_cache_boundary(agent_runtime_core::provider::ProviderCacheBoundary::new(
+            0, 0, 1,
+        ));
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("unsupported stable content must fail closed");
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(provider.transport().requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stable_tool_result_image_is_rejected_before_transport() {
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let request = ProviderRequest::new(
+            ModelId::new("gpt-x"),
+            vec![Message::tool_result(ToolResultBlock {
+                call_id: ToolCallId::new("call-1"),
+                name: "vision".into(),
+                content: vec![ContentPart::Image {
+                    url: "https://example.test/result.png".into(),
+                    detail: None,
+                }],
+                is_error: false,
+            })],
+        )
+        .with_cache_boundary(agent_runtime_core::provider::ProviderCacheBoundary::new(
+            0, 0, 1,
+        ));
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("unsupported stable tool-result content must fail closed");
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(provider.transport().requests().is_empty());
     }
 
     #[test]
@@ -2323,6 +2533,65 @@ mod tests {
         assert_ne!(first["prompt_cache_key"], other["prompt_cache_key"]);
     }
 
+    fn cache_identity(route: &str, prefix: &str) -> CacheIdentity {
+        CacheIdentity::builder(
+            "openai",
+            ModelId::new("gpt-x"),
+            CacheEndpointIdentity::from_opaque("endpoint-a", RegistryRevision::new("endpoint-1")),
+            RegistryRevision::new("adapter-1"),
+            Fingerprint::of("profile-1"),
+        )
+        .provider_key(Fingerprint::of(route))
+        .stable_prefix([CacheIdentityFragment::new(
+            "system",
+            Fingerprint::of(prefix),
+        )])
+        .build()
+    }
+
+    #[test]
+    fn prompt_cache_key_is_a_stable_routing_partition_not_the_full_identity() {
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let first_identity = cache_identity("route-a", "stable-v1");
+        let changed_prefix_identity = cache_identity("route-a", "stable-v2");
+        let isolated_identity = cache_identity("route-b", "stable-v1");
+
+        let first = provider.build_payload(
+            &ProviderRequest::new(ModelId::new("gpt-x"), vec![])
+                .with_cache_identity(first_identity.clone()),
+            &SessionId::new("session-a"),
+        );
+        let changed_prefix = provider.build_payload(
+            &ProviderRequest::new(ModelId::new("gpt-x"), vec![])
+                .with_cache_identity(changed_prefix_identity.clone()),
+            &SessionId::new("session-a"),
+        );
+        let isolated = provider.build_payload(
+            &ProviderRequest::new(ModelId::new("gpt-x"), vec![])
+                .with_cache_identity(isolated_identity),
+            &SessionId::new("session-b"),
+        );
+
+        // OpenAI combines this key with the exact prompt-prefix hash. Keeping
+        // it stable across prefixes preserves routing locality; the exact
+        // CacheIdentity remains attached to each request for Runtime
+        // correlation and the provider's prefix match distinguishes the
+        // changed prefix.
+        assert_eq!(
+            first["prompt_cache_key"],
+            changed_prefix["prompt_cache_key"]
+        );
+        assert_ne!(
+            first_identity.digest(),
+            changed_prefix_identity.digest(),
+            "the exact identity still distinguishes prompt-prefix changes"
+        );
+        assert_ne!(first["prompt_cache_key"], isolated["prompt_cache_key"]);
+    }
+
     #[test]
     fn an_adapter_without_a_prompt_cache_sends_no_key() {
         let mut cfg = OpenAiConfig::new("http://x/v1", "gpt-x");
@@ -2334,6 +2603,73 @@ mod tests {
                 .get("prompt_cache_key")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn explicit_prompt_cache_is_normalized_to_implicit_until_wire_support_is_gated() {
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x")
+                .with_prompt_cache(PromptCacheControl::Explicit { max_breakpoints: 4 }),
+        );
+        let capabilities = provider
+            .capabilities(&ModelId::new("gpt-x"))
+            .expect("configured model capabilities");
+        assert_eq!(capabilities.prompt_cache, PromptCacheControl::Implicit);
+        assert_eq!(
+            capabilities.cache_contract().behavior,
+            ProviderCacheBehavior::ImplicitPrefix
+        );
+    }
+
+    #[test]
+    fn normalized_contract_controls_key_and_drops_explicit_only_metadata() {
+        let mut config = OpenAiConfig::new("http://x/v1", "gpt-x");
+        config.capabilities.cache_contract = Some(ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ExplicitBreakpoint { max_breakpoints: 4 },
+            retention: CacheRetentionContract {
+                minimum_retention_ms: Some(30_000),
+                read_refreshes: true,
+                write_refreshes: true,
+            },
+            key_revision: Some(RegistryRevision::new("explicit-key-1")),
+            ..ProviderCacheContract::default()
+        });
+        let provider = OpenAiProvider::new(ReplayTransport::new(vec![]), config);
+        let capabilities = provider
+            .capabilities(&ModelId::new("gpt-x"))
+            .expect("configured model capabilities");
+        assert_eq!(capabilities.prompt_cache, PromptCacheControl::Implicit);
+        let contract = capabilities.cache_contract();
+        assert_eq!(contract.behavior, ProviderCacheBehavior::ImplicitPrefix);
+        assert_eq!(contract.key_revision, None);
+        assert_eq!(contract.retention, CacheRetentionContract::default());
+        let payload = provider.build_payload(
+            &ProviderRequest::new(ModelId::new("gpt-x"), vec![]),
+            &SessionId::new("session-a"),
+        );
+        assert_eq!(payload["prompt_cache_key"], "session-a");
+    }
+
+    #[test]
+    fn normalized_unsupported_contract_overrides_conflicting_legacy_field() {
+        let mut config = OpenAiConfig::new("http://x/v1", "gpt-x");
+        config.capabilities.prompt_cache = PromptCacheControl::Explicit { max_breakpoints: 4 };
+        config.capabilities.cache_contract = Some(ProviderCacheContract::default());
+        let provider = OpenAiProvider::new(ReplayTransport::new(vec![]), config);
+        let capabilities = provider
+            .capabilities(&ModelId::new("gpt-x"))
+            .expect("configured model capabilities");
+        assert_eq!(capabilities.prompt_cache, PromptCacheControl::None);
+        assert_eq!(
+            capabilities.cache_contract().behavior,
+            ProviderCacheBehavior::Unsupported
+        );
+        let payload = provider.build_payload(
+            &ProviderRequest::new(ModelId::new("gpt-x"), vec![]),
+            &SessionId::new("session-a"),
+        );
+        assert!(payload.get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]

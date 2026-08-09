@@ -263,6 +263,7 @@ fn parse_model(document: &Value, provider: &str, model: &str) -> Option<ModelRec
         // The catalog describes a model, not the adapter that will serve it,
         // and only the adapter knows how it drives a prompt cache.
         prompt_cache: PromptCacheControl::None,
+        cache_contract: None,
         auth: AuthKind::ApiKey,
         continuation: false,
         max_output_tokens: (output > 0).then_some(output),

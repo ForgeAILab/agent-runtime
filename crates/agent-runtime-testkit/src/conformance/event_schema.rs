@@ -14,6 +14,7 @@ const EVENT_ENVELOPE_V9: &str = include_str!("fixtures/event-envelope-v9.json");
 const EVENT_ENVELOPE_V10: &str = include_str!("fixtures/event-envelope-v10.json");
 const EVENT_ENVELOPE_V11: &str = include_str!("fixtures/event-envelope-v11.json");
 const EVENT_ENVELOPE_V13_CACHE: &str = include_str!("fixtures/event-envelope-v13-cache.json");
+const EVENT_ENVELOPE_V14_CACHE: &str = include_str!("fixtures/event-envelope-v14-cache.json");
 const EVENT_ENVELOPE_LEGACY_CACHE: &str = include_str!("fixtures/event-envelope-legacy-cache.json");
 
 /// Asserts every envelope carries the current schema version, round-trips
@@ -142,6 +143,66 @@ pub fn assert_v13_cache_golden_fixture() {
     );
 }
 
+/// Asserts the v14 cache-operation fixture round-trips and contains every
+/// canonical lifecycle variant introduced by the adaptive-cache contract.
+pub fn assert_v14_cache_golden_fixture() {
+    let expected: Value =
+        serde_json::from_str(EVENT_ENVELOPE_V14_CACHE).expect("valid v14 cache fixture JSON");
+    let envelopes: Vec<EventEnvelope> =
+        serde_json::from_value(expected.clone()).expect("v14 cache fixture remains readable");
+    assert_eq!(
+        envelopes.len(),
+        6,
+        "v14 fixture must cover all six lifecycle variants"
+    );
+    let actual = serde_json::to_value(&envelopes).expect("serialize v14 cache fixture");
+    assert_eq!(
+        actual, expected,
+        "the v14 cache lifecycle event representation changed"
+    );
+    let events = envelopes
+        .iter()
+        .map(|envelope| &envelope.payload)
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        events[0],
+        RuntimeEvent::CacheOperationPrepared { .. }
+    ));
+    assert!(matches!(
+        events[1],
+        RuntimeEvent::CacheOperationRejected {
+            request: Some(request),
+            attempt: None,
+            ..
+        } if request.as_str() == "req-cache"
+    ));
+    assert!(matches!(
+        events[2],
+        RuntimeEvent::CacheOperationStarted { .. }
+    ));
+    assert!(matches!(
+        events[3],
+        RuntimeEvent::CacheOperationCompleted { .. }
+    ));
+    assert!(matches!(
+        events[4],
+        RuntimeEvent::CacheAvailabilityEvidenceRecorded { .. }
+    ));
+    assert!(matches!(
+        events[5],
+        RuntimeEvent::CacheOperationSuspended {
+            request: Some(request),
+            attempt: Some(attempt),
+            ..
+        } if request.as_str() == "req-cache" && attempt.as_str() == "att-cache"
+    ));
+    assert!(
+        envelopes
+            .iter()
+            .all(|envelope| envelope.schema_version == 14)
+    );
+}
+
 /// Legacy cache observations had numeric read/write fields and no causal
 /// attribution. They remain readable as present optional values, but the
 /// absent identities stay absent so no miss projection can be fabricated.
@@ -154,6 +215,7 @@ pub fn assert_legacy_cache_observation_is_readable() {
         request,
         attempt,
         cache_plan,
+        cache_identity,
         read_tokens,
         write_tokens,
     } = &envelopes[0].payload
@@ -163,6 +225,7 @@ pub fn assert_legacy_cache_observation_is_readable() {
     assert!(request.is_none());
     assert!(attempt.is_none());
     assert!(cache_plan.is_none());
+    assert!(cache_identity.is_none());
     assert_eq!(*read_tokens, Some(2));
     assert_eq!(*write_tokens, Some(1));
     assert_eq!(
@@ -238,6 +301,11 @@ mod tests {
     #[test]
     fn v13_cache_golden_fixture_is_exactly_compatible() {
         assert_v13_cache_golden_fixture();
+    }
+
+    #[test]
+    fn v14_cache_lifecycle_fixture_is_exactly_compatible() {
+        assert_v14_cache_golden_fixture();
     }
 
     #[test]

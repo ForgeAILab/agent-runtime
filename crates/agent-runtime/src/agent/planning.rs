@@ -39,7 +39,7 @@ use agent_runtime_core::manifest::{
     ActivatedCapability, CapabilityResolution, ContextSegmentRecord, ModelResolution,
     PolicyRevisions, RunManifest, SegmentId, SegmentSensitivity, SummaryCoverage,
 };
-use agent_runtime_core::provider::ToolSchema;
+use agent_runtime_core::provider::{CacheEndpointIdentity, ToolSchema};
 use agent_runtime_core::store::VersionedSessionState;
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
@@ -113,10 +113,16 @@ pub struct RunPlanner {
     compactor: Option<StructuralCompactor>,
     cache_capability: ProviderCacheCapability,
     revisions: RunRevisions,
+    cache_endpoint_identity: Option<CacheEndpointIdentity>,
+    cache_session_partition: Option<Fingerprint>,
     /// The previous turn's cache plan, so a stable prefix can be compared
     /// across turns. Behind a lock because turns run serially but share the
     /// planner.
     previous_cache: Mutex<Option<CachePlan>>,
+    /// The exact immutable plan that crossed the provider-start boundary for
+    /// the latest turn. It is retained only as a Runtime-owned maintenance
+    /// seam; callers cannot replace its identity or prompt contents.
+    last_plan: Mutex<Option<ContextPlan>>,
 }
 
 /// What one planned turn produced.
@@ -147,7 +153,10 @@ impl RunPlanner {
             compactor,
             cache_capability,
             revisions,
+            cache_endpoint_identity: None,
+            cache_session_partition: None,
             previous_cache: Mutex::new(None),
+            last_plan: Mutex::new(None),
         }
     }
 
@@ -161,12 +170,20 @@ impl RunPlanner {
         &self.revisions
     }
 
+    /// Uses a host-supplied opaque endpoint/partition identity for every
+    /// cache plan this run produces. The endpoint itself never enters a
+    /// request or event; only its digest/revision are folded into identity.
+    pub fn with_cache_endpoint_identity(mut self, identity: CacheEndpointIdentity) -> Self {
+        self.cache_endpoint_identity = Some(identity);
+        self
+    }
+
     /// Creates an independent planner for one session.
     ///
     /// Immutable profile/policy inputs are cloned; mutable cache history
     /// always starts empty and can never be observed by another session.
-    pub fn fork_session(&self) -> Self {
-        Self::new(
+    pub fn fork_session(&self, session: &agent_runtime_core::ids::SessionId) -> Self {
+        let mut planner = Self::new(
             self.profile.clone(),
             self.provider_name.clone(),
             self.sizer.clone(),
@@ -174,7 +191,13 @@ impl RunPlanner {
             self.compactor.clone(),
             self.cache_capability.clone(),
             self.revisions.clone(),
-        )
+        );
+        if let Some(endpoint) = &self.cache_endpoint_identity {
+            planner = planner.with_cache_endpoint_identity(endpoint.clone());
+        }
+        planner.cache_session_partition =
+            Some(Fingerprint::of_fields(["session", session.as_str()]));
+        planner
     }
 
     pub(crate) fn restore_previous_cache(
@@ -227,6 +250,39 @@ impl RunPlanner {
             .expect("cache plan lock poisoned") = Some(cache_plan.clone());
     }
 
+    /// Commits the exact plan that crossed the provider-start boundary and
+    /// seeds both predecessor comparison and the session-bound maintenance
+    /// seam.
+    pub(crate) fn commit_provider_plan(&self, plan: &ContextPlan) {
+        if let Some(cache_plan) = plan.cache_plan() {
+            self.commit_cache_plan(cache_plan);
+        }
+        *self.last_plan.lock().expect("last plan lock poisoned") = Some(plan.clone());
+    }
+
+    /// Retires the provider-cache predecessor and maintenance seam after a
+    /// permissive capability downgrade changes the request's tool prefix.
+    /// Keeping either value would let a later turn or cache operation address
+    /// a plan whose provider-visible schemas no longer match the committed
+    /// request.
+    pub(crate) fn retire_cache_baseline(&self) {
+        *self
+            .previous_cache
+            .lock()
+            .expect("cache plan lock poisoned") = None;
+        *self.last_plan.lock().expect("last plan lock poisoned") = None;
+    }
+
+    /// Returns a clone of the last provider-committed immutable plan. The
+    /// caller receives no mutable access and must still pass all cache
+    /// conformance/authority/budget checks when constructing an operation.
+    pub(crate) fn last_committed_plan(&self) -> Option<ContextPlan> {
+        self.last_plan
+            .lock()
+            .expect("last plan lock poisoned")
+            .clone()
+    }
+
     /// Builds the fragments for one turn and compiles them into a plan.
     ///
     /// The fragment set is the complete request: host instructions, the
@@ -239,6 +295,10 @@ impl RunPlanner {
         history: &[Message],
         tools: &[ToolSchema],
     ) -> Result<PlannedTurn, ContextError> {
+        // Treat the newest user message as the active continuation. Live
+        // Runtime turns use the explicit `*_from` methods with a host-owned
+        // start index, while this convenience helper preserves ordinary
+        // prior-turn grouping for callers supplying complete history.
         let active_turn_start = history
             .iter()
             .rposition(|message| message.role == Role::User);
@@ -378,19 +438,27 @@ impl RunPlanner {
             active_turn_start,
         );
 
-        let planner = ContextPlanner::new(&self.profile, self.sizer.as_ref(), self.policy.clone());
+        let mut planner =
+            ContextPlanner::new(&self.profile, self.sizer.as_ref(), self.policy.clone());
+        if let Some(endpoint) = &self.cache_endpoint_identity {
+            planner = planner.with_cache_endpoint_identity(endpoint.clone());
+        }
+        if let Some(partition) = &self.cache_session_partition {
+            planner = planner.with_cache_session_partition(partition.clone());
+        }
         let previous = self
             .previous_cache
             .lock()
             .expect("cache plan lock poisoned")
             .clone();
-        let plan = planner.plan_with_cache(
+        let plan = planner.plan_with_cache_and_revisions(
             fragments,
             self.compactor
                 .as_ref()
                 .map(|compactor| compactor as &dyn agent_runtime_context::Compactor),
             &self.cache_capability,
             previous.as_ref(),
+            self.plan_inputs(revisions),
         )?;
 
         let plan = if semantic_provenance.is_empty() {
@@ -400,8 +468,6 @@ impl RunPlanner {
             outcome.summarized.extend_from_slice(semantic_provenance);
             plan.with_compaction_outcome(outcome)
         };
-        let plan = plan.with_extra_revisions(self.plan_inputs(revisions));
-
         let manifest = self.manifest(&plan, revisions, activation);
         Ok(PlannedTurn { plan, manifest })
     }
@@ -502,11 +568,14 @@ impl RunPlanner {
             )))
             .paired_with_many(conversation_pairings[index].iter().cloned())
             // Committed history is immutable and append-only, which is
-            // exactly what a prefix cache reuses: each attempt's request is
-            // the previous one plus new tail items. Compaction that drops or
-            // replaces a message changes hashes at that index, and cache
-            // planning ends the preserved prefix there on its own.
-            .with_cache_class(CacheClass::Stable);
+            // exactly what a prefix cache reuses. The active turn is the
+            // changing tail, however: it must end the identity's stable
+            // leading prefix even while it remains required for planning.
+            .with_cache_class(if is_active_continuation {
+                CacheClass::Ephemeral
+            } else {
+                CacheClass::Stable
+            });
             fragments.push(if is_active_continuation {
                 fragment
             } else {
@@ -590,6 +659,10 @@ impl RunPlanner {
             )),
             plan.fingerprint(),
             cache_fingerprint,
+        )
+        .with_cache_identity(
+            plan.cache_plan()
+                .and_then(|cache| cache.cache_identity().cloned()),
         )
         .with_policy_revisions(policy_revisions)
         .with_activation(activation.to_vec())
@@ -877,14 +950,26 @@ mod tests {
             .expect("plan");
         let replaced_plan = replaced.plan.cache_plan().expect("cache plan");
         assert_eq!(
-            replaced_plan.preserved_prefix_len, second_plan.preserved_prefix_len,
-            "replacing the newest message must not invalidate the prefix before it"
+            replaced_plan.preserved_prefix_len, second_plan.declared_stable_prefix_len,
+            "replacing the newest message must preserve the prefix sealed by the prior request"
         );
     }
 
     #[test]
     fn planning_without_a_provider_commit_does_not_create_a_predecessor() {
-        let planner = planner(8_000);
+        let planner = RunPlanner::new(
+            profile(8_000),
+            "fake",
+            Arc::new(CharRatioSizer::default()),
+            ContextPolicy::new(RegistryRevision::new("ctx-1"), 64, 0),
+            None,
+            ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "fake"),
+            RunRevisions::empty(),
+        )
+        .with_cache_endpoint_identity(CacheEndpointIdentity::from_opaque(
+            "test-endpoint",
+            RegistryRevision::new("endpoint-1"),
+        ));
         let first = planner
             .plan_turn(Some("stable"), &history(&["first"]), &[])
             .unwrap();
@@ -911,6 +996,22 @@ mod tests {
             Some(u64::from(committed_cache.preserved_prefix_tokens))
         );
         assert!(committed_cache.expected_read_tokens().unwrap() > 0);
+    }
+
+    #[test]
+    fn retiring_cache_baseline_clears_comparison_and_maintenance_plan() {
+        let planner = planner(8_000);
+        let first = planner
+            .plan_turn(Some("stable"), &history(&["first"]), &[])
+            .unwrap();
+        planner.commit_provider_plan(&first.plan);
+        assert!(planner.persisted_previous_cache().is_some());
+        assert!(planner.last_committed_plan().is_some());
+
+        planner.retire_cache_baseline();
+
+        assert!(planner.persisted_previous_cache().is_none());
+        assert!(planner.last_committed_plan().is_none());
     }
 
     #[test]
@@ -1172,8 +1273,8 @@ mod tests {
     #[test]
     fn two_sessions_do_not_share_cache_or_compaction_state() {
         let template = planner(8_000);
-        let session_a = template.fork_session();
-        let session_b = template.fork_session();
+        let session_a = template.fork_session(&agent_runtime_core::ids::SessionId::new("a"));
+        let session_b = template.fork_session(&agent_runtime_core::ids::SessionId::new("b"));
 
         let first_a = session_a
             .plan_turn(Some("alpha instructions"), &history(&["a"]), &[])

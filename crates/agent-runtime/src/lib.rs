@@ -91,6 +91,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod cache;
 pub mod capability;
 pub mod delegation;
 pub mod harness;
@@ -161,10 +162,17 @@ pub mod prelude {
 
     // -- provider adapters and the embeddable runtime facade -----------------
     pub use crate::agent::config::{DowngradePolicy, LoopConfig};
+    pub use crate::cache::{
+        CacheCapturedOutput, CacheHandoffSuffix, CacheMechanism, CacheOperationRequest,
+        CacheOperationResult, CacheResourceDispatchRequest, CacheStateRecord,
+        MAX_HANDOFF_SUFFIX_BYTES, SyntheticCacheRequest,
+    };
     pub use crate::delegation::{
-        CapacityPolicy, ChildRuntimeFactory, ChildState, ChildStatus, ChildTaskOutcome,
-        ChildTaskResult, DELEGATION_PERMISSION, DelegationCapacity, DelegationConfig,
-        DelegationCoordinator, DelegationLimits, SpawnOutcome,
+        CapacityPolicy, ChildCompletionAdmission, ChildCompletionAdmissionRequest,
+        ChildOutcomeCursor, ChildOutcomeIdentity, ChildOutcomeKey, ChildRuntimeFactory, ChildState,
+        ChildStatus, ChildTaskOutcome, ChildTaskResult, DELEGATION_PERMISSION, DelegationCapacity,
+        DelegationConfig, DelegationCoordinator, DelegationLimits, DelegationWaitOptions,
+        SpawnOutcome,
     };
     pub use crate::provider::fake::FakeProvider;
     pub use crate::provider::gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider};

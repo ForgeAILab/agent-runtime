@@ -8,7 +8,8 @@ use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::Message;
 use agent_runtime_core::ids::{AttemptId, RequestId, SessionId};
 use agent_runtime_core::provider::{
-    FinishReason, ModelId, Provider, ProviderCallContext, ProviderRequest, ProviderStreamEvent,
+    FinishReason, ModelId, Provider, ProviderAttemptPurpose, ProviderCallContext, ProviderRequest,
+    ProviderStreamEvent,
 };
 
 /// A default per-attempt context with a fresh cancellation and no deadline.
@@ -18,6 +19,8 @@ pub fn call_ctx() -> (ProviderCallContext, Cancellation) {
         session: SessionId::new("session-test"),
         request_id: RequestId::new("req-conformance"),
         attempt_id: AttemptId::new("att-conformance"),
+        cache_identity: None,
+        purpose: ProviderAttemptPurpose::Ordinary,
         cancel: cancel.clone(),
         deadline: Deadline::never(),
     };
@@ -95,6 +98,8 @@ pub async fn assert_cancellation_stops_stream(provider: &dyn Provider, model: &M
         session: SessionId::new("session-test"),
         request_id: RequestId::new("req-cancel"),
         attempt_id: AttemptId::new("att-cancel"),
+        cache_identity: None,
+        purpose: ProviderAttemptPurpose::Ordinary,
         cancel: cancel.clone(),
         deadline: Deadline::never(),
     };

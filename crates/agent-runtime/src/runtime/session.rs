@@ -1,16 +1,19 @@
 //! The session handle: send input, subscribe to events, cancel, and shut down.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::AbortHandle;
 
 use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
-use agent_runtime_core::checkpoint::{TurnCheckpoint, TurnState};
+use agent_runtime_core::checkpoint::{
+    CacheOperationCheckpoint, CacheOperationResultCheckpoint, TurnCheckpoint, TurnState,
+};
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::{
     InternalTurnInput, Message, ToolCall, ToolResultBlock, UserInput,
@@ -18,16 +21,20 @@ use agent_runtime_core::content::{
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
 use agent_runtime_core::goal::{GoalCommand, GoalCommandResult, GoalProjection, GoalStatus};
-use agent_runtime_core::ids::{SessionId, TurnId};
+use agent_runtime_core::ids::{CacheOperationId, SessionId, TurnId};
 use agent_runtime_core::interaction::InteractionRequest;
 use agent_runtime_core::steer::{SteerReceipt, SteerRejection, SteerRejectionReason};
 use agent_runtime_core::store::{SessionSnapshot, VersionedSessionState};
+use agent_runtime_core::usage::{Provenance, UsageDelta, UsageLedger, UsageRecord, UsageSource};
 use serde_json::Value;
 
+use crate::cache::{
+    CacheOperationRequest, CacheOperationResult, CacheResourceDispatchRequest, cache_operation_turn,
+};
 use crate::capability::ActivationEpoch;
 use crate::harness::GoalComponent;
 use crate::ids::IdMinter;
-use crate::runtime::emitter::{EventEmitter, RuntimeEventStream};
+use crate::runtime::emitter::{CacheEventBatch, EventEmitter, RuntimeEventStream};
 use crate::runtime::engine::{ActiveSessionLease, RuntimeShared};
 use crate::runtime::inject::{InjectedContent, InjectionQueue};
 use crate::runtime::state::{SessionExecutionContext, SessionState};
@@ -48,6 +55,28 @@ pub struct SessionInner {
     pub(crate) execution: Arc<SessionExecutionContext>,
     pub(crate) inbox: Arc<Mutex<InjectionQueue>>,
     pub(crate) turn_gate: AsyncMutex<()>,
+    /// Serializes the idle-admission decision across user turns, internal
+    /// continuations, goal controls, and local actions.  The `turns` mutex
+    /// protects the resulting bookkeeping; this gate protects the
+    /// check-then-reserve boundary so a user cannot arrive between an
+    /// internal idle check and its turn reservation.
+    pub(crate) admission_gate: Mutex<()>,
+    /// Serializes cache admission, provider execution, and the two snapshot
+    /// boundaries for a session. This prevents concurrent last-write-wins
+    /// saves from dropping an operation reservation or terminal result.
+    pub(crate) cache_gate: AsyncMutex<()>,
+    /// Serializes every SessionStore snapshot write, including ordinary turn
+    /// and shutdown persistence, so a snapshot is captured only after its
+    /// predecessor write has completed.
+    pub(crate) persist_gate: Arc<AsyncMutex<()>>,
+    /// Cache dispatches participate in shutdown draining even though they do
+    /// not create an ordinary turn handle.
+    pub(crate) cache_active: AtomicUsize,
+    /// A protected Started save reported an error before this live dispatch
+    /// was allowed to poll the provider. Only these same-handle retries may
+    /// reuse a durable Started checkpoint; an aborted provider future leaves
+    /// no such marker and therefore fails closed instead of replaying I/O.
+    pub(crate) cache_start_repairable: Mutex<BTreeSet<CacheOperationId>>,
     pub(crate) turns: Mutex<ActiveTurns>,
     pub(crate) turn_ready: Notify,
     pub(crate) turns_changed: Notify,
@@ -58,8 +87,21 @@ pub struct SessionInner {
     pub(crate) delegation_coordinator_active: AtomicBool,
     /// Ensures one process-scoped goal controller owns continuation admission.
     pub(crate) goal_controller_active: AtomicBool,
+    /// Number of real-user submissions currently entering the serialized
+    /// admission boundary. Child/goal continuations yield to this marker so
+    /// a user that is already submitting cannot be overtaken by an internal
+    /// turn at the same idle boundary.
+    pub(crate) user_submission_pending: AtomicUsize,
     /// An unanswered interaction checkpoint was intentionally left dormant.
     pub(crate) recovery_deferred: bool,
+}
+
+/// Protected boundary invoked by the cache mechanism immediately after its
+/// final dispatch preflight and immediately before polling provider I/O.
+/// Implementations must durably save the Started checkpoint before returning.
+#[async_trait]
+pub(crate) trait CacheStartBarrier: Send + Sync {
+    async fn cross(&self, operation: CacheOperationCheckpoint) -> Result<(), RuntimeError>;
 }
 
 /// Active turn bookkeeping shared with shutdown.
@@ -82,6 +124,23 @@ struct ServingSteer {
     mailbox: Arc<SteerMailbox>,
 }
 
+struct UserSubmissionGuard<'a> {
+    pending: &'a AtomicUsize,
+}
+
+impl<'a> UserSubmissionGuard<'a> {
+    fn enter(pending: &'a AtomicUsize) -> Self {
+        pending.fetch_add(1, Ordering::AcqRel);
+        Self { pending }
+    }
+}
+
+impl Drop for UserSubmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Default)]
 struct TurnCompletionState {
     done: bool,
@@ -93,6 +152,95 @@ struct TurnCompletionState {
 struct TurnCompletion {
     state: Mutex<TurnCompletionState>,
     notify: Notify,
+}
+
+type TurnAcceptanceHook = Box<dyn FnOnce(Result<(), RuntimeError>) + Send + 'static>;
+
+/// The protected admission barrier for an internal turn.
+///
+/// `try_send_internal_if_idle` returns before the spawned task has reached its
+/// first durable checkpoint.  Delegation uses this small barrier to stage
+/// protected cursor state alongside that checkpoint, and only considers the
+/// child outcome consumed after the checkpoint store has accepted it.
+pub(crate) struct TurnAcceptance {
+    state: Mutex<Option<Result<(), RuntimeError>>>,
+    hook: Mutex<Option<TurnAcceptanceHook>>,
+    notify: Notify,
+}
+
+impl std::fmt::Debug for TurnAcceptance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnAcceptance")
+            .field(
+                "resolved",
+                &self
+                    .state
+                    .lock()
+                    .expect("turn acceptance poisoned")
+                    .is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl TurnAcceptance {
+    pub(crate) fn pending_with_hook(hook: Option<TurnAcceptanceHook>) -> Self {
+        Self {
+            state: Mutex::new(None),
+            hook: Mutex::new(hook),
+            notify: Notify::new(),
+        }
+    }
+
+    fn accepted() -> Self {
+        Self {
+            state: Mutex::new(Some(Ok(()))),
+            hook: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    pub(crate) fn resolve(&self, result: Result<(), RuntimeError>) {
+        let hook = {
+            let mut state = self.state.lock().expect("turn acceptance poisoned");
+            if state.is_some() {
+                return;
+            } else {
+                *state = Some(result.clone());
+            }
+            self.hook
+                .lock()
+                .expect("turn acceptance hook poisoned")
+                .take()
+        };
+        if let Some(hook) = hook {
+            hook(result);
+        }
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.state
+            .lock()
+            .expect("turn acceptance poisoned")
+            .is_none()
+    }
+
+    pub(crate) async fn wait(&self) -> Result<(), RuntimeError> {
+        loop {
+            if let Some(result) = self.state.lock().expect("turn acceptance poisoned").clone() {
+                return result;
+            }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = self.state.lock().expect("turn acceptance poisoned").clone() {
+                return result;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl TurnCompletion {
@@ -119,6 +267,8 @@ impl TurnCompletion {
                 return;
             }
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.state.lock().expect("turn completion poisoned").done {
                 return;
             }
@@ -139,6 +289,7 @@ pub struct TurnHandle {
     id: TurnId,
     cancel: Cancellation,
     completion: Arc<TurnCompletion>,
+    pub(crate) acceptance: Arc<TurnAcceptance>,
 }
 
 /// Atomic no-queue result for an attributed internal turn.
@@ -173,6 +324,12 @@ impl TurnHandle {
         self.completion.outcome().await
     }
 
+    /// Waits for the initial protected acceptance checkpoint.  This is used
+    /// by atomic admission paths; ordinary hosts only need [`Self::completed`].
+    pub(crate) async fn accepted(&self) -> Result<(), RuntimeError> {
+        self.acceptance.wait().await
+    }
+
     /// Interrupts only this turn, including while it is queued.
     pub fn interrupt(&self, reason: CancelReason) {
         self.cancel.cancel(reason);
@@ -183,6 +340,162 @@ impl TurnHandle {
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
     inner: Arc<SessionInner>,
+}
+
+#[derive(Debug)]
+struct SessionCacheStartBarrier {
+    session: SessionHandle,
+    checkpoint: Arc<AsyncMutex<Option<TurnCheckpoint>>>,
+}
+
+struct CacheActivityGuard {
+    inner: Arc<SessionInner>,
+}
+
+impl CacheActivityGuard {
+    fn enter(inner: &Arc<SessionInner>) -> Result<Self, RuntimeError> {
+        let turns = inner.turns.lock().expect("session turns poisoned");
+        if turns.shutting_down {
+            return Err(RuntimeError::conflict(
+                "session is shutting down and no longer accepts cache operations",
+            ));
+        }
+        // Increment while holding the same lock shutdown uses to publish its
+        // stopping decision. This closes the admission-vs-shutdown race.
+        inner.cache_active.fetch_add(1, Ordering::AcqRel);
+        drop(turns);
+        Ok(Self {
+            inner: inner.clone(),
+        })
+    }
+}
+
+impl SessionHandle {
+    fn mark_cache_start_repairable(&self, operation: CacheOperationId) {
+        self.inner
+            .cache_start_repairable
+            .lock()
+            .expect("session cache start state poisoned")
+            .insert(operation);
+    }
+
+    fn clear_cache_start_repairable(&self, operation: &CacheOperationId) {
+        self.inner
+            .cache_start_repairable
+            .lock()
+            .expect("session cache start state poisoned")
+            .remove(operation);
+    }
+
+    fn cache_start_is_repairable(&self, operation: &CacheOperationId) -> bool {
+        self.inner
+            .cache_start_repairable
+            .lock()
+            .expect("session cache start state poisoned")
+            .contains(operation)
+    }
+}
+
+impl Drop for CacheActivityGuard {
+    fn drop(&mut self) {
+        self.inner.cache_active.fetch_sub(1, Ordering::AcqRel);
+        self.inner.turns_changed.notify_waiters();
+    }
+}
+
+/// A cache finalization failure carries the protected phase it reached. A
+/// ResultReady write failure requires rolling back the in-memory reduction;
+/// a later Terminal write failure must retain it because ResultReady and its
+/// event watermark are already durable and recovery is now authoritative.
+#[derive(Debug)]
+enum CacheFinalizeError {
+    ResultReady(RuntimeError),
+    Terminal(RuntimeError),
+}
+
+#[async_trait]
+impl CacheStartBarrier for SessionCacheStartBarrier {
+    async fn cross(&self, operation: CacheOperationCheckpoint) -> Result<(), RuntimeError> {
+        let checkpoint = self
+            .checkpoint
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| RuntimeError::conflict("cache start barrier was crossed twice"))?;
+        if let TurnState::CacheOperationStarted {
+            operation: protected,
+        } = &checkpoint.state
+        {
+            // A store is allowed to durably commit and then report a
+            // transient error. The first invocation has not polled the
+            // provider yet (the event is emitted only after this boundary),
+            // so an exact retry can reuse that protected Started state and
+            // publish its one lifecycle event before proceeding.
+            if protected.operation != operation.operation
+                || protected.identity != operation.identity
+                || protected.purpose != operation.purpose
+                || protected.fingerprint != operation.fingerprint
+            {
+                *self.checkpoint.lock().await = Some(checkpoint);
+                return Err(RuntimeError::conflict(
+                    "cache retry does not match its protected Started checkpoint",
+                ));
+            }
+            self.session
+                .clear_cache_start_repairable(&operation.operation);
+            self.session.inner.emitter.emit(
+                Some(cache_operation_turn(&operation.operation)),
+                RuntimeEvent::CacheOperationStarted {
+                    operation: protected.operation.clone(),
+                    request: protected.request.clone(),
+                    attempt: protected.attempt.clone(),
+                    identity: protected.identity.clone(),
+                    purpose: protected.purpose,
+                },
+            );
+            *self.checkpoint.lock().await = Some(checkpoint);
+            return Ok(());
+        }
+        let next = match self
+            .session
+            .advance_cache_checkpoint_locked(
+                checkpoint.clone(),
+                TurnState::CacheOperationStarted {
+                    operation: operation.clone(),
+                },
+            )
+            .await
+        {
+            Ok(next) => next,
+            Err(error) => {
+                // The provider future has not been polled until this
+                // barrier returns.  Preserve Prepared locally so an exact
+                // retry can repair a transient checkpoint-store fault and
+                // then cross the start boundary once, without replaying any
+                // provider work.
+                self.session
+                    .mark_cache_start_repairable(operation.operation.clone());
+                *self.checkpoint.lock().await = Some(checkpoint);
+                return Err(error);
+            }
+        };
+        self.session
+            .clear_cache_start_repairable(&operation.operation);
+        // The Started event is published only after its protected checkpoint
+        // is durable and before the provider future is first polled.
+        self.session.inner.emitter.emit(
+            Some(cache_operation_turn(&operation.operation)),
+            RuntimeEvent::CacheOperationStarted {
+                operation: operation.operation,
+                request: operation.request,
+                attempt: operation.attempt,
+                identity: operation.identity,
+                purpose: operation.purpose,
+            },
+        );
+        *self.checkpoint.lock().await = Some(next);
+        Ok(())
+    }
 }
 
 impl SessionHandle {
@@ -232,6 +545,374 @@ impl SessionHandle {
         &self.inner
     }
 
+    /// Checks the exact opaque identity at the serialized provider boundary.
+    /// The operation may have been derived earlier; an intervening ordinary
+    /// turn can retire that identity before the maintenance call is admitted.
+    fn cache_identity_matches_last_plan(
+        &self,
+        identity: &agent_runtime_core::provider::CacheIdentity,
+    ) -> bool {
+        self.inner
+            .execution
+            .planner
+            .last_committed_plan()
+            .is_some_and(|plan| {
+                plan.cache_plan()
+                    .and_then(|cache| cache.cache_identity())
+                    .is_some_and(|current| current == identity)
+            })
+    }
+
+    /// Saves the prepared cache checkpoint while the caller already owns the
+    /// session persistence gate. Cache dispatch uses this variant so the
+    /// reservation, protected checkpoint, and ordinary SessionStore snapshot
+    /// cannot observe different projections.
+    async fn begin_cache_checkpoint_locked(
+        &self,
+        turn: agent_runtime_core::ids::TurnId,
+        operation: agent_runtime_core::checkpoint::CacheOperationCheckpoint,
+        deadline: Deadline,
+    ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+            return Ok(None);
+        };
+        let checkpoint_sequence = match store.load_latest(&self.inner.id).await? {
+            None => 1,
+            Some(previous) if previous.state.is_terminal() => {
+                previous.watermark.checkpoint_sequence.saturating_add(1)
+            }
+            Some(_) => {
+                return Err(RuntimeError::conflict(
+                    "cannot admit a cache operation over a non-terminal checkpoint",
+                ));
+            }
+        };
+        let event_sequence = self.inner.emitter.begin_checkpoint_barrier();
+        let checkpoint = TurnCheckpoint::cache_operation(
+            turn,
+            operation,
+            self.snapshot(),
+            deadline,
+            checkpoint_sequence,
+            event_sequence,
+            self.inner.shared.clock.now(),
+        );
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.inner.emitter.end_checkpoint_barrier();
+                return Err(error);
+            }
+        };
+        let save = store.save(&checkpoint).await;
+        self.inner.emitter.end_checkpoint_barrier();
+        save?;
+        Ok(Some(checkpoint))
+    }
+
+    async fn advance_cache_checkpoint(
+        &self,
+        checkpoint: TurnCheckpoint,
+        state: TurnState,
+    ) -> Result<TurnCheckpoint, RuntimeError> {
+        let _persist_gate = self.inner.persist_gate.lock().await;
+        self.advance_cache_checkpoint_locked(checkpoint, state)
+            .await
+    }
+
+    /// Advances a cache checkpoint while the caller already owns the shared
+    /// persistence gate. This is the only form used by an in-flight cache
+    /// dispatch; it keeps checkpoint and SessionStore projections atomic with
+    /// respect to ordinary persistence.
+    async fn advance_cache_checkpoint_locked(
+        &self,
+        checkpoint: TurnCheckpoint,
+        state: TurnState,
+    ) -> Result<TurnCheckpoint, RuntimeError> {
+        let event_sequence = self.inner.emitter.begin_checkpoint_barrier();
+        let next = match checkpoint.transition(
+            state,
+            self.snapshot(),
+            event_sequence,
+            self.inner.shared.clock.now(),
+        ) {
+            Ok(next) => next,
+            Err(error) => {
+                self.inner.emitter.end_checkpoint_barrier();
+                return Err(error);
+            }
+        };
+        if let Some(store) = self.inner.shared.checkpoint_store.as_ref() {
+            let save = store.save(&next).await;
+            self.inner.emitter.end_checkpoint_barrier();
+            save?;
+        } else {
+            self.inner.emitter.end_checkpoint_barrier();
+        }
+        Ok(next)
+    }
+
+    /// Completes the ResultReady -> Terminal boundary while the caller holds
+    /// the persistence gate for the whole cache operation. Result reduction is
+    /// therefore never visible to an ordinary SessionStore snapshot before
+    /// ResultReady is protected.
+    async fn finalize_cache_checkpoint_locked(
+        &self,
+        checkpoint: TurnCheckpoint,
+        result: &CacheOperationResult,
+        operation: &agent_runtime_core::checkpoint::CacheOperationCheckpoint,
+        cache_events: Option<CacheEventBatch>,
+    ) -> Result<(), CacheFinalizeError> {
+        // A rejection is itself the protected preflight decision. Preserve
+        // that reason on the reservation through ResultReady and Terminal so
+        // recovery can return the exact value without re-running mutable
+        // capability checks.
+        let mut operation = operation.clone();
+        if result.outcome == agent_runtime_core::event::CacheOperationOutcome::Rejected {
+            operation.preflight_rejection = result.rejection_reason;
+        }
+        let result_state = TurnState::CacheOperationResultReady {
+            operation: operation.clone(),
+            result: result.checkpoint_result(),
+        };
+        // A protected store write may fail transiently after the provider
+        // result is known. Retry the exact same ResultReady transition once
+        // while the persistence gate and cache event batch are still held;
+        // this repairs a same-process fault without replaying provider I/O.
+        // If the second write also fails, discard the volatile tail and let
+        // the caller roll back the unprotected in-memory projection. The
+        // durable Prepared/Started checkpoint remains the recovery authority.
+        let mut cache_events = cache_events;
+        if let Some(cache_events) = cache_events.as_mut() {
+            cache_events.mark_result_ready();
+        }
+        let checkpoint_before_result = checkpoint.clone();
+        let checkpoint = match self
+            .advance_cache_checkpoint_locked(checkpoint, result_state.clone())
+            .await
+        {
+            Ok(checkpoint) => checkpoint,
+            Err(_first_error) => match self
+                .advance_cache_checkpoint_locked(checkpoint_before_result, result_state)
+                .await
+            {
+                Ok(checkpoint) => checkpoint,
+                Err(second_error) => {
+                    return Err(CacheFinalizeError::ResultReady(second_error));
+                }
+            },
+        };
+        // The result checkpoint's watermark precedes every deferred lifecycle,
+        // evidence, suspension, and usage event. A crash after this save
+        // therefore truncates the tail and recovery can republish it once.
+        if let Some(cache_events) = cache_events {
+            cache_events.flush();
+        }
+        let cache_turn = cache_operation_turn(&operation.operation);
+        let terminal_state = TurnState::CacheOperationTerminal {
+            operation,
+            result: result.checkpoint_result(),
+        };
+        self.advance_cache_checkpoint_locked(checkpoint, terminal_state)
+            .await
+            .map_err(CacheFinalizeError::Terminal)?;
+        self.inner.emitter.clear_cache_tail(&cache_turn);
+        Ok(())
+    }
+
+    /// Repairs a cache operation from a protected checkpoint/result pair.
+    ///
+    /// This is used both by the same-handle retry after a ResultReady save
+    /// fault and by the completed-result fast path after a Terminal save
+    /// fault.  It never constructs or polls a provider request.  A Prepared
+    /// or Started checkpoint is advanced through the exact protected result
+    /// and terminal states; a ResultReady checkpoint only needs its terminal
+    /// successor.
+    async fn repair_cache_checkpoint_result(
+        &self,
+        result: &CacheOperationResult,
+    ) -> Result<(), RuntimeError> {
+        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(mut checkpoint) = store.load_latest(&self.inner.id).await? else {
+            return Err(RuntimeError::conflict(
+                "cache result has no protected checkpoint to repair",
+            ));
+        };
+        checkpoint.validate()?;
+        if checkpoint.session != self.inner.id
+            || checkpoint.turn != cache_operation_turn(&result.operation)
+        {
+            return Err(RuntimeError::conflict(
+                "cache result does not match its protected checkpoint",
+            ));
+        }
+        match checkpoint.state.clone() {
+            TurnState::CacheOperationTerminal { .. } => {}
+            TurnState::CacheOperationResultReady { operation, .. } => {
+                if operation.operation != result.operation
+                    || operation.identity != result.identity
+                    || operation.purpose != result.purpose
+                {
+                    return Err(RuntimeError::conflict(
+                        "cache result does not match its ResultReady checkpoint",
+                    ));
+                }
+                let cache_turn = cache_operation_turn(&operation.operation);
+                if !self.inner.emitter.cache_tail_published(&cache_turn) {
+                    let cache_events = self
+                        .inner
+                        .emitter
+                        .begin_cache_events_for_turn(cache_turn.clone());
+                    let checkpoint_result = result.checkpoint_result();
+                    let usage = self.cache_usage_for_checkpoint(
+                        &checkpoint.snapshot.usage,
+                        &operation,
+                        &checkpoint_result,
+                    )?;
+                    self.replay_cache_checkpoint_events(
+                        &operation,
+                        &checkpoint_result,
+                        false,
+                        false,
+                        usage.as_ref(),
+                    );
+                    cache_events.flush();
+                }
+                checkpoint = self
+                    .advance_cache_checkpoint_locked(
+                        checkpoint,
+                        TurnState::CacheOperationTerminal {
+                            operation,
+                            result: result.checkpoint_result(),
+                        },
+                    )
+                    .await?;
+                self.inner.emitter.clear_cache_tail(&cache_turn);
+            }
+            TurnState::CacheOperationPrepared { operation }
+            | TurnState::CacheOperationStarted { operation } => {
+                if operation.operation != result.operation
+                    || operation.identity != result.identity
+                    || operation.purpose != result.purpose
+                    || (result.outcome
+                        != agent_runtime_core::event::CacheOperationOutcome::Rejected
+                        && operation.attempt != result.attempt)
+                {
+                    return Err(RuntimeError::conflict(
+                        "cache result does not match its in-flight checkpoint",
+                    ));
+                }
+                let cache_events = self
+                    .inner
+                    .emitter
+                    .begin_cache_events_for_turn(cache_operation_turn(&operation.operation));
+                let usage_ledger = self
+                    .inner
+                    .state
+                    .lock()
+                    .expect("session state poisoned")
+                    .usage
+                    .clone();
+                let usage = self.cache_usage_for_checkpoint(
+                    &usage_ledger,
+                    &operation,
+                    &result.checkpoint_result(),
+                )?;
+                checkpoint = self
+                    .advance_cache_checkpoint_locked(
+                        checkpoint,
+                        TurnState::CacheOperationResultReady {
+                            operation: operation.clone(),
+                            result: result.checkpoint_result(),
+                        },
+                    )
+                    .await?;
+                self.replay_cache_checkpoint_events(
+                    &operation,
+                    &result.checkpoint_result(),
+                    false,
+                    false,
+                    usage.as_ref(),
+                );
+                cache_events.flush();
+                checkpoint = self
+                    .advance_cache_checkpoint_locked(
+                        checkpoint,
+                        TurnState::CacheOperationTerminal {
+                            operation,
+                            result: result.checkpoint_result(),
+                        },
+                    )
+                    .await?;
+            }
+            _ => {
+                return Err(RuntimeError::conflict(
+                    "cache result repair requested for a non-cache checkpoint",
+                ));
+            }
+        }
+        let checkpoint_operation = match &checkpoint.state {
+            TurnState::CacheOperationTerminal { operation, .. } => operation.clone(),
+            _ => {
+                return Err(RuntimeError::conflict(
+                    "cache checkpoint repair did not reach Terminal",
+                ));
+            }
+        };
+        self.inner
+            .shared
+            .cache
+            .commit_recovered_result_with_checkpoint(
+                &self.inner.id,
+                &checkpoint_operation,
+                result,
+            )?;
+        self.inner
+            .emitter
+            .clear_cache_tail(&cache_operation_turn(&checkpoint_operation.operation));
+        Ok(())
+    }
+
+    fn emit_cache_prepared(&self, operation: &CacheOperationCheckpoint) {
+        self.inner.emitter.emit(
+            Some(cache_operation_turn(&operation.operation)),
+            RuntimeEvent::CacheOperationPrepared {
+                operation: operation.operation.clone(),
+                request: operation.request.clone(),
+                identity: operation.identity.clone(),
+                purpose: operation.purpose,
+            },
+        );
+    }
+
+    /// Keeps the post-provider ledger beside a live-only result while a
+    /// protected checkpoint save is retried. The ordinary SessionStore
+    /// projection is rolled back on that failure, so the exact usage record
+    /// must travel with the same-process repair capability.
+    fn retain_pending_cache_repair(&self, result: &CacheOperationResult) {
+        let usage = self
+            .inner
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .usage
+            .clone();
+        self.inner
+            .shared
+            .cache
+            .retain_pending_repair(&self.inner.id, result, usage);
+    }
+
+    fn restore_pending_cache_usage(&self, usage: UsageLedger) {
+        self.inner
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .usage = usage;
+    }
+
     /// Enqueues host content for this session, introduced to the model only
     /// at the next safe provider/tool boundary — never by mutating an
     /// in-flight provider stream. Coalescable content past the configured
@@ -250,6 +931,874 @@ impl SessionHandle {
     /// authoritative for earlier events and any detected delivery gaps.
     pub fn subscribe(&self) -> RuntimeEventStream {
         self.inner.emitter.subscribe()
+    }
+
+    /// Dispatches one conformance-gated synthetic cache operation through the
+    /// Runtime mechanism. The operation is attributed with fresh request and
+    /// attempt identities and is never retried or routed to the tool executor.
+    pub async fn dispatch_cache_operation(
+        &self,
+        operation: CacheOperationRequest,
+    ) -> Result<CacheOperationResult, RuntimeError> {
+        let _cache_activity = CacheActivityGuard::enter(&self.inner)?;
+        let _cache_gate = self.inner.cache_gate.lock().await;
+        // Serialize against ordinary provider turns. This is an admission
+        // boundary, not a scheduling policy: if a turn was already serving,
+        // it completes first and the exact identity is then rechecked below.
+        let _turn_gate = self.inner.turn_gate.lock().await;
+        // Keep ordinary persistence out of the result-reduction window. The
+        // cache mechanism updates its in-memory projection before returning;
+        // holding this gate through ResultReady prevents a concurrent
+        // SessionStore snapshot from publishing an unprotected completion.
+        let _persist_gate = self.inner.persist_gate.lock().await;
+        let cache_snapshot = self
+            .inner
+            .shared
+            .cache
+            .snapshot_for_dispatch(&self.inner.id);
+        let usage_snapshot = self
+            .inner
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .usage
+            .clone();
+        let request_id = self.inner.minter.request();
+        let attempt_id = self.inner.minter.attempt();
+        let operation_fingerprint = operation.fingerprint();
+        match self.inner.shared.cache.pending_repair(
+            &self.inner.id,
+            operation.operation(),
+            &operation_fingerprint,
+        ) {
+            Ok(Some((result, usage))) => {
+                self.restore_pending_cache_usage(usage);
+                self.inner
+                    .shared
+                    .cache
+                    .restore_pending_repair_state(&self.inner.id, operation.operation());
+                self.repair_cache_checkpoint_result(&result).await?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Err(reason) => {
+                let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+                self.emit_cache_prepared(&prepared);
+                let result = self.inner.shared.cache.reject_synthetic_for_dispatch(
+                    &self.inner.id,
+                    request_id,
+                    &operation,
+                    reason,
+                    &self.inner.emitter,
+                )?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Ok(None) => {}
+        }
+        match self.inner.shared.cache.completed_result(
+            &self.inner.id,
+            operation.operation(),
+            &operation_fingerprint,
+        ) {
+            Ok(Some(result)) => {
+                self.repair_cache_checkpoint_result(&result).await?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Err(reason) => {
+                let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+                self.emit_cache_prepared(&prepared);
+                let result = self.inner.shared.cache.reject_synthetic_for_dispatch(
+                    &self.inner.id,
+                    request_id,
+                    &operation,
+                    reason,
+                    &self.inner.emitter,
+                )?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Ok(None) => {}
+        }
+        let reserved_existing = self
+            .inner
+            .shared
+            .cache
+            .operation_reserved(&self.inner.id, operation.operation());
+        let prepared_retry_checkpoint = if self.inner.shared.checkpoint_store.is_some() {
+            match self.inner.shared.checkpoint_store.as_ref() {
+                Some(store) => store.load_latest(&self.inner.id).await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let prepared_retry_checkpoint = match prepared_retry_checkpoint {
+            Some(checkpoint) => match &checkpoint.state {
+                TurnState::CacheOperationPrepared {
+                    operation: checkpoint_operation,
+                }
+                | TurnState::CacheOperationStarted {
+                    operation: checkpoint_operation,
+                } if operation.matches_checkpoint(checkpoint_operation)
+                    && (matches!(&checkpoint.state, TurnState::CacheOperationPrepared { .. })
+                        || self.cache_start_is_repairable(operation.operation())) =>
+                {
+                    Some(checkpoint)
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref()
+            && let TurnState::CacheOperationPrepared {
+                operation: checkpoint_operation,
+            } = &checkpoint.state
+            && let Some(reason) = checkpoint_operation.preflight_rejection
+        {
+            let result = self.cache_result_from_checkpoint(
+                checkpoint_operation,
+                &CacheOperationResultCheckpoint {
+                    outcome: agent_runtime_core::event::CacheOperationOutcome::Rejected,
+                    state: self
+                        .inner
+                        .shared
+                        .cache
+                        .current_state(&self.inner.id, &checkpoint_operation.identity),
+                    evidence: None,
+                    metrics: BTreeMap::new(),
+                    rejection_reason: Some(reason),
+                    terminal_reason: None,
+                },
+            );
+            self.repair_cache_checkpoint_result(&result).await?;
+            self.persist_locked().await?;
+            return Ok(result);
+        }
+        if reserved_existing
+            && prepared_retry_checkpoint.is_none()
+            && self.inner.shared.checkpoint_store.is_some()
+        {
+            // A duplicate arriving while a protected cache checkpoint is
+            // non-terminal must not try to allocate another revision-zero
+            // checkpoint for the same synthetic turn. Resolve it as a
+            // structured conflict; recovery owns the existing boundary.
+            let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+            self.emit_cache_prepared(&prepared);
+            let result = self.inner.shared.cache.reject_synthetic_for_dispatch(
+                &self.inner.id,
+                request_id,
+                &operation,
+                agent_runtime_core::event::CacheOperationReason::Conflict,
+                &self.inner.emitter,
+            )?;
+            self.persist_locked().await?;
+            return Ok(result);
+        }
+        if !reserved_existing
+            && prepared_retry_checkpoint.is_none()
+            && !self.cache_identity_matches_last_plan(operation.synthetic().identity())
+        {
+            let checkpoint = if self.inner.shared.checkpoint_store.is_some() {
+                let prepared = operation.checkpoint_metadata_with_rejection(
+                    Some(request_id.clone()),
+                    agent_runtime_core::event::CacheOperationReason::IdentityChanged,
+                );
+                match self
+                    .begin_cache_checkpoint_locked(
+                        cache_operation_turn(operation.operation()),
+                        prepared,
+                        operation.synthetic().deadline(),
+                    )
+                    .await
+                {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+            self.emit_cache_prepared(&prepared);
+            let cache_events = checkpoint.as_ref().map(|_| {
+                self.inner
+                    .emitter
+                    .begin_cache_events_for_turn(cache_operation_turn(operation.operation()))
+            });
+            let result = self.inner.shared.cache.reject_synthetic_for_dispatch(
+                &self.inner.id,
+                request_id,
+                &operation,
+                agent_runtime_core::event::CacheOperationReason::IdentityChanged,
+                &self.inner.emitter,
+            )?;
+            if let Some(checkpoint) = checkpoint {
+                let operation_checkpoint = match &checkpoint.state {
+                    TurnState::CacheOperationPrepared { operation }
+                    | TurnState::CacheOperationStarted { operation }
+                    | TurnState::CacheOperationResultReady { operation, .. }
+                    | TurnState::CacheOperationTerminal { operation, .. } => operation.clone(),
+                    _ => operation
+                        .checkpoint_metadata(result.request.clone(), result.attempt.clone()),
+                };
+                match self
+                    .finalize_cache_checkpoint_locked(
+                        checkpoint,
+                        &result,
+                        &operation_checkpoint,
+                        cache_events,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(CacheFinalizeError::ResultReady(error)) => {
+                        self.retain_pending_cache_repair(&result);
+                        self.inner.shared.cache.rollback_unprotected_result(
+                            &self.inner.id,
+                            operation.operation(),
+                            cache_snapshot.clone(),
+                        );
+                        self.inner
+                            .state
+                            .lock()
+                            .expect("session state poisoned")
+                            .usage = usage_snapshot.clone();
+                        return Err(error);
+                    }
+                    Err(CacheFinalizeError::Terminal(error)) => {
+                        self.retain_pending_cache_repair(&result);
+                        return Err(error);
+                    }
+                }
+            }
+            self.persist_locked().await?;
+            return Ok(result);
+        }
+        let request_id = prepared_retry_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| match &checkpoint.state {
+                TurnState::CacheOperationPrepared { operation }
+                | TurnState::CacheOperationStarted { operation } => operation.request.clone(),
+                _ => None,
+            })
+            .unwrap_or(request_id);
+        let attempt_id = prepared_retry_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| match &checkpoint.state {
+                TurnState::CacheOperationStarted { operation } => operation.attempt.clone(),
+                _ => None,
+            })
+            .unwrap_or(attempt_id);
+        let protected_retry = prepared_retry_checkpoint.is_some();
+        let reserved = self
+            .inner
+            .shared
+            .cache
+            .reserve_synthetic_for_dispatch(&self.inner.id, &operation, &self.inner.cancel)
+            .is_ok()
+            || (reserved_existing && protected_retry);
+        if reserved && self.inner.shared.checkpoint_store.is_none() {
+            // The operation id is now durable before any provider future is
+            // polled. A crash after Started cannot replay the same action on
+            // restart. A SessionStore error is intentionally ambiguous: keep
+            // the live reservation rather than reopening provider admission
+            // when the store may have committed it before returning the
+            // error.
+            self.persist_locked().await?;
+        }
+        let checkpoint = if let Some(checkpoint) = prepared_retry_checkpoint {
+            Some(checkpoint)
+        } else if self.inner.shared.checkpoint_store.is_some() {
+            let prepared = match if self.inner.cancel.is_cancelled() {
+                Some(agent_runtime_core::event::CacheOperationReason::Shutdown)
+            } else {
+                self.inner
+                    .shared
+                    .cache
+                    .preflight_synthetic_reason(&self.inner.id, &operation)
+                    .err()
+            } {
+                Some(reason) => {
+                    operation.checkpoint_metadata_with_rejection(Some(request_id.clone()), reason)
+                }
+                None => operation.checkpoint_metadata(Some(request_id.clone()), None),
+            };
+            let checkpoint = match self
+                .begin_cache_checkpoint_locked(
+                    cache_operation_turn(operation.operation()),
+                    prepared.clone(),
+                    operation.synthetic().deadline(),
+                )
+                .await
+            {
+                Ok(Some(checkpoint)) => checkpoint,
+                Ok(None) => unreachable!("checkpoint store disappeared during dispatch"),
+                Err(error) => {
+                    if reserved {
+                        self.inner
+                            .shared
+                            .cache
+                            .release_operation(&self.inner.id, operation.operation());
+                    }
+                    return Err(error);
+                }
+            };
+            self.emit_cache_prepared(&prepared);
+            Some(checkpoint)
+        } else {
+            None
+        };
+        if reserved && self.inner.shared.checkpoint_store.is_some() {
+            self.persist_locked().await?;
+        }
+        let checkpoint_slot =
+            checkpoint.map(|checkpoint| Arc::new(AsyncMutex::new(Some(checkpoint))));
+        let start_barrier = checkpoint_slot
+            .as_ref()
+            .map(|checkpoint| SessionCacheStartBarrier {
+                session: self.clone(),
+                checkpoint: checkpoint.clone(),
+            });
+        // Only result-tail events are deferred. Prepared/Started remain
+        // visible at their own protected phase boundaries.  The guard also
+        // discards the batch if this future is aborted at any later await.
+        let cache_events = checkpoint_slot.as_ref().map(|_| {
+            self.inner
+                .emitter
+                .begin_cache_events_for_turn(cache_operation_turn(operation.operation()))
+        });
+        let result = match self
+            .inner
+            .shared
+            .cache
+            .dispatch_synthetic(
+                self.inner.id.clone(),
+                request_id,
+                attempt_id,
+                operation.clone(),
+                &self.inner.emitter,
+                self.inner.state.clone(),
+                self.inner.cancel.clone(),
+                reserved,
+                start_barrier
+                    .as_ref()
+                    .map(|barrier| barrier as &dyn CacheStartBarrier),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return Err(error),
+        };
+        let checkpoint = if let Some(slot) = checkpoint_slot {
+            slot.lock().await.take()
+        } else {
+            None
+        };
+        if let Some(checkpoint) = checkpoint {
+            let operation_checkpoint = match &checkpoint.state {
+                TurnState::CacheOperationPrepared { operation }
+                | TurnState::CacheOperationStarted { operation }
+                | TurnState::CacheOperationResultReady { operation, .. }
+                | TurnState::CacheOperationTerminal { operation, .. } => operation.clone(),
+                _ => operation.checkpoint_metadata(result.request.clone(), result.attempt.clone()),
+            };
+            match self
+                .finalize_cache_checkpoint_locked(
+                    checkpoint,
+                    &result,
+                    &operation_checkpoint,
+                    cache_events,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(CacheFinalizeError::ResultReady(error)) => {
+                    self.retain_pending_cache_repair(&result);
+                    self.inner.shared.cache.rollback_unprotected_result(
+                        &self.inner.id,
+                        operation.operation(),
+                        cache_snapshot,
+                    );
+                    self.inner
+                        .state
+                        .lock()
+                        .expect("session state poisoned")
+                        .usage = usage_snapshot;
+                    return Err(error);
+                }
+                Err(CacheFinalizeError::Terminal(error)) => {
+                    self.retain_pending_cache_repair(&result);
+                    return Err(error);
+                }
+            }
+        }
+        self.persist_locked().await?;
+        Ok(result)
+    }
+
+    /// Derives a maintenance operation from the exact immutable plan that
+    /// last crossed this session's provider-start boundary. This is the
+    /// consumer-safe path for Runtime extensions: callers cannot rebuild a
+    /// prompt or inject an independent model/cache identity.
+    pub fn cache_operation_from_last_plan(
+        &self,
+        operation: agent_runtime_core::ids::CacheOperationId,
+        purpose: agent_runtime_core::provider::ProviderAttemptPurpose,
+        authority: agent_runtime_core::provider::CacheAuthority,
+        budget: agent_runtime_core::provider::CacheOperationBudget,
+        cancel: Cancellation,
+        deadline: Deadline,
+    ) -> Result<CacheOperationRequest, RuntimeError> {
+        let plan = self
+            .inner
+            .execution
+            .planner
+            .last_committed_plan()
+            .ok_or_else(|| {
+                RuntimeError::conflict("session has no provider-committed context plan")
+            })?;
+        CacheOperationRequest::from_plan(
+            operation, &plan, purpose, authority, budget, cancel, deadline,
+        )
+    }
+
+    /// Derives a bounded cache-handoff operation from the exact last
+    /// provider-committed plan. The suffix is appended after the immutable
+    /// provider cache boundary and is never persisted or emitted.
+    pub fn cache_handoff_from_last_plan(
+        &self,
+        operation: agent_runtime_core::ids::CacheOperationId,
+        suffix: crate::cache::CacheHandoffSuffix,
+        authority: agent_runtime_core::provider::CacheAuthority,
+        budget: agent_runtime_core::provider::CacheOperationBudget,
+        cancel: Cancellation,
+        deadline: Deadline,
+    ) -> Result<CacheOperationRequest, RuntimeError> {
+        let plan = self
+            .inner
+            .execution
+            .planner
+            .last_committed_plan()
+            .ok_or_else(|| {
+                RuntimeError::conflict("session has no provider-committed context plan")
+            })?;
+        CacheOperationRequest::from_plan_with_handoff_suffix(
+            operation, &plan, suffix, authority, budget, cancel, deadline,
+        )
+    }
+
+    /// Derives an explicit resource operation from the exact last committed
+    /// context plan; resource identity and model remain Runtime-owned.
+    pub fn cache_resource_from_last_plan(
+        &self,
+        operation: agent_runtime_core::ids::CacheOperationId,
+        kind: agent_runtime_core::provider::CacheResourceOperationKind,
+        authority: agent_runtime_core::provider::CacheAuthority,
+        budget: agent_runtime_core::provider::CacheOperationBudget,
+        cancel: Cancellation,
+        deadline: Deadline,
+    ) -> Result<CacheResourceDispatchRequest, RuntimeError> {
+        let plan = self
+            .inner
+            .execution
+            .planner
+            .last_committed_plan()
+            .ok_or_else(|| {
+                RuntimeError::conflict("session has no provider-committed context plan")
+            })?;
+        CacheResourceDispatchRequest::from_plan(
+            operation, &plan, kind, authority, budget, cancel, deadline,
+        )
+    }
+
+    /// Dispatches one typed explicit-resource cache operation through the
+    /// optional provider companion capability.
+    pub async fn dispatch_cache_resource(
+        &self,
+        operation: CacheResourceDispatchRequest,
+    ) -> Result<CacheOperationResult, RuntimeError> {
+        let _cache_activity = CacheActivityGuard::enter(&self.inner)?;
+        let _cache_gate = self.inner.cache_gate.lock().await;
+        let _turn_gate = self.inner.turn_gate.lock().await;
+        // Keep ordinary persistence out of the result-reduction window; see
+        // the synthetic dispatch for the protected-boundary rationale.
+        let _persist_gate = self.inner.persist_gate.lock().await;
+        let cache_snapshot = self
+            .inner
+            .shared
+            .cache
+            .snapshot_for_dispatch(&self.inner.id);
+        let usage_snapshot = self
+            .inner
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .usage
+            .clone();
+        let request_id = self.inner.minter.request();
+        let attempt_id = self.inner.minter.attempt();
+        let operation_fingerprint = operation.fingerprint();
+        match self.inner.shared.cache.pending_repair(
+            &self.inner.id,
+            operation.operation(),
+            &operation_fingerprint,
+        ) {
+            Ok(Some((result, usage))) => {
+                self.restore_pending_cache_usage(usage);
+                self.inner
+                    .shared
+                    .cache
+                    .restore_pending_repair_state(&self.inner.id, operation.operation());
+                self.repair_cache_checkpoint_result(&result).await?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Err(reason) => {
+                let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+                self.emit_cache_prepared(&prepared);
+                let result = self.inner.shared.cache.reject_resource_for_dispatch(
+                    &self.inner.id,
+                    request_id,
+                    &operation,
+                    reason,
+                    &self.inner.emitter,
+                )?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Ok(None) => {}
+        }
+        match self.inner.shared.cache.completed_result(
+            &self.inner.id,
+            operation.operation(),
+            &operation_fingerprint,
+        ) {
+            Ok(Some(result)) => {
+                self.repair_cache_checkpoint_result(&result).await?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Err(reason) => {
+                let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+                self.emit_cache_prepared(&prepared);
+                let result = self.inner.shared.cache.reject_resource_for_dispatch(
+                    &self.inner.id,
+                    request_id,
+                    &operation,
+                    reason,
+                    &self.inner.emitter,
+                )?;
+                self.persist_locked().await?;
+                return Ok(result);
+            }
+            Ok(None) => {}
+        }
+        let reserved_existing = self
+            .inner
+            .shared
+            .cache
+            .operation_reserved(&self.inner.id, operation.operation());
+        let prepared_retry_checkpoint = if self.inner.shared.checkpoint_store.is_some() {
+            match self.inner.shared.checkpoint_store.as_ref() {
+                Some(store) => store.load_latest(&self.inner.id).await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let prepared_retry_checkpoint = match prepared_retry_checkpoint {
+            Some(checkpoint) => match &checkpoint.state {
+                TurnState::CacheOperationPrepared {
+                    operation: checkpoint_operation,
+                }
+                | TurnState::CacheOperationStarted {
+                    operation: checkpoint_operation,
+                } if operation.matches_checkpoint(checkpoint_operation)
+                    && (matches!(&checkpoint.state, TurnState::CacheOperationPrepared { .. })
+                        || self.cache_start_is_repairable(operation.operation())) =>
+                {
+                    Some(checkpoint)
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref()
+            && let TurnState::CacheOperationPrepared {
+                operation: checkpoint_operation,
+            } = &checkpoint.state
+            && let Some(reason) = checkpoint_operation.preflight_rejection
+        {
+            let result = self.cache_result_from_checkpoint(
+                checkpoint_operation,
+                &CacheOperationResultCheckpoint {
+                    outcome: agent_runtime_core::event::CacheOperationOutcome::Rejected,
+                    state: self
+                        .inner
+                        .shared
+                        .cache
+                        .current_state(&self.inner.id, &checkpoint_operation.identity),
+                    evidence: None,
+                    metrics: BTreeMap::new(),
+                    rejection_reason: Some(reason),
+                    terminal_reason: None,
+                },
+            );
+            self.repair_cache_checkpoint_result(&result).await?;
+            self.persist_locked().await?;
+            return Ok(result);
+        }
+        if reserved_existing
+            && prepared_retry_checkpoint.is_none()
+            && self.inner.shared.checkpoint_store.is_some()
+        {
+            let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+            self.emit_cache_prepared(&prepared);
+            let result = self.inner.shared.cache.reject_resource_for_dispatch(
+                &self.inner.id,
+                request_id,
+                &operation,
+                agent_runtime_core::event::CacheOperationReason::Conflict,
+                &self.inner.emitter,
+            )?;
+            self.persist_locked().await?;
+            return Ok(result);
+        }
+        let request_id = prepared_retry_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| match &checkpoint.state {
+                TurnState::CacheOperationPrepared { operation }
+                | TurnState::CacheOperationStarted { operation } => operation.request.clone(),
+                _ => None,
+            })
+            .unwrap_or(request_id);
+        let attempt_id = prepared_retry_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| match &checkpoint.state {
+                TurnState::CacheOperationStarted { operation } => operation.attempt.clone(),
+                _ => None,
+            })
+            .unwrap_or(attempt_id);
+        if !reserved_existing
+            && prepared_retry_checkpoint.is_none()
+            && !self.cache_identity_matches_last_plan(operation.identity())
+        {
+            let checkpoint = if self.inner.shared.checkpoint_store.is_some() {
+                let prepared = operation.checkpoint_metadata_with_rejection(
+                    Some(request_id.clone()),
+                    agent_runtime_core::event::CacheOperationReason::IdentityChanged,
+                );
+                match self
+                    .begin_cache_checkpoint_locked(
+                        cache_operation_turn(operation.operation()),
+                        prepared,
+                        operation.deadline(),
+                    )
+                    .await
+                {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
+            self.emit_cache_prepared(&prepared);
+            let cache_events = checkpoint.as_ref().map(|_| {
+                self.inner
+                    .emitter
+                    .begin_cache_events_for_turn(cache_operation_turn(operation.operation()))
+            });
+            let result = self.inner.shared.cache.reject_resource_for_dispatch(
+                &self.inner.id,
+                request_id,
+                &operation,
+                agent_runtime_core::event::CacheOperationReason::IdentityChanged,
+                &self.inner.emitter,
+            )?;
+            if let Some(checkpoint) = checkpoint {
+                let operation_checkpoint = match &checkpoint.state {
+                    TurnState::CacheOperationPrepared { operation }
+                    | TurnState::CacheOperationStarted { operation }
+                    | TurnState::CacheOperationResultReady { operation, .. }
+                    | TurnState::CacheOperationTerminal { operation, .. } => operation.clone(),
+                    _ => operation
+                        .checkpoint_metadata(result.request.clone(), result.attempt.clone()),
+                };
+                match self
+                    .finalize_cache_checkpoint_locked(
+                        checkpoint,
+                        &result,
+                        &operation_checkpoint,
+                        cache_events,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(CacheFinalizeError::ResultReady(error)) => {
+                        self.retain_pending_cache_repair(&result);
+                        self.inner.shared.cache.rollback_unprotected_result(
+                            &self.inner.id,
+                            operation.operation(),
+                            cache_snapshot.clone(),
+                        );
+                        self.inner
+                            .state
+                            .lock()
+                            .expect("session state poisoned")
+                            .usage = usage_snapshot.clone();
+                        return Err(error);
+                    }
+                    Err(CacheFinalizeError::Terminal(error)) => {
+                        self.retain_pending_cache_repair(&result);
+                        return Err(error);
+                    }
+                }
+            }
+            self.persist_locked().await?;
+            return Ok(result);
+        }
+        let protected_retry = prepared_retry_checkpoint.is_some();
+        let reserved = self
+            .inner
+            .shared
+            .cache
+            .reserve_resource_for_dispatch(&self.inner.id, &operation, &self.inner.cancel)
+            .is_ok()
+            || (reserved_existing && protected_retry);
+        if reserved && self.inner.shared.checkpoint_store.is_none() {
+            self.persist_locked().await?;
+        }
+        let checkpoint = if let Some(checkpoint) = prepared_retry_checkpoint {
+            Some(checkpoint)
+        } else if self.inner.shared.checkpoint_store.is_some() {
+            let prepared = match if self.inner.cancel.is_cancelled() {
+                Some(agent_runtime_core::event::CacheOperationReason::Shutdown)
+            } else {
+                self.inner
+                    .shared
+                    .cache
+                    .preflight_resource_reason(&self.inner.id, &operation)
+                    .err()
+            } {
+                Some(reason) => {
+                    operation.checkpoint_metadata_with_rejection(Some(request_id.clone()), reason)
+                }
+                None => operation.checkpoint_metadata(Some(request_id.clone()), None),
+            };
+            let checkpoint = match self
+                .begin_cache_checkpoint_locked(
+                    cache_operation_turn(operation.operation()),
+                    prepared.clone(),
+                    operation.deadline(),
+                )
+                .await
+            {
+                Ok(Some(checkpoint)) => checkpoint,
+                Ok(None) => unreachable!("checkpoint store disappeared during dispatch"),
+                Err(error) => {
+                    if reserved {
+                        self.inner
+                            .shared
+                            .cache
+                            .release_operation(&self.inner.id, operation.operation());
+                    }
+                    return Err(error);
+                }
+            };
+            self.emit_cache_prepared(&prepared);
+            Some(checkpoint)
+        } else {
+            None
+        };
+        if reserved && self.inner.shared.checkpoint_store.is_some() {
+            self.persist_locked().await?;
+        }
+        let checkpoint_slot =
+            checkpoint.map(|checkpoint| Arc::new(AsyncMutex::new(Some(checkpoint))));
+        let start_barrier = checkpoint_slot
+            .as_ref()
+            .map(|checkpoint| SessionCacheStartBarrier {
+                session: self.clone(),
+                checkpoint: checkpoint.clone(),
+            });
+        let cache_events = checkpoint_slot.as_ref().map(|_| {
+            self.inner
+                .emitter
+                .begin_cache_events_for_turn(cache_operation_turn(operation.operation()))
+        });
+        let result = match self
+            .inner
+            .shared
+            .cache
+            .dispatch_resource(
+                self.inner.id.clone(),
+                request_id,
+                attempt_id,
+                operation.clone(),
+                &self.inner.emitter,
+                self.inner.state.clone(),
+                self.inner.cancel.clone(),
+                reserved,
+                start_barrier
+                    .as_ref()
+                    .map(|barrier| barrier as &dyn CacheStartBarrier),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return Err(error),
+        };
+        let checkpoint = if let Some(slot) = checkpoint_slot {
+            slot.lock().await.take()
+        } else {
+            None
+        };
+        if let Some(checkpoint) = checkpoint {
+            let operation_checkpoint = match &checkpoint.state {
+                TurnState::CacheOperationPrepared { operation }
+                | TurnState::CacheOperationStarted { operation }
+                | TurnState::CacheOperationResultReady { operation, .. }
+                | TurnState::CacheOperationTerminal { operation, .. } => operation.clone(),
+                _ => operation.checkpoint_metadata(result.request.clone(), result.attempt.clone()),
+            };
+            match self
+                .finalize_cache_checkpoint_locked(
+                    checkpoint,
+                    &result,
+                    &operation_checkpoint,
+                    cache_events,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(CacheFinalizeError::ResultReady(error)) => {
+                    self.retain_pending_cache_repair(&result);
+                    self.inner.shared.cache.rollback_unprotected_result(
+                        &self.inner.id,
+                        operation.operation(),
+                        cache_snapshot,
+                    );
+                    self.inner
+                        .state
+                        .lock()
+                        .expect("session state poisoned")
+                        .usage = usage_snapshot;
+                    return Err(error);
+                }
+                Err(CacheFinalizeError::Terminal(error)) => {
+                    self.retain_pending_cache_repair(&result);
+                    return Err(error);
+                }
+            }
+        }
+        self.persist_locked().await?;
+        Ok(result)
     }
 
     /// Queues input for this session and returns a turn-local handle.
@@ -323,13 +1872,47 @@ impl SessionHandle {
         &self,
         input: InternalTurnInput,
     ) -> Result<InternalTurnAdmission, RuntimeError> {
+        self.try_send_internal_if_idle_with_state(input, Vec::new())
+    }
+
+    /// Internal admission variant that stages extension state before the
+    /// spawned turn creates its first checkpoint.  The state is visible to
+    /// the checkpoint snapshot and no state is changed when admission loses
+    /// the idle race.
+    pub(crate) fn try_send_internal_if_idle_with_state(
+        &self,
+        input: InternalTurnInput,
+        extension_updates: Vec<(String, VersionedSessionState)>,
+    ) -> Result<InternalTurnAdmission, RuntimeError> {
+        self.try_send_internal_if_idle_with_state_and_hook(input, extension_updates, None)
+    }
+
+    /// Internal admission variant with a one-shot resolution hook. The hook
+    /// runs after the first acceptance checkpoint has committed (or failed)
+    /// and before waiters are notified. This lets a caller bind its own
+    /// protected state transition to the checkpoint barrier without an
+    /// abortable future having to guess whether rollback is still safe.
+    pub(crate) fn try_send_internal_if_idle_with_state_and_hook(
+        &self,
+        input: InternalTurnInput,
+        extension_updates: Vec<(String, VersionedSessionState)>,
+        acceptance_hook: Option<TurnAcceptanceHook>,
+    ) -> Result<InternalTurnAdmission, RuntimeError> {
         input.validate()?;
+        let _admission = self
+            .inner
+            .admission_gate
+            .lock()
+            .expect("session admission gate poisoned");
         if self.inner.recovery_deferred {
             return Ok(InternalTurnAdmission::Busy);
         }
         let mut turns = self.inner.turns.lock().expect("session turns poisoned");
         if turns.shutting_down {
             return Ok(InternalTurnAdmission::Shutdown);
+        }
+        if self.inner.user_submission_pending.load(Ordering::Acquire) != 0 {
+            return Ok(InternalTurnAdmission::Busy);
         }
         if turns.count != 0 {
             return Ok(InternalTurnAdmission::Busy);
@@ -352,9 +1935,25 @@ impl SessionHandle {
             }
         }
 
+        if !extension_updates.is_empty() {
+            if acceptance_hook.is_some() {
+                self.inner
+                    .execution
+                    .stage_extension_state(extension_updates);
+            } else {
+                self.inner
+                    .execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .extend(extension_updates);
+            }
+        }
+
         let turn_id = self.inner.minter.turn();
         let turn_cancel = self.inner.cancel.child();
         let completion = Arc::new(TurnCompletion::default());
+        let acceptance = Arc::new(TurnAcceptance::pending_with_hook(acceptance_hook));
         let steer_mailbox = Arc::new(SteerMailbox::new(
             turn_id.clone(),
             self.inner.shared.driver.steer_limits(),
@@ -375,12 +1974,14 @@ impl SessionHandle {
         let tid = turn_id.clone();
         let task_cancel = turn_cancel.clone();
         let task_completion = completion.clone();
+        let task_acceptance = acceptance.clone();
         let task_steer_mailbox = steer_mailbox.clone();
         let active = ActiveTurnGuard {
             inner: inner.clone(),
             ticket,
             turn: turn_id.clone(),
             completion: completion.clone(),
+            acceptance: acceptance.clone(),
         };
         let task = tokio::spawn(async move {
             let _active = active;
@@ -406,6 +2007,7 @@ impl SessionHandle {
                     task_steer_mailbox,
                     tid.clone(),
                     input,
+                    task_acceptance,
                 )
                 .await;
             let finish = inner.execution.take_turn_finish(&tid);
@@ -418,6 +2020,7 @@ impl SessionHandle {
             id: turn_id,
             cancel: turn_cancel,
             completion,
+            acceptance,
         }))
     }
 
@@ -449,13 +2052,19 @@ impl SessionHandle {
             _ => None,
         };
         let serving_cancel = {
-            let turns = self.inner.turns.lock().expect("session turns poisoned");
+            let _admission = self
+                .inner
+                .admission_gate
+                .lock()
+                .expect("session admission gate poisoned");
+            let mut turns = self.inner.turns.lock().expect("session turns poisoned");
             if turns.shutting_down {
                 return Err(RuntimeError::conflict(
                     "session is shutting down and no longer accepts goal controls",
                 ));
             }
             if turns.count == 0 {
+                turns.count = 1;
                 None
             } else if let Some((id, generation)) = &pause_target {
                 let current_goal = self
@@ -525,15 +2134,6 @@ impl SessionHandle {
             }
         }
 
-        {
-            let mut turns = self.inner.turns.lock().expect("session turns poisoned");
-            if turns.count != 0 {
-                return Err(RuntimeError::conflict(
-                    "goal mutation lost the idle-session admission race",
-                ));
-            }
-            turns.count = 1;
-        }
         let _control = GoalControlGuard {
             inner: self.inner.clone(),
         };
@@ -559,6 +2159,7 @@ impl SessionHandle {
         ));
         let next = component.apply_host_command(current, command, created_id, now, usage_cursor)?;
 
+        let _persist_gate = self.inner.persist_gate.lock().await;
         let mut snapshot = self.snapshot();
         snapshot.updated = now;
         match &next {
@@ -626,9 +2227,14 @@ impl SessionHandle {
             ));
         }
 
-        let turn = self.inner.minter.turn();
-        let cancel = self.inner.cancel.child();
-        {
+        let (turn, cancel) = {
+            let _admission = self
+                .inner
+                .admission_gate
+                .lock()
+                .expect("session admission gate poisoned");
+            let turn = self.inner.minter.turn();
+            let cancel = self.inner.cancel.child();
             let mut turns = self.inner.turns.lock().expect("session turns poisoned");
             if turns.shutting_down {
                 return Err(RuntimeError::conflict(
@@ -644,7 +2250,8 @@ impl SessionHandle {
             turns.current = Some(turn.clone());
             turns.steering = None;
             turns.cancellations.insert(turn.clone(), cancel.clone());
-        }
+            (turn, cancel)
+        };
         let _active = LocalToolGuard {
             inner: self.inner.clone(),
             turn: turn.clone(),
@@ -675,6 +2282,16 @@ impl SessionHandle {
     }
 
     fn spawn_turn(&self, input: UserInput) -> Result<TurnHandle, RuntimeError> {
+        // Publish user intent before waiting for the shared admission gate.
+        // An internal completion that already owns the gate must observe this
+        // marker and yield rather than winning the idle check while the user
+        // call is queued behind it.
+        let _user_submission = UserSubmissionGuard::enter(&self.inner.user_submission_pending);
+        let _admission = self
+            .inner
+            .admission_gate
+            .lock()
+            .expect("session admission gate poisoned");
         if self.inner.recovery_deferred {
             return Err(RuntimeError::conflict(
                 "session has a deferred pending interaction and cannot accept a new turn",
@@ -689,6 +2306,7 @@ impl SessionHandle {
         let turn_id = self.inner.minter.turn();
         let turn_cancel = self.inner.cancel.child();
         let completion = Arc::new(TurnCompletion::default());
+        let acceptance = Arc::new(TurnAcceptance::accepted());
         let steer_mailbox = Arc::new(SteerMailbox::new(
             turn_id.clone(),
             self.inner.shared.driver.steer_limits(),
@@ -711,6 +2329,7 @@ impl SessionHandle {
             ticket,
             turn: turn_id.clone(),
             completion: completion.clone(),
+            acceptance: acceptance.clone(),
         };
         let task = tokio::spawn(async move {
             let _active = active;
@@ -761,6 +2380,7 @@ impl SessionHandle {
             id: turn_id,
             cancel: turn_cancel,
             completion,
+            acceptance,
         })
     }
 
@@ -768,6 +2388,11 @@ impl SessionHandle {
         &self,
         checkpoint: TurnCheckpoint,
     ) -> Result<TurnHandle, RuntimeError> {
+        let _admission = self
+            .inner
+            .admission_gate
+            .lock()
+            .expect("session admission gate poisoned");
         let mut turns = self.inner.turns.lock().expect("session turns poisoned");
         if turns.shutting_down {
             return Err(RuntimeError::conflict(
@@ -809,6 +2434,7 @@ impl SessionHandle {
             ticket,
             turn: turn_id.clone(),
             completion: completion.clone(),
+            acceptance: Arc::new(TurnAcceptance::accepted()),
         };
         let task = tokio::spawn(async move {
             let _active = active;
@@ -858,7 +2484,356 @@ impl SessionHandle {
             id: turn_id,
             cancel: turn_cancel,
             completion,
+            acceptance: Arc::new(TurnAcceptance::accepted()),
         })
+    }
+
+    /// Resolves a non-terminal cache checkpoint after restart without replaying
+    /// provider I/O. Result/evidence metadata is restored from the protected
+    /// checkpoint, lifecycle events are republished after ResultReady, and a
+    /// terminal cache checkpoint then permits later direct turns.
+    pub(crate) async fn recover_cache_checkpoint(
+        &self,
+        mut checkpoint: TurnCheckpoint,
+    ) -> Result<(), RuntimeError> {
+        let _cache_gate = self.inner.cache_gate.lock().await;
+        let _turn_gate = self.inner.turn_gate.lock().await;
+        checkpoint.validate()?;
+        let recovering_started =
+            matches!(&checkpoint.state, TurnState::CacheOperationStarted { .. });
+        let (operation, result_checkpoint, replay_prepared, replay_started) =
+            match checkpoint.state.clone() {
+                TurnState::CacheOperationPrepared { mut operation } => {
+                    // Prepared proves provider I/O had not crossed its durable
+                    // start boundary. If the original preflight admitted the
+                    // operation, recovery converts that ambiguous unfinished
+                    // reservation into one exact Conflict rejection. Protect
+                    // the chosen reason on the successor operation metadata so
+                    // ResultReady/Terminal validation and later retries never
+                    // have to recompute it.
+                    let rejection_reason = operation
+                        .preflight_rejection
+                        .unwrap_or(agent_runtime_core::event::CacheOperationReason::Conflict);
+                    operation.preflight_rejection = Some(rejection_reason);
+                    (
+                        operation.clone(),
+                        CacheOperationResultCheckpoint {
+                            outcome: agent_runtime_core::event::CacheOperationOutcome::Rejected,
+                            state: self
+                                .inner
+                                .shared
+                                .cache
+                                .current_state(&self.inner.id, &operation.identity),
+                            evidence: None,
+                            metrics: BTreeMap::new(),
+                            rejection_reason: Some(rejection_reason),
+                            terminal_reason: None,
+                        },
+                        true,
+                        false,
+                    )
+                }
+                TurnState::CacheOperationStarted { operation } => (
+                    operation.clone(),
+                    CacheOperationResultCheckpoint {
+                        outcome: agent_runtime_core::event::CacheOperationOutcome::Failed,
+                        state: self
+                            .inner
+                            .shared
+                            .cache
+                            .current_state(&self.inner.id, &operation.identity),
+                        evidence: None,
+                        metrics: BTreeMap::new(),
+                        rejection_reason: None,
+                        terminal_reason: Some(
+                            agent_runtime_core::event::CacheOperationReason::Conflict,
+                        ),
+                    },
+                    false,
+                    true,
+                ),
+                TurnState::CacheOperationResultReady { operation, result } => {
+                    let usage = self.cache_usage_for_checkpoint(
+                        &checkpoint.snapshot.usage,
+                        &operation,
+                        &result,
+                    )?;
+                    let result_value = self.cache_result_from_checkpoint(&operation, &result);
+                    self.inner
+                        .shared
+                        .cache
+                        .commit_recovered_result_with_checkpoint(
+                            &self.inner.id,
+                            &operation,
+                            &result_value,
+                        )?;
+                    self.replay_cache_checkpoint_events(
+                        &operation,
+                        &result,
+                        false,
+                        false,
+                        usage.as_ref(),
+                    );
+                    let terminal = TurnState::CacheOperationTerminal { operation, result };
+                    self.advance_cache_checkpoint(checkpoint, terminal).await?;
+                    return self.persist().await;
+                }
+                TurnState::CacheOperationTerminal { operation, result } => {
+                    // Terminal's post-event watermark proves its lifecycle
+                    // tail already crossed the protected barrier; restoring
+                    // it is state-only and never republishes events.
+                    let result_value = self.cache_result_from_checkpoint(&operation, &result);
+                    self.inner
+                        .shared
+                        .cache
+                        .commit_recovered_result_with_checkpoint(
+                            &self.inner.id,
+                            &operation,
+                            &result_value,
+                        )?;
+                    return self.persist().await;
+                }
+                _ => {
+                    return Err(RuntimeError::conflict(
+                        "requested cache recovery for a non-cache checkpoint",
+                    ));
+                }
+            };
+        let usage = if recovering_started {
+            let record = self.append_recovered_cache_usage(&operation)?;
+            Some(record)
+        } else {
+            self.cache_usage_for_checkpoint(
+                &checkpoint.snapshot.usage,
+                &operation,
+                &result_checkpoint,
+            )?
+        };
+        let result_state = TurnState::CacheOperationResultReady {
+            operation: operation.clone(),
+            result: result_checkpoint.clone(),
+        };
+        checkpoint = self
+            .advance_cache_checkpoint(checkpoint, result_state)
+            .await?;
+        self.replay_cache_checkpoint_events(
+            &operation,
+            &result_checkpoint,
+            replay_prepared,
+            replay_started,
+            usage.as_ref(),
+        );
+        let terminal = TurnState::CacheOperationTerminal {
+            operation: operation.clone(),
+            result: result_checkpoint.clone(),
+        };
+        let recovered_result = self.cache_result_from_checkpoint(&operation, &result_checkpoint);
+        self.inner
+            .shared
+            .cache
+            .commit_recovered_result_with_checkpoint(
+                &self.inner.id,
+                &operation,
+                &recovered_result,
+            )?;
+        self.advance_cache_checkpoint(checkpoint, terminal).await?;
+        self.persist().await
+    }
+
+    fn cache_result_from_checkpoint(
+        &self,
+        operation: &CacheOperationCheckpoint,
+        result: &CacheOperationResultCheckpoint,
+    ) -> CacheOperationResult {
+        CacheOperationResult {
+            operation: operation.operation.clone(),
+            request: operation.request.clone(),
+            attempt: operation.attempt.clone(),
+            identity: operation.identity.clone(),
+            purpose: operation.purpose,
+            outcome: result.outcome,
+            state: result.state,
+            evidence: result.evidence.clone(),
+            metrics: result.metrics.clone(),
+            rejection_reason: result.rejection_reason,
+            terminal_reason: result.terminal_reason,
+            captured_output: None,
+        }
+    }
+
+    /// Finds the one usage record correlated with an admitted cache
+    /// operation. ResultReady snapshots retain the complete ledger, so the
+    /// record itself need not be duplicated in redaction-safe result
+    /// metadata. Requiring uniqueness prevents replay from selecting an
+    /// unrelated provider attempt after a journal splice.
+    fn cache_usage_for_checkpoint(
+        &self,
+        ledger: &agent_runtime_core::usage::UsageLedger,
+        operation: &CacheOperationCheckpoint,
+        result: &CacheOperationResultCheckpoint,
+    ) -> Result<Option<UsageRecord>, RuntimeError> {
+        let matches = ledger
+            .records()
+            .iter()
+            .filter(|record| {
+                record.source == UsageSource::ProviderAttempt
+                    && record.provenance.request == operation.request
+                    && record.provenance.attempt == operation.attempt
+                    && record.provenance.attempt_purpose == Some(operation.purpose)
+                    && record.provenance.cache_identity.as_ref() == Some(&operation.identity)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if result.outcome == agent_runtime_core::event::CacheOperationOutcome::Rejected {
+            if !matches.is_empty() {
+                return Err(RuntimeError::conflict(
+                    "rejected cache checkpoint unexpectedly carries provider usage",
+                ));
+            }
+            return Ok(None);
+        }
+        match matches.as_slice() {
+            [record] => Ok(Some(record.clone())),
+            [] => Err(RuntimeError::conflict(
+                "admitted cache checkpoint is missing its correlated usage record",
+            )),
+            _ => Err(RuntimeError::conflict(
+                "cache checkpoint has multiple correlated usage records",
+            )),
+        }
+    }
+
+    /// Started recovery crossed the provider barrier but has no provider
+    /// response to account for. Append one sparse failed-attempt record so a
+    /// resumed terminal state remains provenance-complete without inventing
+    /// any billed token count.
+    fn append_recovered_cache_usage(
+        &self,
+        operation: &CacheOperationCheckpoint,
+    ) -> Result<UsageRecord, RuntimeError> {
+        let request = operation.request.clone().ok_or_else(|| {
+            RuntimeError::conflict("started cache checkpoint is missing request attribution")
+        })?;
+        let attempt = operation.attempt.clone().ok_or_else(|| {
+            RuntimeError::conflict("started cache checkpoint is missing attempt attribution")
+        })?;
+        let record = UsageRecord {
+            source: UsageSource::ProviderAttempt,
+            provenance: Provenance {
+                request: Some(request),
+                attempt: Some(attempt),
+                tool_call: None,
+                purpose: None,
+                attempt_purpose: Some(operation.purpose),
+                cache_identity: Some(operation.identity.clone()),
+                failed: true,
+            },
+            delta: UsageDelta::new(),
+        };
+        let mut state = self.inner.state.lock().expect("session state poisoned");
+        if state.usage.records().iter().any(|existing| {
+            existing.source == record.source
+                && existing.provenance.request == record.provenance.request
+                && existing.provenance.attempt == record.provenance.attempt
+        }) {
+            return Err(RuntimeError::conflict(
+                "started cache checkpoint already has an attempted usage record",
+            ));
+        }
+        state.usage.record(record.clone());
+        Ok(record)
+    }
+
+    fn replay_cache_checkpoint_events(
+        &self,
+        operation: &CacheOperationCheckpoint,
+        result: &CacheOperationResultCheckpoint,
+        replay_prepared: bool,
+        replay_started: bool,
+        usage: Option<&UsageRecord>,
+    ) {
+        if replay_prepared {
+            self.inner.emitter.emit_cache(
+                Some(cache_operation_turn(&operation.operation)),
+                RuntimeEvent::CacheOperationPrepared {
+                    operation: operation.operation.clone(),
+                    request: operation.request.clone(),
+                    identity: operation.identity.clone(),
+                    purpose: operation.purpose,
+                },
+            );
+        }
+        if result.outcome == agent_runtime_core::event::CacheOperationOutcome::Rejected {
+            self.inner.emitter.emit_cache(
+                Some(cache_operation_turn(&operation.operation)),
+                RuntimeEvent::CacheOperationRejected {
+                    operation: operation.operation.clone(),
+                    request: operation.request.clone(),
+                    attempt: operation.attempt.clone(),
+                    identity: operation.identity.clone(),
+                    purpose: operation.purpose,
+                    reason: result
+                        .rejection_reason
+                        .unwrap_or(agent_runtime_core::event::CacheOperationReason::Conflict),
+                },
+            );
+        } else {
+            if replay_started {
+                self.inner.emitter.emit_cache(
+                    Some(cache_operation_turn(&operation.operation)),
+                    RuntimeEvent::CacheOperationStarted {
+                        operation: operation.operation.clone(),
+                        request: operation.request.clone(),
+                        attempt: operation.attempt.clone(),
+                        identity: operation.identity.clone(),
+                        purpose: operation.purpose,
+                    },
+                );
+            }
+            if let Some(evidence) = &result.evidence {
+                self.inner.emitter.emit_cache(
+                    Some(cache_operation_turn(&operation.operation)),
+                    RuntimeEvent::CacheAvailabilityEvidenceRecorded {
+                        evidence: evidence.clone(),
+                    },
+                );
+                if evidence.suspends_maintenance() {
+                    self.inner.emitter.emit_cache(
+                        Some(cache_operation_turn(&operation.operation)),
+                        RuntimeEvent::CacheOperationSuspended {
+                            request: operation.request.clone(),
+                            attempt: operation.attempt.clone(),
+                            identity: operation.identity.clone(),
+                            operation: Some(operation.operation.clone()),
+                            reason: result.terminal_reason.unwrap_or(
+                                agent_runtime_core::event::CacheOperationReason::CacheMiss,
+                            ),
+                        },
+                    );
+                }
+            }
+            if let Some(record) = usage {
+                self.inner.emitter.emit_cache(
+                    Some(cache_operation_turn(&operation.operation)),
+                    RuntimeEvent::Usage {
+                        record: record.clone(),
+                    },
+                );
+            }
+        }
+        self.inner.emitter.emit_cache(
+            Some(cache_operation_turn(&operation.operation)),
+            RuntimeEvent::CacheOperationCompleted {
+                operation: operation.operation.clone(),
+                request: operation.request.clone(),
+                attempt: operation.attempt.clone(),
+                identity: operation.identity.clone(),
+                purpose: operation.purpose,
+                outcome: result.outcome,
+                reason: result.terminal_reason,
+                metrics: result.metrics.clone(),
+            },
+        );
     }
 
     /// Interrupts the currently serving turn without cancelling the session.
@@ -914,6 +2889,13 @@ impl SessionHandle {
     /// A snapshot of the session's canonical state.
     pub fn snapshot(&self) -> SessionSnapshot {
         let state = self.inner.state.lock().expect("session state poisoned");
+        let mut extension_state = self.inner.execution.snapshot_extension_state();
+        if let Some(cache) = self.inner.shared.cache.persisted_session(&self.inner.id) {
+            extension_state.insert(
+                crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),
+                cache,
+            );
+        }
         SessionSnapshot {
             id: self.inner.id.clone(),
             history: state.history.clone(),
@@ -923,7 +2905,7 @@ impl SessionHandle {
                 .inner
                 .minter
                 .snapshot(self.inner.emitter.next_sequence()),
-            extension_state: self.inner.execution.snapshot_extension_state(),
+            extension_state,
             updated: self.inner.shared.clock.now(),
         }
     }
@@ -935,10 +2917,70 @@ impl SessionHandle {
     /// is idle). It never changes canonical state and is a no-op for an
     /// explicitly ephemeral session.
     pub async fn persist(&self) -> Result<(), RuntimeError> {
+        let _persist_gate = self.inner.persist_gate.lock().await;
+        self.persist_locked().await
+    }
+
+    /// Persists without taking `persist_gate`. Callers must already own the
+    /// gate. Cache dispatch uses this to keep reservation, result reduction,
+    /// and protected checkpoint publication in one serialized interval.
+    async fn persist_locked(&self) -> Result<(), RuntimeError> {
         match &self.inner.shared.session_store {
             Some(store) => store.save(&self.snapshot()).await,
             None => Ok(()),
         }
+    }
+
+    /// Applies runtime-owned extension updates and persists one snapshot as a
+    /// single transaction against ordinary session persistence. A failed
+    /// store write restores the exact in-memory extension values that were
+    /// present before the transaction, while the persistence gate prevents a
+    /// concurrent ordinary save from observing the uncommitted updates.
+    pub(crate) async fn persist_with_extension_state(
+        &self,
+        updates: impl IntoIterator<Item = (String, VersionedSessionState)>,
+    ) -> Result<(), RuntimeError> {
+        let _persist_gate = self.inner.persist_gate.lock().await;
+        let Some(store) = self.inner.shared.session_store.as_ref() else {
+            return Ok(());
+        };
+        let updates = updates.into_iter().collect::<Vec<_>>();
+        let previous = {
+            let mut extensions = self
+                .inner
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            let previous = updates
+                .iter()
+                .map(|(namespace, _)| (namespace.clone(), extensions.get(namespace).cloned()))
+                .collect::<Vec<_>>();
+            for (namespace, state) in &updates {
+                extensions.insert(namespace.clone(), state.clone());
+            }
+            previous
+        };
+        let result = store.save(&self.snapshot()).await;
+        if result.is_err() {
+            let mut extensions = self
+                .inner
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            for (namespace, state) in previous {
+                match state {
+                    Some(state) => {
+                        extensions.insert(namespace, state);
+                    }
+                    None => {
+                        extensions.remove(&namespace);
+                    }
+                }
+            }
+        }
+        result
     }
 
     pub(crate) fn extension_state(&self, namespace: &str) -> Option<VersionedSessionState> {
@@ -949,19 +2991,6 @@ impl SessionHandle {
             .expect("session extension state poisoned")
             .get(namespace)
             .cloned()
-    }
-
-    pub(crate) fn set_extension_state(
-        &self,
-        namespace: impl Into<String>,
-        state: VersionedSessionState,
-    ) {
-        self.inner
-            .execution
-            .extension_state
-            .lock()
-            .expect("session extension state poisoned")
-            .insert(namespace.into(), state);
     }
 
     /// Typed artifact references produced by one turn.
@@ -991,6 +3020,8 @@ impl SessionHandle {
         let drained = tokio::time::timeout(timeout, async {
             loop {
                 let changed = self.inner.turns_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
                 if self
                     .inner
                     .turns
@@ -998,6 +3029,7 @@ impl SessionHandle {
                     .expect("session turns poisoned")
                     .count
                     == 0
+                    && self.inner.cache_active.load(Ordering::Acquire) == 0
                 {
                     break;
                 }
@@ -1015,9 +3047,28 @@ impl SessionHandle {
                 abort.abort();
             }
             tokio::task::yield_now().await;
+            let cache_drained = tokio::time::timeout(timeout, async {
+                loop {
+                    let changed = self.inner.turns_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if self.inner.cache_active.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .is_ok();
+            if !cache_drained {
+                return Err(RuntimeError::internal(
+                    "cache operation did not drain before session shutdown timeout",
+                ));
+            }
         }
 
         self.inner.emitter.emit(None, RuntimeEvent::SessionShutdown);
+        let _persist_gate = self.inner.persist_gate.lock().await;
         let save_result = match &self.inner.shared.session_store {
             Some(store) => store.save(&self.snapshot()).await,
             None => Ok(()),
@@ -1039,6 +3090,10 @@ fn checkpoint_is_steerable(checkpoint: &TurnCheckpoint) -> bool {
             | TurnState::Completing { .. }
             | TurnState::PublishingTerminal { .. }
             | TurnState::Terminal { .. }
+            | TurnState::CacheOperationPrepared { .. }
+            | TurnState::CacheOperationStarted { .. }
+            | TurnState::CacheOperationResultReady { .. }
+            | TurnState::CacheOperationTerminal { .. }
     )
 }
 
@@ -1087,10 +3142,14 @@ struct ActiveTurnGuard {
     ticket: u64,
     turn: TurnId,
     completion: Arc<TurnCompletion>,
+    acceptance: Arc<TurnAcceptance>,
 }
 
 impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
+        self.acceptance.resolve(Err(RuntimeError::cancelled(
+            "turn ended before its acceptance checkpoint committed",
+        )));
         let mut turns = self.inner.turns.lock().expect("session turns poisoned");
         turns.count = turns.count.saturating_sub(1);
         turns.cancellations.remove(&self.turn);

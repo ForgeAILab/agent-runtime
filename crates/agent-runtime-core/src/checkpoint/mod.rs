@@ -7,7 +7,7 @@
 //! this contract under their protected-state policy rather than in an audit
 //! journal.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use async_trait::async_trait;
@@ -18,30 +18,56 @@ use agent_runtime_registry::{Fingerprint, FingerprintHasher};
 use crate::clock::{Deadline, Timestamp};
 use crate::content::{ContentPart, InternalTurnInput, ToolCall, ToolResultBlock, UserInput};
 use crate::error::RuntimeError;
-use crate::event::TurnFinish;
-use crate::ids::{AttemptId, RequestId, SessionId, ToolCallId, TurnId};
+use crate::event::{CacheOperationOutcome, CacheOperationReason, CacheState, TurnFinish};
+use crate::ids::{AttemptId, CacheOperationId, RequestId, SessionId, ToolCallId, TurnId};
 use crate::interaction::{InteractionRequest, InteractionResponse};
-use crate::provider::{FinishReason, ProviderErrorKind, ProviderRequest};
+use crate::provider::{
+    CacheAvailabilityEvidence, CacheIdentity, FinishReason, ProviderAttemptPurpose,
+    ProviderErrorKind, ProviderRequest,
+};
 use crate::store::SessionSnapshot;
 use crate::tool::{PreparedToolCall, ToolOutcome};
 
 /// The protected-checkpoint wire schema.
 ///
-/// Version 2 adds exact attributed internal-turn input and terminal provider
-/// error classification to the same unreleased protected contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+/// Version 3 adds protected provider-cache operation phases and bounded
+/// result metadata to the same unreleased protected contract.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 /// The direct turn-machine transition-table revision.
 ///
 /// A runtime MUST reject a checkpoint with a transition revision it cannot
 /// execute equivalently. Silent best-effort recovery could repeat a provider
-/// call or tool side effect. Revision 1 is the initial transition table from
-/// the same unreleased change and includes interaction barriers.
-pub const TURN_TRANSITION_REVISION: u32 = 3;
+/// call or tool side effect. Revision 4 adds cache operation admission,
+/// result-ready, and terminal transitions.
+pub const TURN_TRANSITION_REVISION: u32 = 4;
+
+const MAX_CACHE_CHECKPOINT_OPERATION_BYTES: usize = 256;
+const MAX_CACHE_CHECKPOINT_METRICS: usize = 64;
+const MAX_CACHE_CHECKPOINT_METRIC_KEY_BYTES: usize = 128;
+
+/// Validates the bounded, redaction-safe identifier used by cache
+/// idempotency and protected lifecycle checkpoints. The same validator is
+/// used at request construction, preflight, restore, and checkpoint save so a
+/// malformed operation cannot be emitted or persisted by a no-store path.
+pub fn validate_cache_operation_id(operation: &CacheOperationId) -> Result<(), RuntimeError> {
+    let value = operation.as_str();
+    if value.is_empty()
+        || value.len() > MAX_CACHE_CHECKPOINT_OPERATION_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(RuntimeError::conflict(
+            "cache operation identity is empty, too long, or malformed",
+        ));
+    }
+    Ok(())
+}
 
 /// Event/checkpoint progress connecting protected state to the redacted
 /// observability stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointWatermark {
     /// Monotonic checkpoint sequence within one session, starting at one.
     pub checkpoint_sequence: u64,
@@ -53,6 +79,12 @@ pub struct CheckpointWatermark {
     /// to precede this protected state; events at/after it are a crash-window
     /// tail that recovery deterministically republishes or discards.
     pub event_sequence: u64,
+    /// Optional event-journal scope. Cache-operation checkpoints set this to
+    /// their synthetic turn so recovery truncates only that operation's
+    /// crash-window tail; ordinary turn checkpoints leave it absent for the
+    /// legacy session-wide sequence boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_turn: Option<TurnId>,
 }
 
 impl CheckpointWatermark {
@@ -61,7 +93,15 @@ impl CheckpointWatermark {
         Self {
             checkpoint_sequence,
             event_sequence,
+            journal_turn: None,
         }
+    }
+
+    /// Attaches the synthetic turn whose events are reconciled at this
+    /// watermark.
+    pub fn scoped_to(mut self, turn: TurnId) -> Self {
+        self.journal_turn = Some(turn);
+        self
     }
 
     /// Advances to the next checkpoint at the supplied event boundary.
@@ -69,8 +109,21 @@ impl CheckpointWatermark {
         Self {
             checkpoint_sequence: self.checkpoint_sequence.saturating_add(1),
             event_sequence,
+            journal_turn: self.journal_turn,
         }
     }
+}
+
+/// A bounded event-journal reconciliation boundary. `turn == None` retains
+/// the historical session-wide truncation behavior used by ordinary turns;
+/// cache checkpoints provide their synthetic turn to avoid deleting unrelated
+/// session or child events emitted while an async protected save was pending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalTruncationScope {
+    /// The first sequence in the checkpoint's crash-window tail.
+    pub event_sequence: u64,
+    /// Optional synthetic turn to which truncation is limited.
+    pub turn: Option<TurnId>,
 }
 
 /// A fully assembled, successful provider-attempt response.
@@ -124,6 +177,131 @@ impl ToolSlotCheckpoint {
             Self::Prepared(prepared) => prepared.tool(),
             Self::CanonicalResult(result) => &result.name,
         }
+    }
+}
+
+/// Redaction-safe identity and attribution for one provider-cache operation.
+///
+/// This is intentionally independent of the Runtime cache facade's request
+/// object: a checkpoint must never retain authority, a handoff suffix, a
+/// provider request body, or a resource handle. The operation fingerprint is
+/// the one-way binding used to reject a conflicting reuse of the operation id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheOperationCheckpoint {
+    /// Stable host-supplied operation identity.
+    pub operation: CacheOperationId,
+    /// Logical provider request identity, once allocated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RequestId>,
+    /// Provider attempt identity, once the operation crossed the start
+    /// barrier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<AttemptId>,
+    /// Exact opaque cache identity.
+    pub identity: CacheIdentity,
+    /// Typed maintenance/resource lane.
+    pub purpose: ProviderAttemptPurpose,
+    /// One-way fingerprint of the full normalized operation request and
+    /// authority. The request body itself is never checkpointed.
+    pub fingerprint: String,
+    /// Exact pre-provider rejection recorded while the operation was
+    /// prepared.  Keeping this on the reservation (rather than deriving a
+    /// fresh result during recovery) makes a crash before ResultReady
+    /// deterministic: the same operation id and fingerprint return the same
+    /// rejection, while a changed request remains a conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_rejection: Option<CacheOperationReason>,
+    /// Comparable preserved-prefix expectation, when the plan supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_read_tokens: Option<u64>,
+}
+
+impl CacheOperationCheckpoint {
+    /// Validates the redaction-safe operation envelope.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        self.identity.validate().map_err(RuntimeError::conflict)?;
+        validate_cache_operation_id(&self.operation)?;
+        if self.fingerprint.len() != 64
+            || !self
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(RuntimeError::conflict(
+                "cache checkpoint operation fingerprint is invalid",
+            ));
+        }
+        if self.purpose == ProviderAttemptPurpose::Ordinary {
+            return Err(RuntimeError::conflict(
+                "ordinary provider attempts cannot use cache checkpoints",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact bounded, redaction-safe result metadata for a cache operation.
+///
+/// Handoff output is deliberately absent. A resumed handoff can recover its
+/// terminal status and evidence but never replay or expose the live-only
+/// captured summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheOperationResultCheckpoint {
+    /// Terminal lifecycle outcome.
+    pub outcome: CacheOperationOutcome,
+    /// Identity-scoped reduced state after the operation.
+    pub state: CacheState,
+    /// Normalized provider evidence, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<CacheAvailabilityEvidence>,
+    /// Bounded numeric metrics.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metrics: BTreeMap<String, u64>,
+    /// Pre-I/O rejection reason, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<CacheOperationReason>,
+    /// Post-admission terminal reason, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<CacheOperationReason>,
+}
+
+impl CacheOperationResultCheckpoint {
+    /// Validates outcome/reason consistency without inspecting provider data.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.metrics.len() > MAX_CACHE_CHECKPOINT_METRICS
+            || self.metrics.iter().any(|(key, _value)| {
+                key.is_empty()
+                    || key.len() > MAX_CACHE_CHECKPOINT_METRIC_KEY_BYTES
+                    || !key.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+        {
+            return Err(RuntimeError::conflict(
+                "cache checkpoint metrics exceed bounded limits",
+            ));
+        }
+        if self.outcome == CacheOperationOutcome::Rejected {
+            if self.rejection_reason.is_none() || self.terminal_reason.is_some() {
+                return Err(RuntimeError::conflict(
+                    "rejected cache checkpoint has invalid terminal reasons",
+                ));
+            }
+        } else if self.rejection_reason.is_some() {
+            return Err(RuntimeError::conflict(
+                "admitted cache checkpoint cannot carry a rejection reason",
+            ));
+        }
+        if self
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.validate().is_err())
+        {
+            return Err(RuntimeError::conflict(
+                "cache checkpoint evidence is invalid",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -312,6 +490,38 @@ pub enum TurnState {
         finish: TurnFinish,
         /// Whether a committed provider attempt produced visible text.
         visible_output: bool,
+    },
+    /// A cache operation was reserved and prepared, but has not crossed the
+    /// provider-start barrier. The checkpoint is protected before the
+    /// corresponding prepared lifecycle event is published.
+    CacheOperationPrepared {
+        /// Redaction-safe operation envelope.
+        operation: CacheOperationCheckpoint,
+    },
+    /// A cache operation crossed its provider-start barrier. Recovery never
+    /// replays provider I/O from this state.
+    CacheOperationStarted {
+        /// Redaction-safe operation envelope with request/attempt attribution.
+        operation: CacheOperationCheckpoint,
+    },
+    /// Cache result/evidence/state is protected and ready for lifecycle event
+    /// publication. The journal watermark intentionally points before the
+    /// deferred result events so recovery can truncate and republish them
+    /// deterministically.
+    CacheOperationResultReady {
+        /// Redaction-safe operation envelope.
+        operation: CacheOperationCheckpoint,
+        /// Exact bounded result metadata (never handoff output).
+        result: CacheOperationResultCheckpoint,
+    },
+    /// Cache lifecycle events were published after ResultReady and the
+    /// terminal checkpoint crossed the protected barrier. Later turns may be
+    /// accepted over this checkpoint.
+    CacheOperationTerminal {
+        /// Redaction-safe operation envelope.
+        operation: CacheOperationCheckpoint,
+        /// Exact bounded result metadata (never handoff output).
+        result: CacheOperationResultCheckpoint,
     },
 }
 

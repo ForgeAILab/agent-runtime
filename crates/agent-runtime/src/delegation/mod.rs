@@ -27,8 +27,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -37,11 +38,18 @@ use tokio::sync::{Notify, watch};
 use agent_runtime_core::approval::{
     ApprovalDecision, ApprovalOrigin, ApprovalPolicy, ApprovalRequest,
 };
-use agent_runtime_core::artifact::{ArtifactRef, ArtifactStore, ArtifactTransfer};
+use agent_runtime_core::artifact::{
+    ArtifactLineage, ArtifactProvenance, ArtifactRef, ArtifactStore, ArtifactTransfer,
+};
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
-use agent_runtime_core::checkpoint::{CheckpointStore, CheckpointWatermark, TurnState};
+use agent_runtime_core::checkpoint::{
+    CheckpointStore, CheckpointWatermark, TurnCheckpoint, TurnState,
+};
 use agent_runtime_core::clock::{Deadline, Timestamp};
-use agent_runtime_core::content::{Message, UserInput};
+use agent_runtime_core::content::{
+    InternalTurnInput, InternalTurnSensitivity, InternalTurnSource, MAX_INTERNAL_TURN_CHARS,
+    Message, UserInput,
+};
 use agent_runtime_core::delegation::{ChildSpec, ToolViewScope, WorkspacePolicy};
 use agent_runtime_core::error::{ErrorKind, RuntimeError};
 use agent_runtime_core::event::{ChildPhase, ChildRecoveryState, RuntimeEvent, TurnFinish};
@@ -61,8 +69,8 @@ use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::command::CheckpointRecoveryPolicy;
 use crate::runtime::emitter::RuntimeEventStream;
 use crate::runtime::engine::Runtime;
-use crate::runtime::session::{SessionHandle, TurnHandle};
-use crate::runtime::state::returned_interaction_from_state;
+use crate::runtime::session::{InternalTurnAdmission, SessionHandle, TurnHandle};
+use crate::runtime::state::{artifact_references_for_turn, returned_interaction_from_state};
 use crate::tool::SecurityConfig;
 
 /// The host-defined permission delegation operations request from the
@@ -74,6 +82,20 @@ pub const DELEGATION_PERMISSION: &str = "agent.delegate";
 pub const CHILD_CATALOG_NAMESPACE: &str = "agent-runtime.delegation.children";
 const CHILD_CATALOG_REVISION: &str = "resumable-child-catalog-1";
 const CHILD_CATALOG_SCHEMA_VERSION: u32 = 1;
+
+/// Parent-owned protected automatic child-outcome cursor state.
+pub const CHILD_OUTCOME_CURSOR_NAMESPACE: &str = "agent-runtime.delegation.child-outcomes";
+// Version two binds completed outcome values to their originating turn. Old
+// protected ledgers do not carry enough identity to validate a key/value pair,
+// so they fail closed at restore instead of being silently upgraded.
+const CHILD_OUTCOME_CURSOR_REVISION: &str = "child-outcome-cursor-2";
+const CHILD_OUTCOME_CURSOR_SCHEMA_VERSION: u32 = 2;
+
+/// Default maximum time a host waits for a child before receiving a running
+/// projection.  The timeout never cancels the child.
+pub const DEFAULT_DELEGATION_WAIT: Duration = Duration::from_secs(5);
+/// Absolute runtime hard cap for one delegation wait.
+pub const HARD_MAX_DELEGATION_WAIT: Duration = Duration::from_secs(30);
 
 /// Builds the runtime a child session runs on.
 ///
@@ -89,11 +111,13 @@ mod types;
 use monitor::*;
 use persistence::*;
 pub use types::{
-    CapacityPolicy, ChildDurability, ChildNeedsInputProjection, ChildRuntimeFactory,
-    ChildSessionRecord, ChildState, ChildStatus, ChildTaskOutcome, ChildTaskResult,
-    DelegationCapacity, DelegationConfig, DelegationCoordinator, DelegationLimits,
-    DurableChildCatalog, DurableChildSpec, SpawnOutcome,
+    CapacityPolicy, ChildCompletionAdmission, ChildCompletionAdmissionRequest, ChildDurability,
+    ChildNeedsInputProjection, ChildOutcomeCursor, ChildOutcomeIdentity, ChildOutcomeKey,
+    ChildRuntimeFactory, ChildSessionRecord, ChildState, ChildStatus, ChildTaskOutcome,
+    ChildTaskResult, DelegationCapacity, DelegationConfig, DelegationCoordinator, DelegationLimits,
+    DelegationWaitOptions, DurableChildCatalog, DurableChildSpec, SpawnOutcome,
 };
 use types::{
-    ChildBinding, ChildEntry, CoordinatorInner, QueuedSpawn, TaskOutcomeKey, checkpoint_can_resume,
+    ChildBinding, ChildEntry, CoordinatorInner, ProtectedChildOutcomeState, QueuedSpawn,
+    TaskOutcomeKey, checkpoint_can_resume,
 };

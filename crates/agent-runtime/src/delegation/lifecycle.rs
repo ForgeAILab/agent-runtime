@@ -1,5 +1,70 @@
 use super::*;
 
+/// One in-flight parent running-child admission.  The reservation is held
+/// across provider/runtime construction and the durable binding save; any
+/// early return (including a capacity Limit, policy/checkpoint failure, or
+/// store failure) releases it without touching the dormant child record.
+struct ParentCapacityReservation {
+    coordinator: Arc<CoordinatorInner>,
+    armed: bool,
+}
+
+impl ParentCapacityReservation {
+    fn try_acquire(coordinator: Arc<CoordinatorInner>) -> Result<Self, RuntimeError> {
+        let mut reservations = coordinator
+            .spawn_reservations
+            .lock()
+            .expect("delegation spawn reservations poisoned");
+        let alive = coordinator
+            .children
+            .lock()
+            .expect("delegation children poisoned")
+            .values()
+            .filter(|entry| {
+                !entry.status.borrow().state.is_terminal()
+                    && matches!(entry.binding, ChildBinding::Live { .. })
+            })
+            .count();
+        if alive.saturating_add(*reservations) >= coordinator.config.limits.max_running_children {
+            return Err(RuntimeError::new(
+                ErrorKind::Limit,
+                "per-parent delegation capacity is exhausted",
+            ));
+        }
+        *reservations = (*reservations).saturating_add(1);
+        drop(reservations);
+        Ok(Self {
+            coordinator,
+            armed: true,
+        })
+    }
+
+    fn release(mut self) {
+        if self.armed {
+            let mut reservations = self
+                .coordinator
+                .spawn_reservations
+                .lock()
+                .expect("delegation spawn reservations poisoned");
+            *reservations = (*reservations).saturating_sub(1);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ParentCapacityReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut reservations = self
+                .coordinator
+                .spawn_reservations
+                .lock()
+                .expect("delegation spawn reservations poisoned");
+            *reservations = (*reservations).saturating_sub(1);
+        }
+    }
+}
+
 impl DelegationCoordinator {
     /// Sends a follow-up task to an existing child under its original
     /// specification and limits.
@@ -13,6 +78,7 @@ impl DelegationCoordinator {
             }),
         )
         .await?;
+        self.arm_outcome_persistence_retry();
         // Refuse incompatible lifecycle states before lazily constructing a
         // provider/runtime. In particular, an interrupted child is never
         // rebound as an idle session merely because the caller used the
@@ -51,7 +117,12 @@ impl DelegationCoordinator {
             }
         }
         let handle = self.bind_child(child, false).await?.0;
-        let (handle, status_tx, previous_status) = {
+        let (handle, status_tx, previous_status, cleared, cleared_ready) = {
+            let _admission = self
+                .inner
+                .outcome_admission_gate
+                .lock()
+                .expect("child outcome admission gate poisoned");
             let children = self
                 .inner
                 .children
@@ -90,20 +161,60 @@ impl DelegationCoordinator {
                 status.state = ChildState::Running;
                 status.updated_at = self.inner.parent.inner().shared.clock.now();
             });
-            (handle, entry.status.clone(), previous)
+            let status_tx = entry.status.clone();
+            let cleared = clear_returned_inputs_for_child_locked(&self.inner, child, &handle);
+            let cleared_ready = clear_ready_task_outcomes_for_child_locked(&self.inner, child);
+            (handle, status_tx, previous, cleared, cleared_ready)
         };
         if let Err(error) = self.persist_catalog().await {
-            status_tx.send_replace(previous_status);
+            let rolled_back = rollback_follow_up_state(
+                &self.inner,
+                child,
+                &handle,
+                &status_tx,
+                &previous_status,
+                cleared,
+                cleared_ready,
+            )?;
+            if rolled_back {
+                let _ = self.persist_catalog().await;
+            }
             return Err(error);
         }
-        let cleared = clear_returned_inputs_for_child(&self.inner, child, &handle);
-        let turn = match handle.send(input) {
-            Ok(turn) => turn,
-            Err(error) => {
-                restore_returned_inputs_for_child(&self.inner, child, &handle, cleared)?;
-                status_tx.send_replace(previous_status);
-                let _ = self.persist_catalog().await;
-                return Err(error);
+        let turn = {
+            let _admission = self
+                .inner
+                .outcome_admission_gate
+                .lock()
+                .expect("child outcome admission gate poisoned");
+            let running = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned")
+                .get(child)
+                .is_some_and(|entry| entry.status.borrow().state == ChildState::Running);
+            if !running {
+                return Err(RuntimeError::conflict(
+                    "child stopped before its follow-up was sent",
+                ));
+            }
+            match handle.send(input) {
+                Ok(turn) => turn,
+                Err(error) => {
+                    restore_follow_up_state_locked(
+                        &self.inner,
+                        child,
+                        &handle,
+                        &status_tx,
+                        &previous_status,
+                        cleared,
+                        cleared_ready,
+                    )?;
+                    drop(_admission);
+                    let _ = self.persist_catalog().await;
+                    return Err(error);
+                }
             }
         };
         self.inner.parent.inner().emitter.emit(
@@ -127,6 +238,7 @@ impl DelegationCoordinator {
             serde_json::json!({ "child_id": child.as_str() }),
         )
         .await?;
+        self.arm_outcome_persistence_retry();
         {
             let children = self
                 .inner
@@ -160,12 +272,34 @@ impl DelegationCoordinator {
             },
         );
         self.spawn_returned_input_collector(child.clone(), handle, turn);
-        self.persist_catalog().await
+        // `bind_child` persisted the live binding before scheduling the exact
+        // checkpoint turn. The collector/monitor owns later status writes;
+        // another save here would create a post-scheduling failure point
+        // that cannot safely roll the already-running turn back.
+        Ok(())
     }
 
     /// Waits until `child` is not running (idle after completing a task, or
-    /// terminal) and returns its snapshot.
+    /// terminal) and returns its snapshot. The default wait is bounded at five
+    /// seconds; a timeout returns the current running projection and never
+    /// cancels the child.
     pub async fn wait(&self, child: &ChildId) -> Result<ChildStatus, RuntimeError> {
+        self.wait_with_options(child, DelegationWaitOptions::default())
+            .await
+    }
+
+    /// Waits with a validated per-call timeout. Timeout decisions use the
+    /// injected runtime clock; the short Tokio timer only wakes the poller so
+    /// a manual clock can advance deterministically without wall-clock
+    /// semantics deciding the result.
+    pub async fn wait_with_options(
+        &self,
+        child: &ChildId,
+        options: DelegationWaitOptions,
+    ) -> Result<ChildStatus, RuntimeError> {
+        let timeout = self.inner.config.validate_wait_options(options)?;
+        let clock = self.inner.parent.inner().shared.clock.clone();
+        let deadline = Deadline::after(clock.as_ref(), timeout.as_millis() as u64);
         let mut rx = {
             let children = self
                 .inner
@@ -177,13 +311,44 @@ impl DelegationCoordinator {
         };
         loop {
             let status = rx.borrow().clone();
+            if self.inner.parent.inner().cancel.is_cancelled() {
+                return Err(RuntimeError::cancelled(
+                    "delegation wait cancelled by the parent session",
+                ));
+            }
             if status.state != ChildState::Running {
                 return Ok(status);
             }
-            if rx.changed().await.is_err() {
-                return Ok(rx.borrow().clone());
+            if deadline.is_expired(clock.as_ref()) {
+                return Ok(status);
+            }
+            let changed = rx.changed();
+            let tick = tokio::time::sleep(Duration::from_millis(5));
+            tokio::pin!(tick);
+            tokio::select! {
+                changed = changed => {
+                    if changed.is_err() {
+                        return Ok(rx.borrow().clone());
+                    }
+                }
+                _ = self.inner.parent.inner().cancel.cancelled() => {
+                    return Err(RuntimeError::cancelled(
+                        "delegation wait cancelled by the parent session",
+                    ));
+                }
+                _ = &mut tick => {}
             }
         }
+    }
+
+    /// Compatibility spelling for hosts that prefer an explicit timeout API.
+    pub async fn wait_with_timeout(
+        &self,
+        child: &ChildId,
+        timeout: Duration,
+    ) -> Result<ChildStatus, RuntimeError> {
+        self.wait_with_options(child, DelegationWaitOptions::with_timeout(timeout))
+            .await
     }
 
     /// Stops a child: cancellation reaches its tools and provider stream, and
@@ -195,6 +360,7 @@ impl DelegationCoordinator {
             serde_json::json!({ "child_id": child.as_str() }),
         )
         .await?;
+        self.arm_outcome_persistence_retry();
         let handle = {
             let children = self
                 .inner
@@ -219,6 +385,7 @@ impl DelegationCoordinator {
             let _ = handle.shutdown().await;
             clear_returned_inputs_for_child(&self.inner, child, &handle);
         }
+        clear_ready_task_outcomes_for_child(&self.inner, child);
         self.persist_catalog().await?;
 
         // Wait for the *terminal* snapshot, not merely non-running: an idle
@@ -290,7 +457,16 @@ impl DelegationCoordinator {
             return Ok((handle, None));
         }
 
-        let (spec, session, expected_policy, expected_watermark, deadline_at) = {
+        let (
+            spec,
+            session,
+            expected_policy,
+            expected_watermark,
+            deadline_at,
+            previous_status,
+            previous_checkpoint_resumable,
+            previous_revision,
+        ) = {
             let children = self
                 .inner
                 .children
@@ -312,10 +488,22 @@ impl DelegationCoordinator {
                 entry.spec.clone(),
                 status.session.clone(),
                 entry.policy_fingerprint.clone(),
-                entry.checkpoint_watermark,
+                entry.checkpoint_watermark.clone(),
                 entry.deadline_at,
+                status.clone(),
+                entry.checkpoint_resumable,
+                entry.revision,
             )
         };
+
+        // Rebinding dormant durable metadata is a new live-child admission,
+        // even though it reuses the existing child identity. Reserve the
+        // parent slot while the provider/runtime is built so concurrent
+        // resume/follow-up calls (and concurrent spawns using the same
+        // reservation counter) cannot oversubscribe max_running_children.
+        // This runs before any status or watermark mutation; a Limit result
+        // leaves the dormant record exactly as it was observed.
+        let mut parent_capacity = Some(ParentCapacityReservation::try_acquire(self.inner.clone())?);
 
         if deadline_at
             .is_some_and(|deadline| self.inner.parent.inner().shared.clock.now() >= deadline)
@@ -358,7 +546,7 @@ impl DelegationCoordinator {
             let checkpoint = store.load_latest(&session).await?.ok_or_else(|| {
                 RuntimeError::conflict(format!("child `{child}` has no exact checkpoint to resume"))
             })?;
-            if matches!(checkpoint.state, TurnState::Terminal { .. }) {
+            if checkpoint.state.is_terminal() {
                 return Err(RuntimeError::conflict(format!(
                     "child `{child}` checkpoint is terminal and cannot be resumed"
                 )));
@@ -392,6 +580,12 @@ impl DelegationCoordinator {
         let uses_shared_capacity = match &self.inner.config.shared_capacity {
             Some(pool) => {
                 if !pool.try_acquire() {
+                    // `spawn` and queued admission reserve the retained child
+                    // identity before attempting process/shared capacity. A
+                    // shared-pool Limit is a pre-bind failure, so return that
+                    // retained reservation immediately; otherwise a transient
+                    // pool exhaustion permanently consumes one retained slot.
+                    release_retained_reservation(&self.inner);
                     return Err(RuntimeError::new(
                         ErrorKind::Limit,
                         "shared delegation capacity is exhausted",
@@ -430,7 +624,7 @@ impl DelegationCoordinator {
             entry.uses_shared_capacity = uses_shared_capacity;
             entry.revision = entry.revision.saturating_add(1);
             if let Some(checkpoint) = &checkpoint {
-                entry.checkpoint_watermark = Some(checkpoint.watermark);
+                entry.checkpoint_watermark = Some(checkpoint.watermark.clone());
                 entry.checkpoint_resumable = checkpoint_can_resume(&checkpoint.state);
                 entry.status.send_modify(|status| {
                     status.state = ChildState::Running;
@@ -438,6 +632,69 @@ impl DelegationCoordinator {
                 });
             }
         }
+        // Persist the binding before starting a resumed turn.  If this parent
+        // catalog write fails, the child runtime must be cancelled and the
+        // entry returned to its exact dormant state; otherwise capacity and a
+        // live binding leak into a retry that cannot see the failed write.
+        if let Err(error) = self.persist_catalog().await {
+            if let Err(rollback_error) = self
+                .rollback_bound_child(
+                    child,
+                    &handle,
+                    &previous_status,
+                    expected_watermark.clone(),
+                    previous_checkpoint_resumable,
+                    previous_revision,
+                )
+                .await
+            {
+                return Err(RuntimeError::new(
+                    error.kind,
+                    format!(
+                        "{}; durable child binding rollback failed: {}",
+                        error.message, rollback_error.message
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+
+        // The binding is durable and now counts as a live child itself. Drop
+        // the in-flight reservation before starting the exact turn so a
+        // concurrent admission observes the binding rather than double
+        // counting this slot.
+        if let Some(reservation) = parent_capacity.take() {
+            reservation.release();
+        }
+
+        let turn = match checkpoint {
+            Some(checkpoint) => match handle.spawn_checkpoint_resume(checkpoint) {
+                Ok(turn) => Some(turn),
+                Err(error) => {
+                    if let Err(rollback_error) = self
+                        .rollback_bound_child(
+                            child,
+                            &handle,
+                            &previous_status,
+                            expected_watermark.clone(),
+                            previous_checkpoint_resumable,
+                            previous_revision,
+                        )
+                        .await
+                    {
+                        return Err(RuntimeError::new(
+                            error.kind,
+                            format!(
+                                "{}; durable child binding rollback failed: {}",
+                                error.message, rollback_error.message
+                            ),
+                        ));
+                    }
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         self.spawn_monitor(
             child.clone(),
             handle.clone(),
@@ -448,12 +705,53 @@ impl DelegationCoordinator {
         if let Some(deadline_at) = deadline_at {
             self.spawn_deadline_watchdog(handle.clone(), deadline_at);
         }
-        let turn = match checkpoint {
-            Some(checkpoint) => Some(handle.spawn_checkpoint_resume(checkpoint)?),
-            None => None,
-        };
-        self.persist_catalog().await?;
         Ok((handle, turn))
+    }
+
+    /// Rolls a durable rebind back to the pre-bind dormant record.  The
+    /// process-owned child runtime is permanently cancelled first, then its
+    /// binding/capacity flags are restored under the coordinator lock so the
+    /// monitor cannot release the same slot twice.
+    async fn rollback_bound_child(
+        &self,
+        child: &ChildId,
+        handle: &SessionHandle,
+        previous_status: &ChildStatus,
+        previous_watermark: Option<CheckpointWatermark>,
+        previous_checkpoint_resumable: bool,
+        previous_revision: u64,
+    ) -> Result<(), RuntimeError> {
+        handle.cancel_session(CancelReason::Shutdown);
+        let _ = handle.shutdown().await;
+        let uses_shared_capacity = {
+            let mut children = self
+                .inner
+                .children
+                .lock()
+                .expect("delegation children poisoned");
+            let Some(entry) = children.get_mut(child) else {
+                return Ok(());
+            };
+            let uses = entry.uses_shared_capacity;
+            entry.binding = ChildBinding::Dormant;
+            entry.uses_shared_capacity = false;
+            entry.checkpoint_watermark = previous_watermark;
+            entry.checkpoint_resumable = previous_checkpoint_resumable;
+            entry.revision = previous_revision;
+            entry.status.send_replace(previous_status.clone());
+            uses
+        };
+        if uses_shared_capacity {
+            if let Some(pool) = &self.inner.config.shared_capacity {
+                pool.release();
+            }
+        }
+        // A binding save may already have succeeded before scheduling the
+        // exact resume turn failed. Persist the dormant rollback as well as
+        // restoring memory; otherwise a retry in the same process would see
+        // dormant state while a restarted parent would incorrectly recover a
+        // live Running binding.
+        self.persist_catalog().await
     }
 
     pub(super) fn check_depth(&self) -> Result<(), RuntimeError> {
@@ -469,7 +767,13 @@ impl DelegationCoordinator {
             .lock()
             .expect("delegation children poisoned")
             .values()
-            .filter(|entry| !entry.status.borrow().state.is_terminal())
+            // Dormant durable children are retained metadata, not live work.
+            // They must not consume a running slot until an explicit resume
+            // rebinds a provider runtime.
+            .filter(|entry| {
+                !entry.status.borrow().state.is_terminal()
+                    && matches!(entry.binding, ChildBinding::Live { .. })
+            })
             .count()
     }
 
@@ -587,23 +891,24 @@ impl DelegationCoordinator {
         &self,
         child: ChildId,
         spec: ChildSpec,
+        retained_reserved: bool,
+        retry_shared_limit: bool,
     ) -> Result<SessionHandle, RuntimeError> {
-        if self
-            .inner
-            .children
-            .lock()
-            .expect("delegation children poisoned")
-            .len()
-            >= self.inner.config.limits.max_retained_children
-        {
-            return Err(RuntimeError::new(
-                ErrorKind::Limit,
-                "retained child limit is exhausted",
-            ));
-        }
+        debug_assert!(
+            retained_reserved,
+            "start_child must hold a retained-record reservation"
+        );
         let uses_shared_capacity = match &self.inner.config.shared_capacity {
             Some(pool) => {
                 if !pool.try_acquire() {
+                    // `spawn` and queued admission reserve the retained child
+                    // identity before attempting process/shared capacity. A
+                    // shared-pool Limit is a pre-bind failure, so return that
+                    // retained reservation immediately; otherwise a transient
+                    // pool exhaustion permanently consumes one retained slot.
+                    if !retry_shared_limit {
+                        release_retained_reservation(&self.inner);
+                    }
                     return Err(RuntimeError::new(
                         ErrorKind::Limit,
                         "shared delegation capacity is exhausted",
@@ -618,7 +923,18 @@ impl DelegationCoordinator {
         let durability = self.inner.factory.durability();
         let requested_session = (durability == ChildDurability::Durable)
             .then(|| SessionId::new(format!("child-session-{}", uuid::Uuid::new_v4())));
-        let policy_fingerprint = self.inner.factory.policy_fingerprint(&durable_spec)?;
+        let policy_fingerprint = match self.inner.factory.policy_fingerprint(&durable_spec) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                if let (true, Some(pool)) =
+                    (uses_shared_capacity, &self.inner.config.shared_capacity)
+                {
+                    pool.release();
+                }
+                release_retained_reservation(&self.inner);
+                return Err(error);
+            }
+        };
         let started = self
             .build_and_start(&child, &durable_spec, requested_session.as_ref())
             .await;
@@ -630,6 +946,7 @@ impl DelegationCoordinator {
                         pool.release();
                     }
                 }
+                release_retained_reservation(&self.inner);
                 return Err(err);
             }
         };
@@ -657,16 +974,6 @@ impl DelegationCoordinator {
 
         // Subscribe before sending the task so no lifecycle event is missed.
         let events = handle.subscribe();
-        self.spawn_monitor(
-            child.clone(),
-            handle.clone(),
-            events,
-            &durable_spec,
-            durability,
-        );
-        if let Some(deadline_at) = deadline_at {
-            self.spawn_deadline_watchdog(handle.clone(), deadline_at);
-        }
 
         self.inner
             .children
@@ -680,7 +987,7 @@ impl DelegationCoordinator {
                         _runtime: runtime,
                     },
                     status: status_tx,
-                    spec: durable_spec,
+                    spec: durable_spec.clone(),
                     policy_fingerprint,
                     checkpoint_watermark: None,
                     checkpoint_resumable: false,
@@ -707,8 +1014,24 @@ impl DelegationCoordinator {
             if let (true, Some(pool)) = (uses_shared_capacity, &self.inner.config.shared_capacity) {
                 pool.release();
             }
+            release_retained_reservation(&self.inner);
             return Err(error);
         }
+
+        // Do not let a monitor observe a partially admitted child.  The
+        // parent catalog is durable before monitor/watchdog tasks can mutate
+        // the binding or release shared capacity.
+        self.spawn_monitor(
+            child.clone(),
+            handle.clone(),
+            events,
+            &durable_spec,
+            durability,
+        );
+        if let Some(deadline_at) = deadline_at {
+            self.spawn_deadline_watchdog(handle.clone(), deadline_at);
+        }
+        release_retained_reservation(&self.inner);
 
         self.inner.parent.inner().emitter.emit(
             None,
@@ -724,11 +1047,22 @@ impl DelegationCoordinator {
         let turn = match handle.send(spec.task) {
             Ok(turn) => turn,
             Err(error) => {
+                // The child was already bound and consumed process/shared
+                // capacity by the time the initial turn submission failed.
+                // Terminate that runtime before returning the direct/queued
+                // start error, then release the slot exactly once. A Host
+                // reason keeps the durable monitor from reconciling this
+                // deliberate start failure as an interrupted shutdown.
                 update_status(&self.inner, &child, |status| {
                     status.state = ChildState::Failed;
                     status.updated_at = self.inner.parent.inner().shared.clock.now();
                 });
                 let _ = self.persist_catalog().await;
+                handle.cancel_session(CancelReason::Host(
+                    "delegated child initial turn submission failed".to_owned(),
+                ));
+                let _ = handle.shutdown().await;
+                release_capacity(&self.inner, &child);
                 return Err(error);
             }
         };

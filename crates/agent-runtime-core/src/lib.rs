@@ -42,6 +42,19 @@ pub mod approval;
 pub mod artifact;
 pub mod broker;
 pub mod cancel;
+/// Cache identity, provider behavior, evidence, and synthetic safety aliases.
+/// The implementation lives with the provider contract; this module gives
+/// consumers a stable semantic import path.
+pub mod cache {
+    pub use crate::provider::{
+        AttemptPurpose, CacheAuthority, CacheAvailabilityEvidence, CacheEndpointIdentity,
+        CacheEvidenceCapabilities, CacheEvidenceKind, CacheEvidenceSource, CacheIdentity,
+        CacheIdentityBuilder, CacheIdentityFragment, CacheIdentityTool, CacheOperationBudget,
+        CacheRefreshCause, CacheResourceIdentity, CacheResourceOperationKind,
+        CacheResourceOperationRequest, CacheResourceOperationResult, ProviderAttemptPurpose,
+        ProviderCacheBehavior, ProviderCacheContract, SyntheticConformance,
+    };
+}
 pub mod catalog;
 pub mod check_set;
 pub mod checkpoint;
@@ -86,14 +99,24 @@ pub mod prelude {
         EgressBroker, EgressDenied, EgressRequest, EgressTuple, FilesystemBroker, FilesystemError,
         FilesystemHandle, FilesystemRight, FilesystemRights, MountName,
     };
+    pub use crate::cache::{
+        AttemptPurpose, CacheAuthority, CacheAvailabilityEvidence, CacheEndpointIdentity,
+        CacheEvidenceCapabilities, CacheEvidenceKind, CacheEvidenceSource, CacheIdentity,
+        CacheIdentityBuilder, CacheIdentityFragment, CacheIdentityTool, CacheOperationBudget,
+        CacheRefreshCause, CacheResourceIdentity, CacheResourceOperationKind,
+        CacheResourceOperationRequest, CacheResourceOperationResult, ProviderAttemptPurpose,
+        ProviderCacheBehavior, ProviderCacheContract, SyntheticConformance,
+    };
     pub use crate::cancel::{CancelReason, Cancellation};
     pub use crate::check_set::{
         ActionClass, AdvisoryFinding, CheckAudit, CheckSetError, CheckSetOutcome, CheckStatus,
         EnforcementLimits, RevocationTarget, SecurityCheckSet, SecurityCheckSetBuilder,
     };
     pub use crate::checkpoint::{
-        AssembledModelResponse, CHECKPOINT_SCHEMA_VERSION, CheckpointStore, CheckpointWatermark,
-        TURN_TRANSITION_REVISION, ToolSlotCheckpoint, TurnCheckpoint, TurnState,
+        AssembledModelResponse, CHECKPOINT_SCHEMA_VERSION, CacheOperationCheckpoint,
+        CacheOperationResultCheckpoint, CheckpointStore, CheckpointWatermark,
+        JournalTruncationScope, TURN_TRANSITION_REVISION, ToolSlotCheckpoint, TurnCheckpoint,
+        TurnState, validate_cache_operation_id,
     };
     pub use crate::clock::{Clock, Deadline, SystemClock, Timestamp};
     pub use crate::compat::LegacyApprovalAuthority;
@@ -107,10 +130,10 @@ pub mod prelude {
     };
     pub use crate::error::{ErrorKind, Result, RuntimeError};
     pub use crate::event::{
-        BudgetCategory, CacheState, CacheStateKind, ChildPhase, ChildRecoveryState,
-        CompactionReason, EstimationConfidence, EventEnvelope, GoalUpdateCause, LimitKind,
-        PlanItemProjection, PlanItemStatus, PlanSensitivity, RuntimeEvent, SCHEMA_VERSION,
-        TurnFinish,
+        BudgetCategory, CacheOperationOutcome, CacheOperationReason, CacheState, CacheStateKind,
+        ChildPhase, ChildRecoveryState, CompactionReason, EstimationConfidence, EventEnvelope,
+        GoalUpdateCause, LimitKind, PlanItemProjection, PlanItemStatus, PlanSensitivity,
+        RuntimeEvent, SCHEMA_VERSION, TurnFinish,
     };
     pub use crate::goal::{
         GOAL_STATE_SCHEMA_VERSION, GoalAccountingState, GoalCommand, GoalCommandResult,
@@ -128,8 +151,8 @@ pub mod prelude {
         LeakDetectorId, LeakFinding, LeakScanResult,
     };
     pub use crate::ids::{
-        AttemptId, ChildId, ChoiceId, EventId, GoalId, InteractionRequestId, QuestionId, RequestId,
-        SessionId, SteerId, TenantId, ToolCallId, TurnId,
+        AttemptId, CacheOperationId, ChildId, ChoiceId, EventId, GoalId, InteractionRequestId,
+        QuestionId, RequestId, SessionId, SteerId, TenantId, ToolCallId, TurnId,
     };
     pub use crate::interaction::{
         Choice, INTERACTION_SCHEMA_VERSION, InteractionBroker, InteractionOrigin,
@@ -153,10 +176,10 @@ pub mod prelude {
     pub use crate::metadata::{MetaValue, Metadata, VendorLimits};
     pub use crate::observer::EventObserver;
     pub use crate::provider::{
-        Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderAttempt,
-        ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
-        ProviderStreamEvent, ReasoningConfig, ReasoningSupport, Sampling, ToolChoice, ToolSchema,
-        UnsupportedFeature,
+        CacheResourceProvider, Capabilities, FinishReason, ModelDescriptor, ModelId,
+        PromptCacheControl, Provider, ProviderAttempt, ProviderCallContext, ProviderError,
+        ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent, ReasoningConfig,
+        ReasoningSupport, Sampling, ToolChoice, ToolSchema, UnsupportedFeature,
     };
     pub use crate::provider_credential::{
         CredentialInvalidation, MAX_PROVIDER_CREDENTIAL_REVISION_CHARS,

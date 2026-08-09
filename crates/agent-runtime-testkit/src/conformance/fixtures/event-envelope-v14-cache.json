@@ -1,0 +1,243 @@
+[
+  {
+    "schema_version": 14,
+    "seq": 0,
+    "id": "evt-cache-op-1",
+    "session": "session-cache",
+    "timestamp": 300,
+    "payload": {
+      "event": "cache_operation_prepared",
+      "operation": "cache-op-1",
+      "request": "req-cache",
+      "identity": {
+        "provider": "fixture-provider",
+        "tokenizer_revision": null,
+        "request_adapter_revision": null,
+        "provider_key": null,
+        "breakpoint_revision": null,
+        "resource": null,
+        "registry_snapshot": null,
+        "scoped_view": null,
+        "activation_revision": null,
+        "harness_revision": null,
+        "cache_policy_revision": null,
+        "endpoint": {
+          "digest": "0123456789abcdef0123456789abcdef",
+          "revision": "endpoint-1"
+        },
+        "adapter_partition_revision": "adapter-partition-1",
+        "model": "fixture-model",
+        "profile": "fedcba9876543210fedcba9876543210",
+        "cache_control": "implicit",
+        "stable_prefix": [],
+        "tools": [],
+        "stable_history": [],
+        "digest": "ed43ffeabf0c9492bf9a369a344bb56c"
+      },
+      "purpose": "cache_keepalive"
+    }
+  },
+  {
+    "schema_version": 14,
+    "seq": 1,
+    "id": "evt-cache-op-2",
+    "session": "session-cache",
+    "timestamp": 301,
+    "payload": {
+      "event": "cache_operation_rejected",
+      "operation": "cache-op-2",
+      "request": "req-cache",
+      "identity": {
+        "provider": "fixture-provider",
+        "tokenizer_revision": null,
+        "request_adapter_revision": null,
+        "provider_key": null,
+        "breakpoint_revision": null,
+        "resource": null,
+        "registry_snapshot": null,
+        "scoped_view": null,
+        "activation_revision": null,
+        "harness_revision": null,
+        "cache_policy_revision": null,
+        "endpoint": {
+          "digest": "0123456789abcdef0123456789abcdef",
+          "revision": "endpoint-1"
+        },
+        "adapter_partition_revision": "adapter-partition-1",
+        "model": "fixture-model",
+        "profile": "fedcba9876543210fedcba9876543210",
+        "cache_control": "implicit",
+        "stable_prefix": [],
+        "tools": [],
+        "stable_history": [],
+        "digest": "ed43ffeabf0c9492bf9a369a344bb56c"
+      },
+      "purpose": "cache_keepalive",
+      "reason": "missing_conformance"
+    }
+  },
+  {
+    "schema_version": 14,
+    "seq": 2,
+    "id": "evt-cache-op-3",
+    "session": "session-cache",
+    "timestamp": 302,
+    "payload": {
+      "event": "cache_operation_started",
+      "operation": "cache-op-1",
+      "request": "req-cache",
+      "attempt": "att-cache",
+      "identity": {
+        "provider": "fixture-provider",
+        "tokenizer_revision": null,
+        "request_adapter_revision": null,
+        "provider_key": null,
+        "breakpoint_revision": null,
+        "resource": null,
+        "registry_snapshot": null,
+        "scoped_view": null,
+        "activation_revision": null,
+        "harness_revision": null,
+        "cache_policy_revision": null,
+        "endpoint": {
+          "digest": "0123456789abcdef0123456789abcdef",
+          "revision": "endpoint-1"
+        },
+        "adapter_partition_revision": "adapter-partition-1",
+        "model": "fixture-model",
+        "profile": "fedcba9876543210fedcba9876543210",
+        "cache_control": "implicit",
+        "stable_prefix": [],
+        "tools": [],
+        "stable_history": [],
+        "digest": "ed43ffeabf0c9492bf9a369a344bb56c"
+      },
+      "purpose": "cache_keepalive"
+    }
+  },
+  {
+    "schema_version": 14,
+    "seq": 3,
+    "id": "evt-cache-op-4",
+    "session": "session-cache",
+    "timestamp": 303,
+    "payload": {
+      "event": "cache_operation_completed",
+      "operation": "cache-op-1",
+      "request": "req-cache",
+      "attempt": "att-cache",
+      "identity": {
+        "provider": "fixture-provider",
+        "tokenizer_revision": null,
+        "request_adapter_revision": null,
+        "provider_key": null,
+        "breakpoint_revision": null,
+        "resource": null,
+        "registry_snapshot": null,
+        "scoped_view": null,
+        "activation_revision": null,
+        "harness_revision": null,
+        "cache_policy_revision": null,
+        "endpoint": {
+          "digest": "0123456789abcdef0123456789abcdef",
+          "revision": "endpoint-1"
+        },
+        "adapter_partition_revision": "adapter-partition-1",
+        "model": "fixture-model",
+        "profile": "fedcba9876543210fedcba9876543210",
+        "cache_control": "implicit",
+        "stable_prefix": [],
+        "tools": [],
+        "stable_history": [],
+        "digest": "ed43ffeabf0c9492bf9a369a344bb56c"
+      },
+      "purpose": "cache_keepalive",
+      "outcome": "completed",
+      "metrics": {
+        "input_tokens": 12
+      }
+    }
+  },
+  {
+    "schema_version": 14,
+    "seq": 4,
+    "id": "evt-cache-op-5",
+    "session": "session-cache",
+    "timestamp": 304,
+    "payload": {
+      "event": "cache_availability_evidence_recorded",
+      "evidence": {
+        "source": "stream",
+        "kind": "observation",
+        "identity": {
+          "provider": "fixture-provider",
+          "tokenizer_revision": null,
+          "request_adapter_revision": null,
+          "provider_key": null,
+          "breakpoint_revision": null,
+          "resource": null,
+          "registry_snapshot": null,
+          "scoped_view": null,
+          "activation_revision": null,
+          "harness_revision": null,
+          "cache_policy_revision": null,
+          "endpoint": {
+            "digest": "0123456789abcdef0123456789abcdef",
+            "revision": "endpoint-1"
+          },
+          "adapter_partition_revision": "adapter-partition-1",
+          "model": "fixture-model",
+          "profile": "fedcba9876543210fedcba9876543210",
+          "cache_control": "implicit",
+          "stable_prefix": [],
+          "tools": [],
+          "stable_history": [],
+          "digest": "ed43ffeabf0c9492bf9a369a344bb56c"
+        },
+        "request": "req-cache",
+        "attempt": "att-cache",
+        "ordering": 1,
+        "read_tokens": 0
+      }
+    }
+  },
+  {
+    "schema_version": 14,
+    "seq": 5,
+    "id": "evt-cache-op-6",
+    "session": "session-cache",
+    "timestamp": 305,
+    "payload": {
+      "event": "cache_operation_suspended",
+      "request": "req-cache",
+      "attempt": "att-cache",
+      "identity": {
+        "provider": "fixture-provider",
+        "tokenizer_revision": null,
+        "request_adapter_revision": null,
+        "provider_key": null,
+        "breakpoint_revision": null,
+        "resource": null,
+        "registry_snapshot": null,
+        "scoped_view": null,
+        "activation_revision": null,
+        "harness_revision": null,
+        "cache_policy_revision": null,
+        "endpoint": {
+          "digest": "0123456789abcdef0123456789abcdef",
+          "revision": "endpoint-1"
+        },
+        "adapter_partition_revision": "adapter-partition-1",
+        "model": "fixture-model",
+        "profile": "fedcba9876543210fedcba9876543210",
+        "cache_control": "implicit",
+        "stable_prefix": [],
+        "tools": [],
+        "stable_history": [],
+        "digest": "ed43ffeabf0c9492bf9a369a344bb56c"
+      },
+      "operation": "cache-op-1",
+      "reason": "cache_miss"
+    }
+  }
+]

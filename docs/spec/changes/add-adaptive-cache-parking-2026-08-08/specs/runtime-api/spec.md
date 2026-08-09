@@ -33,6 +33,9 @@ redaction-safe,
 attempt- or operation-attributed, and ordered with the protected
 checkpoint/watermark boundary that makes them replayable. Smith scheduling and
 observe/off decisions are consumer projections, not Runtime lifecycle events.
+Rejected events include their allocated request attribution when available
+and no attempt before provider admission; suspended events include the request
+and attempt that produced the explicit suspension.
 
 #### Scenario: Dispatch invalidates an accepted preflight
 

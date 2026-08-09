@@ -103,6 +103,27 @@ fn result(call: &ToolCall) -> ToolResultBlock {
     }
 }
 
+fn cache_operation(request: Option<&str>, attempt: Option<&str>) -> CacheOperationCheckpoint {
+    CacheOperationCheckpoint {
+        operation: crate::ids::CacheOperationId::new("cache-op-1"),
+        request: request.map(RequestId::new),
+        attempt: attempt.map(AttemptId::new),
+        identity: crate::provider::CacheIdentity::legacy(
+            agent_runtime_registry::Fingerprint::of("profile"),
+            "fake",
+            ModelId::new("fake"),
+            Vec::new(),
+            crate::provider::PromptCacheControl::Implicit,
+        ),
+        purpose: crate::provider::ProviderAttemptPurpose::CacheKeepalive,
+        // Checkpoint fingerprints are semantic authority digests, not the
+        // registry's legacy non-cryptographic Fingerprint representation.
+        fingerprint: "a".repeat(64),
+        preflight_rejection: None,
+        expected_read_tokens: Some(10),
+    }
+}
+
 #[test]
 fn checkpoint_round_trips_and_verifies() {
     let checkpoint = accepted();
@@ -110,6 +131,388 @@ fn checkpoint_round_trips_and_verifies() {
     let restored: TurnCheckpoint = serde_json::from_str(&json).unwrap();
     restored.validate().unwrap();
     assert_eq!(restored, checkpoint);
+}
+
+#[test]
+fn cache_checkpoint_phases_require_protected_result_before_terminal() {
+    let prepared = TurnCheckpoint::cache_operation(
+        TurnId::new("cache-turn-1"),
+        cache_operation(Some("request-1"), None),
+        snapshot(),
+        Deadline::never(),
+        1,
+        4,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    assert!(matches!(
+        prepared.state,
+        TurnState::CacheOperationPrepared { .. }
+    ));
+
+    let started_operation = cache_operation(Some("request-1"), Some("attempt-1"));
+    let started = prepared
+        .transition(
+            TurnState::CacheOperationStarted {
+                operation: started_operation.clone(),
+            },
+            snapshot(),
+            5,
+            Timestamp(1),
+        )
+        .unwrap();
+    let result = CacheOperationResultCheckpoint {
+        outcome: CacheOperationOutcome::Completed,
+        state: CacheState::WarmObserved,
+        evidence: None,
+        metrics: [("cache_read_tokens".to_owned(), 10)].into_iter().collect(),
+        rejection_reason: None,
+        terminal_reason: None,
+    };
+    let ready = started
+        .transition(
+            TurnState::CacheOperationResultReady {
+                operation: started_operation.clone(),
+                result: result.clone(),
+            },
+            snapshot(),
+            5,
+            Timestamp(2),
+        )
+        .unwrap();
+    assert_eq!(ready.journal_truncation_sequence(), None);
+    let scope = ready
+        .journal_truncation_scope()
+        .expect("cache result recovery has a journal boundary");
+    assert_eq!(scope.event_sequence, 5);
+    assert_eq!(scope.turn, Some(TurnId::new("cache-turn-1")));
+    let swapped_request = CacheOperationCheckpoint {
+        request: Some(RequestId::new("request-spliced")),
+        ..started_operation.clone()
+    };
+    assert!(
+        !TurnState::CacheOperationStarted {
+            operation: started_operation.clone(),
+        }
+        .can_transition_to(&TurnState::CacheOperationResultReady {
+            operation: swapped_request.clone(),
+            result: result.clone(),
+        })
+    );
+    let swapped_attempt = CacheOperationCheckpoint {
+        attempt: Some(AttemptId::new("attempt-spliced")),
+        ..started_operation.clone()
+    };
+    assert!(
+        !ready
+            .state
+            .can_transition_to(&TurnState::CacheOperationTerminal {
+                operation: swapped_attempt,
+                result: result.clone(),
+            })
+    );
+    let terminal = ready
+        .transition(
+            TurnState::CacheOperationTerminal {
+                operation: started_operation,
+                result,
+            },
+            snapshot(),
+            6,
+            Timestamp(3),
+        )
+        .unwrap();
+    assert!(terminal.state.is_terminal());
+    assert_eq!(terminal.journal_truncation_sequence(), None);
+}
+
+#[test]
+fn cache_checkpoint_rejection_can_skip_provider_start_but_not_result_ready() {
+    let mut rejected_operation = cache_operation(Some("request-reject"), None);
+    rejected_operation.preflight_rejection = Some(CacheOperationReason::IdentityChanged);
+    let prepared = TurnCheckpoint::cache_operation(
+        TurnId::new("cache-turn-reject"),
+        rejected_operation.clone(),
+        snapshot(),
+        Deadline::never(),
+        1,
+        4,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    let result = CacheOperationResultCheckpoint {
+        outcome: CacheOperationOutcome::Rejected,
+        state: CacheState::Eligible,
+        evidence: None,
+        metrics: Default::default(),
+        rejection_reason: Some(CacheOperationReason::IdentityChanged),
+        terminal_reason: None,
+    };
+    let ready = prepared
+        .transition(
+            TurnState::CacheOperationResultReady {
+                operation: rejected_operation.clone(),
+                result: result.clone(),
+            },
+            snapshot(),
+            5,
+            Timestamp(1),
+        )
+        .unwrap();
+    assert!(matches!(
+        ready.state,
+        TurnState::CacheOperationResultReady { .. }
+    ));
+    assert!(
+        ready
+            .transition(
+                TurnState::CacheOperationTerminal {
+                    operation: rejected_operation,
+                    result,
+                },
+                snapshot(),
+                6,
+                Timestamp(2),
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn cache_checkpoint_fingerprint_is_canonical_and_one_way() {
+    let mut operation = cache_operation(Some("request-fingerprint"), None);
+    operation.fingerprint = "A".repeat(64);
+    assert!(
+        TurnCheckpoint::cache_operation(
+            TurnId::new("cache-turn-invalid-uppercase"),
+            operation,
+            snapshot(),
+            Deadline::never(),
+            1,
+            4,
+            Timestamp::ZERO,
+        )
+        .is_err()
+    );
+
+    let mut operation = cache_operation(Some("request-fingerprint"), None);
+    operation.fingerprint = "f".repeat(63);
+    assert!(
+        TurnCheckpoint::cache_operation(
+            TurnId::new("cache-turn-invalid-short"),
+            operation,
+            snapshot(),
+            Deadline::never(),
+            1,
+            4,
+            Timestamp::ZERO,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn cache_checkpoint_operation_id_is_bounded_and_safe() {
+    let oversized = "x".repeat(257);
+    for operation_id in [
+        "cache op with spaces",
+        "cache/op/with/slashes",
+        "cache-op-µ",
+        oversized.as_str(),
+    ] {
+        let mut operation = cache_operation(Some("request-operation-id"), None);
+        operation.operation = crate::ids::CacheOperationId::new(operation_id);
+        assert!(
+            TurnCheckpoint::cache_operation(
+                TurnId::new("cache-turn-invalid-operation-id"),
+                operation,
+                snapshot(),
+                Deadline::never(),
+                1,
+                4,
+                Timestamp::ZERO,
+            )
+            .is_err(),
+            "operation id should be rejected: {operation_id:?}"
+        );
+    }
+}
+
+#[test]
+fn cache_checkpoint_metric_keys_are_bounded_identifiers() {
+    let result = CacheOperationResultCheckpoint {
+        outcome: CacheOperationOutcome::Completed,
+        state: CacheState::Eligible,
+        evidence: None,
+        metrics: [("raw metric".to_owned(), 1)].into_iter().collect(),
+        rejection_reason: None,
+        terminal_reason: None,
+    };
+    assert!(result.validate().is_err());
+}
+
+#[test]
+fn resource_cache_evidence_uses_operation_correlation_without_stream_attribution() {
+    let mut prepared_operation = cache_operation(Some("resource-request"), None);
+    prepared_operation.purpose = crate::provider::ProviderAttemptPurpose::CacheResourceInspect;
+    let prepared = TurnCheckpoint::cache_operation(
+        TurnId::new("cache-resource-turn"),
+        prepared_operation.clone(),
+        snapshot(),
+        Deadline::never(),
+        1,
+        4,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    let started_operation = CacheOperationCheckpoint {
+        attempt: Some(AttemptId::new("resource-attempt")),
+        ..prepared_operation
+    };
+    let started = prepared
+        .transition(
+            TurnState::CacheOperationStarted {
+                operation: started_operation.clone(),
+            },
+            snapshot(),
+            5,
+            Timestamp(1),
+        )
+        .unwrap();
+    let evidence = crate::provider::CacheAvailabilityEvidence::resource_operation(
+        started_operation.identity.clone(),
+        started_operation.operation.clone(),
+        0,
+        &crate::provider::CacheResourceOperationResult {
+            resource: None,
+            exists: Some(true),
+            evidence: crate::provider::CacheEvidenceKind::Hit,
+            refresh_cause: None,
+            guaranteed_until: None,
+            usage: crate::usage::UsageDelta::new(),
+        },
+    );
+    let result = CacheOperationResultCheckpoint {
+        outcome: CacheOperationOutcome::Completed,
+        state: CacheState::WarmObserved,
+        evidence: Some(evidence),
+        metrics: BTreeMap::new(),
+        rejection_reason: None,
+        terminal_reason: None,
+    };
+    let ready = started
+        .transition(
+            TurnState::CacheOperationResultReady {
+                operation: started_operation,
+                result,
+            },
+            snapshot(),
+            5,
+            Timestamp(2),
+        )
+        .unwrap();
+    ready.validate().unwrap();
+}
+
+#[test]
+fn cache_checkpoint_rejects_resource_observation_that_reports_absence() {
+    let operation = cache_operation(Some("resource-request"), Some("resource-attempt"));
+    let evidence = crate::provider::CacheAvailabilityEvidence::resource_operation(
+        operation.identity.clone(),
+        operation.operation.clone(),
+        0,
+        &crate::provider::CacheResourceOperationResult {
+            resource: None,
+            exists: Some(false),
+            evidence: crate::provider::CacheEvidenceKind::Observation,
+            refresh_cause: None,
+            guaranteed_until: None,
+            usage: crate::usage::UsageDelta::new(),
+        },
+    );
+    let result = CacheOperationResultCheckpoint {
+        outcome: CacheOperationOutcome::Completed,
+        state: CacheState::Eligible,
+        evidence: Some(evidence),
+        metrics: BTreeMap::new(),
+        rejection_reason: None,
+        terminal_reason: None,
+    };
+    assert!(result.validate().is_err());
+}
+
+#[test]
+fn cache_scoped_expiry_accepts_stream_and_resource_attribution() {
+    for (turn, purpose, resource_scoped) in [
+        (
+            "cache-expiry-stream-turn",
+            crate::provider::ProviderAttemptPurpose::CacheKeepalive,
+            false,
+        ),
+        (
+            "cache-expiry-resource-turn",
+            crate::provider::ProviderAttemptPurpose::CacheResourceInspect,
+            true,
+        ),
+    ] {
+        let mut prepared_operation = cache_operation(Some(turn), None);
+        prepared_operation.purpose = purpose;
+        let prepared = TurnCheckpoint::cache_operation(
+            TurnId::new(turn),
+            prepared_operation.clone(),
+            snapshot(),
+            Deadline::never(),
+            1,
+            4,
+            Timestamp::ZERO,
+        )
+        .unwrap();
+        let started_operation = CacheOperationCheckpoint {
+            attempt: Some(AttemptId::new(format!("{turn}-attempt"))),
+            ..prepared_operation
+        };
+        let started = prepared
+            .transition(
+                TurnState::CacheOperationStarted {
+                    operation: started_operation.clone(),
+                },
+                snapshot(),
+                5,
+                Timestamp(1),
+            )
+            .unwrap();
+        let evidence = crate::provider::CacheAvailabilityEvidence::cache_scoped_expiry(
+            started_operation.identity.clone(),
+            (!resource_scoped)
+                .then(|| started_operation.request.clone())
+                .flatten(),
+            (!resource_scoped)
+                .then(|| started_operation.attempt.clone())
+                .flatten(),
+            resource_scoped.then(|| started_operation.operation.clone()),
+            0,
+        );
+        let result = CacheOperationResultCheckpoint {
+            outcome: CacheOperationOutcome::Suspended,
+            state: CacheState::Suspended,
+            evidence: Some(evidence),
+            metrics: BTreeMap::new(),
+            rejection_reason: None,
+            terminal_reason: Some(CacheOperationReason::CacheExpired),
+        };
+        let ready = started
+            .transition(
+                TurnState::CacheOperationResultReady {
+                    operation: started_operation,
+                    result,
+                },
+                snapshot(),
+                5,
+                Timestamp(2),
+            )
+            .unwrap();
+        ready.validate().unwrap();
+    }
 }
 
 #[test]

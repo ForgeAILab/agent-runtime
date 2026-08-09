@@ -37,8 +37,9 @@ use agent_runtime_core::clock::{Deadline, SystemClock};
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::provider::{
     Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
-    ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
-    ProviderStreamEvent, ReasoningConfig, ToolChoice,
+    ProviderCacheBehavior, ProviderCacheContract, ProviderCallContext, ProviderError,
+    ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent, ReasoningConfig,
+    ToolChoice,
 };
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
@@ -77,6 +78,7 @@ impl AnthropicConfig {
             capabilities: Capabilities {
                 // Anthropic caches only what the request explicitly marks, and
                 // allows four breakpoints per request.
+                cache: true,
                 prompt_cache: PromptCacheControl::Explicit { max_breakpoints: 4 },
                 ..Capabilities::basic_streaming()
             },
@@ -117,6 +119,146 @@ impl AnthropicConfig {
     }
 }
 
+/// The normalized provider contract owns Anthropic marker behavior. The
+/// Messages adapter can place an explicit ephemeral breakpoint, but it has no
+/// provider routing key, addressable resource companion, or synthetic
+/// maintenance/conformance lane. Clear those claims before capabilities cross
+/// the adapter boundary so a host cannot plan an operation the wire shape
+/// cannot represent.
+fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
+    let configured = capabilities.cache_contract.take();
+    let behavior = configured
+        .as_ref()
+        .map(|contract| contract.behavior)
+        .unwrap_or_else(|| capabilities.prompt_cache.behavior());
+    let mut contract = configured.unwrap_or_else(|| {
+        let mut contract = ProviderCacheContract::from_control(capabilities.prompt_cache);
+        contract.evidence.stream = capabilities.cache;
+        contract
+    });
+    contract.retention = Default::default();
+    contract.key_revision = None;
+    contract.maintenance.clear();
+    contract.resource_operations.clear();
+    contract.conformance = None;
+    contract.evidence.resource_operations = false;
+    contract.evidence.cache_scoped_errors = false;
+    contract.evidence.stream &= capabilities.cache;
+    match behavior {
+        ProviderCacheBehavior::Unsupported => {
+            contract.behavior = ProviderCacheBehavior::Unsupported;
+            capabilities.prompt_cache = PromptCacheControl::None;
+        }
+        ProviderCacheBehavior::ImplicitPrefix => {
+            contract.behavior = ProviderCacheBehavior::ImplicitPrefix;
+            capabilities.prompt_cache = PromptCacheControl::Implicit;
+        }
+        ProviderCacheBehavior::ExplicitBreakpoint { max_breakpoints } => {
+            contract.behavior = ProviderCacheBehavior::ExplicitBreakpoint { max_breakpoints };
+            capabilities.prompt_cache = PromptCacheControl::Explicit { max_breakpoints };
+        }
+        // Anthropic's Messages API has no explicit-resource wire operation;
+        // do not silently downgrade a host resource identity to a marker.
+        ProviderCacheBehavior::ExplicitResource => {
+            contract.behavior = ProviderCacheBehavior::Unsupported;
+            capabilities.prompt_cache = PromptCacheControl::None;
+        }
+    }
+    capabilities.cache_contract = Some(contract);
+    capabilities.normalize_cache_contract();
+}
+
+/// The context planner counts canonical content, while this adapter has a
+/// deliberately narrower replay shape. If an authoritative boundary is
+/// present, silently dropping any counted content would make the marker and
+/// expected read describe bytes that never reached Anthropic. Reject the
+/// request before transport I/O instead of emitting misleading evidence.
+fn validate_cacheable_messages(request: &ProviderRequest) -> Result<(), ProviderError> {
+    let Some(boundary) = request.cache_boundary else {
+        return Ok(());
+    };
+    if !boundary.has_stable_prefix() {
+        return Ok(());
+    }
+    if boundary.stable_tool_count as usize > request.tools.len() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::BadRequest,
+            "Anthropic cache boundary exceeds the rendered tool lane",
+        ));
+    }
+    let expected_system = boundary.stable_system_block_count as usize;
+    let expected_messages = boundary.stable_message_count as usize;
+    let mut seen_system = 0usize;
+    let mut seen_messages = 0usize;
+    for message in &request.messages {
+        // Consume source lanes by canonical order before asking whether the
+        // selected message renders. This is deliberate: an empty or
+        // unsupported stable message still occupies the planner's canonical
+        // position and must fail closed; it must never be skipped so a later
+        // changing message can inherit the marker.
+        let stable = match message.role {
+            Role::System => {
+                let stable = seen_system < expected_system;
+                seen_system = seen_system.saturating_add(1);
+                stable
+            }
+            _ => {
+                let stable = seen_messages < expected_messages;
+                seen_messages = seen_messages.saturating_add(1);
+                stable
+            }
+        };
+        if stable && !anthropic_message_is_representable(message) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "Anthropic cache boundary includes content this adapter cannot represent",
+            ));
+        }
+    }
+    if seen_system < expected_system || seen_messages < expected_messages {
+        return Err(ProviderError::new(
+            ProviderErrorKind::BadRequest,
+            "Anthropic cache boundary exceeds representable message lanes",
+        ));
+    }
+    Ok(())
+}
+
+fn anthropic_message_is_representable(message: &Message) -> bool {
+    let parts_representable = message.content.iter().all(|part| match message.role {
+        Role::System => matches!(part, ContentPart::Text { .. }),
+        Role::User => matches!(part, ContentPart::Text { .. } | ContentPart::Image { .. }),
+        Role::Assistant => matches!(
+            part,
+            ContentPart::Text { .. }
+                | ContentPart::ToolCall(_)
+                | ContentPart::Reasoning { redacted: true, .. }
+                | ContentPart::Reasoning {
+                    redacted: false,
+                    signature: Some(_),
+                    ..
+                }
+        ),
+        Role::Tool => matches!(
+            part,
+            ContentPart::ToolResult(result)
+                if result.content.iter().all(|nested| {
+                    matches!(nested, ContentPart::Text { .. } | ContentPart::Image { .. })
+                })
+        ),
+    });
+    if !parts_representable {
+        return false;
+    }
+    match message.role {
+        Role::System => !message.joined_text().trim().is_empty(),
+        // `to_anthropic_message` is the authoritative rendered projection.
+        // It returns `None` for empty messages and for messages whose content
+        // is entirely elided by this adapter.
+        _ => to_anthropic_message(message).is_some(),
+    }
+}
+
 /// A provider over the Anthropic Messages streaming API.
 #[derive(Debug)]
 pub struct AnthropicProvider<T: HttpTransport> {
@@ -127,6 +269,8 @@ pub struct AnthropicProvider<T: HttpTransport> {
 impl<T: HttpTransport> AnthropicProvider<T> {
     /// Builds an adapter over `transport` with `config`.
     pub fn new(transport: T, config: AnthropicConfig) -> Self {
+        let mut config = config;
+        normalize_cache_capabilities(&mut config.capabilities);
         Self { transport, config }
     }
 
@@ -135,7 +279,17 @@ impl<T: HttpTransport> AnthropicProvider<T> {
         &self.transport
     }
 
-    fn build_payload(&self, request: &ProviderRequest) -> Value {
+    fn build_payload(&self, request: &ProviderRequest) -> Result<Value, ProviderError> {
+        if request.model != self.config.model {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "Anthropic request model does not match adapter model",
+            ));
+        }
+        request
+            .validate_cache_identity()
+            .map_err(|error| ProviderError::new(ProviderErrorKind::BadRequest, error))?;
+        validate_cacheable_messages(request)?;
         let mut system_parts: Vec<String> = Vec::new();
         let mut messages = Vec::new();
         for msg in &request.messages {
@@ -164,53 +318,143 @@ impl<T: HttpTransport> AnthropicProvider<T> {
         let obj = payload.as_object_mut().expect("payload is an object");
 
         // Anthropic caches everything up to and including a marked block, and
-        // serializes tools before system before messages. So a single
-        // breakpoint on the trailing system block covers the tool schemas too
-        // — the whole stable prefix for one of the four breakpoints a request
-        // may carry. Without a marker the provider caches nothing at all and
-        // every turn re-reads the entire prefix at full price.
-        let marks = self
-            .config
-            .capabilities
-            .prompt_cache
-            .caches_ephemeral_segment();
+        // serializes tools before system before messages. A current planner
+        // supplies an exact count-only boundary, so the marker lands on the
+        // last stable item in that order. A request without boundary metadata
+        // is legacy: preserve the historical trailing system/tool behavior.
+        let can_mark = matches!(
+            self.config.capabilities.cache_contract().behavior,
+            agent_runtime_core::provider::ProviderCacheBehavior::ExplicitBreakpoint { .. }
+        );
         let breakpoint = json!({"type": "ephemeral"});
 
-        if !request.tools.is_empty() {
-            let last = request.tools.len() - 1;
-            let tools: Vec<Value> = request
-                .tools
-                .iter()
-                .enumerate()
-                .map(|(index, t)| {
-                    let mut tool = json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.input_schema,
-                    });
-                    // Only when there is no system block to carry the marker
-                    // instead; two breakpoints for one contiguous prefix would
-                    // spend a scarce slot for nothing.
-                    if marks && system_parts.is_empty() && index == last {
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+        // Only the stable prefix needs a complete wire projection for its
+        // marker. A changing tail may intentionally contain content this
+        // adapter omits; that omission must not move the marker off the
+        // already-validated stable message.
+        let message_lane_complete = messages.len()
+            >= request
+                .cache_boundary
+                .map_or(0, |boundary| boundary.stable_message_count as usize);
+        let system_lane_complete = request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == Role::System && !message.joined_text().trim().is_empty()
+            })
+            .count()
+            == system_parts.len();
+
+        if let Some(boundary) = request.cache_boundary {
+            let mut marked = false;
+            if can_mark && boundary.has_stable_prefix() {
+                // The Anthropic wire order is tools -> system -> messages;
+                // the last non-empty lane is therefore the exact marker
+                // target. Counts are planner-owned and contain no content.
+                if boundary.stable_message_count > 0 && message_lane_complete {
+                    let index = boundary.stable_message_count as usize - 1;
+                    if let Some(message) = messages.get_mut(index) {
+                        mark_message(message);
+                        marked = true;
+                    }
+                } else if boundary.stable_message_count == 0
+                    && boundary.stable_system_block_count > 0
+                    && system_lane_complete
+                {
+                    let index = boundary.stable_system_block_count as usize - 1;
+                    if index < system_parts.len() {
+                        marked = true;
+                    }
+                } else if boundary.stable_tool_count > 0 {
+                    let index = boundary.stable_tool_count as usize - 1;
+                    if let Some(tool) = tools.get_mut(index) {
+                        tool["cache_control"] = breakpoint.clone();
+                        marked = true;
+                    }
+                }
+            }
+
+            if !system_parts.is_empty() {
+                let blocks: Vec<Value> = system_parts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        let mut block = json!({"type": "text", "text": text});
+                        if can_mark
+                            && boundary.stable_message_count == 0
+                            && boundary.stable_system_block_count > 0
+                            && system_lane_complete
+                            && index == boundary.stable_system_block_count as usize - 1
+                            && marked
+                        {
+                            block["cache_control"] = breakpoint.clone();
+                        }
+                        block
+                    })
+                    .collect();
+                obj.insert("system".into(), Value::Array(blocks));
+            }
+        } else {
+            let marks = can_mark
+                && request
+                    .cache_identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.has_stable_prefix());
+            if !request.tools.is_empty() {
+                // Legacy requests have no authoritative lane counts. Keep
+                // the old fallback: a tool-only prefix gets the marker on its
+                // final tool, while a system block carries it otherwise.
+                if marks && system_parts.is_empty() {
+                    if let Some(tool) = tools.last_mut() {
                         tool["cache_control"] = breakpoint.clone();
                     }
-                    tool
-                })
-                .collect();
-            obj.insert("tools".into(), Value::Array(tools));
-        }
-
-        if !system_parts.is_empty() {
-            if marks {
-                let mut block = json!({
-                    "type": "text",
-                    "text": system_parts.join("\n\n"),
-                });
-                block["cache_control"] = breakpoint;
-                obj.insert("system".into(), Value::Array(vec![block]));
-            } else {
-                obj.insert("system".into(), json!(system_parts.join("\n\n")));
+                }
             }
+            if !system_parts.is_empty() {
+                if marks {
+                    let blocks: Vec<Value> = if request.cache_identity.is_some() {
+                        system_parts
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, text)| {
+                                let mut block = json!({"type": "text", "text": text});
+                                if index == 0 {
+                                    block["cache_control"] = breakpoint.clone();
+                                }
+                                block
+                            })
+                            .collect()
+                    } else {
+                        let mut block = json!({
+                            "type": "text",
+                            "text": system_parts.join("\n\n"),
+                        });
+                        block["cache_control"] = breakpoint;
+                        vec![block]
+                    };
+                    obj.insert("system".into(), Value::Array(blocks));
+                } else {
+                    obj.insert("system".into(), json!(system_parts.join("\n\n")));
+                }
+            }
+        }
+        // The initial payload is assembled before marker placement so the
+        // lane logic can work on neutral `Value`s. Replace its message array
+        // with the marked representation before returning the wire body.
+        obj.insert("messages".into(), Value::Array(messages));
+        if !tools.is_empty() {
+            obj.insert("tools".into(), Value::Array(tools));
         }
         if !request.tools.is_empty() || request.tool_choice != ToolChoice::Auto {
             let choice = match &request.tool_choice {
@@ -257,7 +501,7 @@ impl<T: HttpTransport> AnthropicProvider<T> {
                 obj.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
-        payload
+        Ok(payload)
     }
 }
 
@@ -275,6 +519,29 @@ fn thinking_config(cfg: &ReasoningConfig, output_config: &mut Map<String, Value>
     }
     let budget = cfg.max_tokens?;
     Some(json!({"type": "enabled", "budget_tokens": budget}))
+}
+
+/// Adds an Anthropic cache marker to the final content block of one wire
+/// message. Text-only messages are expanded to the block form because the
+/// marker belongs to a content block, not the message envelope.
+fn mark_message(message: &mut Value) {
+    if let Some(text) = message
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        message["content"] = json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": {"type": "ephemeral"},
+        }]);
+        return;
+    }
+    if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(block) = blocks.iter_mut().rev().find(|block| block.is_object()) {
+            block["cache_control"] = json!({"type": "ephemeral"});
+        }
+    }
 }
 
 /// Renders one canonical non-system message into an Anthropic wire message.
@@ -773,7 +1040,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
-        let payload = self.build_payload(&request);
+        let payload = self.build_payload(&request)?;
         let body = serde_json::to_vec(&payload)
             .map_err(|e| ProviderError::new(ProviderErrorKind::BadRequest, e.to_string()))?;
         let mut headers = vec![
@@ -977,7 +1244,13 @@ mod tests {
     use agent_runtime_core::cancel::Cancellation;
     use agent_runtime_core::content::{ToolCall, ToolResultBlock};
     use agent_runtime_core::ids::{AttemptId, RequestId, SessionId, ToolCallId};
+    use agent_runtime_core::provider::ProviderAttemptPurpose;
     use agent_runtime_core::provider::ToolSchema;
+    use agent_runtime_core::provider::{
+        CacheIdentity, CacheIdentityFragment, ProviderCacheBehavior, ProviderCacheBoundary,
+        ProviderCacheContract, SyntheticConformance,
+    };
+    use agent_runtime_registry::Fingerprint;
     use std::sync::Mutex;
 
     /// A transport that replays fixed SSE byte chunks and records the request.
@@ -1003,6 +1276,10 @@ mod tests {
                 .clone()
                 .expect("a request was sent")
         }
+
+        fn was_called(&self) -> bool {
+            self.recorded.lock().unwrap().is_some()
+        }
     }
     #[async_trait]
     impl HttpTransport for ReplayTransport {
@@ -1026,6 +1303,8 @@ mod tests {
             session: SessionId::new("session-test"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
+            cache_identity: None,
+            purpose: ProviderAttemptPurpose::Ordinary,
             cancel: Cancellation::new(),
             deadline: Deadline::never(),
         }
@@ -1042,18 +1321,24 @@ mod tests {
     const EMPTY_STREAM: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
     async fn sent_payload(request: ProviderRequest) -> Value {
-        let provider = AnthropicProvider::new(
-            ReplayTransport::new(vec![EMPTY_STREAM]),
-            AnthropicConfig::new("http://x/v1", "claude-test"),
-        );
-        let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+        sent_payload_with_config(request, AnthropicConfig::new("http://x/v1", "claude-test"))
+            .await
+            .expect("Anthropic request is representable")
+    }
+
+    async fn sent_payload_with_config(
+        request: ProviderRequest,
+        config: AnthropicConfig,
+    ) -> Result<Value, ProviderError> {
+        let provider = AnthropicProvider::new(ReplayTransport::new(vec![EMPTY_STREAM]), config);
+        let events = collect(provider.stream(request, ctx()).await?).await;
         assert!(
             !events
                 .iter()
                 .any(|e| matches!(e, ProviderStreamEvent::Error { .. }))
         );
         let recorded = provider.transport().recorded();
-        serde_json::from_slice(&recorded.body).expect("request body is JSON")
+        Ok(serde_json::from_slice(&recorded.body).expect("request body is JSON"))
     }
 
     #[tokio::test]
@@ -1103,6 +1388,235 @@ mod tests {
         );
         let payload = sent_payload(request).await;
         assert_eq!(payload["messages"][0]["content"], "no images here");
+    }
+
+    #[tokio::test]
+    async fn request_model_mismatch_is_rejected_before_anthropic_transport() {
+        let transport = ReplayTransport::new(vec![EMPTY_STREAM]);
+        let provider = AnthropicProvider::new(
+            transport,
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let request = ProviderRequest::new(ModelId::new("claude-other"), vec![Message::user("hi")]);
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("adapter must reject a request for another model");
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(!provider.transport().was_called());
+    }
+
+    #[tokio::test]
+    async fn normalized_contract_controls_anthropic_marker_over_legacy_field() {
+        let mut config = AnthropicConfig::new("http://x/v1", "claude-test");
+        config.capabilities.prompt_cache =
+            agent_runtime_core::provider::PromptCacheControl::Implicit;
+        config.capabilities.cache_contract = Some(ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ExplicitBreakpoint { max_breakpoints: 4 },
+            ..ProviderCacheContract::default()
+        });
+        let request =
+            ProviderRequest::new(ModelId::new("claude-test"), vec![Message::system("stable")])
+                .with_cache_boundary(ProviderCacheBoundary::new(0, 1, 0));
+        let payload = sent_payload_with_config(request, config)
+            .await
+            .expect("explicit contract is representable");
+        assert_eq!(payload["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn explicit_resource_contract_is_disabled_before_anthropic_serialization() {
+        let mut config = AnthropicConfig::new("http://x/v1", "claude-test");
+        config.capabilities.prompt_cache = PromptCacheControl::ExplicitResource;
+        config.capabilities.cache_contract = Some(ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ExplicitResource,
+            resource_operations: [
+                agent_runtime_core::provider::CacheResourceOperationKind::Inspect,
+            ]
+            .into_iter()
+            .collect(),
+            conformance: Some(SyntheticConformance::complete()),
+            ..ProviderCacheContract::default()
+        });
+        let provider = AnthropicProvider::new(ReplayTransport::new(Vec::new()), config);
+        let capabilities = provider
+            .capabilities(&ModelId::new("claude-test"))
+            .expect("configured model capabilities");
+        assert_eq!(capabilities.prompt_cache, PromptCacheControl::None);
+        let contract = capabilities.cache_contract.expect("normalized contract");
+        assert_eq!(contract.behavior, ProviderCacheBehavior::Unsupported);
+        assert!(contract.resource_operations.is_empty());
+        assert!(contract.conformance.is_none());
+    }
+
+    #[tokio::test]
+    async fn conflicting_implicit_contract_disables_anthropic_marker() {
+        let mut config = AnthropicConfig::new("http://x/v1", "claude-test");
+        config.capabilities.prompt_cache =
+            agent_runtime_core::provider::PromptCacheControl::Explicit { max_breakpoints: 4 };
+        config.capabilities.cache_contract = Some(ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ImplicitPrefix,
+            ..ProviderCacheContract::default()
+        });
+        let request =
+            ProviderRequest::new(ModelId::new("claude-test"), vec![Message::system("stable")])
+                .with_cache_boundary(ProviderCacheBoundary::new(0, 1, 0));
+        let payload = sent_payload_with_config(request, config)
+            .await
+            .expect("implicit contract request is representable");
+        assert!(payload["system"][0].get("cache_control").is_none());
+    }
+
+    #[tokio::test]
+    async fn stable_unsigned_reasoning_is_rejected_before_anthropic_io() {
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![Message::assistant(vec![ContentPart::Reasoning {
+                text: "cannot replay".into(),
+                redacted: false,
+                signature: None,
+            }])],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 0, 1));
+        let result =
+            sent_payload_with_config(request, AnthropicConfig::new("http://x/v1", "claude-test"))
+                .await;
+        assert_eq!(
+            result
+                .expect_err("unsupported stable content must fail closed")
+                .kind,
+            ProviderErrorKind::BadRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_assistant_image_is_rejected_before_anthropic_io() {
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![Message::assistant(vec![ContentPart::Image {
+                url: "https://example.test/image.png".into(),
+                detail: None,
+            }])],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 0, 1));
+        let result =
+            sent_payload_with_config(request, AnthropicConfig::new("http://x/v1", "claude-test"))
+                .await;
+        assert_eq!(
+            result
+                .expect_err("unsupported stable content must fail closed")
+                .kind,
+            ProviderErrorKind::BadRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_empty_message_cannot_shift_anthropic_marker_to_changing_tail() {
+        let transport = ReplayTransport::new(vec![EMPTY_STREAM]);
+        let provider = AnthropicProvider::new(
+            transport,
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![
+                // The planner's stable-message count describes this first
+                // canonical lane; it must not be skipped just because the
+                // adapter would render it as no message.
+                Message::assistant(Vec::new()),
+                Message::user("changing tail"),
+            ],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 0, 1));
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("empty stable content must fail closed");
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(!provider.transport().was_called());
+    }
+
+    #[tokio::test]
+    async fn stable_tool_result_with_elided_part_is_rejected_before_anthropic_io() {
+        let transport = ReplayTransport::new(vec![EMPTY_STREAM]);
+        let provider = AnthropicProvider::new(
+            transport,
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![Message::tool_result(ToolResultBlock {
+                call_id: ToolCallId::new("call-1"),
+                name: "unsupported".into(),
+                content: vec![ContentPart::Reasoning {
+                    text: "not a tool-result wire block".into(),
+                    redacted: false,
+                    signature: None,
+                }],
+                is_error: false,
+            })],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 0, 1));
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("elided stable content must fail closed");
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(!provider.transport().was_called());
+    }
+
+    #[tokio::test]
+    async fn stable_system_content_that_would_be_elided_is_rejected_before_anthropic_io() {
+        let transport = ReplayTransport::new(vec![EMPTY_STREAM]);
+        let provider = AnthropicProvider::new(
+            transport,
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Image {
+                        url: "https://example.test/system.png".into(),
+                        detail: None,
+                    }],
+                },
+                Message::system("changing system tail"),
+            ],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 1, 0));
+        let error = provider
+            .stream(request, ctx())
+            .await
+            .err()
+            .expect("elided stable system content must fail closed");
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(!provider.transport().was_called());
+    }
+
+    #[tokio::test]
+    async fn an_unrepresentable_changing_tail_does_not_move_a_stable_marker() {
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![
+                Message::user("stable"),
+                Message::assistant(vec![ContentPart::Image {
+                    url: "https://example.test/image.png".into(),
+                    detail: None,
+                }]),
+            ],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 0, 1));
+        let payload = sent_payload(request).await;
+        assert_eq!(
+            payload["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1520,7 +2034,8 @@ mod tests {
 
     #[tokio::test]
     async fn tools_carry_the_breakpoint_when_there_is_no_system_block() {
-        let mut request = ProviderRequest::new(ModelId::new("claude"), vec![Message::user("hi")]);
+        let mut request =
+            ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
         request.tools = vec![ToolSchema {
             name: "read".into(),
             description: "Read a file".into(),
@@ -1533,11 +2048,173 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_with_nothing_stable_carries_no_breakpoint() {
-        let request = ProviderRequest::new(ModelId::new("claude"), vec![Message::user("hi")]);
+        let request = ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
         let payload = sent_payload(request).await;
         assert!(payload.get("tools").is_none());
         assert!(payload.get("system").is_none());
         assert!(!payload.to_string().contains("cache_control"));
+    }
+
+    #[tokio::test]
+    async fn an_exact_identity_without_a_stable_prefix_carries_no_breakpoint() {
+        let identity = CacheIdentity::legacy(
+            Fingerprint::of("profile"),
+            "anthropic",
+            ModelId::new("claude-test"),
+            std::iter::empty(),
+            PromptCacheControl::Explicit { max_breakpoints: 4 },
+        );
+        let payload = sent_payload(
+            ProviderRequest::new(ModelId::new("claude-test"), vec![Message::system("tail")])
+                .with_cache_identity(identity),
+        )
+        .await;
+        assert!(payload["system"][0].get("cache_control").is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_breakpoint_terminates_before_a_changing_message_tail() {
+        let identity = CacheIdentity::legacy(
+            Fingerprint::of("profile"),
+            "anthropic",
+            ModelId::new("claude-test"),
+            [CacheIdentityFragment::new(
+                "system",
+                Fingerprint::of("stable instructions"),
+            )],
+            PromptCacheControl::Explicit { max_breakpoints: 4 },
+        );
+        let first = sent_payload(
+            ProviderRequest::new(
+                ModelId::new("claude-test"),
+                vec![
+                    Message::system("stable instructions"),
+                    Message::system("tail-a"),
+                ],
+            )
+            .with_cache_identity(identity.clone()),
+        )
+        .await;
+        let second = sent_payload(
+            ProviderRequest::new(
+                ModelId::new("claude-test"),
+                vec![
+                    Message::system("stable instructions"),
+                    Message::system("tail-b"),
+                ],
+            )
+            .with_cache_identity(identity),
+        )
+        .await;
+
+        assert_eq!(first["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(second["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(first["system"][0]["text"], second["system"][0]["text"]);
+        assert_eq!(first["system"][1]["text"], "tail-a");
+        assert_eq!(second["system"][1]["text"], "tail-b");
+        assert!(first["system"][1].get("cache_control").is_none());
+        assert!(second["system"][1].get("cache_control").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_authoritative_boundary_separates_stable_and_no_cache_instructions() {
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![
+                Message::system("stable instructions"),
+                Message::system("do not cache"),
+            ],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 1, 0));
+        let payload = sent_payload(request).await;
+
+        assert_eq!(payload["system"][0]["text"], "stable instructions");
+        assert_eq!(payload["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(payload["system"][1]["text"], "do not cache");
+        assert!(payload["system"][1].get("cache_control").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_authoritative_boundary_marks_stable_history_before_an_ephemeral_tail() {
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![
+                Message::user("stable history"),
+                Message::user("current input"),
+            ],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(0, 0, 1));
+        let payload = sent_payload(request).await;
+
+        assert_eq!(
+            payload["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(
+            payload["messages"][0]["content"][0]["text"],
+            "stable history"
+        );
+        assert_eq!(payload["messages"][1]["content"], "current input");
+    }
+
+    #[tokio::test]
+    async fn an_authoritative_boundary_marks_system_after_stable_tools() {
+        let mut request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![Message::system("stable system")],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(1, 1, 0));
+        request.tools = vec![ToolSchema {
+            name: "read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let payload = sent_payload(request).await;
+
+        assert!(payload["tools"][0].get("cache_control").is_none());
+        assert_eq!(payload["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[tokio::test]
+    async fn a_changing_tool_keeps_the_marker_before_later_wire_lanes() {
+        let mut request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![Message::system("stable system")],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::new(1, 0, 0));
+        request.tools = vec![
+            ToolSchema {
+                name: "stable".into(),
+                description: "stable schema".into(),
+                input_schema: json!({"type": "object"}),
+            },
+            ToolSchema {
+                name: "changing".into(),
+                description: "changing schema".into(),
+                input_schema: json!({"type": "object"}),
+            },
+        ];
+        let payload = sent_payload(request).await;
+
+        assert_eq!(payload["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert!(payload["tools"][1].get("cache_control").is_none());
+        assert!(payload["system"][0].get("cache_control").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_changing_system_tail_forces_the_authoritative_boundary_to_stay_unmarked() {
+        let request = ProviderRequest::new(
+            ModelId::new("claude-test"),
+            vec![
+                Message::user("stable history"),
+                Message::system("changing system"),
+            ],
+        )
+        .with_cache_boundary(ProviderCacheBoundary::default());
+        let payload = sent_payload(request).await;
+
+        assert!(!payload.to_string().contains("cache_control"));
+        assert_eq!(payload["system"][0]["text"], "changing system");
     }
 
     #[tokio::test]

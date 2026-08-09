@@ -116,6 +116,10 @@ neutral_id!(
     /// Identifies one delegated child session, stable across its lifecycle.
     ChildId
 );
+neutral_id!(
+    /// Identifies one bounded provider-side cache operation.
+    CacheOperationId
+);
 
 #[cfg(test)]
 mod tests {

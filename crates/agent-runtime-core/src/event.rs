@@ -27,8 +27,8 @@ use crate::delegation::WorkspacePolicy;
 use crate::error::RuntimeError;
 use crate::goal::GoalProjection;
 use crate::ids::{
-    AttemptId, ChildId, EventId, InteractionRequestId, QuestionId, RequestId, SessionId, SteerId,
-    ToolCallId, TurnId,
+    AttemptId, CacheOperationId, ChildId, EventId, InteractionRequestId, QuestionId, RequestId,
+    SessionId, SteerId, ToolCallId, TurnId,
 };
 use crate::interaction::{InteractionOutcomeKind, InteractionSensitivity};
 use crate::manifest::{ActivatedCapability, SegmentId, SegmentKind, SummaryCoverage};
@@ -44,7 +44,10 @@ fn default_true() -> bool {
 fn is_true(value: &bool) -> bool {
     *value
 }
-use crate::provider::{FinishReason, ModelId, RateLimitSnapshot};
+use crate::provider::{
+    CacheAvailabilityEvidence, CacheIdentity, FinishReason, ModelId, ProviderAttemptPurpose,
+    RateLimitSnapshot,
+};
 use crate::steer::SteerDiscardReason;
 use crate::usage::UsageRecord;
 
@@ -96,7 +99,10 @@ use crate::usage::UsageRecord;
 ///
 /// Bumped to 13 for presence-aware, attributed cache observations and the
 /// attempt-scoped [`RuntimeEvent::CacheStateChanged`] projection.
-pub const SCHEMA_VERSION: u32 = 13;
+///
+/// Bumped to 14 for exact cache identities, typed synthetic purposes, and the
+/// canonical cache-operation lifecycle variants.
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,10 +188,47 @@ pub enum CacheState {
     WarmObserved,
     /// Provider cache evidence was observed below the comparable expectation.
     MissObserved,
+    /// The provider explicitly reported expiry for this identity.
+    Expired,
+    /// Synthetic maintenance is suspended after an explicit miss/expiry.
+    Suspended,
 }
 
 /// Backwards-friendly name for callers that describe the enum as a kind.
 pub type CacheStateKind = CacheState;
+
+/// Why a canonical cache operation was rejected or suspended. Values are
+/// bounded, redaction-safe mechanism reasons; Smith policy remains outside
+/// the Runtime event vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheOperationReason {
+    Unsupported,
+    MissingConformance,
+    MissingAuthority,
+    InvalidIdentity,
+    BudgetExceeded,
+    Cancelled,
+    DeadlineExceeded,
+    CapabilityChanged,
+    IdentityChanged,
+    CacheMiss,
+    CacheExpired,
+    ProtocolViolation,
+    Shutdown,
+    Conflict,
+}
+
+/// Bounded outcome of one cache operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheOperationOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    Rejected,
+    Suspended,
+}
 
 /// Why compaction ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +623,10 @@ pub enum RuntimeEvent {
         /// journal entries omit this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_plan: Option<Fingerprint>,
+        /// The exact opaque cache identity used by the request. Legacy
+        /// journal entries omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_identity: Option<CacheIdentity>,
         /// Tokens read from cache. `Some(0)` is an explicit provider zero;
         /// `None` means the provider omitted the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,6 +644,9 @@ pub enum RuntimeEvent {
         attempt: AttemptId,
         /// The exact cache-plan fingerprint used by this attempt.
         cache_plan: Fingerprint,
+        /// The exact opaque cache identity used by this attempt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_identity: Option<CacheIdentity>,
         /// The provider-neutral resolved state.
         state: CacheState,
         /// The comparable preserved-prefix expectation. `None` means no prior
@@ -615,6 +665,96 @@ pub enum RuntimeEvent {
         missed_tokens: Option<u64>,
         /// Confidence in the planner's token-count expectation.
         confidence: EstimationConfidence,
+    },
+    /// A bounded cache operation passed Runtime preflight.
+    CacheOperationPrepared {
+        /// Stable operation identity.
+        operation: CacheOperationId,
+        /// Logical request identity, when this operation will stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<RequestId>,
+        /// Exact opaque cache identity.
+        identity: CacheIdentity,
+        /// Typed operation purpose.
+        purpose: ProviderAttemptPurpose,
+    },
+    /// A cache operation was rejected before provider I/O.
+    CacheOperationRejected {
+        /// Stable operation identity.
+        operation: CacheOperationId,
+        /// Logical request allocated for the rejected operation, when one was
+        /// available before provider admission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<RequestId>,
+        /// Provider attempt attribution. Pre-I/O rejection normally has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<AttemptId>,
+        /// Exact opaque cache identity.
+        identity: CacheIdentity,
+        /// Typed operation purpose.
+        purpose: ProviderAttemptPurpose,
+        /// Structured redaction-safe reason.
+        reason: CacheOperationReason,
+    },
+    /// A cache operation crossed its provider admission boundary.
+    CacheOperationStarted {
+        /// Stable operation identity.
+        operation: CacheOperationId,
+        /// Request/attempt attribution when applicable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<RequestId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<AttemptId>,
+        /// Exact opaque cache identity.
+        identity: CacheIdentity,
+        /// Typed operation purpose.
+        purpose: ProviderAttemptPurpose,
+    },
+    /// A cache operation reached a bounded terminal outcome.
+    CacheOperationCompleted {
+        /// Stable operation identity.
+        operation: CacheOperationId,
+        /// Request/attempt attribution when applicable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<RequestId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<AttemptId>,
+        /// Exact opaque cache identity.
+        identity: CacheIdentity,
+        /// Typed operation purpose.
+        purpose: ProviderAttemptPurpose,
+        /// Terminal outcome.
+        outcome: CacheOperationOutcome,
+        /// Optional structured terminal reason. This is used for failures or
+        /// cancellations after `CacheOperationStarted`; pre-I/O admission
+        /// failures continue to use `CacheOperationRejected`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<CacheOperationReason>,
+        /// Bounded aggregate metrics, never raw provider bodies.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metrics: BTreeMap<String, u64>,
+    },
+    /// Normalized provider evidence was recorded before attempt completion.
+    CacheAvailabilityEvidenceRecorded {
+        /// Canonical normalized evidence.
+        evidence: CacheAvailabilityEvidence,
+    },
+    /// Synthetic maintenance for an exact identity was suspended after
+    /// explicit provider evidence.
+    CacheOperationSuspended {
+        /// Logical request that produced the explicit suspension, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<RequestId>,
+        /// Provider attempt that produced the explicit suspension, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<AttemptId>,
+        /// Exact opaque cache identity.
+        identity: CacheIdentity,
+        /// Operation that produced the suspension, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<CacheOperationId>,
+        /// Structured suspension reason.
+        reason: CacheOperationReason,
     },
     /// A server-reported limit-state observation for the credential that
     /// served an attempt. Absent windows mean the provider reported nothing,
@@ -845,6 +985,7 @@ mod tests {
                 request: None,
                 attempt: None,
                 cache_plan: None,
+                cache_identity: None,
                 read_tokens: Some(4),
                 write_tokens: Some(1),
             }
@@ -877,6 +1018,7 @@ mod tests {
                 request: None,
                 attempt: None,
                 cache_plan: None,
+                cache_identity: None,
                 read_tokens: Some(8),
                 write_tokens: Some(0),
             }
@@ -889,6 +1031,7 @@ mod tests {
             request: RequestId::new("req-1"),
             attempt: AttemptId::new("att-1"),
             cache_plan: Fingerprint::of("plan"),
+            cache_identity: None,
             state: CacheState::WarmObserved,
             expected_read_tokens: Some(100),
             observed_read_tokens: Some(100),

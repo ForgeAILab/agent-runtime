@@ -30,13 +30,17 @@ use std::fmt;
 use agent_runtime_core::catalog::ResolvedModelProfile;
 use agent_runtime_core::content::{Message, Role};
 use agent_runtime_core::ids::ToolCallId;
-use agent_runtime_core::provider::ToolSchema;
+use agent_runtime_core::provider::{
+    CacheEndpointIdentity, CacheIdentity, CacheIdentityFragment, CacheIdentityTool,
+    ProviderCacheBoundary, ToolSchema,
+};
+use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
 use crate::budget::{BudgetReport, ContextBudget, ContextError, ContextPolicy};
 use crate::cache::{CachePlan, ProviderCacheCapability};
 use crate::compaction::{CompactionError, CompactionResult, validate_compacted};
 use crate::fragment::{ContextFragment, FragmentContent, FragmentKind};
-use crate::plan::{ContextPlan, PlanSegment};
+use crate::plan::{ContextPlan, PlanInputs, PlanSegment};
 use crate::sizing::{EstimationConfidence, RequestSizer};
 
 /// Where the compaction author plugs in, without changing
@@ -66,6 +70,8 @@ pub struct ContextPlanner<'a> {
     policy: ContextPolicy,
     budget: ContextBudget,
     compactor: Option<&'a dyn Compactor>,
+    cache_endpoint_identity: Option<CacheEndpointIdentity>,
+    cache_session_partition: Option<Fingerprint>,
 }
 
 impl<'a> ContextPlanner<'a> {
@@ -83,6 +89,8 @@ impl<'a> ContextPlanner<'a> {
             policy,
             budget,
             compactor: None,
+            cache_endpoint_identity: None,
+            cache_session_partition: None,
         }
     }
 
@@ -90,6 +98,22 @@ impl<'a> ContextPlanner<'a> {
     /// documentation for the exact contract.
     pub fn with_compactor(mut self, compactor: &'a dyn Compactor) -> Self {
         self.compactor = Some(compactor);
+        self
+    }
+
+    /// Supplies the host-owned opaque endpoint/partition identity used when
+    /// constructing provider cache identities. The endpoint URL, tenant, and
+    /// credentials never enter the planner or its events.
+    pub fn with_cache_endpoint_identity(mut self, identity: CacheEndpointIdentity) -> Self {
+        self.cache_endpoint_identity = Some(identity);
+        self
+    }
+
+    /// Attaches the host/runtime session partition used for the provider wire
+    /// cache key. It is kept separate from endpoint identity so endpoint
+    /// changes and session isolation remain independently auditable.
+    pub fn with_cache_session_partition(mut self, partition: Fingerprint) -> Self {
+        self.cache_session_partition = Some(partition);
         self
     }
 
@@ -113,21 +137,254 @@ impl<'a> ContextPlanner<'a> {
         capability: &ProviderCacheCapability,
         previous: Option<&CachePlan>,
     ) -> Result<ContextPlan, ContextError> {
+        self.plan_with_cache_and_revisions(
+            fragments,
+            compactor,
+            capability,
+            previous,
+            PlanInputs::new(),
+        )
+    }
+
+    /// Plans and attaches the redaction-safe revisions before computing the
+    /// exact cache identity. Runtime-owned registry/view/activation changes
+    /// are therefore part of identity correlation, not a post-hoc plan
+    /// fingerprint decoration.
+    pub fn plan_with_cache_and_revisions(
+        &self,
+        fragments: Vec<ContextFragment>,
+        compactor: Option<&dyn Compactor>,
+        capability: &ProviderCacheCapability,
+        previous: Option<&CachePlan>,
+        revisions: PlanInputs,
+    ) -> Result<ContextPlan, ContextError> {
+        // The normalized contract is authoritative for identity, boundary,
+        // and expectation decisions. A manually assembled capability with
+        // contradictory legacy fields must not influence any of them.
+        let capability = capability.validated_or_none();
         let planner = ContextPlanner {
             profile: self.profile,
             sizer: self.sizer,
             policy: self.policy.clone(),
             budget: self.budget,
             compactor,
+            cache_endpoint_identity: self.cache_endpoint_identity.clone(),
+            cache_session_partition: self.cache_session_partition.clone(),
         };
-        let plan = planner.plan(fragments)?;
-        let cache_plan = CachePlan::build(
+        let plan = planner.plan(fragments)?.with_extra_revisions(revisions);
+        let endpoint_missing = capability.contract.behavior.supports_stable_prefix()
+            && self.cache_endpoint_identity.is_none();
+        let cache_identity = self.cache_identity(&plan, &capability);
+        // Constructors for the public identity components remain infallible
+        // for compatibility, so the completed identity is the first point
+        // where the planner can enforce the persistence/provider boundary.
+        // Fail before attaching a cache plan: an invalid identity must not
+        // reach a manifest, lifecycle event, or provider adapter.
+        cache_identity
+            .validate()
+            .map_err(ContextError::invalid_cache_identity)?;
+        let mut cache_plan = CachePlan::build_with_identity(
             self.profile.fingerprint(),
+            cache_identity,
             plan.segments(),
             previous,
-            capability,
+            &capability,
         );
+        if endpoint_missing {
+            // A stable provider identity without the host's endpoint/tenant
+            // partition is not safely addressable. Keep local structural
+            // reuse, but suppress the provider identity, marker expectation,
+            // and future baseline instead of routing through a profile-only
+            // fallback.
+            cache_plan.suppress_provider_expectation();
+        }
+        if cache_plan.declared_stable_prefix_len > 0
+            && !plan
+                .cache_boundary()
+                .is_some_and(|boundary| boundary.has_stable_prefix())
+        {
+            // The authoritative boundary made the structural prefix
+            // impossible to mark exactly. Do not turn that structural match
+            // into an expected provider read or a false miss for any provider
+            // behavior; the request is deliberately unmarked and remains
+            // evidence-unknown.
+            cache_plan.suppress_provider_expectation();
+        }
         Ok(plan.with_cache_plan(cache_plan))
+    }
+
+    /// Constructs the one exact, opaque provider identity for a plan. The
+    /// profile fallback is used only for an unsupported projection;
+    /// supported provider identities are suppressed above when the host has
+    /// not supplied an endpoint partition.
+    fn cache_identity(
+        &self,
+        plan: &ContextPlan,
+        capability: &ProviderCacheCapability,
+    ) -> CacheIdentity {
+        self.cache_identity_with_endpoint(
+            plan,
+            capability,
+            self.cache_endpoint_identity.clone().unwrap_or_else(|| {
+                CacheEndpointIdentity::from_opaque(
+                    self.profile.provider.as_bytes(),
+                    RegistryRevision::new("profile-default"),
+                )
+            }),
+        )
+    }
+
+    /// Constructs a cache identity using a host-supplied endpoint digest and
+    /// revision while retaining the planner's canonical prefix/tool inputs.
+    pub fn cache_identity_with_endpoint(
+        &self,
+        plan: &ContextPlan,
+        capability: &ProviderCacheCapability,
+        endpoint: CacheEndpointIdentity,
+    ) -> CacheIdentity {
+        let capability = capability.validated_or_none();
+        let stable_tool_count = plan
+            .segments()
+            .iter()
+            .take_while(|segment| segment.cache_class == crate::fragment::CacheClass::Stable)
+            .filter(|segment| segment.kind == FragmentKind::ToolSchema)
+            .count();
+        let mut builder =
+            CacheIdentity::builder(
+                self.profile.provider.clone(),
+                self.profile.model.clone(),
+                endpoint.clone(),
+                capability.revision.clone(),
+                self.profile.fingerprint(),
+            )
+            .cache_control(capability.contract.behavior.to_prompt_cache_control())
+            .stable_prefix(
+                plan.segments()
+                    .iter()
+                    .take_while(|segment| {
+                        segment.cache_class == crate::fragment::CacheClass::Stable
+                    })
+                    .map(|segment| {
+                        CacheIdentityFragment::new(
+                            segment.fragment.as_str(),
+                            segment.content_hash.clone(),
+                        )
+                    }),
+            )
+            .tools(plan.tools().iter().take(stable_tool_count).enumerate().map(
+                |(ordinal, tool)| {
+                    CacheIdentityTool::new(
+                        tool.name.clone(),
+                        tool.description.as_bytes(),
+                        tool.input_schema.to_string().as_bytes(),
+                        ordinal as u32,
+                    )
+                },
+            ));
+        if let Some(tokenizer) = &self.profile.tokenizer {
+            builder = builder.tokenizer_revision(tokenizer.revision.clone());
+        }
+        if let Some(adapter) = &self.profile.request_adapter {
+            builder = builder.request_adapter_revision(adapter.revision.clone());
+        }
+        let mut registry_snapshot = None;
+        let mut scoped_view = None;
+        let mut activation = None;
+        let mut harness = None;
+        // Keep a bounded, ordered projection of the committed history that
+        // actually belongs to the stable leading prefix. The active
+        // Ephemeral tail is intentionally excluded even when it has a
+        // `history:<n>` fragment id.
+        let history = plan
+            .segments()
+            .iter()
+            .take_while(|segment| segment.cache_class == crate::fragment::CacheClass::Stable)
+            .filter(|segment| segment.kind == FragmentKind::History)
+            .map(|segment| {
+                CacheIdentityFragment::new(segment.fragment.as_str(), segment.content_hash.clone())
+            })
+            .collect::<Vec<_>>();
+        for (name, revision) in plan.plan_inputs().revisions() {
+            let fingerprint = agent_runtime_registry::Fingerprint::of(revision);
+            match name {
+                "registry_snapshot" => registry_snapshot = Some(fingerprint),
+                "scoped_view" => scoped_view = Some(fingerprint),
+                "activation" => activation = Some(fingerprint),
+                "harness_pipeline" => harness = Some(fingerprint),
+                _ if name.starts_with("history:") => {}
+                _ => {}
+            }
+        }
+        let cache_policy_revision = self
+            .profile
+            .cache_policy
+            .as_ref()
+            .map(|component| component.revision.clone())
+            .or_else(|| Some(capability.revision.clone()));
+        // OpenAI-compatible adapters combine this routing key with the
+        // provider's exact prompt-prefix hash. Keep the key stable when only
+        // prompt content changes (stable-prefix fragments, tools, or history)
+        // so appending a turn does not strand the previous prefix, while
+        // partitioning every endpoint/session/model/contract revision that
+        // must not share provider state. The complete CacheIdentity remains
+        // on the request and in Runtime evidence for exact correlation.
+        let mut provider_key_fields = vec![
+            format!("provider={}", self.profile.provider),
+            format!("model={}", self.profile.model.as_str()),
+            format!("profile={}", self.profile.fingerprint().as_str()),
+            format!("endpoint_digest={}", endpoint.digest.as_str()),
+            format!("endpoint_revision={}", endpoint.revision.as_str()),
+            format!(
+                "adapter_partition_revision={}",
+                capability.revision.as_str()
+            ),
+            format!(
+                "cache_control={:?}",
+                capability.contract.behavior.to_prompt_cache_control()
+            ),
+        ];
+        if let Some(partition) = &self.cache_session_partition {
+            provider_key_fields.push(format!("session_partition={}", partition.as_str()));
+        }
+        if let Some(tokenizer) = &self.profile.tokenizer {
+            provider_key_fields.push(format!("tokenizer_revision={}", tokenizer.revision));
+        }
+        if let Some(adapter) = &self.profile.request_adapter {
+            provider_key_fields.push(format!("request_adapter_revision={}", adapter.revision));
+        }
+        if let Some(key_revision) = &capability.contract.key_revision {
+            provider_key_fields.push(format!("key_revision={}", key_revision));
+        }
+        if let Some(resource) = &capability.resource_identity {
+            provider_key_fields.push(format!("resource_digest={}", resource.digest.as_str()));
+            provider_key_fields.push(format!("resource_revision={}", resource.revision));
+        }
+        for (name, revision) in [
+            ("registry_snapshot", registry_snapshot.as_ref()),
+            ("scoped_view", scoped_view.as_ref()),
+            ("activation", activation.as_ref()),
+            ("harness_pipeline", harness.as_ref()),
+        ] {
+            if let Some(revision) = revision {
+                provider_key_fields.push(format!("{name}={}", revision.as_str()));
+            }
+        }
+        if let Some(revision) = &cache_policy_revision {
+            provider_key_fields.push(format!("cache_policy_revision={revision}"));
+        }
+        let provider_key = agent_runtime_registry::Fingerprint::of_fields(provider_key_fields);
+        builder = builder.provider_key(provider_key);
+        if let Some(key_revision) = &capability.contract.key_revision {
+            builder = builder.breakpoint_revision(key_revision.clone());
+        }
+        if let Some(resource) = &capability.resource_identity {
+            builder = builder.resource(resource.clone());
+        }
+        builder = builder
+            .registry_revisions(registry_snapshot, scoped_view, activation)
+            .runtime_revisions(harness, cache_policy_revision)
+            .stable_history(history);
+        builder.build()
     }
 
     /// Compiles `fragments` into an immutable plan.
@@ -248,7 +505,7 @@ impl<'a> ContextPlanner<'a> {
             }
         }
 
-        let messages = merge_into_messages(&fragments);
+        let (messages, cache_boundary) = merge_into_messages(&fragments);
         let tools = collect_tools(&fragments);
         let segments = fragments
             .iter()
@@ -262,13 +519,15 @@ impl<'a> ContextPlanner<'a> {
             })
             .collect();
 
-        Ok(ContextPlan::new(
+        let plan = ContextPlan::new(
             messages,
             tools,
             segments,
             report,
             self.profile.fingerprint(),
-        ))
+        )
+        .with_cache_boundary(cache_boundary);
+        Ok(plan)
     }
 }
 
@@ -325,40 +584,114 @@ pub(crate) fn validate_pairing(fragments: &[ContextFragment]) -> Result<(), Cont
     Ok(())
 }
 
-/// Merges system/developer/ability instruction text into one leading system
-/// message (fragments of those kinds always sort first, so this is a single
-/// forward pass), passes message fragments through unchanged, and wraps any
-/// other text fragment in its own message via [`default_role_for`].
-fn merge_into_messages(fragments: &[ContextFragment]) -> Vec<Message> {
-    // Tool-schema fragments do not produce messages and therefore must not
-    // act as an instruction flush boundary. Collect every instruction in
-    // canonical fragment order first so an explicitly later ability section
-    // cannot disappear merely because a schema preceded it in the capability
-    // lane.
-    let instruction_parts: Vec<&str> = fragments
+/// Merges instruction text into separate stable and changing system blocks,
+/// passes message fragments through unchanged, wraps other text fragments in
+/// their default role, and derives the count-only provider cache boundary
+/// from the same canonical fragment sequence. Keeping the rendering and
+/// boundary derivation together prevents a caller from reconstructing a
+/// marker position from redacted prompt content.
+fn merge_into_messages(fragments: &[ContextFragment]) -> (Vec<Message>, ProviderCacheBoundary) {
+    let stable_prefix_len = fragments
         .iter()
-        .filter(|fragment| is_instruction_kind(fragment.kind))
-        .filter_map(|fragment| match &fragment.content {
+        .take_while(|fragment| fragment.cache_class == crate::fragment::CacheClass::Stable)
+        .count();
+    let mut stable_instruction_parts = Vec::new();
+    let mut changing_instruction_parts = Vec::new();
+    for (index, fragment) in fragments.iter().enumerate() {
+        if !is_instruction_kind(fragment.kind) {
+            continue;
+        }
+        let Some(text) = (match &fragment.content {
             FragmentContent::Text(text) => Some(text.as_str()),
             _ => None,
-        })
-        .collect();
-    let mut messages = Vec::new();
-    flush_instructions(&mut messages, &instruction_parts);
+        }) else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if index < stable_prefix_len {
+            stable_instruction_parts.push(text);
+        } else {
+            changing_instruction_parts.push(text);
+        }
+    }
 
-    for fragment in fragments {
+    let mut messages = Vec::new();
+    flush_instructions(&mut messages, &stable_instruction_parts);
+    flush_instructions(&mut messages, &changing_instruction_parts);
+
+    let mut stable_tool_count = fragments[..stable_prefix_len]
+        .iter()
+        .filter(|fragment| matches!(fragment.content, FragmentContent::Tool(_)))
+        .count();
+    let changing_tool = fragments[stable_prefix_len..]
+        .iter()
+        .any(|fragment| matches!(fragment.content, FragmentContent::Tool(_)));
+    let mut stable_system_block_count = usize::from(!stable_instruction_parts.is_empty());
+    let mut stable_message_count = 0usize;
+    let mut changing_system_block = !changing_instruction_parts.is_empty();
+
+    for (index, fragment) in fragments.iter().enumerate() {
         if is_instruction_kind(fragment.kind) {
             continue;
         }
+        let stable = index < stable_prefix_len;
         match &fragment.content {
-            FragmentContent::Message(message) => messages.push(message.clone()),
+            FragmentContent::Message(message) => {
+                if stable {
+                    if message.role == Role::System {
+                        if !message.joined_text().trim().is_empty() {
+                            stable_system_block_count += 1;
+                        }
+                    } else {
+                        stable_message_count += 1;
+                    }
+                } else if message.role == Role::System && !message.joined_text().trim().is_empty() {
+                    changing_system_block = true;
+                }
+                messages.push(message.clone());
+            }
             FragmentContent::Text(text) => {
-                messages.push(Message::text(default_role_for(fragment.kind), text.clone()))
+                let role = default_role_for(fragment.kind);
+                if stable && !text.trim().is_empty() {
+                    if role == Role::System {
+                        stable_system_block_count += 1;
+                    } else {
+                        stable_message_count += 1;
+                    }
+                } else if role == Role::System && !text.trim().is_empty() {
+                    changing_system_block = true;
+                }
+                messages.push(Message::text(role, text.clone()));
             }
             FragmentContent::Tool(_) => {}
         }
     }
-    messages
+
+    // Anthropic moves all tools before system and all system blocks before
+    // ordinary history. If that reordering would force any changing item
+    // ahead of a nominally stable later lane, no marker can represent the
+    // complete CacheIdentity. Fail closed for the whole request rather than
+    // marking a smaller prefix while attaching the larger identity.
+    let boundary_is_exact = !(changing_system_block && stable_message_count > 0)
+        && !(changing_tool && (stable_system_block_count > 0 || stable_message_count > 0));
+    if !boundary_is_exact {
+        stable_tool_count = 0;
+        stable_system_block_count = 0;
+        stable_message_count = 0;
+    }
+
+    let boundary = ProviderCacheBoundary::new(
+        count_as_u32(stable_tool_count),
+        count_as_u32(stable_system_block_count),
+        count_as_u32(stable_message_count),
+    );
+    (messages, boundary)
+}
+
+fn count_as_u32(count: usize) -> u32 {
+    count.min(u32::MAX as usize) as u32
 }
 
 fn flush_instructions(messages: &mut Vec<Message>, parts: &[&str]) {
@@ -407,11 +740,14 @@ mod tests {
 
     use agent_runtime_core::catalog::{Modality, ModelLimits, ResolvedModelProfile};
     use agent_runtime_core::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock};
-    use agent_runtime_core::provider::{Capabilities, ModelId};
-    use agent_runtime_registry::RegistryRevision;
+    use agent_runtime_core::provider::{
+        CacheEndpointIdentity, Capabilities, ModelId, PromptCacheControl, ProviderCacheBehavior,
+        ProviderCacheBoundary, ToolSchema,
+    };
+    use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
     use crate::budget::ContextErrorKind;
-    use crate::fragment::{ContextLane, ContextPosition, FragmentSource};
+    use crate::fragment::{CacheClass, ContextLane, ContextPosition, FragmentSource};
     use crate::sizing::CharRatioSizer;
 
     fn profile(
@@ -617,6 +953,334 @@ mod tests {
         assert!(joined.contains("be helpful"));
         assert!(joined.contains("be terse"));
         assert!(joined.contains("use the search tool"));
+    }
+
+    #[test]
+    fn stable_and_no_cache_instructions_render_as_separate_blocks() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let plan = planner
+            .plan(vec![
+                text_fragment("tail", FragmentKind::DeveloperInstruction, "do not cache")
+                    .with_cache_class(CacheClass::NoCache),
+                text_fragment("stable", FragmentKind::SystemInstruction, "stable policy"),
+            ])
+            .unwrap();
+
+        assert_eq!(plan.messages().len(), 2);
+        assert_eq!(plan.messages()[0].joined_text(), "stable policy");
+        assert_eq!(plan.messages()[1].joined_text(), "do not cache");
+        assert_eq!(
+            plan.cache_boundary(),
+            Some(ProviderCacheBoundary::new(0, 1, 0))
+        );
+        assert_eq!(
+            plan.to_provider_request(ModelId::new("test-model"))
+                .cache_boundary,
+            plan.cache_boundary()
+        );
+    }
+
+    #[test]
+    fn stable_history_boundary_excludes_an_ephemeral_tail() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let history = ContextFragment::new(
+            "history",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("history-1"),
+            FragmentContent::Message(Message::user("stable history")),
+        );
+        let tail = text_fragment("tail", FragmentKind::UserInput, "current input")
+            .with_cache_class(CacheClass::Ephemeral);
+        let plan = planner.plan(vec![tail, history]).unwrap();
+
+        assert_eq!(plan.messages().len(), 2);
+        assert_eq!(plan.messages()[0], Message::user("stable history"));
+        assert_eq!(plan.messages()[1], Message::user("current input"));
+        assert_eq!(
+            plan.cache_boundary(),
+            Some(ProviderCacheBoundary::new(0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn a_later_changing_system_block_prevents_a_history_marker() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let history = ContextFragment::new(
+            "history",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("history-1"),
+            FragmentContent::Message(Message::user("stable history")),
+        )
+        .with_position(ContextPosition::new(ContextLane::Conversation, 0));
+        let system_tail = text_fragment("system-tail", FragmentKind::Memory, "changing system")
+            .with_position(ContextPosition::new(ContextLane::Conversation, 1))
+            .with_cache_class(CacheClass::NoCache);
+        let plan = planner.plan(vec![history, system_tail]).unwrap();
+
+        assert_eq!(plan.messages().len(), 2);
+        assert_eq!(
+            plan.cache_boundary(),
+            Some(ProviderCacheBoundary::default())
+        );
+    }
+
+    #[test]
+    fn stable_tools_and_system_use_the_system_lane_as_the_last_boundary() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let tool = ToolSchema {
+            name: "search".into(),
+            description: "search".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let plan = planner
+            .plan(vec![
+                ContextFragment::new(
+                    "tool",
+                    FragmentKind::ToolSchema,
+                    FragmentSource::Host,
+                    RegistryRevision::new("tool-1"),
+                    FragmentContent::Tool(Box::new(tool.clone())),
+                ),
+                text_fragment("system", FragmentKind::SystemInstruction, "stable system"),
+            ])
+            .unwrap();
+
+        assert_eq!(plan.tools(), &[tool]);
+        assert_eq!(plan.messages().len(), 1);
+        assert_eq!(
+            plan.cache_boundary(),
+            Some(ProviderCacheBoundary::new(1, 1, 0))
+        );
+    }
+
+    #[test]
+    fn changing_tool_forces_later_lanes_closed_and_stays_out_of_identity() {
+        use crate::cache::ProviderCacheCapability;
+
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0)).with_cache_endpoint_identity(
+            CacheEndpointIdentity::from_opaque(
+                "test-endpoint",
+                RegistryRevision::new("endpoint-1"),
+            ),
+        );
+        let capability =
+            ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test-provider");
+        let fragments = |changing_description: &str| {
+            vec![
+                ContextFragment::new(
+                    "a-stable-tool",
+                    FragmentKind::ToolSchema,
+                    FragmentSource::Host,
+                    RegistryRevision::new("tool-1"),
+                    FragmentContent::Tool(Box::new(ToolSchema {
+                        name: "stable".into(),
+                        description: "stable schema".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    })),
+                ),
+                ContextFragment::new(
+                    "z-changing-tool",
+                    FragmentKind::ToolSchema,
+                    FragmentSource::Host,
+                    RegistryRevision::new("tool-1"),
+                    FragmentContent::Tool(Box::new(ToolSchema {
+                        name: "changing".into(),
+                        description: changing_description.into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    })),
+                )
+                .with_cache_class(CacheClass::NoCache),
+                text_fragment("system", FragmentKind::SystemInstruction, "stable system"),
+            ]
+        };
+
+        let first = planner
+            .plan_with_cache(fragments("tail-a"), None, &capability, None)
+            .unwrap();
+        let representable = vec![
+            ContextFragment::new(
+                "a-stable-tool",
+                FragmentKind::ToolSchema,
+                FragmentSource::Host,
+                RegistryRevision::new("tool-1"),
+                FragmentContent::Tool(Box::new(ToolSchema {
+                    name: "stable".into(),
+                    description: "stable schema".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                })),
+            ),
+            text_fragment("system", FragmentKind::SystemInstruction, "stable system"),
+        ];
+        let second = planner
+            .plan_with_cache(representable.clone(), None, &capability, first.cache_plan())
+            .unwrap();
+
+        assert_eq!(
+            first.cache_boundary(),
+            Some(ProviderCacheBoundary::default())
+        );
+        assert_eq!(first.cache_plan().unwrap().expected_read_tokens(), None);
+        assert_eq!(
+            second.cache_plan().unwrap().expected_read_tokens(),
+            None,
+            "an unmarked request must not seed the next provider expectation"
+        );
+        let third = planner
+            .plan_with_cache(representable, None, &capability, second.cache_plan())
+            .unwrap();
+        assert_eq!(
+            third.cache_plan().unwrap().expected_read_tokens(),
+            Some(u64::from(
+                third.cache_plan().unwrap().preserved_prefix_tokens
+            )),
+            "the representable request establishes the next baseline only after it is itself a predecessor"
+        );
+    }
+
+    #[test]
+    fn implicit_provider_all_zero_boundary_cannot_seed_a_later_expectation() {
+        use crate::cache::ProviderCacheCapability;
+
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0)).with_cache_endpoint_identity(
+            CacheEndpointIdentity::from_opaque(
+                "test-endpoint",
+                RegistryRevision::new("endpoint-1"),
+            ),
+        );
+        let capability = ProviderCacheCapability::from_control(
+            RegistryRevision::new("cache-implicit-1"),
+            "test-provider",
+            PromptCacheControl::Implicit,
+        );
+        let unmarked = || {
+            vec![
+                ContextFragment::new(
+                    "a-stable-tool",
+                    FragmentKind::ToolSchema,
+                    FragmentSource::Host,
+                    RegistryRevision::new("tool-1"),
+                    FragmentContent::Tool(Box::new(ToolSchema {
+                        name: "stable".into(),
+                        description: "stable schema".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    })),
+                ),
+                ContextFragment::new(
+                    "z-changing-tool",
+                    FragmentKind::ToolSchema,
+                    FragmentSource::Host,
+                    RegistryRevision::new("tool-1"),
+                    FragmentContent::Tool(Box::new(ToolSchema {
+                        name: "changing".into(),
+                        description: "changing schema".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    })),
+                )
+                .with_cache_class(CacheClass::NoCache),
+                text_fragment("system", FragmentKind::SystemInstruction, "stable system"),
+            ]
+        };
+        let representable = || {
+            vec![
+                ContextFragment::new(
+                    "a-stable-tool",
+                    FragmentKind::ToolSchema,
+                    FragmentSource::Host,
+                    RegistryRevision::new("tool-1"),
+                    FragmentContent::Tool(Box::new(ToolSchema {
+                        name: "stable".into(),
+                        description: "stable schema".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    })),
+                ),
+                text_fragment("system", FragmentKind::SystemInstruction, "stable system"),
+            ]
+        };
+
+        let first = planner
+            .plan_with_cache(unmarked(), None, &capability, None)
+            .unwrap();
+        assert_eq!(
+            first.cache_boundary(),
+            Some(ProviderCacheBoundary::default())
+        );
+        let first_cache = first.cache_plan().expect("first cache plan");
+        assert_eq!(first_cache.expected_read_tokens(), None);
+        assert!(!first_cache.provider_baseline_available);
+        assert!(
+            first_cache.cache_identity().is_none(),
+            "an authoritative all-zero boundary must suppress implicit provider identity"
+        );
+
+        let second = planner
+            .plan_with_cache(representable(), None, &capability, first.cache_plan())
+            .unwrap();
+        let second_cache = second.cache_plan().expect("second cache plan");
+        assert!(second_cache.provider_baseline_available);
+        assert_eq!(
+            second_cache.expected_read_tokens(),
+            None,
+            "the unmarked implicit request must not seed B's provider expectation"
+        );
+
+        let third = planner
+            .plan_with_cache(representable(), None, &capability, second.cache_plan())
+            .unwrap();
+        let third_cache = third.cache_plan().expect("third cache plan");
+        assert_eq!(
+            third_cache.expected_read_tokens(),
+            Some(u64::from(third_cache.preserved_prefix_tokens)),
+            "only the representable B request can seed C's expectation"
+        );
+    }
+
+    #[test]
+    fn stable_history_projection_uses_fragment_kind_not_id_prefix() {
+        use crate::cache::ProviderCacheCapability;
+
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0)).with_cache_endpoint_identity(
+            CacheEndpointIdentity::from_opaque(
+                "test-endpoint",
+                RegistryRevision::new("endpoint-1"),
+            ),
+        );
+        let capability =
+            ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test-provider");
+        let plan = planner
+            .plan_with_cache(
+                vec![
+                    text_fragment("memo", FragmentKind::History, "committed"),
+                    text_fragment("history:misclassified", FragmentKind::Memory, "memory"),
+                ],
+                None,
+                &capability,
+                None,
+            )
+            .unwrap();
+        let identity = plan
+            .cache_plan()
+            .and_then(|cache| cache.cache_identity())
+            .expect("exact cache identity");
+        let wire = serde_json::to_value(identity).expect("identity serializes");
+        let history = wire["stable_history"].as_array().expect("history array");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["id"], "memo");
     }
 
     #[test]
@@ -913,6 +1577,249 @@ mod tests {
 
         assert!(plan.cache_plan().is_some());
         assert!(!plan.compaction_outcome().is_noop());
+    }
+
+    #[test]
+    fn plan_with_cache_rejects_an_oversized_fragment_identity_before_attachment() {
+        use crate::cache::ProviderCacheCapability;
+
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let capability =
+            ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test-provider");
+        let oversized_id = format!("fragment-{}", "x".repeat(128));
+
+        let error = planner
+            .plan_with_cache(
+                vec![text_fragment(
+                    &oversized_id,
+                    FragmentKind::SystemInstruction,
+                    "stable",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .expect_err("unbounded fragment ids must fail closed");
+
+        assert_eq!(error.kind, ContextErrorKind::InvalidCacheIdentity);
+        assert!(error.message.contains("stable fragment id"));
+    }
+
+    #[test]
+    fn plan_with_cache_rejects_an_unsafe_profile_provider_before_attachment() {
+        use crate::cache::ProviderCacheCapability;
+
+        let mut p = profile(10_000, 10_000, 100);
+        p.provider = "provider/with-raw?tenant=value".to_owned();
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let capability =
+            ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test-provider");
+
+        let error = planner
+            .plan_with_cache(
+                vec![text_fragment(
+                    "system",
+                    FragmentKind::SystemInstruction,
+                    "stable",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .expect_err("raw provider labels must fail closed");
+
+        assert_eq!(error.kind, ContextErrorKind::InvalidCacheIdentity);
+        assert!(error.message.contains("provider"));
+    }
+
+    #[test]
+    fn plan_with_cache_rejects_an_unsafe_cache_revision_before_attachment() {
+        use crate::cache::ProviderCacheCapability;
+
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let capability = ProviderCacheCapability::full(
+            RegistryRevision::new("cache/revision-with-raw-input"),
+            "test-provider",
+        );
+
+        let error = planner
+            .plan_with_cache(
+                vec![text_fragment(
+                    "system",
+                    FragmentKind::SystemInstruction,
+                    "stable",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .expect_err("unsafe revisions must fail closed");
+
+        assert_eq!(error.kind, ContextErrorKind::InvalidCacheIdentity);
+        assert!(error.message.contains("adapter partition revision"));
+    }
+
+    #[test]
+    fn contradictory_capability_is_normalized_before_identity_and_boundary() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let mut capability =
+            ProviderCacheCapability::full(RegistryRevision::new("cache-contradictory"), "test");
+        capability.supports_stable = false;
+
+        let plan = planner
+            .plan_with_cache(
+                vec![text_fragment(
+                    "system",
+                    FragmentKind::SystemInstruction,
+                    "stable",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .expect("contradictory declarations fail closed to ordinary planning");
+        let cache = plan.cache_plan().expect("cache plan remains structural");
+        assert_eq!(
+            cache.provider_cache.capability.contract.behavior,
+            ProviderCacheBehavior::Unsupported
+        );
+        assert!(cache.cache_identity().is_none());
+        assert_eq!(cache.expected_read_tokens(), None);
+    }
+
+    #[test]
+    fn stable_cache_without_a_host_endpoint_is_suppressed_not_routed_by_profile() {
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let capability =
+            ProviderCacheCapability::full(RegistryRevision::new("cache-without-endpoint"), "test");
+
+        let plan = planner
+            .plan_with_cache(
+                vec![text_fragment(
+                    "system",
+                    FragmentKind::SystemInstruction,
+                    "stable",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .expect("ordinary execution remains available without cache partition input");
+        let cache = plan.cache_plan().expect("cache plan remains structural");
+        assert!(cache.cache_identity().is_none());
+        assert!(!cache.provider_baseline_available);
+        assert_eq!(cache.expected_read_tokens(), None);
+        assert!(
+            plan.to_provider_request(ModelId::new("test-model"))
+                .cache_identity
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn routing_key_isolated_by_endpoint_and_session_but_stable_for_prefix_changes() {
+        use crate::cache::ProviderCacheCapability;
+
+        let p = profile(10_000, 10_000, 100);
+        let sizer = CharRatioSizer::default();
+        let capability = ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test");
+        let endpoint_a =
+            CacheEndpointIdentity::from_opaque("endpoint-a", RegistryRevision::new("endpoint-1"));
+
+        let planner_a = ContextPlanner::new(&p, &sizer, policy(100, 0))
+            .with_cache_endpoint_identity(endpoint_a.clone())
+            .with_cache_session_partition(Fingerprint::of("session-a"));
+        let first = planner_a
+            .plan_with_cache(
+                vec![text_fragment(
+                    "sys",
+                    FragmentKind::SystemInstruction,
+                    "stable-v1",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .unwrap();
+        let second = planner_a
+            .plan_with_cache(
+                vec![text_fragment(
+                    "sys",
+                    FragmentKind::SystemInstruction,
+                    "stable-v2",
+                )],
+                None,
+                &capability,
+                first.cache_plan(),
+            )
+            .unwrap();
+
+        let first_identity = first.cache_plan().unwrap().cache_identity().unwrap();
+        let second_identity = second.cache_plan().unwrap().cache_identity().unwrap();
+        assert_ne!(first_identity.digest(), second_identity.digest());
+        assert_eq!(
+            first_identity.wire_cache_key(),
+            second_identity.wire_cache_key()
+        );
+
+        let session_b = ContextPlanner::new(&p, &sizer, policy(100, 0))
+            .with_cache_endpoint_identity(endpoint_a)
+            .with_cache_session_partition(Fingerprint::of("session-b"))
+            .plan_with_cache(
+                vec![text_fragment(
+                    "sys",
+                    FragmentKind::SystemInstruction,
+                    "stable-v1",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .unwrap();
+        let endpoint_b = ContextPlanner::new(&p, &sizer, policy(100, 0))
+            .with_cache_endpoint_identity(CacheEndpointIdentity::from_opaque(
+                "endpoint-b",
+                RegistryRevision::new("endpoint-1"),
+            ))
+            .with_cache_session_partition(Fingerprint::of("session-a"))
+            .plan_with_cache(
+                vec![text_fragment(
+                    "sys",
+                    FragmentKind::SystemInstruction,
+                    "stable-v1",
+                )],
+                None,
+                &capability,
+                None,
+            )
+            .unwrap();
+        assert_ne!(
+            first_identity.wire_cache_key(),
+            session_b
+                .cache_plan()
+                .unwrap()
+                .cache_identity()
+                .unwrap()
+                .wire_cache_key()
+        );
+        assert_ne!(
+            first_identity.wire_cache_key(),
+            endpoint_b
+                .cache_plan()
+                .unwrap()
+                .cache_identity()
+                .unwrap()
+                .wire_cache_key()
+        );
     }
 
     #[test]

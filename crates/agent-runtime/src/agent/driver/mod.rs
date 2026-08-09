@@ -44,8 +44,9 @@ use agent_runtime_core::interaction::{
 };
 use agent_runtime_core::manifest::{ActivatedCapability, SegmentId, SegmentKind, SummaryCoverage};
 use agent_runtime_core::provider::{
-    FinishReason, Provider, ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest,
-    ProviderStreamEvent, ToolChoice, UnsupportedFeature,
+    CacheAvailabilityEvidence, CacheEvidenceKind, CacheIdentity, CacheRefreshCause, FinishReason,
+    Provider, ProviderAttemptPurpose, ProviderCallContext, ProviderError, ProviderErrorKind,
+    ProviderRequest, ProviderStreamEvent, ToolChoice, UnsupportedFeature,
 };
 use agent_runtime_core::provider_credential::ProviderCredentialRecovery;
 use agent_runtime_core::steer::{SteerDiscardReason, SteerLimits};
@@ -59,6 +60,7 @@ use agent_runtime_registry::{Fingerprint, RegistryRevision};
 use crate::agent::assembler::ToolCallAssembler;
 use crate::agent::config::LoopConfig;
 use crate::agent::planning::{PreviousCacheRestore, RunPlanner};
+use crate::cache::CacheMechanism;
 use crate::harness::{
     CAPABILITY_SEARCH_TOOL_NAME, ContextView, HarnessPipeline, HistoryProjection, HistoryView,
     LiveAbilityRuntime, ModelView, QUESTIONNAIRE_TOOL_NAME, ToolOutputView, TurnCommitView,
@@ -67,6 +69,7 @@ use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
 use crate::runtime::emitter::EventEmitter;
 use crate::runtime::inject::InjectionQueue;
+use crate::runtime::session::TurnAcceptance;
 use crate::runtime::state::{SessionExecutionContext, SessionState};
 use crate::runtime::steer::{DrainOrClose, SteerEntry, SteerMailbox};
 use crate::tool::ToolExecutor;
@@ -411,6 +414,7 @@ fn strip_stale_reasoning(history: &mut Vec<Message>) {
 #[derive(Debug, Clone)]
 pub struct Driver {
     provider: Arc<dyn Provider>,
+    pub(crate) cache: Arc<CacheMechanism>,
     registry: SealedToolRegistry,
     executor: ToolExecutor,
     clock: Arc<dyn Clock>,
@@ -434,6 +438,7 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         provider: Arc<dyn Provider>,
+        cache: Arc<CacheMechanism>,
         registry: SealedToolRegistry,
         executor: ToolExecutor,
         clock: Arc<dyn Clock>,
@@ -449,6 +454,7 @@ impl Driver {
     ) -> Self {
         Self {
             provider,
+            cache,
             registry,
             executor,
             clock,
@@ -502,7 +508,7 @@ impl Driver {
             (Some(runtime), false) => Some(
                 runtime
                     .derive_session(
-                        session,
+                        session.clone(),
                         parent,
                         interaction_ready,
                         &self.harness,
@@ -513,7 +519,7 @@ impl Driver {
             ),
             (None, false) => None,
         };
-        let planner = self.planner_template.fork_session();
+        let planner = self.planner_template.fork_session(&session);
         if !defer_pending_interaction {
             if let Some(persisted) =
                 extension_state.get(crate::agent::planning::PREVIOUS_CACHE_STATE_NAMESPACE)
@@ -526,7 +532,13 @@ impl Driver {
                 }
             }
         }
-        SessionExecutionContext::new(planner, interaction_disposition, extension_state, abilities)
+        SessionExecutionContext::new(
+            &session,
+            planner,
+            interaction_disposition,
+            extension_state,
+            abilities,
+        )
     }
 
     pub(crate) fn executor(&self) -> &ToolExecutor {
@@ -608,6 +620,7 @@ impl Driver {
                 inbox,
                 steer_mailbox: None,
                 turn_id,
+                acceptance: None,
             },
         )
         .run(input)
@@ -639,6 +652,7 @@ impl Driver {
                 inbox,
                 steer_mailbox: Some(steer_mailbox),
                 turn_id,
+                acceptance: None,
             },
         )
         .run(input)
@@ -659,6 +673,7 @@ impl Driver {
         steer_mailbox: Arc<SteerMailbox>,
         turn_id: TurnId,
         input: InternalTurnInput,
+        acceptance: Arc<TurnAcceptance>,
     ) {
         TurnMachine::new(
             self,
@@ -671,6 +686,7 @@ impl Driver {
                 inbox,
                 steer_mailbox: Some(steer_mailbox),
                 turn_id,
+                acceptance: Some(acceptance),
             },
         )
         .run_internal(input)
@@ -703,6 +719,7 @@ impl Driver {
                 inbox,
                 steer_mailbox: None,
                 turn_id,
+                acceptance: None,
             },
         );
         match machine.run_local_action(call, deadline).await {
@@ -740,6 +757,7 @@ impl Driver {
                 inbox,
                 steer_mailbox,
                 turn_id,
+                acceptance: None,
             },
             checkpoint,
         )
@@ -763,6 +781,7 @@ struct TurnMachine<'a> {
     inbox: Arc<Mutex<InjectionQueue>>,
     steer_mailbox: Option<Arc<SteerMailbox>>,
     turn_id: TurnId,
+    acceptance: Option<Arc<TurnAcceptance>>,
     checkpoint: Option<TurnCheckpoint>,
 }
 
@@ -778,6 +797,7 @@ struct TurnMachineContext {
     inbox: Arc<Mutex<InjectionQueue>>,
     steer_mailbox: Option<Arc<SteerMailbox>>,
     turn_id: TurnId,
+    acceptance: Option<Arc<TurnAcceptance>>,
 }
 
 mod provider;

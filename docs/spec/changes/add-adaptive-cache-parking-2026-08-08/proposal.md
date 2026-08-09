@@ -37,9 +37,16 @@ are missing upstream.
   provider-error expiry into one typed CacheAvailabilityEvidence contract.
   Ordinary errors, omitted fields, and elapsed time never imply expiry.
 - Add conformance declarations for synthetic request safety.
-- Add a typed no-tools synthetic request purpose and bounded request path.
-  Synthetic requests MUST be attributable, cancellable, deadline-bound,
-  non-retrying, and rejected unless the adapter/model conformance gate passes.
+- Add a typed no-tool-invocation synthetic request purpose and bounded request
+  path. Synthetic requests preserve identity-bound tool schemas when those
+  schemas are provider-prefix material, force tool choice to none, never
+  execute a returned tool call, and MUST be attributable, cancellable,
+  deadline-bound, non-retrying, and rejected unless the adapter/model
+  conformance gate passes. Cache handoff alone may add a bounded host-supplied
+  non-system suffix after the immutable prefix and return bounded protected
+  text to the live caller; neither the suffix nor returned text is persisted
+  or emitted by Runtime, and recovery never replays the provider operation to
+  reconstruct it.
 - Add canonical Runtime operation lifecycle events and typed attempt-purpose
   attribution while preserving redaction-safe event and manifest boundaries.
   New RuntimeEvent variants use one schema-version bump and remain

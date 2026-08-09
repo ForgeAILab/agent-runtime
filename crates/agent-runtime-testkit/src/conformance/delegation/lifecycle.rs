@@ -180,6 +180,137 @@ pub async fn assert_child_artifact_result_transfers_to_parent() {
     );
 }
 
+/// A custom artifact-store transfer override cannot smuggle altered
+/// destination metadata into a persisted or published child result.
+pub async fn assert_malicious_artifact_transfer_override_fails_closed() {
+    for mutation in MaliciousTransferMutation::ALL {
+        let (_runtime, parent) = parent_session(true).await;
+        let mut call =
+            tool_call_fragments(0, "call-malicious-artifact", "produce_child_artifact", "{}");
+        call.push(ProviderStreamEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        });
+        let store = Arc::new(MaliciousTransferArtifactStore::new(mutation));
+        let factory = Arc::new(
+            ScriptedChildFactory::new(vec![vec![
+                ScriptedStream::new(call),
+                ScriptedStream::new(vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "artifact ready".into(),
+                    },
+                    usage_event(8, 2),
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ]),
+            ]])
+            .with_tools(vec![Arc::new(ChildArtifactTool)])
+            .with_artifact_store(store),
+        );
+        let coordinator =
+            DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+        let mut parent_events = parent.subscribe();
+        let child = match coordinator
+            .spawn(child_spec("reject malicious artifact metadata"))
+            .await
+            .unwrap()
+        {
+            SpawnOutcome::Spawned { child, .. } => child,
+            other => panic!(
+                "expected a spawned child for {} mutation, got {other:?}",
+                mutation.label()
+            ),
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let envelope = parent_events
+                    .next()
+                    .await
+                    .expect("parent event stream closed before malicious artifact failure");
+                match envelope.payload {
+                    RuntimeEvent::ChildCompleted { child: id, .. } if id == child => {
+                        panic!(
+                            "{} mutation must not produce a completion event",
+                            mutation.label()
+                        )
+                    }
+                    RuntimeEvent::ChildFailed { child: id, .. } if id == child => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{} mutation did not fail closed before publication",
+                mutation.label()
+            )
+        });
+        assert_eq!(
+            coordinator.status(&child).unwrap().state,
+            ChildState::Failed,
+            "{} mutation must fail the child",
+            mutation.label()
+        );
+        assert!(
+            coordinator.take_ready_task_outcomes().is_empty(),
+            "{} mutation must not persist a ready outcome",
+            mutation.label()
+        );
+    }
+}
+
+/// A tool-provided artifact owned by another session is rejected before the
+/// child result is admitted.  The failure is terminal, but it must not emit a
+/// completion event or expose a ready outcome for the foreign reference.
+pub async fn assert_foreign_artifact_result_fails_closed_without_completion_event() {
+    let (_runtime, parent) = parent_session(true).await;
+    let mut call =
+        tool_call_fragments(0, "call-foreign-artifact", "produce_foreign_artifact", "{}");
+    call.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![vec![ScriptedStream::new(call)]])
+            .with_tools(vec![Arc::new(ForeignArtifactTool)]),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+    let mut parent_events = parent.subscribe();
+    let child = match coordinator
+        .spawn(child_spec("reject a foreign artifact"))
+        .await
+        .unwrap()
+    {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let envelope = parent_events
+                .next()
+                .await
+                .expect("parent event stream closed before foreign artifact failure");
+            match envelope.payload {
+                RuntimeEvent::ChildCompleted { child: id, .. } if id == child => {
+                    panic!("foreign artifact must not produce a completion event")
+                }
+                RuntimeEvent::ChildFailed { child: id, .. } if id == child => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("foreign artifact failure was not published");
+    assert_eq!(
+        coordinator.status(&child).unwrap().state,
+        ChildState::Failed
+    );
+    assert!(coordinator.take_ready_task_outcomes().is_empty());
+}
+
 /// A child whose provider classified its whole answer as reasoning still
 /// completes with a non-empty result carrying that reasoning text.
 pub async fn assert_reasoning_only_result_survives() {
@@ -249,6 +380,60 @@ pub async fn assert_capacity_reject() {
     );
 }
 
+/// Queue admission is lossless: a queued child starts as soon as the running
+/// slot is released, and remains bounded by the configured pending cap.
+pub async fn assert_queue_policy_promotes_waiting_child() {
+    let (_runtime, parent) = parent_session(true).await;
+    let factory = Arc::new(ScriptedChildFactory::new(vec![
+        blocking_child_script(),
+        text_child_script("queued child started"),
+    ]));
+    let coordinator = DelegationCoordinator::new(
+        &parent,
+        factory,
+        DelegationConfig {
+            limits: DelegationLimits {
+                max_running_children: 1,
+                ..DelegationLimits::default()
+            },
+            capacity_policy: CapacityPolicy::Queue { max_pending: 1 },
+            ..DelegationConfig::default()
+        },
+    )
+    .unwrap();
+
+    let first = match coordinator
+        .spawn(child_spec("hold the only slot"))
+        .await
+        .unwrap()
+    {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected the first child to start, got {other:?}"),
+    };
+    let queued = coordinator
+        .spawn(child_spec("wait for a slot"))
+        .await
+        .unwrap();
+    let second = match queued {
+        SpawnOutcome::Queued { child } => child,
+        other => panic!("expected the second child to queue, got {other:?}"),
+    };
+
+    coordinator.stop(&first).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = coordinator.status(&second).unwrap();
+            if status.state == ChildState::Idle {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued child did not start after the slot was released");
+    assert_eq!(status.last_result.as_deref(), Some("queued child started"));
+}
+
 /// Stopping a child mid-stream propagates cancellation into its provider
 /// stream and produces exactly one terminal stopped event.
 pub async fn assert_stop_cancels_running_child() {
@@ -314,10 +499,168 @@ pub async fn assert_parent_teardown_stops_children() {
     };
 
     parent.shutdown().await.unwrap();
-    let status = coordinator.wait(&child).await.unwrap();
+    let status = match coordinator.wait(&child).await {
+        Ok(status) => status,
+        Err(error) => {
+            assert!(
+                error.message.contains("cancelled"),
+                "parent cancellation must remain distinct from timeout: {error:?}"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let status = coordinator.status(&child).unwrap();
+                    if status.state.is_terminal() {
+                        break status;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("parent shutdown eventually stops the child")
+        }
+    };
     assert!(
         status.state.is_terminal(),
         "children must stop with their parent, got {:?}",
         status.state
     );
+}
+
+/// Child waits are bounded observations, not cancellation requests: zero is
+/// an immediate check, the default and explicit deadlines return the current
+/// running projection, and cancellation remains a distinct error.  The
+/// deadline decisions use the injected clock so this test does not sleep for
+/// the production five-second default.
+pub async fn assert_wait_options_are_bounded_and_cancellation_is_distinct() {
+    let clock = crate::ManualClock::shared(0);
+    let (_runtime, parent) = parent_session_with_clock(true, clock.clone()).await;
+    let factory = Arc::new(ScriptedChildFactory::new(vec![blocking_child_script()]));
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+    let child = match coordinator.spawn(child_spec("bounded wait")).await.unwrap() {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+
+    let immediate = coordinator
+        .wait_with_timeout(&child, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(immediate.state, ChildState::Running);
+
+    let default_wait = {
+        let coordinator = coordinator.clone();
+        let child = child.clone();
+        tokio::spawn(async move { coordinator.wait(&child).await })
+    };
+    // Let the waiter establish its deadline at the initial manual-clock
+    // boundary before advancing it to the configured default.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    clock.advance(DEFAULT_DELEGATION_WAIT.as_millis() as u64);
+    let default_status = tokio::time::timeout(Duration::from_secs(1), default_wait)
+        .await
+        .expect("default wait is bounded")
+        .expect("default wait task did not panic")
+        .unwrap();
+    assert_eq!(default_status.state, ChildState::Running);
+
+    let explicit_wait = {
+        let coordinator = coordinator.clone();
+        let child = child.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_with_timeout(&child, Duration::from_secs(1))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    clock.advance(1_000);
+    let explicit_status = tokio::time::timeout(Duration::from_secs(1), explicit_wait)
+        .await
+        .expect("explicit wait is bounded")
+        .expect("explicit wait task did not panic")
+        .unwrap();
+    assert_eq!(explicit_status.state, ChildState::Running);
+
+    let above_hard_max = coordinator
+        .wait_with_timeout(&child, HARD_MAX_DELEGATION_WAIT + Duration::from_secs(1))
+        .await
+        .expect_err("a per-call timeout above the hard maximum must be rejected");
+    assert!(above_hard_max.message.contains("hard maximum"));
+
+    let cancellation_wait = {
+        let coordinator = coordinator.clone();
+        let child = child.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_with_timeout(&child, HARD_MAX_DELEGATION_WAIT)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    parent.shutdown().await.unwrap();
+    let cancellation = tokio::time::timeout(Duration::from_secs(1), cancellation_wait)
+        .await
+        .expect("parent cancellation wakes the wait")
+        .expect("cancellation wait task did not panic")
+        .expect_err("parent cancellation must not be reported as a timeout");
+    assert!(
+        cancellation.message.contains("cancelled by the parent"),
+        "cancellation has a distinct error from a bounded timeout: {cancellation:?}"
+    );
+
+    // Both the host-narrowed maximum and the runtime hard maximum are
+    // validated at coordinator construction and at each per-call override.
+    let (_runtime, parent) = parent_session(true).await;
+    let invalid = DelegationConfig {
+        wait_max: HARD_MAX_DELEGATION_WAIT + Duration::from_secs(1),
+        ..DelegationConfig::default()
+    };
+    assert!(
+        DelegationCoordinator::new(
+            &parent,
+            Arc::new(ScriptedChildFactory::new(Vec::new())),
+            invalid,
+        )
+        .is_err(),
+        "a host maximum above thirty seconds must be rejected at construction"
+    );
+
+    let (_runtime, parent) = parent_session(true).await;
+    let invalid = DelegationConfig {
+        wait_default: Duration::from_secs(2),
+        wait_max: Duration::from_secs(1),
+        ..DelegationConfig::default()
+    };
+    assert!(
+        DelegationCoordinator::new(
+            &parent,
+            Arc::new(ScriptedChildFactory::new(Vec::new())),
+            invalid,
+        )
+        .is_err(),
+        "a default timeout above the host maximum must be rejected at construction"
+    );
+
+    let (_runtime, parent) = parent_session(true).await;
+    let factory = Arc::new(ScriptedChildFactory::new(vec![blocking_child_script()]));
+    let coordinator = DelegationCoordinator::new(
+        &parent,
+        factory,
+        DelegationConfig {
+            wait_default: Duration::from_secs(1),
+            wait_max: Duration::from_secs(1),
+            ..DelegationConfig::default()
+        },
+    )
+    .unwrap();
+    let child = match coordinator.spawn(child_spec("host max")).await.unwrap() {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    let host_max = coordinator
+        .wait_with_timeout(&child, Duration::from_secs(2))
+        .await
+        .expect_err("per-call waits above the host maximum must be rejected");
+    assert!(host_max.message.contains("configured hard maximum"));
 }

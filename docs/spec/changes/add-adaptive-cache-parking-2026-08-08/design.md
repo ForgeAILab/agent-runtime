@@ -23,8 +23,9 @@ embedding product prompts, status UI, database models, or policy thresholds.
   run revisions.
 - Preserve provider evidence presence, expiry/resource outcomes, and
   attempt/purpose attribution.
-- Make every synthetic request bounded, no-tools, cancellable, non-retrying,
-  and conformance-gated.
+- Make every synthetic request bounded, unable to invoke or execute tools,
+  cancellable, non-retrying, and conformance-gated while preserving any tool
+  schemas that are part of the exact provider prefix.
 - Provide canonical lifecycle events, typed usage attribution, and protected
   persistence primitives.
 - Provide bounded child wait, protected outcome delivery, deterministic
@@ -98,8 +99,28 @@ planner and includes:
 Consumers never hash prompt text independently. A registry/view/activation
 change creates a new identity and retires the previous comparable baseline.
 The changing conversation tail is tracked in the structural CachePlan but does
-not enter CacheIdentity. Local compiled-context keys remain separate from
+not enter CacheIdentity. When that exact tail is sealed as append-only stable
+history on a later turn, Runtime may treat the newer identity as a strict
+extension of the prior identity and preserve only the already-sealed prefix
+expectation. Editing, removing, or reordering any previously sealed entry
+retires comparability. Local compiled-context keys remain separate from
 provider cache identity and provider warmth.
+
+Some adapters reorder prompt lanes on the wire (for example, tools before
+system before ordinary messages). The planner carries a count-only boundary
+derived beside rendering. If that reordering would place any changing tool or
+system block ahead of a nominally stable later lane, Runtime emits no explicit
+marker for that request and suppresses the provider read expectation. It MUST
+NOT mark a smaller prefix while attaching the larger CacheIdentity, because
+that would correlate evidence to an identity the provider did not address.
+
+The opaque provider key is a provider routing/partition input, not a substitute
+for CacheIdentity. An adapter may intentionally keep that key stable across
+append-only plans when the provider also matches the exact rendered prefix.
+Endpoint and session partitions plus adapter/key revisions prevent accidental
+cross-tenant or cross-session routing, while the full Runtime identity remains
+authoritative for evidence and comparability. Equality of provider keys alone
+never transfers warmth or establishes a cache hit.
 
 ### 4. Evidence is presence-aware and never inferred
 
@@ -123,17 +144,36 @@ raw prompt content or an unverified warm claim.
 
 Runtime adds a typed attempt purpose and request context for cache keepalive,
 handoff checkpoint, idle compaction, and cache resource operations. The
-constructor derives the request
-from an immutable context plan and exact identity, advertises no tools,
-disallows mutation, caps output, applies the provided deadline and
-cancellation, and performs no hidden retry. The adapter/model conformance
-record must cover suffix exclusion, key/breakpoint stability, no-tool behavior,
+constructor derives the request from an immutable context plan and exact
+identity, forces tool choice to none, disallows tool execution and mutation,
+caps output, applies the provided deadline and cancellation, and performs no
+hidden retry. Stable tool schemas are provider-prefix material, so the
+constructor preserves their exact identity-bound bytes/order when present;
+removing them would address a different cache. The adapter/model conformance
+record must cover suffix exclusion, key/breakpoint stability, disabled tool
+invocation, protocol-failure handling for an unexpected tool call,
 presence-aware evidence, bounded output, cancellation, and duplicate-call
 behavior before the action is eligible.
 
 Synthetic work is not canonical user history. The Runtime may persist its
 attempt/checkpoint identity and bounded result metadata, while Smith decides
 whether any semantic summary belongs in its own resume-capsule projection.
+For this change, the persisted synthetic-operation manifest is the
+redaction-safe cache mechanism extension record together with the protected
+`CacheOperationCheckpoint`/`CacheOperationResultCheckpoint`; the ordinary
+`RunManifest` remains an identity projection and is not expanded with
+transient operation ids, request/attempt data, evidence, or metrics.
+Only a cache handoff checkpoint may carry a bounded host-supplied non-system
+suffix, appended after the immutable cache prefix and its breakpoint. Its
+conservative input estimate and observed provider usage count against the
+operation budget. Runtime may return bounded generated text through a
+protected, redacted-Debug live result, but marks that field non-serializable:
+the suffix and generated text are absent from canonical history, events,
+manifests, journals, snapshots, and persisted idempotency results. If the live
+result is lost across a crash, recovery returns the persisted completion
+without the text and without replaying the provider operation. Smith therefore
+treats the summary as an optional optimization and preserves cold-resume
+correctness without it.
 Child completion is ordinary attributed InternalTurnSource work and is not a
 synthetic cache purpose.
 
@@ -144,7 +184,9 @@ variants: CacheOperationPrepared, CacheOperationRejected,
 CacheOperationStarted, CacheOperationCompleted,
 CacheAvailabilityEvidenceRecorded, and CacheOperationSuspended. Events carry
 identity digest, request, attempt or operation identity, typed purpose, bounded
-metrics, and structured reason; they never carry raw prompt text, provider
+metrics, and structured reason; rejected events carry a request when Runtime
+has allocated one but normally no attempt, while suspension events carry both
+request and attempt once provider admission has occurred. They never carry raw prompt text, provider
 bodies, credentials, or product resume-capsule content. Legacy serialized data
 remains backward-readable, and exhaustive consumers update through the
 compatibility gate.
@@ -206,11 +248,26 @@ Cache lifecycle state, synthetic idempotency, and child outcome cursors are
 versioned namespaced extension state in SessionSnapshot and are protected when
 they contain exact content or action identity. Exact in-flight transitions
 remain TurnCheckpoint state with CheckpointStore watermarks. Recovery validates
-revisions and never reconstructs exact execution from redacted events.
+revisions and never reconstructs exact execution from redacted events. Each
+cache checkpoint watermark additionally carries the synthetic cache turn as a
+journal scope. Recovery truncates/replays only that operation's crash-window
+tail, preserving unrelated session, child, and shutdown events emitted while
+an asynchronous protected save is pending; terminal cache checkpoints restore
+state without replaying their already-published lifecycle tail.
 
 No second canonical conversation, lease database, or provider-side history is
 introduced. Smith's resume-capsule content is a consumer projection over these
 Runtime primitives.
+
+When a host enables only `SessionStore` and a process crashes after an
+operation reservation but before a protected checkpoint/result is available,
+Runtime restores the redaction-safe reservation and full request fingerprint
+but has no provider result to repair. An exact retry therefore returns the
+same structured `Conflict` and a changed request also returns `Conflict`; it
+never replays provider I/O. Same-process repair of an indeterminate provider
+result requires the protected `CheckpointStore` boundary (and its cache
+extension); hosts that need a recoverable terminal result must configure both
+stores.
 
 ### 10. Consumer landed-revision boundary
 

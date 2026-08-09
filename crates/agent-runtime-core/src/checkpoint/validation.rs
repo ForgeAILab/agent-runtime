@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::CacheEvidenceSource;
 
 pub(super) fn slots_correspond(source_calls: &[ToolCall], slots: &[ToolSlotCheckpoint]) -> bool {
     if source_calls.len() != slots.len() {
@@ -116,16 +117,28 @@ pub(super) fn interaction_state_valid(
         && request.validate().is_ok()
 }
 impl TurnCheckpoint {
-    /// Event-journal truncation boundary required before recovery.
+    /// Legacy session-wide event-journal truncation boundary.
     ///
-    /// `Some(sequence)` means discard every durable observer record with
-    /// `envelope.sequence >= sequence` before resuming this non-terminal
-    /// checkpoint. A terminal checkpoint returns `None`: its post-event
-    /// watermark and successful protected-store barrier prove that
-    /// `TurnCompleted` is already in the durable journal prefix, so that
-    /// terminal tail must be retained rather than removed.
+    /// This returns `Some` only for unscoped ordinary checkpoints. Scoped
+    /// cache checkpoints deliberately return `None` so an older host cannot
+    /// globally truncate unrelated session/child events; migrated hosts must
+    /// use [`Self::journal_truncation_scope`] and filter by both sequence and
+    /// synthetic cache turn. Terminal checkpoints also return `None`.
     pub fn journal_truncation_sequence(&self) -> Option<u64> {
-        (!matches!(self.state, TurnState::Terminal { .. })).then_some(self.watermark.event_sequence)
+        self.journal_truncation_scope()
+            .filter(|scope| scope.turn.is_none())
+            .map(|scope| scope.event_sequence)
+    }
+
+    /// Returns the event-journal boundary for a non-terminal checkpoint.
+    /// Cache-operation checkpoints are scoped to their synthetic turn;
+    /// ordinary checkpoints return `turn: None` for compatibility with the
+    /// session-wide journal contract.
+    pub fn journal_truncation_scope(&self) -> Option<JournalTruncationScope> {
+        (!self.state.is_terminal()).then_some(JournalTruncationScope {
+            event_sequence: self.watermark.event_sequence,
+            turn: self.watermark.journal_turn.clone(),
+        })
     }
 
     /// Creates the first checkpoint for an accepted turn.
@@ -252,6 +265,51 @@ impl TurnCheckpoint {
         Ok(checkpoint)
     }
 
+    /// Creates the first protected checkpoint for one cache operation.
+    ///
+    /// Cache operations are represented in the same checkpoint stream as
+    /// direct turns, but own no canonical-history suffix. Their synthetic
+    /// turn id is stable for the host operation and never enters model-facing
+    /// history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_operation(
+        turn: TurnId,
+        operation: CacheOperationCheckpoint,
+        snapshot: SessionSnapshot,
+        deadline: Deadline,
+        checkpoint_sequence: u64,
+        event_sequence: u64,
+        updated: Timestamp,
+    ) -> Result<Self, RuntimeError> {
+        operation.validate()?;
+        let session = snapshot.id.clone();
+        let state = TurnState::CacheOperationPrepared { operation };
+        let checkpoint = Self {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            transition_revision: TURN_TRANSITION_REVISION,
+            session,
+            turn: turn.clone(),
+            state_revision: 0,
+            operation_fingerprint: checkpoint_operation_fingerprint(
+                &state,
+                snapshot.history.len(),
+                None,
+                false,
+            ),
+            active_history_start: snapshot.history.len(),
+            internal_input: None,
+            visible_output: false,
+            state,
+            snapshot,
+            deadline,
+            watermark: CheckpointWatermark::new(checkpoint_sequence, event_sequence)
+                .scoped_to(turn.clone()),
+            updated,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
     /// Advances through the explicit transition table.
     ///
     /// Reapplying the exact current state is idempotent and returns the
@@ -343,7 +401,7 @@ impl TurnCheckpoint {
             state: next,
             snapshot,
             deadline: self.deadline,
-            watermark: self.watermark.next(event_sequence),
+            watermark: self.watermark.clone().next(event_sequence),
             updated,
         };
         checkpoint.validate()?;
@@ -369,11 +427,33 @@ impl TurnCheckpoint {
                 "checkpoint sequence must start at one",
             ));
         }
+        let cache_state = matches!(
+            self.state,
+            TurnState::CacheOperationPrepared { .. }
+                | TurnState::CacheOperationStarted { .. }
+                | TurnState::CacheOperationResultReady { .. }
+                | TurnState::CacheOperationTerminal { .. }
+        );
+        match (cache_state, self.watermark.journal_turn.as_ref()) {
+            (true, Some(turn)) if turn == &self.turn => {}
+            (true, _) => {
+                return Err(RuntimeError::conflict(
+                    "cache checkpoint watermark must be scoped to its synthetic turn",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(RuntimeError::conflict(
+                    "ordinary checkpoint cannot carry a cache journal scope",
+                ));
+            }
+            (false, None) => {}
+        }
         let initial = matches!(
             self.state,
             TurnState::Accepted { .. }
                 | TurnState::InternalAccepted { .. }
                 | TurnState::LocalActionAccepted { .. }
+                | TurnState::CacheOperationPrepared { .. }
         );
         if (self.state_revision == 0) != initial {
             return Err(RuntimeError::conflict(
@@ -404,7 +484,15 @@ impl TurnCheckpoint {
             }
             _ => {}
         }
+        let cache_operation = matches!(
+            self.state,
+            TurnState::CacheOperationPrepared { .. }
+                | TurnState::CacheOperationStarted { .. }
+                | TurnState::CacheOperationResultReady { .. }
+                | TurnState::CacheOperationTerminal { .. }
+        );
         let local_action = !internal_turn
+            && !cache_operation
             && (matches!(
                 self.state,
                 TurnState::LocalActionAccepted { .. }
@@ -419,7 +507,13 @@ impl TurnCheckpoint {
                         | TurnState::PublishingTerminal { .. }
                         | TurnState::Terminal { .. }
                 )));
-        if local_action {
+        if cache_operation {
+            if self.active_history_start != self.snapshot.history.len() {
+                return Err(RuntimeError::conflict(
+                    "cache-operation checkpoint changed canonical history",
+                ));
+            }
+        } else if local_action {
             if self.active_history_start != self.snapshot.history.len() {
                 return Err(RuntimeError::conflict(
                     "local-action checkpoint changed canonical history",
@@ -475,6 +569,104 @@ impl TurnCheckpoint {
             | TurnState::Completing { .. }
             | TurnState::PublishingTerminal { .. }
             | TurnState::Terminal { .. } => {}
+            TurnState::CacheOperationPrepared { operation }
+            | TurnState::CacheOperationStarted { operation }
+            | TurnState::CacheOperationResultReady { operation, .. }
+            | TurnState::CacheOperationTerminal { operation, .. } => operation.validate()?,
+        }
+        if let TurnState::CacheOperationStarted { operation } = &self.state
+            && operation.preflight_rejection.is_some()
+        {
+            return Err(RuntimeError::conflict(
+                "cache checkpoint rejection crossed the provider-start boundary",
+            ));
+        }
+        match &self.state {
+            TurnState::CacheOperationResultReady { operation, result }
+            | TurnState::CacheOperationTerminal { operation, result } => {
+                result.validate()?;
+                match operation.preflight_rejection {
+                    Some(reason)
+                        if result.outcome != CacheOperationOutcome::Rejected
+                            || result.rejection_reason != Some(reason) =>
+                    {
+                        return Err(RuntimeError::conflict(
+                            "cache rejection result does not match its protected preflight reason",
+                        ));
+                    }
+                    None if result.outcome == CacheOperationOutcome::Rejected => {
+                        // A rejection that reached a protected result boundary
+                        // must retain its exact preflight reason in the
+                        // operation reservation. This prevents a crash from
+                        // turning an exact retry into a newly computed reason.
+                        return Err(RuntimeError::conflict(
+                            "cache rejection result is missing its protected preflight reason",
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(evidence) = &result.evidence {
+                    let attribution_mismatch = match evidence.source {
+                        CacheEvidenceSource::ResourceOperation => {
+                            evidence.identity != operation.identity
+                                || evidence.request.is_some()
+                                || evidence.attempt.is_some()
+                                || evidence.operation.as_ref() != Some(&operation.operation)
+                        }
+                        CacheEvidenceSource::Stream => {
+                            evidence.identity != operation.identity
+                                || evidence.request != operation.request
+                                || evidence.attempt != operation.attempt
+                                || evidence.operation.is_some()
+                        }
+                        CacheEvidenceSource::CacheScopedError => {
+                            let stream_attribution = evidence.request.is_some()
+                                && evidence.attempt.is_some()
+                                && evidence.operation.is_none();
+                            let resource_attribution = evidence.request.is_none()
+                                && evidence.attempt.is_none()
+                                && evidence.operation.as_ref() == Some(&operation.operation);
+                            evidence.identity != operation.identity
+                                || !(stream_attribution
+                                    && evidence.request == operation.request
+                                    && evidence.attempt == operation.attempt
+                                    || resource_attribution)
+                        }
+                    };
+                    if attribution_mismatch {
+                        return Err(RuntimeError::conflict(
+                            "cache checkpoint evidence does not correlate with its operation",
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let TurnState::CacheOperationStarted { operation }
+        | TurnState::CacheOperationResultReady { operation, .. }
+        | TurnState::CacheOperationTerminal { operation, .. } = &self.state
+        {
+            let rejected_result = matches!(
+                &self.state,
+                TurnState::CacheOperationResultReady { result, .. }
+                    | TurnState::CacheOperationTerminal { result, .. }
+                    if result.outcome == CacheOperationOutcome::Rejected
+            );
+            if operation.request.is_none()
+                || (!rejected_result && operation.attempt.is_none())
+                || (rejected_result && operation.attempt.is_some())
+            {
+                return Err(RuntimeError::conflict(
+                    "started cache checkpoint is missing request/attempt attribution",
+                ));
+            }
+        }
+        if let TurnState::CacheOperationPrepared { operation } = &self.state {
+            if operation.attempt.is_some() {
+                return Err(RuntimeError::conflict(
+                    "prepared cache checkpoint crossed the start attribution boundary",
+                ));
+            }
         }
         if matches!(
             &self.state,
@@ -690,5 +882,9 @@ pub(super) fn state_name(state: &TurnState) -> &'static str {
         TurnState::Completing { .. } => "completing",
         TurnState::PublishingTerminal { .. } => "publishing_terminal",
         TurnState::Terminal { .. } => "terminal",
+        TurnState::CacheOperationPrepared { .. } => "cache_operation_prepared",
+        TurnState::CacheOperationStarted { .. } => "cache_operation_started",
+        TurnState::CacheOperationResultReady { .. } => "cache_operation_result_ready",
+        TurnState::CacheOperationTerminal { .. } => "cache_operation_terminal",
     }
 }

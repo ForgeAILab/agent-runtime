@@ -28,8 +28,9 @@ use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::provider::{
     AuthKind, Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
-    ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
-    ProviderStreamEvent, ReasoningSupport, ToolChoice,
+    ProviderCacheBehavior, ProviderCacheContract, ProviderCallContext, ProviderError,
+    ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent, ReasoningSupport,
+    ToolChoice,
 };
 use agent_runtime_core::provider_credential::{
     CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,
@@ -109,6 +110,7 @@ impl ResponsesConfig {
                 usage: true,
                 cache: true,
                 prompt_cache: PromptCacheControl::Implicit,
+                cache_contract: None,
                 auth: AuthKind::ApiKey,
                 continuation: false,
                 max_output_tokens: None,
@@ -136,9 +138,14 @@ impl ResponsesConfig {
         self
     }
 
-    /// Overrides the prompt cache control declared in capabilities.
+    /// Overrides the legacy prompt-cache declaration.
+    ///
+    /// This generic Responses adapter currently emits only OpenAI's implicit
+    /// routing key. Explicit breakpoint/resource declarations are normalized
+    /// to `ImplicitPrefix` when the provider is constructed until a
+    /// model-gated wire implementation is added.
     pub fn with_prompt_cache(mut self, cache: PromptCacheControl) -> Self {
-        self.capabilities.prompt_cache = cache;
+        self.capabilities.override_prompt_cache(cache);
         self
     }
 
@@ -175,6 +182,7 @@ impl<T: HttpTransport> fmt::Debug for ResponsesProvider<T> {
 impl<T: HttpTransport> ResponsesProvider<T> {
     /// Builds an adapter using the optional static key in `config`.
     pub fn new(transport: T, mut config: ResponsesConfig) -> Result<Self, ProviderError> {
+        normalize_cache_capabilities(&mut config.capabilities);
         let credential_source = config.api_key.take().map(|secret| {
             Arc::new(StaticProviderCredentialSource::new(secret))
                 as Arc<dyn ProviderCredentialSource>
@@ -190,10 +198,11 @@ impl<T: HttpTransport> ResponsesProvider<T> {
     /// Builds an adapter using a host-owned renewable credential source.
     pub fn with_credential_source(
         transport: T,
-        config: ResponsesConfig,
+        mut config: ResponsesConfig,
         credential_target: ProviderCredentialTarget,
         credential_source: Arc<dyn ProviderCredentialSource>,
     ) -> Result<Self, ProviderError> {
+        normalize_cache_capabilities(&mut config.capabilities);
         if config.api_key.is_some() {
             return Err(bad_request(
                 "conflicting Responses provider credential configuration",
@@ -262,10 +271,25 @@ impl<T: HttpTransport> ResponsesProvider<T> {
         let object = payload
             .as_object_mut()
             .expect("Responses payload is an object");
-        if self.config.capabilities.prompt_cache.caches_stable_prefix() {
+        if self
+            .config
+            .capabilities
+            .cache_contract()
+            .behavior
+            .supports_stable_prefix()
+        {
+            // OpenAI combines this routing partition with the exact prompt
+            // prefix. Keep it stable across prefix/history changes; the
+            // complete CacheIdentity remains attached to the request for
+            // Runtime correlation.
+            let cache_key = request
+                .cache_identity
+                .as_ref()
+                .map(|identity| identity.wire_cache_key().as_str())
+                .unwrap_or_else(|| session.as_str());
             object.insert(
                 "prompt_cache_key".into(),
-                Value::String(session.as_str().to_owned()),
+                Value::String(cache_key.to_owned()),
             );
         }
         if !request.tools.is_empty() {
@@ -374,6 +398,50 @@ impl<T: HttpTransport> ResponsesProvider<T> {
     }
 }
 
+/// The generic Responses adapter currently implements only the implicit
+/// routing-key contract. Explicit breakpoint fields are model- and
+/// endpoint-scoped (for example, GPT-5.6's newer wire mode) and are not
+/// emitted here. Normalize explicit declarations to implicit so Runtime
+/// fails closed instead of planning unsupported breakpoint or maintenance
+/// behavior.
+fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
+    // This generic Responses adapter emits only an implicit routing key. Keep
+    // the normalized contract fail-closed for every declaration rather than
+    // retaining explicit/resource metadata that is absent from the wire.
+    let configured = capabilities.cache_contract.take();
+    let behavior = configured
+        .as_ref()
+        .map(|contract| contract.behavior)
+        .unwrap_or_else(|| capabilities.prompt_cache.behavior());
+    let mut contract = configured.unwrap_or_else(|| {
+        let mut contract = ProviderCacheContract::from_control(capabilities.prompt_cache);
+        contract.evidence.stream = capabilities.cache;
+        contract
+    });
+    contract.retention = Default::default();
+    contract.key_revision = None;
+    contract.maintenance.clear();
+    contract.resource_operations.clear();
+    contract.conformance = None;
+    contract.evidence.resource_operations = false;
+    contract.evidence.cache_scoped_errors = false;
+    contract.evidence.stream &= capabilities.cache;
+    match behavior {
+        ProviderCacheBehavior::Unsupported => {
+            contract.behavior = ProviderCacheBehavior::Unsupported;
+            capabilities.prompt_cache = PromptCacheControl::None;
+        }
+        ProviderCacheBehavior::ImplicitPrefix
+        | ProviderCacheBehavior::ExplicitBreakpoint { .. }
+        | ProviderCacheBehavior::ExplicitResource => {
+            contract.behavior = ProviderCacheBehavior::ImplicitPrefix;
+            capabilities.prompt_cache = PromptCacheControl::Implicit;
+        }
+    }
+    capabilities.cache_contract = Some(contract);
+    capabilities.normalize_cache_contract();
+}
+
 fn default_credential_target() -> ProviderCredentialTarget {
     ProviderCredentialTarget::new("xai-responses")
         .expect("static Responses credential target is valid")
@@ -412,6 +480,9 @@ fn validate_request(
     config: &ResponsesConfig,
     request: &ProviderRequest,
 ) -> Result<(), ProviderError> {
+    request
+        .validate_cache_identity()
+        .map_err(|error| bad_request(&error))?;
     if request.model != config.model {
         return Err(bad_request(
             "Responses request model does not match adapter model",
@@ -817,6 +888,7 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::Server => "Responses provider service failure",
         ProviderErrorKind::Cancelled => "Responses provider request cancelled",
         ProviderErrorKind::Unsupported => "Responses provider feature is unsupported",
+        ProviderErrorKind::CacheExpired => "Responses provider cache identity expired",
         ProviderErrorKind::LimitExhausted => "Responses provider usage limit exhausted",
     };
     let mut sanitized = ProviderError::new(error.kind, message);
@@ -1968,12 +2040,18 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_runtime_core::provider::ProviderAttemptPurpose;
     use futures_util::StreamExt;
     use std::sync::Mutex;
 
     use agent_runtime_core::cancel::Cancellation;
     use agent_runtime_core::content::{ToolCall, ToolResultBlock};
     use agent_runtime_core::ids::{AttemptId, RequestId};
+    use agent_runtime_core::provider::{
+        CacheEndpointIdentity, CacheIdentity, CacheIdentityFragment, CacheRetentionContract,
+        ProviderCacheBehavior, ProviderCacheContract,
+    };
+    use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
     #[derive(Debug)]
     struct ReplayTransport {
@@ -2028,6 +2106,8 @@ mod tests {
             session: SessionId::new("session-test"),
             request_id: RequestId::new("request-test"),
             attempt_id: AttemptId::new("attempt-test"),
+            cache_identity: None,
+            purpose: ProviderAttemptPurpose::Ordinary,
             cancel: Cancellation::new(),
             deadline: Deadline::never(),
         }
@@ -2130,6 +2210,124 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["input"][1]["content"][1]["type"], "input_image");
+    }
+
+    fn cache_identity(route: &str, prefix: &str) -> CacheIdentity {
+        CacheIdentity::builder(
+            "responses",
+            ModelId::new("grok-4.5"),
+            CacheEndpointIdentity::from_opaque("endpoint-a", RegistryRevision::new("endpoint-1")),
+            RegistryRevision::new("adapter-1"),
+            Fingerprint::of("profile-1"),
+        )
+        .provider_key(Fingerprint::of(route))
+        .stable_prefix([CacheIdentityFragment::new(
+            "system",
+            Fingerprint::of(prefix),
+        )])
+        .build()
+    }
+
+    #[test]
+    fn prompt_cache_key_is_a_stable_routing_partition_not_the_full_identity() {
+        let provider = provider("");
+        let first_identity = cache_identity("route-a", "stable-v1");
+        let changed_prefix_identity = cache_identity("route-a", "stable-v2");
+        let isolated_identity = cache_identity("route-b", "stable-v1");
+
+        let first = provider
+            .build_payload(
+                &ProviderRequest::new(ModelId::new("grok-4.5"), vec![])
+                    .with_cache_identity(first_identity.clone()),
+                &SessionId::new("session-a"),
+            )
+            .expect("first payload");
+        let changed_prefix = provider
+            .build_payload(
+                &ProviderRequest::new(ModelId::new("grok-4.5"), vec![])
+                    .with_cache_identity(changed_prefix_identity.clone()),
+                &SessionId::new("session-a"),
+            )
+            .expect("changed-prefix payload");
+        let isolated = provider
+            .build_payload(
+                &ProviderRequest::new(ModelId::new("grok-4.5"), vec![])
+                    .with_cache_identity(isolated_identity),
+                &SessionId::new("session-b"),
+            )
+            .expect("isolated payload");
+
+        // OpenAI combines this key with the exact prompt-prefix hash. Keeping
+        // it stable across prefixes preserves routing locality; the exact
+        // CacheIdentity remains attached to each request for Runtime
+        // correlation and the provider's prefix match distinguishes the
+        // changed prefix.
+        assert_eq!(
+            first["prompt_cache_key"],
+            changed_prefix["prompt_cache_key"]
+        );
+        assert_ne!(
+            first_identity.digest(),
+            changed_prefix_identity.digest(),
+            "the exact identity still distinguishes prompt-prefix changes"
+        );
+        assert_ne!(first["prompt_cache_key"], isolated["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn normalized_contract_controls_key_and_drops_explicit_only_metadata() {
+        let mut config = ResponsesConfig::new("https://api.x.ai/v1", "grok-4.5");
+        config.capabilities.cache_contract = Some(ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ExplicitBreakpoint { max_breakpoints: 4 },
+            retention: CacheRetentionContract {
+                minimum_retention_ms: Some(30_000),
+                read_refreshes: true,
+                write_refreshes: true,
+            },
+            key_revision: Some(RegistryRevision::new("explicit-key-1")),
+            ..ProviderCacheContract::default()
+        });
+        let provider = ResponsesProvider::new(ReplayTransport::new(""), config)
+            .expect("valid Responses config");
+        let capabilities = provider
+            .capabilities(&ModelId::new("grok-4.5"))
+            .expect("configured model capabilities");
+        assert_eq!(capabilities.prompt_cache, PromptCacheControl::Implicit);
+        let contract = capabilities.cache_contract();
+        assert_eq!(contract.behavior, ProviderCacheBehavior::ImplicitPrefix);
+        assert_eq!(contract.key_revision, None);
+        assert_eq!(contract.retention, CacheRetentionContract::default());
+        let payload = provider
+            .build_payload(
+                &ProviderRequest::new(ModelId::new("grok-4.5"), vec![]),
+                &SessionId::new("session-a"),
+            )
+            .expect("payload");
+        assert_eq!(payload["prompt_cache_key"], "session-a");
+    }
+
+    #[test]
+    fn normalized_unsupported_contract_overrides_conflicting_legacy_field() {
+        let mut config = ResponsesConfig::new("https://api.x.ai/v1", "grok-4.5");
+        config.capabilities.prompt_cache = PromptCacheControl::Explicit { max_breakpoints: 4 };
+        config.capabilities.cache_contract = Some(ProviderCacheContract::default());
+        let provider = ResponsesProvider::new(ReplayTransport::new(""), config)
+            .expect("valid Responses config");
+        let capabilities = provider
+            .capabilities(&ModelId::new("grok-4.5"))
+            .expect("configured model capabilities");
+        assert_eq!(capabilities.prompt_cache, PromptCacheControl::None);
+        assert_eq!(
+            capabilities.cache_contract().behavior,
+            ProviderCacheBehavior::Unsupported
+        );
+        let payload = provider
+            .build_payload(
+                &ProviderRequest::new(ModelId::new("grok-4.5"), vec![]),
+                &SessionId::new("session-a"),
+            )
+            .expect("payload");
+        assert!(payload.get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -2338,6 +2536,8 @@ mod tests {
             session: SessionId::new("s"),
             request_id: RequestId::new("r"),
             attempt_id: AttemptId::new("a"),
+            cache_identity: None,
+            purpose: ProviderAttemptPurpose::Ordinary,
             cancel: cancel.clone(),
             deadline: Deadline::never(),
         };
@@ -2346,6 +2546,24 @@ mod tests {
         cancel.cancel(agent_runtime_core::cancel::CancelReason::UserRequested);
         assert!(
             matches!(stream.next().await, Some(ProviderStreamEvent::Error { error }) if error.kind == ProviderErrorKind::Cancelled)
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_cache_is_normalized_to_implicit_until_wire_support_is_gated() {
+        let provider = ResponsesProvider::new(
+            ReplayTransport::new(""),
+            ResponsesConfig::new("https://api.x.ai/v1", "grok-4.5")
+                .with_prompt_cache(PromptCacheControl::Explicit { max_breakpoints: 4 }),
+        )
+        .expect("valid Responses config");
+        let capabilities = provider
+            .capabilities(&ModelId::new("grok-4.5"))
+            .expect("configured model capabilities");
+        assert_eq!(capabilities.prompt_cache, PromptCacheControl::Implicit);
+        assert_eq!(
+            capabilities.cache_contract().behavior,
+            ProviderCacheBehavior::ImplicitPrefix
         );
     }
 

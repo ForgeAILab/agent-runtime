@@ -6,7 +6,12 @@ Runtime SHALL persist cache lifecycle state, synthetic operation identity, and
 child-outcome consumption state through versioned namespaced extension records
 using the existing SessionSnapshot and VersionedSessionState contracts. Each
 record MUST declare sensitivity and revision, and incompatible state MUST fail
-closed rather than being guessed.
+closed rather than being guessed. Cache operation idempotency MUST bind an
+operation ID to a redaction-safe one-way fingerprint of its exact semantic
+request and authority capability. An exact duplicate MAY return its committed
+result without provider I/O; reuse with a different identity, purpose,
+resource kind, handoff suffix, authority, or bounded request shape MUST return
+a conflict without provider I/O or protected output.
 
 #### Scenario: Cache lifecycle state resumes
 
@@ -22,6 +27,14 @@ closed rather than being guessed.
 - **THEN** it reports a structured compatibility failure or explicit
   non-equivalent recovery choice
 - **AND** it does not silently reset the cursor
+
+#### Scenario: Operation ID is reused for another request
+
+- **GIVEN** a cache operation ID already identifies a committed handoff
+- **WHEN** a caller submits that ID with a different suffix, authority, cache
+  identity, purpose, or bounded request shape
+- **THEN** Runtime returns a structured conflict and no protected prior output
+- **AND** it performs no provider request
 
 ### Requirement: Protected cursor and checkpoint ordering
 
@@ -54,18 +67,47 @@ for exact recovery.
 - **THEN** the child outcome remains discoverable through the protected cursor
 - **AND** no lossy event replay is used to reconstruct exact content
 
+### Requirement: Cache checkpoint journal scope
+
+Runtime SHALL bind each non-terminal cache checkpoint watermark to the
+operation's synthetic cache turn. During recovery, journal reconciliation MUST
+truncate and republish only that scoped cache-operation tail; ordinary session,
+child, and shutdown events emitted while an asynchronous protected checkpoint
+save is in progress MUST remain durable and MUST NOT be dropped or replayed.
+Terminal cache checkpoints are state-only on restart because their lifecycle
+tail already crossed the protected terminal boundary.
+
+#### Scenario: An unrelated event interleaves with a cache checkpoint save
+
+- **GIVEN** a cache operation has written a Prepared, Started, or ResultReady
+  checkpoint and an unrelated session or child event is emitted while the next
+  protected save is pending
+- **WHEN** the process resumes from that cache checkpoint
+- **THEN** recovery truncates only cache events carrying the checkpoint's
+  synthetic turn at or after its watermark
+- **AND** the unrelated event remains in the journal exactly once
+- **AND** cache lifecycle/evidence/usage events are republished in their
+  original order without provider I/O
+
 ### Requirement: Reproducible cache lifecycle attribution
 
-Persisted manifests and lifecycle events SHALL retain redaction-safe cache
-identity, provider/model/adaptor revisions, operation purpose, request/attempt
-identity, evidence status, and bounded metrics sufficient for equivalent
-replay and audit. Raw prompt content, provider bodies, credentials, and
-consumer resume-capsule text MUST remain outside ordinary observability.
+Runtime SHALL retain reproducible cache lifecycle attribution in the persisted
+synthetic-operation manifest (the versioned cache-mechanism extension plus
+protected `CacheOperationCheckpoint` and `CacheOperationResultCheckpoint`)
+and lifecycle events, including redaction-safe cache identity,
+provider/model/adapter revisions, operation
+purpose, request/attempt identity, evidence status, and bounded metrics
+sufficient for equivalent replay and audit. The ordinary `RunManifest` MAY
+retain only its existing identity projection; it is not required to contain
+transient operation ids or evidence. Raw prompt content, provider bodies,
+credentials, and consumer resume-capsule text MUST remain outside ordinary
+observability.
 
 #### Scenario: Audit a suspended cache identity
 
 - **GIVEN** a maintenance miss suspends an exact cache identity
-- **WHEN** an operator inspects the persisted manifest
+- **WHEN** an operator inspects the persisted synthetic-operation manifest or
+  protected cache checkpoint
 - **THEN** the identity digest, provider/model revisions, purpose, and
   suspension reason are identifiable
 - **AND** raw prompt or provider response content is absent

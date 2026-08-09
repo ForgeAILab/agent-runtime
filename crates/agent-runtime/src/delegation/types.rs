@@ -81,6 +81,7 @@ pub enum CapacityPolicy {
 pub struct DelegationCapacity {
     limit: usize,
     running: AtomicU64,
+    released: Notify,
 }
 
 impl DelegationCapacity {
@@ -89,6 +90,7 @@ impl DelegationCapacity {
         Arc::new(Self {
             limit,
             running: AtomicU64::new(0),
+            released: Notify::new(),
         })
     }
 
@@ -117,11 +119,287 @@ impl DelegationCapacity {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                 Some(v.saturating_sub(1))
             });
+        self.released.notify_one();
+    }
+
+    pub(super) async fn wait_for_release(&self) {
+        self.released.notified().await;
     }
 }
 
+/// Per-call child wait bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DelegationWaitOptions {
+    /// Optional wait duration. `None` uses the coordinator's configured
+    /// default (five seconds by default).
+    pub timeout: Option<Duration>,
+}
+
+impl DelegationWaitOptions {
+    /// Uses the coordinator default wait.
+    pub const fn default_wait() -> Self {
+        Self { timeout: None }
+    }
+
+    /// Requests one bounded per-call wait.
+    pub const fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+        }
+    }
+}
+
+/// Opaque stable identity for one protected child task outcome.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ChildOutcomeIdentity {
+    /// A normal completed child turn.
+    Completed(TurnId),
+    /// A child turn returned a protected interaction request.
+    NeedsInput(InteractionRequestId),
+}
+
+/// Opaque child/outcome key used by the protected parent cursor.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ChildOutcomeKey {
+    child: ChildId,
+    outcome: ChildOutcomeIdentity,
+}
+
+impl fmt::Debug for ChildOutcomeKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildOutcomeKey")
+            .field("child", &self.child)
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
+impl ChildOutcomeKey {
+    pub(super) fn new(child: ChildId, outcome: ChildOutcomeIdentity) -> Self {
+        Self { child, outcome }
+    }
+
+    /// Stable child identity without exposing protected outcome content.
+    pub fn child(&self) -> &ChildId {
+        &self.child
+    }
+
+    /// Stable task-outcome identity.
+    pub fn outcome(&self) -> &ChildOutcomeIdentity {
+        &self.outcome
+    }
+}
+
+/// Opaque parent-scoped cursor for automatic child-outcome consumption.
+///
+/// The cursor contains only stable identities and a monotonic revision; the
+/// exact result/request remains in protected child state.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildOutcomeCursor {
+    parent: SessionId,
+    revision: u64,
+    consumed: Vec<ChildOutcomeKey>,
+}
+
+const MAX_CURSOR_IDENTITIES: usize = 256;
+
+impl fmt::Debug for ChildOutcomeCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildOutcomeCursor")
+            .field("parent", &self.parent)
+            .field("revision", &self.revision)
+            .field("consumed_count", &self.consumed.len())
+            .finish()
+    }
+}
+
+impl ChildOutcomeCursor {
+    pub(super) fn initial(parent: SessionId) -> Self {
+        Self {
+            parent,
+            revision: 0,
+            consumed: Vec::new(),
+        }
+    }
+
+    pub(super) fn validate(&self, parent: &SessionId) -> Result<(), RuntimeError> {
+        if &self.parent != parent {
+            return Err(RuntimeError::conflict(
+                "child outcome cursor belongs to another parent",
+            ));
+        }
+        if self.consumed.len() > MAX_CURSOR_IDENTITIES
+            || self.consumed.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(RuntimeError::conflict(
+                "child outcome cursor identities must be sorted and unique",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn next(&self, keys: impl IntoIterator<Item = ChildOutcomeKey>) -> Self {
+        let mut consumed = self.consumed.clone();
+        consumed.extend(keys);
+        consumed.sort();
+        consumed.dedup();
+        Self {
+            parent: self.parent.clone(),
+            revision: self.revision.saturating_add(1),
+            consumed,
+        }
+    }
+
+    pub(super) fn contains(&self, key: &ChildOutcomeKey) -> bool {
+        self.consumed.binary_search(key).is_ok()
+    }
+
+    pub(super) fn consumed(&self) -> &[ChildOutcomeKey] {
+        &self.consumed
+    }
+
+    pub(super) fn prune_to(&mut self, retained: impl IntoIterator<Item = ChildOutcomeKey>) {
+        let retained = retained
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let keep_recent_from = self.consumed.len().saturating_sub(MAX_CURSOR_IDENTITIES);
+        let mut consumed: Vec<ChildOutcomeKey> = self
+            .consumed
+            .iter()
+            .enumerate()
+            .filter(|(index, key)| *index >= keep_recent_from || retained.contains(*key))
+            .map(|(_, key)| key.clone())
+            .collect();
+        // Retained identities are a preference, not a way to exceed the
+        // bounded cursor contract. Keep the lexically latest canonical
+        // identities when the retained projection itself is larger than the
+        // cap; the delivery ledger remains authoritative for duplicate
+        // suppression after an old cursor identity is pruned.
+        if consumed.len() > MAX_CURSOR_IDENTITIES {
+            let drop_count = consumed.len() - MAX_CURSOR_IDENTITIES;
+            consumed.drain(..drop_count);
+        }
+        self.consumed = consumed;
+    }
+
+    pub(super) fn belongs_to(&self, parent: &SessionId) -> bool {
+        &self.parent == parent
+    }
+
+    /// Parent identity bound to this cursor.
+    pub fn parent(&self) -> &SessionId {
+        &self.parent
+    }
+
+    /// Monotonic cursor revision.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+/// Provenance-bearing request for one atomic child-completion admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildCompletionAdmissionRequest {
+    parent: SessionId,
+    expected_cursor: ChildOutcomeCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child: Option<ChildId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<ChildOutcomeIdentity>,
+}
+
+impl ChildCompletionAdmissionRequest {
+    /// Requests admission against an expected parent cursor revision.
+    pub fn new(parent: SessionId, expected_cursor: ChildOutcomeCursor) -> Self {
+        Self {
+            parent,
+            expected_cursor,
+            child: None,
+            outcome: None,
+        }
+    }
+
+    /// Requests admission while naming one triggering child outcome. Runtime
+    /// still consumes the complete canonical ready batch at the boundary.
+    pub fn for_outcome(
+        parent: SessionId,
+        expected_cursor: ChildOutcomeCursor,
+        child: ChildId,
+        outcome: ChildOutcomeIdentity,
+    ) -> Self {
+        Self {
+            parent,
+            expected_cursor,
+            child: Some(child),
+            outcome: Some(outcome),
+        }
+    }
+
+    pub fn parent(&self) -> &SessionId {
+        &self.parent
+    }
+
+    pub fn expected_cursor(&self) -> &ChildOutcomeCursor {
+        &self.expected_cursor
+    }
+
+    pub fn named_outcome(&self) -> Option<ChildOutcomeKey> {
+        self.child
+            .clone()
+            .zip(self.outcome.clone())
+            .map(|(child, outcome)| ChildOutcomeKey::new(child, outcome))
+    }
+
+    pub(super) fn has_partial_named_outcome(&self) -> bool {
+        self.child.is_some() != self.outcome.is_some()
+    }
+}
+
+/// Versioned protected delivery state persisted in the parent snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct ProtectedChildOutcomeState {
+    pub(super) schema_version: u32,
+    pub(super) parent: SessionId,
+    /// Monotonic protected-state revision. This advances for every durable
+    /// outcome/ready projection mutation, including a follow-up that clears a
+    /// superseded result while leaving the cursor revision unchanged.
+    #[serde(default)]
+    pub(super) revision: u64,
+    pub(super) cursor: ChildOutcomeCursor,
+    /// All durable host-inspection outcomes, including cursor-consumed ones.
+    pub(super) outcomes: Vec<(ChildOutcomeKey, ChildTaskOutcome)>,
+    /// Explicit automatic-delivery projection. `None` preserves the legacy
+    /// interpretation for snapshots written before this field existed.
+    #[serde(default)]
+    pub(super) ready: Option<Vec<ChildOutcomeKey>>,
+}
+
+/// Result of the serialized child-completion admission boundary.
+#[derive(Debug)]
+pub enum ChildCompletionAdmission {
+    /// The child-completion internal turn was accepted after its checkpoint
+    /// barrier and carries the cursor committed with that turn.
+    Accepted {
+        /// The ordinary attributed internal turn handle.
+        turn: TurnHandle,
+        /// Cursor revision staged with the acceptance checkpoint.
+        cursor: ChildOutcomeCursor,
+    },
+    /// User, goal, local action, or another internal turn won the boundary.
+    Busy,
+    /// The supplied cursor or named outcome is no longer current.
+    Stale,
+    /// The parent session is shutting down.
+    Shutdown,
+    /// The request is structurally inconsistent or no ready protected outcome
+    /// exists for it.
+    Conflict { reason: String },
+}
+
 /// Coordinator configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DelegationConfig {
     /// Per-parent caps.
     pub limits: DelegationLimits,
@@ -133,6 +411,48 @@ pub struct DelegationConfig {
     /// child tool views, whatever the spec's scope, so a child can never see
     /// spawn/stop operations.
     pub delegation_tool_names: Vec<String>,
+    /// Default bounded child wait.
+    pub wait_default: Duration,
+    /// Host-narrowed maximum child wait, never above the runtime hard cap.
+    pub wait_max: Duration,
+}
+
+impl Default for DelegationConfig {
+    fn default() -> Self {
+        Self {
+            limits: DelegationLimits::default(),
+            capacity_policy: CapacityPolicy::default(),
+            shared_capacity: None,
+            delegation_tool_names: Vec::new(),
+            wait_default: DEFAULT_DELEGATION_WAIT,
+            wait_max: HARD_MAX_DELEGATION_WAIT,
+        }
+    }
+}
+
+impl DelegationConfig {
+    pub(super) fn validate_wait_options(
+        &self,
+        options: DelegationWaitOptions,
+    ) -> Result<Duration, RuntimeError> {
+        if self.wait_max.is_zero() || self.wait_max > HARD_MAX_DELEGATION_WAIT {
+            return Err(RuntimeError::config(
+                "delegation wait maximum must be non-zero and no greater than thirty seconds",
+            ));
+        }
+        if self.wait_default > self.wait_max {
+            return Err(RuntimeError::config(
+                "delegation wait default cannot exceed its configured maximum",
+            ));
+        }
+        let timeout = options.timeout.unwrap_or(self.wait_default);
+        if timeout > self.wait_max || timeout > HARD_MAX_DELEGATION_WAIT {
+            return Err(RuntimeError::config(
+                "delegation wait timeout exceeds the configured hard maximum",
+            ));
+        }
+        Ok(timeout)
+    }
 }
 
 impl Default for DelegationLimits {
@@ -227,10 +547,17 @@ impl ChildState {
 }
 
 pub(super) fn checkpoint_can_resume(state: &TurnState) -> bool {
+    // A publishing/terminal checkpoint already crossed the child turn's
+    // provider boundary.  It must be reconciled into the parent catalog and
+    // protected outcome ledger; treating it as resumable would either repeat
+    // a provider/tool turn or lose the terminal result after a crash.
     !matches!(
         state,
-        TurnState::CallingModel { .. } | TurnState::Terminal { .. }
-    )
+        TurnState::CallingModel { .. }
+            | TurnState::PublishingTerminal { .. }
+            | TurnState::Terminal { .. }
+            | TurnState::CacheOperationTerminal { .. }
+    ) && !state.is_terminal()
 }
 
 /// A structured snapshot of one child.
@@ -334,6 +661,13 @@ impl DurableChildCatalog {
 /// Exact typed result of one completed delegated child task.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChildTaskResult {
+    /// Exact terminal child turn that produced this result.
+    ///
+    /// The turn is part of the protected outcome value as well as the
+    /// [`ChildOutcomeKey`]. Keeping both copies lets recovery reject a
+    /// persisted key/value splice instead of treating any two completed
+    /// results as interchangeable.
+    pub turn: TurnId,
     /// Final visible answer.
     pub text: String,
     /// Parent-owned artifacts explicitly copied from this child turn.
@@ -345,6 +679,7 @@ impl fmt::Debug for ChildTaskResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ChildTaskResult")
+            .field("turn", &self.turn)
             .field("text_chars", &self.text.chars().count())
             .field("artifact_count", &self.artifacts.len())
             .finish()
@@ -356,7 +691,7 @@ impl fmt::Debug for ChildTaskResult {
 /// `NeedsInput` retains the protected interaction request; callers must not
 /// stringify it into ordinary conversation or plaintext persistence. Use
 /// [`ChildTaskOutcome::model_projection`] for the bounded delivery shape.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChildTaskOutcome {
     /// The child completed its current task.
     Completed {
@@ -542,15 +877,19 @@ impl ChildEntry {
     }
 
     pub(super) fn record(&self) -> ChildSessionRecord {
+        self.record_with_status(self.status.borrow().clone())
+    }
+
+    pub(super) fn record_with_status(&self, status: ChildStatus) -> ChildSessionRecord {
         ChildSessionRecord {
             schema_version: CHILD_CATALOG_SCHEMA_VERSION,
-            child: self.status.borrow().child.clone(),
-            child_session: self.status.borrow().session.clone(),
-            parent_session: self.status.borrow().parent.clone(),
+            child: status.child.clone(),
+            child_session: status.session.clone(),
+            parent_session: status.parent.clone(),
             spec: self.spec.clone(),
             policy_fingerprint: self.policy_fingerprint.clone(),
-            status: self.status.borrow().clone(),
-            checkpoint_watermark: self.checkpoint_watermark,
+            status,
+            checkpoint_watermark: self.checkpoint_watermark.clone(),
             checkpoint_resumable: self.checkpoint_resumable,
             revision: self.revision,
             deadline_at: self.deadline_at,
@@ -563,11 +902,7 @@ pub(super) struct QueuedSpawn {
     pub(super) spec: ChildSpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum TaskOutcomeKey {
-    Completed(TurnId),
-    NeedsInput(InteractionRequestId),
-}
+pub(super) type TaskOutcomeKey = ChildOutcomeIdentity;
 
 pub(super) struct CoordinatorInner {
     pub(super) parent: SessionHandle,
@@ -576,9 +911,64 @@ pub(super) struct CoordinatorInner {
     pub(super) children: Mutex<BTreeMap<ChildId, ChildEntry>>,
     pub(super) queue: Mutex<Vec<QueuedSpawn>>,
     pub(super) spawn_reservations: Mutex<usize>,
+    /// Retained-record reservations cover the interval between spawn
+    /// admission and insertion into `children`.  Checking `children.len()`
+    /// alone lets concurrent spawns all pass a max-retained-children cap.
+    pub(super) retained_reservations: Mutex<usize>,
     pub(super) returned_inputs:
         Mutex<BTreeMap<(ChildId, InteractionRequestId), InteractionRequest>>,
     pub(super) ready_task_outcomes: Mutex<BTreeMap<(ChildId, TaskOutcomeKey), ChildTaskOutcome>>,
+    /// Protected outcomes that have crossed the parent session-store barrier.
+    /// A terminal result may be staged in `ready_task_outcomes` before that
+    /// barrier, but no host inspection or automatic admission may expose it
+    /// until this set contains its opaque identity.
+    pub(super) durable_task_outcomes: Mutex<std::collections::BTreeSet<ChildOutcomeKey>>,
+    /// Durable host-inspection ledger. Delivery readiness is tracked
+    /// separately so consuming an automatic projection never erases the
+    /// exact result returned by `task_outcome` after a restart.
+    pub(super) task_outcome_ledger: Mutex<BTreeMap<(ChildId, TaskOutcomeKey), ChildTaskOutcome>>,
+    /// Completion/status transitions awaiting the parent snapshot barrier.
+    pub(super) pending_terminal_statuses: Mutex<BTreeMap<ChildId, ChildStatus>>,
+    pub(super) pending_terminal_outcomes: Mutex<std::collections::BTreeSet<ChildOutcomeKey>>,
+    /// Monotonic revision for protected outcome ledger/readiness mutations.
+    pub(super) outcome_state_revision: AtomicU64,
+    pub(super) outcome_cursor: Mutex<ChildOutcomeCursor>,
+    /// Serializes cursor validation, parent idle arbitration, and staging.
+    pub(super) outcome_admission_gate: Mutex<()>,
+    /// Prevents asynchronous catalog persistence from replacing a cursor
+    /// extension value staged for an in-flight parent acceptance checkpoint.
+    pub(super) outcome_admission_in_flight: AtomicBool,
+    /// Wakes persistence callers waiting for an in-flight parent acceptance
+    /// barrier to resolve before they snapshot protected outcomes.
+    pub(super) outcome_admission_changed: Notify,
+    /// The last protected-outcome persistence failure. Waiters receive this
+    /// error instead of silently waiting forever for an outcome that was not
+    /// made durable; staging a later distinct outcome begins a fresh barrier.
+    pub(super) outcome_persistence_error: Mutex<Option<RuntimeError>>,
+    /// Successful ordinary catalog saves must not erase an unobserved
+    /// protected-outcome failure: a background monitor save could otherwise
+    /// make `wait_ready_task_outcomes` wait forever. `recover` sets this flag
+    /// when it is explicitly retrying a failed terminal reduction.
+    pub(super) outcome_persistence_retry: AtomicBool,
+    /// Whether a waiter has observed the current persistence error. Once the
+    /// error is observable, a later successful save may clear it normally.
+    pub(super) outcome_persistence_error_observed: AtomicBool,
+    /// Terminal checkpoint recoveries whose parent/catalog transaction has
+    /// not crossed its persistence barrier yet.  This is process-local
+    /// retry state: it is intentionally not persisted as a second source of
+    /// truth, and is cleared only after the catalog/outcome transaction
+    /// succeeds.
+    pub(super) pending_terminal_recoveries: Mutex<std::collections::BTreeSet<ChildId>>,
+    /// Terminal checkpoint watermarks whose recovery projection was already
+    /// persisted and published in this coordinator.  Re-running `recover`
+    /// is otherwise liable to emit duplicate public lifecycle events for the
+    /// same authoritative checkpoint.  A later checkpoint watermark naturally
+    /// makes the child eligible again.
+    pub(super) published_recoveries: Mutex<BTreeMap<ChildId, Option<CheckpointWatermark>>>,
+    /// At most one wake-up waiter retries a queue item blocked by a shared
+    /// process capacity pool.  The pool notification is edge-triggered, so
+    /// duplicate waiters would otherwise create unbounded retry tasks.
+    pub(super) shared_capacity_retry_waiting: AtomicBool,
     pub(super) returned_inputs_changed: Notify,
     pub(super) next_child: AtomicU64,
     pub(super) bind_gate: tokio::sync::Mutex<()>,
@@ -602,5 +992,30 @@ impl fmt::Debug for DelegationCoordinator {
         f.debug_struct("DelegationCoordinator")
             .field("parent", self.inner.parent.id())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pruning_keeps_a_sorted_restart_valid_cursor_at_the_cap() {
+        let parent = SessionId::new("cursor-cap-parent");
+        let child = ChildId::new("child-1");
+        let mut cursor = ChildOutcomeCursor::initial(parent.clone());
+        let keys = (0..300)
+            .map(|turn| {
+                ChildOutcomeKey::new(
+                    child.clone(),
+                    ChildOutcomeIdentity::Completed(TurnId::new(format!("turn-{turn}"))),
+                )
+            })
+            .collect::<Vec<_>>();
+        cursor = cursor.next(keys);
+        cursor.prune_to(std::iter::empty());
+        assert_eq!(cursor.consumed.len(), MAX_CURSOR_IDENTITIES);
+        assert!(cursor.validate(&parent).is_ok());
+        assert!(cursor.consumed.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }
