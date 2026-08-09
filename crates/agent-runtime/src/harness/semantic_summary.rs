@@ -22,6 +22,7 @@ use agent_runtime_core::artifact::{
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::TurnFinish;
+use agent_runtime_core::provider::ProviderAttemptPurpose;
 use agent_runtime_core::store::{SessionStateSensitivity, VersionedSessionState};
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
@@ -613,6 +614,8 @@ impl SemanticSummaryCoordinator {
                 source: UsageSource::SemanticSummary,
                 provenance: Provenance {
                     purpose: Some(purpose.into()),
+                    attempt_purpose: (purpose == SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE)
+                        .then_some(ProviderAttemptPurpose::IdleCompaction),
                     ..Provenance::default()
                 },
                 delta: response.usage,
@@ -1134,6 +1137,10 @@ mod tests {
             patch.usage[0].provenance.purpose.as_deref(),
             Some(SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE)
         );
+        assert_eq!(
+            patch.usage[0].provenance.attempt_purpose,
+            Some(ProviderAttemptPurpose::IdleCompaction)
+        );
         let projection = coordinator
             .project(&HistoryView {
                 session: SessionId::new("s"),
@@ -1472,6 +1479,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(commit.usage.len(), 1);
+        assert_eq!(
+            commit.usage[0].provenance.purpose.as_deref(),
+            Some(SEMANTIC_SUMMARY_PURPOSE)
+        );
+        assert_eq!(commit.usage[0].provenance.attempt_purpose, None);
         let state = commit.state.unwrap().into_state();
         assert_eq!(
             state.sensitivity,
