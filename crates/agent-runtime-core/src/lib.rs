@@ -107,9 +107,10 @@ pub mod prelude {
     };
     pub use crate::error::{ErrorKind, Result, RuntimeError};
     pub use crate::event::{
-        BudgetCategory, ChildPhase, ChildRecoveryState, CompactionReason, EstimationConfidence,
-        EventEnvelope, GoalUpdateCause, LimitKind, PlanItemProjection, PlanItemStatus,
-        PlanSensitivity, RuntimeEvent, SCHEMA_VERSION, TurnFinish,
+        BudgetCategory, CacheState, CacheStateKind, ChildPhase, ChildRecoveryState,
+        CompactionReason, EstimationConfidence, EventEnvelope, GoalUpdateCause, LimitKind,
+        PlanItemProjection, PlanItemStatus, PlanSensitivity, RuntimeEvent, SCHEMA_VERSION,
+        TurnFinish,
     };
     pub use crate::goal::{
         GOAL_STATE_SCHEMA_VERSION, GoalAccountingState, GoalCommand, GoalCommandResult,

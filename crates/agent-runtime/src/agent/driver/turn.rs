@@ -939,7 +939,7 @@ impl<'a> TurnMachine<'a> {
                 .expect("session state poisoned")
                 .history
                 .clone();
-            let mut request = match driver
+            let planned_request = match driver
                 .build_request(
                     &history,
                     &emitter,
@@ -1006,6 +1006,7 @@ impl<'a> TurnMachine<'a> {
                 }
             };
 
+            let mut request = planned_request.request;
             if let Err(err) = driver.validate_and_downgrade(&mut request, &emitter, &turn) {
                 emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
                 self.complete(TurnFinish::Failed, visible_output).await;
@@ -1030,10 +1031,22 @@ impl<'a> TurnMachine<'a> {
                 self.complete(TurnFinish::Failed, visible_output).await;
                 return;
             }
+            if turn_cancel.is_cancelled() {
+                self.complete_cancelled(visible_output).await;
+                return;
+            }
+            if let Some(cache_plan) = planned_request.cache_plan.as_ref() {
+                // The predecessor boundary is the provider-request start,
+                // not plan construction. A request rejected by preflight or
+                // cancelled before this point must not seed the next cache
+                // comparison.
+                execution.planner.commit_cache_plan(cache_plan);
+            }
             let outcome = driver
                 .run_provider(
                     request,
                     &request_id,
+                    planned_request.cache.as_ref(),
                     &emitter,
                     &minter,
                     &turn_cancel,

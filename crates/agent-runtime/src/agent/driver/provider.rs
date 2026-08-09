@@ -18,6 +18,90 @@ struct PendingReasoning {
     started_at: Timestamp,
 }
 
+/// The exact cache-plan projection that was used to derive one provider
+/// request. It travels with the request into every retry attempt so cache
+/// evidence cannot be joined to a neighboring turn's plan event by accident.
+#[derive(Debug, Clone)]
+pub(super) struct ProviderCacheProjection {
+    /// The exact cache-plan fingerprint.
+    pub(super) cache_plan: Fingerprint,
+    /// The comparable provider-request expectation, if a predecessor exists.
+    pub(super) expected_read_tokens: Option<u64>,
+    /// Confidence in the planner's token count.
+    pub(super) confidence: EstimationConfidence,
+    /// Whether the provider can reuse a stable prompt prefix.
+    pub(super) provider_cache_supported: bool,
+}
+
+/// A request plus the cache-plan projection from which it was built.
+#[derive(Debug, Clone)]
+pub(super) struct PlannedProviderRequest {
+    pub(super) request: ProviderRequest,
+    pub(super) cache: Option<ProviderCacheProjection>,
+    pub(super) cache_plan: Option<CachePlan>,
+}
+
+/// Resolves one normalized cache observation against the exact plan that
+/// produced the request. The provider-reported values remain separate from
+/// `missed_tokens`, which is derived evidence and never enters `UsageDelta`.
+fn resolve_cache_state(
+    projection: &ProviderCacheProjection,
+    observation: Option<(Option<u64>, Option<u64>)>,
+    cache_reporting_supported: bool,
+) -> (
+    CacheState,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+) {
+    let (observed_read_tokens, observed_write_tokens) = observation.unwrap_or((None, None));
+
+    if !projection.provider_cache_supported {
+        return (
+            CacheState::Unsupported,
+            projection.expected_read_tokens,
+            observed_read_tokens,
+            observed_write_tokens,
+            None,
+        );
+    }
+    // A provider that does not declare cache reporting cannot turn an
+    // unexpected omission (or even an adapter-local observation) into a
+    // canonical hit/miss claim.
+    if !cache_reporting_supported || observation.is_none() {
+        return (
+            CacheState::Unknown,
+            projection.expected_read_tokens,
+            observed_read_tokens,
+            observed_write_tokens,
+            None,
+        );
+    }
+
+    let missed_tokens = projection
+        .expected_read_tokens
+        .zip(observed_read_tokens)
+        .map(|(expected, observed)| expected.saturating_sub(observed));
+    let miss_observed = missed_tokens.is_some_and(|missed| missed > 0);
+    let warm_observed = observed_read_tokens.is_some_and(|read| read > 0)
+        || observed_write_tokens.is_some_and(|write| write > 0);
+    let state = if miss_observed {
+        CacheState::MissObserved
+    } else if warm_observed {
+        CacheState::WarmObserved
+    } else {
+        CacheState::Eligible
+    };
+    (
+        state,
+        projection.expected_read_tokens,
+        observed_read_tokens,
+        observed_write_tokens,
+        missed_tokens,
+    )
+}
+
 /// One coalesced presentation delta ready to become a `RuntimeEvent`.
 enum CoalescedDelta {
     Text(String),
@@ -263,7 +347,7 @@ impl Driver {
         step: u32,
         cancel: &Cancellation,
         deadline: Deadline,
-    ) -> Result<ProviderRequest, ContextError> {
+    ) -> Result<PlannedProviderRequest, ContextError> {
         debug_assert_eq!(
             execution.active_history_start(turn_id),
             Some(active_history_start),
@@ -588,7 +672,18 @@ impl Driver {
                 _ => {}
             }
         }
-        Ok(request)
+        let cache = plan.cache_plan().map(|cache_plan| ProviderCacheProjection {
+            cache_plan: cache_plan.fingerprint(),
+            expected_read_tokens: cache_plan.expected_read_tokens(),
+            confidence: map_confidence(plan.confidence()),
+            provider_cache_supported: cache_plan.provider_cache.capability.supports_stable,
+        });
+        let cache_plan = plan.cache_plan().cloned();
+        Ok(PlannedProviderRequest {
+            request,
+            cache,
+            cache_plan,
+        })
     }
 
     /// Validates the request against the model's capabilities. Unsupported
@@ -648,6 +743,7 @@ impl Driver {
         &self,
         request: ProviderRequest,
         request_id: &RequestId,
+        cache: Option<&ProviderCacheProjection>,
         emitter: &EventEmitter,
         minter: &IdMinter,
         turn_cancel: &Cancellation,
@@ -686,8 +782,11 @@ impl Driver {
             let mut text = String::new();
             let mut attempt_visible_output = false;
             let mut accepted_semantic_event = false;
+            let mut response_progress = false;
             let mut reasoning = ReasoningAccumulator::default();
             let mut usage = UsageDelta::new();
+            let mut cache_observation: Option<(Option<u64>, Option<u64>)> = None;
+            let mut reached_cache_evidence_boundary = false;
             let mut assembler = ToolCallAssembler::default();
             let mut error: Option<ProviderError> = None;
             let mut provider_finish: Option<FinishReason> = None;
@@ -762,6 +861,7 @@ impl Driver {
                         match event {
                             ProviderStreamEvent::TextDelta { text: t } => {
                                 accepted_semantic_event = true;
+                                response_progress = true;
                                 if !t.is_empty() {
                                     attempt_visible_output = true;
                                 }
@@ -777,6 +877,7 @@ impl Driver {
                                 signature,
                             } => {
                                 accepted_semantic_event = true;
+                                response_progress = true;
                                 reasoning.push(&t, redacted, signature);
                                 // The signature is provider integrity data for
                                 // canonical replay; the UI event stream never
@@ -794,6 +895,7 @@ impl Driver {
                                 arguments_fragment,
                             } => {
                                 accepted_semantic_event = true;
+                                response_progress = true;
                                 // A tool call is a content switch as much as
                                 // text↔reasoning is. Without this, the prose
                                 // that introduces a call ("let me read the
@@ -806,24 +908,44 @@ impl Driver {
                             }
                             ProviderStreamEvent::Usage { delta } => {
                                 accepted_semantic_event = true;
+                                response_progress = true;
+                                reached_cache_evidence_boundary = true;
                                 usage.merge(&delta);
                             }
                             ProviderStreamEvent::CacheObservation {
                                 read_tokens,
                                 write_tokens,
                             } => {
+                                if read_tokens.is_none() && write_tokens.is_none() {
+                                    // A manually-constructed empty event is
+                                    // not evidence. Adapters are expected to
+                                    // use `ProviderStreamEvent::cache_observation`,
+                                    // which rejects this shape at creation.
+                                    continue;
+                                }
                                 accepted_semantic_event = true;
+                                response_progress = true;
+                                reached_cache_evidence_boundary = true;
                                 // A pending coalesced delta must land before
                                 // this non-delta event so emission order
-                                // matches stream arrival order.
+                                // matches stream arrival order. Cache values
+                                // themselves are held until the attempt's
+                                // final usage boundary so duplicate provider
+                                // frames cannot create duplicate evidence.
                                 emit_coalesced(coalescer.drain());
-                                emitter.emit(
-                                    turn.clone(),
-                                    RuntimeEvent::CacheObservation {
-                                        read_tokens,
-                                        write_tokens,
-                                    },
-                                );
+                                match &mut cache_observation {
+                                    Some((observed_read, observed_write)) => {
+                                        if read_tokens.is_some() {
+                                            *observed_read = read_tokens;
+                                        }
+                                        if write_tokens.is_some() {
+                                            *observed_write = write_tokens;
+                                        }
+                                    }
+                                    None => {
+                                        cache_observation = Some((read_tokens, write_tokens));
+                                    }
+                                }
                             }
                             ProviderStreamEvent::Downgrade { capability, detail } => {
                                 accepted_semantic_event = true;
@@ -849,6 +971,8 @@ impl Driver {
                             ProviderStreamEvent::VendorMetadata { .. } => {}
                             ProviderStreamEvent::Finish { reason } => {
                                 accepted_semantic_event = true;
+                                response_progress = true;
+                                reached_cache_evidence_boundary = true;
                                 provider_finish = Some(reason);
                                 break;
                             }
@@ -859,6 +983,14 @@ impl Driver {
                         }
                     }
                 }
+            }
+            // A provider is allowed to close a successful stream without an
+            // explicit Finish frame. Content deltas still prove that a
+            // response reached the runtime, so omission of cache fields must
+            // resolve to `unknown`; a transport error or cancellation before
+            // any response progress remains state-free.
+            if error.is_none() && response_progress {
+                reached_cache_evidence_boundary = true;
             }
             // Every stream exit path — natural end, `Finish`, `Error`, or the
             // `turn_cancel.is_cancelled()` break above — falls through to
@@ -926,6 +1058,53 @@ impl Driver {
                     .usage
                     .record(record.clone());
                 emitter.emit(turn.clone(), RuntimeEvent::Usage { record });
+            }
+
+            if let Some((read_tokens, write_tokens)) = cache_observation {
+                emitter.emit(
+                    turn.clone(),
+                    RuntimeEvent::CacheObservation {
+                        request: Some(request_id.clone()),
+                        attempt: Some(attempt_id.clone()),
+                        cache_plan: cache.map(|projection| projection.cache_plan.clone()),
+                        read_tokens,
+                        write_tokens,
+                    },
+                );
+            }
+
+            if reached_cache_evidence_boundary {
+                if let Some(projection) = cache {
+                    let cache_reporting_supported = self
+                        .provider
+                        .capabilities(&request.model)
+                        .is_some_and(|capabilities| capabilities.cache);
+                    let (
+                        state,
+                        expected_read_tokens,
+                        observed_read_tokens,
+                        observed_write_tokens,
+                        missed_tokens,
+                    ) = resolve_cache_state(
+                        projection,
+                        cache_observation,
+                        cache_reporting_supported,
+                    );
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::CacheStateChanged {
+                            request: request_id.clone(),
+                            attempt: attempt_id.clone(),
+                            cache_plan: projection.cache_plan.clone(),
+                            state,
+                            expected_read_tokens,
+                            observed_read_tokens,
+                            observed_write_tokens,
+                            missed_tokens,
+                            confidence: projection.confidence,
+                        },
+                    );
+                }
             }
 
             if turn_cancel.is_cancelled() {
@@ -1069,5 +1248,81 @@ impl Driver {
                 finish,
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn projection(expected_read_tokens: Option<u64>) -> ProviderCacheProjection {
+        ProviderCacheProjection {
+            cache_plan: Fingerprint::of("plan"),
+            expected_read_tokens,
+            confidence: EstimationConfidence::Exact,
+            provider_cache_supported: true,
+        }
+    }
+
+    #[test]
+    fn explicit_zero_against_a_comparable_expectation_is_a_miss() {
+        let resolved = resolve_cache_state(&projection(Some(105_000)), Some((Some(0), None)), true);
+        assert_eq!(resolved.0, CacheState::MissObserved);
+        assert_eq!(resolved.1, Some(105_000));
+        assert_eq!(resolved.2, Some(0));
+        assert_eq!(resolved.4, Some(105_000));
+    }
+
+    #[test]
+    fn partial_read_uses_saturating_miss_arithmetic() {
+        let resolved =
+            resolve_cache_state(&projection(Some(105_000)), Some((Some(80_000), None)), true);
+        assert_eq!(resolved.0, CacheState::MissObserved);
+        assert_eq!(resolved.2, Some(80_000));
+        assert_eq!(resolved.4, Some(25_000));
+    }
+
+    #[test]
+    fn larger_than_expected_read_is_warm_with_derived_zero() {
+        let resolved = resolve_cache_state(&projection(Some(10)), Some((Some(20), None)), true);
+        assert_eq!(resolved.0, CacheState::WarmObserved);
+        assert_eq!(resolved.4, Some(0));
+    }
+
+    #[test]
+    fn first_request_zero_is_eligible_without_a_miss() {
+        let resolved = resolve_cache_state(&projection(None), Some((Some(0), None)), true);
+        assert_eq!(resolved.0, CacheState::Eligible);
+        assert_eq!(resolved.4, None);
+    }
+
+    #[test]
+    fn explicit_zero_with_a_zero_expectation_retains_derived_zero() {
+        let resolved = resolve_cache_state(&projection(Some(0)), Some((Some(0), None)), true);
+        assert_eq!(resolved.0, CacheState::Eligible);
+        assert_eq!(resolved.4, Some(0));
+    }
+
+    #[test]
+    fn omitted_cache_evidence_is_unknown() {
+        let resolved = resolve_cache_state(&projection(Some(105_000)), None, true);
+        assert_eq!(resolved.0, CacheState::Unknown);
+        assert_eq!(resolved.1, Some(105_000));
+        assert_eq!(resolved.2, None);
+        assert_eq!(resolved.4, None);
+    }
+
+    #[test]
+    fn unsupported_cache_plans_and_reporting_are_not_misses() {
+        let mut unsupported = projection(Some(100));
+        unsupported.provider_cache_supported = false;
+        assert_eq!(
+            resolve_cache_state(&unsupported, Some((Some(0), None)), true).0,
+            CacheState::Unsupported
+        );
+        assert_eq!(
+            resolve_cache_state(&projection(Some(100)), Some((Some(0), None)), false).0,
+            CacheState::Unknown
+        );
     }
 }

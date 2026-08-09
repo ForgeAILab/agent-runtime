@@ -186,6 +186,14 @@ pub struct CachePlan {
     /// compare against — a first turn has nothing to invalidate. Zero when
     /// `identity` differs from `previous`'s, regardless of segment hashes.
     pub preserved_prefix_len: usize,
+    /// Whether this plan was built after a prior provider-request cache plan
+    /// existed. This is deliberately separate from
+    /// [`CachePlan::preserved_prefix_len`]: a first request has no comparable
+    /// expectation even though all of its declared stable prefix is retained
+    /// for future reuse, while an identity change has a prior baseline and an
+    /// expected read of zero.
+    #[serde(default)]
+    pub has_comparable_predecessor: bool,
     /// The summed token cost of the preserved prefix.
     pub preserved_prefix_tokens: u32,
     /// The summed token cost of everything at or after the preserved
@@ -222,6 +230,7 @@ impl CachePlan {
             .take_while(|segment| segment.cache_class == CacheClass::Stable)
             .count();
 
+        let has_comparable_predecessor = previous.is_some();
         let preserved_prefix_len = match previous {
             Some(previous) if previous.identity == identity => segments
                 .iter()
@@ -253,12 +262,27 @@ impl CachePlan {
             segments,
             declared_stable_prefix_len,
             preserved_prefix_len,
+            has_comparable_predecessor,
             preserved_prefix_tokens,
             invalidated_tokens,
             changed_segments,
             local_compiled_context_key,
             provider_cache,
         }
+    }
+
+    /// The expected provider cache read for this request. A first provider
+    /// request has no baseline and therefore returns `None`; every later plan
+    /// has a comparable predecessor, even when identity or prefix changes
+    /// reduce the expectation to `Some(0)`.
+    pub fn expected_read_tokens(&self) -> Option<u64> {
+        self.has_comparable_predecessor
+            .then_some(u64::from(self.preserved_prefix_tokens))
+    }
+
+    /// Whether this plan was compared against a prior provider request.
+    pub fn has_comparable_predecessor(&self) -> bool {
+        self.has_comparable_predecessor
     }
 
     /// This plan's own fingerprint, recorded in run manifests and cache-plan
@@ -283,6 +307,10 @@ impl CachePlan {
                 "provider_supported",
                 self.provider_cache.capability.revision.as_str(),
             );
+        hasher.pair(
+            "has_predecessor",
+            self.has_comparable_predecessor.to_string(),
+        );
         for segment in &self.segments {
             hasher.pair(segment.fragment.as_str(), segment.cache_class.as_str());
         }
@@ -399,6 +427,8 @@ mod tests {
         let plan1 = CachePlan::build(identity.clone(), &turn1, None, &capability);
         assert_eq!(plan1.declared_stable_prefix_len, 2);
         assert_eq!(plan1.preserved_prefix_len, 2);
+        assert!(!plan1.has_comparable_predecessor());
+        assert_eq!(plan1.expected_read_tokens(), None);
 
         let turn2 = vec![
             segment(
@@ -426,6 +456,8 @@ mod tests {
         let plan2 = CachePlan::build(identity, &turn2, Some(&plan1), &capability);
         assert_eq!(plan2.preserved_prefix_len, 2);
         assert_eq!(plan2.preserved_prefix_tokens, 30);
+        assert!(plan2.has_comparable_predecessor());
+        assert_eq!(plan2.expected_read_tokens(), Some(30));
         assert_eq!(plan2.changed_segments, vec![FragmentId::new("input-2")]);
     }
 
@@ -487,6 +519,7 @@ mod tests {
         let plan2 = CachePlan::build(identity, &turn2, Some(&plan1), &capability);
 
         assert_eq!(plan2.preserved_prefix_len, 1);
+        assert_eq!(plan2.expected_read_tokens(), Some(10));
         assert_eq!(
             plan2.changed_segments,
             vec![FragmentId::new("tool"), FragmentId::new("input")]
@@ -526,6 +559,7 @@ mod tests {
         let plan2 = CachePlan::build(identity_b, &segments, Some(&plan1), &capability);
 
         assert_eq!(plan2.preserved_prefix_len, 0);
+        assert_eq!(plan2.expected_read_tokens(), Some(0));
         assert_eq!(plan2.changed_segments.len(), segments.len());
         assert_eq!(
             plan1.local_compiled_context_key,
@@ -563,6 +597,7 @@ mod tests {
         let plan2 = CachePlan::build(identity_b, &segments, Some(&plan1), &capability);
 
         assert_eq!(plan2.preserved_prefix_len, 0);
+        assert_eq!(plan2.expected_read_tokens(), Some(0));
         assert_eq!(plan2.changed_segments.len(), segments.len());
     }
 
@@ -580,10 +615,78 @@ mod tests {
         )];
         let plan = CachePlan::build(identity.clone(), &segments, None, &no_stable);
         assert_eq!(plan.provider_cache.unsupported, vec![CacheClass::Stable]);
+        assert_eq!(plan.expected_read_tokens(), None);
+
+        let comparable = CachePlan::build(identity.clone(), &segments, Some(&plan), &no_stable);
+        assert_eq!(comparable.expected_read_tokens(), Some(10));
+        assert_eq!(
+            comparable.provider_cache.unsupported,
+            vec![CacheClass::Stable]
+        );
 
         let full = full_capability();
         let plan2 = CachePlan::build(identity, &segments, None, &full);
         assert!(plan2.provider_cache.unsupported.is_empty());
+    }
+
+    #[test]
+    fn compaction_prefix_replacement_keeps_only_the_surviving_expectation() {
+        let identity = base_profile().fingerprint();
+        let capability = full_capability();
+        let previous_segments = vec![
+            segment(
+                "system",
+                FragmentKind::SystemInstruction,
+                CacheClass::Stable,
+                "system-v1",
+                10,
+            ),
+            segment(
+                "history-1",
+                FragmentKind::History,
+                CacheClass::Stable,
+                "history-v1",
+                20,
+            ),
+            segment(
+                "history-2",
+                FragmentKind::History,
+                CacheClass::Stable,
+                "history-v2",
+                30,
+            ),
+        ];
+        let previous = CachePlan::build(identity.clone(), &previous_segments, None, &capability);
+
+        // A compactor retained the stable system prefix but replaced the old
+        // history run with one summary segment. The expectation is the
+        // surviving ten-token prefix, not the old thirty-token total and not
+        // an unknown value.
+        let compacted_segments = vec![
+            segment(
+                "system",
+                FragmentKind::SystemInstruction,
+                CacheClass::Stable,
+                "system-v1",
+                10,
+            ),
+            segment(
+                "summary-1",
+                FragmentKind::Summary,
+                CacheClass::Stable,
+                "summary-v1",
+                12,
+            ),
+        ];
+        let compacted =
+            CachePlan::build(identity, &compacted_segments, Some(&previous), &capability);
+        assert_eq!(compacted.preserved_prefix_len, 1);
+        assert_eq!(compacted.preserved_prefix_tokens, 10);
+        assert_eq!(compacted.expected_read_tokens(), Some(10));
+        assert_eq!(
+            compacted.changed_segments,
+            vec![FragmentId::new("summary-1")]
+        );
     }
 
     #[test]
@@ -603,6 +706,27 @@ mod tests {
             plan_a.local_compiled_context_key,
             plan_b.local_compiled_context_key
         );
+    }
+
+    #[test]
+    fn predecessor_presence_is_part_of_the_cache_plan_fingerprint() {
+        let identity = base_profile().fingerprint();
+        let capability = full_capability();
+        let segments = vec![segment(
+            "sys",
+            FragmentKind::SystemInstruction,
+            CacheClass::Stable,
+            "sys-body",
+            10,
+        )];
+        let first = CachePlan::build(identity.clone(), &segments, None, &capability);
+        let second = CachePlan::build(identity, &segments, Some(&first), &capability);
+
+        assert_eq!(
+            first.preserved_prefix_tokens,
+            second.preserved_prefix_tokens
+        );
+        assert_ne!(first.fingerprint(), second.fingerprint());
     }
 
     #[test]

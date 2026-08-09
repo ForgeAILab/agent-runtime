@@ -1,6 +1,6 @@
 //! Event-schema conformance: versioning, serialization stability, and ordering.
 
-use agent_runtime_core::event::{EventEnvelope, SCHEMA_VERSION};
+use agent_runtime_core::event::{EventEnvelope, RuntimeEvent, SCHEMA_VERSION};
 use serde_json::Value;
 
 const EVENT_ENVELOPE_V1: &str = include_str!("fixtures/event-envelope-v1.json");
@@ -13,6 +13,8 @@ const EVENT_ENVELOPE_V8: &str = include_str!("fixtures/event-envelope-v8.json");
 const EVENT_ENVELOPE_V9: &str = include_str!("fixtures/event-envelope-v9.json");
 const EVENT_ENVELOPE_V10: &str = include_str!("fixtures/event-envelope-v10.json");
 const EVENT_ENVELOPE_V11: &str = include_str!("fixtures/event-envelope-v11.json");
+const EVENT_ENVELOPE_V13_CACHE: &str = include_str!("fixtures/event-envelope-v13-cache.json");
+const EVENT_ENVELOPE_LEGACY_CACHE: &str = include_str!("fixtures/event-envelope-legacy-cache.json");
 
 /// Asserts every envelope carries the current schema version, round-trips
 /// losslessly through JSON, and that sequence numbers are strictly increasing.
@@ -126,6 +128,49 @@ pub fn assert_v11_golden_fixture() {
     );
 }
 
+/// Asserts presence-aware zero/absence cache fields and the correlated state
+/// projection round-trip exactly as the v13 fixture records them.
+pub fn assert_v13_cache_golden_fixture() {
+    let expected: Value =
+        serde_json::from_str(EVENT_ENVELOPE_V13_CACHE).expect("valid v13 cache fixture JSON");
+    let envelopes: Vec<EventEnvelope> =
+        serde_json::from_value(expected.clone()).expect("v13 cache fixture remains readable");
+    let actual = serde_json::to_value(envelopes).expect("serialize v13 cache fixture");
+    assert_eq!(
+        actual, expected,
+        "the v13 presence-aware cache event representation changed"
+    );
+}
+
+/// Legacy cache observations had numeric read/write fields and no causal
+/// attribution. They remain readable as present optional values, but the
+/// absent identities stay absent so no miss projection can be fabricated.
+pub fn assert_legacy_cache_observation_is_readable() {
+    let expected: Value =
+        serde_json::from_str(EVENT_ENVELOPE_LEGACY_CACHE).expect("valid legacy cache fixture JSON");
+    let envelopes: Vec<EventEnvelope> = serde_json::from_value(expected.clone())
+        .expect("legacy cache observation remains readable");
+    let RuntimeEvent::CacheObservation {
+        request,
+        attempt,
+        cache_plan,
+        read_tokens,
+        write_tokens,
+    } = &envelopes[0].payload
+    else {
+        panic!("expected a legacy cache observation");
+    };
+    assert!(request.is_none());
+    assert!(attempt.is_none());
+    assert!(cache_plan.is_none());
+    assert_eq!(*read_tokens, Some(2));
+    assert_eq!(*write_tokens, Some(1));
+    assert_eq!(
+        serde_json::to_value(envelopes).expect("serialize legacy cache"),
+        expected
+    );
+}
+
 /// Asserts old unattributed delta fixtures remain rejected by v6 just as they
 /// were by v5; adding interaction events does not relax output attribution.
 pub fn assert_unattributed_output_fixtures_are_rejected() {
@@ -188,6 +233,16 @@ mod tests {
     #[test]
     fn v11_golden_fixture_is_exactly_compatible() {
         assert_v11_golden_fixture();
+    }
+
+    #[test]
+    fn v13_cache_golden_fixture_is_exactly_compatible() {
+        assert_v13_cache_golden_fixture();
+    }
+
+    #[test]
+    fn legacy_cache_observation_remains_readable_without_attribution() {
+        assert_legacy_cache_observation_is_readable();
     }
 
     #[test]

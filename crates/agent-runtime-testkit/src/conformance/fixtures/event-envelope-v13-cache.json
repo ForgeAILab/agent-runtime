@@ -1,0 +1,51 @@
+[
+  {
+    "schema_version": 13,
+    "seq": 0,
+    "id": "evt-cache-1",
+    "session": "session-cache",
+    "turn": "turn-cache",
+    "timestamp": 200,
+    "payload": {
+      "event": "cache_observation",
+      "request": "req-cache",
+      "attempt": "att-cache",
+      "cache_plan": "plan-cache",
+      "read_tokens": 0
+    }
+  },
+  {
+    "schema_version": 13,
+    "seq": 1,
+    "id": "evt-cache-2",
+    "session": "session-cache",
+    "turn": "turn-cache",
+    "timestamp": 201,
+    "payload": {
+      "event": "cache_observation",
+      "request": "req-cache",
+      "attempt": "att-cache",
+      "cache_plan": "plan-cache",
+      "write_tokens": 3
+    }
+  },
+  {
+    "schema_version": 13,
+    "seq": 2,
+    "id": "evt-cache-3",
+    "session": "session-cache",
+    "turn": "turn-cache",
+    "timestamp": 202,
+    "payload": {
+      "event": "cache_state_changed",
+      "request": "req-cache",
+      "attempt": "att-cache",
+      "cache_plan": "plan-cache",
+      "state": "miss_observed",
+      "expected_read_tokens": 105000,
+      "observed_read_tokens": 0,
+      "missed_tokens": 105000,
+      "confidence": "estimated"
+    }
+  }
+]

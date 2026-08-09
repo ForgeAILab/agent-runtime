@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use agent_runtime::provider::ProviderCredentialTarget;
-use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, usage_event};
+use agent_runtime::provider::anthropic::{AnthropicConfig, AnthropicProvider};
+use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, cache_observation, usage_event};
 use agent_runtime::provider::gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider};
 use agent_runtime::provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent_runtime::provider::responses::{ResponsesConfig, ResponsesProvider};
@@ -38,6 +39,37 @@ fn kind(event: &ProviderStreamEvent) -> &'static str {
     }
 }
 
+fn cache_observations(events: &[ProviderStreamEvent]) -> Vec<(Option<u64>, Option<u64>)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderStreamEvent::CacheObservation {
+                read_tokens,
+                write_tokens,
+            } => Some((*read_tokens, *write_tokens)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_cache_observation(
+    events: &[ProviderStreamEvent],
+    expected: &[(Option<u64>, Option<u64>)],
+) {
+    assert_eq!(cache_observations(events), expected);
+    let cache_index = events
+        .iter()
+        .position(|event| matches!(event, ProviderStreamEvent::CacheObservation { .. }));
+    let finish_index = events
+        .iter()
+        .position(|event| matches!(event, ProviderStreamEvent::Finish { .. }));
+    if expected.is_empty() {
+        assert!(cache_index.is_none());
+    } else {
+        assert!(cache_index < finish_index);
+    }
+}
+
 fn fake_two_chunk_text() -> FakeProvider {
     FakeProvider::new(
         "fake",
@@ -46,6 +78,7 @@ fn fake_two_chunk_text() -> FakeProvider {
             ProviderStreamEvent::TextDelta { text: "Hel".into() },
             ProviderStreamEvent::TextDelta { text: "lo".into() },
             usage_event(10, 2),
+            cache_observation(Some(0), None).expect("explicit zero is evidence"),
             ProviderStreamEvent::Finish {
                 reason: FinishReason::Stop,
             },
@@ -58,7 +91,7 @@ fn openai_two_chunk_text() -> OpenAiProvider<ReplayTransport> {
         "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
-        "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+        "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n",
         "data: [DONE]\n\n",
     );
     OpenAiProvider::new(
@@ -97,6 +130,12 @@ fn responses_two_chunk_text() -> ResponsesProvider<ReplayTransport> {
         responses_config(),
     )
     .expect("Responses fixture config")
+}
+
+fn anthropic_config() -> AnthropicConfig {
+    let mut config = AnthropicConfig::new("https://api.anthropic.com/v1", "claude-x");
+    config.api_key = Some(Secret::new("fixture-key"));
+    config
 }
 
 #[test]
@@ -149,6 +188,121 @@ async fn gemini_adapter_meets_normalized_contract() {
 async fn responses_adapter_meets_normalized_contract() {
     let provider = responses_two_chunk_text();
     pc::assert_normalized_text_stream(&provider, &ModelId::new("grok-4.5")).await;
+}
+
+#[tokio::test]
+async fn cache_presence_and_read_write_separation_conform_across_adapters() {
+    let fake = FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![
+            usage_event(10, 2),
+            cache_observation(Some(0), None).expect("explicit zero is evidence"),
+            ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])],
+    );
+    let fake_events = pc::collect(
+        &fake,
+        ProviderRequest::new(ModelId::new("fake"), vec![Message::user("hi")]),
+    )
+    .await;
+    assert_cache_observation(&fake_events, &[(Some(0), None)]);
+
+    let openai = OpenAiProvider::new(
+        ReplayTransport::single(concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":7,\"cache_write_tokens\":3}}}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )),
+        OpenAiConfig::new("http://local/v1", "gpt-x"),
+    );
+    let openai_events = pc::collect(
+        &openai,
+        ProviderRequest::new(ModelId::new("gpt-x"), vec![Message::user("hi")]),
+    )
+    .await;
+    assert_cache_observation(&openai_events, &[(Some(7), Some(3))]);
+    let openai_usage = openai_events
+        .iter()
+        .find_map(|event| match event {
+            ProviderStreamEvent::Usage { delta } => Some(delta),
+            _ => None,
+        })
+        .expect("OpenAI usage");
+    assert_eq!(
+        openai_usage.get(agent_runtime_core::usage::CounterKind::InputCached),
+        7
+    );
+    assert_eq!(
+        openai_usage.get(agent_runtime_core::usage::CounterKind::CacheWrite),
+        3
+    );
+
+    let responses = ResponsesProvider::new(
+        ReplayTransport::single(concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":7,\"cache_write_tokens\":3},\"output_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n",
+        )),
+        responses_config(),
+    )
+    .expect("Responses config");
+    let responses_events = pc::collect(
+        &responses,
+        ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("hi")]),
+    )
+    .await;
+    assert_cache_observation(&responses_events, &[(Some(7), Some(3))]);
+
+    let anthropic = AnthropicProvider::new(
+        ReplayTransport::single(concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":5}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        )),
+        anthropic_config(),
+    );
+    let anthropic_events = pc::collect(
+        &anthropic,
+        ProviderRequest::new(ModelId::new("claude-x"), vec![Message::user("hi")]),
+    )
+    .await;
+    assert_cache_observation(&anthropic_events, &[(Some(0), Some(5))]);
+
+    let gemini = GeminiInteractionsProvider::new(
+        ReplayTransport::single(concat!(
+            "event: interaction.completed\n",
+            "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"status\":\"completed\",\"usage\":{\"total_input_tokens\":10,\"total_output_tokens\":2,\"total_cached_tokens\":0}}}\n\n",
+            "event: done\n",
+            "data: [DONE]\n\n",
+        )),
+        gemini_config(),
+    )
+    .expect("Gemini config");
+    let gemini_events = pc::collect(
+        &gemini,
+        ProviderRequest::new(ModelId::new("gemini-x"), vec![Message::user("hi")]),
+    )
+    .await;
+    assert_cache_observation(&gemini_events, &[(Some(0), None)]);
+
+    let omitted = OpenAiProvider::new(
+        ReplayTransport::single(concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        )),
+        OpenAiConfig::new("http://local/v1", "gpt-x"),
+    );
+    let omitted_events = pc::collect(
+        &omitted,
+        ProviderRequest::new(ModelId::new("gpt-x"), vec![Message::user("hi")]),
+    )
+    .await;
+    assert_cache_observation(&omitted_events, &[]);
 }
 
 #[tokio::test]

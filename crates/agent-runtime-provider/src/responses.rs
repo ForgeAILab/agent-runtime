@@ -1413,12 +1413,21 @@ fn response_usage(
         .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or_default();
+    let details = usage.get("input_tokens_details");
     let cached = usage
         .get("input_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    let written = details
+        .and_then(|details| details.get("cache_write_tokens"))
         .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_write_tokens").and_then(Value::as_u64));
+    // Keep UsageDelta disjoint and bounded by the provider's total input,
+    // while retaining the raw optional values in CacheObservation.
+    let cached_count = cached.unwrap_or_default().min(input);
+    let write_count = written
         .unwrap_or_default()
-        .min(input);
+        .min(input.saturating_sub(cached_count));
     let output = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
@@ -1430,14 +1439,22 @@ fn response_usage(
         .unwrap_or_default()
         .min(output);
     let mut delta = UsageDelta::new();
-    if input.saturating_sub(cached) > 0 {
-        delta.add(CounterKind::InputUncached, input.saturating_sub(cached));
+    let uncached = input
+        .saturating_sub(cached_count)
+        .saturating_sub(write_count);
+    if uncached > 0 {
+        delta.add(CounterKind::InputUncached, uncached);
     }
-    if cached > 0 {
-        delta.add(CounterKind::InputCached, cached);
+    if cached_count > 0 {
+        delta.add(CounterKind::InputCached, cached_count);
+    }
+    if write_count > 0 {
+        delta.add(CounterKind::CacheWrite, write_count);
+    }
+    if cached.is_some() || written.is_some() {
         out.push(ProviderStreamEvent::CacheObservation {
             read_tokens: cached,
-            write_tokens: 0,
+            write_tokens: written,
         });
     }
     if output.saturating_sub(reasoning) > 0 {
@@ -2180,7 +2197,10 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::ToolCallDelta { id: Some(id), .. } if id == "call_1")));
         assert!(events.iter().any(|event| matches!(
             event,
-            ProviderStreamEvent::CacheObservation { read_tokens: 4, .. }
+            ProviderStreamEvent::CacheObservation {
+                read_tokens: Some(4),
+                write_tokens: None,
+            }
         )));
         assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::Usage { delta } if delta.get(CounterKind::InputUncached) == 6 && delta.get(CounterKind::InputCached) == 4 && delta.get(CounterKind::Output) == 5 && delta.get(CounterKind::Reasoning) == 3)));
         assert!(matches!(
@@ -2189,6 +2209,74 @@ mod tests {
                 reason: FinishReason::ToolCalls
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn cache_observation_preserves_zero_write_and_omission_independently() {
+        let cases = [
+            (
+                "zero-read",
+                "{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2}",
+                Some(0),
+                None,
+                0,
+                0,
+            ),
+            (
+                "omitted",
+                "{\"input_tokens\":10,\"output_tokens\":2}",
+                None,
+                None,
+                0,
+                0,
+            ),
+            (
+                "write-only",
+                "{\"input_tokens\":10,\"input_tokens_details\":{\"cache_write_tokens\":3},\"output_tokens\":2}",
+                None,
+                Some(3),
+                0,
+                3,
+            ),
+        ];
+
+        for (name, usage, expected_read, expected_write, cached, written) in cases {
+            let body = format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[],\"usage\":{usage}}}}}\n\ndata: [DONE]\n\n"
+            );
+            let events = collect_events(
+                body.as_str(),
+                ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("hi")]),
+            )
+            .await;
+            let observations: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::CacheObservation {
+                        read_tokens,
+                        write_tokens,
+                    } => Some((*read_tokens, *write_tokens)),
+                    _ => None,
+                })
+                .collect();
+
+            if expected_read.is_none() && expected_write.is_none() {
+                assert!(observations.is_empty(), "{name} must stay absent");
+            } else {
+                assert_eq!(
+                    observations,
+                    vec![(expected_read, expected_write)],
+                    "{name}"
+                );
+            }
+            let usage = events.iter().find_map(|event| match event {
+                ProviderStreamEvent::Usage { delta } => Some(delta),
+                _ => None,
+            });
+            let usage = usage.expect("usage event");
+            assert_eq!(usage.get(CounterKind::InputCached), cached, "{name}");
+            assert_eq!(usage.get(CounterKind::CacheWrite), written, "{name}");
+        }
     }
 
     #[tokio::test]

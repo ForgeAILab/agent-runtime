@@ -896,7 +896,10 @@ struct WireInteraction {
 #[derive(Debug, Default, Deserialize)]
 struct WireUsage {
     #[serde(default)]
-    total_cached_tokens: u64,
+    /// Optional so an omitted cached-token field is not mistaken for an
+    /// explicit zero. Gemini currently reports reads only; writes remain
+    /// absent in the normalized observation.
+    total_cached_tokens: Option<u64>,
     #[serde(default)]
     total_input_tokens: u64,
     #[serde(default)]
@@ -930,6 +933,7 @@ struct StreamState {
     seen_indices: BTreeSet<u32>,
     pending_terminal: Option<PendingTerminal>,
     event_count: usize,
+    usage_reported: bool,
     saw_function_call: bool,
     saw_semantic_event: bool,
 }
@@ -1146,7 +1150,13 @@ fn event_to_events(
                 return Err(malformed("Gemini interaction ended with active steps"));
             }
             if let Some(usage) = interaction.usage {
+                if state.usage_reported {
+                    return Err(malformed(
+                        "Gemini interaction reported usage more than once",
+                    ));
+                }
                 emit_usage(usage, out);
+                state.usage_reported = true;
                 state.saw_semantic_event = true;
             }
             // What the turn *did* decides the finish reason; the terminal word
@@ -1212,18 +1222,15 @@ fn validate_stream_signature(signature: &str) -> Result<(), ProviderError> {
 }
 
 fn emit_usage(usage: WireUsage, out: &mut Vec<ProviderStreamEvent>) {
-    let cached = usage.total_cached_tokens.min(usage.total_input_tokens);
-    let uncached = usage.total_input_tokens.saturating_sub(cached);
+    let cached = usage.total_cached_tokens;
+    let cached_count = cached.unwrap_or(0).min(usage.total_input_tokens);
+    let uncached = usage.total_input_tokens.saturating_sub(cached_count);
     let mut delta = UsageDelta::new();
     if uncached > 0 {
         delta.add(CounterKind::InputUncached, uncached);
     }
-    if cached > 0 {
-        delta.add(CounterKind::InputCached, cached);
-        out.push(ProviderStreamEvent::CacheObservation {
-            read_tokens: cached,
-            write_tokens: 0,
-        });
+    if cached_count > 0 {
+        delta.add(CounterKind::InputCached, cached_count);
     }
     if usage.total_output_tokens > 0 {
         delta.add(CounterKind::Output, usage.total_output_tokens);
@@ -1233,6 +1240,15 @@ fn emit_usage(usage: WireUsage, out: &mut Vec<ProviderStreamEvent>) {
     }
     if !delta.is_empty() {
         out.push(ProviderStreamEvent::Usage { delta });
+    }
+    // Keep the final cache evidence adjacent to the usage boundary while
+    // preserving the same Usage-then-Cache ordering as OpenAI-compatible
+    // streams. Presence is still independent of the sparse billing delta.
+    if cached.is_some() {
+        out.push(ProviderStreamEvent::CacheObservation {
+            read_tokens: cached,
+            write_tokens: None,
+        });
     }
 }
 
@@ -1984,8 +2000,8 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderStreamEvent::CacheObservation {
-                read_tokens: 40,
-                write_tokens: 0
+                read_tokens: Some(40),
+                write_tokens: None
             }
         )));
         assert!(events.iter().any(|event| matches!(
@@ -2003,6 +2019,54 @@ mod tests {
             })
         ));
         assert!(!format!("{events:?}").contains("not-exported"));
+    }
+
+    #[tokio::test]
+    async fn cache_observation_distinguishes_explicit_zero_from_omission() {
+        let cases = [
+            (
+                "zero",
+                "\"total_input_tokens\":10,\"total_cached_tokens\":0",
+                Some(0),
+            ),
+            ("omitted", "\"total_input_tokens\":10", None),
+        ];
+        for (name, usage, expected_read) in cases {
+            let sse = format!(
+                "event: interaction.completed\ndata: {{\"event_type\":\"interaction.completed\",\"interaction\":{{\"status\":\"completed\",\"usage\":{{{usage}}}}}}}\n\nevent: done\ndata: [DONE]\n\n"
+            );
+            let provider =
+                GeminiInteractionsProvider::new(ReplayTransport::new([sse.as_str()]), config())
+                    .unwrap();
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(
+                            ModelId::new("gemini-test"),
+                            vec![Message::user("hi")],
+                        ),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let observations: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::CacheObservation {
+                        read_tokens,
+                        write_tokens,
+                    } => Some((*read_tokens, *write_tokens)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(read) = expected_read {
+                assert_eq!(observations, vec![(Some(read), None)], "{name}");
+            } else {
+                assert!(observations.is_empty(), "{name} must stay absent");
+            }
+        }
     }
 
     #[tokio::test]

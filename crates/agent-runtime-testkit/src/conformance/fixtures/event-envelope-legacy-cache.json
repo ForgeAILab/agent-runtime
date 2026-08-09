@@ -1,0 +1,15 @@
+[
+  {
+    "schema_version": 12,
+    "seq": 0,
+    "id": "evt-legacy-cache",
+    "session": "session-legacy",
+    "turn": "turn-legacy",
+    "timestamp": 199,
+    "payload": {
+      "event": "cache_observation",
+      "read_tokens": 2,
+      "write_tokens": 1
+    }
+  }
+]

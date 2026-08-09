@@ -751,12 +751,21 @@ struct OpenAiUsage {
     completion_tokens: Option<u64>,
     #[serde(default)]
     prompt_tokens_details: Option<PromptDetails>,
+    /// A few OpenAI-compatible gateways place the write count at the usage
+    /// level instead of under `prompt_tokens_details`.
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PromptDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
+    /// Some OpenAI-compatible gateways report tokens written to the prompt
+    /// cache alongside the standard cached-read count. Keep the field
+    /// optional so an omitted value remains distinguishable from `0`.
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
 }
 
 fn map_finish_reason(raw: &str) -> FinishReason {
@@ -789,28 +798,97 @@ fn decode_stream_chunk(data: &str) -> Result<StreamChunk, ProviderError> {
     Ok(chunk)
 }
 
+/// A cumulative cache usage snapshot gathered while an OpenAI stream is
+/// running. Providers and gateways may send more than one usage frame; only
+/// the final values become a normalized cache observation.
+#[derive(Debug, Default)]
+struct CacheObservationAccumulator {
+    read_tokens: Option<u64>,
+    write_tokens: Option<u64>,
+    usage_delta: Option<UsageDelta>,
+}
+
+impl CacheObservationAccumulator {
+    fn record(&mut self, read_tokens: Option<u64>, write_tokens: Option<u64>) {
+        if read_tokens.is_some() {
+            self.read_tokens = read_tokens;
+        }
+        if write_tokens.is_some() {
+            self.write_tokens = write_tokens;
+        }
+    }
+
+    fn has_observation(&self) -> bool {
+        self.read_tokens.is_some() || self.write_tokens.is_some()
+    }
+
+    fn has_usage(&self) -> bool {
+        self.usage_delta.is_some()
+    }
+
+    fn record_usage(&mut self, delta: UsageDelta) {
+        if !delta.is_empty() {
+            // OpenAI-compatible usage frames are cumulative. Retaining the
+            // latest complete delta prevents a retry/stream adapter from
+            // double-counting earlier cumulative frames.
+            self.usage_delta = Some(delta);
+        }
+    }
+
+    fn take_events(&mut self) -> Vec<ProviderStreamEvent> {
+        let mut events = Vec::with_capacity(2);
+        if let Some(delta) = self.usage_delta.take() {
+            events.push(ProviderStreamEvent::Usage { delta });
+        }
+        let read_tokens = self.read_tokens.take();
+        let write_tokens = self.write_tokens.take();
+        if let Some(event) = ProviderStreamEvent::cache_observation(read_tokens, write_tokens) {
+            events.push(event);
+        }
+        events
+    }
+}
+
 /// Maps one decoded chunk to zero or more neutral events.
-fn chunk_to_events(chunk: StreamChunk, out: &mut Vec<ProviderStreamEvent>) -> Option<FinishReason> {
+fn chunk_to_events(
+    chunk: StreamChunk,
+    out: &mut Vec<ProviderStreamEvent>,
+    cache: &mut CacheObservationAccumulator,
+) -> Option<FinishReason> {
     if let Some(usage) = chunk.usage {
         let cached = usage
             .prompt_tokens_details
             .as_ref()
-            .and_then(|d| d.cached_tokens)
-            .unwrap_or(0);
+            .and_then(|details| details.cached_tokens);
+        let written = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_write_tokens)
+            .or(usage.cache_write_tokens);
         let prompt = usage.prompt_tokens.unwrap_or(0);
-        let uncached = prompt.saturating_sub(cached);
+        // Usage counters are disjoint. Provider cache fields are retained as
+        // raw observations below, while the billing counters are bounded by
+        // the reported input total so malformed gateway responses cannot
+        // double-count input tokens.
+        let cached_count = cached.unwrap_or(0).min(prompt);
+        let write_count = written
+            .unwrap_or(0)
+            .min(prompt.saturating_sub(cached_count));
+        let uncached = prompt
+            .saturating_sub(cached_count)
+            .saturating_sub(write_count);
         let mut delta = UsageDelta::new()
             .with(CounterKind::InputUncached, uncached)
             .with(CounterKind::Output, usage.completion_tokens.unwrap_or(0));
-        if cached > 0 {
-            delta.add(CounterKind::InputCached, cached);
-            out.push(ProviderStreamEvent::CacheObservation {
-                read_tokens: cached,
-                write_tokens: 0,
-            });
+        if cached_count > 0 {
+            delta.add(CounterKind::InputCached, cached_count);
         }
+        if write_count > 0 {
+            delta.add(CounterKind::CacheWrite, write_count);
+        }
+        cache.record(cached, written);
         if !delta.is_empty() {
-            out.push(ProviderStreamEvent::Usage { delta });
+            cache.record_usage(delta);
         }
     }
     let mut finish = None;
@@ -940,17 +1018,24 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             let mut saw_semantic_event = false;
             let mut emitted_finish = false;
             let mut pending_finish = None;
+            let mut cache = CacheObservationAccumulator::default();
 
             'outer: loop {
                 let next = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Error {
                             error: ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"),
                         };
                         return;
                     }
                     _ = wait_for_deadline(deadline, clock.as_ref()) => {
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Error {
                             error: ProviderError::new(
                                 ProviderErrorKind::Timeout,
@@ -987,6 +1072,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                                 clock.clone(),
                             ).await
                         };
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Error { error };
                         return;
                     }
@@ -995,6 +1083,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                     Ok(Some(text)) => text,
                     Ok(None) => continue,
                     Err(error) => {
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Error { error };
                         return;
                     }
@@ -1003,6 +1094,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 for frame in parser.drain_frames() {
                     let data = frame.data.trim();
                     if frame.event.as_deref() == Some("error") {
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Error {
                             error: stream_error(),
                         };
@@ -1012,6 +1106,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         continue;
                     }
                     if data == "[DONE]" {
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Finish {
                             reason: pending_finish.unwrap_or(FinishReason::Stop),
                         };
@@ -1022,8 +1119,12 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         Ok(parsed) => {
                             saw_chunk = true;
                             let mut events = Vec::new();
-                            let finish = chunk_to_events(parsed, &mut events);
-                            saw_semantic_event |= !events.is_empty() || finish.is_some();
+                            let finish = chunk_to_events(parsed, &mut events, &mut cache);
+                            saw_semantic_event |=
+                                !events.is_empty()
+                                    || finish.is_some()
+                                    || cache.has_observation()
+                                    || cache.has_usage();
                             for ev in events {
                                 yield ev;
                             }
@@ -1032,6 +1133,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                             }
                         }
                         Err(error) => {
+                            for event in cache.take_events() {
+                                yield event;
+                            }
                             yield ProviderStreamEvent::Error {
                                 error,
                             };
@@ -1042,6 +1146,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             }
 
             if !pending_bytes.is_empty() {
+                for event in cache.take_events() {
+                    yield event;
+                }
                 yield ProviderStreamEvent::Error {
                     error: ProviderError::new(
                         ProviderErrorKind::MalformedStream,
@@ -1056,11 +1163,17 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 if let Some(frame) = parser.finish() {
                     let data = frame.data.trim();
                     if frame.event.as_deref() == Some("error") {
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Error {
                             error: stream_error(),
                         };
                         return;
                     } else if data == "[DONE]" {
+                        for event in cache.take_events() {
+                            yield event;
+                        }
                         yield ProviderStreamEvent::Finish {
                             reason: pending_finish.unwrap_or(FinishReason::Stop),
                         };
@@ -1070,7 +1183,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                             Ok(parsed) => {
                                 saw_chunk = true;
                                 let mut events = Vec::new();
-                                let finish = chunk_to_events(parsed, &mut events);
+                                let finish = chunk_to_events(parsed, &mut events, &mut cache);
                                 for ev in events {
                                     yield ev;
                                 }
@@ -1079,6 +1192,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                                 }
                             }
                             Err(error) => {
+                                for event in cache.take_events() {
+                                    yield event;
+                                }
                                 yield ProviderStreamEvent::Error {
                                     error,
                                 };
@@ -1092,6 +1208,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             // Always terminate with a Finish if the server ended the stream
             // without an explicit finish reason but did send content.
             if !emitted_finish && (saw_chunk || pending_finish.is_some()) {
+                for event in cache.take_events() {
+                    yield event;
+                }
                 yield ProviderStreamEvent::Finish {
                     reason: pending_finish.unwrap_or(FinishReason::Stop),
                 };
@@ -1617,7 +1736,10 @@ mod tests {
         assert_eq!(text, "Hello");
         assert!(events.iter().any(|e| matches!(
             e,
-            ProviderStreamEvent::CacheObservation { read_tokens: 4, .. }
+            ProviderStreamEvent::CacheObservation {
+                read_tokens: Some(4),
+                write_tokens: None,
+            }
         )));
         assert!(events.iter().any(|e| matches!(
             e,
@@ -1625,6 +1747,133 @@ mod tests {
                 reason: FinishReason::Stop
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn cache_observation_preserves_zero_write_and_omission_independently() {
+        let cases = [
+            (
+                "zero-read",
+                "{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":0}}",
+                Some(0),
+                None,
+                0,
+                0,
+            ),
+            (
+                "omitted",
+                "{\"prompt_tokens\":10,\"completion_tokens\":2}",
+                None,
+                None,
+                0,
+                0,
+            ),
+            (
+                "write-only",
+                "{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cache_write_tokens\":3}}",
+                None,
+                Some(3),
+                0,
+                3,
+            ),
+        ];
+
+        for (name, usage, expected_read, expected_write, cached, written) in cases {
+            let body = format!(
+                "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{usage}}}\n\ndata: [DONE]\n\n"
+            );
+            let provider = OpenAiProvider::new(
+                ReplayTransport::new(vec![body.as_str()]),
+                OpenAiConfig::new("http://x/v1", "gpt-x"),
+            );
+            let request = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
+            let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+            let observations: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::CacheObservation {
+                        read_tokens,
+                        write_tokens,
+                    } => Some((*read_tokens, *write_tokens)),
+                    _ => None,
+                })
+                .collect();
+
+            if expected_read.is_none() && expected_write.is_none() {
+                assert!(observations.is_empty(), "{name} must stay absent");
+            } else {
+                assert_eq!(
+                    observations,
+                    vec![(expected_read, expected_write)],
+                    "{name}"
+                );
+            }
+            let usage = events.iter().find_map(|event| match event {
+                ProviderStreamEvent::Usage { delta } => Some(delta),
+                _ => None,
+            });
+            let usage = usage.expect("usage event");
+            assert_eq!(usage.get(CounterKind::InputCached), cached, "{name}");
+            assert_eq!(usage.get(CounterKind::CacheWrite), written, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cumulative_usage_frames_emit_one_final_cache_observation() {
+        let sse = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":2,\"cache_write_tokens\":1}}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2}}}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![sse]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let events = collect(
+            provider
+                .stream(
+                    ProviderRequest::new(ModelId::new("gpt-x"), vec![Message::user("hi")]),
+                    ctx(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let observations: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::CacheObservation {
+                    read_tokens,
+                    write_tokens,
+                } => Some((*read_tokens, *write_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(observations, vec![(Some(4), Some(2))]);
+        let usage_events: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Usage { delta } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage_events.len(), 1, "cumulative usage is emitted once");
+        assert_eq!(
+            usage_events[0].get(CounterKind::InputCached),
+            4,
+            "the final cumulative read is not double-counted"
+        );
+        assert_eq!(usage_events[0].get(CounterKind::CacheWrite), 2);
+        let cache_index = events
+            .iter()
+            .position(|event| matches!(event, ProviderStreamEvent::CacheObservation { .. }))
+            .expect("cache observation");
+        let finish_index = events
+            .iter()
+            .position(|event| matches!(event, ProviderStreamEvent::Finish { .. }))
+            .expect("finish");
+        assert!(cache_index < finish_index);
     }
 
     /// A replay transport that also reports response headers.

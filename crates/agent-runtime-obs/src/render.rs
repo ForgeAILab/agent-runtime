@@ -7,6 +7,7 @@
 
 use agent_runtime_core::event::{EventEnvelope, RuntimeEvent};
 use serde_json::Value;
+use std::fmt::Display;
 
 /// The stable snake_case discriminant of a [`RuntimeEvent`].
 ///
@@ -44,6 +45,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::Downgrade { .. } => "downgrade",
         RuntimeEvent::Usage { .. } => "usage",
         RuntimeEvent::CacheObservation { .. } => "cache_observation",
+        RuntimeEvent::CacheStateChanged { .. } => "cache_state_changed",
         RuntimeEvent::RateLimitObservation { .. } => "rate_limit_observation",
         RuntimeEvent::ProviderAttemptFinished { .. } => "provider_attempt_finished",
         RuntimeEvent::LimitReached { .. } => "limit_reached",
@@ -267,9 +269,36 @@ fn summary(payload: &RuntimeEvent) -> String {
             compact(&serde_json::to_value(&record.delta).unwrap_or(Value::Null))
         ),
         RuntimeEvent::CacheObservation {
+            request,
+            attempt,
+            cache_plan,
             read_tokens,
             write_tokens,
-        } => format!("cache_observation read={read_tokens} write={write_tokens}"),
+        } => format!(
+            "cache_observation request={} attempt={} cache_plan={} read={} write={}",
+            optional_display(request),
+            optional_display(attempt),
+            optional_display(cache_plan),
+            optional_display(read_tokens),
+            optional_display(write_tokens),
+        ),
+        RuntimeEvent::CacheStateChanged {
+            request,
+            attempt,
+            cache_plan,
+            state,
+            expected_read_tokens,
+            observed_read_tokens,
+            observed_write_tokens,
+            missed_tokens,
+            confidence,
+        } => format!(
+            "cache_state_changed request={request} attempt={attempt} cache_plan={cache_plan} state={state:?} expected={} observed_read={} observed_write={} missed={} confidence={confidence:?}",
+            optional_display(expected_read_tokens),
+            optional_display(observed_read_tokens),
+            optional_display(observed_write_tokens),
+            optional_display(missed_tokens),
+        ),
         RuntimeEvent::RateLimitObservation { attempt, snapshot } => {
             // Rendered from the most-consumed window: an observer line reports
             // the number that matters, and "unknown" when none was reported.
@@ -365,6 +394,15 @@ fn summary(payload: &RuntimeEvent) -> String {
 /// Compact JSON rendering of a value (no whitespace).
 fn compact(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+/// Displays an optional scalar without exposing Rust's `Some(...)` wrapper in
+/// the compact human log. `none` remains distinct from an explicit `0`.
+fn optional_display<T: Display>(value: &Option<T>) -> String {
+    value
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Clip a string to at most `max` characters, appending an ellipsis when cut.
@@ -511,5 +549,51 @@ mod tests {
         assert!(line.contains("input_tokens=420"));
         assert!(line.contains("input_budget=8000"));
         assert!(line.contains("reserved=512"));
+    }
+
+    #[test]
+    fn cache_events_render_presence_and_causal_identity_without_vendor_data() {
+        use agent_runtime_core::event::{CacheState, EstimationConfidence};
+        use agent_runtime_registry::Fingerprint;
+
+        let observation = envelope(
+            None,
+            RuntimeEvent::CacheObservation {
+                request: Some(RequestId::new("req-1")),
+                attempt: Some(AttemptId::new("att-2")),
+                cache_plan: Some(Fingerprint::of("plan-1")),
+                read_tokens: Some(0),
+                write_tokens: None,
+            },
+        );
+        let line = log_line(&observation);
+        assert_eq!(event_type(&observation.payload), "cache_observation");
+        assert!(line.contains("request=req-1"));
+        assert!(line.contains("attempt=att-2"));
+        assert!(line.contains("read=0"));
+        assert!(line.contains("write=none"));
+        assert!(!line.contains("prompt"));
+
+        let state = envelope(
+            None,
+            RuntimeEvent::CacheStateChanged {
+                request: RequestId::new("req-1"),
+                attempt: AttemptId::new("att-2"),
+                cache_plan: Fingerprint::of("plan-1"),
+                state: CacheState::MissObserved,
+                expected_read_tokens: Some(105_000),
+                observed_read_tokens: Some(0),
+                observed_write_tokens: None,
+                missed_tokens: Some(105_000),
+                confidence: EstimationConfidence::Estimated,
+            },
+        );
+        let line = log_line(&state);
+        assert_eq!(event_type(&state.payload), "cache_state_changed");
+        assert!(line.contains("state=MissObserved"));
+        assert!(line.contains("expected=105000"));
+        assert!(line.contains("observed_read=0"));
+        assert!(line.contains("observed_write=none"));
+        assert!(line.contains("missed=105000"));
     }
 }

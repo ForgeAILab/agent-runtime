@@ -53,6 +53,13 @@ impl UsageDelta {
 
     /// Adds `value` to a counter.
     pub fn add(&mut self, kind: CounterKind, value: u64) {
+        // Keep the sparse representation invariant even for callers that
+        // accumulate provider counters incrementally.  Cache evidence uses
+        // `Option<u64>` precisely so an explicit zero is not forced through
+        // this billing-oriented structure.
+        if value == 0 {
+            return;
+        }
         let slot = self.counters.entry(kind).or_insert(0);
         *slot = slot.saturating_add(value);
     }
@@ -235,5 +242,16 @@ mod tests {
         assert_eq!(ledger.records().len(), 2);
         assert_eq!(ledger.total().get(CounterKind::InputUncached), 14);
         assert_eq!(ledger.total().get(CounterKind::Output), 4);
+    }
+
+    #[test]
+    fn zero_counters_stay_out_of_sparse_deltas() {
+        let mut delta = UsageDelta::new();
+        delta.add(CounterKind::InputCached, 0);
+        assert!(delta.is_empty());
+        assert_eq!(delta.iter().collect::<Vec<_>>(), Vec::new());
+
+        let built = UsageDelta::new().with(CounterKind::CacheWrite, 0);
+        assert!(built.is_empty());
     }
 }

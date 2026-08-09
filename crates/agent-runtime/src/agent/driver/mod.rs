@@ -34,7 +34,8 @@ use agent_runtime_core::content::{
 };
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{
-    BudgetCategory, CompactionReason, EstimationConfidence, LimitKind, RuntimeEvent, TurnFinish,
+    BudgetCategory, CacheState, CompactionReason, EstimationConfidence, LimitKind, RuntimeEvent,
+    TurnFinish,
 };
 use agent_runtime_core::ids::{RequestId, TurnId};
 use agent_runtime_core::interaction::{

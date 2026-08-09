@@ -701,10 +701,16 @@ pub enum ProviderStreamEvent {
     },
     /// A cache observation.
     CacheObservation {
-        /// Tokens read from cache.
-        read_tokens: u64,
-        /// Tokens written to cache.
-        write_tokens: u64,
+        /// Tokens read from cache, when the provider reported a cache-read
+        /// field. `Some(0)` is an explicit zero; `None` means the field was
+        /// omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_tokens: Option<u64>,
+        /// Tokens written to cache, when the provider reported a cache-write
+        /// field. `Some(0)` is an explicit zero; `None` means the field was
+        /// omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_tokens: Option<u64>,
     },
     /// A server-reported limit-state observation for the credential that
     /// served this attempt. Emitted only when the provider reported one.
@@ -728,6 +734,32 @@ pub enum ProviderStreamEvent {
 
 /// A boxed provider event stream.
 pub type ProviderStream = Pin<Box<dyn Stream<Item = ProviderStreamEvent> + Send>>;
+
+impl ProviderStreamEvent {
+    /// Builds a cache observation only when at least one provider cache field
+    /// was present. This preserves an explicit zero while preventing an empty
+    /// observation from becoming evidence downstream.
+    pub fn cache_observation(read_tokens: Option<u64>, write_tokens: Option<u64>) -> Option<Self> {
+        (read_tokens.is_some() || write_tokens.is_some()).then_some(Self::CacheObservation {
+            read_tokens,
+            write_tokens,
+        })
+    }
+
+    /// Returns the cache observation's independent field presence, if this is
+    /// a cache event. An empty manually-constructed event is not evidence.
+    pub fn cache_fields(&self) -> Option<(Option<u64>, Option<u64>)> {
+        match self {
+            Self::CacheObservation {
+                read_tokens,
+                write_tokens,
+            } if read_tokens.is_some() || write_tokens.is_some() => {
+                Some((*read_tokens, *write_tokens))
+            }
+            _ => None,
+        }
+    }
+}
 
 /// The per-attempt context handed to a [`Provider`].
 #[derive(Debug, Clone)]
@@ -844,5 +876,33 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: ProviderStreamEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn cache_observation_preserves_zero_and_omission_independently() {
+        let ev = ProviderStreamEvent::cache_observation(Some(0), None).expect("read field");
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["read_tokens"], 0);
+        assert!(json.get("write_tokens").is_none());
+        assert_eq!(ev.cache_fields(), Some((Some(0), None)));
+
+        assert!(ProviderStreamEvent::cache_observation(None, None).is_none());
+    }
+
+    #[test]
+    fn legacy_numeric_cache_observation_deserializes_as_present_values() {
+        let json = serde_json::json!({
+            "type": "cache_observation",
+            "read_tokens": 4,
+            "write_tokens": 1,
+        });
+        let event: ProviderStreamEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            event,
+            ProviderStreamEvent::CacheObservation {
+                read_tokens: Some(4),
+                write_tokens: Some(1),
+            }
+        );
     }
 }

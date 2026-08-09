@@ -103,6 +103,18 @@ pub fn usage_event(input: u64, output: u64) -> ProviderStreamEvent {
     }
 }
 
+/// Builds a presence-aware cache observation for scripted streams.
+///
+/// `Some(0)` is retained as explicit provider evidence. When both arguments
+/// are `None`, no event is returned, matching the first-party adapter
+/// contract for an omitted cache-usage section.
+pub fn cache_observation(
+    read_tokens: Option<u64>,
+    write_tokens: Option<u64>,
+) -> Option<ProviderStreamEvent> {
+    ProviderStreamEvent::cache_observation(read_tokens, write_tokens)
+}
+
 /// Convenience: build the fragmented tool-call deltas for a single call so the
 /// runtime's assembly path is exercised.
 pub fn tool_call_fragments(
@@ -220,5 +232,24 @@ mod tests {
             }
         ));
         assert_eq!(p.requests().len(), 1);
+    }
+
+    #[test]
+    fn cache_observation_helper_preserves_presence() {
+        assert!(matches!(
+            cache_observation(Some(0), None),
+            Some(ProviderStreamEvent::CacheObservation {
+                read_tokens: Some(0),
+                write_tokens: None,
+            })
+        ));
+        assert!(matches!(
+            cache_observation(None, Some(7)),
+            Some(ProviderStreamEvent::CacheObservation {
+                read_tokens: None,
+                write_tokens: Some(7),
+            })
+        ));
+        assert!(cache_observation(None, None).is_none());
     }
 }

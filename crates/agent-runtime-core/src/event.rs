@@ -93,7 +93,10 @@ use crate::usage::UsageRecord;
 /// subscribes to the child's own stream through
 /// `DelegationCoordinator::child_events` — the full vocabulary, rather than a
 /// summary of it re-derived one variant at a time.
-pub const SCHEMA_VERSION: u32 = 12;
+///
+/// Bumped to 13 for presence-aware, attributed cache observations and the
+/// attempt-scoped [`RuntimeEvent::CacheStateChanged`] projection.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +164,28 @@ pub enum EstimationConfidence {
     /// approximate.
     Estimated,
 }
+
+/// Provider-neutral cache state derived from a plan and, when available, a
+/// provider-reported cache observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheState {
+    /// The provider cannot honor stable prompt-cache reuse for this plan.
+    Unsupported,
+    /// Cache reuse is possible, but this attempt supplied no cache evidence.
+    Unknown,
+    /// The request is eligible for cache reuse, without a positive reusable
+    /// expectation or observed cache result establishing a hit/miss.
+    Eligible,
+    /// Provider cache evidence was observed without a reusable-prefix
+    /// shortfall.
+    WarmObserved,
+    /// Provider cache evidence was observed below the comparable expectation.
+    MissObserved,
+}
+
+/// Backwards-friendly name for callers that describe the enum as a kind.
+pub type CacheStateKind = CacheState;
 
 /// Why compaction ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,10 +568,53 @@ pub enum RuntimeEvent {
     },
     /// A cache observation.
     CacheObservation {
-        /// Tokens read from cache.
-        read_tokens: u64,
-        /// Tokens written to cache.
-        write_tokens: u64,
+        /// The logical request that produced this observation, when emitted by
+        /// the current runtime. Legacy journal entries omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<RequestId>,
+        /// The provider attempt that produced this observation. Legacy journal
+        /// entries omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<AttemptId>,
+        /// The exact cache-plan fingerprint used by the request. Legacy
+        /// journal entries omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_plan: Option<Fingerprint>,
+        /// Tokens read from cache. `Some(0)` is an explicit provider zero;
+        /// `None` means the provider omitted the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_tokens: Option<u64>,
+        /// Tokens written to cache. `Some(0)` is an explicit provider zero;
+        /// `None` means the provider omitted the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_tokens: Option<u64>,
+    },
+    /// The canonical cache state resolved for one provider attempt.
+    CacheStateChanged {
+        /// The logical request.
+        request: RequestId,
+        /// The specific provider attempt.
+        attempt: AttemptId,
+        /// The exact cache-plan fingerprint used by this attempt.
+        cache_plan: Fingerprint,
+        /// The provider-neutral resolved state.
+        state: CacheState,
+        /// The comparable preserved-prefix expectation. `None` means no prior
+        /// provider-request baseline existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_read_tokens: Option<u64>,
+        /// The provider-reported cache-read value, preserving field presence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_read_tokens: Option<u64>,
+        /// The provider-reported cache-write value, preserving field presence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_write_tokens: Option<u64>,
+        /// The derived saturating shortfall, when both an expectation and a
+        /// read observation were available and the expectation was missed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        missed_tokens: Option<u64>,
+        /// Confidence in the planner's token-count expectation.
+        confidence: EstimationConfidence,
     },
     /// A server-reported limit-state observation for the credential that
     /// served an attempt. Absent windows mean the provider reported nothing,
@@ -761,6 +829,79 @@ mod tests {
             canonical_payloads(&[base]),
             canonical_payloads(&[decorated])
         );
+    }
+
+    #[test]
+    fn legacy_numeric_cache_observation_deserializes_without_attribution() {
+        let event: RuntimeEvent = serde_json::from_value(serde_json::json!({
+            "event": "cache_observation",
+            "read_tokens": 4,
+            "write_tokens": 1,
+        }))
+        .unwrap();
+        assert_eq!(
+            event,
+            RuntimeEvent::CacheObservation {
+                request: None,
+                attempt: None,
+                cache_plan: None,
+                read_tokens: Some(4),
+                write_tokens: Some(1),
+            }
+        );
+        // A legacy observation has no causal identity and is therefore raw
+        // compatibility evidence only; deserialization never synthesizes a
+        // cache-state projection or missed-token claim.
+        assert!(!matches!(event, RuntimeEvent::CacheStateChanged { .. }));
+    }
+
+    #[test]
+    fn legacy_cache_observation_envelope_fixture_remains_readable() {
+        let envelope: EventEnvelope = serde_json::from_value(serde_json::json!({
+            "schema_version": 12,
+            "seq": 7,
+            "id": "event-7",
+            "session": "session-1",
+            "timestamp": 0,
+            "payload": {
+                "event": "cache_observation",
+                "read_tokens": 8,
+                "write_tokens": 0
+            }
+        }))
+        .unwrap();
+        assert_eq!(envelope.schema_version, 12);
+        assert!(matches!(
+            envelope.payload,
+            RuntimeEvent::CacheObservation {
+                request: None,
+                attempt: None,
+                cache_plan: None,
+                read_tokens: Some(8),
+                write_tokens: Some(0),
+            }
+        ));
+    }
+
+    #[test]
+    fn attributed_cache_state_roundtrips_explicit_zero_and_derived_zero() {
+        let event = RuntimeEvent::CacheStateChanged {
+            request: RequestId::new("req-1"),
+            attempt: AttemptId::new("att-1"),
+            cache_plan: Fingerprint::of("plan"),
+            state: CacheState::WarmObserved,
+            expected_read_tokens: Some(100),
+            observed_read_tokens: Some(100),
+            observed_write_tokens: Some(0),
+            missed_tokens: Some(0),
+            confidence: EstimationConfidence::Exact,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["observed_read_tokens"], 100);
+        assert_eq!(json["observed_write_tokens"], 0);
+        assert_eq!(json["missed_tokens"], 0);
+        let back: RuntimeEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event, back);
     }
 
     /// "Automatic routing activates browser research": intent routing selects

@@ -216,6 +216,17 @@ impl RunPlanner {
         )
     }
 
+    /// Commits a cache plan only once its corresponding provider request has
+    /// crossed the preflight boundary. Planning alone must not establish a
+    /// predecessor: validation, cancellation, and other pre-I/O failures do
+    /// not represent a provider request that could seed the next comparison.
+    pub(crate) fn commit_cache_plan(&self, cache_plan: &CachePlan) {
+        *self
+            .previous_cache
+            .lock()
+            .expect("cache plan lock poisoned") = Some(cache_plan.clone());
+    }
+
     /// Builds the fragments for one turn and compiles them into a plan.
     ///
     /// The fragment set is the complete request: host instructions, the
@@ -390,13 +401,6 @@ impl RunPlanner {
             plan.with_compaction_outcome(outcome)
         };
         let plan = plan.with_extra_revisions(self.plan_inputs(revisions));
-
-        if let Some(cache_plan) = plan.cache_plan() {
-            *self
-                .previous_cache
-                .lock()
-                .expect("cache plan lock poisoned") = Some(cache_plan.clone());
-        }
 
         let manifest = self.manifest(&plan, revisions, activation);
         Ok(PlannedTurn { plan, manifest })
@@ -843,6 +847,7 @@ mod tests {
             .cache_plan()
             .expect("cache plan")
             .preserved_prefix_len;
+        planner.commit_cache_plan(first.plan.cache_plan().expect("cache plan"));
 
         let second = planner
             .plan_turn(
@@ -852,6 +857,7 @@ mod tests {
             )
             .expect("plan");
         let second_plan = second.plan.cache_plan().expect("cache plan");
+        planner.commit_cache_plan(second_plan);
 
         assert!(first_prefix > 0);
         assert_eq!(
@@ -877,11 +883,43 @@ mod tests {
     }
 
     #[test]
+    fn planning_without_a_provider_commit_does_not_create_a_predecessor() {
+        let planner = planner(8_000);
+        let first = planner
+            .plan_turn(Some("stable"), &history(&["first"]), &[])
+            .unwrap();
+        let second = planner
+            .plan_turn(Some("stable"), &history(&["second"]), &[])
+            .unwrap();
+        assert_eq!(
+            first.plan.cache_plan().unwrap().expected_read_tokens(),
+            None
+        );
+        assert_eq!(
+            second.plan.cache_plan().unwrap().expected_read_tokens(),
+            None,
+            "a preflight-only plan must not become the next request's baseline"
+        );
+
+        planner.commit_cache_plan(first.plan.cache_plan().expect("cache plan"));
+        let committed = planner
+            .plan_turn(Some("stable"), &history(&["third"]), &[])
+            .unwrap();
+        let committed_cache = committed.plan.cache_plan().unwrap();
+        assert_eq!(
+            committed_cache.expected_read_tokens(),
+            Some(u64::from(committed_cache.preserved_prefix_tokens))
+        );
+        assert!(committed_cache.expected_read_tokens().unwrap() > 0);
+    }
+
+    #[test]
     fn previous_cache_round_trips_as_redaction_safe_session_state() {
         let original = planner(8_000);
-        original
+        let first = original
             .plan_turn(Some("stable-a"), &history(&["first"]), &[])
             .unwrap();
+        original.commit_cache_plan(first.plan.cache_plan().expect("cache plan"));
         let persisted = original
             .persisted_previous_cache()
             .expect("a completed plan creates cache state");
@@ -912,9 +950,10 @@ mod tests {
     #[test]
     fn valid_previous_cache_from_another_model_profile_is_rebased() {
         let original = planner(8_000);
-        original
+        let first = original
             .plan_turn(Some("stable-a"), &history(&["first"]), &[])
             .unwrap();
+        original.commit_cache_plan(first.plan.cache_plan().expect("cache plan"));
         let persisted = original
             .persisted_previous_cache()
             .expect("a completed plan creates cache state");
@@ -1139,6 +1178,7 @@ mod tests {
         let first_a = session_a
             .plan_turn(Some("alpha instructions"), &history(&["a"]), &[])
             .unwrap();
+        session_a.commit_cache_plan(first_a.plan.cache_plan().expect("cache plan"));
         let changed_a = session_a
             .plan_turn(Some("changed instructions"), &history(&["a2"]), &[])
             .unwrap();

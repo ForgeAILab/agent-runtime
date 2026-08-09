@@ -140,15 +140,26 @@ explicitly rather than substituting what happens to be installed. A host that
 wants to proceed anyway must opt in explicitly via
 `check_replay_as(&available, ReplayMode::LabeledNonEquivalent)`.
 
-## 6. Event schema version 8
+## 6. Event schema version 13
 
-`SCHEMA_VERSION` is now `9`. The current vocabulary includes registry sealing,
+`SCHEMA_VERSION` is now `13`. The current vocabulary includes registry sealing,
 scoped-view derivation, model resolution, capability retrieval and activation,
 context planning and compaction, cache-plan changes, budget failures,
 attempt-scoped speculative output, metadata-only interaction lifecycle,
-lossless child `needs_input`, and durability-aligned `PlanUpdated`.
+lossless child `needs_input`, durability-aligned `PlanUpdated`, durable-child
+recovery, and attempt-attributed prompt-cache evidence.
 
-Committed v5 through v9 fixtures guard the compatible wire representations.
+Provider adapters now emit `ProviderStreamEvent::CacheObservation` with
+independent `Option<u64>` read/write values: `Some(0)` is reported zero and
+`None` is omission. Canonical `RuntimeEvent::CacheObservation` adds optional
+request, attempt, and cache-plan attribution, and the new
+`RuntimeEvent::CacheStateChanged` carries the expectation, observation,
+saturating missed-token result, and estimation confidence for one attempt.
+Legacy numeric cache-observation envelopes still deserialize, but consumers
+must not treat their absent attribution as a verified zero or miss. Exhaustive
+matches on either event enum must handle these new forms.
+
+Committed v5 through v13 fixtures guard the compatible wire representations.
 Pre-v5 output deltas are intentionally not accepted because they lack the
 request/attempt identity needed to discard retry output safely. A consumer
 that matches exhaustively on `RuntimeEvent` must handle the new variants.

@@ -605,6 +605,9 @@ fn decode_event(data: &str) -> Result<WireEvent, ProviderError> {
 struct StreamState {
     /// Cumulative output tokens already reported as usage.
     reported_output: u64,
+    /// The Messages stream has one input-usage boundary. A repeated boundary
+    /// is malformed rather than duplicate cache evidence.
+    usage_reported: bool,
     /// The finish reason reported by `message_delta`, held until the stream
     /// terminates.
     pending_finish: Option<FinishReason>,
@@ -621,20 +624,27 @@ fn event_to_events(
     match event {
         WireEvent::MessageStart { message } => {
             if let Some(usage) = message.usage {
+                if state.usage_reported {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::MalformedStream,
+                        "Anthropic stream reported input usage more than once",
+                    ));
+                }
+                state.usage_reported = true;
                 let uncached = usage.input_tokens.unwrap_or(0);
-                let cached = usage.cache_read_input_tokens.unwrap_or(0);
-                let written = usage.cache_creation_input_tokens.unwrap_or(0);
+                let cached = usage.cache_read_input_tokens;
+                let written = usage.cache_creation_input_tokens;
                 let mut delta = UsageDelta::new();
                 if uncached > 0 {
                     delta.add(CounterKind::InputUncached, uncached);
                 }
-                if cached > 0 {
-                    delta.add(CounterKind::InputCached, cached);
+                if cached.unwrap_or(0) > 0 {
+                    delta.add(CounterKind::InputCached, cached.unwrap_or(0));
                 }
-                if written > 0 {
-                    delta.add(CounterKind::CacheWrite, written);
+                if written.unwrap_or(0) > 0 {
+                    delta.add(CounterKind::CacheWrite, written.unwrap_or(0));
                 }
-                if cached > 0 || written > 0 {
+                if cached.is_some() || written.is_some() {
                     out.push(ProviderStreamEvent::CacheObservation {
                         read_tokens: cached,
                         write_tokens: written,
@@ -1345,8 +1355,8 @@ mod tests {
         assert!(events.iter().any(|e| matches!(
             e,
             ProviderStreamEvent::CacheObservation {
-                read_tokens: 4,
-                write_tokens: 2,
+                read_tokens: Some(4),
+                write_tokens: Some(2),
             }
         )));
         assert!(events.iter().any(|e| matches!(
@@ -1363,6 +1373,79 @@ mod tests {
             2,
             "one input usage at message_start, one output usage at message_delta"
         );
+    }
+
+    #[tokio::test]
+    async fn cache_observation_preserves_zero_write_and_omission_independently() {
+        let cases = [
+            (
+                "zero-read",
+                "\"input_tokens\":10,\"cache_read_input_tokens\":0",
+                Some(0),
+                None,
+                0,
+                0,
+            ),
+            ("omitted", "\"input_tokens\":10", None, None, 0, 0),
+            (
+                "write-only",
+                "\"input_tokens\":10,\"cache_creation_input_tokens\":3",
+                None,
+                Some(3),
+                0,
+                3,
+            ),
+        ];
+
+        for (name, usage, expected_read, expected_write, cached, written) in cases {
+            let sse = format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{{usage}}}}}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":2}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let provider = AnthropicProvider::new(
+                ReplayTransport::new(vec![sse.as_str()]),
+                AnthropicConfig::new("http://x/v1", "claude-test"),
+            );
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(
+                            ModelId::new("claude-test"),
+                            vec![Message::user("hi")],
+                        ),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let observations: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::CacheObservation {
+                        read_tokens,
+                        write_tokens,
+                    } => Some((*read_tokens, *write_tokens)),
+                    _ => None,
+                })
+                .collect();
+
+            if expected_read.is_none() && expected_write.is_none() {
+                assert!(observations.is_empty(), "{name} must stay absent");
+            } else {
+                assert_eq!(
+                    observations,
+                    vec![(expected_read, expected_write)],
+                    "{name}"
+                );
+            }
+            let usage = events.iter().find_map(|event| match event {
+                ProviderStreamEvent::Usage { delta } => Some(delta),
+                _ => None,
+            });
+            let usage = usage.expect("usage event");
+            assert_eq!(usage.get(CounterKind::InputCached), cached, "{name}");
+            assert_eq!(usage.get(CounterKind::CacheWrite), written, "{name}");
+        }
     }
 
     #[tokio::test]

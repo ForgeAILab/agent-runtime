@@ -25,12 +25,18 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - `Named`/`Registry<T>`/`Sealed<T>` moved to `agent-runtime-registry`. A `Named`
   impl on a foreign type (e.g. `Arc<dyn YourTrait>`) is now an orphan impl and
   needs a local newtype.
-- Event `SCHEMA_VERSION` is now `11`. Since the registry-driven v2 baseline,
+- Event `SCHEMA_VERSION` is now `13`. Since the registry-driven v2 baseline,
   tool-call argument projection, delegation, attempt-scoped streaming,
   metadata-only host interaction, lossless child `needs_input`, and
-  durability-aligned `PlanUpdated`, and durable-child recovery/resume each
-  advanced the vocabulary. Golden fixtures retain the compatible v5 through
-  v11 wire forms; pre-v5
+  durability-aligned `PlanUpdated`, durable-child recovery/resume, and
+  attempt-attributed prompt-cache evidence each advanced the vocabulary.
+  Provider `CacheObservation` read/write fields are now independently
+  presence-aware, canonical observations carry request/attempt/cache-plan
+  attribution, and `CacheStateChanged` reports the comparable expectation,
+  provider observation, saturating shortfall, and confidence. Exhaustive
+  provider/event matches must handle the new shapes. Legacy numeric cache
+  observations remain readable without fabricating attribution or a miss.
+  Golden fixtures retain the compatible v5 through v13 wire forms; pre-v5
   unattributed output deltas are intentionally rejected.
 - `SessionHandle::send` and `run` return `Result<TurnHandle, RuntimeError>`.
   `TurnHandle` owns turn-local interruption and completion; use
