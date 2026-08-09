@@ -1,0 +1,15 @@
+{
+  "change_id": "add-adaptive-cache-parking",
+  "change_ref": "add-adaptive-cache-parking-2026-08-08",
+  "created_at": "2026-08-09T01:46:54Z",
+  "updated_at": "2026-08-09T02:38:40Z",
+  "completed_at": null,
+  "status": "implementing",
+  "approved_at": "2026-08-09T02:38:40Z",
+  "implementation_started_at": "2026-08-09T02:38:40Z",
+  "depends_on": [
+    "wire-provider-prompt-cache-2026-08-03",
+    "add-prompt-cache-miss-evidence-2026-08-08"
+  ],
+  "external_dependencies": []
+}
