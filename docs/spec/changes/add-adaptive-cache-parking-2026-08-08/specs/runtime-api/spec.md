@@ -23,6 +23,15 @@ purpose, result, or rejection data.
 - **THEN** Runtime returns a structured denied or unsupported result
 - **AND** no provider request starts
 
+#### Scenario: Host serializes an identity-bound post-dispatch projection
+
+- **GIVEN** a synthetic operation returned one exact cache identity
+- **WHEN** the host acquires Runtime's current-identity lease for its durable
+  consumer projection
+- **THEN** a stale identity receives no lease
+- **AND** an ordinary provider turn cannot commit a different plan until the
+  valid lease is released
+
 ### Requirement: Canonical Runtime operation lifecycle events
 
 Runtime SHALL add the CacheOperationPrepared, CacheOperationRejected,

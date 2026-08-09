@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
 use tokio::task::AbortHandle;
 
 use agent_runtime_core::artifact::ArtifactRef;
@@ -136,6 +136,19 @@ struct ServingSteer {
 
 struct UserSubmissionGuard<'a> {
     pending: &'a AtomicUsize,
+}
+
+/// A read-only lease proving that one exact cache identity is still the last
+/// provider-committed plan while the lease is held.
+///
+/// The lease serializes against ordinary provider-turn admission. Consumers
+/// may use it to commit an identity-bound host projection after a synthetic
+/// operation returns. They must drop it before starting another turn or cache
+/// operation.
+#[must_use = "dropping the lease releases provider-turn admission"]
+#[derive(Debug)]
+pub struct CurrentCacheIdentityLease<'a> {
+    _turn_gate: AsyncMutexGuard<'a, ()>,
 }
 
 impl<'a> UserSubmissionGuard<'a> {
@@ -637,6 +650,25 @@ impl SessionHandle {
                     .and_then(|cache| cache.cache_identity())
                     .is_some_and(|current| current == identity)
             })
+    }
+
+    /// Acquires a read-only lease when `identity` is still the exact last
+    /// provider-committed cache identity.
+    ///
+    /// The identity is checked after acquiring the ordinary provider-turn
+    /// gate, closing the post-dispatch race where a new real turn could commit
+    /// a different plan before a host persists identity-bound metadata.
+    pub async fn lock_current_cache_identity(
+        &self,
+        identity: &agent_runtime_core::provider::CacheIdentity,
+    ) -> Option<CurrentCacheIdentityLease<'_>> {
+        let turn_gate = self.inner.turn_gate.lock().await;
+        if !self.cache_identity_matches_last_plan(identity) {
+            return None;
+        }
+        Some(CurrentCacheIdentityLease {
+            _turn_gate: turn_gate,
+        })
     }
 
     /// Saves the prepared cache checkpoint while the caller already owns the

@@ -3168,7 +3168,77 @@ async fn stale_plan_identity_is_rejected_at_serialized_provider_boundary() {
         result.rejection_reason,
         Some(CacheOperationReason::IdentityChanged)
     );
+    assert!(
+        session
+            .lock_current_cache_identity(&result.identity)
+            .await
+            .is_none(),
+        "a stale operation identity cannot acquire the post-dispatch lease"
+    );
     assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn current_cache_identity_lease_blocks_a_real_turn_until_projection_finishes() {
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        synthetic_capabilities(),
+        vec![
+            ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }]),
+            ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }]),
+            ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }]),
+        ],
+    ));
+    let runtime = synthetic_cache_runtime(provider.clone())
+        .build()
+        .expect("runtime builds");
+    let session = runtime
+        .start_session(StartSession::new())
+        .await
+        .expect("session starts");
+    session.run(UserInput::text("seed")).await.unwrap();
+    let operation = synthetic_operation_for_test(
+        &session,
+        "identity-lease-operation",
+        CacheAuthority::new("fixture-authority"),
+    );
+    let result = session
+        .dispatch_cache_operation(operation)
+        .await
+        .expect("cache operation completes");
+    assert_eq!(result.outcome, CacheOperationOutcome::Completed);
+
+    let lease = session
+        .lock_current_cache_identity(&result.identity)
+        .await
+        .expect("the dispatched identity is still current");
+    let raced_session = session.clone();
+    let mut real_turn = tokio::spawn(async move {
+        raced_session
+            .run(UserInput::text("race the host projection"))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut real_turn)
+            .await
+            .is_err(),
+        "a real provider turn crossed an identity-bound projection lease"
+    );
+    assert_eq!(provider.requests().len(), 2);
+
+    drop(lease);
+    tokio::time::timeout(Duration::from_secs(1), real_turn)
+        .await
+        .expect("real turn resumes after projection lease release")
+        .expect("real turn task joins")
+        .expect("real turn completes");
+    assert_eq!(provider.requests().len(), 3);
 }
 
 #[tokio::test]
