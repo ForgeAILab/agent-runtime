@@ -627,6 +627,8 @@ impl Runtime {
             delegation_coordinator_active: AtomicBool::new(false),
             goal_controller_active: AtomicBool::new(false),
             user_submission_pending: std::sync::atomic::AtomicUsize::new(0),
+            idle_compaction_inflight: AtomicBool::new(false),
+            idle_compaction_attempted: AtomicBool::new(false),
             recovery_deferred,
         });
 

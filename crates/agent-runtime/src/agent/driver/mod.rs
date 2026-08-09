@@ -8,6 +8,7 @@
 //! recording, an explicit turn deadline, fail-closed approval via the executor,
 //! and structured terminal events.
 
+use std::collections::BTreeMap;
 use std::future::{Future, pending};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -62,8 +63,9 @@ use crate::agent::config::LoopConfig;
 use crate::agent::planning::{PreviousCacheRestore, RunPlanner};
 use crate::cache::CacheMechanism;
 use crate::harness::{
-    CAPABILITY_SEARCH_TOOL_NAME, ContextView, HarnessPipeline, HistoryProjection, HistoryView,
-    LiveAbilityRuntime, ModelView, QUESTIONNAIRE_TOOL_NAME, ToolOutputView, TurnCommitView,
+    CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView, HarnessPipeline,
+    HistoryProjection, HistoryView, LiveAbilityRuntime, ModelView, QUESTIONNAIRE_TOOL_NAME,
+    SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, ToolOutputView, TurnCommitPatch, TurnCommitView,
 };
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
@@ -539,6 +541,60 @@ impl Driver {
             extension_state,
             abilities,
         )
+    }
+
+    /// Runs the opt-in idle-boundary phase through the same ordered
+    /// turn-commit components used by ordinary terminal turns.  State and
+    /// usage validation stays here so a SessionHandle cannot apply an
+    /// arbitrary patch returned by an extension.
+    pub(crate) async fn run_idle_compaction_hooks(
+        &self,
+        view: &TurnCommitView,
+        extension_state: &BTreeMap<String, VersionedSessionState>,
+        cancel: &Cancellation,
+    ) -> Result<Vec<(ComponentDescriptor, TurnCommitPatch)>, RuntimeError> {
+        let mut patches = Vec::new();
+        for hook in self.harness.turn_commit() {
+            let descriptor = hook.descriptor();
+            let mut hook_view = view.clone();
+            hook_view.state = extension_state.get(descriptor.id().as_str()).cloned();
+            let patch = crate::agent::driver::turn::await_turn_commit_phase(
+                hook.after_idle_compaction(&hook_view),
+                cancel,
+                Deadline::never(),
+                self.clock.clone(),
+                "running idle compaction hook",
+            )
+            .await;
+            let Some(patch) = (match patch {
+                Ok(patch) => patch,
+                Err(error) => return Err(error),
+            }) else {
+                continue;
+            };
+            if let Some(state) = &patch.state {
+                if state.revision != *descriptor.revision() {
+                    return Err(RuntimeError::conflict(format!(
+                        "idle compaction component `{}` returned state revision `{}` but declares `{}`",
+                        descriptor.id(),
+                        state.revision,
+                        descriptor.revision()
+                    )));
+                }
+            }
+            if patch.usage.iter().any(|record| {
+                record.source != UsageSource::SemanticSummary
+                    || record.provenance.purpose.as_deref()
+                        != Some(SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE)
+            }) {
+                return Err(RuntimeError::conflict(format!(
+                    "idle compaction component `{}` attempted to publish non-idle-summary usage",
+                    descriptor.id()
+                )));
+            }
+            patches.push((descriptor, patch));
+        }
+        Ok(patches)
     }
 
     pub(crate) fn executor(&self) -> &ToolExecutor {

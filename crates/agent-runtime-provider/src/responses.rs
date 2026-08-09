@@ -48,6 +48,8 @@ pub const RESPONSES_PATH: &str = "responses";
 /// Default validity requested from renewable credentials before provider I/O.
 pub const DEFAULT_CREDENTIAL_MINIMUM_VALIDITY_MS: u64 = 30_000;
 
+const OFFICIAL_OPENAI_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1";
+
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MESSAGES: usize = 2_048;
 const MAX_CONTENT_PARTS: usize = 8_192;
@@ -182,7 +184,7 @@ impl<T: HttpTransport> fmt::Debug for ResponsesProvider<T> {
 impl<T: HttpTransport> ResponsesProvider<T> {
     /// Builds an adapter using the optional static key in `config`.
     pub fn new(transport: T, mut config: ResponsesConfig) -> Result<Self, ProviderError> {
-        normalize_cache_capabilities(&mut config.capabilities);
+        normalize_cache_capabilities(&mut config.capabilities, &config.base_url);
         let credential_source = config.api_key.take().map(|secret| {
             Arc::new(StaticProviderCredentialSource::new(secret))
                 as Arc<dyn ProviderCredentialSource>
@@ -202,7 +204,7 @@ impl<T: HttpTransport> ResponsesProvider<T> {
         credential_target: ProviderCredentialTarget,
         credential_source: Arc<dyn ProviderCredentialSource>,
     ) -> Result<Self, ProviderError> {
-        normalize_cache_capabilities(&mut config.capabilities);
+        normalize_cache_capabilities(&mut config.capabilities, &config.base_url);
         if config.api_key.is_some() {
             return Err(bad_request(
                 "conflicting Responses provider credential configuration",
@@ -398,16 +400,17 @@ impl<T: HttpTransport> ResponsesProvider<T> {
     }
 }
 
-/// The generic Responses adapter currently implements only the implicit
-/// routing-key contract. Explicit breakpoint fields are model- and
-/// endpoint-scoped (for example, GPT-5.6's newer wire mode) and are not
-/// emitted here. Normalize explicit declarations to implicit so Runtime
-/// fails closed instead of planning unsupported breakpoint or maintenance
-/// behavior.
-fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
+/// The generic Responses adapter emits only the implicit routing key. Explicit
+/// breakpoint fields are model- and endpoint-scoped and are not emitted here.
+/// The official OpenAI endpoint is the sole adapter/endpoint combination whose
+/// configured synthetic-maintenance conformance may survive normalization;
+/// every other endpoint remains observation-only until it has a dedicated,
+/// independently verified adapter contract.
+fn normalize_cache_capabilities(capabilities: &mut Capabilities, base_url: &str) {
     // This generic Responses adapter emits only an implicit routing key. Keep
-    // the normalized contract fail-closed for every declaration rather than
-    // retaining explicit/resource metadata that is absent from the wire.
+    // the normalized contract fail-closed rather than retaining
+    // explicit/resource metadata that is absent from the wire. Maintenance and
+    // conformance are retained only for the exact official endpoint below.
     let configured = capabilities.cache_contract.take();
     let behavior = configured
         .as_ref()
@@ -420,9 +423,11 @@ fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
     });
     contract.retention = Default::default();
     contract.key_revision = None;
-    contract.maintenance.clear();
+    if !is_official_openai_responses_base_url(base_url) {
+        contract.maintenance.clear();
+        contract.conformance = None;
+    }
     contract.resource_operations.clear();
-    contract.conformance = None;
     contract.evidence.resource_operations = false;
     contract.evidence.cache_scoped_errors = false;
     contract.evidence.stream &= capabilities.cache;
@@ -440,6 +445,15 @@ fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
     }
     capabilities.cache_contract = Some(contract);
     capabilities.normalize_cache_contract();
+}
+
+/// Returns whether `base_url` is exactly the official OpenAI Responses base
+/// URL, allowing only one harmless trailing slash. Deliberately avoid URL
+/// parsing/canonicalization here: paths, hosts, schemes, ports, credentials,
+/// and query/fragment lookalikes must not inherit official conformance.
+fn is_official_openai_responses_base_url(base_url: &str) -> bool {
+    base_url == OFFICIAL_OPENAI_RESPONSES_BASE_URL
+        || base_url.strip_suffix('/') == Some(OFFICIAL_OPENAI_RESPONSES_BASE_URL)
 }
 
 fn default_credential_target() -> ProviderCredentialTarget {
@@ -2048,8 +2062,8 @@ mod tests {
     use agent_runtime_core::content::{ToolCall, ToolResultBlock};
     use agent_runtime_core::ids::{AttemptId, RequestId};
     use agent_runtime_core::provider::{
-        CacheEndpointIdentity, CacheIdentity, CacheIdentityFragment, CacheRetentionContract,
-        ProviderCacheBehavior, ProviderCacheContract,
+        CacheEndpointIdentity, CacheEvidenceCapabilities, CacheIdentity, CacheIdentityFragment,
+        CacheRetentionContract, ProviderCacheBehavior, ProviderCacheContract, SyntheticConformance,
     };
     use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
@@ -2235,6 +2249,8 @@ mod tests {
         let changed_prefix_identity = cache_identity("route-a", "stable-v2");
         let isolated_identity = cache_identity("route-b", "stable-v1");
 
+        assert_eq!(first_identity.profile(), &Fingerprint::of("profile-1"));
+
         let first = provider
             .build_payload(
                 &ProviderRequest::new(ModelId::new("grok-4.5"), vec![])
@@ -2328,6 +2344,89 @@ mod tests {
             )
             .expect("payload");
         assert!(payload.get("prompt_cache_key").is_none());
+    }
+
+    fn conformed_config(base_url: &str) -> ResponsesConfig {
+        let mut config = ResponsesConfig::new(base_url, "gpt-4.1");
+        config.capabilities.cache_contract = Some(ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ImplicitPrefix,
+            evidence: CacheEvidenceCapabilities {
+                stream: true,
+                ..Default::default()
+            },
+            maintenance: [
+                ProviderAttemptPurpose::CacheKeepalive,
+                ProviderAttemptPurpose::CacheHandoffCheckpoint,
+                ProviderAttemptPurpose::IdleCompaction,
+            ]
+            .into_iter()
+            .collect(),
+            conformance: Some(SyntheticConformance::complete()),
+            ..ProviderCacheContract::default()
+        });
+        config
+    }
+
+    #[test]
+    fn official_openai_responses_preserves_all_synthetic_conformance_gates() {
+        for base_url in ["https://api.openai.com/v1", "https://api.openai.com/v1/"] {
+            let provider =
+                ResponsesProvider::new(ReplayTransport::new(""), conformed_config(base_url))
+                    .expect("valid official Responses config");
+            let capabilities = provider
+                .capabilities(&ModelId::new("gpt-4.1"))
+                .expect("configured model capabilities");
+            let contract = capabilities.cache_contract();
+
+            assert_eq!(capabilities.prompt_cache, PromptCacheControl::Implicit);
+            assert_eq!(contract.conformance, Some(SyntheticConformance::complete()));
+            for purpose in [
+                ProviderAttemptPurpose::CacheKeepalive,
+                ProviderAttemptPurpose::CacheHandoffCheckpoint,
+                ProviderAttemptPurpose::IdleCompaction,
+            ] {
+                assert!(
+                    contract.supports_synthetic(purpose),
+                    "official endpoint should support {purpose:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_official_responses_endpoints_clear_synthetic_conformance() {
+        for base_url in [
+            "https://api.x.ai/v1",
+            "https://api.openai.com.evil/v1",
+            "https://api.openai.com/v1/extra",
+            "https://api.openai.com/v1//",
+            "http://api.openai.com/v1",
+        ] {
+            let provider =
+                ResponsesProvider::new(ReplayTransport::new(""), conformed_config(base_url))
+                    .expect("valid custom Responses config");
+            let capabilities = provider
+                .capabilities(&ModelId::new("gpt-4.1"))
+                .expect("configured model capabilities");
+            let contract = capabilities.cache_contract();
+
+            assert_eq!(capabilities.prompt_cache, PromptCacheControl::Implicit);
+            assert!(
+                contract.maintenance.is_empty(),
+                "custom endpoint retained maintenance: {base_url}"
+            );
+            assert_eq!(contract.conformance, None, "custom endpoint: {base_url}");
+            for purpose in [
+                ProviderAttemptPurpose::CacheKeepalive,
+                ProviderAttemptPurpose::CacheHandoffCheckpoint,
+                ProviderAttemptPurpose::IdleCompaction,
+            ] {
+                assert!(
+                    !contract.supports_synthetic(purpose),
+                    "custom endpoint should remain observe-only for {purpose:?}: {base_url}"
+                );
+            }
+        }
     }
 
     #[test]

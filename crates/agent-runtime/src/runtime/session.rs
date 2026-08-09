@@ -32,7 +32,10 @@ use crate::cache::{
     CacheOperationRequest, CacheOperationResult, CacheResourceDispatchRequest, cache_operation_turn,
 };
 use crate::capability::ActivationEpoch;
-use crate::harness::GoalComponent;
+use crate::harness::{
+    GoalComponent, HarnessEvent, ProtectedSemanticSummary, SEMANTIC_SUMMARY_COMPONENT_ID,
+    TurnCommitView, protected_summary_from_patch,
+};
 use crate::ids::IdMinter;
 use crate::runtime::emitter::{CacheEventBatch, EventEmitter, RuntimeEventStream};
 use crate::runtime::engine::{ActiveSessionLease, RuntimeShared};
@@ -92,6 +95,12 @@ pub struct SessionInner {
     /// a user that is already submitting cannot be overtaken by an internal
     /// turn at the same idle boundary.
     pub(crate) user_submission_pending: AtomicUsize,
+    /// Claims one explicit idle compaction call at a time. The claim is
+    /// released when the async operation ends, including cancellation.
+    pub(crate) idle_compaction_inflight: AtomicBool,
+    /// Consumes the one idle-compaction attempt until a new real turn begins.
+    /// A failed summary therefore cannot be retried at the same boundary.
+    pub(crate) idle_compaction_attempted: AtomicBool,
     /// An unanswered interaction checkpoint was intentionally left dormant.
     pub(crate) recovery_deferred: bool,
 }
@@ -309,6 +318,59 @@ pub enum InternalTurnAdmission {
     Shutdown,
 }
 
+/// Outcome of one explicit idle semantic-compaction boundary.
+///
+/// The accepted branch intentionally carries the protected result by value so
+/// callers can consume its metadata/body without an extra allocation; the
+/// larger enum branch is an API tradeoff for this infrequent boundary result.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, PartialEq, Eq)]
+pub enum IdleCompactionAdmission {
+    /// The idle boundary was claimed. A summary is present when the
+    /// configured coordinator committed one; a fallback reason means the
+    /// bounded attempt completed without changing summary state.
+    Accepted {
+        /// Protected summary metadata and body, when committed.
+        summary: Option<ProtectedSemanticSummary>,
+        /// Redaction-safe fallback category, when the attempt made no state
+        /// change.
+        fallback_reason: Option<String>,
+        /// Disjoint usage committed by this idle attempt.
+        usage: UsageDelta,
+    },
+    /// User/admission/active work already owns the boundary, or this idle
+    /// interval has consumed its one attempt.
+    Busy,
+    /// Shutdown or cancellation won the protected boundary.
+    Shutdown,
+}
+
+impl std::fmt::Debug for IdleCompactionAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accepted {
+                summary,
+                fallback_reason,
+                usage,
+            } => formatter
+                .debug_struct("IdleCompactionAdmission::Accepted")
+                .field("has_summary", &summary.is_some())
+                .field("fallback_reason", fallback_reason)
+                .field("usage", usage)
+                .finish(),
+            Self::Busy => formatter.write_str("IdleCompactionAdmission::Busy"),
+            Self::Shutdown => formatter.write_str("IdleCompactionAdmission::Shutdown"),
+        }
+    }
+}
+
+/// Protected result metadata returned by an accepted idle compaction.
+pub type IdleCompactionSummary = ProtectedSemanticSummary;
+
+/// Compatibility name for hosts that model the method as a result rather than
+/// an admission operation.
+pub type IdleCompactionResult = IdleCompactionAdmission;
+
 impl TurnHandle {
     /// The accepted turn id.
     pub fn id(&self) -> &TurnId {
@@ -350,6 +412,19 @@ struct SessionCacheStartBarrier {
 
 struct CacheActivityGuard {
     inner: Arc<SessionInner>,
+}
+
+struct IdleCompactionGuard {
+    inner: Arc<SessionInner>,
+    _cache_activity: CacheActivityGuard,
+}
+
+impl Drop for IdleCompactionGuard {
+    fn drop(&mut self) {
+        self.inner
+            .idle_compaction_inflight
+            .store(false, Ordering::Release);
+    }
 }
 
 impl CacheActivityGuard {
@@ -931,6 +1006,245 @@ impl SessionHandle {
     /// authoritative for earlier events and any detected delivery gaps.
     pub fn subscribe(&self) -> RuntimeEventStream {
         self.inner.emitter.subscribe()
+    }
+
+    /// Attempts one semantic compaction at the current idle turn boundary.
+    ///
+    /// The operation claims the same admission boundary as user and internal
+    /// turns, invokes the configured semantic-summary hook through the normal
+    /// driver pipeline, and commits its extension state and usage under the
+    /// ordinary persistence gate. A failed model attempt is represented by an
+    /// accepted result with a fallback reason and consumes the attempt; it is
+    /// never retried automatically. The canonical history remains unchanged.
+    pub async fn try_idle_semantic_compaction(
+        &self,
+    ) -> Result<IdleCompactionAdmission, RuntimeError> {
+        // Claim both admission layers before publishing the idle attempt.  In
+        // particular, do not release `admission_gate` and then await
+        // `turn_gate`: a user can otherwise win admission in that gap and the
+        // idle operation would run against the new interval's history.
+        let turn_gate = {
+            let _admission = self
+                .inner
+                .admission_gate
+                .lock()
+                .expect("session admission gate poisoned");
+            if self.inner.recovery_deferred {
+                return Ok(IdleCompactionAdmission::Busy);
+            }
+            let turns = self.inner.turns.lock().expect("session turns poisoned");
+            if turns.shutting_down || self.inner.cancel.is_cancelled() {
+                return Ok(IdleCompactionAdmission::Shutdown);
+            }
+            if self.inner.user_submission_pending.load(Ordering::Acquire) != 0
+                || turns.count != 0
+                || self.inner.idle_compaction_attempted.load(Ordering::Acquire)
+            {
+                return Ok(IdleCompactionAdmission::Busy);
+            }
+            let turn_gate = match self.inner.turn_gate.try_lock() {
+                Ok(turn_gate) => turn_gate,
+                Err(_) => return Ok(IdleCompactionAdmission::Busy),
+            };
+            if self
+                .inner
+                .idle_compaction_inflight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(IdleCompactionAdmission::Busy);
+            }
+            self.inner
+                .idle_compaction_attempted
+                .store(true, Ordering::Release);
+            turn_gate
+        };
+        // Keep the successful gate guard through snapshot, hook, and
+        // persistence.  This prevents a turn admitted after the check from
+        // changing the canonical boundary while compaction is in flight.
+        let _turn_gate = turn_gate;
+
+        let cache_activity = match CacheActivityGuard::enter(&self.inner) {
+            Ok(activity) => activity,
+            Err(_) => {
+                self.inner
+                    .idle_compaction_inflight
+                    .store(false, Ordering::Release);
+                return Ok(IdleCompactionAdmission::Shutdown);
+            }
+        };
+        let _idle = IdleCompactionGuard {
+            inner: self.inner.clone(),
+            _cache_activity: cache_activity,
+        };
+        if self.inner.cancel.is_cancelled() {
+            return Ok(IdleCompactionAdmission::Shutdown);
+        }
+
+        let (history, usage, boundary_turn) = {
+            let state = self.inner.state.lock().expect("session state poisoned");
+            let boundary_turn = state
+                .manifests
+                .last()
+                .map(|manifest| manifest.turn.clone())
+                .unwrap_or_else(|| TurnId::new("idle-compaction-boundary"));
+            (
+                Arc::from(state.history.clone().into_boxed_slice()),
+                Arc::from(state.usage.records().to_vec().into_boxed_slice()),
+                boundary_turn,
+            )
+        };
+        let extension_state = self
+            .inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .clone();
+        let committed_at = self.inner.shared.clock.now();
+        let view = TurnCommitView {
+            session: self.inner.id.clone(),
+            turn: boundary_turn.clone(),
+            finish: TurnFinish::Completed,
+            provider_error_kind: None,
+            visible_output: false,
+            history,
+            state: None,
+            usage,
+            started_at: committed_at,
+            committed_at,
+        };
+        let patches = match self
+            .inner
+            .shared
+            .driver
+            .run_idle_compaction_hooks(&view, &extension_state, &self.inner.cancel)
+            .await
+        {
+            Ok(patches) => patches,
+            Err(_error) if self.inner.cancel.is_cancelled() => {
+                return Ok(IdleCompactionAdmission::Shutdown);
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut updates = Vec::new();
+        let mut usage_records = Vec::new();
+        let mut events = Vec::new();
+        let mut summary = None;
+        let mut fallback_reason = None;
+        let mut usage = UsageDelta::new();
+        for (descriptor, patch) in patches {
+            if descriptor.id().as_str() == SEMANTIC_SUMMARY_COMPONENT_ID {
+                summary = protected_summary_from_patch(&patch)?;
+            }
+            if fallback_reason.is_none() {
+                fallback_reason = patch.events.iter().find_map(|event| match event {
+                    HarnessEvent::SemanticSummaryFallback { reason } => Some(reason.clone()),
+                    _ => None,
+                });
+            }
+            if let Some(state) = patch.state {
+                updates.push((descriptor.id().as_str().to_owned(), state.into_state()));
+            }
+            for record in &patch.usage {
+                usage.merge(&record.delta);
+            }
+            usage_records.extend(patch.usage);
+            events.extend(patch.events);
+        }
+
+        let _persist_gate = self.inner.persist_gate.lock().await;
+        if self.inner.cancel.is_cancelled() {
+            return Ok(IdleCompactionAdmission::Shutdown);
+        }
+        let previous_extensions = {
+            let extensions = self
+                .inner
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            updates
+                .iter()
+                .map(|(namespace, _)| (namespace.clone(), extensions.get(namespace).cloned()))
+                .collect::<Vec<_>>()
+        };
+        let previous_usage = self
+            .inner
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .usage
+            .clone();
+        {
+            let mut extensions = self
+                .inner
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            for (namespace, state) in &updates {
+                extensions.insert(namespace.clone(), state.clone());
+            }
+        }
+        {
+            let mut state = self.inner.state.lock().expect("session state poisoned");
+            for record in &usage_records {
+                state.usage.record(record.clone());
+            }
+        }
+        let save_result = match &self.inner.shared.session_store {
+            Some(store) => store.save(&self.snapshot()).await,
+            None => Ok(()),
+        };
+        if let Err(error) = save_result {
+            {
+                let mut extensions = self
+                    .inner
+                    .execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned");
+                for (namespace, previous) in previous_extensions {
+                    match previous {
+                        Some(state) => {
+                            extensions.insert(namespace, state);
+                        }
+                        None => {
+                            extensions.remove(&namespace);
+                        }
+                    }
+                }
+            }
+            self.inner
+                .state
+                .lock()
+                .expect("session state poisoned")
+                .usage = previous_usage;
+            return Err(error);
+        }
+
+        for record in usage_records {
+            self.inner
+                .emitter
+                .emit(Some(boundary_turn.clone()), RuntimeEvent::Usage { record });
+        }
+        for event in events {
+            self.inner
+                .emitter
+                .emit(Some(boundary_turn.clone()), event.into_runtime_event());
+        }
+        Ok(IdleCompactionAdmission::Accepted {
+            summary,
+            fallback_reason,
+            usage,
+        })
+    }
+
+    /// Alias emphasizing that this is the single idle-compaction attempt.
+    pub async fn try_idle_compaction(&self) -> Result<IdleCompactionAdmission, RuntimeError> {
+        self.try_idle_semantic_compaction().await
     }
 
     /// Dispatches one conformance-gated synthetic cache operation through the
@@ -1935,6 +2249,9 @@ impl SessionHandle {
             }
         }
 
+        self.inner
+            .idle_compaction_attempted
+            .store(false, Ordering::Release);
         if !extension_updates.is_empty() {
             if acceptance_hook.is_some() {
                 self.inner
@@ -2303,6 +2620,12 @@ impl SessionHandle {
                 "session is shutting down and no longer accepts turns",
             ));
         }
+        // A real user turn starts a new idle interval. This reset is made
+        // while the serialized admission gate is held, so an idle attempt
+        // cannot be re-enabled by a stale boundary after user work wins.
+        self.inner
+            .idle_compaction_attempted
+            .store(false, Ordering::Release);
         let turn_id = self.inner.minter.turn();
         let turn_cancel = self.inner.cancel.child();
         let completion = Arc::new(TurnCompletion::default());

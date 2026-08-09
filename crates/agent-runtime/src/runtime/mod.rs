@@ -24,5 +24,8 @@ pub use emitter::{EventEmitter, RuntimeEventStream};
 pub use engine::Runtime;
 pub use goal::{GoalAdmissionGate, GoalController, GoalControllerConfig};
 pub use inject::InjectedContent;
-pub use session::{InternalTurnAdmission, SessionHandle, TurnHandle};
+pub use session::{
+    IdleCompactionAdmission, IdleCompactionResult, IdleCompactionSummary, InternalTurnAdmission,
+    SessionHandle, TurnHandle,
+};
 pub use state::{SessionExecutionContext, SessionState};

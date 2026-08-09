@@ -22,7 +22,7 @@ use agent_runtime_core::artifact::{
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::TurnFinish;
-use agent_runtime_core::store::VersionedSessionState;
+use agent_runtime_core::store::{SessionStateSensitivity, VersionedSessionState};
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
@@ -33,8 +33,12 @@ use super::pipeline::{
 
 /// Protected state wire version.
 pub const SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION: u32 = 1;
+/// Stable harness component identity and state namespace.
+pub const SEMANTIC_SUMMARY_COMPONENT_ID: &str = "harness.semantic_summary";
 /// Stable separately attributed purpose.
 pub const SEMANTIC_SUMMARY_PURPOSE: &str = "context.semantic_summary";
+/// Stable purpose for an explicit idle-boundary semantic compaction attempt.
+pub const SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE: &str = "cache_idle_compaction";
 /// Default completed-turn floor below which a session is never summarized.
 pub const DEFAULT_SUMMARY_MIN_TURNS: usize = 4;
 /// Default share of the post-opening input budget that triggers summarization.
@@ -102,6 +106,91 @@ pub trait SummaryModel: Send + Sync + fmt::Debug {
         &self,
         request: &SummaryModelRequest,
     ) -> Result<SummaryModelResponse, RuntimeError>;
+}
+
+/// A protected summary body returned to the host that owns the session.
+///
+/// The body is intentionally not included in [`Debug`] output.  Hosts may
+/// read it at the protected boundary with [`Self::as_str`], while redacted
+/// diagnostics can retain the surrounding metadata without leaking semantic
+/// content.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtectedSummaryBody(String);
+
+impl ProtectedSummaryBody {
+    /// Returns the protected summary text to an authorized live caller.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProtectedSummaryBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProtectedSummaryBody([redacted])")
+    }
+}
+
+/// Redaction-safe metadata and protected body for one committed summary.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtectedSemanticSummary {
+    /// Number of canonical history messages replaced by the projection.
+    pub omit_prefix: usize,
+    /// Fingerprint of the exact canonical source prefix.
+    pub source_fingerprint: Fingerprint,
+    /// Protected original-history artifact reference.
+    pub source_artifact: agent_runtime_core::artifact::ArtifactRef,
+    /// Revision of the generated summary body.
+    pub summary_revision: RegistryRevision,
+    /// Dedicated summary model identity.
+    pub model_id: String,
+    /// Dedicated summary model/adapter revision.
+    pub model_revision: RegistryRevision,
+    /// Stable routing/accounting purpose.
+    pub purpose: String,
+    /// Content sensitivity selected by policy.
+    pub sensitivity: Sensitivity,
+    /// Disjoint usage attributed to the committed semantic-summary attempt.
+    ///
+    /// This contains accounting metadata only; it never contains summary
+    /// content or source history.
+    pub usage: UsageDelta,
+    /// Protected semantic body.
+    pub body: ProtectedSummaryBody,
+}
+
+impl ProtectedSemanticSummary {
+    fn from_state(state: SemanticSummaryState, usage: UsageDelta) -> Self {
+        Self {
+            omit_prefix: state.omit_prefix,
+            source_fingerprint: state.source_fingerprint,
+            source_artifact: state.source_artifact,
+            summary_revision: state.summary_revision,
+            model_id: state.model_id,
+            model_revision: state.model_revision,
+            purpose: state.purpose,
+            sensitivity: state.sensitivity,
+            usage,
+            body: ProtectedSummaryBody(state.summary),
+        }
+    }
+}
+
+impl fmt::Debug for ProtectedSemanticSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtectedSemanticSummary")
+            .field("omit_prefix", &self.omit_prefix)
+            .field("source_fingerprint", &self.source_fingerprint)
+            .field("source_artifact", &self.source_artifact)
+            .field("summary_revision", &self.summary_revision)
+            .field("model_id", &self.model_id)
+            .field("model_revision", &self.model_revision)
+            .field("purpose", &self.purpose)
+            .field("sensitivity", &self.sensitivity)
+            .field("usage", &self.usage)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 /// Host policy for semantic summarization.
@@ -297,7 +386,7 @@ impl SemanticSummaryCoordinator {
 
     fn descriptor_value(&self) -> ComponentDescriptor {
         ComponentDescriptor::new(
-            "harness.semantic_summary",
+            SEMANTIC_SUMMARY_COMPONENT_ID,
             RegistryRevision::new(format!(
                 "{}:{}:{}",
                 self.policy.revision,
@@ -324,7 +413,11 @@ impl SemanticSummaryCoordinator {
             || state.policy_revision != self.policy.revision
             || state.model_id != self.model.id()
             || state.model_revision != self.model.revision()
-            || state.purpose != SEMANTIC_SUMMARY_PURPOSE
+            || state.omit_prefix == 0
+            || !matches!(
+                state.purpose.as_str(),
+                SEMANTIC_SUMMARY_PURPOSE | SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
+            )
             || state.sensitivity == Sensitivity::Secret
             || state.summary.trim().is_empty()
             || state.summary.chars().count() > self.policy.max_summary_chars
@@ -357,6 +450,27 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
     }
 
     async fn after_commit(&self, view: &TurnCommitView) -> Result<TurnCommitPatch, RuntimeError> {
+        self.summarize(view, SEMANTIC_SUMMARY_PURPOSE, false).await
+    }
+
+    async fn after_idle_compaction(
+        &self,
+        view: &TurnCommitView,
+    ) -> Result<Option<TurnCommitPatch>, RuntimeError> {
+        Ok(Some(
+            self.summarize(view, SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, true)
+                .await?,
+        ))
+    }
+}
+
+impl SemanticSummaryCoordinator {
+    async fn summarize(
+        &self,
+        view: &TurnCommitView,
+        purpose: &str,
+        force_idle: bool,
+    ) -> Result<TurnCommitPatch, RuntimeError> {
         if view.finish != TurnFinish::Completed {
             return Ok(TurnCommitPatch::default());
         }
@@ -369,7 +483,7 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
         if user_starts.len() < self.policy.min_turns {
             return Ok(TurnCommitPatch::default());
         }
-        if !self.under_context_pressure(&view.usage) {
+        if !force_idle && !self.under_context_pressure(&view.usage) {
             return Ok(TurnCommitPatch::default());
         }
         let retain_index = user_starts.len().saturating_sub(self.policy.retain_turns);
@@ -377,8 +491,12 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
         if omit_prefix == 0 {
             return Ok(TurnCommitPatch::default());
         }
-        if let Some(existing) = &view.state {
-            let existing = self.decode_state(existing)?;
+        let existing = view
+            .state
+            .as_ref()
+            .map(|state| self.decode_state(state))
+            .transpose()?;
+        if let Some(existing) = &existing {
             if existing.omit_prefix >= omit_prefix {
                 return Ok(TurnCommitPatch::default());
             }
@@ -393,12 +511,30 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
         };
         let source_fingerprint = Fingerprint::of(&encoded);
         let idempotency = Fingerprint::of_fields([
-            b"semantic-summary".as_slice(),
+            purpose.as_bytes(),
             view.session.as_str().as_bytes(),
             self.policy.revision.as_str().as_bytes(),
             self.model.revision().as_str().as_bytes(),
             encoded.as_slice(),
+            existing
+                .as_ref()
+                .map(|state| state.summary_revision.as_str().as_bytes())
+                .unwrap_or_default(),
         ]);
+        let model_messages = existing
+            .as_ref()
+            .map(|state| {
+                let mut messages = Vec::with_capacity(
+                    1usize.saturating_add(omit_prefix.saturating_sub(state.omit_prefix)),
+                );
+                messages.push(Message::assistant(vec![ContentPart::text(format!(
+                    "Previously committed semantic summary:\n{}",
+                    state.summary
+                ))]));
+                messages.extend(view.history[state.omit_prefix..omit_prefix].iter().cloned());
+                messages
+            })
+            .unwrap_or_else(|| source.to_vec());
         let artifact_sensitivity = match self.policy.sensitivity {
             Sensitivity::Public => ArtifactSensitivity::Public,
             Sensitivity::Internal | Sensitivity::Sensitive => ArtifactSensitivity::Sensitive,
@@ -411,7 +547,7 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
                 media_type: "application/vnd.agent-runtime.history+json".into(),
                 sensitivity: artifact_sensitivity,
                 retention: self.policy.retention,
-                provenance: ArtifactProvenance::new(view.session.clone(), SEMANTIC_SUMMARY_PURPOSE)
+                provenance: ArtifactProvenance::new(view.session.clone(), purpose)
                     .with_turn(view.turn.clone()),
                 idempotency_key: idempotency.as_str().to_owned(),
             })
@@ -430,8 +566,8 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
         let response = match self
             .model
             .summarize(&SummaryModelRequest {
-                messages: Arc::from(source.to_vec().into_boxed_slice()),
-                purpose: SEMANTIC_SUMMARY_PURPOSE.into(),
+                messages: Arc::from(model_messages.into_boxed_slice()),
+                purpose: purpose.into(),
                 idempotency_key: idempotency.as_str().to_owned(),
                 max_output_chars: self.policy.max_summary_chars,
             })
@@ -451,6 +587,7 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
             [
                 source_fingerprint.as_str(),
                 self.model.revision().as_str(),
+                purpose,
                 summary.as_str(),
             ]
             .join("\n"),
@@ -465,7 +602,7 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
             summary_revision,
             model_id: self.model.id().to_owned(),
             model_revision: self.model.revision(),
-            purpose: SEMANTIC_SUMMARY_PURPOSE.into(),
+            purpose: purpose.into(),
             sensitivity: self.policy.sensitivity,
         };
         let value = serde_json::to_value(&state).map_err(|error| {
@@ -475,7 +612,7 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
             .then(|| UsageRecord {
                 source: UsageSource::SemanticSummary,
                 provenance: Provenance {
-                    purpose: Some(SEMANTIC_SUMMARY_PURPOSE.into()),
+                    purpose: Some(purpose.into()),
                     ..Provenance::default()
                 },
                 delta: response.usage,
@@ -491,6 +628,68 @@ impl TurnCommitHook for SemanticSummaryCoordinator {
             events: Vec::new(),
         })
     }
+}
+
+/// Decodes the protected result body carried by an idle-compaction patch.
+///
+/// The hook has already performed policy/model identity validation. This
+/// narrow helper is kept crate-visible so the SessionHandle can return the
+/// protected live result without exposing the internal wire state type.
+pub(crate) fn protected_summary_from_patch(
+    patch: &TurnCommitPatch,
+) -> Result<Option<ProtectedSemanticSummary>, RuntimeError> {
+    let Some(state) = patch.state.as_ref() else {
+        return Ok(None);
+    };
+    let persisted = VersionedSessionState {
+        revision: state.revision.clone(),
+        sensitivity: state.sensitivity,
+        value: state.value.clone(),
+    };
+    let decoded: SemanticSummaryState =
+        serde_json::from_value(persisted.value).map_err(|error| {
+            RuntimeError::conflict(format!(
+                "idle semantic summary patch state is malformed: {error}"
+            ))
+        })?;
+    if decoded.schema_version != SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION
+        || decoded.purpose != SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
+        || decoded.sensitivity == Sensitivity::Secret
+        || state.sensitivity != SessionStateSensitivity::Sensitive
+        || decoded.omit_prefix == 0
+        || decoded.summary.trim().is_empty()
+    {
+        return Err(RuntimeError::conflict(
+            "idle semantic summary patch failed protected-result validation",
+        ));
+    }
+    decoded.source_artifact.validate().map_err(|error| {
+        RuntimeError::conflict(format!(
+            "idle semantic summary artifact is invalid: {error}"
+        ))
+    })?;
+    let expected_artifact_sensitivity = match decoded.sensitivity {
+        Sensitivity::Public => ArtifactSensitivity::Public,
+        Sensitivity::Internal | Sensitivity::Sensitive => ArtifactSensitivity::Sensitive,
+        Sensitivity::Secret => unreachable!("secret summaries are rejected above"),
+    };
+    if decoded.source_artifact.byte_length == 0
+        || decoded.source_artifact.provenance.purpose != SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
+        || decoded.source_artifact.sensitivity != expected_artifact_sensitivity
+    {
+        return Err(RuntimeError::conflict(
+            "idle semantic summary artifact failed protected-result validation",
+        ));
+    }
+    let usage = patch
+        .usage
+        .iter()
+        .filter(|record| record.source == UsageSource::SemanticSummary)
+        .fold(UsageDelta::new(), |mut total, record| {
+            total.merge(&record.delta);
+            total
+        });
+    Ok(Some(ProtectedSemanticSummary::from_state(decoded, usage)))
 }
 
 #[async_trait]
@@ -585,8 +784,10 @@ mod tests {
     use agent_runtime_core::content::UserInput;
     use agent_runtime_core::ids::{SessionId, TurnId};
     use agent_runtime_core::provider::{Capabilities, FinishReason, ModelId, ProviderStreamEvent};
+    use agent_runtime_core::store::{SessionSnapshot, SessionStore};
     use agent_runtime_core::usage::CounterKind;
     use agent_runtime_provider::fake::{FakeProvider, ScriptedStream};
+    use tokio::sync::Notify;
 
     use crate::runtime::{RuntimeBuilder, StartSession};
 
@@ -635,6 +836,25 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct FailingSessionStore;
+
+    #[async_trait]
+    impl SessionStore for FailingSessionStore {
+        async fn load(
+            &self,
+            _session: &SessionId,
+        ) -> Result<Option<SessionSnapshot>, RuntimeError> {
+            Ok(None)
+        }
+
+        async fn save(&self, _snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+            Err(RuntimeError::conflict(
+                "injected idle-compaction persistence failure",
+            ))
+        }
+    }
+
+    #[derive(Debug)]
     struct FixedSummary;
 
     #[async_trait]
@@ -651,12 +871,44 @@ mod tests {
             &self,
             request: &SummaryModelRequest,
         ) -> Result<SummaryModelResponse, RuntimeError> {
-            assert_eq!(request.purpose, SEMANTIC_SUMMARY_PURPOSE);
+            assert!(matches!(
+                request.purpose.as_str(),
+                SEMANTIC_SUMMARY_PURPOSE | SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
+            ));
             Ok(SummaryModelResponse {
                 text: "Earlier turns established the implementation constraints.".into(),
                 usage: UsageDelta::new()
                     .with(CounterKind::InputUncached, 10)
                     .with(CounterKind::Output, 5),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingSummary {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SummaryModel for BlockingSummary {
+        fn id(&self) -> &str {
+            "blocking-summary"
+        }
+
+        fn revision(&self) -> RegistryRevision {
+            RegistryRevision::new("blocking-summary-v1")
+        }
+
+        async fn summarize(
+            &self,
+            _request: &SummaryModelRequest,
+        ) -> Result<SummaryModelResponse, RuntimeError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(SummaryModelResponse {
+                text: "summary committed before the queued user turn".into(),
+                usage: UsageDelta::new(),
             })
         }
     }
@@ -697,6 +949,40 @@ mod tests {
             },
         )
         .expect("a valid policy")
+    }
+
+    fn runtime_with_coordinator(
+        coordinator: Arc<SemanticSummaryCoordinator>,
+    ) -> crate::runtime::Runtime {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .provider(Arc::new(FakeProvider::text_reply("ok")))
+            .history_projector(coordinator.clone())
+            .turn_commit_hook(coordinator)
+            .build()
+            .expect("runtime with semantic summary")
+    }
+
+    fn runtime_with_coordinator_and_store(
+        coordinator: Arc<SemanticSummaryCoordinator>,
+        store: Arc<dyn SessionStore>,
+    ) -> crate::runtime::Runtime {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .provider(Arc::new(FakeProvider::text_reply("ok")))
+            .session_store(store)
+            .history_projector(coordinator.clone())
+            .turn_commit_hook(coordinator)
+            .build()
+            .expect("runtime with semantic summary and session store")
     }
 
     async fn summarized(coordinator: &SemanticSummaryCoordinator, usage: Vec<UsageRecord>) -> bool {
@@ -817,6 +1103,335 @@ mod tests {
         // semantic summarization.
         let coordinator = pressure_coordinator(100_000);
         assert!(summarized(&coordinator, Vec::new()).await);
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_forces_the_idle_purpose_and_projects_canonical_history() {
+        let coordinator = pressure_coordinator(100_000_000);
+        let history = history(6);
+        let patch = coordinator
+            .after_idle_compaction(&TurnCommitView {
+                session: SessionId::new("s"),
+                turn: TurnId::new("idle"),
+                finish: TurnFinish::Completed,
+                provider_error_kind: None,
+                visible_output: false,
+                history: Arc::from(history.clone()),
+                state: None,
+                usage: Arc::from(ledger(&[2_000, 2_100, 2_200])),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
+            })
+            .await
+            .expect("idle compaction patch")
+            .expect("semantic summary coordinator is installed");
+        let state = patch.state.expect("idle summary state").into_state();
+        assert_eq!(
+            state.value["purpose"],
+            SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
+        );
+        assert_eq!(
+            patch.usage[0].provenance.purpose.as_deref(),
+            Some(SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE)
+        );
+        let projection = coordinator
+            .project(&HistoryView {
+                session: SessionId::new("s"),
+                turn: TurnId::new("next"),
+                history: Arc::from(history.clone()),
+                active_history_start: history.len(),
+                state: Some(state),
+            })
+            .await
+            .expect("idle summary projects");
+        assert_eq!(projection.omit_prefix, 8);
+        assert_eq!(projection.provenance[0].covers.len(), 8);
+        assert_eq!(history.len(), 12, "canonical history remains complete");
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_reduces_follow_up_input_to_prior_summary_and_delta() {
+        #[derive(Debug, Default)]
+        struct RecordingSummary {
+            lengths: Mutex<Vec<usize>>,
+        }
+
+        #[async_trait]
+        impl SummaryModel for RecordingSummary {
+            fn id(&self) -> &str {
+                "recording-summary"
+            }
+
+            fn revision(&self) -> RegistryRevision {
+                RegistryRevision::new("recording-summary-v1")
+            }
+
+            async fn summarize(
+                &self,
+                request: &SummaryModelRequest,
+            ) -> Result<SummaryModelResponse, RuntimeError> {
+                self.lengths.lock().unwrap().push(request.messages.len());
+                Ok(SummaryModelResponse {
+                    text: "bounded summary".into(),
+                    usage: UsageDelta::new(),
+                })
+            }
+        }
+
+        let model = Arc::new(RecordingSummary::default());
+        let coordinator = SemanticSummaryCoordinator::new(
+            Arc::new(MemoryArtifacts::default()),
+            model.clone(),
+            SemanticSummaryPolicy {
+                min_turns: 4,
+                retain_turns: 2,
+                input_budget_tokens: 100_000,
+                ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
+            },
+        )
+        .unwrap();
+        let first_history = history(6);
+        let first = coordinator
+            .after_idle_compaction(&TurnCommitView {
+                session: SessionId::new("s"),
+                turn: TurnId::new("idle-1"),
+                finish: TurnFinish::Completed,
+                provider_error_kind: None,
+                visible_output: false,
+                history: Arc::from(first_history.clone()),
+                state: None,
+                usage: Arc::from([]),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let state = first.state.unwrap().into_state();
+        let mut second_history = first_history;
+        second_history.extend(history(2));
+        let _second = coordinator
+            .after_idle_compaction(&TurnCommitView {
+                session: SessionId::new("s"),
+                turn: TurnId::new("idle-2"),
+                finish: TurnFinish::Completed,
+                provider_error_kind: None,
+                visible_output: false,
+                history: Arc::from(second_history),
+                state: Some(state),
+                usage: Arc::from([]),
+                started_at: Timestamp::ZERO,
+                committed_at: Timestamp::ZERO,
+            })
+            .await
+            .unwrap();
+        let lengths = model.lengths.lock().unwrap().clone();
+        assert_eq!(lengths[0], 8);
+        assert!(lengths[1] < 12, "follow-up input should be bounded");
+    }
+
+    #[tokio::test]
+    async fn session_idle_compaction_returns_protected_summary_and_preserves_history() {
+        let coordinator = Arc::new(pressure_coordinator(100_000_000));
+        let runtime = runtime_with_coordinator(coordinator);
+        let session = runtime
+            .start_session(StartSession::new().with_history(history(6)))
+            .await
+            .unwrap();
+        let before = session.history();
+        let result = session.try_idle_compaction().await.unwrap();
+        let summary = match result {
+            crate::runtime::IdleCompactionAdmission::Accepted {
+                summary: Some(summary),
+                fallback_reason: None,
+                usage,
+            } => {
+                assert_eq!(
+                    usage,
+                    UsageDelta::new()
+                        .with(CounterKind::InputUncached, 10)
+                        .with(CounterKind::Output, 5)
+                );
+                summary
+            }
+            other => panic!("unexpected idle result: {other:?}"),
+        };
+        assert_eq!(summary.purpose, SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE);
+        assert_eq!(
+            summary.usage,
+            UsageDelta::new()
+                .with(CounterKind::InputUncached, 10)
+                .with(CounterKind::Output, 5)
+        );
+        assert!(summary.body.as_str().contains("Earlier turns"));
+        assert_eq!(session.history(), before);
+        assert_eq!(
+            session.snapshot().extension_state[SEMANTIC_SUMMARY_COMPONENT_ID].value["purpose"],
+            SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
+        );
+        assert!(matches!(
+            session.try_idle_compaction().await.unwrap(),
+            crate::runtime::IdleCompactionAdmission::Busy
+        ));
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_idle_compaction_is_busy_when_a_user_turn_owns_admission() {
+        let coordinator = Arc::new(pressure_coordinator(100_000_000));
+        let runtime = runtime_with_coordinator(coordinator);
+        let session = runtime
+            .start_session(StartSession::new().with_history(history(6)))
+            .await
+            .unwrap();
+        let turn = session.send(UserInput::text("user wins")).unwrap();
+        assert!(matches!(
+            session.try_idle_compaction().await.unwrap(),
+            crate::runtime::IdleCompactionAdmission::Busy
+        ));
+        turn.completed().await;
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_gate_remains_owned_when_a_user_turn_arrives_after_admission() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let coordinator = Arc::new(
+            SemanticSummaryCoordinator::new(
+                Arc::new(MemoryArtifacts::default()),
+                Arc::new(BlockingSummary {
+                    started: started.clone(),
+                    release: release.clone(),
+                }),
+                SemanticSummaryPolicy {
+                    min_turns: 4,
+                    retain_turns: 2,
+                    input_budget_tokens: 100_000,
+                    ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
+                },
+            )
+            .unwrap(),
+        );
+        let runtime = runtime_with_coordinator(coordinator);
+        let session = runtime
+            .start_session(StartSession::new().with_history(history(6)))
+            .await
+            .unwrap();
+        let idle_session = session.clone();
+        let idle = tokio::spawn(async move { idle_session.try_idle_semantic_compaction().await });
+        started.notified().await;
+
+        // The idle attempt has already claimed the turn gate. The user is
+        // accepted into the next turn interval but cannot alter the canonical
+        // boundary or summary input until idle persistence completes.
+        let user = session
+            .send(UserInput::text("queued after idle admission"))
+            .unwrap();
+        release.notify_one();
+        let result = idle.await.unwrap().unwrap();
+        user.completed().await;
+
+        let summary = match result {
+            crate::runtime::IdleCompactionAdmission::Accepted {
+                summary: Some(summary),
+                fallback_reason: None,
+                ..
+            } => summary,
+            other => panic!("unexpected idle result: {other:?}"),
+        };
+        assert_eq!(summary.omit_prefix, 8);
+        assert_eq!(session.history().len(), 14);
+        assert_eq!(
+            session.snapshot().extension_state[SEMANTIC_SUMMARY_COMPONENT_ID].value["omit_prefix"],
+            8
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_idle_compaction_failure_has_no_state_mutation_or_retry() {
+        let coordinator = Arc::new(
+            SemanticSummaryCoordinator::new(
+                Arc::new(MemoryArtifacts::default()),
+                Arc::new(FailingSummary),
+                SemanticSummaryPolicy {
+                    min_turns: 4,
+                    retain_turns: 2,
+                    input_budget_tokens: 100_000,
+                    ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
+                },
+            )
+            .unwrap(),
+        );
+        let runtime = runtime_with_coordinator(coordinator);
+        let session = runtime
+            .start_session(StartSession::new().with_history(history(6)))
+            .await
+            .unwrap();
+        let before = session.snapshot();
+        let result = session.try_idle_semantic_compaction().await.unwrap();
+        assert!(matches!(
+            result,
+            crate::runtime::IdleCompactionAdmission::Accepted {
+                summary: None,
+                fallback_reason: Some(reason),
+                ..
+            } if reason == "summary_model_unavailable"
+        ));
+        let after = session.snapshot();
+        assert_eq!(after.history, before.history);
+        assert!(
+            !after
+                .extension_state
+                .contains_key(SEMANTIC_SUMMARY_COMPONENT_ID)
+        );
+        assert!(matches!(
+            session.try_idle_semantic_compaction().await.unwrap(),
+            crate::runtime::IdleCompactionAdmission::Busy
+        ));
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_idle_compaction_persistence_failure_rolls_back_state_and_usage() {
+        let coordinator = Arc::new(pressure_coordinator(100_000_000));
+        let runtime =
+            runtime_with_coordinator_and_store(coordinator, Arc::new(FailingSessionStore));
+        let session = runtime
+            .start_session(StartSession::new().with_history(history(6)))
+            .await
+            .unwrap();
+        let before = session.snapshot();
+        let error = session
+            .try_idle_semantic_compaction()
+            .await
+            .expect_err("idle persistence must fail");
+        assert!(error.to_string().contains("persistence failure"));
+        let after = session.snapshot();
+        assert_eq!(after.history, before.history);
+        assert_eq!(after.usage, before.usage);
+        assert_eq!(after.extension_state, before.extension_state);
+        assert!(matches!(
+            session.try_idle_semantic_compaction().await.unwrap(),
+            crate::runtime::IdleCompactionAdmission::Busy
+        ));
+        let _ = session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_idle_compaction_returns_shutdown_after_shutdown_begins() {
+        let coordinator = Arc::new(pressure_coordinator(100_000_000));
+        let runtime = runtime_with_coordinator(coordinator);
+        let session = runtime
+            .start_session(StartSession::new().with_history(history(6)))
+            .await
+            .unwrap();
+        session.shutdown().await.unwrap();
+        assert!(matches!(
+            session.try_idle_compaction().await.unwrap(),
+            crate::runtime::IdleCompactionAdmission::Shutdown
+        ));
     }
 
     #[test]

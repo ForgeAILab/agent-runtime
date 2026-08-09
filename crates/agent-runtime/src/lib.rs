@@ -182,8 +182,9 @@ pub mod prelude {
     pub use crate::provider::transport::{ByteStream, HttpRequest, HttpTransport};
     pub use crate::runtime::{
         CheckpointRecoveryPolicy, GoalAdmissionGate, GoalController, GoalControllerConfig,
-        InjectedContent, InternalTurnAdmission, Runtime, RuntimeBuilder, RuntimeEventStream,
-        SessionHandle, StartSession, TurnHandle,
+        IdleCompactionAdmission, IdleCompactionResult, IdleCompactionSummary, InjectedContent,
+        InternalTurnAdmission, Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle,
+        StartSession, TurnHandle,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};

@@ -37,11 +37,13 @@ pub use pipeline::{
     ToolViewPatch, ToolViewResolver, TurnCommitHook, TurnCommitPatch, TurnCommitView,
 };
 pub use questionnaire::{QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
+pub(crate) use semantic_summary::protected_summary_from_patch;
 pub use semantic_summary::{
     DEFAULT_MAX_SUMMARY_CHARS, DEFAULT_SUMMARY_MIN_TURNS, DEFAULT_SUMMARY_RETAIN_TURNS,
-    DEFAULT_SUMMARY_TRIGGER_PERCENT, SEMANTIC_SUMMARY_PURPOSE,
-    SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION, SemanticSummaryCoordinator, SemanticSummaryPolicy,
-    SummaryModel, SummaryModelRequest, SummaryModelResponse,
+    DEFAULT_SUMMARY_TRIGGER_PERCENT, ProtectedSemanticSummary, ProtectedSummaryBody,
+    SEMANTIC_SUMMARY_COMPONENT_ID, SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE,
+    SEMANTIC_SUMMARY_PURPOSE, SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION, SemanticSummaryCoordinator,
+    SemanticSummaryPolicy, SummaryModel, SummaryModelRequest, SummaryModelResponse,
 };
 pub use todos::{
     MAX_TODO_ID_CHARS, MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TODO_STATE_SCHEMA_VERSION,

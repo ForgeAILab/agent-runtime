@@ -693,6 +693,19 @@ pub trait TurnCommitHook: Send + Sync + fmt::Debug {
 
     /// Returns an optional mutation of this hook's own namespace.
     async fn after_commit(&self, view: &TurnCommitView) -> Result<TurnCommitPatch, RuntimeError>;
+
+    /// Runs one explicit idle-boundary compaction attempt.
+    ///
+    /// Components that do not own idle compaction return `None`.  The Runtime
+    /// invokes this through the same ordered, protected hook collection as a
+    /// normal terminal turn; the caller remains responsible for deciding when
+    /// an idle attempt is appropriate.
+    async fn after_idle_compaction(
+        &self,
+        _view: &TurnCommitView,
+    ) -> Result<Option<TurnCommitPatch>, RuntimeError> {
+        Ok(None)
+    }
 }
 
 /// Mutable builder for one ordered harness pipeline.

@@ -518,6 +518,11 @@ impl CacheIdentity {
         &self.model
     }
 
+    /// The redaction-safe model/profile fingerprint.
+    pub fn profile(&self) -> &Fingerprint {
+        &self.profile
+    }
+
     /// The provider routing-partition key selected by the host/provider
     /// contract. OpenAI-compatible adapters combine this value with their
     /// exact prompt-prefix hash; it is intentionally narrower than the full
