@@ -2028,8 +2028,7 @@ pub async fn assert_returned_input_survives_parent_restart_without_provider_work
     };
     let child_session = handle.id().clone();
     assert_eq!(edit_invocations.load(Ordering::Acquire), 0);
-    handle.shutdown().await.unwrap();
-    coordinator.flush().await.unwrap();
+    coordinator.shutdown(CancelReason::Shutdown).await.unwrap();
     parent.shutdown().await.unwrap();
 
     let (_runtime, resumed_parent) =

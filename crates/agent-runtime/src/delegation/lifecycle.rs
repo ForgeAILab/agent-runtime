@@ -411,6 +411,18 @@ impl DelegationCoordinator {
         }
     }
 
+    /// Bounded host-teardown boundary for every live child execution.
+    ///
+    /// Unlike an explicit per-child [`Self::stop`], process teardown preserves
+    /// already committed completed/needs-input outcomes for exact-once parent
+    /// delivery after restart. The final flush makes child bindings, outcome
+    /// cursors, and protected ready identities durable before the host releases
+    /// its parent-session resources.
+    pub async fn shutdown(&self, reason: CancelReason) -> Result<(), RuntimeError> {
+        self.stop_all(reason).await;
+        self.flush().await
+    }
+
     /// Stops every non-terminal child (used on parent teardown).
     pub(super) async fn stop_all(&self, reason: CancelReason) {
         let handles: Vec<(ChildId, SessionHandle)> = {
@@ -428,9 +440,8 @@ impl DelegationCoordinator {
         for (_, handle) in &handles {
             handle.cancel(reason.clone());
         }
-        for (child, handle) in &handles {
+        for (_, handle) in &handles {
             let _ = handle.shutdown().await;
-            clear_returned_inputs_for_child(&self.inner, child, handle);
         }
         let _ = self.persist_catalog().await;
     }
