@@ -1,7 +1,7 @@
 ---
 created_at: 2026-08-08T22:32:53Z
-updated_at: 2026-08-09T01:03:44Z
-completed_at:
+updated_at: 2026-08-09T01:28:05Z
+completed_at: 2026-08-09T01:28:05Z
 ---
 
 ## 1. Core contracts
@@ -72,13 +72,13 @@ completed_at:
   transport failure.
 - [x] 5.4 Update every in-repo exhaustive `RuntimeEvent` match and document the
   pre-1.0 breaking contract in the changelog/release notes.
-- [ ] 5.5 Run the Smith, Nyx, and Open Forge compatibility suites against the
+- [x] 5.5 Run the Smith, Nyx, and Open Forge compatibility suites against the
   candidate revision; land
   `tui:add-prompt-cache-miss-visibility-2026-08-08` before release.
 
-  _The in-repo Smith, Nyx, and Open Forge consumer suites pass. This remains
-  open until the linked Smith change is landed against an approved Runtime
-  revision._
+  _The in-repo Smith, Nyx, and Open Forge consumer suites pass. Smith change
+  `fd033dbf705281ee473a101b623b8f02bf2dde08` is landed and pins approved
+  Runtime revision `0a07231649d81ccb40f2395a9924f8bd6027baf9`._
 
 ## 6. Verification
 
