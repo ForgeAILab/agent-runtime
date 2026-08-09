@@ -65,7 +65,8 @@ use crate::cache::CacheMechanism;
 use crate::harness::{
     CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView, HarnessPipeline,
     HistoryProjection, HistoryView, LiveAbilityRuntime, ModelView, QUESTIONNAIRE_TOOL_NAME,
-    SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, ToolOutputView, TurnCommitPatch, TurnCommitView,
+    SEMANTIC_SUMMARY_COMPONENT_ID, SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, ToolOutputView,
+    TurnCommitPatch, TurnCommitView,
 };
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
@@ -434,6 +435,14 @@ pub struct Driver {
 impl Driver {
     pub(crate) fn steer_limits(&self) -> SteerLimits {
         self.config.steer_limits
+    }
+
+    pub(crate) fn semantic_summary_revision(&self) -> Option<RegistryRevision> {
+        self.harness.history().iter().find_map(|component| {
+            let descriptor = component.descriptor();
+            (descriptor.id().as_str() == SEMANTIC_SUMMARY_COMPONENT_ID)
+                .then(|| descriptor.revision().clone())
+        })
     }
 
     /// Builds a driver from its injected services and configuration.

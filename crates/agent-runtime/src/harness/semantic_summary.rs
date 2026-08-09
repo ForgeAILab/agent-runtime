@@ -176,6 +176,75 @@ impl ProtectedSemanticSummary {
     }
 }
 
+/// Decodes and validates one protected semantic-summary extension value.
+///
+/// This is the narrow host recovery seam for stores that keep Sensitive
+/// extension state outside their ordinary session JSON. The returned body is
+/// protected in [`ProtectedSummaryBody`] and must not cross an observability
+/// or redaction-safe persistence boundary. Callers restoring a live session
+/// must still use [`crate::runtime::SessionHandle::restore_semantic_summary_if_absent`],
+/// which also checks the active component revision, source session, and
+/// canonical history prefix before installing the state.
+pub fn protected_semantic_summary_from_state(
+    persisted: &VersionedSessionState,
+    usage: UsageDelta,
+) -> Result<ProtectedSemanticSummary, RuntimeError> {
+    let decoded: SemanticSummaryState =
+        serde_json::from_value(persisted.value.clone()).map_err(|error| {
+            RuntimeError::conflict(format!(
+                "protected semantic summary state is malformed: {error}"
+            ))
+        })?;
+    if decoded.schema_version != SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION
+        || !matches!(
+            decoded.purpose.as_str(),
+            SEMANTIC_SUMMARY_PURPOSE | SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
+        )
+        || decoded.sensitivity == Sensitivity::Secret
+        || persisted.sensitivity != SessionStateSensitivity::Sensitive
+        || decoded.omit_prefix == 0
+        || decoded.model_id.trim().is_empty()
+        || decoded.summary.trim().is_empty()
+    {
+        return Err(RuntimeError::conflict(
+            "protected semantic summary state failed validation",
+        ));
+    }
+    decoded.source_artifact.validate().map_err(|error| {
+        RuntimeError::conflict(format!(
+            "protected semantic summary artifact is invalid: {error}"
+        ))
+    })?;
+    let expected_artifact_sensitivity = match decoded.sensitivity {
+        Sensitivity::Public => ArtifactSensitivity::Public,
+        Sensitivity::Internal | Sensitivity::Sensitive => ArtifactSensitivity::Sensitive,
+        Sensitivity::Secret => unreachable!("secret summaries are rejected above"),
+    };
+    if decoded.source_artifact.byte_length == 0
+        || decoded.source_artifact.provenance.purpose != decoded.purpose
+        || decoded.source_artifact.sensitivity != expected_artifact_sensitivity
+    {
+        return Err(RuntimeError::conflict(
+            "protected semantic summary artifact failed validation",
+        ));
+    }
+    let expected_summary_revision = RegistryRevision::from_content(
+        [
+            decoded.source_fingerprint.as_str(),
+            decoded.model_revision.as_str(),
+            decoded.purpose.as_str(),
+            decoded.summary.as_str(),
+        ]
+        .join("\n"),
+    );
+    if decoded.summary_revision != expected_summary_revision {
+        return Err(RuntimeError::conflict(
+            "protected semantic summary revision failed validation",
+        ));
+    }
+    Ok(ProtectedSemanticSummary::from_state(decoded, usage))
+}
+
 impl fmt::Debug for ProtectedSemanticSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -649,41 +718,6 @@ pub(crate) fn protected_summary_from_patch(
         sensitivity: state.sensitivity,
         value: state.value.clone(),
     };
-    let decoded: SemanticSummaryState =
-        serde_json::from_value(persisted.value).map_err(|error| {
-            RuntimeError::conflict(format!(
-                "idle semantic summary patch state is malformed: {error}"
-            ))
-        })?;
-    if decoded.schema_version != SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION
-        || decoded.purpose != SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
-        || decoded.sensitivity == Sensitivity::Secret
-        || state.sensitivity != SessionStateSensitivity::Sensitive
-        || decoded.omit_prefix == 0
-        || decoded.summary.trim().is_empty()
-    {
-        return Err(RuntimeError::conflict(
-            "idle semantic summary patch failed protected-result validation",
-        ));
-    }
-    decoded.source_artifact.validate().map_err(|error| {
-        RuntimeError::conflict(format!(
-            "idle semantic summary artifact is invalid: {error}"
-        ))
-    })?;
-    let expected_artifact_sensitivity = match decoded.sensitivity {
-        Sensitivity::Public => ArtifactSensitivity::Public,
-        Sensitivity::Internal | Sensitivity::Sensitive => ArtifactSensitivity::Sensitive,
-        Sensitivity::Secret => unreachable!("secret summaries are rejected above"),
-    };
-    if decoded.source_artifact.byte_length == 0
-        || decoded.source_artifact.provenance.purpose != SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
-        || decoded.source_artifact.sensitivity != expected_artifact_sensitivity
-    {
-        return Err(RuntimeError::conflict(
-            "idle semantic summary artifact failed protected-result validation",
-        ));
-    }
     let usage = patch
         .usage
         .iter()
@@ -692,7 +726,13 @@ pub(crate) fn protected_summary_from_patch(
             total.merge(&record.delta);
             total
         });
-    Ok(Some(ProtectedSemanticSummary::from_state(decoded, usage)))
+    let summary = protected_semantic_summary_from_state(&persisted, usage)?;
+    if summary.purpose != SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE {
+        return Err(RuntimeError::conflict(
+            "idle semantic summary patch carried a non-idle purpose",
+        ));
+    }
+    Ok(Some(summary))
 }
 
 #[async_trait]
@@ -1281,6 +1321,70 @@ mod tests {
             crate::runtime::IdleCompactionAdmission::Busy
         ));
         session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn protected_summary_state_restores_only_at_a_matching_idle_boundary() {
+        let coordinator = Arc::new(pressure_coordinator(100_000_000));
+        let runtime = runtime_with_coordinator(coordinator);
+        let session_id = SessionId::new("protected-summary-restore");
+        let canonical_history = history(6);
+        let source = runtime
+            .start_session(
+                StartSession::new()
+                    .with_id(session_id.clone())
+                    .with_history(canonical_history.clone()),
+            )
+            .await
+            .unwrap();
+        let result = source.try_idle_compaction().await.unwrap();
+        assert!(matches!(
+            result,
+            crate::runtime::IdleCompactionAdmission::Accepted {
+                summary: Some(_),
+                ..
+            }
+        ));
+        let persisted = source.snapshot().extension_state[SEMANTIC_SUMMARY_COMPONENT_ID].clone();
+        source.shutdown().await.unwrap();
+
+        let resumed = runtime
+            .start_session(
+                StartSession::new()
+                    .with_id(session_id)
+                    .with_history(canonical_history),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !resumed
+                .snapshot()
+                .extension_state
+                .contains_key(SEMANTIC_SUMMARY_COMPONENT_ID)
+        );
+
+        let mut wrong_revision = persisted.clone();
+        wrong_revision.revision = RegistryRevision::new("wrong-summary-component");
+        assert!(
+            resumed
+                .restore_semantic_summary_if_absent(wrong_revision)
+                .is_err()
+        );
+        assert!(
+            resumed
+                .restore_semantic_summary_if_absent(persisted.clone())
+                .unwrap()
+        );
+        assert_eq!(
+            resumed.snapshot().extension_state[SEMANTIC_SUMMARY_COMPONENT_ID],
+            persisted
+        );
+        assert!(
+            !resumed
+                .restore_semantic_summary_if_absent(persisted)
+                .unwrap()
+        );
+        resumed.shutdown().await.unwrap();
     }
 
     #[tokio::test]

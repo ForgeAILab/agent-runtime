@@ -44,6 +44,7 @@ pub use semantic_summary::{
     SEMANTIC_SUMMARY_COMPONENT_ID, SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE,
     SEMANTIC_SUMMARY_PURPOSE, SEMANTIC_SUMMARY_STATE_SCHEMA_VERSION, SemanticSummaryCoordinator,
     SemanticSummaryPolicy, SummaryModel, SummaryModelRequest, SummaryModelResponse,
+    protected_semantic_summary_from_state,
 };
 pub use todos::{
     MAX_TODO_ID_CHARS, MAX_TODO_ITEMS, MAX_TODO_TEXT_CHARS, TODO_STATE_SCHEMA_VERSION,
