@@ -17,6 +17,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use agent_runtime_registry::{EntryProvenance, RegistryRevision, RegistrySource};
+#[cfg(feature = "skill-files")]
 use sha2::{Digest, Sha256};
 
 use crate::Named;
@@ -89,6 +90,7 @@ pub struct Skill {
     registry_source: RegistrySource,
 }
 
+#[cfg(feature = "serde")]
 const fn built_in_source() -> RegistrySource {
     RegistrySource::BuiltIn
 }
@@ -191,20 +193,7 @@ impl Skill {
                         "file-backed skill has no verified SHA-256 digest",
                     )
                 })?;
-                let bytes = std::fs::read(path)?;
-                let found: [u8; 32] = Sha256::digest(&bytes).into();
-                if found != expected {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "skill content digest changed (expected {}, found {})",
-                            hex_digest(&expected),
-                            hex_digest(&found)
-                        ),
-                    ));
-                }
-                String::from_utf8(bytes)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                load_verified_instructions(path, expected)
             }
         }
     }
@@ -246,6 +235,31 @@ fn hex_digest(digest: &[u8; 32]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(feature = "skill-files")]
+fn load_verified_instructions(path: &Path, expected: [u8; 32]) -> io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let found: [u8; 32] = Sha256::digest(&bytes).into();
+    if found != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "skill content digest changed (expected {}, found {})",
+                hex_digest(&expected),
+                hex_digest(&found)
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(not(feature = "skill-files"))]
+fn load_verified_instructions(_path: &Path, _expected: [u8; 32]) -> io::Result<String> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file-backed skill activation requires the `skill-files` feature",
+    ))
 }
 
 impl Named for Skill {
@@ -308,6 +322,7 @@ mod tests {
         assert_eq!(skill.metadata.get("version").map(String::as_str), Some("1"));
     }
 
+    #[cfg(feature = "skill-files")]
     #[test]
     fn file_skill_reads_body_at_load_time() {
         let dir = tempfile::tempdir().unwrap();
@@ -331,6 +346,7 @@ mod tests {
     /// searching its descriptor must still succeed, because both operate
     /// only on bounded card metadata. The file is read for the first time
     /// only once `activate` is called, after it exists.
+    #[cfg(feature = "skill-files")]
     #[test]
     fn searching_a_skill_never_reads_its_instruction_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -385,6 +401,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "skill-files")]
     #[test]
     fn changing_a_file_after_descriptor_creation_fails_activation() {
         let dir = tempfile::tempdir().unwrap();
@@ -424,5 +441,19 @@ mod tests {
             skill.activate(),
             Err(ActivationError::Unavailable { .. })
         ));
+    }
+
+    #[cfg(not(feature = "skill-files"))]
+    #[test]
+    fn verified_file_fails_closed_without_the_skill_files_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        std::fs::write(&path, "instructions").unwrap();
+        let skill = Skill::from_verified_file("deploy", "Deploy the app", &path, [0; 32]);
+        let error = skill
+            .activate()
+            .expect_err("file activation must require its dependency-bearing feature");
+        assert!(matches!(&error, ActivationError::Unavailable { .. }));
+        assert!(error.to_string().contains("`skill-files` feature"));
     }
 }

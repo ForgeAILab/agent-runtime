@@ -374,7 +374,21 @@ impl TurnCheckpoint {
             && self.active_history_start == active_history_start
             && self.visible_output == visible_output
         {
-            return Ok(self.clone());
+            // A protected extension hook may need to durably stage or clear
+            // state while the direct machine remains in `Planning`.  The
+            // initial accepted states still have to cross their ordinary
+            // transition to `Planning`; only an already-advanced state may
+            // publish a same-state snapshot successor.
+            if snapshot == self.snapshot {
+                return Ok(self.clone());
+            }
+            if !matches!(self.state, TurnState::Planning { .. }) || self.state_revision == 0 {
+                // Reapplying an accepted (or any other non-refreshable)
+                // state remains idempotent even if a caller supplied a
+                // different, uncommitted snapshot. Accepted input must cross
+                // its ordinary transition to Planning first.
+                return Ok(self.clone());
+            }
         }
         if !self.state.can_transition_to(&next) {
             return Err(RuntimeError::conflict(format!(
@@ -574,9 +588,11 @@ impl TurnCheckpoint {
             | TurnState::CacheOperationResultReady { operation, .. }
             | TurnState::CacheOperationTerminal { operation, .. } => operation.validate()?,
         }
-        if let TurnState::CacheOperationStarted { operation } = &self.state
-            && operation.preflight_rejection.is_some()
-        {
+        if matches!(
+            &self.state,
+            TurnState::CacheOperationStarted { operation }
+                if operation.preflight_rejection.is_some()
+        ) {
             return Err(RuntimeError::conflict(
                 "cache checkpoint rejection crossed the provider-start boundary",
             ));

@@ -13,17 +13,19 @@ categories.workspace = true
 [dependencies]
 # Registry-only by default (std only, per the registry kernel's own default
 # feature graph). The `tool` feature bridges the runtime's Tool contract
-# (pulling agent-runtime-core); `serde` adds (de)serialization.
+# (pulling agent-runtime-core); `serde` adds (de)serialization; `skill-files`
+# verifies file-backed instruction bodies at activation time.
 agent-runtime-registry = { workspace = true }
 agent-runtime-core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-sha2.workspace = true
+sha2 = { workspace = true, optional = true }
 
 [features]
 default = []
 tool = ["dep:agent-runtime-core", "dep:serde_json"]
 serde = ["dep:serde", "agent-runtime-registry/serde"]
+skill-files = ["dep:sha2"]
 
 [dev-dependencies]
 async-trait.workspace = true

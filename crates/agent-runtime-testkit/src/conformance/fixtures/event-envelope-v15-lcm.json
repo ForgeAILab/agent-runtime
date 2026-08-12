@@ -1,0 +1,200 @@
+[
+  {
+    "schema_version": 15,
+    "seq": 0,
+    "id": "evt-lcm-0",
+    "session": "session-lcm",
+    "timestamp": 400,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "pressure_decision",
+      "reason": "soft_threshold_exceeded",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "dag_revision": 7,
+        "soft_threshold_tokens": 8000,
+        "hard_threshold_tokens": 9000,
+        "pressure_percent": 86,
+        "policy_revision": "policy-1",
+        "algorithm_revision": "algorithm-1",
+        "sensitivity": "sensitive",
+        "trust": "user_content"
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 1,
+    "id": "evt-lcm-1",
+    "session": "session-lcm",
+    "timestamp": 401,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "operation_admission",
+      "reason": "admitted",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "operation_id": "operation-1",
+        "operation_fingerprint": "0123456789abcdef0123456789abcdef",
+        "dag_revision": 7,
+        "policy_revision": "policy-1",
+        "algorithm_revision": "algorithm-1"
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 2,
+    "id": "evt-lcm-2",
+    "session": "session-lcm",
+    "timestamp": 402,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "escalation",
+      "reason": "provider_failure",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "operation_id": "operation-1",
+        "escalation_level": 1,
+        "model_revision": "summary-model-1",
+        "sizer_revision": "sizer-1",
+        "input_tokens": 500,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 3,
+    "id": "evt-lcm-3",
+    "session": "session-lcm",
+    "timestamp": 403,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "leaf_commit",
+      "reason": "admitted",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "operation_id": "operation-1",
+        "node_id": "node-leaf-1",
+        "dag_revision": 8,
+        "covered_start": 10,
+        "covered_end": 19,
+        "covered_count": 10,
+        "source_fingerprint": "11111111111111111111111111111111",
+        "result_fingerprint": "22222222222222222222222222222222",
+        "input_tokens": 500,
+        "output_tokens": 120,
+        "reclaimed_tokens": 380,
+        "sensitivity": "sensitive",
+        "trust": "user_content",
+        "guard_revision": "guard-1"
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 4,
+    "id": "evt-lcm-4",
+    "session": "session-lcm",
+    "timestamp": 404,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "condensation",
+      "reason": "admitted",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "operation_id": "operation-2",
+        "node_id": "node-condensed-1",
+        "dag_revision": 9,
+        "child_count": 3,
+        "child_ids": ["node-leaf-1", "node-leaf-2"],
+        "covered_start": 10,
+        "covered_end": 30,
+        "covered_count": 21,
+        "result_fingerprint": "33333333333333333333333333333333"
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 5,
+    "id": "evt-lcm-5",
+    "session": "session-lcm",
+    "timestamp": 405,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "deterministic_fallback",
+      "reason": "non_shrinking_output",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "operation_id": "operation-1",
+        "escalation_level": 3,
+        "sizer_revision": "sizer-1",
+        "input_tokens": 500,
+        "output_tokens": 120,
+        "reclaimed_tokens": 380
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 6,
+    "id": "evt-lcm-6",
+    "session": "session-lcm",
+    "timestamp": 406,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "legacy_import",
+      "reason": "imported",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "node_id": "node-imported-1",
+        "covered_start": 0,
+        "covered_end": 9,
+        "covered_count": 10,
+        "source_fingerprint": "44444444444444444444444444444444",
+        "result_fingerprint": "55555555555555555555555555555555",
+        "algorithm_revision": "algorithm-1"
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 7,
+    "id": "evt-lcm-7",
+    "session": "session-lcm",
+    "timestamp": 407,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "expansion",
+      "reason": "bounded",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "node_id": "node-condensed-1",
+        "expanded_count": 8,
+        "expansion_cursor": "cursor-1",
+        "covered_count": 8
+      }
+    }
+  },
+  {
+    "schema_version": 15,
+    "seq": 8,
+    "id": "evt-lcm-8",
+    "session": "session-lcm",
+    "timestamp": 408,
+    "payload": {
+      "event": "lcm_lifecycle",
+      "kind": "failure",
+      "reason": "unauthorized",
+      "metadata": {
+        "timeline_id": "timeline-1",
+        "operation_id": "operation-3",
+        "node_id": "node-condensed-1",
+        "dag_revision": 9,
+        "source_fingerprint": "66666666666666666666666666666666"
+      }
+    }
+  }
+]

@@ -42,7 +42,7 @@
 //! # Composing through the facade
 //!
 //! An ordinary host needs only this one crate: [`registry`], [`ability`],
-//! [`provider`], and [`context`] are re-exported below, and [`prelude`]
+//! [`provider`], [`context`], and [`lcm`] are re-exported below, and [`prelude`]
 //! gathers the commonly used items from all of them plus [`hub`] and
 //! [`capability`]. For example, an ability catalog and a system prompt fold
 //! into the same versioned [`context::ContextFragment`]s an authoritative
@@ -116,6 +116,13 @@ pub use agent_runtime_registry as registry;
 /// runtime sends is derived from one of its plans.
 pub use agent_runtime_context as context;
 
+/// Lossless Context Memory: immutable timelines, hierarchical summary DAGs,
+/// deterministic compaction planning, and bounded expansion contracts.
+///
+/// Re-exported from [`agent_runtime_lcm`] so runtime hosts can compose LCM
+/// through the facade while standalone hosts can depend on the leaf package.
+pub use agent_runtime_lcm as lcm;
+
 /// The unified ability catalog — the one registry mechanism plus the
 /// tool/skill/ability capability kinds.
 ///
@@ -152,7 +159,14 @@ pub mod prelude {
     };
 
     // -- registry hub: the administrative facade over every typed domain -----
-    pub use crate::harness::{QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
+    pub use crate::harness::{
+        BeforeProviderPatch, DefaultLcmSourceClassifier, ExpansionItem, ExpansionRequest,
+        LcmCoordinator, LcmCoordinatorPolicy, LcmExpansion, LcmExpansionCursor, LcmNodeId,
+        LcmReader, LcmSourceClassifier, LcmStore, LcmSummaryModel, LcmSummaryModelRequest,
+        LcmSummaryModelResponse, LcmTimelineBinding, LcmTimelineResolver, LcmView,
+        LcmViewAuthority, LcmWriter, QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool,
+        StaticLcmTimelineResolver,
+    };
     pub use crate::hub::{RegistryHub, RegistryHubBuilder, ScopeInputs, ScopedRegistry};
 
     // -- capability retrieval, selection, and pre-activation -----------------
@@ -182,9 +196,8 @@ pub mod prelude {
     pub use crate::provider::transport::{ByteStream, HttpRequest, HttpTransport};
     pub use crate::runtime::{
         CheckpointRecoveryPolicy, CurrentCacheIdentityLease, GoalAdmissionGate, GoalController,
-        GoalControllerConfig, IdleCompactionAdmission, IdleCompactionResult, IdleCompactionSummary,
-        InjectedContent, InternalTurnAdmission, Runtime, RuntimeBuilder, RuntimeEventStream,
-        SessionHandle, StartSession, TurnHandle,
+        GoalControllerConfig, IdleCompactionAdmission, InjectedContent, InternalTurnAdmission,
+        Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle, StartSession, TurnHandle,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};

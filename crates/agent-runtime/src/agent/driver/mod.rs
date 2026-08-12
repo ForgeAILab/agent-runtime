@@ -64,9 +64,9 @@ use crate::agent::planning::{PreviousCacheRestore, RunPlanner};
 use crate::cache::CacheMechanism;
 use crate::harness::{
     CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView, HarnessPipeline,
-    HistoryProjection, HistoryView, LiveAbilityRuntime, ModelView, QUESTIONNAIRE_TOOL_NAME,
-    SEMANTIC_SUMMARY_COMPONENT_ID, SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, ToolOutputView,
-    TurnCommitPatch, TurnCommitView,
+    HistoryProjection, HistoryView, IdleCompactionResult, LCM_COMPONENT_ID,
+    LCM_IDLE_COMPACTION_PURPOSE, LCM_SUMMARY_PURPOSE, LiveAbilityRuntime, ModelView,
+    QUESTIONNAIRE_TOOL_NAME, ToolOutputView, TurnCommitView,
 };
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
@@ -197,7 +197,13 @@ fn validate_history_projection(
                 "history projection summary has no matching provenance",
             ));
         };
-        if provenance.source_artifact.is_none()
+        if provenance.lossless.is_some() {
+            if provenance.validate_for_projection().is_err() {
+                return Err(RuntimeError::conflict(
+                    "lossless summary provenance is incomplete or secret",
+                ));
+            }
+        } else if provenance.source_artifact.is_none()
             || provenance
                 .model_purpose
                 .as_deref()
@@ -437,14 +443,6 @@ impl Driver {
         self.config.steer_limits
     }
 
-    pub(crate) fn semantic_summary_revision(&self) -> Option<RegistryRevision> {
-        self.harness.history().iter().find_map(|component| {
-            let descriptor = component.descriptor();
-            (descriptor.id().as_str() == SEMANTIC_SUMMARY_COMPONENT_ID)
-                .then(|| descriptor.revision().clone())
-        })
-    }
-
     /// Builds a driver from its injected services and configuration.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -561,10 +559,14 @@ impl Driver {
         view: &TurnCommitView,
         extension_state: &BTreeMap<String, VersionedSessionState>,
         cancel: &Cancellation,
-    ) -> Result<Vec<(ComponentDescriptor, TurnCommitPatch)>, RuntimeError> {
+        only_component: Option<&str>,
+    ) -> Result<Vec<(ComponentDescriptor, IdleCompactionResult)>, RuntimeError> {
         let mut patches = Vec::new();
         for hook in self.harness.turn_commit() {
             let descriptor = hook.descriptor();
+            if only_component.is_some_and(|component| descriptor.id().as_str() != component) {
+                continue;
+            }
             let mut hook_view = view.clone();
             hook_view.state = extension_state.get(descriptor.id().as_str()).cloned();
             let patch = crate::agent::driver::turn::await_turn_commit_phase(
@@ -575,13 +577,17 @@ impl Driver {
                 "running idle compaction hook",
             )
             .await;
-            let Some(patch) = (match patch {
-                Ok(patch) => patch,
+            let result = match patch {
+                Ok(result) => result,
                 Err(error) => return Err(error),
-            }) else {
-                continue;
             };
-            if let Some(state) = &patch.state {
+            if result.retry_after_checkpoint && descriptor.id().as_str() != LCM_COMPONENT_ID {
+                return Err(RuntimeError::conflict(format!(
+                    "idle compaction component `{}` requested an unsupported retry",
+                    descriptor.id()
+                )));
+            }
+            if let Some(state) = &result.patch.state {
                 if state.revision != *descriptor.revision() {
                     return Err(RuntimeError::conflict(format!(
                         "idle compaction component `{}` returned state revision `{}` but declares `{}`",
@@ -591,17 +597,17 @@ impl Driver {
                     )));
                 }
             }
-            if patch.usage.iter().any(|record| {
-                record.source != UsageSource::SemanticSummary
-                    || record.provenance.purpose.as_deref()
-                        != Some(SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE)
+            if result.patch.usage.iter().any(|record| {
+                descriptor.id().as_str() != LCM_COMPONENT_ID
+                    || record.source != UsageSource::SemanticSummary
+                    || record.provenance.purpose.as_deref() != Some(LCM_IDLE_COMPACTION_PURPOSE)
             }) {
                 return Err(RuntimeError::conflict(format!(
-                    "idle compaction component `{}` attempted to publish non-idle-summary usage",
+                    "idle compaction component `{}` attempted to publish non-LCM usage",
                     descriptor.id()
                 )));
             }
-            patches.push((descriptor, patch));
+            patches.push((descriptor, result));
         }
         Ok(patches)
     }

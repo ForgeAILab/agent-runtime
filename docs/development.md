@@ -65,6 +65,64 @@ cargo build                             # resolves the versioned dependency agai
 Removing the override restores the versioned dependency with **no source
 changes** to the consumer manifest.
 
+## Consuming `agent-runtime-lcm` directly
+
+Hosts that do not use the runtime facade can depend on `agent-runtime-lcm`
+alone. Implement `LcmReader` and `LcmWriter` over the host's transactional
+store (`LcmStore` is only the convenience bound for an adapter implementing
+both). Mint one `LcmViewAuthority` at the host authorization boundary and
+share that authority with the store adapter and every `LcmView` used for the
+bound timeline. The adapter must authorize every read and write before looking
+up an opaque identity; a timeline or node ID is never an authority grant.
+
+```toml
+[dependencies]
+agent-runtime-lcm = "0.1"
+
+[dev-dependencies]
+agent-runtime-testkit = "0.1"
+```
+
+Run the shared testkit against the real adapter before calling it production
+ready:
+
+```rust
+use agent_runtime_lcm::LcmViewAuthority;
+use agent_runtime_testkit::conformance::lcm::{
+    assert_lcm_store_conformance, LcmStoreFixture,
+};
+
+assert_lcm_store_conformance(|timeline| async move {
+    let authority = LcmViewAuthority::new();
+    let store = HostLcmStore::new(timeline.clone(), authority.clone()).await;
+    let authorized = authority.issue(timeline.clone(), "host-binding-1");
+    LcmStoreFixture {
+        authorized,
+        unauthorized_same_timeline: LcmViewAuthority::new()
+            .issue(timeline, "forged-binding"),
+        store,
+    }
+})
+.await;
+```
+
+The fixture shape above is illustrative; use the testkit's
+`LcmStoreFixture<S>` and supply the adapter's own setup. The suite exercises
+append idempotency/gaps, atomic leaf and condensation CAS, bounded expansion,
+and same-timeline unauthorized-view isolation. `agent-runtime-lcm` has no
+default production database; its in-memory store is test-support only.
+
+Runtime hosts should provide a durable `SessionStore` whenever LCM is
+configured: idle compaction deliberately refuses admission without it because
+the staged model response must cross a protected persistence boundary before
+the store CAS. Attach a host `ContentGuard` with
+`LcmCoordinator::with_content_guard` when derived summary bodies require
+policy evaluation. Its ID/revision is a strict protected-state compatibility
+input, so rotate it through an explicit host migration rather than expecting a
+persisted session to silently rebase. Use `SessionHandle::expand_lcm` for
+bounded authorized inspection; never expose or reconstruct `LcmView` grants
+from an opaque node or cursor supplied by a caller.
+
 ## Quality gates
 
 ```sh
@@ -112,13 +170,17 @@ version, tag, or Git revision.
 # Current event vocabulary plus every retained compatibility fixture.
 cargo test -p agent-runtime-testkit event_schema
 
+# LCM package and shared-store conformance unit suites.
+cargo test -p agent-runtime-testkit --lib lcm
+
 # All production packages on the declared minimum compiler.
 cargo +1.86.0 build \
   -p agent-runtime-registry -p agent-runtime-core -p agent-runtime-ability \
-  -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-obs \
+  -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-lcm \
+  -p agent-runtime-obs \
   -p agent-runtime --all-features
 ```
 
-The current event schema is v10. Golden fixtures cover the compatible v5, v6,
-v7, v8, v9, and v10 forms; older unattributed provider-output deltas are
-rejected deliberately.
+The current event schema is v15. Golden fixtures cover the retained v5-v11 and
+v13-v15 forms; older unattributed provider-output deltas are rejected
+deliberately.

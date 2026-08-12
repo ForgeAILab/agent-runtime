@@ -37,7 +37,10 @@ pub use cache::{CachePlan, ProviderCacheCapability, ProviderCachePlan, SegmentFi
 #[allow(deprecated)]
 pub use compaction::{
     CompactionError, CompactionErrorKind, CompactionOutcome, CompactionPolicy, CompactionResult,
-    SemanticCompactor, StructuralCompactor, SummaryProvenance, validate_compacted,
+    LosslessSummaryClassification, LosslessSummaryProducer, LosslessSummaryProvenance,
+    MAX_LOSSLESS_CHILD_IDS, MAX_LOSSLESS_CLASSIFICATION_REVISIONS, MAX_LOSSLESS_ID_CHARS,
+    MAX_LOSSLESS_METADATA_CHARS, SemanticCompactor, StructuralCompactor, SummaryProvenance,
+    SummaryProvenanceError, validate_compacted,
 };
 pub use fragment::{
     CacheClass, ContextFragment, ContextLane, ContextPosition, ConversationGroupId,

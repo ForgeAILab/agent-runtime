@@ -23,7 +23,8 @@ use std::sync::Mutex;
 use agent_runtime_context::budget::{ContextError, ContextPolicy};
 use agent_runtime_context::cache::{CachePlan, ProviderCacheCapability};
 use agent_runtime_context::compaction::{
-    CompactionOutcome, StructuralCompactor, SummaryProvenance,
+    CompactionOutcome, LosslessSummaryProducer as ContextLosslessSummaryProducer,
+    LosslessSummaryProvenance, StructuralCompactor, SummaryProvenance,
 };
 use agent_runtime_context::fragment::{
     CacheClass, ContextFragment, ContextLane, ContextPosition, ConversationGroupId,
@@ -36,8 +37,9 @@ use agent_runtime_core::catalog::ResolvedModelProfile;
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::ids::ToolCallId;
 use agent_runtime_core::manifest::{
-    ActivatedCapability, CapabilityResolution, ContextSegmentRecord, ModelResolution,
-    PolicyRevisions, RunManifest, SegmentId, SegmentSensitivity, SummaryCoverage,
+    ActivatedCapability, CapabilityResolution, ContextSegmentRecord, LosslessSummaryClassification,
+    LosslessSummaryProducer, LosslessSummaryRecord, ModelResolution, PolicyRevisions, RunManifest,
+    SegmentId, SegmentSensitivity, SummaryCoverage,
 };
 use agent_runtime_core::provider::{CacheEndpointIdentity, ToolSchema};
 use agent_runtime_core::store::VersionedSessionState;
@@ -629,6 +631,18 @@ impl RunPlanner {
             })
             .collect();
 
+        let lossless_summaries: Vec<LosslessSummaryRecord> = plan
+            .compaction_outcome()
+            .summarized
+            .iter()
+            .filter_map(|provenance| {
+                provenance
+                    .lossless
+                    .as_ref()
+                    .map(|lossless| map_lossless_summary(provenance, lossless))
+            })
+            .collect();
+
         let mut policy_revisions = PolicyRevisions::new()
             .with_tokenizer(plan.sizer_revision().clone())
             .with_context_policy(component("context_policy", self.policy.revision.clone()));
@@ -668,6 +682,7 @@ impl RunPlanner {
         .with_activation(activation.to_vec())
         .with_segments(segments)
         .with_summaries(summaries)
+        .with_lossless_summaries(lossless_summaries)
     }
 }
 
@@ -770,6 +785,70 @@ fn component(name: &str, revision: RegistryRevision) -> agent_runtime_core::cata
         agent_runtime_registry::RegistryId::context_policy(name),
         revision,
     )
+}
+
+/// Maps neutral context-layer lossless metadata into the core manifest
+/// vocabulary without importing the LCM package into either layer.
+fn map_lossless_summary(
+    provenance: &SummaryProvenance,
+    lossless: &LosslessSummaryProvenance,
+) -> LosslessSummaryRecord {
+    let classification = LosslessSummaryClassification {
+        sensitivity: map_sensitivity(lossless.classification.sensitivity),
+        trust: lossless.classification.trust,
+        guard_revision: lossless.classification.guard_revision.clone(),
+        guard_revisions: lossless.classification.guard_revisions.clone(),
+        transformation_revision: lossless.classification.transformation_revision.clone(),
+        transformation_revisions: lossless.classification.transformation_revisions.clone(),
+    };
+    let producer = match &lossless.producer {
+        ContextLosslessSummaryProducer::Deterministic { algorithm_revision } => {
+            LosslessSummaryProducer::Deterministic {
+                algorithm_revision: algorithm_revision.clone(),
+            }
+        }
+        ContextLosslessSummaryProducer::Model {
+            model_id,
+            model_revision,
+            purpose,
+            escalation_level,
+        } => LosslessSummaryProducer::Model {
+            model_id: model_id.clone(),
+            model_revision: model_revision.clone(),
+            purpose: purpose.clone(),
+            escalation_level: *escalation_level,
+        },
+    };
+    LosslessSummaryRecord {
+        summary: SegmentId::new(provenance.summary.as_str()),
+        covered: provenance
+            .covers
+            .iter()
+            .map(|id| SegmentId::new(id.as_str()))
+            .collect(),
+        timeline_id: lossless.timeline_id.clone(),
+        node_id: lossless.node_id.clone(),
+        dag_revision: lossless.dag_revision,
+        node_revision: lossless.node_revision,
+        authorization_revision: lossless.authorization_revision.clone(),
+        store_revision: lossless.store_revision.clone(),
+        store_view_revision: lossless.store_view_revision.clone(),
+        source_range_start: lossless.source_range_start,
+        source_range_end: lossless.source_range_end,
+        covered_count: lossless.covered_count,
+        source_tokens: lossless.source_tokens,
+        token_count: lossless.token_count,
+        source_fingerprint: lossless.source_fingerprint.clone(),
+        policy_revision: lossless.policy_revision.clone(),
+        algorithm_revision: lossless.algorithm_revision.clone(),
+        sizer_revision: lossless.sizer_revision.clone(),
+        summary_revision: lossless.summary_revision.clone(),
+        classification,
+        producer,
+        child_node_ids: lossless.child_node_ids.clone(),
+        operation_id: lossless.operation_id.clone(),
+        operation_fingerprint: lossless.operation_fingerprint.clone(),
+    }
 }
 
 /// Maps the context crate's classification onto core's manifest vocabulary.
@@ -1329,5 +1408,163 @@ mod tests {
             fitting.plan.compaction_outcome().is_noop(),
             "a fitting request has no compaction outcome of its own"
         );
+    }
+
+    #[test]
+    fn lossless_provenance_maps_into_the_redaction_safe_manifest_record() {
+        let lossless = LosslessSummaryProvenance {
+            timeline_id: "timeline-a".into(),
+            node_id: "node-a".into(),
+            dag_revision: 2,
+            node_revision: 1,
+            authorization_revision: RegistryRevision::new("binding-1"),
+            store_revision: RegistryRevision::new("store-1"),
+            store_view_revision: RegistryRevision::new("view-1"),
+            source_range_start: 0,
+            source_range_end: 0,
+            covered_count: 1,
+            source_tokens: 40,
+            token_count: 12,
+            source_fingerprint: Fingerprint::of("source"),
+            policy_revision: RegistryRevision::new("policy-1"),
+            algorithm_revision: RegistryRevision::new("algorithm-1"),
+            sizer_revision: RegistryRevision::new("sizer-1"),
+            summary_revision: RegistryRevision::new("summary-1"),
+            classification: agent_runtime_context::compaction::LosslessSummaryClassification::new(
+                Sensitivity::Internal,
+                agent_runtime_registry::TrustClass::UserContent,
+            ),
+            producer: ContextLosslessSummaryProducer::Deterministic {
+                algorithm_revision: RegistryRevision::new("algorithm-1"),
+            },
+            child_node_ids: Vec::new(),
+            operation_id: Some("operation-a".into()),
+            operation_fingerprint: Some(Fingerprint::of("operation-a")),
+        };
+        let provenance = SummaryProvenance {
+            summary: agent_runtime_context::FragmentId::new("summary-a"),
+            covers: vec![agent_runtime_context::FragmentId::new("history:0")],
+            policy_revision: RegistryRevision::new("policy-1"),
+            source_artifact: None,
+            model_purpose: None,
+            model_revision: None,
+            sensitivity: Some(Sensitivity::Internal),
+            lossless: Some(lossless),
+        };
+
+        let record = map_lossless_summary(&provenance, provenance.lossless.as_ref().unwrap());
+        assert_eq!(record.timeline_id, "timeline-a");
+        assert_eq!(record.node_id, "node-a");
+        assert_eq!(record.policy_revision, RegistryRevision::new("policy-1"));
+        assert!(matches!(
+            record.producer,
+            LosslessSummaryProducer::Deterministic { .. }
+        ));
+    }
+
+    #[test]
+    fn model_lossless_provenance_preserves_replay_metadata_and_round_trips_safely() {
+        let classification = agent_runtime_context::compaction::LosslessSummaryClassification::new(
+            Sensitivity::Sensitive,
+            agent_runtime_registry::TrustClass::ToolOutput,
+        )
+        .with_guard_revisions(["guard-a", "guard-b"])
+        .with_transformation_revisions(["transform-a", "transform-b"]);
+        let lossless = LosslessSummaryProvenance {
+            timeline_id: "timeline-model".into(),
+            node_id: "node-model".into(),
+            dag_revision: 8,
+            node_revision: 7,
+            authorization_revision: RegistryRevision::new("binding-model-1"),
+            store_revision: RegistryRevision::new("store-model-1"),
+            store_view_revision: RegistryRevision::new("view-model-1"),
+            source_range_start: 4,
+            source_range_end: 5,
+            covered_count: 2,
+            source_tokens: 80,
+            token_count: 24,
+            source_fingerprint: Fingerprint::of("model-source"),
+            policy_revision: RegistryRevision::new("policy-model-1"),
+            algorithm_revision: RegistryRevision::new("algorithm-model-1"),
+            sizer_revision: RegistryRevision::new("sizer-model-1"),
+            summary_revision: RegistryRevision::new("summary-model-1"),
+            classification,
+            producer: ContextLosslessSummaryProducer::Model {
+                model_id: "summary-model".into(),
+                model_revision: RegistryRevision::new("summary-model-rev-1"),
+                purpose: "context.semantic_summary".into(),
+                escalation_level: 2,
+            },
+            child_node_ids: vec!["child-a".into(), "child-b".into()],
+            operation_id: Some("operation-model".into()),
+            operation_fingerprint: Some(Fingerprint::of("operation-model")),
+        };
+        let provenance = SummaryProvenance {
+            summary: agent_runtime_context::FragmentId::new("summary:model"),
+            covers: vec![
+                agent_runtime_context::FragmentId::new("history:4"),
+                agent_runtime_context::FragmentId::new("history:5"),
+            ],
+            policy_revision: RegistryRevision::new("policy-model-1"),
+            source_artifact: None,
+            model_purpose: Some("context.semantic_summary".into()),
+            model_revision: Some(RegistryRevision::new("summary-model-rev-1")),
+            sensitivity: Some(Sensitivity::Sensitive),
+            lossless: Some(lossless),
+        };
+
+        provenance
+            .validate_for_projection()
+            .expect("model provenance is valid");
+        let record = map_lossless_summary(&provenance, provenance.lossless.as_ref().unwrap());
+
+        assert_eq!(record.timeline_id, "timeline-model");
+        assert_eq!(record.node_id, "node-model");
+        assert_eq!(record.source_range_start, 4);
+        assert_eq!(record.source_range_end, 5);
+        assert_eq!(record.covered_count, 2);
+        assert_eq!(record.authorization_revision.as_str(), "binding-model-1");
+        assert_eq!(record.store_revision.as_str(), "store-model-1");
+        assert_eq!(record.store_view_revision.as_str(), "view-model-1");
+        assert_eq!(
+            record.child_node_ids,
+            vec!["child-a".to_owned(), "child-b".to_owned()]
+        );
+        assert_eq!(record.operation_id.as_deref(), Some("operation-model"));
+        assert_eq!(
+            record.operation_fingerprint,
+            Some(Fingerprint::of("operation-model"))
+        );
+        assert_eq!(record.classification.guard_revision, None);
+        assert_eq!(
+            record.classification.guard_revisions,
+            std::collections::BTreeSet::from(["guard-a".into(), "guard-b".into()])
+        );
+        assert_eq!(record.classification.transformation_revision, None);
+        assert_eq!(
+            record.classification.transformation_revisions,
+            std::collections::BTreeSet::from(["transform-a".into(), "transform-b".into()])
+        );
+        assert!(matches!(
+            &record.producer,
+            LosslessSummaryProducer::Model {
+                model_id,
+                model_revision,
+                purpose,
+                escalation_level,
+            } if model_id == "summary-model"
+                && model_revision.as_str() == "summary-model-rev-1"
+                && purpose == "context.semantic_summary"
+                && *escalation_level == 2
+        ));
+        record.validate().expect("mapped record is valid");
+
+        let json = serde_json::to_string(&record).expect("lossless record serializes");
+        assert!(!json.contains("summary body"));
+        assert!(!json.contains("source body"));
+        let restored: LosslessSummaryRecord =
+            serde_json::from_str(&json).expect("lossless record deserializes");
+        assert_eq!(restored, record);
+        assert_eq!(restored.fingerprint(), record.fingerprint());
     }
 }

@@ -16,17 +16,16 @@ use agent_runtime_core::checkpoint::{
 };
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::{
-    InternalTurnInput, Message, Role, ToolCall, ToolResultBlock, UserInput,
+    InternalTurnInput, Message, ToolCall, ToolResultBlock, UserInput,
 };
 use agent_runtime_core::error::RuntimeError;
-use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
+use agent_runtime_core::event::{LcmLifecycleKind, LcmLifecycleReason, RuntimeEvent, TurnFinish};
 use agent_runtime_core::goal::{GoalCommand, GoalCommandResult, GoalProjection, GoalStatus};
 use agent_runtime_core::ids::{CacheOperationId, SessionId, TurnId};
 use agent_runtime_core::interaction::InteractionRequest;
 use agent_runtime_core::steer::{SteerReceipt, SteerRejection, SteerRejectionReason};
 use agent_runtime_core::store::{SessionSnapshot, VersionedSessionState};
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageLedger, UsageRecord, UsageSource};
-use agent_runtime_registry::Fingerprint;
 use serde_json::Value;
 
 use crate::cache::{
@@ -34,8 +33,8 @@ use crate::cache::{
 };
 use crate::capability::ActivationEpoch;
 use crate::harness::{
-    GoalComponent, HarnessEvent, ProtectedSemanticSummary, SEMANTIC_SUMMARY_COMPONENT_ID,
-    TurnCommitView, protected_semantic_summary_from_state, protected_summary_from_patch,
+    ComponentDescriptor, ExpansionRequest, GoalComponent, HarnessEvent, IdleCompactionResult,
+    LCM_COMPONENT_ID, LcmCoordinator, LcmExpansion, LcmExpansionObservation, TurnCommitView,
 };
 use crate::ids::IdMinter;
 use crate::runtime::emitter::{CacheEventBatch, EventEmitter, RuntimeEventStream};
@@ -100,7 +99,7 @@ pub struct SessionInner {
     /// released when the async operation ends, including cancellation.
     pub(crate) idle_compaction_inflight: AtomicBool,
     /// Consumes the one idle-compaction attempt until a new real turn begins.
-    /// A failed summary therefore cannot be retried at the same boundary.
+    /// A failed LCM attempt therefore cannot be retried at the same boundary.
     pub(crate) idle_compaction_attempted: AtomicBool,
     /// An unanswered interaction checkpoint was intentionally left dormant.
     pub(crate) recovery_deferred: bool,
@@ -332,23 +331,19 @@ pub enum InternalTurnAdmission {
     Shutdown,
 }
 
-/// Outcome of one explicit idle semantic-compaction boundary.
+/// Outcome of one explicit idle LCM-compaction boundary.
 ///
-/// The accepted branch intentionally carries the protected result by value so
-/// callers can consume its metadata/body without an extra allocation; the
-/// larger enum branch is an API tradeoff for this infrequent boundary result.
-#[allow(clippy::large_enum_variant)]
+/// The accepted branch contains only redaction-safe lifecycle metadata and
+/// usage; protected summary bodies never cross the runtime facade.
 #[derive(Clone, PartialEq, Eq)]
 pub enum IdleCompactionAdmission {
-    /// The idle boundary was claimed. A summary is present when the
-    /// configured coordinator committed one; a fallback reason means the
-    /// bounded attempt completed without changing summary state.
+    /// The idle boundary was claimed.
     Accepted {
-        /// Protected summary metadata and body, when committed.
-        summary: Option<ProtectedSemanticSummary>,
-        /// Redaction-safe fallback category, when the attempt made no state
-        /// change.
-        fallback_reason: Option<String>,
+        /// Whether the configured LCM state changed at this boundary.
+        changed: bool,
+        /// Typed redaction-safe fallback/failure reason, when one was
+        /// reported by LCM lifecycle events.
+        fallback_reason: Option<LcmLifecycleReason>,
         /// Disjoint usage committed by this idle attempt.
         usage: UsageDelta,
     },
@@ -363,12 +358,12 @@ impl std::fmt::Debug for IdleCompactionAdmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Accepted {
-                summary,
+                changed,
                 fallback_reason,
                 usage,
             } => formatter
                 .debug_struct("IdleCompactionAdmission::Accepted")
-                .field("has_summary", &summary.is_some())
+                .field("changed", changed)
                 .field("fallback_reason", fallback_reason)
                 .field("usage", usage)
                 .finish(),
@@ -377,13 +372,6 @@ impl std::fmt::Debug for IdleCompactionAdmission {
         }
     }
 }
-
-/// Protected result metadata returned by an accepted idle compaction.
-pub type IdleCompactionSummary = ProtectedSemanticSummary;
-
-/// Compatibility name for hosts that model the method as a result rather than
-/// an admission operation.
-pub type IdleCompactionResult = IdleCompactionAdmission;
 
 impl TurnHandle {
     /// The accepted turn id.
@@ -438,6 +426,71 @@ impl Drop for IdleCompactionGuard {
         self.inner
             .idle_compaction_inflight
             .store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct IdleCompactionBatch {
+    updates: Vec<(String, VersionedSessionState)>,
+    usage_records: Vec<UsageRecord>,
+    events: Vec<HarnessEvent>,
+    changed: bool,
+    fallback_reason: Option<LcmLifecycleReason>,
+    usage: UsageDelta,
+    retry_after_checkpoint: bool,
+}
+
+impl IdleCompactionBatch {
+    fn from_results(
+        results: Vec<(ComponentDescriptor, IdleCompactionResult)>,
+        previous_extensions: &BTreeMap<String, VersionedSessionState>,
+    ) -> Self {
+        let mut updates = Vec::new();
+        let mut usage_records = Vec::new();
+        let mut events = Vec::new();
+        let mut changed = false;
+        let mut fallback_reason = None;
+        let mut usage = UsageDelta::new();
+        let mut retry_after_checkpoint = false;
+        for (descriptor, result) in results {
+            if descriptor.id().as_str() == LCM_COMPONENT_ID {
+                if let Some(state) = result.patch.state.as_ref() {
+                    let next = state.clone().into_state();
+                    changed = changed
+                        || previous_extensions
+                            .get(LCM_COMPONENT_ID)
+                            .is_none_or(|previous| previous != &next);
+                }
+                if fallback_reason.is_none() {
+                    fallback_reason = result.patch.events.iter().find_map(|event| match event {
+                        HarnessEvent::LcmLifecycle {
+                            kind: LcmLifecycleKind::Failure,
+                            reason,
+                            ..
+                        } => *reason,
+                        _ => None,
+                    });
+                }
+                retry_after_checkpoint |= result.retry_after_checkpoint;
+            }
+            if let Some(state) = result.patch.state {
+                updates.push((descriptor.id().as_str().to_owned(), state.into_state()));
+            }
+            for record in &result.patch.usage {
+                usage.merge(&record.delta);
+            }
+            usage_records.extend(result.patch.usage);
+            events.extend(result.patch.events);
+        }
+        Self {
+            updates,
+            usage_records,
+            events,
+            changed,
+            fallback_reason,
+            usage,
+            retry_after_checkpoint,
+        }
     }
 }
 
@@ -1041,17 +1094,108 @@ impl SessionHandle {
         self.inner.emitter.subscribe()
     }
 
-    /// Attempts one semantic compaction at the current idle turn boundary.
+    /// Attempts one LCM compaction at the current idle turn boundary.
     ///
     /// The operation claims the same admission boundary as user and internal
-    /// turns, invokes the configured semantic-summary hook through the normal
+    /// turns, invokes the configured LCM hook through the normal
     /// driver pipeline, and commits its extension state and usage under the
     /// ordinary persistence gate. A failed model attempt is represented by an
     /// accepted result with a fallback reason and consumes the attempt; it is
     /// never retried automatically. The canonical history remains unchanged.
-    pub async fn try_idle_semantic_compaction(
-        &self,
-    ) -> Result<IdleCompactionAdmission, RuntimeError> {
+    async fn idle_checkpoint_is_safe(&self) -> Result<bool, RuntimeError> {
+        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+            return Ok(true);
+        };
+        let Some(checkpoint) = store.load_latest(&self.inner.id).await? else {
+            return Ok(true);
+        };
+        checkpoint.validate()?;
+        Ok(matches!(
+            checkpoint.state,
+            TurnState::Terminal { .. } | TurnState::CacheOperationTerminal { .. }
+        ))
+    }
+
+    /// Applies one idle result and crosses the ordinary durable snapshot
+    /// boundary. LCM's first pass therefore cannot reach its CAS mutation
+    /// until its protected pending response and usage have been saved.
+    async fn persist_idle_batch(&self, batch: &IdleCompactionBatch) -> Result<(), RuntimeError> {
+        let store = self.inner.shared.session_store.as_ref();
+        let previous_extensions = {
+            let mut extensions = self
+                .inner
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            let previous = batch
+                .updates
+                .iter()
+                .map(|(namespace, _)| (namespace.clone(), extensions.get(namespace).cloned()))
+                .collect::<Vec<_>>();
+            for (namespace, state) in &batch.updates {
+                extensions.insert(namespace.clone(), state.clone());
+            }
+            previous
+        };
+        let previous_usage = {
+            let mut state = self.inner.state.lock().expect("session state poisoned");
+            let previous = state.usage.clone();
+            for record in &batch.usage_records {
+                state.usage.record(record.clone());
+            }
+            previous
+        };
+        let result = match store {
+            Some(store) => store.save(&self.snapshot()).await,
+            None => Ok(()),
+        };
+        if result.is_err() {
+            {
+                let mut extensions = self
+                    .inner
+                    .execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned");
+                for (namespace, previous) in previous_extensions {
+                    match previous {
+                        Some(state) => {
+                            extensions.insert(namespace, state);
+                        }
+                        None => {
+                            extensions.remove(&namespace);
+                        }
+                    }
+                }
+            }
+            self.inner
+                .state
+                .lock()
+                .expect("session state poisoned")
+                .usage = previous_usage;
+        }
+        result
+    }
+
+    fn emit_idle_batch(&self, boundary_turn: &TurnId, batch: &IdleCompactionBatch) {
+        for record in &batch.usage_records {
+            self.inner.emitter.emit(
+                Some(boundary_turn.clone()),
+                RuntimeEvent::Usage {
+                    record: record.clone(),
+                },
+            );
+        }
+        for event in &batch.events {
+            self.inner.emitter.emit(
+                Some(boundary_turn.clone()),
+                event.clone().into_runtime_event(),
+            );
+        }
+    }
+
+    pub async fn try_idle_compaction(&self) -> Result<IdleCompactionAdmission, RuntimeError> {
         // Claim both admission layers before publishing the idle attempt.  In
         // particular, do not release `admission_gate` and then await
         // `turn_gate`: a user can otherwise win admission in that gap and the
@@ -1087,9 +1231,6 @@ impl SessionHandle {
             {
                 return Ok(IdleCompactionAdmission::Busy);
             }
-            self.inner
-                .idle_compaction_attempted
-                .store(true, Ordering::Release);
             turn_gate
         };
         // Keep the successful gate guard through snapshot, hook, and
@@ -1113,6 +1254,15 @@ impl SessionHandle {
         if self.inner.cancel.is_cancelled() {
             return Ok(IdleCompactionAdmission::Shutdown);
         }
+        if self.inner.shared.lcm.is_some() && self.inner.shared.session_store.is_none() {
+            return Ok(IdleCompactionAdmission::Busy);
+        }
+        if !self.idle_checkpoint_is_safe().await? {
+            return Ok(IdleCompactionAdmission::Busy);
+        }
+        self.inner
+            .idle_compaction_attempted
+            .store(true, Ordering::Release);
 
         let (history, usage, boundary_turn) = {
             let state = self.inner.state.lock().expect("session state poisoned");
@@ -1147,137 +1297,103 @@ impl SessionHandle {
             started_at: committed_at,
             committed_at,
         };
-        let patches = match self
+        let results = match self
             .inner
             .shared
             .driver
-            .run_idle_compaction_hooks(&view, &extension_state, &self.inner.cancel)
+            .run_idle_compaction_hooks(&view, &extension_state, &self.inner.cancel, None)
             .await
         {
-            Ok(patches) => patches,
+            Ok(results) => results,
             Err(_error) if self.inner.cancel.is_cancelled() => {
                 return Ok(IdleCompactionAdmission::Shutdown);
             }
             Err(error) => return Err(error),
         };
-
-        let mut updates = Vec::new();
-        let mut usage_records = Vec::new();
-        let mut events = Vec::new();
-        let mut summary = None;
-        let mut fallback_reason = None;
-        let mut usage = UsageDelta::new();
-        for (descriptor, patch) in patches {
-            if descriptor.id().as_str() == SEMANTIC_SUMMARY_COMPONENT_ID {
-                summary = protected_summary_from_patch(&patch)?;
-            }
-            if fallback_reason.is_none() {
-                fallback_reason = patch.events.iter().find_map(|event| match event {
-                    HarnessEvent::SemanticSummaryFallback { reason } => Some(reason.clone()),
-                    _ => None,
-                });
-            }
-            if let Some(state) = patch.state {
-                updates.push((descriptor.id().as_str().to_owned(), state.into_state()));
-            }
-            for record in &patch.usage {
-                usage.merge(&record.delta);
-            }
-            usage_records.extend(patch.usage);
-            events.extend(patch.events);
-        }
-
+        let first_batch = IdleCompactionBatch::from_results(results, &extension_state);
         let _persist_gate = self.inner.persist_gate.lock().await;
         if self.inner.cancel.is_cancelled() {
             return Ok(IdleCompactionAdmission::Shutdown);
         }
-        let previous_extensions = {
-            let extensions = self
-                .inner
-                .execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned");
-            updates
-                .iter()
-                .map(|(namespace, _)| (namespace.clone(), extensions.get(namespace).cloned()))
-                .collect::<Vec<_>>()
-        };
-        let previous_usage = self
+        self.persist_idle_batch(&first_batch).await?;
+        self.emit_idle_batch(&boundary_turn, &first_batch);
+
+        if !first_batch.retry_after_checkpoint {
+            return Ok(IdleCompactionAdmission::Accepted {
+                changed: first_batch.changed,
+                fallback_reason: first_batch.fallback_reason,
+                usage: first_batch.usage,
+            });
+        }
+
+        // Exactly one checkpointed retry is allowed. The first save above is
+        // the durable handoff; only LCM is rerun, so unrelated hooks cannot
+        // repeat work or publish a second idle operation.
+        if self.inner.cancel.is_cancelled() {
+            return Ok(IdleCompactionAdmission::Shutdown);
+        }
+        let second_extension_state = self
+            .inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .clone();
+        let second_usage = self
             .inner
             .state
             .lock()
             .expect("session state poisoned")
             .usage
-            .clone();
-        {
-            let mut extensions = self
-                .inner
-                .execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned");
-            for (namespace, state) in &updates {
-                extensions.insert(namespace.clone(), state.clone());
-            }
-        }
-        {
-            let mut state = self.inner.state.lock().expect("session state poisoned");
-            for record in &usage_records {
-                state.usage.record(record.clone());
-            }
-        }
-        let save_result = match &self.inner.shared.session_store {
-            Some(store) => store.save(&self.snapshot()).await,
-            None => Ok(()),
+            .records()
+            .to_vec();
+        let second_view = TurnCommitView {
+            session: self.inner.id.clone(),
+            turn: boundary_turn.clone(),
+            finish: TurnFinish::Completed,
+            provider_error_kind: None,
+            visible_output: false,
+            history: view.history.clone(),
+            state: None,
+            usage: Arc::from(second_usage.into_boxed_slice()),
+            started_at: committed_at,
+            committed_at,
         };
-        if let Err(error) = save_result {
-            {
-                let mut extensions = self
-                    .inner
-                    .execution
-                    .extension_state
-                    .lock()
-                    .expect("session extension state poisoned");
-                for (namespace, previous) in previous_extensions {
-                    match previous {
-                        Some(state) => {
-                            extensions.insert(namespace, state);
-                        }
-                        None => {
-                            extensions.remove(&namespace);
-                        }
-                    }
-                }
+        let second_results = match self
+            .inner
+            .shared
+            .driver
+            .run_idle_compaction_hooks(
+                &second_view,
+                &second_extension_state,
+                &self.inner.cancel,
+                Some(LCM_COMPONENT_ID),
+            )
+            .await
+        {
+            Ok(results) => results,
+            Err(_error) if self.inner.cancel.is_cancelled() => {
+                return Ok(IdleCompactionAdmission::Shutdown);
             }
-            self.inner
-                .state
-                .lock()
-                .expect("session state poisoned")
-                .usage = previous_usage;
-            return Err(error);
+            Err(error) => return Err(error),
+        };
+        let second_batch =
+            IdleCompactionBatch::from_results(second_results, &second_extension_state);
+        if second_batch.retry_after_checkpoint {
+            return Err(RuntimeError::conflict(
+                "idle LCM compaction exceeded its two-pass retry bound",
+            ));
         }
+        self.persist_idle_batch(&second_batch).await?;
+        self.emit_idle_batch(&boundary_turn, &second_batch);
 
-        for record in usage_records {
-            self.inner
-                .emitter
-                .emit(Some(boundary_turn.clone()), RuntimeEvent::Usage { record });
-        }
-        for event in events {
-            self.inner
-                .emitter
-                .emit(Some(boundary_turn.clone()), event.into_runtime_event());
-        }
+        let mut usage = first_batch.usage.clone();
+        usage.merge(&second_batch.usage);
         Ok(IdleCompactionAdmission::Accepted {
-            summary,
-            fallback_reason,
+            changed: first_batch.changed || second_batch.changed,
+            fallback_reason: first_batch.fallback_reason.or(second_batch.fallback_reason),
             usage,
         })
-    }
-
-    /// Alias emphasizing that this is the single idle-compaction attempt.
-    pub async fn try_idle_compaction(&self) -> Result<IdleCompactionAdmission, RuntimeError> {
-        self.try_idle_semantic_compaction().await
     }
 
     /// Dispatches one conformance-gated synthetic cache operation through the
@@ -1398,30 +1514,32 @@ impl SessionHandle {
             },
             None => None,
         };
-        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref()
-            && let TurnState::CacheOperationPrepared {
+        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref() {
+            if let TurnState::CacheOperationPrepared {
                 operation: checkpoint_operation,
             } = &checkpoint.state
-            && let Some(reason) = checkpoint_operation.preflight_rejection
-        {
-            let result = self.cache_result_from_checkpoint(
-                checkpoint_operation,
-                &CacheOperationResultCheckpoint {
-                    outcome: agent_runtime_core::event::CacheOperationOutcome::Rejected,
-                    state: self
-                        .inner
-                        .shared
-                        .cache
-                        .current_state(&self.inner.id, &checkpoint_operation.identity),
-                    evidence: None,
-                    metrics: BTreeMap::new(),
-                    rejection_reason: Some(reason),
-                    terminal_reason: None,
-                },
-            );
-            self.repair_cache_checkpoint_result(&result).await?;
-            self.persist_locked().await?;
-            return Ok(result);
+            {
+                if let Some(reason) = checkpoint_operation.preflight_rejection {
+                    let result = self.cache_result_from_checkpoint(
+                        checkpoint_operation,
+                        &CacheOperationResultCheckpoint {
+                            outcome: agent_runtime_core::event::CacheOperationOutcome::Rejected,
+                            state: self
+                                .inner
+                                .shared
+                                .cache
+                                .current_state(&self.inner.id, &checkpoint_operation.identity),
+                            evidence: None,
+                            metrics: BTreeMap::new(),
+                            rejection_reason: Some(reason),
+                            terminal_reason: None,
+                        },
+                    );
+                    self.repair_cache_checkpoint_result(&result).await?;
+                    self.persist_locked().await?;
+                    return Ok(result);
+                }
+            }
         }
         if reserved_existing
             && prepared_retry_checkpoint.is_none()
@@ -1873,30 +1991,32 @@ impl SessionHandle {
             },
             None => None,
         };
-        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref()
-            && let TurnState::CacheOperationPrepared {
+        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref() {
+            if let TurnState::CacheOperationPrepared {
                 operation: checkpoint_operation,
             } = &checkpoint.state
-            && let Some(reason) = checkpoint_operation.preflight_rejection
-        {
-            let result = self.cache_result_from_checkpoint(
-                checkpoint_operation,
-                &CacheOperationResultCheckpoint {
-                    outcome: agent_runtime_core::event::CacheOperationOutcome::Rejected,
-                    state: self
-                        .inner
-                        .shared
-                        .cache
-                        .current_state(&self.inner.id, &checkpoint_operation.identity),
-                    evidence: None,
-                    metrics: BTreeMap::new(),
-                    rejection_reason: Some(reason),
-                    terminal_reason: None,
-                },
-            );
-            self.repair_cache_checkpoint_result(&result).await?;
-            self.persist_locked().await?;
-            return Ok(result);
+            {
+                if let Some(reason) = checkpoint_operation.preflight_rejection {
+                    let result = self.cache_result_from_checkpoint(
+                        checkpoint_operation,
+                        &CacheOperationResultCheckpoint {
+                            outcome: agent_runtime_core::event::CacheOperationOutcome::Rejected,
+                            state: self
+                                .inner
+                                .shared
+                                .cache
+                                .current_state(&self.inner.id, &checkpoint_operation.identity),
+                            evidence: None,
+                            metrics: BTreeMap::new(),
+                            rejection_reason: Some(reason),
+                            terminal_reason: None,
+                        },
+                    );
+                    self.repair_cache_checkpoint_result(&result).await?;
+                    self.persist_locked().await?;
+                    return Ok(result);
+                }
+            }
         }
         if reserved_existing
             && prepared_retry_checkpoint.is_none()
@@ -3242,100 +3362,39 @@ impl SessionHandle {
         f(&state.history)
     }
 
-    /// Restores a protected semantic-summary extension only when canonical
-    /// and protected startup state did not already provide one.
+    /// Expands one opaque LCM node through the host-authorized coordinator.
     ///
-    /// This narrow cold-resume seam is intended for hosts whose ordinary
-    /// session store deliberately omits Sensitive extension namespaces and
-    /// retains them in a separate protected artifact. It is fail-closed: the
-    /// current summary component revision, source session, canonical history
-    /// prefix, and content-derived summary revision must all match, and no
-    /// turn or cache operation may be active. Existing Runtime-restored state
-    /// always wins and is never overwritten.
-    pub fn restore_semantic_summary_if_absent(
+    /// The caller supplies only the bounded request. The runtime resolves the
+    /// session's binding and issues the store view internally, so a node id or
+    /// cursor cannot be used as an authority grant. This operation is
+    /// read-only: it does not invoke provider/model/ability code or mutate
+    /// history, usage, extension state, checkpoints, or session persistence.
+    /// Exactly one redaction-safe LCM lifecycle event is emitted for every
+    /// request, including missing configuration and failed authorization.
+    pub async fn expand_lcm(
         &self,
-        persisted: VersionedSessionState,
-    ) -> Result<bool, RuntimeError> {
-        let _admission = self
-            .inner
-            .admission_gate
-            .lock()
-            .expect("session admission gate poisoned");
-        {
-            let turns = self.inner.turns.lock().expect("session turns poisoned");
-            if turns.shutting_down
-                || turns.count != 0
-                || self.inner.cancel.is_cancelled()
-                || self.inner.user_submission_pending.load(Ordering::Acquire) != 0
-                || self.inner.cache_active.load(Ordering::Acquire) != 0
-            {
-                return Err(RuntimeError::conflict(
-                    "semantic summary restore requires an idle live session",
-                ));
+        request: ExpansionRequest,
+    ) -> Result<LcmExpansion, RuntimeError> {
+        let _turn_gate = self.inner.turn_gate.lock().await;
+        let observation = match self.inner.shared.lcm.as_ref() {
+            Some(coordinator) => {
+                coordinator
+                    .expand_for_session(&self.inner.id, request)
+                    .await
             }
-        }
-        let expected_revision = self
-            .inner
-            .shared
-            .driver
-            .semantic_summary_revision()
-            .ok_or_else(|| {
-                RuntimeError::config(
-                    "semantic summary restore requires a configured summary component",
-                )
-            })?;
-        if persisted.revision != expected_revision {
-            return Err(RuntimeError::conflict(
-                "semantic summary restore revision does not match the active component",
-            ));
-        }
-        {
-            let extensions = self
-                .inner
-                .execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned");
-            if extensions.contains_key(SEMANTIC_SUMMARY_COMPONENT_ID) {
-                return Ok(false);
+            None => {
+                let fingerprint = LcmCoordinator::expansion_request_fingerprint(&request);
+                let error = RuntimeError::config("LCM coordinator is not configured");
+                LcmExpansionObservation {
+                    event: LcmCoordinator::expansion_failure_event(&fingerprint, &error),
+                    result: Err(error),
+                }
             }
-        }
-
-        let summary = protected_semantic_summary_from_state(&persisted, UsageDelta::new())?;
-        if summary.source_artifact.provenance.session != self.inner.id {
-            return Err(RuntimeError::conflict(
-                "semantic summary restore artifact belongs to another session",
-            ));
-        }
-        {
-            let state = self.inner.state.lock().expect("session state poisoned");
-            if summary.omit_prefix > state.history.len()
-                || (summary.omit_prefix < state.history.len()
-                    && state.history[summary.omit_prefix].role != Role::User)
-            {
-                return Err(RuntimeError::conflict(
-                    "semantic summary restore would split or exceed canonical history",
-                ));
-            }
-            let encoded =
-                serde_json::to_vec(&state.history[..summary.omit_prefix]).map_err(|error| {
-                    RuntimeError::internal(format!(
-                        "failed to verify restored semantic summary source: {error}"
-                    ))
-                })?;
-            if Fingerprint::of(encoded) != summary.source_fingerprint {
-                return Err(RuntimeError::conflict(
-                    "semantic summary restore source no longer matches canonical history",
-                ));
-            }
-        }
+        };
         self.inner
-            .execution
-            .extension_state
-            .lock()
-            .expect("session extension state poisoned")
-            .insert(SEMANTIC_SUMMARY_COMPONENT_ID.to_owned(), persisted);
-        Ok(true)
+            .emitter
+            .emit(None, observation.event.into_runtime_event());
+        observation.result
     }
 
     /// A snapshot of the session's canonical state.

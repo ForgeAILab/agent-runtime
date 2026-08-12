@@ -63,6 +63,7 @@ jobs:
           -p agent-runtime-ability
           -p agent-runtime-provider
           -p agent-runtime-context
+          -p agent-runtime-lcm
           -p agent-runtime-obs
           -p agent-runtime
       - name: build production packages on MSRV with all features
@@ -73,6 +74,7 @@ jobs:
           -p agent-runtime-ability
           -p agent-runtime-provider
           -p agent-runtime-context
+          -p agent-runtime-lcm
           -p agent-runtime-obs
           -p agent-runtime
 
@@ -109,6 +111,13 @@ jobs:
           echo "$tree" | grep -q agent-runtime-registry
       - name: context builds without a provider or network client
         run: cargo build -p agent-runtime-context
+      - name: LCM builds without a provider, storage engine, or network client
+        run: |
+          cargo build -p agent-runtime-lcm
+          cargo package -p agent-runtime-lcm --list >/dev/null
+          tree=$(cargo tree -p agent-runtime-lcm --no-default-features -e normal)
+          echo "$tree"
+          ! echo "$tree" | grep -E '(agent-runtime-provider|sqlx|rusqlite|reqwest|hyper|axum|tonic|rmcp|ratatui|crossterm|smith-|nyx-|open-forge)'
 
   # Dependency + license policy, including the consumer-domain dependency ban.
   deny:

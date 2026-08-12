@@ -990,21 +990,6 @@ async fn terminal_publication_recovers_before_or_after_the_event_exactly_once() 
 async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_without_rerun() {
     let id = SessionId::new("publishing-terminal-hook-recovery");
     let checkpoints = Arc::new(agent_runtime_testkit::InMemoryCheckpointStore::new());
-    let artifacts = Arc::new(ScenarioArtifactStore::default());
-    let summary_model = Arc::new(CountingSummaryModel::default());
-    let summary = Arc::new(
-        SemanticSummaryCoordinator::new(
-            artifacts,
-            summary_model.clone(),
-            SemanticSummaryPolicy {
-                min_turns: 2,
-                retain_turns: 1,
-                input_budget_tokens: 100_000,
-                ..SemanticSummaryPolicy::new(RegistryRevision::new("durable-summary-v1"))
-            },
-        )
-        .unwrap(),
-    );
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let observer = RecordingObserver::shared();
     let source_runtime = RuntimeBuilder::new(ModelId::new("fake"))
@@ -1032,9 +1017,7 @@ async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_with
             ],
         )))
         .checkpoint_store(checkpoints.clone())
-        .history_projector(summary.clone())
-        .turn_commit_hook(Arc::new(CountingSemanticSummaryHook {
-            inner: summary.clone(),
+        .turn_commit_hook(Arc::new(CountingDurableCommitHook {
             calls: hook_calls.clone(),
         }))
         .observer(observer.clone())
@@ -1048,7 +1031,6 @@ async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_with
     source.run(UserInput::text("second request")).await.unwrap();
 
     assert_eq!(hook_calls.load(Ordering::Acquire), 2);
-    assert_eq!(summary_model.calls.load(Ordering::Acquire), 1);
     let publishing = checkpoints
         .history(&id)
         .into_iter()
@@ -1070,7 +1052,7 @@ async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_with
         publishing.snapshot.extension_state.values().any(|state| {
             state.sensitivity == agent_runtime_core::store::SessionStateSensitivity::Sensitive
         }),
-        "PublishingTerminal protects the semantic summary state"
+        "PublishingTerminal protects sensitive commit-hook state"
     );
     assert!(
         observer.events().iter().any(|event| {
@@ -1095,9 +1077,7 @@ async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_with
             Vec::new(),
         )))
         .checkpoint_store(recovery_checkpoints.clone())
-        .history_projector(summary.clone())
-        .turn_commit_hook(Arc::new(CountingSemanticSummaryHook {
-            inner: summary,
+        .turn_commit_hook(Arc::new(CountingDurableCommitHook {
             calls: hook_calls.clone(),
         }))
         .observer(recovery_observer.clone())
@@ -1113,11 +1093,6 @@ async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_with
         hook_calls.load(Ordering::Acquire),
         2,
         "PublishingTerminal recovery must not invoke turn-commit hooks again"
-    );
-    assert_eq!(
-        summary_model.calls.load(Ordering::Acquire),
-        1,
-        "the idempotently keyed summary call is not repeated after its result is protected"
     );
     assert_eq!(
         recovered

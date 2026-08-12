@@ -13,9 +13,10 @@ categories.workspace = true
 [dependencies]
 agent-runtime-registry = { workspace = true, features = ["serde"] }
 agent-runtime-core.workspace = true
-agent-runtime-ability = { workspace = true, features = ["tool", "serde"] }
+agent-runtime-ability = { workspace = true, features = ["tool", "serde", "skill-files"] }
 agent-runtime-provider.workspace = true
 agent-runtime-context.workspace = true
+agent-runtime-lcm.workspace = true
 agent-runtime-obs = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

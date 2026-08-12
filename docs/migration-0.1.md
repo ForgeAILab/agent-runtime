@@ -92,8 +92,8 @@ silently reduced. Attach `StructuralCompactor` to opt into deterministic
 prior-turn reasoning removal, optional-fragment eviction, and unpaired
 tool-result/history bounding under configured watermarks. It deliberately
 does not invent semantic summaries or drop an old tool exchange merely to fit;
-use the runtime-level `SemanticSummaryCoordinator` when stored originals and a
-purpose-attributed summary model are available.
+use the runtime-level `LcmCoordinator` when an authorized logical timeline,
+transactional LCM store, and host-supplied LCM summary model are available.
 
 ## 3. `agent-runtime-prompt` folded into `agent-runtime-context`
 
@@ -125,6 +125,10 @@ the same fix the ability crate uses for `AbilityEntry`/`ToolEntry`.
 registry, model, resolver, tokenizer, adapter, context, compaction, and cache
 revisions and fingerprints.
 
+`RunManifest` is now manifest schema v2. Its redaction-safe lossless LCM
+records and their fingerprints are part of the manifest's replay semantics;
+summary and source bodies remain outside the manifest.
+
 This is a **migration, not a breaking read**: the field is `#[serde(default)]`,
 so a snapshot persisted before manifests existed still loads with an empty
 list.
@@ -137,12 +141,29 @@ ever be recorded as `{id, classification, hash, tokens}`.
 For replay, `RunManifest::check_replay(&available)` requires every recorded
 revision to be present and identical; a missing or changed revision fails
 explicitly rather than substituting what happens to be installed. A host that
-wants to proceed anyway must opt in explicitly via
-`check_replay_as(&available, ReplayMode::LabeledNonEquivalent)`.
+wants to inspect or label a mismatch uses
+`RunManifest::check_replay_as(&available, mode)`, which now returns a typed
+`ReplayMismatch` report containing separate revision, lossless-record, and
+assembled-context mismatch fields, including under
+`ReplayMode::LabeledNonEquivalent`.
 
-## 6. Event schema version 13
+Under `ReplayMode::Equivalent`, any revision, lossless-record, or
+assembled-context difference is rejected with the typed mismatch details;
+`ReplayMode::LabeledNonEquivalent` reports those differences without claiming
+equivalence.
 
-`SCHEMA_VERSION` is now `13`. The current vocabulary includes registry sealing,
+LCM equivalent replay must restore the exact lossless records and pass the
+assembled context fingerprint through
+`RunManifest::check_replay_with_lossless_context(&available, &lossless,
+&assembled_context)` or
+`RunManifest::check_replay_as_with_lossless_context(&available, &lossless,
+&assembled_context, mode)`. The revision-only `check_replay` and
+`check_replay_as` entry points do not establish LCM equivalence; when LCM
+records are present they report missing lossless/context evidence instead.
+
+## 6. Event schema version 15
+
+`SCHEMA_VERSION` is now `15`. The current vocabulary includes registry sealing,
 scoped-view derivation, model resolution, capability retrieval and activation,
 context planning and compaction, cache-plan changes, budget failures,
 attempt-scoped speculative output, metadata-only interaction lifecycle,
@@ -155,11 +176,14 @@ independent `Option<u64>` read/write values: `Some(0)` is reported zero and
 request, attempt, and cache-plan attribution, and the new
 `RuntimeEvent::CacheStateChanged` carries the expectation, observation,
 saturating missed-token result, and estimation confidence for one attempt.
+`RuntimeEvent::LcmLifecycle` adds typed, metadata-only pressure, admission,
+escalation, node commit, condensation, deterministic fallback, legacy import,
+bounded expansion, and failure observations without source or summary bodies.
 Legacy numeric cache-observation envelopes still deserialize, but consumers
 must not treat their absent attribution as a verified zero or miss. Exhaustive
 matches on either event enum must handle these new forms.
 
-Committed v5 through v13 fixtures guard the compatible wire representations.
+Committed v5-v11 and v13-v15 fixtures guard the compatible wire representations.
 Pre-v5 output deltas are intentionally not accepted because they lack the
 request/attempt identity needed to discard retry output safely. A consumer
 that matches exhaustively on `RuntimeEvent` must handle the new variants.
@@ -256,9 +280,9 @@ middleware that mutates shared request or session dictionaries.
 
 The standard questionnaire is activated only when host interaction is ready.
 Large tool output can be moved to a session-private `ArtifactStore` and read
-back in bounded pages through `artifact.read`. Todos, memory, artifacts, and
-semantic summaries remain generic mechanism; hosts still own their sources,
-trust policy, persistence implementations, and presentation.
+back in bounded pages through `artifact.read`. Todos, external memory,
+artifacts, and LCM remain generic mechanism; hosts still own their sources,
+authorization policy, persistence implementations, and presentation.
 
 ## 11. Durable child sessions require both stores
 
@@ -423,11 +447,154 @@ the existing provider event vocabulary. Grok model limits and product
 defaults remain host/catalog policy; no live provider call is required by the
 shared conformance fixtures.
 
+## 17. Lossless Context Memory
+
+`LcmCoordinator` is now the one persisted semantic-history path. The old
+session-scoped rolling state is not a second active history or a compatibility
+alias. Hosts may depend on `agent-runtime-lcm` directly, or use the facade's
+`agent_runtime::lcm` re-export and `agent_runtime::harness` integration.
+
+For direct package use, implement `LcmReader` and `LcmWriter` over the host's
+transactional store (`LcmStore` is the combined convenience bound). Mint one
+`LcmViewAuthority` at the host authorization boundary and share that authority
+with the store adapter and the views used by the binding. Every store method
+must authorize its `LcmView` before looking up an opaque timeline, entry, or
+node. Add `agent-runtime-testkit` as a development dependency and run
+`assert_lcm_store_conformance` against the host adapter; the suite covers
+immutable append, atomic leaf/condensation CAS, bounded expansion, and
+unauthorized same-timeline views. The package supplies no production database.
+
+The facade composition has four host-owned inputs — store, model, policy, and
+timeline authorization — and attaches exactly one coordinator:
+
+```rust
+use std::sync::Arc;
+use agent_runtime::core::catalog::{ModelLimits, ResolvedModelProfile};
+use agent_runtime::core::ids::SessionId;
+use agent_runtime::core::provider::ModelId;
+use agent_runtime::lcm::{LcmTimelineId, LcmViewAuthority};
+use agent_runtime::harness::{
+    LcmCoordinator, LcmCoordinatorPolicy, LcmTimelineBinding,
+    StaticLcmTimelineResolver,
+};
+use agent_runtime::runtime::{RuntimeBuilder, StartSession};
+
+let session_id = SessionId::new("host-session-1");
+let model_id = ModelId::new("host-model");
+let profile = ResolvedModelProfile::explicit(
+    "host-provider",
+    model_id.clone(),
+    ModelLimits::new(128_000, 128_000, 4_096),
+);
+let authority = LcmViewAuthority::new();
+let binding = LcmTimelineBinding::new(
+    session_id.clone(),
+    LcmTimelineId::new("host-timeline-1"),
+    agent_runtime::registry::RegistryRevision::new("host-binding-1"),
+    authority.clone(),
+)?;
+let resolver = Arc::new(StaticLcmTimelineResolver::new(binding));
+let policy = LcmCoordinatorPolicy {
+    input_budget_tokens: u64::from(profile.limits.max_input_tokens),
+    ..Default::default()
+};
+let coordinator = LcmCoordinator::new(
+    host_store,          // Arc<dyn LcmStore>, backed by the host database
+    summary_model,       // Arc<dyn LcmSummaryModel>, host model/purpose policy
+    resolver,
+    policy,
+)?
+.with_content_guard(content_guard); // optional; evaluates derived bodies only
+let runtime = RuntimeBuilder::new(model_id)
+    .provider(provider)
+    .model_profile(profile)
+    .session_store(session_store) // durable extension namespace for resume cutover
+    .lcm(Arc::new(coordinator))
+    .build()?;
+let session = runtime
+    .start_session(StartSession::new().with_id(session_id))
+    .await?;
+```
+
+Soft pressure records the decision at the completed-turn boundary; model work
+is admitted only when the host explicitly claims the protected idle boundary
+with `SessionHandle::try_idle_compaction()`. The old idle semantic-summary API
+is replaced by this call, which returns metadata only through
+`IdleCompactionAdmission::Accepted { changed, fallback_reason, usage }` (or
+`Busy`/`Shutdown`); no summary body crosses the runtime facade. Hard pressure
+runs bounded, checkpointed compaction in the coordinator's pre-provider hook,
+before any provider request, and fails with a structured cannot-fit result when
+required content still cannot fit. LCM only returns versioned candidates and
+pointers; the context planner remains authoritative for final ordering, token
+accounting, structural compaction, cache identity, and provider serialization.
+
+`with_content_guard(...)` applies the host's guard to every newly produced,
+pending, imported, or loaded summary body before commit/projection. Raw
+immutable entries retain only guard provenance that actually produced their
+source; configuring a summary guard does not rewrite or stamp those entries.
+Guard ID and revision are part of the coordinator descriptor and protected LCM
+state. Changing either is therefore an explicit compatibility boundary: an
+existing checkpoint will not silently rotate or rebase to a new guard. Migrate
+that protected state under host policy (or bind a new compatible
+session/timeline) before resuming with the new descriptor; removing a guard
+while guarded historical provenance remains fails closed.
+
+Bounded source inspection goes through
+`SessionHandle::expand_lcm(ExpansionRequest)`. The caller supplies only an
+opaque node/cursor and limit; the coordinator resolves the session's
+host-authorized binding internally, so an ID is never an authority grant.
+Expansion is read-only and emits exactly one metadata-only lifecycle event on
+success or failure. It does not invoke the provider or summary model and does
+not mutate history, usage, checkpoints, manifests, or the LCM DAG.
+
+Each committed node records its own producer purpose (for example
+`context.semantic_summary` or `cache_idle_compaction`), model identity/revision
+and escalation level when model work was used, or deterministic algorithm
+metadata for fallback. Binding/authorization revision, store schema revision,
+store-view authorization revision, and source-classifier revision are separate
+values; none is substituted for another during resume or replay. Sensitivity,
+trust, content-guard, transformation, source, node, DAG, policy, algorithm,
+and sizer revisions remain attached to the node's lossless provenance.
+
+When `RuntimeBuilder::lcm(coordinator)` is configured, resuming an existing
+session automatically detects valid schema-v1 state in the old protected
+namespace. The host must provide a durable `SessionStore`, and the coordinator
+must have the legacy protected `ArtifactStore` configured with
+`with_legacy_artifact_store(...)` for this boundary. Resume
+validates the protected state, exact canonical history and source fingerprint,
+artifact bytes/provenance, and the host-authorized timeline binding. It then
+appends the immutable history, commits the replacement LCM leaf, and persists
+the replacement protected checkpoint before accepting turns; only after that
+durable boundary is the old namespace removed. Any malformed or missing state,
+artifact, revision, history, or binding fails closed without partial timeline
+or DAG mutation. The importer is an internal automatic cutover path: there is
+no public/manual restore alias and hosts must not invoke an importer directly.
+
+Lifecycle events and run manifests are redaction-safe. They carry only bounded
+opaque identities, ranges, fingerprints, revisions, classifications, counts,
+usage, and stable reasons; summary/source bodies, artifacts, credentials, and
+authority grants remain outside telemetry. `RunManifest` LCM records preserve
+per-node purpose/producer, binding/store/store-view revisions, source and
+summary fingerprints, and context fingerprints. The protected LCM state
+separately preserves the source-classifier revision and joined classification,
+so equivalent replay can reuse committed nodes or fail explicitly rather than
+silently substitute revisions.
+
+Vector/embedding retrieval remains a separate host-provided `MemorySource`.
+LCM owns episodic context reachability and compaction, not product memory ACLs,
+retention policy, scheduling, or a concrete database. Consumer bindings remain
+separate: Nyx binds a timeline to its authorized channel, Smith to a persistent
+agent session, and Open Forge to its authorized Room + AgentIdentity context.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.
 - [ ] Replace `agent_runtime_prompt` imports with `agent_runtime::context`.
 - [ ] Replace `TokenEstimator`/`CharBasedEstimator` with a `RequestSizer`.
+- [ ] Replace the removed rolling summary path with an authorized LCM timeline,
+      store, model, and policy; configure the protected legacy `ArtifactStore`
+      when a `.lcm` resume may encounter schema-v1 state (import is automatic,
+      with no public restore call).
 - [ ] Wrap any foreign-type `Named` impl in a local newtype.
 - [ ] Handle the new `RuntimeEvent` variants if you match exhaustively.
 - [ ] Distinguish future whole-turn input from active-turn steering and retain

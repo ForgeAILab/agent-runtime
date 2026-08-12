@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::content::{ContentPart, Message, Role};
-use agent_runtime_registry::RegistryRevision;
+use agent_runtime_registry::{Fingerprint, RegistryRevision, TrustClass};
 
 use crate::budget::{BudgetReport, ContextBudget};
 use crate::fragment::{
@@ -51,11 +51,437 @@ use crate::sizing::{DEFAULT_CHARS_PER_TOKEN, RequestSizer};
 /// down to before compaction moves on to the next stage.
 const DEFAULT_BOUND_CHARS: usize = 200;
 
+/// Maximum characters accepted for opaque lossless-summary identities.
+pub const MAX_LOSSLESS_ID_CHARS: usize = 256;
+/// Maximum characters accepted for lossless producer labels and revisions.
+pub const MAX_LOSSLESS_METADATA_CHARS: usize = 256;
+/// Maximum direct child identities retained in one lossless provenance record.
+pub const MAX_LOSSLESS_CHILD_IDS: usize = 256;
+/// Maximum guard/transformation revisions retained in one joined
+/// classification.
+pub const MAX_LOSSLESS_CLASSIFICATION_REVISIONS: usize = 256;
+
+/// The joined security/provenance classification of a lossless summary.
+///
+/// The context crate carries only redaction-safe classification metadata here:
+/// no source or summary body is retained. Guard and transformation revisions
+/// are strings because the neutral guard contract intentionally does not make
+/// its revision wrapper serializable; the values still participate in
+/// fingerprints and replay dependencies at the manifest boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LosslessSummaryClassification {
+    /// Most-sensitive source classification covered by the summary.
+    pub sensitivity: Sensitivity,
+    /// Least-trusted source classification covered by the summary.
+    pub trust: TrustClass,
+    /// The canonical guard revision selected for the joined source, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_revision: Option<String>,
+    /// Every guard revision contributing to the joined source.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub guard_revisions: BTreeSet<String>,
+    /// The canonical transformation revision selected for the joined source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transformation_revision: Option<RegistryRevision>,
+    /// Every transformation revision contributing to the joined source.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub transformation_revisions: BTreeSet<String>,
+}
+
+impl LosslessSummaryClassification {
+    /// Creates a classification without guard or transformation metadata.
+    pub fn new(sensitivity: Sensitivity, trust: TrustClass) -> Self {
+        Self {
+            sensitivity,
+            trust,
+            guard_revision: None,
+            guard_revisions: BTreeSet::new(),
+            transformation_revision: None,
+            transformation_revisions: BTreeSet::new(),
+        }
+    }
+
+    /// Records a canonical guard revision.
+    pub fn with_guard_revision(mut self, revision: impl Into<String>) -> Self {
+        let revision = revision.into();
+        self.guard_revisions.insert(revision.clone());
+        self.guard_revision = Some(revision);
+        self
+    }
+
+    /// Records every guard revision contributing to the joined source.
+    pub fn with_guard_revisions(
+        mut self,
+        revisions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        for revision in revisions {
+            self.guard_revisions.insert(revision.into());
+        }
+        self.guard_revision = (self.guard_revisions.len() == 1)
+            .then(|| self.guard_revisions.iter().next().cloned())
+            .flatten();
+        self
+    }
+
+    /// Records a canonical transformation revision.
+    pub fn with_transformation_revision(mut self, revision: RegistryRevision) -> Self {
+        self.transformation_revisions
+            .insert(revision.as_str().to_owned());
+        self.transformation_revision = Some(revision);
+        self
+    }
+
+    /// Records every transformation revision contributing to the joined
+    /// source.
+    pub fn with_transformation_revisions(
+        mut self,
+        revisions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        for revision in revisions {
+            self.transformation_revisions.insert(revision.into());
+        }
+        self.transformation_revision = (self.transformation_revisions.len() == 1)
+            .then(|| {
+                self.transformation_revisions
+                    .iter()
+                    .next()
+                    .cloned()
+                    .map(RegistryRevision::new)
+            })
+            .flatten();
+        self
+    }
+}
+
+/// How a lossless summary was produced.
+///
+/// Deterministic summaries identify their algorithm and intentionally carry no
+/// model requirement. Model summaries carry the model identity, revision, and
+/// purpose needed for equivalent replay and protected-state validation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "producer", rename_all = "snake_case")]
+pub enum LosslessSummaryProducer {
+    /// Produced without provider/model I/O by a deterministic algorithm.
+    Deterministic {
+        /// Revision of the deterministic reduction algorithm.
+        algorithm_revision: RegistryRevision,
+    },
+    /// Produced by a summary model.
+    Model {
+        /// Opaque model identity.
+        model_id: String,
+        /// Model revision used for the response.
+        model_revision: RegistryRevision,
+        /// Dedicated purpose bound to the model call.
+        purpose: String,
+        /// Numeric escalation level selected for the model attempt (1..=3).
+        escalation_level: u8,
+    },
+}
+
+impl fmt::Debug for LosslessSummaryProducer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Deterministic { algorithm_revision } => formatter
+                .debug_struct("LosslessSummaryProducer::Deterministic")
+                .field("algorithm_revision", algorithm_revision)
+                .finish(),
+            Self::Model {
+                model_id,
+                model_revision,
+                purpose,
+                escalation_level,
+            } => formatter
+                .debug_struct("LosslessSummaryProducer::Model")
+                .field("model_id", &Fingerprint::of(model_id.as_bytes()))
+                .field("model_revision", model_revision)
+                .field("purpose", &Fingerprint::of(purpose.as_bytes()))
+                .field("escalation_level", escalation_level)
+                .finish(),
+        }
+    }
+}
+
+/// Redaction-safe provenance for a summary node projected into context.
+///
+/// This is deliberately independent of `agent-runtime-lcm`: the context
+/// planner can accept a host's neutral lossless metadata without depending on
+/// a storage implementation or importing LCM identity types. The exact
+/// covered fragment ids remain on [`SummaryProvenance::covers`]; this record
+/// carries the durable timeline/node metadata needed by manifests and replay.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LosslessSummaryProvenance {
+    /// Opaque logical timeline identity.
+    pub timeline_id: String,
+    /// Opaque summary-node identity.
+    pub node_id: String,
+    /// DAG revision at which this node was observed.
+    pub dag_revision: u64,
+    /// Revision assigned to the node by its successful commit.
+    pub node_revision: u64,
+    /// Host authorization/configuration revision binding the timeline.
+    pub authorization_revision: RegistryRevision,
+    /// Adapter/schema semantic revision of the backing lossless store.
+    pub store_revision: RegistryRevision,
+    /// Store-view authorization revision used for this projection.
+    pub store_view_revision: RegistryRevision,
+    /// Inclusive source-range start.
+    pub source_range_start: u64,
+    /// Inclusive source-range end.
+    pub source_range_end: u64,
+    /// Number of covered source positions.
+    pub covered_count: u64,
+    /// Number of source tokens before summarization.
+    pub source_tokens: u64,
+    /// Number of tokens in the projected summary.
+    pub token_count: u64,
+    /// Fingerprint of the covered immutable source.
+    pub source_fingerprint: Fingerprint,
+    /// LCM summary policy revision.
+    pub policy_revision: RegistryRevision,
+    /// LCM deterministic algorithm revision.
+    pub algorithm_revision: RegistryRevision,
+    /// Request-sizer revision used for strict shrink validation.
+    pub sizer_revision: RegistryRevision,
+    /// Revision of the protected summary body/content.
+    pub summary_revision: RegistryRevision,
+    /// Joined source classification.
+    pub classification: LosslessSummaryClassification,
+    /// Summary producer and its replay-relevant identity.
+    pub producer: LosslessSummaryProducer,
+    /// Bounded direct child identities for a condensed node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_node_ids: Vec<String>,
+    /// Idempotency operation identity, when this projection carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// Idempotency operation fingerprint, when this projection carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_fingerprint: Option<Fingerprint>,
+}
+
+impl fmt::Debug for LosslessSummaryProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LosslessSummaryProvenance")
+            .field("timeline_id", &Fingerprint::of(self.timeline_id.as_bytes()))
+            .field("node_id", &Fingerprint::of(self.node_id.as_bytes()))
+            .field("dag_revision", &self.dag_revision)
+            .field("node_revision", &self.node_revision)
+            .field("authorization_revision", &self.authorization_revision)
+            .field("store_revision", &self.store_revision)
+            .field("store_view_revision", &self.store_view_revision)
+            .field("source_range_start", &self.source_range_start)
+            .field("source_range_end", &self.source_range_end)
+            .field("covered_count", &self.covered_count)
+            .field("source_tokens", &self.source_tokens)
+            .field("token_count", &self.token_count)
+            .field("source_fingerprint", &self.source_fingerprint)
+            .field("policy_revision", &self.policy_revision)
+            .field("algorithm_revision", &self.algorithm_revision)
+            .field("sizer_revision", &self.sizer_revision)
+            .field("summary_revision", &self.summary_revision)
+            .field("classification", &self.classification)
+            .field("producer", &self.producer)
+            .field(
+                "child_node_ids",
+                &self
+                    .child_node_ids
+                    .iter()
+                    .map(|id| Fingerprint::of(id.as_bytes()))
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "operation_id",
+                &self
+                    .operation_id
+                    .as_ref()
+                    .map(|id| Fingerprint::of(id.as_bytes())),
+            )
+            .field("operation_fingerprint", &self.operation_fingerprint)
+            .finish()
+    }
+}
+
+impl LosslessSummaryProvenance {
+    /// Returns whether this record has a valid non-empty source range.
+    pub fn has_valid_range(&self) -> bool {
+        self.source_range_start <= self.source_range_end
+            && self.covered_count > 0
+            && self
+                .source_range_end
+                .checked_sub(self.source_range_start)
+                .and_then(|length| length.checked_add(1))
+                == Some(self.covered_count)
+    }
+
+    /// Returns whether this record is safe to use as semantic projection
+    /// provenance. This checks metadata shape and producer requirements only;
+    /// coverage against a particular history is the driver's responsibility.
+    pub fn validate(&self) -> Result<(), SummaryProvenanceError> {
+        if !bounded_identity(&self.timeline_id)
+            || !bounded_identity(&self.node_id)
+            || !bounded_revision(&self.authorization_revision)
+            || !bounded_revision(&self.store_revision)
+            || !bounded_revision(&self.store_view_revision)
+            || !bounded_revision(&self.policy_revision)
+            || !bounded_revision(&self.algorithm_revision)
+            || !bounded_revision(&self.sizer_revision)
+            || !bounded_revision(&self.summary_revision)
+        {
+            return Err(SummaryProvenanceError::MissingIdentity);
+        }
+        if !self.has_valid_range()
+            || self.node_revision == 0
+            || self.node_revision > self.dag_revision
+            || self.source_tokens == 0
+            || self.token_count == 0
+            || self.token_count >= self.source_tokens
+            || self.child_node_ids.len() > MAX_LOSSLESS_CHILD_IDS
+            || self.child_node_ids.iter().any(|id| !bounded_identity(id))
+            || self.child_node_ids.iter().collect::<BTreeSet<_>>().len()
+                != self.child_node_ids.len()
+            || self
+                .operation_id
+                .as_deref()
+                .is_some_and(|id| !bounded_identity(id))
+            || self.operation_id.is_some() != self.operation_fingerprint.is_some()
+            || !valid_classification(&self.classification)
+        {
+            return Err(SummaryProvenanceError::InvalidRange);
+        }
+        if self.classification.sensitivity == Sensitivity::Secret {
+            return Err(SummaryProvenanceError::SecretSource);
+        }
+        match &self.producer {
+            LosslessSummaryProducer::Deterministic { algorithm_revision } => {
+                if !bounded_revision(algorithm_revision)
+                    || self.algorithm_revision != *algorithm_revision
+                {
+                    return Err(SummaryProvenanceError::RevisionMismatch);
+                }
+            }
+            LosslessSummaryProducer::Model {
+                model_id,
+                model_revision,
+                purpose,
+                escalation_level,
+            } if !bounded_identity(model_id)
+                || !bounded_revision(model_revision)
+                || !bounded_metadata(purpose)
+                || !(1..=3).contains(escalation_level) =>
+            {
+                return Err(SummaryProvenanceError::MissingModelMetadata);
+            }
+            LosslessSummaryProducer::Model { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+fn bounded_identity(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= MAX_LOSSLESS_ID_CHARS
+}
+
+fn bounded_metadata(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= MAX_LOSSLESS_METADATA_CHARS
+}
+
+fn bounded_revision(revision: &RegistryRevision) -> bool {
+    bounded_metadata(revision.as_str())
+}
+
+fn valid_classification(classification: &LosslessSummaryClassification) -> bool {
+    classification.guard_revisions.len() <= MAX_LOSSLESS_CLASSIFICATION_REVISIONS
+        && classification.transformation_revisions.len() <= MAX_LOSSLESS_CLASSIFICATION_REVISIONS
+        && classification
+            .guard_revision
+            .as_deref()
+            .is_none_or(bounded_metadata)
+        && match (
+            classification.guard_revision.as_ref(),
+            classification.guard_revisions.len(),
+        ) {
+            (None, 0) | (None, 2..=usize::MAX) => true,
+            (Some(revision), 1) => classification.guard_revisions.contains(revision),
+            _ => false,
+        }
+        && classification
+            .guard_revisions
+            .iter()
+            .all(|revision| bounded_metadata(revision))
+        && classification
+            .transformation_revision
+            .as_ref()
+            .is_none_or(bounded_revision)
+        && match (
+            classification.transformation_revision.as_ref(),
+            classification.transformation_revisions.len(),
+        ) {
+            (None, 0) | (None, 2..=usize::MAX) => true,
+            (Some(revision), 1) => classification
+                .transformation_revisions
+                .contains(revision.as_str()),
+            _ => false,
+        }
+        && classification
+            .transformation_revisions
+            .iter()
+            .all(|revision| bounded_metadata(revision))
+}
+
+/// Why summary provenance cannot be accepted for semantic projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryProvenanceError {
+    /// The summary lacks the exact artifact or lossless identity needed to
+    /// recover its source.
+    MissingIdentity,
+    /// The source range/count metadata is inconsistent.
+    InvalidRange,
+    /// Secret content was marked as summary input.
+    SecretSource,
+    /// A model-produced summary omitted required model metadata.
+    MissingModelMetadata,
+    /// The deterministic producer and record algorithm revisions disagree.
+    RevisionMismatch,
+    /// The outer summary classification disagrees with its lossless record.
+    ClassificationMismatch,
+    /// The exact covered fragment list disagrees with the lossless range.
+    CoverageMismatch,
+    /// A legacy artifact-backed summary omitted its model metadata.
+    MissingLegacyMetadata,
+    /// Legacy and lossless provenance were mixed in one record.
+    MixedProvenance,
+}
+
+impl fmt::Display for SummaryProvenanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::MissingIdentity => "summary provenance identity is missing",
+            Self::InvalidRange => "summary provenance range is invalid",
+            Self::SecretSource => "secret source cannot be summarized",
+            Self::MissingModelMetadata => "model summary provenance is missing model metadata",
+            Self::RevisionMismatch => "summary producer revision does not match its record",
+            Self::ClassificationMismatch => {
+                "summary classification does not match its lossless record"
+            }
+            Self::CoverageMismatch => "summary coverage does not match its lossless range",
+            Self::MissingLegacyMetadata => {
+                "legacy artifact-backed summary provenance is incomplete"
+            }
+            Self::MixedProvenance => "legacy and lossless summary provenance were mixed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SummaryProvenanceError {}
+
 /// Which original fragment ids one summary replaced, and under which policy
 /// revision — the provenance the "summaries carry provenance" requirement
 /// demands. Lives beside the fragment rather than on it, since
 /// [`ContextFragment`] has no compaction-specific fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryProvenance {
     /// The summary fragment's id.
     pub summary: FragmentId,
@@ -77,6 +503,218 @@ pub struct SummaryProvenance {
     /// Maximum sensitivity among covered originals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensitivity: Option<Sensitivity>,
+    /// Neutral lossless-summary metadata, when this summary came from an LCM
+    /// timeline/DAG rather than a protected legacy artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless: Option<LosslessSummaryProvenance>,
+}
+
+impl fmt::Debug for SummaryProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SummaryProvenance")
+            .field(
+                "summary",
+                &Fingerprint::of(self.summary.as_str().as_bytes()),
+            )
+            .field(
+                "covers",
+                &self
+                    .covers
+                    .iter()
+                    .map(|id| Fingerprint::of(id.as_str().as_bytes()))
+                    .collect::<Vec<_>>(),
+            )
+            .field("policy_revision", &self.policy_revision)
+            .field(
+                "source_artifact",
+                &self
+                    .source_artifact
+                    .as_ref()
+                    .map(|artifact| Fingerprint::of(artifact.id.as_str().as_bytes())),
+            )
+            .field(
+                "model_purpose",
+                &self
+                    .model_purpose
+                    .as_ref()
+                    .map(|purpose| Fingerprint::of(purpose.as_bytes())),
+            )
+            .field("model_revision", &self.model_revision)
+            .field("sensitivity", &self.sensitivity)
+            .field("lossless", &self.lossless)
+            .finish()
+    }
+}
+
+impl SummaryProvenance {
+    /// Attaches neutral lossless-summary metadata.
+    pub fn with_lossless(mut self, lossless: LosslessSummaryProvenance) -> Self {
+        self.lossless = Some(lossless);
+        self
+    }
+
+    /// Validates the producer/provenance shape required by history projection.
+    /// Legacy artifact-backed summaries retain their model requirements;
+    /// deterministic lossless summaries do not acquire a fabricated model
+    /// requirement.
+    pub fn validate_for_projection(&self) -> Result<(), SummaryProvenanceError> {
+        if !bounded_identity(self.summary.as_str())
+            || self
+                .covers
+                .iter()
+                .any(|cover| !bounded_identity(cover.as_str()))
+        {
+            return Err(SummaryProvenanceError::MissingIdentity);
+        }
+        let mut covered = BTreeSet::new();
+        if self.covers.is_empty()
+            || self
+                .covers
+                .iter()
+                .any(|cover| !covered.insert(cover.as_str()))
+            || self.covers.iter().any(|cover| cover == &self.summary)
+            || (self.lossless.is_none() && !canonical_cover_order(&self.covers))
+        {
+            return Err(SummaryProvenanceError::CoverageMismatch);
+        }
+        if !bounded_revision(&self.policy_revision) {
+            return Err(SummaryProvenanceError::RevisionMismatch);
+        }
+
+        if let Some(lossless) = &self.lossless {
+            if self.source_artifact.is_some() {
+                return Err(SummaryProvenanceError::MixedProvenance);
+            }
+            if self.policy_revision != lossless.policy_revision {
+                return Err(SummaryProvenanceError::RevisionMismatch);
+            }
+            if self.sensitivity != Some(lossless.classification.sensitivity) {
+                return Err(SummaryProvenanceError::ClassificationMismatch);
+            }
+            if self.covers.len() as u64 != lossless.covered_count
+                || !canonical_lossless_covers(
+                    &self.covers,
+                    lossless.source_range_start,
+                    lossless.source_range_end,
+                )
+            {
+                return Err(SummaryProvenanceError::CoverageMismatch);
+            }
+            if self.sensitivity == Some(Sensitivity::Secret)
+                || lossless.classification.sensitivity == Sensitivity::Secret
+            {
+                return Err(SummaryProvenanceError::SecretSource);
+            }
+            lossless.validate()?;
+            match &lossless.producer {
+                LosslessSummaryProducer::Deterministic { .. } => {
+                    if self.model_purpose.is_some() || self.model_revision.is_some() {
+                        return Err(SummaryProvenanceError::MixedProvenance);
+                    }
+                }
+                LosslessSummaryProducer::Model {
+                    model_revision,
+                    purpose,
+                    ..
+                } => {
+                    if self.model_purpose.as_deref() != Some(purpose.as_str())
+                        || self.model_revision.as_ref() != Some(model_revision)
+                    {
+                        return Err(SummaryProvenanceError::MixedProvenance);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if self.source_artifact.is_none()
+            || self
+                .model_purpose
+                .as_deref()
+                .is_none_or(|purpose| !bounded_metadata(purpose))
+            || self
+                .model_revision
+                .as_ref()
+                .is_none_or(|revision| !bounded_revision(revision))
+            || self.sensitivity == Some(Sensitivity::Secret)
+        {
+            return Err(SummaryProvenanceError::MissingLegacyMetadata);
+        }
+        Ok(())
+    }
+}
+
+/// Checks that the outer fragment ids are unique and retain the canonical
+/// source order. LCM projections use `history:<sequence>` ids; those must be
+/// compared numerically rather than lexicographically (`history:10` follows
+/// `history:9`). Other host fragment ids retain their existing ordered-id
+/// contract and are checked for strict deterministic ordering.
+fn canonical_lossless_covers(
+    covers: &[FragmentId],
+    source_range_start: u64,
+    source_range_end: u64,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    if covers.iter().any(|cover| !seen.insert(cover.as_str())) {
+        return false;
+    }
+
+    let all_history_ids = covers
+        .iter()
+        .all(|cover| cover.as_str().starts_with("history:"));
+    if !all_history_ids
+        && covers
+            .iter()
+            .any(|cover| cover.as_str().starts_with("history:"))
+    {
+        return false;
+    }
+    if all_history_ids {
+        return covers.iter().enumerate().all(|(offset, cover)| {
+            let Some(sequence) = cover
+                .as_str()
+                .strip_prefix("history:")
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                return false;
+            };
+            let Some(offset) = u64::try_from(offset).ok() else {
+                return false;
+            };
+            source_range_start
+                .checked_add(offset)
+                .is_some_and(|expected| expected == sequence)
+                && sequence <= source_range_end
+        });
+    }
+
+    covers
+        .windows(2)
+        .all(|window| window[0].as_str() < window[1].as_str())
+}
+
+fn canonical_cover_order(covers: &[FragmentId]) -> bool {
+    let all_history_ids = covers
+        .iter()
+        .all(|cover| cover.as_str().starts_with("history:"));
+    if all_history_ids {
+        let mut sequences = Vec::with_capacity(covers.len());
+        for cover in covers {
+            let Some(sequence) = cover
+                .as_str()
+                .strip_prefix("history:")
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                return false;
+            };
+            sequences.push(sequence);
+        }
+        return sequences.windows(2).all(|window| window[0] < window[1]);
+    }
+    covers
+        .windows(2)
+        .all(|window| window[0].as_str() < window[1].as_str())
 }
 
 /// What one compaction pass actually did.
@@ -162,6 +800,8 @@ pub enum CompactionErrorKind {
     InvalidPairing,
     /// A `Sensitivity::Secret` fragment was covered by a new summary.
     SecretSummarized,
+    /// A summary carried incomplete or inconsistent provenance metadata.
+    InvalidSummaryProvenance,
 }
 
 impl CompactionErrorKind {
@@ -172,6 +812,7 @@ impl CompactionErrorKind {
             CompactionErrorKind::RequiredContentModified => "required_content_modified",
             CompactionErrorKind::InvalidPairing => "invalid_pairing",
             CompactionErrorKind::SecretSummarized => "secret_summarized",
+            CompactionErrorKind::InvalidSummaryProvenance => "invalid_summary_provenance",
         }
     }
 }
@@ -223,6 +864,16 @@ impl CompactionError {
             kind: CompactionErrorKind::SecretSummarized,
             message: format!("secret fragment `{fragment}` must never be summarized"),
             fragment: Some(fragment),
+        }
+    }
+
+    /// A summary omitted or contradicted its required provenance metadata.
+    /// The underlying validation error is static and carries no opaque ids.
+    pub fn invalid_summary_provenance(error: SummaryProvenanceError) -> Self {
+        Self {
+            kind: CompactionErrorKind::InvalidSummaryProvenance,
+            message: error.to_string(),
+            fragment: None,
         }
     }
 }
@@ -298,6 +949,9 @@ pub fn validate_compacted(
             if was_secret {
                 return Err(CompactionError::secret_summarized(covered.clone()));
             }
+        }
+        if let Err(error) = summary.validate_for_projection() {
+            return Err(CompactionError::invalid_summary_provenance(error));
         }
     }
 
@@ -927,11 +1581,268 @@ mod tests {
                 model_purpose: None,
                 model_revision: None,
                 sensitivity: None,
+                lossless: None,
             }],
             ..CompactionOutcome::default()
         };
         let err = validate_compacted(&original, &candidate, &outcome).unwrap_err();
         assert_eq!(err.kind, CompactionErrorKind::SecretSummarized);
+    }
+
+    #[test]
+    fn validate_compacted_rejects_invalid_summary_provenance() {
+        let original = vec![history_fragment("history-1", 1, "source")];
+        let candidate = vec![history_fragment("summary-1", 2, "summary")];
+        let outcome = CompactionOutcome {
+            summarized: vec![SummaryProvenance {
+                summary: FragmentId::new("summary-1"),
+                covers: vec![FragmentId::new("history-1")],
+                policy_revision: RegistryRevision::new("policy-1"),
+                source_artifact: None,
+                model_purpose: None,
+                model_revision: None,
+                sensitivity: None,
+                lossless: None,
+            }],
+            ..CompactionOutcome::default()
+        };
+        let err = validate_compacted(&original, &candidate, &outcome).unwrap_err();
+        assert_eq!(err.kind, CompactionErrorKind::InvalidSummaryProvenance);
+        assert_eq!(
+            err.message,
+            "legacy artifact-backed summary provenance is incomplete"
+        );
+        assert!(err.fragment.is_none());
+    }
+
+    fn lossless_provenance(producer: LosslessSummaryProducer) -> LosslessSummaryProvenance {
+        LosslessSummaryProvenance {
+            timeline_id: "timeline-a".into(),
+            node_id: "node-a".into(),
+            dag_revision: 2,
+            node_revision: 1,
+            authorization_revision: RegistryRevision::new("binding-1"),
+            store_revision: RegistryRevision::new("store-1"),
+            store_view_revision: RegistryRevision::new("view-1"),
+            source_range_start: 0,
+            source_range_end: 1,
+            covered_count: 2,
+            source_tokens: 30,
+            token_count: 12,
+            source_fingerprint: Fingerprint::of("source"),
+            policy_revision: RegistryRevision::new("policy-1"),
+            algorithm_revision: RegistryRevision::new("algorithm-1"),
+            sizer_revision: RegistryRevision::new("sizer-1"),
+            summary_revision: RegistryRevision::new("summary-1"),
+            classification: LosslessSummaryClassification::new(
+                Sensitivity::Internal,
+                TrustClass::UserContent,
+            ),
+            producer,
+            child_node_ids: Vec::new(),
+            operation_id: None,
+            operation_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn deterministic_lossless_provenance_does_not_require_model_fields() {
+        let lossless = lossless_provenance(LosslessSummaryProducer::Deterministic {
+            algorithm_revision: RegistryRevision::new("algorithm-1"),
+        });
+        let provenance = SummaryProvenance {
+            summary: FragmentId::new("summary-id"),
+            covers: vec![FragmentId::new("history:0"), FragmentId::new("history:1")],
+            policy_revision: RegistryRevision::new("policy-1"),
+            source_artifact: None,
+            model_purpose: None,
+            model_revision: None,
+            sensitivity: Some(Sensitivity::Internal),
+            lossless: Some(lossless.clone()),
+        };
+        assert!(provenance.validate_for_projection().is_ok());
+        assert!(
+            serde_json::to_string(&provenance)
+                .unwrap()
+                .contains("source_fingerprint")
+        );
+        let debug = format!("{lossless:?}");
+        assert!(debug.contains("timeline_id"));
+        assert!(!debug.contains("timeline-a"));
+        let outer_debug = format!("{provenance:?}");
+        assert!(!outer_debug.contains("history:0"));
+        assert!(!outer_debug.contains("summary-id"));
+    }
+
+    #[test]
+    fn joined_classification_preserves_exact_revision_sets_without_fabrication() {
+        let one =
+            LosslessSummaryClassification::new(Sensitivity::Internal, TrustClass::UserContent)
+                .with_guard_revisions(["guard-a"])
+                .with_transformation_revisions(["transform-a"]);
+        assert_eq!(one.guard_revision.as_deref(), Some("guard-a"));
+        assert_eq!(
+            one.transformation_revision
+                .as_ref()
+                .map(RegistryRevision::as_str),
+            Some("transform-a")
+        );
+
+        let many = one
+            .with_guard_revisions(["guard-b"])
+            .with_transformation_revisions(["transform-b"]);
+        assert!(many.guard_revision.is_none());
+        assert!(many.transformation_revision.is_none());
+        assert!(valid_classification(&many));
+    }
+
+    #[test]
+    fn lossless_provenance_rejects_non_shrinking_or_incoherent_commit_metadata() {
+        let mut lossless = lossless_provenance(LosslessSummaryProducer::Deterministic {
+            algorithm_revision: RegistryRevision::new("algorithm-1"),
+        });
+        lossless.token_count = 0;
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::InvalidRange)
+        );
+
+        lossless.token_count = lossless.source_tokens;
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::InvalidRange)
+        );
+
+        lossless.token_count = 12;
+        lossless.node_revision = lossless.dag_revision + 1;
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::InvalidRange)
+        );
+
+        lossless.node_revision = 1;
+        lossless.operation_id = Some("operation-a".into());
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::InvalidRange)
+        );
+
+        lossless.operation_fingerprint = Some(Fingerprint::of("operation-a"));
+        lossless.child_node_ids = vec!["child-a".into(), "child-a".into()];
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::InvalidRange)
+        );
+
+        lossless.child_node_ids.clear();
+        lossless.store_revision = RegistryRevision::new(" ");
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::MissingIdentity)
+        );
+    }
+
+    #[test]
+    fn model_lossless_provenance_requires_purpose_and_escalation_metadata() {
+        let lossless = lossless_provenance(LosslessSummaryProducer::Model {
+            model_id: "summary-model".into(),
+            model_revision: RegistryRevision::new("model-1"),
+            purpose: "context.semantic_summary".into(),
+            escalation_level: 1,
+        });
+        let mut provenance = SummaryProvenance {
+            summary: FragmentId::new("summary-id"),
+            covers: vec![FragmentId::new("history:0"), FragmentId::new("history:1")],
+            policy_revision: RegistryRevision::new("policy-1"),
+            source_artifact: None,
+            model_purpose: Some("context.semantic_summary".into()),
+            model_revision: Some(RegistryRevision::new("model-1")),
+            sensitivity: Some(Sensitivity::Internal),
+            lossless: Some(lossless.clone()),
+        };
+        assert!(provenance.validate_for_projection().is_ok());
+
+        provenance.sensitivity = None;
+        assert_eq!(
+            provenance.validate_for_projection(),
+            Err(SummaryProvenanceError::ClassificationMismatch)
+        );
+        provenance.sensitivity = Some(Sensitivity::Internal);
+        provenance.model_purpose = Some("wrong-purpose".into());
+        assert_eq!(
+            provenance.validate_for_projection(),
+            Err(SummaryProvenanceError::MixedProvenance)
+        );
+        provenance.model_purpose = Some("context.semantic_summary".into());
+        provenance.model_revision = None;
+        assert_eq!(
+            provenance.validate_for_projection(),
+            Err(SummaryProvenanceError::MixedProvenance)
+        );
+        provenance.model_revision = Some(RegistryRevision::new("model-1"));
+
+        provenance.policy_revision = RegistryRevision::new("policy-other");
+        assert_eq!(
+            provenance.validate_for_projection(),
+            Err(SummaryProvenanceError::RevisionMismatch)
+        );
+        provenance.policy_revision = RegistryRevision::new("policy-1");
+        provenance.sensitivity = Some(Sensitivity::Public);
+        assert_eq!(
+            provenance.validate_for_projection(),
+            Err(SummaryProvenanceError::ClassificationMismatch)
+        );
+        provenance.sensitivity = Some(Sensitivity::Internal);
+        provenance.covers.reverse();
+        assert_eq!(
+            provenance.validate_for_projection(),
+            Err(SummaryProvenanceError::CoverageMismatch)
+        );
+
+        provenance.covers = vec![FragmentId::new("history:10"), FragmentId::new("history:11")];
+        {
+            let lossless = provenance.lossless.as_mut().expect("lossless metadata");
+            lossless.source_range_start = 10;
+            lossless.source_range_end = 11;
+        }
+        assert!(provenance.validate_for_projection().is_ok());
+
+        provenance.covers[1] = FragmentId::new("history:10");
+        assert_eq!(
+            provenance.validate_for_projection(),
+            Err(SummaryProvenanceError::CoverageMismatch)
+        );
+
+        let lossless = provenance.lossless.as_mut().expect("lossless metadata");
+        lossless.source_range_end = u64::MAX;
+        lossless.covered_count = u64::MAX;
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::InvalidRange)
+        );
+    }
+
+    #[test]
+    fn lossless_identity_and_child_bounds_fail_closed() {
+        let mut lossless = lossless_provenance(LosslessSummaryProducer::Deterministic {
+            algorithm_revision: RegistryRevision::new("algorithm-1"),
+        });
+        lossless.timeline_id = "x".repeat(MAX_LOSSLESS_ID_CHARS + 1);
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::MissingIdentity)
+        );
+
+        let mut lossless = lossless_provenance(LosslessSummaryProducer::Deterministic {
+            algorithm_revision: RegistryRevision::new("algorithm-1"),
+        });
+        lossless.child_node_ids = (0..=MAX_LOSSLESS_CHILD_IDS)
+            .map(|index| format!("child-{index}"))
+            .collect();
+        assert_eq!(
+            lossless.validate(),
+            Err(SummaryProvenanceError::InvalidRange)
+        );
     }
 
     #[test]

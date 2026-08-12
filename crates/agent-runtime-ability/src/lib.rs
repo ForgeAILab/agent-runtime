@@ -31,7 +31,9 @@
 //! (std-only), so any system can reuse the descriptor and activation
 //! contracts without pulling in the agent loop. The optional `tool` feature
 //! bridges the runtime's `Tool` contract (pulling `agent-runtime-core`);
-//! `serde` adds (de)serialization to descriptors and cards.
+//! `serde` adds (de)serialization to descriptors and cards; and `skill-files`
+//! enables SHA-256 verification when activating file-backed skills. The
+//! `agent-runtime` facade enables all three integration features.
 //!
 //! # Example
 //!

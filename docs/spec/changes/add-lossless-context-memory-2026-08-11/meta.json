@@ -1,0 +1,19 @@
+{
+  "change_id": "add-lossless-context-memory",
+  "change_ref": "add-lossless-context-memory-2026-08-11",
+  "created_at": "2026-08-11T21:39:04Z",
+  "updated_at": "2026-08-12T01:49:11Z",
+  "completed_at": "2026-08-12T01:49:11Z",
+  "status": "implemented",
+  "depends_on": [],
+  "coordinates_with": [
+    "add-runtime-security-boundary-2026-07-24"
+  ],
+  "external_dependencies": [
+    {
+      "repository": "Nyx",
+      "revision": "9614842d8f614d7d41e00d8e73ed3d042764d451",
+      "purpose": "donor implementation and conformance evidence"
+    }
+  ]
+}

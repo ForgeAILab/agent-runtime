@@ -41,8 +41,8 @@ use crate::agent::config::{DowngradePolicy, LoopConfig};
 use crate::agent::driver::Driver;
 use crate::capability::{ActivationBudget, CapabilityResolver};
 use crate::harness::{
-    ContextContributor, HarnessPipelineBuilder, HistoryProjector, LiveAbilityRuntime,
-    ModelInterceptor, ToolOutputProcessor, ToolViewResolver, TurnCommitHook,
+    ContextContributor, HarnessPipelineBuilder, HistoryProjector, LcmCoordinator,
+    LiveAbilityRuntime, ModelInterceptor, ToolOutputProcessor, ToolViewResolver, TurnCommitHook,
 };
 use crate::hub::ScopeInputs;
 use crate::provider::retry::RetryPolicy;
@@ -99,6 +99,7 @@ pub struct RuntimeBuilder {
     activation_context: ActivationContext,
     activation_budget: Option<ActivationBudget>,
     harness: HarnessPipelineBuilder,
+    lcm: Option<Arc<LcmCoordinator>>,
 }
 
 impl RuntimeBuilder {
@@ -151,6 +152,7 @@ impl RuntimeBuilder {
             activation_context: ActivationContext::new(),
             activation_budget: None,
             harness: HarnessPipelineBuilder::new(),
+            lcm: None,
         }
     }
 
@@ -310,13 +312,27 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Adds the one protected semantic-history projector.
+    /// Adds the one protected history projector.
     ///
     /// The same component will commonly also be registered as a
     /// [`TurnCommitHook`] so model/storage work happens at a durable boundary
     /// and provider planning only projects already-checkpointed state.
     pub fn history_projector(mut self, component: Arc<dyn HistoryProjector>) -> Self {
         self.harness.history_projector(component);
+        self
+    }
+
+    /// Registers one LCM coordinator as both the protected history projector
+    /// and turn-commit hook. The exact same coordinator allocation is retained
+    /// in the runtime's shared composition for resume/import integration.
+    ///
+    /// Registration remains explicit: calling this more than once, or pairing
+    /// it with another history projector, is rejected when the harness
+    /// pipeline is sealed rather than silently composing two histories.
+    pub fn lcm(mut self, coordinator: Arc<LcmCoordinator>) -> Self {
+        self.harness.history_projector(coordinator.clone());
+        self.harness.turn_commit_hook(coordinator.clone());
+        self.lcm = Some(coordinator);
         self
     }
 
@@ -844,6 +860,7 @@ impl RuntimeBuilder {
             shutdown_timeout_ms: self.shutdown_timeout_ms,
             injection_queue_limit: self.injection_queue_limit,
             active_sessions: Arc::new(ActiveSessionRegistry::default()),
+            lcm: self.lcm,
         };
         Ok(Runtime::from_shared(Arc::new(shared)))
     }

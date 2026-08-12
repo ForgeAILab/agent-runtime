@@ -169,9 +169,11 @@ pub mod prelude {
         ResourceLimitKind, ResourceLimits, TerminationReason, VerifiedArtifact, backend_conforms,
     };
     pub use crate::manifest::{
-        ActivatedCapability, CapabilityResolution, ContextSegmentRecord, MANIFEST_SCHEMA_VERSION,
-        ManifestReason, ModelResolution, PolicyRevisions, ReplayMismatch, ReplayMode,
-        RevisionMismatch, RunManifest, SegmentId, SegmentKind, SegmentSensitivity, SummaryCoverage,
+        ActivatedCapability, CapabilityResolution, ContextSegmentRecord, LosslessReplayMismatch,
+        LosslessSummaryClassification, LosslessSummaryProducer, LosslessSummaryRecord,
+        MANIFEST_SCHEMA_VERSION, ManifestReason, ModelResolution, PolicyRevisions, ReplayMismatch,
+        ReplayMode, RevisionMismatch, RunManifest, SegmentId, SegmentKind, SegmentSensitivity,
+        SummaryCoverage,
     };
     pub use crate::metadata::{MetaValue, Metadata, VendorLimits};
     pub use crate::observer::EventObserver;

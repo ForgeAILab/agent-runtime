@@ -11,6 +11,33 @@ contain breaking changes and are coordinated with consumer proposals.
 
 See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 
+- The removed session-scoped rolling-summary contract is replaced by Lossless
+  Context Memory (LCM). Hosts bind an authorized logical timeline and compose
+  `LcmCoordinator`; when `.lcm` is configured, resume automatically imports
+  valid schema-v1 state only when the coordinator has the legacy protected
+  `ArtifactStore` and the runtime has a durable `SessionStore`, validates
+  canonical history/artifact/binding identity, and persists the replacement
+  before accepting turns. There is no public/manual restore alias or second
+  semantic-compaction path.
+- `RunManifest` is now manifest schema v2 with redaction-safe lossless LCM
+  records and fingerprint semantics. `RunManifest::check_replay_as` returns a
+  typed `ReplayMismatch` report covering revision, lossless-record, and
+  assembled-context differences, even for a labeled non-equivalent replay;
+  strict equivalent replay rejects every such difference. LCM equivalent
+  replay must use `check_replay_with_lossless_context` or
+  `check_replay_as_with_lossless_context` with the restored lossless records
+  and assembled context fingerprint; the revision-only entry points do not
+  establish LCM equivalence.
+- The old idle semantic-summary API is replaced by
+  `SessionHandle::try_idle_compaction()`, which returns metadata only through
+  `IdleCompactionAdmission::Accepted { changed, fallback_reason, usage }`
+  (or `Busy`/`Shutdown`). No summary body crosses the runtime facade.
+- LCM integrations may attach a summary-body `ContentGuard`; its ID/revision
+  is a strict checkpoint compatibility boundary and guarded historical state
+  fails closed if the guard is removed. `SessionHandle::expand_lcm` provides
+  bounded, read-only inspection through the coordinator's host-authorized
+  timeline binding and emits metadata-only lifecycle events.
+
 - `RuntimeBuilder::build()` now **requires** a resolvable model profile, via
   `model_profile(..)` or `model_catalog(..)`, and fails otherwise. There is no
   default context window: a runtime that cannot state its model's limits cannot
@@ -25,7 +52,7 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - `Named`/`Registry<T>`/`Sealed<T>` moved to `agent-runtime-registry`. A `Named`
   impl on a foreign type (e.g. `Arc<dyn YourTrait>`) is now an orphan impl and
   needs a local newtype.
-- Event `SCHEMA_VERSION` is now `13`. Since the registry-driven v2 baseline,
+- Event `SCHEMA_VERSION` is now `15`. Since the registry-driven v2 baseline,
   tool-call argument projection, delegation, attempt-scoped streaming,
   metadata-only host interaction, lossless child `needs_input`, and
   durability-aligned `PlanUpdated`, durable-child recovery/resume, and
@@ -36,8 +63,11 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   provider observation, saturating shortfall, and confidence. Exhaustive
   provider/event matches must handle the new shapes. Legacy numeric cache
   observations remain readable without fabricating attribution or a miss.
-  Golden fixtures retain the compatible v5 through v13 wire forms; pre-v5
-  unattributed output deltas are intentionally rejected.
+  Version 14 adds the canonical cache-operation lifecycle; version 15 adds the
+  metadata-only `LcmLifecycle` event for pressure, admission, escalation,
+  commits, fallback, import, expansion, and failure. Golden fixtures retain
+  the compatible v5-v11 and v13-v15 wire forms; pre-v5 unattributed output
+  deltas are intentionally rejected.
 - `SessionHandle::send` and `run` return `Result<TurnHandle, RuntimeError>`.
   `TurnHandle` owns turn-local interruption and completion; use
   `cancel_session` only for terminal session teardown. The compatibility
@@ -55,10 +85,10 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   Chronology is preserved within one conversation lane, complete parallel
   tool exchanges are atomic, and the active-turn continuation is required
   during compaction.
-- Deterministic compaction is named `StructuralCompactor` and no longer
-  fabricates semantic summaries. The asynchronous semantic-summary
-  coordinator stores originals, calls a purpose-attributed model, and submits
-  provenance-bearing history projection back through deterministic planning.
+- Deterministic structural compaction remains network-free. Persisted semantic
+  history compaction now uses LCM's immutable timeline and transactional
+  hierarchical summary DAG; committed active nodes are projected back through
+  the authoritative context planner with lossless source pointers.
 - Live ability routing derives a scoped view and activation epochs per
   session. `registry.search` stages an authorized, dependency-complete bundle
   transactionally and exposes it only after the canonical search result
@@ -95,6 +125,11 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- `agent-runtime-lcm`, a store- and provider-neutral package for immutable
+  logical timelines, transactional leaf/condensed summary DAGs, deterministic
+  tool-exchange-safe planning, bounded expansion, soft/hard pressure decisions,
+  and three-stage convergence-guaranteed summarization. The runtime facade
+  re-exports it as `agent_runtime::lcm`.
 - Native stateless OpenAI Responses provider, first fixture-verified against
   xAI Grok: bounded input-item encoding, session-keyed implicit prompt caching,
   encrypted reasoning replay, function-call streaming, structured output,
@@ -139,8 +174,8 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 - Standard harness components: typed checkpointed todos with `PlanUpdated`,
   descriptor-first lazily verified skills, bounded memory contribution,
   session-private artifact offloading plus authorized paginated
-  `artifact.read`, structured questionnaire interaction, and
-  purpose-attributed semantic summary coordination. Persistent goals add
+  `artifact.read`, structured questionnaire interaction, and Lossless Context
+  Memory coordination. Persistent goals add
   descriptor-first `get_goal`/`create_goal`/`update_goal`, optimistic typed
   host controls, provider-evidence accounting, and a process-scoped conditional
   continuation controller with no synthetic user history.

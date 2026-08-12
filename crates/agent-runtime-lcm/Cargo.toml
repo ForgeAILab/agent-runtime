@@ -1,0 +1,32 @@
+[package]
+name = "agent-runtime-lcm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Host-neutral lossless context memory identities, DAG contracts, planning, and bounded summarization"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+agent-runtime-core.workspace = true
+agent-runtime-context.workspace = true
+agent-runtime-registry = { workspace = true, features = ["serde"] }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+# Reference storage is intentionally opt-in. Production hosts should provide
+# their own transactional adapter and run the conformance suite against it.
+test-support = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+
+[lints]
+workspace = true

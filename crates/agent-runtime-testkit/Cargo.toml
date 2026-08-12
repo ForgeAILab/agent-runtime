@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 agent-runtime-core.workspace = true
+agent-runtime-lcm = { workspace = true, features = ["test-support"] }
 agent-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true

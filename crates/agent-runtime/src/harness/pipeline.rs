@@ -19,7 +19,8 @@ use agent_runtime_core::clock::Timestamp;
 use agent_runtime_core::content::{Message, ToolCall};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{
-    GoalUpdateCause, PlanItemProjection, PlanSensitivity, RuntimeEvent, TurnFinish,
+    GoalUpdateCause, LcmLifecycleKind, LcmLifecycleMetadata, LcmLifecycleReason,
+    PlanItemProjection, PlanSensitivity, RuntimeEvent, TurnFinish,
 };
 use agent_runtime_core::goal::GoalProjection;
 use agent_runtime_core::ids::{SessionId, TurnId};
@@ -137,7 +138,7 @@ impl fmt::Debug for HistoryProjection {
     }
 }
 
-/// Projects a previously checkpointed semantic summary into context.
+/// Projects previously checkpointed history compaction into context.
 ///
 /// This phase is read-only. Model/storage work belongs in a turn-commit hook
 /// so no uncheckpointed side effect occurs while a provider request is being
@@ -566,11 +567,14 @@ pub enum HarnessEvent {
         /// Public projection. Sensitive components emit metadata-only absence.
         goal: Option<GoalProjection>,
     },
-    /// Optional semantic summarization fell back to unchanged structural
-    /// planning. The reason is a bounded category, never model/store content.
-    SemanticSummaryFallback {
-        /// Stable safe reason category.
-        reason: String,
+    /// Redaction-safe LCM pressure or operation metadata.
+    LcmLifecycle {
+        /// Typed LCM lifecycle phase.
+        kind: LcmLifecycleKind,
+        /// Typed bounded reason, when one applies.
+        reason: Option<LcmLifecycleReason>,
+        /// Opaque identities, revisions, classifications, and token metrics.
+        metadata: Box<LcmLifecycleMetadata>,
     },
 }
 
@@ -597,9 +601,14 @@ impl HarnessEvent {
                 sensitivity,
                 goal,
             },
-            Self::SemanticSummaryFallback { reason } => RuntimeEvent::Downgrade {
-                capability: "semantic_summary".into(),
-                detail: reason,
+            Self::LcmLifecycle {
+                kind,
+                reason,
+                metadata,
+            } => RuntimeEvent::LcmLifecycle {
+                kind,
+                reason,
+                metadata: *metadata,
             },
         }
     }
@@ -619,14 +628,15 @@ pub trait ToolOutputProcessor: Send + Sync + fmt::Debug {
     ) -> Result<ToolOutputPatch, RuntimeError>;
 }
 
-/// Immutable input after a turn reaches its terminal commit boundary.
+/// Immutable input at a terminal commit or protected pre-provider boundary.
 #[derive(Clone)]
 pub struct TurnCommitView {
     /// Owning session.
     pub session: SessionId,
-    /// Completed turn.
+    /// Logical turn being committed or admitted.
     pub turn: TurnId,
-    /// Terminal result.
+    /// Terminal result, or `Completed` as the admission placeholder before a
+    /// provider call.
     pub finish: TurnFinish,
     /// Typed provider failure responsible for the terminal result, if any.
     pub provider_error_kind: Option<ProviderErrorKind>,
@@ -684,12 +694,129 @@ impl fmt::Debug for TurnCommitPatch {
     }
 }
 
+/// Result of one explicit idle-boundary hook pass.
+///
+/// The patch is applied and durably persisted before a caller honors
+/// `retry_after_checkpoint`. This is the only idle retry signal; components
+/// cannot request an implicit in-process loop.
+#[derive(Clone, Default)]
+pub struct IdleCompactionResult {
+    /// State, usage, and lifecycle events produced by this idle pass.
+    pub patch: TurnCommitPatch,
+    /// Request one second pass after `patch` has crossed the SessionStore
+    /// boundary. The runtime reruns only the LCM hook for that pass.
+    pub retry_after_checkpoint: bool,
+}
+
+impl IdleCompactionResult {
+    /// Completes the idle boundary after applying `patch`.
+    pub fn complete(patch: TurnCommitPatch) -> Self {
+        Self {
+            patch,
+            retry_after_checkpoint: false,
+        }
+    }
+
+    /// Persists `patch` before rerunning the owning LCM hook once.
+    pub fn checkpoint_and_retry(patch: TurnCommitPatch) -> Self {
+        Self {
+            patch,
+            retry_after_checkpoint: true,
+        }
+    }
+}
+
+impl fmt::Debug for IdleCompactionResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdleCompactionResult")
+            .field("patch", &self.patch)
+            .field("retry_after_checkpoint", &self.retry_after_checkpoint)
+            .finish()
+    }
+}
+
+/// Result of the protected admission hook. A component may return a durable
+/// patch together with a structured block: the runtime applies and
+/// checkpoints the patch before refusing provider I/O.
+#[derive(Clone, Default)]
+pub struct BeforeProviderPatch {
+    /// State, usage, and lifecycle events to apply before the admission
+    /// result is acted upon.
+    pub patch: TurnCommitPatch,
+    /// Structured reason provider admission must stop, after `patch` is
+    /// applied. This remains outside the persisted extension state.
+    pub block: Option<RuntimeError>,
+    /// The runtime must checkpoint `Planning` with `patch`, then invoke the
+    /// admission hooks again before allowing provider I/O. This is used for
+    /// protected response handoff boundaries where a validated result must
+    /// survive a crash before its external mutation.
+    pub retry_admission: bool,
+}
+
+impl BeforeProviderPatch {
+    /// Continues provider admission after applying `patch`.
+    pub fn continue_with(patch: TurnCommitPatch) -> Self {
+        Self {
+            patch,
+            block: None,
+            retry_admission: false,
+        }
+    }
+
+    /// Applies `patch`, then blocks provider admission with `error`.
+    pub fn blocked(patch: TurnCommitPatch, error: RuntimeError) -> Self {
+        Self {
+            patch,
+            block: Some(error),
+            retry_admission: false,
+        }
+    }
+
+    /// Applies `patch`, checkpoints `Planning`, and retries admission before
+    /// provider I/O.
+    pub fn checkpoint_and_retry(patch: TurnCommitPatch) -> Self {
+        Self {
+            patch,
+            block: None,
+            retry_admission: true,
+        }
+    }
+}
+
+impl fmt::Debug for BeforeProviderPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BeforeProviderPatch")
+            .field("patch", &self.patch)
+            .field("blocked", &self.block.is_some())
+            .field("retry_admission", &self.retry_admission)
+            .finish()
+    }
+}
+
 /// Runs after a terminal turn state is assembled and before its session
 /// snapshot is persisted.
 #[async_trait]
 pub trait TurnCommitHook: Send + Sync + fmt::Debug {
     /// Stable component metadata.
     fn descriptor(&self) -> ComponentDescriptor;
+
+    /// Runs at the protected admission boundary immediately before the
+    /// runtime checkpoints `Planning` and performs provider I/O.  The
+    /// default is a no-op so existing turn-commit components do not acquire
+    /// an admission responsibility merely by implementing this trait.
+    ///
+    /// The returned patch uses the same state, usage, and typed-event
+    /// semantics as [`Self::after_commit`].
+    async fn before_provider(
+        &self,
+        _view: &TurnCommitView,
+    ) -> Result<BeforeProviderPatch, RuntimeError> {
+        Ok(BeforeProviderPatch::continue_with(
+            TurnCommitPatch::default(),
+        ))
+    }
 
     /// Returns an optional mutation of this hook's own namespace.
     async fn after_commit(&self, view: &TurnCommitView) -> Result<TurnCommitPatch, RuntimeError>;
@@ -703,8 +830,8 @@ pub trait TurnCommitHook: Send + Sync + fmt::Debug {
     async fn after_idle_compaction(
         &self,
         _view: &TurnCommitView,
-    ) -> Result<Option<TurnCommitPatch>, RuntimeError> {
-        Ok(None)
+    ) -> Result<IdleCompactionResult, RuntimeError> {
+        Ok(IdleCompactionResult::default())
     }
 }
 

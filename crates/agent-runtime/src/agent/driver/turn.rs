@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) enum BeforeProviderOutcome {
+    Continue,
+    RetryAdmission,
+    Block(RuntimeError),
+}
+
 impl<'a> TurnMachine<'a> {
     fn resolve_acceptance(&self, result: Result<(), RuntimeError>) {
         if let Some(acceptance) = &self.acceptance {
@@ -459,6 +465,180 @@ impl<'a> TurnMachine<'a> {
         }
         self.execution
             .record_turn_finish(self.turn_id.clone(), finish);
+    }
+
+    /// Runs the protected admission hooks before the next `Planning`
+    /// checkpoint. Their patches are applied to the extension namespace and
+    /// usage ledger before `transition(Planning)` takes its snapshot, so a
+    /// hard-pressure compaction cannot be followed by provider I/O with a
+    /// stale session checkpoint.
+    pub(super) async fn run_before_provider_hooks(
+        &mut self,
+        step: u32,
+    ) -> Result<BeforeProviderOutcome, RuntimeError> {
+        let deadline = self
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.deadline)
+            .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
+        let history: Arc<[Message]> = Arc::from(
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .history
+                .clone()
+                .into_boxed_slice(),
+        );
+        let usage: Arc<[UsageRecord]> = Arc::from(
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .usage
+                .records()
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let committed_at = self.driver.clock.now();
+        let started_at = self
+            .execution
+            .active_turn_started_at(&self.turn_id)
+            .unwrap_or(committed_at);
+        let visible_output = self
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.visible_output);
+        let mut updates = Vec::new();
+        let mut hook_usage = Vec::new();
+        let mut hook_events = Vec::new();
+        let mut blocked = None;
+        let mut retry_admission = false;
+        for hook in self.driver.harness.turn_commit() {
+            let descriptor = hook.descriptor();
+            let component_state = self
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned")
+                .get(descriptor.id().as_str())
+                .cloned();
+            let outcome = await_harness_phase(
+                hook.before_provider(&TurnCommitView {
+                    session: self.emitter.session().clone(),
+                    turn: self.turn_id.clone(),
+                    // Admission is not a terminal outcome. The view reuses
+                    // the immutable turn-commit shape while exposing the
+                    // canonical state and usage immediately before planning.
+                    finish: TurnFinish::Completed,
+                    provider_error_kind: None,
+                    visible_output,
+                    history: history.clone(),
+                    state: component_state.clone(),
+                    usage: usage.clone(),
+                    started_at,
+                    committed_at,
+                }),
+                &self.cancel,
+                deadline,
+                self.driver.clock.clone(),
+                "running before-provider hook",
+            )
+            .await?;
+            if outcome.retry_admission {
+                if descriptor.id().as_str() != LCM_COMPONENT_ID {
+                    return Err(RuntimeError::conflict(format!(
+                        "before-provider component `{}` requested an unsupported retry",
+                        descriptor.id()
+                    )));
+                }
+                if outcome.block.is_some() {
+                    return Err(RuntimeError::conflict(
+                        "LCM before-provider hook cannot block and retry the same admission",
+                    ));
+                }
+                let Some(next_state) = outcome.patch.state.as_ref() else {
+                    return Err(RuntimeError::conflict(
+                        "LCM before-provider retry requires protected state progress",
+                    ));
+                };
+                if component_state.as_ref().is_some_and(|current| {
+                    current.revision == next_state.revision
+                        && current.sensitivity == next_state.sensitivity
+                        && current.value == next_state.value
+                }) {
+                    return Err(RuntimeError::conflict(
+                        "LCM before-provider retry made no protected state progress",
+                    ));
+                }
+            }
+            let patch = outcome.patch;
+            if let Some(error) = outcome.block {
+                blocked = blocked.or(Some(error));
+            }
+            retry_admission |= outcome.retry_admission;
+            if let Some(state) = patch.state {
+                if state.revision != *descriptor.revision() {
+                    return Err(RuntimeError::conflict(format!(
+                        "before-provider component `{}` returned state revision `{}` but declares `{}`",
+                        descriptor.id(),
+                        state.revision,
+                        descriptor.revision()
+                    )));
+                }
+                updates.push((descriptor.id().as_str().to_owned(), state.into_state()));
+            }
+            for record in patch.usage {
+                if descriptor.id().as_str() != LCM_COMPONENT_ID
+                    || record.source != UsageSource::SemanticSummary
+                    || record.provenance.purpose.as_deref() != Some(LCM_SUMMARY_PURPOSE)
+                {
+                    return Err(RuntimeError::conflict(format!(
+                        "before-provider component `{}` attempted to publish non-LCM usage",
+                        descriptor.id()
+                    )));
+                }
+                hook_usage.push(record);
+            }
+            hook_events.extend(patch.events);
+        }
+        {
+            let mut extension = self
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            for (namespace, state) in updates {
+                extension.insert(namespace, state);
+            }
+        }
+        for record in hook_usage {
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .usage
+                .record(record.clone());
+            self.emitter
+                .emit(Some(self.turn_id.clone()), RuntimeEvent::Usage { record });
+        }
+        for event in hook_events {
+            self.emitter
+                .emit(Some(self.turn_id.clone()), event.into_runtime_event());
+        }
+        if let Some(error) = blocked {
+            // A blocked admission must cross the protected Planning
+            // checkpoint before terminal failure is published. Hook events
+            // are emitted first so the checkpoint watermark covers them, as
+            // it does for terminal turn-commit hooks.
+            self.transition(TurnState::Planning { step }).await?;
+            return Ok(BeforeProviderOutcome::Block(error));
+        }
+        if retry_admission {
+            // The staged response is now part of the protected Planning
+            // checkpoint. A subsequent admission pass can commit/adopt it
+            // without invoking the summary model again.
+            self.transition(TurnState::Planning { step }).await?;
+            return Ok(BeforeProviderOutcome::RetryAdmission);
+        }
+        Ok(BeforeProviderOutcome::Continue)
     }
 
     pub(super) async fn run_turn_commit_hooks(
@@ -946,6 +1126,21 @@ impl<'a> TurnMachine<'a> {
                 )
                 .await;
                 return;
+            }
+
+            match self.run_before_provider_hooks(step).await {
+                Ok(BeforeProviderOutcome::Block(error)) => {
+                    emitter.emit(turn.clone(), RuntimeEvent::Error { error });
+                    self.complete(TurnFinish::Failed, visible_output).await;
+                    return;
+                }
+                Ok(BeforeProviderOutcome::RetryAdmission) => continue,
+                Ok(BeforeProviderOutcome::Continue) => {}
+                Err(error) => {
+                    emitter.emit(turn.clone(), RuntimeEvent::Error { error });
+                    self.complete(TurnFinish::Failed, visible_output).await;
+                    return;
+                }
             }
 
             if let Err(error) = self.transition(TurnState::Planning { step }).await {

@@ -1,6 +1,7 @@
 //! Event-schema conformance: versioning, serialization stability, and ordering.
 
-use agent_runtime_core::event::{EventEnvelope, RuntimeEvent, SCHEMA_VERSION};
+use agent_runtime_core::event::{EventEnvelope, RuntimeEvent, SCHEMA_VERSION, canonical_payloads};
+use agent_runtime_core::metadata::Metadata;
 use serde_json::Value;
 
 const EVENT_ENVELOPE_V1: &str = include_str!("fixtures/event-envelope-v1.json");
@@ -15,6 +16,7 @@ const EVENT_ENVELOPE_V10: &str = include_str!("fixtures/event-envelope-v10.json"
 const EVENT_ENVELOPE_V11: &str = include_str!("fixtures/event-envelope-v11.json");
 const EVENT_ENVELOPE_V13_CACHE: &str = include_str!("fixtures/event-envelope-v13-cache.json");
 const EVENT_ENVELOPE_V14_CACHE: &str = include_str!("fixtures/event-envelope-v14-cache.json");
+const EVENT_ENVELOPE_V15_LCM: &str = include_str!("fixtures/event-envelope-v15-lcm.json");
 const EVENT_ENVELOPE_LEGACY_CACHE: &str = include_str!("fixtures/event-envelope-legacy-cache.json");
 
 /// Asserts every envelope carries the current schema version, round-trips
@@ -203,6 +205,63 @@ pub fn assert_v14_cache_golden_fixture() {
     );
 }
 
+/// Asserts the v15 LCM lifecycle fixture round-trips exactly and covers every
+/// typed lifecycle kind without admitting bodies or authority-bearing fields.
+pub fn assert_v15_lcm_golden_fixture() {
+    let expected: Value =
+        serde_json::from_str(EVENT_ENVELOPE_V15_LCM).expect("valid v15 LCM fixture JSON");
+    let envelopes: Vec<EventEnvelope> =
+        serde_json::from_value(expected.clone()).expect("v15 LCM fixture remains readable");
+    assert_eq!(envelopes.len(), 9, "v15 fixture must cover every LCM kind");
+    assert!(
+        envelopes
+            .iter()
+            .all(|envelope| envelope.schema_version == SCHEMA_VERSION)
+    );
+    assert!(
+        envelopes
+            .iter()
+            .all(|envelope| matches!(envelope.payload, RuntimeEvent::LcmLifecycle { .. }))
+    );
+    let actual = serde_json::to_value(&envelopes).expect("serialize v15 LCM fixture");
+    assert_eq!(actual, expected, "the v15 LCM event representation changed");
+
+    for envelope in &envelopes {
+        let payload = serde_json::to_value(&envelope.payload).expect("serialize LCM payload");
+        let metadata = payload
+            .get("metadata")
+            .expect("LCM payload must carry typed metadata");
+        for forbidden in ["summary", "summary_body", "source_body", "artifact_body"] {
+            assert!(
+                metadata.get(forbidden).is_none(),
+                "LCM metadata must not carry {forbidden}"
+            );
+        }
+        let serialized = payload.to_string();
+        for forbidden in ["credential", "authorization_grant", "secret body"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "LCM payload must not contain {forbidden}"
+            );
+        }
+        let child_ids = metadata
+            .get("child_ids")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        assert!(child_ids <= 16, "LCM child id list must remain bounded");
+    }
+
+    // Canonical comparisons ignore host presentation metadata while retaining
+    // the complete typed lifecycle payload.
+    let decorated = envelopes[0]
+        .clone()
+        .with_metadata(Metadata::new().with("host_note", "not_canonical"));
+    assert_eq!(
+        canonical_payloads(&envelopes[..1]),
+        canonical_payloads(&[decorated])
+    );
+}
+
 /// Legacy cache observations had numeric read/write fields and no causal
 /// attribution. They remain readable as present optional values, but the
 /// absent identities stay absent so no miss projection can be fabricated.
@@ -306,6 +365,11 @@ mod tests {
     #[test]
     fn v14_cache_lifecycle_fixture_is_exactly_compatible() {
         assert_v14_cache_golden_fixture();
+    }
+
+    #[test]
+    fn v15_lcm_lifecycle_fixture_is_exactly_compatible() {
+        assert_v15_lcm_golden_fixture();
     }
 
     #[test]

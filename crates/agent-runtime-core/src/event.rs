@@ -13,12 +13,16 @@
 //! fingerprints, registry ids, token counts, revisions — never secrets, raw
 //! skill instructions, or raw fragment content.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use agent_runtime_registry::{Fingerprint, RegistryId, RegistryRevision};
+pub use agent_runtime_registry::Fingerprint;
+use agent_runtime_registry::{RegistryId, RegistryRevision, TrustClass};
 
 use crate::cancel::CancelReason;
 use crate::clock::Timestamp;
@@ -31,7 +35,9 @@ use crate::ids::{
     SessionId, SteerId, ToolCallId, TurnId,
 };
 use crate::interaction::{InteractionOutcomeKind, InteractionSensitivity};
-use crate::manifest::{ActivatedCapability, SegmentId, SegmentKind, SummaryCoverage};
+use crate::manifest::{
+    ActivatedCapability, SegmentId, SegmentKind, SegmentSensitivity, SummaryCoverage,
+};
 use crate::metadata::Metadata;
 
 /// Serde default for flags that are absent on the wire unless notable.
@@ -102,7 +108,11 @@ use crate::usage::UsageRecord;
 ///
 /// Bumped to 14 for exact cache identities, typed synthetic purposes, and the
 /// canonical cache-operation lifecycle variants.
-pub const SCHEMA_VERSION: u32 = 14;
+///
+/// Bumped to 15 for the redaction-safe, metadata-only LCM lifecycle
+/// projection. Envelopes written with v14 remain readable because every v14
+/// payload variant and field retains its serde shape.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +250,512 @@ pub enum CompactionReason {
     BudgetExceeded,
     /// The host explicitly requested compaction.
     HostRequested,
+}
+
+/// The bounded phase represented by an [`RuntimeEvent::LcmLifecycle`] event.
+///
+/// This is deliberately one event variant rather than a growing family of
+/// provider- or store-specific events. The phase is typed, while details live
+/// in [`LcmLifecycleMetadata`] and the optional [`LcmLifecycleReason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LcmLifecycleKind {
+    /// A soft/hard pressure decision was evaluated.
+    PressureDecision,
+    /// A compaction operation was admitted or rejected before mutation.
+    OperationAdmission,
+    /// A model escalation level was attempted.
+    Escalation,
+    /// A lossless leaf node was committed.
+    LeafCommit,
+    /// A condensed node was committed and children were superseded.
+    Condensation,
+    /// The deterministic strict-shrink fallback was used.
+    DeterministicFallback,
+    /// A valid legacy flat summary was imported into the first leaf.
+    LegacyImport,
+    /// A bounded expansion or continuation was served.
+    Expansion,
+    /// A structured LCM failure prevented the requested operation.
+    Failure,
+}
+
+/// Redaction-safe reasons for an [`RuntimeEvent::LcmLifecycle`] transition.
+///
+/// These values intentionally contain no provider text, store error text,
+/// authorization material, or model/source bodies. A host that needs richer
+/// diagnostics should retain them in its protected store and correlate them
+/// with the opaque ids and fingerprints in [`LcmLifecycleMetadata`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LcmLifecycleReason {
+    /// The observed pressure was below the configured soft threshold.
+    BelowSoftThreshold,
+    /// The observed pressure crossed the soft threshold.
+    SoftThresholdExceeded,
+    /// The observed pressure crossed the hard threshold.
+    HardThresholdExceeded,
+    /// The operation won admission for its checkpoint.
+    Admitted,
+    /// Another compatible operation already owns the checkpoint.
+    AlreadyInFlight,
+    /// A compare-and-swap revision was stale.
+    StaleRevision,
+    /// A provider/model attempt failed or was unavailable.
+    ProviderFailure,
+    /// A model returned no usable output.
+    EmptyOutput,
+    /// A model output exceeded its requested bound.
+    OverBudgetOutput,
+    /// A model output did not strictly shrink its source.
+    NonShrinkingOutput,
+    /// A valid legacy state was imported.
+    Imported,
+    /// Legacy state was absent, malformed, or failed integrity checks.
+    InvalidLegacyState,
+    /// An expansion was authorized by the host-owned view.
+    Authorized,
+    /// An expansion was rejected because the view was not authorized.
+    Unauthorized,
+    /// The requested bounded expansion reached its limit.
+    Bounded,
+    /// A requested node/entry was not found in the authorized view.
+    NotFound,
+    /// The store rejected a transactional mutation.
+    StoreConflict,
+    /// The store failed without exposing its underlying error text.
+    StoreFailure,
+    /// The requested content could not fit under the policy.
+    CannotFit,
+    /// Input metadata or ranges were invalid.
+    InvalidInput,
+    /// The operation was cancelled before its mutation committed.
+    Cancelled,
+}
+
+/// Maximum number of Unicode scalar values in an opaque LCM id or cursor that
+/// may enter an event payload.
+pub const MAX_LCM_LIFECYCLE_ID_CHARS: usize = 128;
+
+/// Maximum number of child ids carried individually on one LCM event. The
+/// complete child cardinality belongs in [`LcmLifecycleMetadata::child_count`].
+pub const MAX_LCM_LIFECYCLE_CHILD_IDS: usize = 16;
+
+/// Why LCM lifecycle metadata failed its bounded-shape validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LcmLifecycleMetadataError {
+    /// An opaque id/cursor field was empty.
+    EmptyOpaqueId,
+    /// An opaque id/cursor field exceeded [`MAX_LCM_LIFECYCLE_ID_CHARS`].
+    OpaqueIdTooLong,
+    /// More than [`MAX_LCM_LIFECYCLE_CHILD_IDS`] child ids were supplied.
+    TooManyChildIds,
+    /// One child id exceeded [`MAX_LCM_LIFECYCLE_ID_CHARS`].
+    ChildIdTooLong,
+    /// One child id was empty.
+    EmptyChildId,
+    /// A pressure percentage was outside the inclusive 0..=100 range.
+    InvalidPressurePercent,
+    /// An escalation level was outside the inclusive 1..=3 range.
+    InvalidEscalationLevel,
+    /// Covered range fields were only partially present.
+    IncompleteCoveredRange,
+    /// Covered range start followed its end.
+    ReversedCoveredRange,
+    /// Covered range length disagreed with its count.
+    CoveredRangeCountMismatch,
+    /// Child ids were duplicated or did not fit their aggregate count.
+    ChildCountMismatch,
+    /// A revision/metadata label was blank or exceeded its bound.
+    InvalidMetadata,
+    /// Soft and hard token thresholds were not ordered.
+    InvalidThresholdOrder,
+}
+
+impl fmt::Display for LcmLifecycleMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyOpaqueId => "opaque LCM id/cursor must not be empty",
+            Self::OpaqueIdTooLong => "opaque LCM id/cursor exceeds its character bound",
+            Self::TooManyChildIds => "LCM child id list exceeds its bound",
+            Self::ChildIdTooLong => "an LCM child id exceeds its character bound",
+            Self::EmptyChildId => "an LCM child id must not be empty",
+            Self::InvalidPressurePercent => "LCM pressure percentage must be between 0 and 100",
+            Self::InvalidEscalationLevel => "LCM escalation level must be between 1 and 3",
+            Self::IncompleteCoveredRange => "LCM covered range fields must be provided together",
+            Self::ReversedCoveredRange => "LCM covered range is reversed",
+            Self::CoveredRangeCountMismatch => "LCM covered range does not match its count",
+            Self::ChildCountMismatch => "LCM child ids do not match their aggregate count",
+            Self::InvalidMetadata => "LCM metadata revision or label is invalid",
+            Self::InvalidThresholdOrder => "LCM soft threshold must not exceed its hard threshold",
+        })
+    }
+}
+
+impl std::error::Error for LcmLifecycleMetadataError {}
+
+/// Metadata carried by an [`RuntimeEvent::LcmLifecycle`] event.
+///
+/// Every field is optional so one bounded event can represent pressure,
+/// admission, mutation, expansion, import, fallback, and failure without
+/// introducing parallel schemas. Values must be opaque ids, fingerprints,
+/// revisions, classifications, counts, or token metrics. Producers MUST cap
+/// ids and child lists before emission; no field is a license to put summary,
+/// source, artifact, credential, or authorization content on the event bus.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LcmLifecycleMetadata {
+    /// Opaque host-owned timeline identity.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_bounded_optional_id",
+        deserialize_with = "deserialize_bounded_optional_id"
+    )]
+    pub timeline_id: Option<String>,
+    /// Opaque compaction operation identity.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_bounded_optional_id",
+        deserialize_with = "deserialize_bounded_optional_id"
+    )]
+    pub operation_id: Option<String>,
+    /// Fingerprint of the idempotent operation request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_fingerprint: Option<Fingerprint>,
+    /// Opaque node identity, when the event concerns one node.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_bounded_optional_id",
+        deserialize_with = "deserialize_bounded_optional_id"
+    )]
+    pub node_id: Option<String>,
+    /// Expected/current DAG revision used by a checkpoint or CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dag_revision: Option<u64>,
+    /// Inclusive covered sequence start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_start: Option<u64>,
+    /// Inclusive covered sequence end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_end: Option<u64>,
+    /// Number of source entries covered by a node or expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_count: Option<u32>,
+    /// Number of children in a condensation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_count: Option<u32>,
+    /// Bounded opaque child ids; producers cap this list to a small fixed
+    /// limit and use `child_count` for the complete aggregate count.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_bounded_child_ids",
+        deserialize_with = "deserialize_bounded_child_ids"
+    )]
+    pub child_ids: Vec<String>,
+    /// Number of entries returned by a bounded expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_count: Option<u32>,
+    /// Opaque continuation cursor for a bounded expansion.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_bounded_optional_id",
+        deserialize_with = "deserialize_bounded_optional_id"
+    )]
+    pub expansion_cursor: Option<String>,
+    /// Soft pressure threshold in estimated input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_threshold_tokens: Option<u32>,
+    /// Hard pressure threshold in estimated input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_threshold_tokens: Option<u32>,
+    /// Observed pressure percentage, when the host computes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_percent: Option<u8>,
+    /// Escalation level attempted, starting at one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_level: Option<u8>,
+    /// Policy revision used for the decision or mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<RegistryRevision>,
+    /// LCM algorithm revision used for the decision or mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithm_revision: Option<RegistryRevision>,
+    /// Summary-model implementation revision, when model work was attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<RegistryRevision>,
+    /// Request-sizer revision governing strict-shrink/token accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizer_revision: Option<RegistryRevision>,
+    /// Joined sensitivity classification of covered content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<SegmentSensitivity>,
+    /// Joined trust classification of covered content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustClass>,
+    /// Content-guard revision joined into the summary provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_revision: Option<RegistryRevision>,
+    /// Fingerprint of the protected source range, never the source body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<Fingerprint>,
+    /// Fingerprint of the committed summary/condensed result, never its body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_fingerprint: Option<Fingerprint>,
+    /// Estimated source tokens before an escalation/commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    /// Estimated replacement tokens after an escalation/commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    /// Tokens reclaimed by the committed operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaimed_tokens: Option<u32>,
+}
+
+impl fmt::Debug for LcmLifecycleMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redact = |value: &str| Fingerprint::of(value.as_bytes());
+        formatter
+            .debug_struct("LcmLifecycleMetadata")
+            .field("timeline_id", &self.timeline_id.as_deref().map(redact))
+            .field("operation_id", &self.operation_id.as_deref().map(redact))
+            .field("operation_fingerprint", &self.operation_fingerprint)
+            .field("node_id", &self.node_id.as_deref().map(redact))
+            .field("dag_revision", &self.dag_revision)
+            .field("covered_start", &self.covered_start)
+            .field("covered_end", &self.covered_end)
+            .field("covered_count", &self.covered_count)
+            .field("child_count", &self.child_count)
+            .field(
+                "child_ids",
+                &self
+                    .child_ids
+                    .iter()
+                    .map(|id| redact(id))
+                    .collect::<Vec<_>>(),
+            )
+            .field("expanded_count", &self.expanded_count)
+            .field(
+                "expansion_cursor",
+                &self.expansion_cursor.as_deref().map(redact),
+            )
+            .field("soft_threshold_tokens", &self.soft_threshold_tokens)
+            .field("hard_threshold_tokens", &self.hard_threshold_tokens)
+            .field("pressure_percent", &self.pressure_percent)
+            .field("escalation_level", &self.escalation_level)
+            .field("policy_revision", &self.policy_revision)
+            .field("algorithm_revision", &self.algorithm_revision)
+            .field("model_revision", &self.model_revision)
+            .field("sizer_revision", &self.sizer_revision)
+            .field("sensitivity", &self.sensitivity)
+            .field("trust", &self.trust)
+            .field("guard_revision", &self.guard_revision)
+            .field("source_fingerprint", &self.source_fingerprint)
+            .field("result_fingerprint", &self.result_fingerprint)
+            .field("input_tokens", &self.input_tokens)
+            .field("output_tokens", &self.output_tokens)
+            .field("reclaimed_tokens", &self.reclaimed_tokens)
+            .finish()
+    }
+}
+
+impl LcmLifecycleMetadata {
+    /// Validates all opaque ids and individually listed child ids before an
+    /// event is emitted or persisted.
+    pub fn validate(&self) -> Result<(), LcmLifecycleMetadataError> {
+        for value in [&self.timeline_id, &self.operation_id, &self.node_id]
+            .into_iter()
+            .flatten()
+        {
+            validate_lcm_opaque_id(value)?;
+        }
+        if let Some(value) = &self.expansion_cursor {
+            validate_lcm_opaque_id(value)?;
+        }
+        if self.child_ids.len() > MAX_LCM_LIFECYCLE_CHILD_IDS {
+            return Err(LcmLifecycleMetadataError::TooManyChildIds);
+        }
+        for child in &self.child_ids {
+            if child.trim().is_empty() {
+                return Err(LcmLifecycleMetadataError::EmptyChildId);
+            }
+            if child.chars().count() > MAX_LCM_LIFECYCLE_ID_CHARS {
+                return Err(LcmLifecycleMetadataError::ChildIdTooLong);
+            }
+        }
+        if self.child_ids.iter().collect::<BTreeSet<_>>().len() != self.child_ids.len()
+            || self
+                .child_count
+                .is_some_and(|count| u64::from(count) < self.child_ids.len() as u64)
+            || (self.child_count.is_none() && !self.child_ids.is_empty())
+        {
+            return Err(LcmLifecycleMetadataError::ChildCountMismatch);
+        }
+        if self.pressure_percent.is_some_and(|percent| percent > 100) {
+            return Err(LcmLifecycleMetadataError::InvalidPressurePercent);
+        }
+        if self
+            .escalation_level
+            .is_some_and(|level| !(1..=3).contains(&level))
+        {
+            return Err(LcmLifecycleMetadataError::InvalidEscalationLevel);
+        }
+        match (self.covered_start, self.covered_end, self.covered_count) {
+            (None, None, None) => {}
+            (None, None, Some(count)) if count > 0 => {}
+            (Some(_), None, _) | (None, Some(_), _) | (Some(_), Some(_), None) => {
+                return Err(LcmLifecycleMetadataError::IncompleteCoveredRange);
+            }
+            (Some(start), Some(end), Some(count)) => {
+                if start > end {
+                    return Err(LcmLifecycleMetadataError::ReversedCoveredRange);
+                }
+                let expected = end
+                    .checked_sub(start)
+                    .and_then(|length| length.checked_add(1))
+                    .ok_or(LcmLifecycleMetadataError::CoveredRangeCountMismatch)?;
+                if expected != u64::from(count) {
+                    return Err(LcmLifecycleMetadataError::CoveredRangeCountMismatch);
+                }
+            }
+            (None, None, Some(_)) => {
+                return Err(LcmLifecycleMetadataError::CoveredRangeCountMismatch);
+            }
+        }
+        if self
+            .soft_threshold_tokens
+            .zip(self.hard_threshold_tokens)
+            .is_some_and(|(soft, hard)| soft > hard)
+        {
+            return Err(LcmLifecycleMetadataError::InvalidThresholdOrder);
+        }
+        for revision in [
+            self.policy_revision.as_ref(),
+            self.algorithm_revision.as_ref(),
+            self.model_revision.as_ref(),
+            self.sizer_revision.as_ref(),
+            self.guard_revision.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if revision.as_str().trim().is_empty()
+                || revision.as_str().chars().count() > MAX_LCM_LIFECYCLE_ID_CHARS
+            {
+                return Err(LcmLifecycleMetadataError::InvalidMetadata);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_lcm_opaque_id(value: &str) -> Result<(), LcmLifecycleMetadataError> {
+    if value.trim().is_empty() {
+        return Err(LcmLifecycleMetadataError::EmptyOpaqueId);
+    }
+    if value.chars().count() > MAX_LCM_LIFECYCLE_ID_CHARS {
+        return Err(LcmLifecycleMetadataError::OpaqueIdTooLong);
+    }
+    Ok(())
+}
+
+fn serialize_bounded_optional_id<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let Some(value) = value {
+        validate_lcm_opaque_id(value).map_err(serde::ser::Error::custom)?;
+    }
+    value.serialize(serializer)
+}
+
+fn deserialize_bounded_optional_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        validate_lcm_opaque_id(value).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn serialize_bounded_child_ids<S>(value: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.len() > MAX_LCM_LIFECYCLE_CHILD_IDS {
+        return Err(serde::ser::Error::custom(
+            LcmLifecycleMetadataError::TooManyChildIds,
+        ));
+    }
+    for child in value {
+        if child.trim().is_empty() {
+            return Err(serde::ser::Error::custom(
+                LcmLifecycleMetadataError::EmptyChildId,
+            ));
+        }
+        if child.chars().count() > MAX_LCM_LIFECYCLE_ID_CHARS {
+            return Err(serde::ser::Error::custom(
+                LcmLifecycleMetadataError::ChildIdTooLong,
+            ));
+        }
+    }
+    value.serialize(serializer)
+}
+
+fn deserialize_bounded_child_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Vec::<String>::deserialize(deserializer)?;
+    if value.len() > MAX_LCM_LIFECYCLE_CHILD_IDS {
+        return Err(serde::de::Error::custom(
+            LcmLifecycleMetadataError::TooManyChildIds,
+        ));
+    }
+    for child in &value {
+        if child.trim().is_empty() {
+            return Err(serde::de::Error::custom(
+                LcmLifecycleMetadataError::EmptyChildId,
+            ));
+        }
+        if child.chars().count() > MAX_LCM_LIFECYCLE_ID_CHARS {
+            return Err(serde::de::Error::custom(
+                LcmLifecycleMetadataError::ChildIdTooLong,
+            ));
+        }
+    }
+    Ok(value)
+}
+
+fn serialize_validated_lcm_metadata<S>(
+    value: &LcmLifecycleMetadata,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value.validate().map_err(serde::ser::Error::custom)?;
+    value.serialize(serializer)
+}
+
+fn deserialize_validated_lcm_metadata<'de, D>(
+    deserializer: D,
+) -> Result<LcmLifecycleMetadata, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = LcmLifecycleMetadata::deserialize(deserializer)?;
+    value.validate().map_err(serde::de::Error::custom)?;
+    Ok(value)
 }
 
 /// Public status of one generic harness todo item.
@@ -449,6 +965,25 @@ pub enum RuntimeEvent {
         summaries: Vec<SummaryCoverage>,
         /// Tokens reclaimed by compaction.
         reclaimed_tokens: u32,
+    },
+    /// A redaction-safe lifecycle observation from the lossless context
+    /// memory (LCM) engine.
+    ///
+    /// LCM emits one typed phase with bounded metadata instead of exposing
+    /// summary bodies, source entries, protected artifacts, credentials, or
+    /// authorization grants to the event stream.
+    LcmLifecycle {
+        /// The lifecycle phase being observed.
+        kind: LcmLifecycleKind,
+        /// Structured reason, when the phase has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<LcmLifecycleReason>,
+        /// Bounded identities, revisions, classifications, and token metrics.
+        #[serde(
+            serialize_with = "serialize_validated_lcm_metadata",
+            deserialize_with = "deserialize_validated_lcm_metadata"
+        )]
+        metadata: LcmLifecycleMetadata,
     },
     /// A generic harness todo plan reached a durable tool-result boundary.
     ///
@@ -869,6 +1404,38 @@ pub enum RuntimeEvent {
     SessionShutdown,
 }
 
+impl RuntimeEvent {
+    /// Validates semantic invariants for payloads that have a bounded
+    /// structural contract. Non-LCM events currently have no additional
+    /// envelope-level checks.
+    pub fn validate(&self) -> Result<(), LcmLifecycleMetadataError> {
+        match self {
+            Self::LcmLifecycle { metadata, .. } => metadata.validate(),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// An event envelope could not be constructed because its payload violated a
+/// core-level invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventEnvelopeError {
+    /// LCM lifecycle metadata failed bounded semantic validation.
+    InvalidLcmLifecycleMetadata(LcmLifecycleMetadataError),
+}
+
+impl fmt::Display for EventEnvelopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLcmLifecycleMetadata(error) => {
+                write!(formatter, "invalid LCM lifecycle metadata: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EventEnvelopeError {}
+
 /// A versioned envelope around a [`RuntimeEvent`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
@@ -893,16 +1460,21 @@ pub struct EventEnvelope {
 }
 
 impl EventEnvelope {
-    /// Builds an envelope at the current schema version.
-    pub fn new(
+    /// Attempts to build an envelope after validating semantic payload
+    /// invariants. This is the recoverable constructor for hosts that want to
+    /// turn malformed lifecycle observations into a structured failure.
+    pub fn try_new(
         seq: u64,
         id: EventId,
         session: SessionId,
         turn: Option<TurnId>,
         timestamp: Timestamp,
         payload: RuntimeEvent,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, EventEnvelopeError> {
+        payload
+            .validate()
+            .map_err(EventEnvelopeError::InvalidLcmLifecycleMetadata)?;
+        Ok(Self {
             schema_version: SCHEMA_VERSION,
             seq,
             id,
@@ -911,7 +1483,25 @@ impl EventEnvelope {
             timestamp,
             payload,
             metadata: Metadata::new(),
-        }
+        })
+    }
+
+    /// Builds an envelope at the current schema version.
+    ///
+    /// The long-standing infallible constructor is retained for unrelated
+    /// event call sites, but it now fails closed for invalid LCM metadata
+    /// before an envelope can reach an in-memory observer. Callers that need
+    /// recoverable handling should use [`Self::try_new`].
+    pub fn new(
+        seq: u64,
+        id: EventId,
+        session: SessionId,
+        turn: Option<TurnId>,
+        timestamp: Timestamp,
+        payload: RuntimeEvent,
+    ) -> Self {
+        Self::try_new(seq, id, session, turn, timestamp, payload)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// Attaches host presentation metadata.
@@ -1023,6 +1613,213 @@ mod tests {
                 write_tokens: Some(0),
             }
         ));
+    }
+
+    #[test]
+    fn v14_envelope_remains_readable_after_lcm_schema_bump() {
+        let envelope: EventEnvelope = serde_json::from_value(serde_json::json!({
+            "schema_version": 14,
+            "seq": 7,
+            "id": "event-v14",
+            "session": "session-1",
+            "timestamp": 0,
+            "payload": {
+                "event": "cache_observation",
+                "read_tokens": 8,
+                "write_tokens": 0
+            }
+        }))
+        .unwrap();
+        assert_eq!(envelope.schema_version, 14);
+        assert!(matches!(
+            envelope.payload,
+            RuntimeEvent::CacheObservation {
+                request: None,
+                attempt: None,
+                cache_plan: None,
+                cache_identity: None,
+                read_tokens: Some(8),
+                write_tokens: Some(0),
+            }
+        ));
+    }
+
+    #[test]
+    fn lcm_lifecycle_round_trips_without_content_or_authority_fields() {
+        let event = RuntimeEvent::LcmLifecycle {
+            kind: LcmLifecycleKind::LeafCommit,
+            reason: Some(LcmLifecycleReason::Admitted),
+            metadata: LcmLifecycleMetadata {
+                timeline_id: Some("timeline-1".into()),
+                operation_id: Some("operation-1".into()),
+                operation_fingerprint: Some(Fingerprint::of("operation")),
+                node_id: Some("node-1".into()),
+                dag_revision: Some(4),
+                covered_start: Some(10),
+                covered_end: Some(19),
+                covered_count: Some(10),
+                child_count: Some(2),
+                child_ids: vec!["child-1".into(), "child-2".into()],
+                expanded_count: None,
+                expansion_cursor: None,
+                soft_threshold_tokens: Some(8_000),
+                hard_threshold_tokens: Some(9_000),
+                pressure_percent: Some(86),
+                escalation_level: None,
+                policy_revision: Some(RegistryRevision::new("policy-1")),
+                algorithm_revision: Some(RegistryRevision::new("algorithm-1")),
+                model_revision: None,
+                sizer_revision: Some(RegistryRevision::new("sizer-1")),
+                sensitivity: Some(SegmentSensitivity::Sensitive),
+                trust: Some(TrustClass::UserContent),
+                guard_revision: Some(RegistryRevision::new("guard-1")),
+                source_fingerprint: Some(Fingerprint::of("source")),
+                result_fingerprint: Some(Fingerprint::of("result")),
+                input_tokens: Some(500),
+                output_tokens: Some(120),
+                reclaimed_tokens: Some(380),
+            },
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "lcm_lifecycle");
+        assert_eq!(json["kind"], "leaf_commit");
+        assert_eq!(json["reason"], "admitted");
+        assert!(json.get("summary").is_none());
+        assert!(json.get("source_body").is_none());
+        assert!(json.get("artifact_body").is_none());
+        assert!(json.get("credentials").is_none());
+        assert!(json.get("authorization").is_none());
+        let back: RuntimeEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn lcm_lifecycle_metadata_enforces_opaque_id_and_child_bounds() {
+        let metadata = LcmLifecycleMetadata {
+            timeline_id: Some("t".repeat(MAX_LCM_LIFECYCLE_ID_CHARS + 1)),
+            ..LcmLifecycleMetadata::default()
+        };
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::OpaqueIdTooLong)
+        );
+        assert!(serde_json::to_value(&metadata).is_err());
+
+        let too_many_children = serde_json::json!({
+            "child_ids": (0..=MAX_LCM_LIFECYCLE_CHILD_IDS)
+                .map(|index| format!("child-{index}"))
+                .collect::<Vec<_>>()
+        });
+        assert!(serde_json::from_value::<LcmLifecycleMetadata>(too_many_children).is_err());
+    }
+
+    #[test]
+    fn lcm_lifecycle_metadata_enforces_semantic_ranges_and_cardinality() {
+        let mut metadata = LcmLifecycleMetadata {
+            pressure_percent: Some(101),
+            ..LcmLifecycleMetadata::default()
+        };
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::InvalidPressurePercent)
+        );
+
+        metadata.pressure_percent = None;
+        metadata.escalation_level = Some(0);
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::InvalidEscalationLevel)
+        );
+
+        metadata.escalation_level = None;
+        metadata.covered_start = Some(10);
+        metadata.covered_end = Some(9);
+        metadata.covered_count = Some(0);
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::ReversedCoveredRange)
+        );
+
+        metadata.covered_end = Some(11);
+        metadata.covered_count = Some(1);
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::CoveredRangeCountMismatch)
+        );
+
+        metadata.covered_start = None;
+        metadata.covered_end = None;
+        metadata.covered_count = None;
+        metadata.child_ids = vec!["child-1".into()];
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::ChildCountMismatch)
+        );
+
+        metadata.child_count = Some(1);
+        metadata.child_ids.push("child-1".into());
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::ChildCountMismatch)
+        );
+
+        metadata.child_ids = vec!["   ".into()];
+        assert_eq!(
+            metadata.validate(),
+            Err(LcmLifecycleMetadataError::EmptyChildId)
+        );
+    }
+
+    #[test]
+    fn event_envelope_rejects_invalid_lcm_metadata_before_observation() {
+        let payload = RuntimeEvent::LcmLifecycle {
+            kind: LcmLifecycleKind::PressureDecision,
+            reason: None,
+            metadata: LcmLifecycleMetadata {
+                pressure_percent: Some(101),
+                ..LcmLifecycleMetadata::default()
+            },
+        };
+        let result = EventEnvelope::try_new(
+            0,
+            EventId::new("e-invalid"),
+            SessionId::new("s"),
+            None,
+            Timestamp::ZERO,
+            payload,
+        );
+        assert_eq!(
+            result,
+            Err(EventEnvelopeError::InvalidLcmLifecycleMetadata(
+                LcmLifecycleMetadataError::InvalidPressurePercent
+            ))
+        );
+    }
+
+    #[test]
+    fn lcm_debug_redacts_opaque_ids() {
+        let metadata = LcmLifecycleMetadata {
+            timeline_id: Some("timeline-secret".into()),
+            operation_id: Some("operation-secret".into()),
+            node_id: Some("node-secret".into()),
+            child_count: Some(1),
+            child_ids: vec!["child-secret".into()],
+            expansion_cursor: Some("cursor-secret".into()),
+            ..LcmLifecycleMetadata::default()
+        };
+        let debug = format!("{metadata:?}");
+        for opaque in [
+            "timeline-secret",
+            "operation-secret",
+            "node-secret",
+            "child-secret",
+            "cursor-secret",
+        ] {
+            assert!(
+                !debug.contains(opaque),
+                "opaque id leaked in Debug: {opaque}"
+            );
+        }
     }
 
     #[test]

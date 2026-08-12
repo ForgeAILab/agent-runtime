@@ -11,11 +11,16 @@ use agent_runtime_core::event::RuntimeEvent;
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::observer::EventObserver;
 use agent_runtime_core::store::{SecretStore, SessionSnapshot, SessionStore};
+use agent_runtime_core::usage::UsageDelta;
 use serde_json::Value;
 
 use crate::agent::driver::Driver;
 use crate::cache::CacheMechanism;
 use crate::delegation::{CHILD_CATALOG_NAMESPACE, CHILD_OUTCOME_CURSOR_NAMESPACE};
+use crate::harness::{
+    HarnessEvent, LCM_COMPONENT_ID, LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID, LcmCoordinator,
+    import_semantic_summary_v1,
+};
 use crate::ids::IdMinter;
 use crate::runtime::command::{COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession};
 use crate::runtime::emitter::EventEmitter;
@@ -76,6 +81,18 @@ fn merge_terminal_checkpoint_snapshot(
     }
 
     for (namespace, exact) in &protected.extension_state {
+        // A successful one-time LCM import may be newer than the terminal
+        // checkpoint that carried the old flat-summary namespace. Once the
+        // canonical snapshot contains only the replacement, do not resurrect
+        // the legacy component during protected-state overlay.
+        if namespace == LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID
+            && canonical.extension_state.contains_key(LCM_COMPONENT_ID)
+            && !canonical
+                .extension_state
+                .contains_key(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID)
+        {
+            continue;
+        }
         if let Some(ordinary) = canonical.extension_state.get(namespace) {
             if ordinary.revision != exact.revision {
                 return Err(RuntimeError::conflict(format!(
@@ -151,7 +168,161 @@ fn merge_newer_nonterminal_delegation_state(
                 .insert(namespace.to_owned(), state.clone());
         }
     }
+    merge_durable_lcm_import(protected, ordinary)?;
     Ok(())
+}
+
+/// Carries an already-durable one-time LCM import across an older
+/// non-terminal turn checkpoint. The protected checkpoint remains authority
+/// for turn progress; only this exact namespace replacement is admitted from
+/// ordinary persistence.
+fn merge_durable_lcm_import(
+    protected: &mut SessionSnapshot,
+    ordinary: &SessionSnapshot,
+) -> Result<(), RuntimeError> {
+    let ordinary_lcm = ordinary.extension_state.get(LCM_COMPONENT_ID);
+    let ordinary_legacy = ordinary
+        .extension_state
+        .get(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID);
+    if ordinary_lcm.is_some() && ordinary_legacy.is_some() {
+        return Err(RuntimeError::conflict(
+            "canonical session contains both legacy semantic-summary and LCM state",
+        ));
+    }
+    let protected_lcm = protected.extension_state.get(LCM_COMPONENT_ID);
+    let protected_legacy = protected
+        .extension_state
+        .get(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID);
+    if protected_lcm.is_some() && protected_legacy.is_some() {
+        return Err(RuntimeError::conflict(
+            "protected checkpoint contains both legacy semantic-summary and LCM state",
+        ));
+    }
+    match (
+        ordinary_lcm,
+        ordinary_legacy,
+        protected_lcm,
+        protected_legacy,
+    ) {
+        (Some(replacement), None, None, Some(_)) => {
+            protected
+                .extension_state
+                .remove(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID);
+            protected
+                .extension_state
+                .insert(LCM_COMPONENT_ID.to_owned(), replacement.clone());
+        }
+        (Some(ordinary), None, Some(exact), None) if ordinary != exact => {
+            return Err(RuntimeError::conflict(
+                "canonical and protected LCM checkpoints differ",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validates the canonical LCM namespace or performs the one-time import of
+/// the removed flat semantic-summary namespace before a live session handle
+/// exists. The DAG commit is idempotent; if ordinary persistence fails after
+/// that commit, a later resume adopts the exact existing node.
+async fn prepare_lcm_resume(
+    shared: &RuntimeShared,
+    session: &SessionId,
+    snapshot: &mut SessionSnapshot,
+) -> Result<(Vec<HarnessEvent>, bool), RuntimeError> {
+    let legacy = snapshot
+        .extension_state
+        .get(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID)
+        .cloned();
+    let current = snapshot.extension_state.get(LCM_COMPONENT_ID).cloned();
+    if legacy.is_some() && current.is_some() {
+        return Err(RuntimeError::conflict(
+            "session contains both legacy semantic-summary and LCM state",
+        ));
+    }
+
+    let Some(coordinator) = shared.lcm.as_ref() else {
+        if legacy.is_some() || current.is_some() {
+            return Err(RuntimeError::conflict(
+                "persisted semantic-compaction state requires RuntimeBuilder::lcm",
+            ));
+        }
+        return Ok((Vec::new(), false));
+    };
+
+    if let Some(current) = current {
+        let validation = coordinator
+            .validate_resume_state(session, &snapshot.history, &current)
+            .await?;
+        let Some(repaired) = validation else {
+            return Ok((Vec::new(), false));
+        };
+        snapshot
+            .extension_state
+            .insert(LCM_COMPONENT_ID.to_owned(), repaired);
+        snapshot.updated = shared.clock.now();
+        if let Some(session_store) = shared.session_store.as_ref() {
+            // A repaired successor is the new protected authority. Persist it
+            // before constructing a live handle so a second crash cannot
+            // discard the proof and repeat recovery work.
+            session_store.save(snapshot).await?;
+        }
+        return Ok((Vec::new(), true));
+    }
+
+    let Some(legacy) = legacy else {
+        // Resolve the host binding even for a fresh session so an invalid or
+        // cross-session grant fails during construction, not at first use.
+        coordinator.timeline_binding(session)?;
+        return Ok((Vec::new(), false));
+    };
+    let session_store = shared.session_store.as_ref().ok_or_else(|| {
+        RuntimeError::conflict(
+            "legacy semantic-summary import requires durable session persistence",
+        )
+    })?;
+    let patch = import_semantic_summary_v1(
+        coordinator,
+        session,
+        &snapshot.history,
+        &legacy,
+        UsageDelta::new(),
+    )
+    .await?;
+    if !patch.usage.is_empty() {
+        return Err(RuntimeError::conflict(
+            "legacy semantic-summary import attempted to duplicate accounted usage",
+        ));
+    }
+    let replacement = patch.state.ok_or_else(|| {
+        RuntimeError::internal("legacy semantic-summary import returned no replacement state")
+    })?;
+    snapshot
+        .extension_state
+        .remove(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID);
+    snapshot
+        .extension_state
+        .insert(LCM_COMPONENT_ID.to_owned(), replacement.into_state());
+    snapshot.updated = shared.clock.now();
+    coordinator
+        .validate_resume_state(
+            session,
+            &snapshot.history,
+            snapshot
+                .extension_state
+                .get(LCM_COMPONENT_ID)
+                .expect("replacement inserted above"),
+        )
+        .await?;
+
+    // This snapshot makes the namespace replacement durable before a session
+    // handle can accept work. An older terminal/non-terminal protected
+    // checkpoint is reconciled by the narrow merge rules above. If this save
+    // fails after the node commit, retry adopts the deterministic node and
+    // attempts the replacement save again without another model call.
+    session_store.save(snapshot).await?;
+    Ok((patch.events, true))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +507,10 @@ pub struct RuntimeShared {
     pub(crate) shutdown_timeout_ms: u64,
     pub(crate) injection_queue_limit: usize,
     pub(crate) active_sessions: Arc<ActiveSessionRegistry>,
+    /// The explicitly configured LCM coordinator, retained so resume/import
+    /// paths use the same host-authorized component allocation as the sealed
+    /// history projector and turn-commit hook.
+    pub(crate) lcm: Option<Arc<LcmCoordinator>>,
 }
 
 /// In-process lease table preventing two handles from restoring and minting
@@ -474,7 +649,7 @@ impl Runtime {
             (true, Some(store)) => store.load(&session_id).await?,
             _ => None,
         };
-        let checkpoint = match (explicit_id, &self.shared.checkpoint_store) {
+        let mut checkpoint = match (explicit_id, &self.shared.checkpoint_store) {
             (true, Some(store)) => store.load_latest(&session_id).await?,
             _ => None,
         };
@@ -522,7 +697,7 @@ impl Runtime {
         // host policy may intentionally omit sensitive extension namespaces,
         // though, so the protected terminal copy overlays those exact values
         // after compatibility validation.
-        let snapshot = match (&checkpoint, snapshot) {
+        let mut snapshot = match (&checkpoint, snapshot) {
             (Some(checkpoint), Some(mut snapshot))
                 if matches!(checkpoint.state, TurnState::Terminal { .. }) =>
             {
@@ -561,6 +736,28 @@ impl Runtime {
             }
             (Some(checkpoint), None) => Some(checkpoint.snapshot.clone()),
             (None, snapshot) => snapshot,
+        };
+        let (lcm_resume_events, _) = if let Some(canonical) = snapshot.as_mut() {
+            let (events, repaired) =
+                prepare_lcm_resume(&self.shared, &session_id, canonical).await?;
+            if repaired || !events.is_empty() {
+                // Recovery must continue from the replacement namespace even
+                // when the loaded protected checkpoint still contains schema
+                // v1. The next checkpoint transition persists this exact
+                // snapshot under a fresh state revision.
+                if let Some(checkpoint) = checkpoint.as_mut() {
+                    checkpoint.snapshot = canonical.clone();
+                    checkpoint.validate()?;
+                }
+            }
+            (events, repaired)
+        } else if let Some(coordinator) = self.shared.lcm.as_ref() {
+            // Fresh ephemeral sessions still validate their host-issued
+            // binding before construction succeeds.
+            coordinator.timeline_binding(&session_id)?;
+            (Vec::new(), false)
+        } else {
+            (Vec::new(), false)
         };
         if let Some(snapshot) = snapshot {
             state.history = snapshot.history;
@@ -636,6 +833,9 @@ impl Runtime {
         self.shared
             .driver
             .emit_session_composition(&inner.emitter, &inner.execution);
+        for event in lcm_resume_events {
+            inner.emitter.emit(None, event.into_runtime_event());
+        }
         let session = SessionHandle::new(inner);
         let checkpoint = if request.checkpoint_recovery != CheckpointRecoveryPolicy::Defer
             && !recovery_deferred

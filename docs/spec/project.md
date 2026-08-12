@@ -33,9 +33,13 @@
 - `agent-runtime-context`: the authoritative context engine — versioned
   positioned fragments, complete token accounting, structural compaction, and
   cache-aware planning. Deterministic and network-free.
+- `agent-runtime-lcm`: immutable logical timelines, transactional hierarchical
+  summary DAGs, deterministic tool-safe compaction planning, bounded expansion,
+  and convergence-guaranteed summarization. Store- and provider-neutral.
 - `agent-runtime`: the embeddable runtime — registry hub, capability routing,
   checkpointable direct turn machine, prepared tool execution, host
-  interaction, delegation, generic harness components, and the session facade
+  interaction, delegation, generic harness components including the LCM
+  coordinator, and the session facade
 - `agent-runtime-obs`: optional event sinks and projections, never on the
   execution path
 - `agent-runtime-testkit`: deterministic fake providers, clocks, event
@@ -60,6 +64,10 @@ dependency isolation or independent reuse.
   through neutral contracts
 - Source ownership: moved behavior has one canonical implementation; consumers
   MUST remove superseded copies during their migration
+- LCM authority: hosts own timeline authorization and persistence. Nyx binds an
+  authorized channel, Smith binds a persistent agent session, and Open Forge
+  binds an authorized Room + AgentIdentity context; a runtime `SessionId` or
+  opaque LCM ID alone is never authority.
 - Code style: `cargo fmt`; Clippy warnings are errors
 - Testing: unit tests, deterministic conformance suites, schema fixtures, and
   compatibility checks against all supported consumers
@@ -73,6 +81,7 @@ dependency isolation or independent reuse.
 | Area | Owner |
 | --- | --- |
 | Provider contracts, common adapters, direct agent loop, and tool contracts | Agent Runtime |
+| LCM timeline/DAG mechanism, deterministic planning, expansion, and runtime hooks | Agent Runtime; host binding/store/model/policy remain consumer-owned |
 | Streaming events, cancellation, usage/cache accounting, and runtime testkit | Agent Runtime |
 | Terminal UI, `smith -p`, and Smith-specific configuration/defaults | Smith |
 | Chat adapters, memory source/persistence policy, cron, workflows, gateway, and Nyx product policy | Nyx |

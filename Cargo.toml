@@ -6,6 +6,7 @@ members = [
     "crates/agent-runtime-ability",
     "crates/agent-runtime-provider",
     "crates/agent-runtime-context",
+    "crates/agent-runtime-lcm",
     "crates/agent-runtime-obs",
     "crates/agent-runtime",
     "crates/agent-runtime-mcp",
@@ -50,6 +51,7 @@ agent-runtime-core = { path = "crates/agent-runtime-core", version = "0.1.0" }
 agent-runtime-ability = { path = "crates/agent-runtime-ability", version = "0.1.0" }
 agent-runtime-provider = { path = "crates/agent-runtime-provider", version = "0.1.0" }
 agent-runtime-context = { path = "crates/agent-runtime-context", version = "0.1.0" }
+agent-runtime-lcm = { path = "crates/agent-runtime-lcm", version = "0.1.0" }
 agent-runtime-obs = { path = "crates/agent-runtime-obs", version = "0.1.0" }
 agent-runtime = { path = "crates/agent-runtime", version = "0.1.0" }
 agent-runtime-mcp = { path = "crates/agent-runtime-mcp", version = "0.1.0" }

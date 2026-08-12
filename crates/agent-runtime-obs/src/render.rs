@@ -5,6 +5,7 @@
 //! Consumers wanting a different look implement their own [`crate::EventSink`]
 //! or format the [`crate::ObsRow`] projection instead.
 
+use agent_runtime_core::event::Fingerprint;
 use agent_runtime_core::event::{EventEnvelope, RuntimeEvent};
 use serde_json::Value;
 use std::fmt::Display;
@@ -29,6 +30,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::CapabilitiesActivated { .. } => "capabilities_activated",
         RuntimeEvent::ContextPlanned { .. } => "context_planned",
         RuntimeEvent::ContextCompacted { .. } => "context_compacted",
+        RuntimeEvent::LcmLifecycle { .. } => "lcm_lifecycle",
         RuntimeEvent::PlanUpdated { .. } => "plan_updated",
         RuntimeEvent::GoalUpdated { .. } => "goal_updated",
         RuntimeEvent::CachePlanChanged { .. } => "cache_plan_changed",
@@ -166,6 +168,47 @@ fn summary(payload: &RuntimeEvent) -> String {
             "context_compacted context={context} reason={reason:?} evicted={} summaries={} reclaimed_tokens={reclaimed_tokens}",
             evicted.len(),
             summaries.len()
+        ),
+        RuntimeEvent::LcmLifecycle {
+            kind,
+            reason,
+            metadata,
+        } => format!(
+            "lcm_lifecycle kind={kind:?} reason={} timeline={} operation={} node={} operation_fingerprint={} source_fingerprint={} result_fingerprint={} child_ids={} dag_revision={} covered={}..{} covered_count={} child_count={} expanded_count={} input_tokens={} output_tokens={} reclaimed_tokens={} pressure_percent={} escalation_level={} policy_revision={} algorithm_revision={} model_revision={} sizer_revision={} guard_revision={} sensitivity={} trust={}",
+            reason
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "none".to_owned()),
+            optional_opaque_id(&metadata.timeline_id),
+            optional_opaque_id(&metadata.operation_id),
+            optional_opaque_id(&metadata.node_id),
+            optional_display(&metadata.operation_fingerprint),
+            optional_display(&metadata.source_fingerprint),
+            optional_display(&metadata.result_fingerprint),
+            opaque_id_list(&metadata.child_ids),
+            optional_display(&metadata.dag_revision),
+            optional_display(&metadata.covered_start),
+            optional_display(&metadata.covered_end),
+            optional_display(&metadata.covered_count),
+            optional_display(&metadata.child_count),
+            optional_display(&metadata.expanded_count),
+            optional_display(&metadata.input_tokens),
+            optional_display(&metadata.output_tokens),
+            optional_display(&metadata.reclaimed_tokens),
+            optional_display(&metadata.pressure_percent),
+            optional_display(&metadata.escalation_level),
+            optional_display(&metadata.policy_revision),
+            optional_display(&metadata.algorithm_revision),
+            optional_display(&metadata.model_revision),
+            optional_display(&metadata.sizer_revision),
+            optional_display(&metadata.guard_revision),
+            metadata
+                .sensitivity
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "none".to_owned()),
+            metadata
+                .trust
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "none".to_owned()),
         ),
         RuntimeEvent::PlanUpdated {
             revision,
@@ -477,6 +520,30 @@ fn optional_display<T: Display>(value: &Option<T>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+/// Renders an opaque LCM identity as a stable fingerprint. Timeline, node,
+/// operation, child, and continuation ids are correlation handles—not log
+/// content—and must never appear verbatim in ordinary observation output.
+fn optional_opaque_id(value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .map(|id| Fingerprint::of(id.as_bytes()).to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// Renders the individually listed child identities as stable fingerprints.
+/// The aggregate child count remains a separate field so truncated lists are
+/// distinguishable from complete ones.
+fn opaque_id_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "none".to_owned();
+    }
+    values
+        .iter()
+        .map(|id| Fingerprint::of(id.as_bytes()).to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Clip a string to at most `max` characters, appending an ellipsis when cut.
 /// Uses char boundaries so multi-byte text never panics.
 fn clip(value: &str, max: usize) -> String {
@@ -621,6 +688,43 @@ mod tests {
         assert!(line.contains("input_tokens=420"));
         assert!(line.contains("input_budget=8000"));
         assert!(line.contains("reserved=512"));
+    }
+
+    #[test]
+    fn lcm_lifecycle_renders_typed_metrics_without_content_or_authority() {
+        use agent_runtime_core::event::{
+            LcmLifecycleKind, LcmLifecycleMetadata, LcmLifecycleReason,
+        };
+
+        let env = envelope(
+            None,
+            RuntimeEvent::LcmLifecycle {
+                kind: LcmLifecycleKind::DeterministicFallback,
+                reason: Some(LcmLifecycleReason::NonShrinkingOutput),
+                metadata: LcmLifecycleMetadata {
+                    timeline_id: Some("timeline-1".into()),
+                    operation_id: Some("operation-1".into()),
+                    node_id: Some("node-1".into()),
+                    input_tokens: Some(500),
+                    output_tokens: Some(120),
+                    reclaimed_tokens: Some(380),
+                    ..LcmLifecycleMetadata::default()
+                },
+            },
+        );
+        let line = log_line(&env);
+        assert_eq!(event_type(&env.payload), "lcm_lifecycle");
+        assert!(line.contains("kind=DeterministicFallback"));
+        assert!(line.contains("reason=NonShrinkingOutput"));
+        assert!(line.contains(&format!("timeline={}", Fingerprint::of("timeline-1"))));
+        assert!(!line.contains("timeline-1"));
+        assert!(!line.contains("operation-1"));
+        assert!(!line.contains("node-1"));
+        assert!(line.contains("input_tokens=500"));
+        assert!(line.contains("output_tokens=120"));
+        assert!(line.contains("reclaimed_tokens=380"));
+        assert!(!line.contains("summary body"));
+        assert!(!line.contains("authorization"));
     }
 
     #[test]

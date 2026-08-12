@@ -25,7 +25,7 @@ pub use engine::Runtime;
 pub use goal::{GoalAdmissionGate, GoalController, GoalControllerConfig};
 pub use inject::InjectedContent;
 pub use session::{
-    CurrentCacheIdentityLease, IdleCompactionAdmission, IdleCompactionResult,
-    IdleCompactionSummary, InternalTurnAdmission, SessionHandle, TurnHandle,
+    CurrentCacheIdentityLease, IdleCompactionAdmission, InternalTurnAdmission, SessionHandle,
+    TurnHandle,
 };
 pub use state::{SessionExecutionContext, SessionState};

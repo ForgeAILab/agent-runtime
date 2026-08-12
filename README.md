@@ -23,8 +23,9 @@ types.
 | `agent-runtime-ability` | Descriptor-first abilities on the registry kernel: bounded `AbilityDescriptor`s, dependency/conflict/readiness metadata, lazy policy-checked activation, and the unified `Ability`/`AbilityKind` view. Registry-only by default; `tool` bridges the runtime's `Tool`. |
 | `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, configurable OpenAI-compatible, native Responses, and native Gemini Interactions adapters, a deterministic fake, and the attempt-recording retry/backoff classifier. |
 | `agent-runtime-context` | The authoritative context engine: versioned and positioned `ContextFragment`s (including composable system-prompt sections), complete token accounting (`RequestSizer`/`CharRatioSizer`), deterministic structural compaction, and cache-aware planning through `ContextPlanner`. Deterministic and network-free. |
+| `agent-runtime-lcm` | Lossless Context Memory: immutable logical timelines, transactional hierarchical summary DAGs, deterministic tool-safe compaction planning, convergence-guaranteed summarization, and bounded expansion. Store- and provider-neutral. |
 | `agent-runtime-obs` | Observability facade over the event envelope: an async `EventSink`, `FanoutSink`, a `SinkObserver` bridge, an event-stream pump, an `ObsRow` SQL projection, and feature-gated CLI/file/SQLite sinks. |
-| `agent-runtime` | The embeddable runtime: session-scoped registry views and activation epochs, the checkpointable direct turn machine, prepared tool execution, host interaction, delegation, and reusable harness components for todos, memory, artifacts, and semantic summaries. Re-exports `registry`, `ability`, `provider`, and `context`, and `obs` behind an opt-in feature. |
+| `agent-runtime` | The embeddable runtime: session-scoped registry views and activation epochs, the checkpointable direct turn machine, prepared tool execution, host interaction, delegation, and reusable harness components for todos, memory, artifacts, and LCM. Re-exports `registry`, `ability`, `provider`, `context`, and `lcm`, and `obs` behind an opt-in feature. |
 | `agent-runtime-testkit` | Deterministic fakes, clocks, event recorders, reusable conformance suites, and neutral consumer adapter fixtures. |
 
 All crates except `agent-runtime-testkit` are intended as production
@@ -194,6 +195,19 @@ their real-user turn is admitted.
 Goal state is durable in versioned extension state, while scheduling remains
 strictly process-scoped—there is no daemon or restart-time execution.
 
+LCM is opt-in: a host supplies its transactional `LcmReader`/`LcmWriter`
+adapter, one shared `LcmViewAuthority`, timeline resolver, summary model, and
+policy, then attaches the coordinator with `RuntimeBuilder::lcm`. Soft work is
+admitted only by `SessionHandle::try_idle_compaction`; hard work completes
+before provider admission. The context planner remains authoritative for final
+budgeting and provider serialization. Hosts may attach a summary-body
+`ContentGuard` with `LcmCoordinator::with_content_guard`; guard identity and
+revision are protected compatibility inputs. Authorized callers can inspect a
+bounded source page through `SessionHandle::expand_lcm` without receiving or
+supplying an authority grant. See
+[`docs/migration-0.1.md`](docs/migration-0.1.md#17-lossless-context-memory) for
+the direct-package and facade composition examples.
+
 ## Development
 
 ```sh
@@ -204,7 +218,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 # violation reaches a consumer, since newer syntax compiles fine on stable.
 cargo +1.86.0 build \
   -p agent-runtime-registry -p agent-runtime-core -p agent-runtime-ability \
-  -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-obs \
+  -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-lcm \
+  -p agent-runtime-obs \
   -p agent-runtime
 
 # Dependency boundaries are contracts, not preferences.

@@ -84,3 +84,31 @@ downgrade; side-effect-aware tool scheduling; and the embeddable runtime facade
 Adopting this runtime in Nyx, Smith, or Open Forge — and deleting each
 consumer's superseded implementation — requires a **separate approved proposal
 in that consumer's repository**. This change does not modify any consumer.
+
+## Lossless Context Memory transfer (implemented; consumer adoption pending)
+
+The implemented Lossless Context Memory transfer is based on Nyx revision
+`9614842d8f614d7d41e00d8e73ed3d042764d451` (`chore(runtime): close phase 1
+merge gates`). The donor is `MIT OR Apache-2.0`; this repository uses the MIT
+option. Any transferred substantial source must retain the donor
+`LICENSE-MIT` notice, `Copyright (c) 2025-2026 Nyx Contributors`, alongside the
+destination `LICENSE` and this provenance record.
+
+The neutral transfer is limited to the summary-DAG invariants, active-node and
+frontier projection, token-targeted compaction selection, three-stage
+strict-shrink escalation, and their conformance tests. The canonical
+destinations are the `crates/agent-runtime-lcm/src/{summarize,planning,
+pressure,projection,store}.rs` modules plus
+`crates/agent-runtime/src/harness/lcm.rs` for turn/checkpoint integration. The
+full source-to-destination map, donor behavior/test inventory, historical
+pre-cutover baseline, and consumer binding rows are in
+[`docs/spec/changes/add-lossless-context-memory-2026-08-11/transfer-baseline.md`](docs/spec/changes/add-lossless-context-memory-2026-08-11/transfer-baseline.md).
+
+This records source transfer only; it does not claim final validation, a
+release gate, or consumer adoption. No Nyx, Smith, or Open Forge repository has
+been changed here. Each consumer adoption remains a separate approved change
+with its own binding, store conformance, and recovery gate. Nyx channel
+identity, Smith persistent agent-session identity, and Open Forge Room +
+AgentIdentity authorization remain host policy. Nyx SQLite migrations,
+settlement/vector-memory policy, provider prompts/catalog, scheduler policy,
+and product memory authority are not transferred.

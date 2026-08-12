@@ -220,6 +220,7 @@ pub fn assert_compaction_conformance() {
             model_purpose: None,
             model_revision: None,
             sensitivity: None,
+            lossless: None,
         }],
         ..CompactionOutcome::default()
     };
