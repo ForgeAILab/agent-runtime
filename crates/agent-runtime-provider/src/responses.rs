@@ -74,6 +74,25 @@ pub struct ResponsesConfig {
     pub api_key: Option<Secret>,
     /// Additional headers sent with every request.
     pub extra_headers: Vec<(String, String)>,
+    /// How the terminal `response.completed`/`response.incomplete` payload's
+    /// `output` array is treated.
+    pub terminal_output: TerminalOutputPolicy,
+}
+
+/// How a Responses stream's terminal payload contributes to the turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TerminalOutputPolicy {
+    /// Reconcile the terminal `output` array with the streamed items,
+    /// treating divergence as a malformed stream. The platform Responses API
+    /// keeps both views consistent.
+    #[default]
+    Reconcile,
+    /// Trust the streamed `output_item.done` items and read only usage from
+    /// the terminal payload. The ChatGPT/Codex backend re-serializes items in
+    /// the terminal payload (e.g. freshly re-encrypted reasoning), so
+    /// reconciliation would reject valid streams; reference clients ignore
+    /// the terminal output entirely.
+    UsageOnly,
 }
 
 impl fmt::Debug for ResponsesConfig {
@@ -119,6 +138,7 @@ impl ResponsesConfig {
             },
             api_key: None,
             extra_headers: Vec::new(),
+            terminal_output: TerminalOutputPolicy::Reconcile,
         }
     }
 
@@ -155,7 +175,40 @@ impl ResponsesConfig {
     pub fn xai(model: impl Into<String>) -> Self {
         Self::new("https://api.x.ai/v1", model)
     }
+
+    /// Preset config for the OpenAI platform Responses API
+    /// (`https://api.openai.com/v1`).
+    pub fn openai(model: impl Into<String>) -> Self {
+        Self::new("https://api.openai.com/v1", model)
+    }
+
+    /// Preset config for the ChatGPT/Codex Responses backend
+    /// ([`CHATGPT_CODEX_BASE_URL`]) used by ChatGPT OAuth accounts.
+    ///
+    /// The backend authenticates the OAuth bearer token against the Codex
+    /// CLI OAuth client and rejects requests that do not carry that client's
+    /// identifying headers. It also re-serializes terminal output (reasoning
+    /// items get freshly re-encrypted), so the terminal payload is consumed
+    /// for usage only. Pair with [`Self::with_chatgpt_account`] when the
+    /// token spans multiple workspace accounts.
+    pub fn chatgpt(model: impl Into<String>) -> Self {
+        let mut config = Self::new(CHATGPT_CODEX_BASE_URL, model)
+            .with_extra_header("OpenAI-Beta", "responses=experimental")
+            .with_extra_header("originator", "codex_cli_rs");
+        config.capabilities.auth = AuthKind::Bearer;
+        config.terminal_output = TerminalOutputPolicy::UsageOnly;
+        config
+    }
+
+    /// Adds the `chatgpt-account-id` header selecting which of the OAuth
+    /// token's workspace accounts the request bills against.
+    pub fn with_chatgpt_account(self, account_id: impl Into<String>) -> Self {
+        self.with_extra_header("chatgpt-account-id", account_id)
+    }
 }
+
+/// The ChatGPT/Codex Responses endpoint served to ChatGPT OAuth accounts.
+pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 /// A native, stateless OpenAI Responses provider over injected HTTP.
 pub struct ResponsesProvider<T: HttpTransport> {
@@ -1035,6 +1088,7 @@ enum PendingTerminal {
 
 #[derive(Debug, Default)]
 struct StreamState {
+    terminal_output: TerminalOutputPolicy,
     tools: BTreeMap<u32, ToolSlot>,
     tool_by_item_id: BTreeMap<String, u32>,
     tool_by_call_id: BTreeMap<String, u32>,
@@ -1712,7 +1766,9 @@ fn event_to_events(
             let response = event
                 .get("response")
                 .ok_or_else(|| malformed("Responses completed event was missing response"))?;
-            hydrate_response_output(state, response, out)?;
+            if state.terminal_output == TerminalOutputPolicy::Reconcile {
+                hydrate_response_output(state, response, out)?;
+            }
             flush_reasoning_signatures(state, out);
             response_usage(state, response, out)?;
             state.validate_tools()?;
@@ -1727,7 +1783,9 @@ fn event_to_events(
             let response = event
                 .get("response")
                 .ok_or_else(|| malformed("Responses incomplete event was missing response"))?;
-            hydrate_response_output(state, response, out)?;
+            if state.terminal_output == TerminalOutputPolicy::Reconcile {
+                hydrate_response_output(state, response, out)?;
+            }
             flush_reasoning_signatures(state, out);
             response_usage(state, response, out)?;
             state.validate_tools()?;
@@ -1882,6 +1940,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
         let credential_source = self.credential_source.clone();
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
+        let terminal_output = self.config.terminal_output;
         let out = stream! {
             // Emitted first so a consumer sees the limit state that governed
             // this attempt before any of its output.
@@ -1890,7 +1949,10 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
             }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
-            let mut state = StreamState::default();
+            let mut state = StreamState {
+                terminal_output,
+                ..StreamState::default()
+            };
             let mut done = false;
 
             'outer: loop {
@@ -2532,6 +2594,65 @@ mod tests {
             })
             .collect();
         assert_eq!(signatures, ["enc-a"]);
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop
+            })
+        ));
+    }
+
+    #[test]
+    fn chatgpt_preset_targets_codex_backend_with_usage_only_terminal() {
+        let config = ResponsesConfig::chatgpt("gpt-5.3").with_chatgpt_account("acct-1");
+        assert_eq!(config.base_url, CHATGPT_CODEX_BASE_URL);
+        assert_eq!(config.capabilities.auth, AuthKind::Bearer);
+        assert_eq!(config.terminal_output, TerminalOutputPolicy::UsageOnly);
+        let headers: Vec<(&str, &str)> = config
+            .extra_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                ("OpenAI-Beta", "responses=experimental"),
+                ("originator", "codex_cli_rs"),
+                ("chatgpt-account-id", "acct-1"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_only_terminal_ignores_reserialized_output() {
+        // The Codex backend's terminal payload re-serializes every item:
+        // reasoning is re-encrypted, summaries can be re-ordered, and hosted
+        // items may appear. Under `UsageOnly` none of that is reconciled —
+        // streamed items stand, and the terminal payload contributes usage.
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"think\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"think\"}],\"encrypted_content\":\"enc-a\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"reordered\"}],\"encrypted_content\":\"enc-b\"},{\"type\":\"web_search_call\",\"id\":\"ws_1\"}],\"usage\":{\"input_tokens\":10,\"output_tokens\":8}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let provider = ResponsesProvider::new(
+            ReplayTransport::new(body),
+            ResponsesConfig::chatgpt("gpt-5.3"),
+        )
+        .expect("valid ChatGPT config");
+        let request = ProviderRequest::new(ModelId::new("gpt-5.3"), vec![Message::user("hi")]);
+        let mut stream = provider
+            .stream(request, ctx())
+            .await
+            .expect("stream begins");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::ReasoningDelta { signature: Some(signature), .. } if signature == "enc-a")));
+        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::Usage { delta } if delta.get(CounterKind::Output) > 0)));
         assert!(matches!(
             events.last(),
             Some(ProviderStreamEvent::Finish {
