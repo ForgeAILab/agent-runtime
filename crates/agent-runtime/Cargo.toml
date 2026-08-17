@@ -43,6 +43,7 @@ obs = ["dep:agent-runtime-obs"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
 agent-runtime-obs.workspace = true
+agent-runtime-lcm = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

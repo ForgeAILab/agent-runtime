@@ -52,7 +52,7 @@ pub use projection::{
 };
 pub use store::{
     AppendResult, CommitResult, ExpansionItem, ExpansionRequest, LcmError, LcmExpansion, LcmReader,
-    LcmStore, LcmView, LcmViewAuthority, LcmWriter, operation_fingerprint,
+    LcmStore, LcmView, LcmViewAuthority, LcmWriter, TruncateResult, operation_fingerprint,
 };
 pub use summarize::{
     EscalationLevel, LcmEscalatingSummarizer, LcmEscalationPolicy, LcmSummaryAttempt,

@@ -18,7 +18,7 @@ use crate::node::{CondensationCommit, LcmEdge, LcmNode, LcmNodeKind, LeafCommit}
 use crate::planning::{source_fingerprint_entries, source_fingerprint_nodes};
 use crate::store::{
     AppendResult, CommitResult, ExpansionItem, ExpansionRequest, LcmError, LcmExpansion, LcmReader,
-    LcmView, LcmViewAuthority, LcmWriter, validate_limit, validate_view,
+    LcmView, LcmViewAuthority, LcmWriter, TruncateResult, validate_limit, validate_view,
 };
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -790,6 +790,49 @@ impl LcmWriter for InMemoryLcmStore {
             },
         );
         Ok(result)
+    }
+
+    async fn truncate_from(
+        &self,
+        view: &LcmView,
+        from: LcmSequence,
+    ) -> Result<TruncateResult, LcmError> {
+        self.authorize_view(view)?;
+        validate_view(&self.timeline_id, view)?;
+        let mut state = self.lock()?;
+        if state
+            .nodes
+            .values()
+            .any(|node| node.range.end >= from && node.superseded_by.is_none())
+        {
+            return Err(LcmError::RangeOverlap);
+        }
+        let removed_sequences = state
+            .entries
+            .range(from..)
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>();
+        if removed_sequences.is_empty() {
+            return Ok(TruncateResult {
+                revision: state.revision,
+                removed: 0,
+            });
+        }
+        let next_revision = state.revision.next().ok_or_else(|| LcmError::Invalid {
+            reason: "LCM revision space is exhausted".into(),
+        })?;
+        let mut removed = 0;
+        for sequence in removed_sequences {
+            if let Some(entry) = state.entries.remove(&sequence) {
+                state.entry_ids.remove(&entry.id);
+                removed += 1;
+            }
+        }
+        state.revision = next_revision;
+        Ok(TruncateResult {
+            revision: state.revision,
+            removed,
+        })
     }
 }
 

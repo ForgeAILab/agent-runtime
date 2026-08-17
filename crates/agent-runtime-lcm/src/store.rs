@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::entry::{LcmAppendRequest, LcmEntry};
 use crate::ids::{
-    LcmExpansionCursor, LcmNodeId, LcmOperationFingerprint, LcmRange, LcmRevision, LcmTimelineId,
-    MAX_LCM_ID_CHARS,
+    LcmExpansionCursor, LcmNodeId, LcmOperationFingerprint, LcmRange, LcmRevision, LcmSequence,
+    LcmTimelineId, MAX_LCM_ID_CHARS,
 };
 use crate::node::{CondensationCommit, LcmNode, LeafCommit};
 
@@ -229,6 +229,15 @@ pub struct AppendResult {
     pub already_committed: bool,
 }
 
+/// Result of a provisional-tail truncation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncateResult {
+    /// Durable revision after the truncation.
+    pub revision: LcmRevision,
+    /// Number of entries removed.
+    pub removed: usize,
+}
+
 /// Result of an atomic node mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitResult {
@@ -388,6 +397,26 @@ pub trait LcmWriter: LcmReader {
         view: &LcmView,
         request: CondensationCommit,
     ) -> Result<CommitResult, LcmError>;
+
+    /// Removes the provisional tail of the immutable sequence, starting at
+    /// `from` (inclusive).
+    ///
+    /// This exists solely so a host can disown entries appended by a turn
+    /// that never reached a terminal checkpoint; committed DAG history is
+    /// never rewritten. Implementations MUST reject the call when any node's
+    /// source range reaches into the truncated span. Stores that cannot
+    /// support truncation keep the default implementation, which rejects the
+    /// call; the coordinator then surfaces the original divergence error.
+    async fn truncate_from(
+        &self,
+        view: &LcmView,
+        from: LcmSequence,
+    ) -> Result<TruncateResult, LcmError> {
+        let _ = (view, from);
+        Err(LcmError::Invalid {
+            reason: "LCM store does not support provisional-tail truncation".to_owned(),
+        })
+    }
 }
 
 /// Combined store convenience bound; no concrete backend is supplied here.

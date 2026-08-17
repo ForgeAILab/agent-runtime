@@ -1037,43 +1037,205 @@ impl LcmCoordinator {
         if start == history.len() {
             return Ok(());
         }
-        let entries = history[start..]
+        match self.try_append_range(binding, history, start).await? {
+            Ok(()) => Ok(()),
+            Err(LcmError::SequenceGap { expected, .. }) => {
+                self.reconcile_diverged_store(binding, history, start, Some(expected))
+                    .await
+            }
+            Err(LcmError::EntryConflict) => {
+                self.reconcile_diverged_store(binding, history, start, None)
+                    .await
+            }
+            Err(error) => Err(map_lcm_error(error)),
+        }
+    }
+
+    /// Builds and appends the canonical entries for `history[from..]`. The
+    /// outer `Result` carries host-side failures; the inner one is the raw
+    /// store outcome so a caller can react to a specific [`LcmError`].
+    async fn try_append_range(
+        &self,
+        binding: &LcmTimelineBinding,
+        history: &[Message],
+        from: usize,
+    ) -> Result<Result<(), LcmError>, RuntimeError> {
+        let entries = history[from..]
             .iter()
             .enumerate()
-            .map(|(offset, message)| self.entry_for(binding, (start + offset) as u64, message))
+            .map(|(offset, message)| self.entry_for(binding, (from + offset) as u64, message))
             .collect::<Result<Vec<_>, _>>()?;
-        let encoded = serde_json::to_vec(&history[start..]).map_err(|error| {
+        let encoded = serde_json::to_vec(&history[from..]).map_err(|error| {
             RuntimeError::internal(format!("failed to encode LCM append operation: {error}"))
         })?;
         let operation_id =
-            LcmOperationId::new(format!("history:{}:{}", start, Fingerprint::of(encoded)));
+            LcmOperationId::new(format!("history:{}:{}", from, Fingerprint::of(encoded)));
         let request = LcmAppendRequest::new(operation_id, entries);
-        self.store
+        Ok(self
+            .store
             .append(&binding.view(), request)
             .await
-            .map(|_: AppendResult| ())
-            .map_err(map_lcm_error)
+            .map(|_: AppendResult| ()))
     }
 
-    async fn load_entries(
+    /// Re-anchors a history append whose checkpointed frontier disagrees with
+    /// the store content. Every case is a crash/failure artifact:
+    ///
+    /// - store BEHIND the frontier (`tail < start`): a checkpoint advanced but
+    ///   its append never became durable; re-append from the store tail —
+    ///   every message below the checkpointed frontier is canonical.
+    /// - store AHEAD of the frontier (`tail > start`, or an entry conflict at
+    ///   an overlapping sequence): a turn that never reached a terminal
+    ///   checkpoint appended entries the canonical history has since
+    ///   disowned; verify the overlap, truncate from the first diverged
+    ///   sequence, and append the canonical suffix.
+    ///
+    /// `tail` is the store frontier when the append error reported one
+    /// (a sequence gap); an entry conflict does not, so the overlap is
+    /// discovered by lenient reads instead.
+    async fn reconcile_diverged_store(
+        &self,
+        binding: &LcmTimelineBinding,
+        history: &[Message],
+        start: usize,
+        tail: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        let view = binding.view();
+        if let Some(tail) = tail {
+            let tail = usize::try_from(tail).map_err(|_| {
+                RuntimeError::conflict("LCM store tail exceeds addressable history")
+            })?;
+            if tail < start {
+                return match self.try_append_range(binding, history, tail).await? {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(map_lcm_error(error)),
+                };
+            }
+        }
+        let stored = self
+            .load_stored_overlap(&view, start, history.len())
+            .await?;
+        let mut divergence = None;
+        for (offset, entry) in stored.iter().enumerate() {
+            let sequence = start + offset;
+            let canonical = self.entry_for(binding, sequence as u64, &history[sequence])?;
+            if canonical.content_fingerprint != entry.content_fingerprint {
+                divergence = Some(sequence);
+                break;
+            }
+        }
+        // Entries beyond the canonical history length are orphans even when
+        // the whole overlap matches.
+        let beyond_canonical = match tail {
+            Some(tail) => tail as usize > history.len(),
+            None => self.store_has_entry_at(&view, history.len()).await?,
+        };
+        let truncate_at = divergence.or_else(|| beyond_canonical.then_some(history.len()));
+        let resume_from = match truncate_at {
+            Some(sequence) => {
+                self.store
+                    .truncate_from(&view, LcmSequence::new(sequence as u64))
+                    .await
+                    .map_err(map_lcm_error)?;
+                sequence
+            }
+            None => start + stored.len(),
+        };
+        if resume_from >= history.len() {
+            return Ok(());
+        }
+        match self.try_append_range(binding, history, resume_from).await? {
+            Ok(()) => Ok(()),
+            Err(error) => Err(map_lcm_error(error)),
+        }
+    }
+
+    /// Whether the store holds an entry at `sequence`.
+    async fn store_has_entry_at(
         &self,
         view: &LcmView,
-        history_len: usize,
+        sequence: usize,
+    ) -> Result<bool, RuntimeError> {
+        let sequence = LcmSequence::new(sequence as u64);
+        let range = LcmRange::new(sequence, sequence)
+            .map_err(|error| RuntimeError::conflict(error.to_string()))?;
+        Ok(!self
+            .store
+            .load_range(view, range, 1)
+            .await
+            .map_err(map_lcm_error)?
+            .is_empty())
+    }
+
+    /// Loads whatever contiguous stored entries exist in `[from, end)`,
+    /// returning a possibly-shorter prefix when the store tail ends inside
+    /// the range.
+    async fn load_stored_overlap(
+        &self,
+        view: &LcmView,
+        from: usize,
+        end: usize,
     ) -> Result<Vec<LcmEntry>, RuntimeError> {
-        if history_len == 0 {
+        if from >= end {
             return Ok(Vec::new());
         }
-        let end = LcmSequence::new(history_len.saturating_sub(1) as u64);
-        let mut next = LcmSequence::new(0);
-        let mut entries = Vec::with_capacity(history_len);
+        let last = (end - 1) as u64;
+        let mut next = from as u64;
+        let mut entries = Vec::new();
         loop {
-            if next.get() > end.get() {
+            if next > last {
+                break;
+            }
+            let page_end = next
+                .saturating_add((LCM_READ_PAGE_SIZE.saturating_sub(1)) as u64)
+                .min(last);
+            let page_range = LcmRange::new(LcmSequence::new(next), LcmSequence::new(page_end))
+                .map_err(|error| RuntimeError::conflict(error.to_string()))?;
+            let page = self
+                .store
+                .load_range(view, page_range, LCM_READ_PAGE_SIZE)
+                .await
+                .map_err(map_lcm_error)?;
+            for (offset, entry) in page.iter().enumerate() {
+                let expected = next.saturating_add(offset as u64);
+                if entry.sequence.get() != expected || entry.timeline_id != *view.timeline_id() {
+                    return Err(RuntimeError::conflict(
+                        "LCM history page violated timeline or sequence ordering",
+                    ));
+                }
+            }
+            let span = (page_end - next + 1) as usize;
+            entries.extend(page.iter().cloned());
+            if page.len() < span {
+                break;
+            }
+            next = page_end.saturating_add(1);
+        }
+        Ok(entries)
+    }
+
+    /// Loads the stored entries covering `[from, end)`, validating timeline
+    /// and sequence continuity.
+    async fn load_range_paged(
+        &self,
+        view: &LcmView,
+        from: usize,
+        end: usize,
+    ) -> Result<Vec<LcmEntry>, RuntimeError> {
+        if from >= end {
+            return Ok(Vec::new());
+        }
+        let last = LcmSequence::new(end.saturating_sub(1) as u64);
+        let mut next = LcmSequence::new(from as u64);
+        let mut entries = Vec::with_capacity(end - from);
+        loop {
+            if next.get() > last.get() {
                 break;
             }
             let page_end = LcmSequence::new(
                 next.get()
                     .saturating_add((LCM_READ_PAGE_SIZE.saturating_sub(1)) as u64)
-                    .min(end.get()),
+                    .min(last.get()),
             );
             let page_range = LcmRange::new(next, page_end)
                 .map_err(|error| RuntimeError::conflict(error.to_string()))?;
@@ -1096,22 +1258,30 @@ impl LcmCoordinator {
                 }
             }
             entries.extend(page.iter().cloned());
-            let last = page.last().expect("non-empty page").sequence;
-            next = last.next().ok_or_else(|| {
+            let page_last = page.last().expect("non-empty page").sequence;
+            next = page_last.next().ok_or_else(|| {
                 RuntimeError::conflict("LCM history sequence overflowed while paging")
             })?;
-            if entries.len() > history_len {
+            if entries.len() > end - from {
                 return Err(RuntimeError::conflict(
                     "LCM store returned an oversized history",
                 ));
             }
         }
-        if entries.len() != history_len {
+        if entries.len() != end - from {
             return Err(RuntimeError::conflict(
                 "LCM store did not return the complete canonical history",
             ));
         }
         Ok(entries)
+    }
+
+    async fn load_entries(
+        &self,
+        view: &LcmView,
+        history_len: usize,
+    ) -> Result<Vec<LcmEntry>, RuntimeError> {
+        self.load_range_paged(view, 0, history_len).await
     }
 
     async fn checkpoint_state(
@@ -3264,6 +3434,15 @@ impl TurnCommitHook for LcmCoordinator {
     }
 
     async fn after_commit(&self, view: &TurnCommitView) -> Result<TurnCommitPatch, RuntimeError> {
+        // A non-completed turn must not advance the immutable LCM timeline:
+        // its history suffix is not durable in the host's canonical record,
+        // and a strict synchronize failure here would strand the checkpoint
+        // short of Terminal, wedging the session ("cannot accept a new turn
+        // over a non-terminal checkpoint"). Synchronization is catch-up
+        // based, so the next completed boundary reconciles the full suffix.
+        if view.finish != TurnFinish::Completed {
+            return Ok(TurnCommitPatch::default());
+        }
         let binding = self.timeline_binding(&view.session)?;
         let previous = view
             .state
@@ -3278,9 +3457,6 @@ impl TurnCommitHook for LcmCoordinator {
             usage: Vec::new(),
             events: Vec::new(),
         };
-        if view.finish != TurnFinish::Completed {
-            return Ok(patch);
-        }
         let required_tokens = self
             .estimated_context_tokens(&binding, view.history.len())
             .await?;
