@@ -1327,11 +1327,12 @@ fn finish_reasoning_item(
     if let Some(signature) = optional_string(item, "encrypted_content") {
         validate_signature(&signature)
             .map_err(|_| malformed("Responses encrypted reasoning was invalid"))?;
-        if let Some(previous) = &slot.signature {
-            if previous != &signature {
-                return Err(malformed("Responses reasoning signature changed"));
-            }
-        } else {
+        // `encrypted_content` is an opaque blob some backends (ChatGPT/Codex)
+        // re-encrypt on every serialization, so the copy in a later event —
+        // e.g. the terminal `response.completed` output — need not match the
+        // one streamed in `output_item.done` byte-for-byte. Keep the first
+        // sealed copy; any of them replays correctly.
+        if slot.signature.is_none() {
             slot.signature = Some(signature);
         }
     }
@@ -1403,11 +1404,8 @@ fn handle_output_item_added(
             if let Some(signature) = optional_string(item, "encrypted_content") {
                 validate_signature(&signature)
                     .map_err(|_| malformed("Responses encrypted reasoning was invalid"))?;
-                if let Some(previous) = &slot.signature {
-                    if previous != &signature {
-                        return Err(malformed("Responses reasoning signature changed"));
-                    }
-                } else {
+                // Keep the first sealed copy; see `finish_reasoning_item`.
+                if slot.signature.is_none() {
                     slot.signature = Some(signature);
                 }
             }
@@ -2504,6 +2502,40 @@ mod tests {
             events.last(),
             Some(ProviderStreamEvent::Finish {
                 reason: FinishReason::ToolCalls
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn keeps_first_reasoning_signature_when_terminal_output_reencrypts_it() {
+        // The ChatGPT/Codex backend re-encrypts `encrypted_content` on every
+        // serialization, so the reasoning item inside `response.completed`
+        // carries different bytes than the streamed `output_item.done`.
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"think\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"think\"}],\"encrypted_content\":\"enc-a\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"think\"}],\"encrypted_content\":\"enc-b\"},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":8}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let request = ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("hi")]);
+        let events = collect_events(body, request).await;
+        let signatures: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::ReasoningDelta {
+                    signature: Some(signature),
+                    ..
+                } => Some(signature.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signatures, ["enc-a"]);
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop
             })
         ));
     }
