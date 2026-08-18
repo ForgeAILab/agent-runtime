@@ -106,6 +106,66 @@ pub struct SessionInner {
     pub(crate) recovery_deferred: bool,
 }
 
+impl SessionInner {
+    /// Reconciles one protected non-terminal checkpoint left by a turn that
+    /// is no longer running so later admission cannot wedge behind it.
+    ///
+    /// New work admitted over such a checkpoint finalizes the interrupted
+    /// turn as an explicit `Failed` terminal -- never replaying its
+    /// indeterminate outcome -- and then proceeds through ordinary
+    /// acceptance. Live turns (including checkpoint-resume recovery that is
+    /// still serving) and cache-operation checkpoints are never finalized
+    /// here; admission over those keeps failing closed exactly as before.
+    pub(crate) async fn reconcile_interrupted_checkpoint(&self) {
+        let Some(store) = self.shared.checkpoint_store.clone() else {
+            return;
+        };
+        let checkpoint = match store.load_latest(&self.id).await {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => return,
+            Err(error) => {
+                // The acceptance checkpoint re-reads the same store and
+                // fails closed with proper turn attribution; surface the
+                // reconciliation attempt without blocking admission.
+                self.emitter
+                    .emit(None, RuntimeEvent::Error { error });
+                return;
+            }
+        };
+        if checkpoint.state.is_terminal()
+            || matches!(
+                checkpoint.state,
+                TurnState::CacheOperationPrepared { .. }
+                    | TurnState::CacheOperationStarted { .. }
+                    | TurnState::CacheOperationResultReady { .. }
+            )
+        {
+            return;
+        }
+        let live = self
+            .turns
+            .lock()
+            .expect("session turns poisoned")
+            .cancellations
+            .contains_key(&checkpoint.turn);
+        if live {
+            return;
+        }
+        self.shared
+            .driver
+            .finalize_interrupted_turn(
+                self.state.clone(),
+                self.execution.clone(),
+                self.emitter.clone(),
+                self.minter.clone(),
+                self.cancel.child(),
+                self.inbox.clone(),
+                checkpoint,
+            )
+            .await;
+    }
+}
+
 /// Protected boundary invoked by the cache mechanism immediately after its
 /// final dispatch preflight and immediately before polling provider I/O.
 /// Implementations must durably save the Started checkpoint before returning.
@@ -2344,6 +2404,7 @@ impl SessionHandle {
                     mailbox: task_steer_mailbox.clone(),
                 });
             }
+            inner.reconcile_interrupted_checkpoint().await;
             inner
                 .shared
                 .driver
@@ -2607,6 +2668,7 @@ impl SessionHandle {
             turn: turn.clone(),
         };
         let _turn_gate = self.inner.turn_gate.lock().await;
+        self.inner.reconcile_interrupted_checkpoint().await;
 
         let call = ToolCall {
             id: self.inner.minter.tool_call(),
@@ -2711,6 +2773,7 @@ impl SessionHandle {
                     mailbox: task_steer_mailbox.clone(),
                 });
             }
+            inner.reconcile_interrupted_checkpoint().await;
             inner
                 .shared
                 .driver
