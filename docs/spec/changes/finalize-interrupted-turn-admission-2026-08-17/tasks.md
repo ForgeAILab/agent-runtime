@@ -5,7 +5,7 @@ updated_at: 2026-08-17T00:00:00Z
 
 ## 0. Coordination and Baseline
 
-- [ ] 0.1 Approve this proposal and delta spec before implementation.
+- [x] 0.1 Approve this proposal and delta spec before implementation.
 - [x] 0.2 Confirm the acceptance-time conflict sites and the terminal
   publication path in the driver.
 
