@@ -1,6 +1,51 @@
 use super::*;
 
 impl<'a> TurnMachine<'a> {
+    /// Finalizes one validated non-terminal checkpoint from a turn that is
+    /// no longer running as an explicit `Failed` terminal.
+    ///
+    /// Admission reconciliation calls this when new work arrives over a
+    /// protected checkpoint whose turn ended without a durable terminal
+    /// boundary. The interrupted turn's provider or tool outcome is
+    /// indeterminate, so this never replays it: the turn is attributed an
+    /// error and completes through the ordinary terminal publication path,
+    /// keeping the checkpoint chain -- and therefore replay -- continuous.
+    pub(super) async fn abandon(mut self) {
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .expect("abandon requires a checkpoint")
+            .clone();
+        if let Err(error) = checkpoint.validate() {
+            self.emit_non_durable_failure(error, checkpoint.visible_output);
+            return;
+        }
+        if let Some(input) = checkpoint.internal_input.clone() {
+            self.execution.begin_internal_turn(
+                self.turn_id.clone(),
+                checkpoint.active_history_start,
+                self.driver.clock.now(),
+                input,
+            );
+        } else {
+            self.execution.begin_turn(
+                self.turn_id.clone(),
+                checkpoint.active_history_start,
+                self.driver.clock.now(),
+            );
+        }
+        self.emitter.emit(
+            Some(self.turn_id.clone()),
+            RuntimeEvent::Error {
+                error: RuntimeError::conflict(
+                    "interrupted turn left no durable terminal boundary; finalized as failed without replay",
+                ),
+            },
+        );
+        self.complete(TurnFinish::Failed, checkpoint.visible_output)
+            .await;
+    }
+
     pub(super) async fn resume(mut self) {
         let checkpoint = self
             .checkpoint

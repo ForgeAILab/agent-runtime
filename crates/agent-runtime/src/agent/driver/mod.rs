@@ -835,6 +835,40 @@ impl Driver {
         .resume()
         .await;
     }
+
+    /// Finalizes one validated non-terminal checkpoint from a turn that is
+    /// no longer running as an explicit `Failed` terminal without minting a
+    /// new turn or replaying its indeterminate provider/tool work.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finalize_interrupted_turn(
+        &self,
+        state: Arc<Mutex<SessionState>>,
+        execution: Arc<SessionExecutionContext>,
+        emitter: Arc<EventEmitter>,
+        minter: Arc<IdMinter>,
+        turn_cancel: Cancellation,
+        inbox: Arc<Mutex<InjectionQueue>>,
+        checkpoint: TurnCheckpoint,
+    ) {
+        let turn_id = checkpoint.turn.clone();
+        TurnMachine::from_checkpoint(
+            self,
+            TurnMachineContext {
+                state,
+                execution,
+                emitter,
+                minter,
+                cancel: turn_cancel,
+                inbox,
+                steer_mailbox: None,
+                turn_id,
+                acceptance: None,
+            },
+            checkpoint,
+        )
+        .abandon()
+        .await;
+    }
 }
 
 /// One explicit, serializable direct-loop execution.
