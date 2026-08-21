@@ -1,6 +1,6 @@
 ---
 created_at: 2026-08-07T20:26:54Z
-updated_at: 2026-08-07T20:33:14Z
+updated_at: 2026-08-21T01:33:37Z
 completed_at:
 ---
 
@@ -12,6 +12,8 @@ completed_at:
   satisfied; that change is archived and its Sections 1-4 pass.
 - [x] 0.3 Record the `rmcp` version pinned at implementation time and verify its
   license and transitive graph against `deny.toml` before adding it.
+- [x] 0.4 Approve the coordinated external-service, host-resource,
+  endpoint-network, data-egress, and conservative MCP floor amendment.
 
 ## 1. Package Skeleton
 
@@ -107,6 +109,26 @@ completed_at:
   `agent-runtime-mcp` with default features only, registers a real server's
   tools through its composition path, and exercised a live stdio server end to
   end (`crates/smith-runtime/tests/mcp_live.rs`).
+
+## 8. Conservative External and Host Authority
+
+- [x] 8.1 Add stable typed permissions for same-user host filesystem reads and
+  writes plus external-service reads and writes.
+- [x] 8.2 Add host-resource read/write, external-service read/write,
+  endpoint-scoped network, and destination-scoped data-egress effects while
+  retaining the legacy local constructors.
+- [x] 8.3 Derive permissions, structural resources, risk, and scheduling keys
+  from the new effects. Enforce local workspace checks only for local
+  filesystem effects, and validate host/external effect resources without
+  treating them as workspace paths.
+- [x] 8.4 Make `McpServerConfig` default every unreviewed tool to external read,
+  possible external write, its exact resolved endpoint, and data egress;
+  annotations may only add risk.
+- [x] 8.5 Add core/executor/MCP tests for missing annotations,
+  `readOnlyHint = true`, `destructiveHint = false`, false benign schemas,
+  endpoint changes, effect/resource mismatches, and host-shell resources.
+- [x] 8.6 Re-run core, executor, MCP default/all-feature, serialization,
+  scheduler, workspace, and consumer-conformance suites.
 
 ## Deviations and Remaining Work
 

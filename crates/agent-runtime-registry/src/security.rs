@@ -47,6 +47,14 @@ pub enum Permission {
     FsCreate,
     /// Delete a file.
     FsDelete,
+    /// Read the same-user host filesystem outside a workspace capability.
+    HostFsRead,
+    /// Mutate the same-user host filesystem outside a workspace capability.
+    HostFsWrite,
+    /// Read state from an external service.
+    ExternalRead,
+    /// Mutate state in an external service.
+    ExternalWrite,
     /// Perform an outbound HTTP request.
     NetHttp,
     /// Transmit data outside the runtime's trust boundary.
@@ -81,6 +89,10 @@ impl Permission {
             Permission::FsWrite => "fs.write",
             Permission::FsCreate => "fs.create",
             Permission::FsDelete => "fs.delete",
+            Permission::HostFsRead => "host.fs.read",
+            Permission::HostFsWrite => "host.fs.write",
+            Permission::ExternalRead => "external.read",
+            Permission::ExternalWrite => "external.write",
             Permission::NetHttp => "net.http",
             Permission::DataEgress => "data.egress",
             Permission::CredentialUse => "credential.use",
@@ -101,6 +113,10 @@ impl Permission {
             Permission::FsWrite => hasher.field("permission.fs_write"),
             Permission::FsCreate => hasher.field("permission.fs_create"),
             Permission::FsDelete => hasher.field("permission.fs_delete"),
+            Permission::HostFsRead => hasher.field("permission.host_fs_read"),
+            Permission::HostFsWrite => hasher.field("permission.host_fs_write"),
+            Permission::ExternalRead => hasher.field("permission.external_read"),
+            Permission::ExternalWrite => hasher.field("permission.external_write"),
             Permission::NetHttp => hasher.field("permission.net_http"),
             Permission::DataEgress => hasher.field("permission.data_egress"),
             Permission::CredentialUse => hasher.field("permission.credential_use"),
@@ -261,6 +277,12 @@ mod tests {
     fn known_permissions_render_stable_dotted_slugs() {
         assert_eq!(Permission::NetHttp.as_str(), "net.http");
         assert_eq!(Permission::CredentialUse.to_string(), "credential.use");
+        assert_eq!(Permission::HostFsRead.as_str(), "host.fs.read");
+        assert_eq!(Permission::HostFsWrite.as_str(), "host.fs.write");
+        assert_eq!(Permission::ExternalRead.as_str(), "external.read");
+        assert_eq!(Permission::ExternalWrite.as_str(), "external.write");
+        assert_ne!(Permission::HostFsRead, Permission::FsRead);
+        assert_ne!(Permission::ExternalWrite, Permission::FsWrite);
     }
 
     #[test]

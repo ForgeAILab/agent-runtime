@@ -877,7 +877,7 @@ impl ToolExecutor {
         }
         let permissions = prepared.required_permissions();
         if permissions.contains(&agent_runtime_registry::Permission::FsRead)
-            && !prepared.effects().has_read()
+            && !prepared.effects().has_filesystem_read()
         {
             return Err("prepared fs.read permission has no matching read effect".into());
         }
@@ -894,20 +894,77 @@ impl ToolExecutor {
                 "prepared filesystem mutation permission has no matching write effect".into(),
             );
         }
+        if permissions.contains(&agent_runtime_registry::Permission::HostFsRead)
+            && prepared.effects().host_read_kinds().next().is_none()
+        {
+            return Err("prepared host.fs.read permission has no matching host read effect".into());
+        }
+        if permissions.contains(&agent_runtime_registry::Permission::HostFsWrite)
+            && prepared.effects().host_writes().next().is_none()
+        {
+            return Err(
+                "prepared host.fs.write permission has no matching host write effect".into(),
+            );
+        }
+        if permissions.contains(&agent_runtime_registry::Permission::ExternalRead)
+            && prepared.effects().external_reads().next().is_none()
+        {
+            return Err(
+                "prepared external.read permission has no matching external read effect".into(),
+            );
+        }
+        if permissions.contains(&agent_runtime_registry::Permission::ExternalWrite)
+            && prepared.effects().external_writes().next().is_none()
+        {
+            return Err(
+                "prepared external.write permission has no matching external write effect".into(),
+            );
+        }
         if permissions.contains(&agent_runtime_registry::Permission::ProcessSpawn)
             && !prepared.effects().spawns_process()
         {
             return Err("prepared process.spawn permission has no matching spawn effect".into());
         }
-        if permissions.iter().any(|permission| {
-            matches!(
-                permission,
-                agent_runtime_registry::Permission::NetHttp
-                    | agent_runtime_registry::Permission::DataEgress
-            )
-        }) && !prepared.effects().has_network()
+        if permissions.contains(&agent_runtime_registry::Permission::NetHttp)
+            && !prepared.effects().has_network()
         {
             return Err("prepared network permission has no matching network effect".into());
+        }
+        if permissions.contains(&agent_runtime_registry::Permission::DataEgress)
+            && !prepared.effects().has_data_egress()
+        {
+            return Err("prepared data.egress permission has no matching egress effect".into());
+        }
+        for kind in prepared
+            .effects()
+            .host_read_kinds()
+            .chain(prepared.effects().host_writes().map(|(kind, _)| kind))
+        {
+            if !matches!(
+                prepared.resource(),
+                SecurityResource::Other { kind: prepared_kind, .. } if prepared_kind == kind
+            ) {
+                return Err(format!(
+                    "prepared host effect requires a matching `{kind}` resource"
+                ));
+            }
+        }
+        for service in prepared.effects().external_reads().chain(
+            prepared
+                .effects()
+                .external_writes()
+                .map(|(service, _)| service),
+        ) {
+            if !matches!(
+                prepared.resource(),
+                SecurityResource::Other { kind, id }
+                    if kind == "external-service" && id == service.as_str()
+            ) {
+                return Err(format!(
+                    "prepared external effect requires the exact service resource `{}`",
+                    service.as_str()
+                ));
+            }
         }
         Ok(())
     }

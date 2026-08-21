@@ -1,6 +1,6 @@
 ---
 created_at: 2026-08-07T20:26:54Z
-updated_at: 2026-08-07T20:26:54Z
+updated_at: 2026-08-20T23:18:00Z
 ---
 
 # Design: MCP as a capability source
@@ -63,9 +63,10 @@ may raise and may never lower:
 declared = host_floor ∪ annotation_derived_additions
 ```
 
-- The host supplies `McpServerConfig::effect_floor`, defaulting to
-  `ToolEffects::read_only().with_network()` — every remote call is at minimum a
-  network egress to the server.
+- The host supplies `McpServerConfig::effect_floor`, defaulting to a typed
+  external-service read/write plus endpoint-network and data-egress floor —
+  every unreviewed remote call may mutate the service and transmit data to the
+  exact server endpoint.
 - `destructiveHint: true` **adds** a write effect. `readOnlyHint: true` is
   recorded as metadata for display and retrieval ranking but subtracts nothing.
 - `permission_upper_bound` is then derived from `declared` by the existing
@@ -75,6 +76,28 @@ declared = host_floor ∪ annotation_derived_additions
 A server that omits annotations entirely and a server that claims to be read-only
 receive identical authority. Lying is therefore useless, which is the property
 worth having.
+
+### 2026-08-20 authority vocabulary correction
+
+The original floor reused `Effect::Read`, `Effect::Write`, and bare
+`Effect::Network`. Those variants imply workspace `fs.*` permissions and cannot
+represent a remote service or exact endpoint. The executor also requires every
+write effect to carry a filesystem resource, which prevents consumers from
+truthfully representing an unsandboxed host process.
+
+The shared vocabulary therefore gains distinct host-resource and
+external-service read/write effects, endpoint-scoped network, and
+destination-scoped data egress. Corresponding typed permissions keep local,
+host, and external authority incomparable. Write scopes remain the scheduler's
+conflict keys, while only local filesystem write scopes enter workspace
+enforcement. A host/external prepared resource must structurally match its
+effect domain; it is never reinterpreted as a project mount.
+
+An MCP service scope binds the host-chosen server identity and exact resolved
+transport endpoint without credential values. Server annotations can add
+presentation risk, but no annotation can remove the possible external write or
+egress floor. A host may inject a narrower reviewed floor only after binding its
+own review to server identity, exact tool name, and schema revision.
 
 **Rejected: trusting annotations.** It reads naturally and matches how several
 MCP hosts behave, but it lets the audited party write its own audit. A server

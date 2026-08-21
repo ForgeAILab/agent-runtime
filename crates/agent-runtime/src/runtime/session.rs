@@ -126,8 +126,7 @@ impl SessionInner {
                 // The acceptance checkpoint re-reads the same store and
                 // fails closed with proper turn attribution; surface the
                 // reconciliation attempt without blocking admission.
-                self.emitter
-                    .emit(None, RuntimeEvent::Error { error });
+                self.emitter.emit(None, RuntimeEvent::Error { error });
                 return;
             }
         };

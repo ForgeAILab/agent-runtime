@@ -100,7 +100,7 @@ impl ApprovalRequest {
 
     /// The write scopes the invocation would touch.
     pub fn write_scopes(&self) -> Vec<WriteScope> {
-        self.prepared.effects().write_scopes().cloned().collect()
+        self.prepared.effects().mutation_scopes().cloned().collect()
     }
 
     /// Whether the invocation spawns a process, distinct from a plain write.

@@ -70,7 +70,7 @@ pub mod naming;
 pub mod tool;
 
 pub use client::{McpClient, McpConnection};
-pub use config::{McpServerConfig, McpTransport, ToolFilter};
+pub use config::{McpServerConfig, McpToolPolicyKey, McpTransport, ToolFilter};
 pub use descriptor::{RemoteTool, RemoteToolBinding, bind_remote_tool};
 pub use error::McpError;
 pub use tool::McpTool;

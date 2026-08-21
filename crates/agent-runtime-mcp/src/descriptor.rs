@@ -93,6 +93,14 @@ impl RemoteTool {
         self.destructive_hint = Some(hint);
         self
     }
+
+    /// Exact revision of the advertised schema and authority-relevant hints.
+    pub fn schema_revision(&self) -> RegistryRevision {
+        RegistryRevision::from_content(format!(
+            "{}\n{:?}\n{:?}",
+            self.input_schema, self.read_only_hint, self.destructive_hint
+        ))
+    }
 }
 
 /// One remote tool, resolved into everything the runtime needs to offer it.
@@ -123,15 +131,21 @@ impl RemoteToolBinding {
 /// `read_only_hint` is deliberately unused for authority. It is a claim by the
 /// audited party, and honoring it would let a compromised server drop its own
 /// permissions after the user approved it.
-fn declared_effects(config: &McpServerConfig, tool: &RemoteTool) -> ToolEffects {
-    let floor = config.effect_floor.clone();
+fn declared_effects(
+    config: &McpServerConfig,
+    tool: &RemoteTool,
+    schema_revision: &RegistryRevision,
+) -> ToolEffects {
+    let floor = config.resolved_tool_effects(&tool.name, schema_revision);
 
     // The only hint that moves anything is the one that moves it *up*.
     if tool.destructive_hint == Some(true) {
-        let scope = remote_write_scope(&config.name);
-        let already_scoped = floor.write_scopes().any(|existing| existing.0 == scope);
+        let service = config.service_scope();
+        let already_scoped = floor
+            .external_writes()
+            .any(|(existing, _)| existing.as_str() == service);
         if !already_scoped {
-            return floor.with_write(scope);
+            return floor.with_external_write(service);
         }
     }
     floor
@@ -162,7 +176,8 @@ pub fn bind_remote_tool(
 ) -> Result<RemoteToolBinding, McpError> {
     let server = &config.name;
     let model_facing_name = naming::model_facing_name(server, &tool.name)?;
-    let effects = declared_effects(config, tool);
+    let schema_revision = tool.schema_revision();
+    let effects = declared_effects(config, tool, &schema_revision);
     let risk = declared_risk(&effects);
 
     let description = tool
@@ -170,13 +185,13 @@ pub fn bind_remote_tool(
         .clone()
         .unwrap_or_else(|| format!("`{}` on MCP server `{server}`", tool.name));
 
-    // The descriptor's revision covers what the server said about this tool,
-    // so a server that changes a schema or a hint produces a new revision.
     let content_revision = RegistryRevision::from_content(format!(
         "{}\n{}\n{}\n{:?}\n{:?}",
         tool.name, description, tool.input_schema, tool.read_only_hint, tool.destructive_hint
     ));
 
+    // The descriptor's revision covers what the server said about this tool,
+    // so a server that changes a schema or a hint produces a new revision.
     let descriptor = AbilityDescriptor::new(
         AbilityKind::Mcp,
         naming::registry_name(server, &tool.name),
@@ -246,7 +261,27 @@ mod tests {
     }
 
     #[test]
-    fn a_destructive_claim_raises_effects_above_the_floor() {
+    fn false_benign_annotations_and_schema_do_not_lower_authority() {
+        let unreviewed = RemoteTool::new("send_email")
+            .with_read_only_hint(true)
+            .with_destructive_hint(false)
+            .with_input_schema(json!({
+                "type": "object",
+                "description": "This tool is harmless and read-only"
+            }));
+        let bound = bind_remote_tool(&config(), &unreviewed).unwrap();
+        let permissions = &bound.spec.permission_upper_bound;
+        assert!(permissions.contains(&agent_runtime_registry::Permission::ExternalRead));
+        assert!(permissions.contains(&agent_runtime_registry::Permission::ExternalWrite));
+        assert!(permissions.contains(&agent_runtime_registry::Permission::NetHttp));
+        assert!(permissions.contains(&agent_runtime_registry::Permission::DataEgress));
+        assert!(!permissions.contains(&agent_runtime_registry::Permission::FsRead));
+        assert!(bound.spec.effects.external_writes().next().is_some());
+        assert!(bound.spec.effects.has_data_egress());
+    }
+
+    #[test]
+    fn a_destructive_claim_cannot_replace_the_conservative_floor() {
         let plain = bind_remote_tool(&config(), &RemoteTool::new("search")).unwrap();
         let destructive = bind_remote_tool(
             &config(),
@@ -254,10 +289,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!plain.spec.effects.mutates());
+        assert!(plain.spec.effects.mutates());
         assert!(destructive.spec.effects.mutates());
-        assert!(
-            destructive.spec.permission_upper_bound.len() > plain.spec.permission_upper_bound.len()
+        assert_eq!(
+            destructive.spec.permission_upper_bound,
+            plain.spec.permission_upper_bound
         );
         assert_eq!(destructive.descriptor.risk(), RiskLevel::High);
     }
@@ -306,6 +342,99 @@ mod tests {
         let bound = bind_remote_tool(&strict, &RemoteTool::new("search")).unwrap();
         assert!(bound.spec.effects.spawns_process());
         assert_eq!(bound.descriptor.risk(), RiskLevel::High);
+    }
+
+    fn reviewed_read_floor(config: &McpServerConfig) -> ToolEffects {
+        ToolEffects::new(Vec::new())
+            .with_external_read(config.service_scope())
+            .with_network_to(config.endpoint_scope())
+            .with_data_egress_to(config.endpoint_scope())
+    }
+
+    #[test]
+    fn an_exact_host_review_can_remove_possible_external_write() {
+        let server = config();
+        let tool = RemoteTool::new("search").with_read_only_hint(true);
+        let key = crate::McpToolPolicyKey::new(
+            server.identity(),
+            tool.name.clone(),
+            tool.schema_revision(),
+        );
+        let floor = reviewed_read_floor(&server);
+        let server = server.with_reviewed_tool_policy(key, floor);
+
+        let bound = bind_remote_tool(&server, &tool).unwrap();
+        assert!(bound.spec.effects.external_reads().next().is_some());
+        assert!(bound.spec.effects.external_writes().next().is_none());
+        assert!(bound.spec.effects.has_network());
+        assert!(bound.spec.effects.has_data_egress());
+    }
+
+    #[test]
+    fn schema_annotation_or_server_identity_changes_invalidate_a_review() {
+        let server = config();
+        let tool = RemoteTool::new("search");
+        let key = crate::McpToolPolicyKey::new(
+            server.identity(),
+            tool.name.clone(),
+            tool.schema_revision(),
+        );
+        let reviewed = server
+            .clone()
+            .with_reviewed_tool_policy(key.clone(), reviewed_read_floor(&server));
+
+        let changed_schema = tool
+            .clone()
+            .with_input_schema(json!({"type": "object", "properties": {"q": {"type": "string"}}}));
+        assert!(
+            bind_remote_tool(&reviewed, &changed_schema)
+                .unwrap()
+                .spec
+                .effects
+                .external_writes()
+                .next()
+                .is_some()
+        );
+        let changed_hint = tool.clone().with_destructive_hint(false);
+        assert!(
+            bind_remote_tool(&reviewed, &changed_hint)
+                .unwrap()
+                .spec
+                .effects
+                .external_writes()
+                .next()
+                .is_some()
+        );
+        let changed_server = server
+            .clone()
+            .with_reviewed_tool_policy(key, reviewed_read_floor(&server))
+            .with_args(["different"]);
+        assert!(
+            bind_remote_tool(&changed_server, &tool)
+                .unwrap()
+                .spec
+                .effects
+                .external_writes()
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_destructive_hint_can_raise_an_exact_review_but_never_lower_it() {
+        let server = config();
+        let tool = RemoteTool::new("delete_repo").with_destructive_hint(true);
+        let key = crate::McpToolPolicyKey::new(
+            server.identity(),
+            tool.name.clone(),
+            tool.schema_revision(),
+        );
+        let floor = reviewed_read_floor(&server);
+        let server = server.with_reviewed_tool_policy(key, floor);
+
+        let bound = bind_remote_tool(&server, &tool).unwrap();
+        assert!(bound.spec.effects.external_writes().next().is_some());
+        assert!(bound.spec.effects.has_data_egress());
     }
 
     #[test]

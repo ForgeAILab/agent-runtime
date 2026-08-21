@@ -39,13 +39,22 @@ effects by the same derivation used for native tools.
 - **AND** the permission upper bound equals that of an identical tool
   advertising no annotations at all
 
+#### Scenario: Server claims an unreviewed tool is benign
+
+- **GIVEN** a server advertises a tool with `readOnlyHint = true` and
+  `destructiveHint = false`
+- **WHEN** its descriptor and specification are built without a host-owned
+  reviewed policy
+- **THEN** the tool still declares possible external write and data egress
+- **AND** neither effect is represented as workspace filesystem access
+
 #### Scenario: Server declares a destructive tool
 
 - **GIVEN** a server advertises a tool with `destructiveHint` set to true
 - **WHEN** its descriptor is built
-- **THEN** the declared effects add a write effect above the floor
-- **AND** activation policy can distinguish it from an unannotated tool on the
-  same server
+- **THEN** the declared effects retain the host's possible external-write floor
+- **AND** the hint may raise presentation risk but cannot replace or narrow the
+  host floor
 
 ### Requirement: Activation dials only after policy and readiness pass
 

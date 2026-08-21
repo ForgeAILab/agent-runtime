@@ -38,10 +38,44 @@ pub enum Effect {
         /// The write scope.
         scope: WriteScope,
     },
+    /// Reads the same-user host outside a workspace capability.
+    HostRead {
+        /// Host-defined resource kind the prepared resource must use.
+        resource_kind: String,
+    },
+    /// Writes the same-user host outside a workspace capability.
+    HostWrite {
+        /// Host-defined resource kind the prepared resource must use.
+        resource_kind: String,
+        /// Scheduler conflict scope for the host mutation.
+        scope: WriteScope,
+    },
+    /// Reads state from an external service.
+    ExternalRead {
+        /// Stable service identity, including the reviewed endpoint identity.
+        service: ExternalServiceScope,
+    },
+    /// Mutates state in an external service.
+    ExternalWrite {
+        /// Stable service identity, including the reviewed endpoint identity.
+        service: ExternalServiceScope,
+        /// Scheduler conflict scope for the external mutation.
+        scope: WriteScope,
+    },
     /// Spawns a process.
     SpawnProcess,
     /// Performs network I/O.
     Network,
+    /// Performs network I/O to one exact endpoint.
+    NetworkTo {
+        /// Resolved endpoint without credential values.
+        endpoint: EndpointScope,
+    },
+    /// Transmits data to one exact destination outside the trust boundary.
+    DataEgress {
+        /// Resolved destination without credential values.
+        destination: EndpointScope,
+    },
 }
 
 /// A logical scope a tool writes to. Overlapping scopes are serialized by the
@@ -56,6 +90,40 @@ impl WriteScope {
         Self(scope.into())
     }
     /// The scope as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Stable identity of an external service authority domain.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExternalServiceScope(pub String);
+
+impl ExternalServiceScope {
+    /// Wraps an already-resolved service identity.
+    pub fn new(scope: impl Into<String>) -> Self {
+        Self(scope.into())
+    }
+
+    /// The service identity as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Exact network or egress endpoint without credential values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EndpointScope(pub String);
+
+impl EndpointScope {
+    /// Wraps an already-resolved endpoint.
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self(endpoint.into())
+    }
+
+    /// The endpoint as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -81,6 +149,21 @@ impl ToolEffects {
         Self { effects }
     }
 
+    /// Returns the ordered union of two declared effect sets.
+    ///
+    /// Exact duplicates are removed. This is intended for authority floors:
+    /// host additions can raise a conservative baseline without replacing or
+    /// lowering any effect already present.
+    pub fn union(&self, other: &Self) -> Self {
+        let mut effects = self.effects.clone();
+        for effect in &other.effects {
+            if !effects.contains(effect) {
+                effects.push(effect.clone());
+            }
+        }
+        Self { effects }
+    }
+
     /// Whether the prepared invocation declares no external effect.
     pub fn is_empty(&self) -> bool {
         self.effects.is_empty()
@@ -90,6 +173,45 @@ impl ToolEffects {
     pub fn with_write(mut self, scope: impl Into<String>) -> Self {
         self.effects.push(Effect::Write {
             scope: WriteScope::new(scope),
+        });
+        self
+    }
+
+    /// Adds same-user host read authority for a host-defined resource kind.
+    pub fn with_host_read(mut self, resource_kind: impl Into<String>) -> Self {
+        self.effects.push(Effect::HostRead {
+            resource_kind: resource_kind.into(),
+        });
+        self
+    }
+
+    /// Adds same-user host write authority and its scheduler conflict scope.
+    pub fn with_host_write(
+        mut self,
+        resource_kind: impl Into<String>,
+        scope: impl Into<String>,
+    ) -> Self {
+        self.effects.push(Effect::HostWrite {
+            resource_kind: resource_kind.into(),
+            scope: WriteScope::new(scope),
+        });
+        self
+    }
+
+    /// Adds a read from one external service.
+    pub fn with_external_read(mut self, service: impl Into<String>) -> Self {
+        self.effects.push(Effect::ExternalRead {
+            service: ExternalServiceScope::new(service),
+        });
+        self
+    }
+
+    /// Adds a possible mutation of one external service.
+    pub fn with_external_write(mut self, service: impl Into<String>) -> Self {
+        let service = ExternalServiceScope::new(service);
+        self.effects.push(Effect::ExternalWrite {
+            scope: WriteScope::new(format!("external:{}", service.as_str())),
+            service,
         });
         self
     }
@@ -106,11 +228,33 @@ impl ToolEffects {
         self
     }
 
+    /// Adds network I/O to an exact resolved endpoint.
+    pub fn with_network_to(mut self, endpoint: impl Into<String>) -> Self {
+        self.effects.push(Effect::NetworkTo {
+            endpoint: EndpointScope::new(endpoint),
+        });
+        self
+    }
+
+    /// Adds data egress to an exact resolved destination.
+    pub fn with_data_egress_to(mut self, destination: impl Into<String>) -> Self {
+        self.effects.push(Effect::DataEgress {
+            destination: EndpointScope::new(destination),
+        });
+        self
+    }
+
     /// Whether the tool mutates state (writes or spawns processes).
     pub fn mutates(&self) -> bool {
-        self.effects
-            .iter()
-            .any(|e| matches!(e, Effect::Write { .. } | Effect::SpawnProcess))
+        self.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::Write { .. }
+                    | Effect::HostWrite { .. }
+                    | Effect::ExternalWrite { .. }
+                    | Effect::SpawnProcess
+            )
+        })
     }
 
     /// Whether invoking the tool exercises authority that must be authorized
@@ -133,19 +277,82 @@ impl ToolEffects {
 
     /// Whether the tool performs network I/O.
     pub fn has_network(&self) -> bool {
-        self.effects.iter().any(|e| matches!(e, Effect::Network))
+        self.effects
+            .iter()
+            .any(|e| matches!(e, Effect::Network | Effect::NetworkTo { .. }))
+    }
+
+    /// Whether the effect set contains legacy unscoped network authority.
+    pub fn has_unscoped_network(&self) -> bool {
+        self.effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Network))
+    }
+
+    /// The exact endpoints named by scoped network effects.
+    pub fn network_endpoints(&self) -> impl Iterator<Item = &EndpointScope> {
+        self.effects.iter().filter_map(|effect| match effect {
+            Effect::NetworkTo { endpoint } => Some(endpoint),
+            _ => None,
+        })
+    }
+
+    /// Whether the tool transmits data outside the trust boundary.
+    pub fn has_data_egress(&self) -> bool {
+        self.effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::DataEgress { .. }))
+    }
+
+    /// Exact destinations named by data-egress effects.
+    pub fn data_egress_destinations(&self) -> impl Iterator<Item = &EndpointScope> {
+        self.effects.iter().filter_map(|effect| match effect {
+            Effect::DataEgress { destination } => Some(destination),
+            _ => None,
+        })
     }
 
     /// Whether the tool only reads (no writes, spawns, or network).
     pub fn is_read_only(&self) -> bool {
-        self.effects.iter().all(|e| matches!(e, Effect::Read))
+        self.effects.iter().all(|e| {
+            matches!(
+                e,
+                Effect::Read | Effect::HostRead { .. } | Effect::ExternalRead { .. }
+            )
+        })
     }
 
     /// Whether the effect set includes a filesystem read.
     pub fn has_read(&self) -> bool {
+        self.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Read | Effect::HostRead { .. } | Effect::ExternalRead { .. }
+            )
+        })
+    }
+
+    /// Whether the tool reads a local filesystem resource.
+    pub fn has_filesystem_read(&self) -> bool {
         self.effects
             .iter()
             .any(|effect| matches!(effect, Effect::Read))
+    }
+
+    /// Host resource kinds read by this tool.
+    pub fn host_read_kinds(&self) -> impl Iterator<Item = &str> {
+        self.effects.iter().filter_map(|effect| match effect {
+            Effect::HostRead { resource_kind } => Some(resource_kind.as_str()),
+            _ => None,
+        })
+    }
+
+    /// External services read by this tool.
+    pub fn external_reads(&self) -> impl Iterator<Item = &ExternalServiceScope> {
+        self.effects.iter().filter_map(|effect| match effect {
+            Effect::ExternalRead { service } => Some(service),
+            _ => None,
+        })
     }
 
     /// The declared write scopes.
@@ -156,10 +363,39 @@ impl ToolEffects {
         })
     }
 
+    /// Same-user host mutation scopes and their required resource kinds.
+    pub fn host_writes(&self) -> impl Iterator<Item = (&str, &WriteScope)> {
+        self.effects.iter().filter_map(|effect| match effect {
+            Effect::HostWrite {
+                resource_kind,
+                scope,
+            } => Some((resource_kind.as_str(), scope)),
+            _ => None,
+        })
+    }
+
+    /// External service mutations and their scheduler scopes.
+    pub fn external_writes(&self) -> impl Iterator<Item = (&ExternalServiceScope, &WriteScope)> {
+        self.effects.iter().filter_map(|effect| match effect {
+            Effect::ExternalWrite { service, scope } => Some((service, scope)),
+            _ => None,
+        })
+    }
+
+    /// Every mutation conflict scope, regardless of authority domain.
+    pub fn mutation_scopes(&self) -> impl Iterator<Item = &WriteScope> {
+        self.effects.iter().filter_map(|effect| match effect {
+            Effect::Write { scope }
+            | Effect::HostWrite { scope, .. }
+            | Effect::ExternalWrite { scope, .. } => Some(scope),
+            _ => None,
+        })
+    }
+
     /// Whether any write scope overlaps `other`'s write scopes.
     pub fn writes_overlap(&self, other: &ToolEffects) -> bool {
-        self.write_scopes()
-            .any(|a| other.write_scopes().any(|b| a == b))
+        self.mutation_scopes()
+            .any(|a| other.mutation_scopes().any(|b| a == b))
     }
 
     /// Conservative permission upper bound implied by these static effects.
@@ -177,14 +413,29 @@ impl ToolEffects {
         {
             permissions.insert(Permission::FsRead);
         }
+        if self.host_read_kinds().next().is_some() {
+            permissions.insert(Permission::HostFsRead);
+        }
+        if self.external_reads().next().is_some() {
+            permissions.insert(Permission::ExternalRead);
+        }
         if self.write_scopes().next().is_some() {
             permissions.insert(Permission::FsWrite);
+        }
+        if self.host_writes().next().is_some() {
+            permissions.insert(Permission::HostFsWrite);
+        }
+        if self.external_writes().next().is_some() {
+            permissions.insert(Permission::ExternalWrite);
         }
         if self.spawns_process() {
             permissions.insert(Permission::ProcessSpawn);
         }
         if self.has_network() {
             permissions.insert(Permission::NetHttp);
+        }
+        if self.has_data_egress() {
+            permissions.insert(Permission::DataEgress);
         }
         permissions.into_iter().collect()
     }
@@ -254,13 +505,61 @@ impl ToolEffects {
                 _ => SecurityResource::filesystem(mount, Vec::new()),
             });
         }
+        if self.host_read_kinds().next().is_some() || self.host_writes().next().is_some() {
+            permissions.extend(
+                [Permission::HostFsRead, Permission::HostFsWrite]
+                    .into_iter()
+                    .filter(|permission| match permission {
+                        Permission::HostFsRead => self.host_read_kinds().next().is_some(),
+                        Permission::HostFsWrite => self.host_writes().next().is_some(),
+                        _ => false,
+                    }),
+            );
+            let kind = self
+                .host_read_kinds()
+                .next()
+                .or_else(|| self.host_writes().next().map(|(kind, _)| kind))
+                .expect("a host effect supplied a kind");
+            resource.get_or_insert_with(|| SecurityResource::other(kind, tool_name));
+        }
+        if self.external_reads().next().is_some() || self.external_writes().next().is_some() {
+            if self.external_reads().next().is_some() {
+                permissions.insert(Permission::ExternalRead);
+            }
+            if self.external_writes().next().is_some() {
+                permissions.insert(Permission::ExternalWrite);
+            }
+            let service = self
+                .external_reads()
+                .next()
+                .or_else(|| self.external_writes().next().map(|(service, _)| service))
+                .expect("an external effect supplied a service");
+            resource.get_or_insert_with(|| {
+                SecurityResource::other("external-service", service.as_str())
+            });
+        }
         if self.spawns_process() {
             permissions.insert(Permission::ProcessSpawn);
             resource.get_or_insert_with(|| SecurityResource::other("process", tool_name));
         }
         if self.has_network() {
             permissions.insert(Permission::NetHttp);
-            resource.get_or_insert_with(|| SecurityResource::network("", "", Vec::new()));
+            resource.get_or_insert_with(|| {
+                self.network_endpoints().next().map_or_else(
+                    || SecurityResource::network("", "", Vec::new()),
+                    |endpoint| SecurityResource::network(endpoint.as_str(), "", Vec::new()),
+                )
+            });
+        }
+        if self.has_data_egress() {
+            permissions.insert(Permission::DataEgress);
+            resource.get_or_insert_with(|| {
+                let destination = self
+                    .data_egress_destinations()
+                    .next()
+                    .expect("a data-egress effect supplied a destination");
+                SecurityResource::network(destination.as_str(), "", Vec::new())
+            });
         }
 
         let resource = resource.unwrap_or_else(|| SecurityResource::other("tool", tool_name));
@@ -1126,6 +1425,71 @@ mod tests {
                 Permission::ProcessSpawn,
                 Permission::NetHttp
             ])
+        );
+    }
+
+    #[test]
+    fn host_effects_use_host_permissions_and_a_non_workspace_resource() {
+        let effects = ToolEffects::new(vec![])
+            .with_host_read("host-shell")
+            .with_host_write("host-shell", "host:filesystem")
+            .with_spawn();
+        let (permissions, resource) = effects.authorization_request("shell", "/ws");
+        assert_eq!(
+            permissions,
+            PermissionSet::from_iter([
+                Permission::HostFsRead,
+                Permission::HostFsWrite,
+                Permission::ProcessSpawn,
+            ])
+        );
+        assert_eq!(resource, SecurityResource::other("host-shell", "shell"));
+        assert!(effects.write_scopes().next().is_none());
+        assert_eq!(
+            effects
+                .mutation_scopes()
+                .map(WriteScope::as_str)
+                .collect::<Vec<_>>(),
+            ["host:filesystem"]
+        );
+    }
+
+    #[test]
+    fn external_effects_retain_service_endpoint_and_egress_authority() {
+        let service = "mcp:github@revision#https://mcp.example.test/v1";
+        let endpoint = "https://mcp.example.test/v1";
+        let effects = ToolEffects::new(vec![])
+            .with_external_read(service)
+            .with_external_write(service)
+            .with_network_to(endpoint)
+            .with_data_egress_to(endpoint);
+        let (permissions, resource) = effects.authorization_request("remote", "/ws");
+        assert_eq!(
+            permissions,
+            PermissionSet::from_iter([
+                Permission::ExternalRead,
+                Permission::ExternalWrite,
+                Permission::NetHttp,
+                Permission::DataEgress,
+            ])
+        );
+        assert_eq!(
+            resource,
+            SecurityResource::other("external-service", service)
+        );
+        assert_eq!(
+            effects
+                .network_endpoints()
+                .map(EndpointScope::as_str)
+                .collect::<Vec<_>>(),
+            [endpoint]
+        );
+        assert_eq!(
+            effects
+                .data_egress_destinations()
+                .map(EndpointScope::as_str)
+                .collect::<Vec<_>>(),
+            [endpoint]
         );
     }
 

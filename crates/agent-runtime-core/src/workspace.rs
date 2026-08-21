@@ -5,12 +5,12 @@
 //! check; the neutral contract is intentionally minimal and the default host
 //! implementation is expected to be fail-closed (deny paths outside the root).
 
-use std::fmt;
+use std::{any::Any, fmt};
 
 use crate::error::{ErrorKind, RuntimeError};
 
 /// A host-defined boundary within which tools may operate.
-pub trait Workspace: Send + Sync + fmt::Debug {
+pub trait Workspace: Any + Send + Sync + fmt::Debug {
     /// A stable, human-readable identifier for the boundary root.
     fn root(&self) -> &str;
 

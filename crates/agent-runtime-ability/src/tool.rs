@@ -215,6 +215,10 @@ fn permission_affordance(permission: &Permission) -> &'static str {
         Permission::FsWrite => "file-write",
         Permission::FsCreate => "file-create",
         Permission::FsDelete => "file-delete",
+        Permission::HostFsRead => "host-file-read",
+        Permission::HostFsWrite => "host-file-write",
+        Permission::ExternalRead => "external-read",
+        Permission::ExternalWrite => "external-write",
         Permission::NetHttp => "network-http",
         Permission::DataEgress => "data-egress",
         Permission::CredentialUse => "credential-use",
@@ -232,6 +236,8 @@ fn permission_risk(permissions: &[Permission]) -> RiskLevel {
         .iter()
         .map(|permission| match permission {
             Permission::FsDelete
+            | Permission::HostFsWrite
+            | Permission::ExternalWrite
             | Permission::DataEgress
             | Permission::CredentialUse
             | Permission::ProcessSpawn
@@ -241,7 +247,11 @@ fn permission_risk(permissions: &[Permission]) -> RiskLevel {
             | Permission::NetHttp
             | Permission::StdioRead
             | Permission::StdioWrite => RiskLevel::Medium,
-            Permission::FsRead | Permission::ClockRead | Permission::RandomRead => RiskLevel::Low,
+            Permission::FsRead
+            | Permission::HostFsRead
+            | Permission::ExternalRead
+            | Permission::ClockRead
+            | Permission::RandomRead => RiskLevel::Low,
         })
         .max()
         .unwrap_or(RiskLevel::None)

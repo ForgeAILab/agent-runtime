@@ -1,6 +1,6 @@
 ---
 created_at: 2026-08-07T20:26:54Z
-updated_at: 2026-08-07T20:33:14Z
+updated_at: 2026-08-20T23:18:00Z
 ---
 
 ## Why
@@ -48,6 +48,11 @@ That change is archived and its gate is satisfied.
   host-supplied conservative floor. Server-provided annotations
   (`readOnlyHint`, `destructiveHint`) MAY raise the declared effects and MUST
   NOT lower them. A server cannot describe itself into fewer permissions.
+- **BREAKING security correction:** distinguish local filesystem, same-user
+  host filesystem, and external-service read/write effects; add endpoint-scoped
+  network and data-egress effects. Every unreviewed MCP tool defaults to
+  external read, possible external write, endpoint network, and data egress.
+  Missing or false annotations cannot suppress that floor.
 - Fill `Activated::McpConnection` end to end: activation policy gates the dial,
   and readiness/credential checks run before any process is spawned or socket
   opened.
@@ -58,12 +63,12 @@ That change is archived and its gate is satisfied.
 ## Impact
 
 - Affected specs: `capability-routing`, `package-architecture`, `tool-execution`
-- Affected code: new `agent-runtime-mcp`; `agent-runtime-testkit` gains a fake
-  server fixture. No production changes to `agent-runtime-core`,
-  `agent-runtime-ability`, or `agent-runtime` are required — the contracts they
-  already publish are sufficient, which is the evidence that this design fits.
-- Public compatibility: additive only. No existing type, event, or checkpoint
-  schema changes.
+- Affected code: `agent-runtime-mcp`, plus the shared permission, effect,
+  prepared-resource, scheduling, and executor contracts in
+  `agent-runtime-registry`, `agent-runtime-core`, and `agent-runtime`.
+- Public compatibility: existing local effect constructors remain source
+  compatible. New typed permissions/effects are additive, while the MCP
+  default authority and its serialized prepared evidence intentionally widen.
 - Dependency graph: `rmcp`'s mandatory set is `chrono`, `futures`,
   `pin-project-lite`, `serde`, `serde_json`, `thiserror`, `tokio`, `tokio-util`,
   `tracing`. `chrono` and `tracing` are new to the workspace and both are
@@ -114,6 +119,8 @@ never reads a config file, prompts a user, or names a product.
    content-block translation, and oversized-output bounding.
 5. Streamable HTTP transport behind the `http` feature, plus `cargo deny`
    verification of the full feature graph.
+6. Authority hardening: typed host/external effects, endpoint network and
+   data-egress scopes, conservative MCP defaults, and executor conformance.
 
 Slices 1 through 4 must pass before slice 5 adds the heavier dependency set.
 
@@ -123,3 +130,6 @@ Approval authorizes Stage 2 implementation in this repository only. It does not
 authorize consumer changes, package publication, MCP resources/prompts/sampling,
 an OAuth flow, or a server implementation. `../tui` requires separate approval of
 its coordinated proposal.
+
+The 2026-08-20 authority-hardening amendment and its coordinated Smith change
+were explicitly approved together before Section 8 implementation.

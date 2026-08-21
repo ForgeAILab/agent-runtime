@@ -81,6 +81,36 @@ pub enum ToolFilter {
     Deny(Vec<String>),
 }
 
+/// Exact host review identity for one remote tool classification.
+///
+/// All three fields are host-computed. Server content cannot create or select
+/// this key; changing the resolved server definition, tool name, schema, or
+/// relevant annotations makes the record stop matching.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct McpToolPolicyKey {
+    /// Exact resolved server identity, excluding secret values.
+    pub server_identity: RegistryRevision,
+    /// Server-facing tool name.
+    pub tool_name: String,
+    /// Revision of the complete advertised tool descriptor.
+    pub schema_revision: RegistryRevision,
+}
+
+impl McpToolPolicyKey {
+    /// Creates one exact reviewed-policy key.
+    pub fn new(
+        server_identity: RegistryRevision,
+        tool_name: impl Into<String>,
+        schema_revision: RegistryRevision,
+    ) -> Self {
+        Self {
+            server_identity,
+            tool_name: tool_name.into(),
+            schema_revision,
+        }
+    }
+}
+
 impl ToolFilter {
     /// Whether a tool passes this filter.
     pub fn accepts(&self, tool: &str) -> bool {
@@ -113,6 +143,10 @@ pub struct McpServerConfig {
     /// never lower it below — see [`crate::descriptor`]. The default is a read
     /// plus the network egress the call itself performs.
     pub effect_floor: ToolEffects,
+    /// Whether the floor was explicitly supplied by reviewed host policy.
+    effect_floor_reviewed: bool,
+    /// Exact host-reviewed per-tool classifications.
+    reviewed_tool_policies: BTreeMap<McpToolPolicyKey, ToolEffects>,
     /// How much text one call may contribute before truncation.
     pub max_output_bytes: usize,
     /// Credential and configuration names that must be ready before this
@@ -147,19 +181,20 @@ impl McpServerConfig {
 
     /// A server with an explicit transport and conservative defaults.
     pub fn new(name: impl Into<String>, transport: McpTransport) -> Self {
-        Self {
+        let mut config = Self {
             name: name.into(),
             transport,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             tools: ToolFilter::All,
-            // Every remote call is at minimum a read and a network egress to
-            // the server. A tool that does less is indistinguishable from one
-            // that does more, so the floor assumes more.
-            effect_floor: ToolEffects::read_only().with_network(),
+            effect_floor: ToolEffects::new(Vec::new()),
+            effect_floor_reviewed: false,
+            reviewed_tool_policies: BTreeMap::new(),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             readiness: ReadinessRequirement::none(),
-        }
+        };
+        config.refresh_default_effect_floor();
+        config
     }
 
     /// Sets the command arguments. Stdio transports only.
@@ -171,6 +206,7 @@ impl McpServerConfig {
         if let McpTransport::Stdio { args: slot, .. } = &mut self.transport {
             *slot = args.into_iter().map(Into::into).collect();
         }
+        self.refresh_default_effect_floor();
         self
     }
 
@@ -179,6 +215,7 @@ impl McpServerConfig {
         if let McpTransport::Stdio { env, .. } = &mut self.transport {
             env.insert(key.into(), value.into());
         }
+        self.refresh_default_effect_floor();
         self
     }
 
@@ -187,12 +224,28 @@ impl McpServerConfig {
         if let McpTransport::StreamableHttp { headers, .. } = &mut self.transport {
             headers.insert(key.into(), value.into());
         }
+        self.refresh_default_effect_floor();
         self
     }
 
     /// Raises or replaces the authority floor for this server's tools.
     pub fn with_effect_floor(mut self, floor: ToolEffects) -> Self {
         self.effect_floor = floor;
+        self.effect_floor_reviewed = true;
+        self
+    }
+
+    /// Adds a host-reviewed effect classification for one exact tool schema.
+    ///
+    /// The record is inert unless its server identity, tool name, and schema
+    /// revision all match at binding time. Invalid floors fail closed to the
+    /// conservative unreviewed classification.
+    pub fn with_reviewed_tool_policy(
+        mut self,
+        key: McpToolPolicyKey,
+        effects: ToolEffects,
+    ) -> Self {
+        self.reviewed_tool_policies.insert(key, effects);
         self
     }
 
@@ -275,6 +328,87 @@ impl McpServerConfig {
         }
         RegistryRevision::from_content(material)
     }
+
+    /// Exact resolved transport destination without credential values.
+    pub fn endpoint_scope(&self) -> String {
+        match &self.transport {
+            McpTransport::Stdio { .. } => {
+                format!("stdio://mcp/{}/{}", self.name, self.identity().as_str())
+            }
+            McpTransport::StreamableHttp { url, .. } => url.clone(),
+        }
+    }
+
+    /// Stable external-service identity used by effects and prepared resources.
+    pub fn service_scope(&self) -> String {
+        format!(
+            "mcp:{}@{}#{}",
+            self.name,
+            self.identity().as_str(),
+            self.endpoint_scope()
+        )
+    }
+
+    /// The effective host floor for tools on this exact server definition.
+    pub fn resolved_effect_floor(&self) -> ToolEffects {
+        if self.effect_floor_reviewed {
+            self.conservative_effect_floor().union(&self.effect_floor)
+        } else {
+            self.conservative_effect_floor()
+        }
+    }
+
+    /// Resolves an exact reviewed tool classification or the conservative
+    /// server floor when no valid host record matches.
+    pub fn resolved_tool_effects(
+        &self,
+        tool_name: &str,
+        schema_revision: &RegistryRevision,
+    ) -> ToolEffects {
+        let key = McpToolPolicyKey::new(self.identity(), tool_name, schema_revision.clone());
+        self.reviewed_tool_policies
+            .get(&key)
+            .filter(|effects| self.valid_reviewed_tool_floor(effects))
+            .cloned()
+            .unwrap_or_else(|| self.resolved_effect_floor())
+    }
+
+    fn conservative_effect_floor(&self) -> ToolEffects {
+        let service = self.service_scope();
+        let endpoint = self.endpoint_scope();
+        ToolEffects::new(Vec::new())
+            .with_external_read(service.clone())
+            .with_external_write(service)
+            .with_network_to(endpoint.clone())
+            .with_data_egress_to(endpoint)
+    }
+
+    fn valid_reviewed_tool_floor(&self, effects: &ToolEffects) -> bool {
+        let service = self.service_scope();
+        let endpoint = self.endpoint_scope();
+        let classified_service = effects
+            .external_reads()
+            .any(|scope| scope.as_str() == service)
+            || effects
+                .external_writes()
+                .any(|(scope, _)| scope.as_str() == service);
+        classified_service
+            && !effects.has_unscoped_network()
+            && effects
+                .network_endpoints()
+                .any(|scope| scope.as_str() == endpoint)
+            && effects
+                .data_egress_destinations()
+                .any(|scope| scope.as_str() == endpoint)
+            && effects.host_read_kinds().next().is_none()
+            && effects.host_writes().next().is_none()
+    }
+
+    fn refresh_default_effect_floor(&mut self) {
+        if !self.effect_floor_reviewed {
+            self.effect_floor = self.conservative_effect_floor();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -282,11 +416,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_floor_is_read_plus_network() {
+    fn the_default_floor_is_external_read_write_network_and_egress() {
         let config = McpServerConfig::stdio("github", "npx");
-        assert!(config.effect_floor.has_read());
-        assert!(config.effect_floor.has_network());
-        assert!(!config.effect_floor.mutates());
+        let floor = config.resolved_effect_floor();
+        assert!(floor.has_read());
+        assert!(floor.external_reads().next().is_some());
+        assert!(floor.external_writes().next().is_some());
+        assert!(floor.has_network());
+        assert!(floor.has_data_egress());
+        assert!(floor.mutates());
+        assert!(floor.write_scopes().next().is_none());
     }
 
     #[test]
@@ -295,6 +434,23 @@ mod tests {
         let swapped =
             McpServerConfig::stdio("github", "npx").with_args(["-y", "server-github-evil"]);
         assert_ne!(benign.identity(), swapped.identity());
+        assert_ne!(benign.service_scope(), swapped.service_scope());
+        assert_ne!(
+            benign.resolved_effect_floor(),
+            swapped.resolved_effect_floor()
+        );
+    }
+
+    #[test]
+    fn remote_endpoint_changes_every_scoped_authority_identity() {
+        let before = McpServerConfig::streamable_http("github", "https://one.example/mcp");
+        let after = McpServerConfig::streamable_http("github", "https://two.example/mcp");
+        assert_ne!(before.endpoint_scope(), after.endpoint_scope());
+        assert_ne!(before.service_scope(), after.service_scope());
+        assert_ne!(
+            before.resolved_effect_floor(),
+            after.resolved_effect_floor()
+        );
     }
 
     #[test]
