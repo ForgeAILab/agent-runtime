@@ -1,5 +1,30 @@
 ## ADDED Requirements
 
+### Requirement: Effect domains remain structurally distinct
+
+The runtime SHALL distinguish local filesystem, same-user host filesystem, and
+external-service read/write effects, and SHALL represent network and data
+egress with exact destination scopes when supplied. Permission derivation,
+scheduling, prepared-resource validation, and workspace enforcement MUST retain
+those domains: host or external effects MUST NOT be interpreted as project
+filesystem access, while local effects MUST NOT escape workspace enforcement.
+
+#### Scenario: Host process writes outside a project
+
+- **GIVEN** a prepared host-process action declares same-user host read/write
+  effects and a matching host-defined resource
+- **WHEN** the executor validates it
+- **THEN** the call remains approval-eligible under typed host permissions
+- **AND** the executor does not reject it as a mismatched workspace resource
+
+#### Scenario: External tool has an endpoint
+
+- **GIVEN** an external-service tool declares possible external write, network
+  to one endpoint, and data egress to that destination
+- **WHEN** its prepared authority is derived
+- **THEN** the permission set includes external write, network, and data egress
+- **AND** the resource/effects retain the service identity and exact endpoint
+
 ### Requirement: Remote tools never claim argument-narrowed authority
 
 A tool whose argument schema is defined by a remote party SHALL derive its

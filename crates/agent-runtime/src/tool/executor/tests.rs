@@ -1334,6 +1334,102 @@ async fn invalid_prepared_authority_fails_closed_before_invocation() {
     }
 }
 
+#[test]
+fn host_and_external_effects_require_matching_non_workspace_resources() {
+    let executor = ToolExecutor::new(
+        ToolRegistry::new().seal(),
+        Arc::new(AllowAll),
+        Arc::new(WsRoot),
+        Arc::new(SystemClock),
+        10_000,
+        ConflictPolicy::ScopeOverlap,
+        empty_security_config(),
+    );
+
+    let host_effects = ToolEffects::new(vec![])
+        .with_host_read("host-shell")
+        .with_host_write("host-shell", "host:filesystem")
+        .with_spawn()
+        .with_network();
+    let host_spec = ToolSpec::new(
+        "shell",
+        "host shell",
+        json!({"type": "object"}),
+        host_effects.clone(),
+    );
+    let host_call = call("shell", "host", json!({}));
+    let host_prepared = PreparedToolCall::new(
+        host_call.id.clone(),
+        "shell",
+        json!({}),
+        host_effects.permission_upper_bound(),
+        SecurityResource::other("host-shell", "sha256:action"),
+        host_effects.clone(),
+        ToolCallDisplay::new("Run host shell"),
+    );
+    executor
+        .verify_prepared(&host_call, &host_spec, &host_prepared)
+        .expect("matching host authority validates");
+
+    let wrong_host = PreparedToolCall::new(
+        host_call.id.clone(),
+        "shell",
+        json!({}),
+        host_effects.permission_upper_bound(),
+        SecurityResource::filesystem("/ws", Vec::new()),
+        host_effects,
+        ToolCallDisplay::new("Run host shell"),
+    );
+    assert!(
+        executor
+            .verify_prepared(&host_call, &host_spec, &wrong_host)
+            .expect_err("workspace resource cannot stand in for host authority")
+            .contains("host-shell")
+    );
+
+    let service = "mcp:github@revision#https://mcp.example.test/v1";
+    let external_effects = ToolEffects::new(vec![])
+        .with_external_read(service)
+        .with_external_write(service)
+        .with_network_to("https://mcp.example.test/v1")
+        .with_data_egress_to("https://mcp.example.test/v1");
+    let external_spec = ToolSpec::new(
+        "mcp__github__send_email",
+        "remote tool",
+        json!({"type": "object"}),
+        external_effects.clone(),
+    );
+    let external_call = call("mcp__github__send_email", "external", json!({}));
+    let external_prepared = PreparedToolCall::new(
+        external_call.id.clone(),
+        "mcp__github__send_email",
+        json!({}),
+        external_effects.permission_upper_bound(),
+        SecurityResource::other("external-service", service),
+        external_effects.clone(),
+        ToolCallDisplay::new("Call external service"),
+    );
+    executor
+        .verify_prepared(&external_call, &external_spec, &external_prepared)
+        .expect("matching external authority validates");
+
+    let wrong_external = PreparedToolCall::new(
+        external_call.id.clone(),
+        "mcp__github__send_email",
+        json!({}),
+        external_effects.permission_upper_bound(),
+        SecurityResource::other("external-service", "mcp:other"),
+        external_effects,
+        ToolCallDisplay::new("Call external service"),
+    );
+    assert!(
+        executor
+            .verify_prepared(&external_call, &external_spec, &wrong_external)
+            .expect_err("a different service cannot satisfy prepared authority")
+            .contains("exact service resource")
+    );
+}
+
 /// Reads one exact file outside the workspace: prepares a host-mounted
 /// resource so authorization sees the escape.
 #[derive(Debug)]

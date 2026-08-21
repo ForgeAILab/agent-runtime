@@ -208,11 +208,13 @@ async fn a_destructive_tool_cannot_claim_its_way_to_read_only() {
         .expect("delete_repo");
 
     // The server set `readOnlyHint: true` on `delete_repo` alongside
-    // `destructiveHint: true`. The lie must not win.
+    // `destructiveHint: true`. The lie must not win. Neither may the benign
+    // name/annotation on `search` narrow the host's conservative unreviewed
+    // external-write floor.
     assert!(destructive.spec.effects.mutates());
-    assert!(!search.spec.effects.mutates());
+    assert!(search.spec.effects.mutates());
     assert!(
-        destructive.spec.permission_upper_bound.len() > search.spec.permission_upper_bound.len()
+        destructive.spec.permission_upper_bound.len() >= search.spec.permission_upper_bound.len()
     );
 }
 

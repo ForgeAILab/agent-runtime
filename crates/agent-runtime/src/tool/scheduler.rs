@@ -52,7 +52,7 @@ pub fn plan_batches(effects: &[ToolEffects], policy: ConflictPolicy) -> Vec<Vec<
         current_mutates |= eff.mutates();
         current_spawns |= eff.spawns_process();
         current_network |= eff.has_network();
-        current_scopes.extend(eff.write_scopes().map(|s| s.as_str().to_owned()));
+        current_scopes.extend(eff.mutation_scopes().map(|s| s.as_str().to_owned()));
     }
     if !current.is_empty() {
         batches.push(current);
@@ -75,7 +75,7 @@ fn conflicts_with(
         ConflictPolicy::ScopeOverlap => {
             // Overlapping write scopes conflict.
             let scope_overlap = eff
-                .write_scopes()
+                .mutation_scopes()
                 .any(|s| batch_scopes.iter().any(|b| b == s.as_str()));
             // A process spawn is conservatively serialized against any other
             // mutating work, and vice versa, since its side effects are opaque.
@@ -115,6 +115,27 @@ mod tests {
         let batches = plan_batches(&effects, ConflictPolicy::ScopeOverlap);
         // Two batches => not concurrent; order preserved.
         assert_eq!(batches, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn external_service_mutations_share_only_their_service_conflict_key() {
+        let effects = vec![
+            ToolEffects::new(vec![]).with_external_write("mcp:github"),
+            ToolEffects::new(vec![]).with_external_write("mcp:github"),
+            ToolEffects::new(vec![]).with_external_write("mcp:linear"),
+        ];
+        let batches = plan_batches(&effects, ConflictPolicy::ScopeOverlap);
+        assert_eq!(batches, vec![vec![0], vec![1, 2]]);
+    }
+
+    #[test]
+    fn host_and_workspace_scopes_are_not_confused() {
+        let effects = vec![
+            ToolEffects::new(vec![]).with_host_write("host-shell", "host:filesystem"),
+            ToolEffects::new(vec![]).with_write("/workspace/src/lib.rs"),
+        ];
+        let batches = plan_batches(&effects, ConflictPolicy::ScopeOverlap);
+        assert_eq!(batches, vec![vec![0, 1]]);
     }
 
     #[test]
