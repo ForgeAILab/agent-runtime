@@ -1707,10 +1707,16 @@ fn event_to_events(
     if state.event_count > MAX_STREAM_EVENTS {
         return Err(malformed("Responses stream emitted too many events"));
     }
+    // The first terminal event closes the attempt. The ChatGPT Codex backend
+    // keeps the SSE connection open after `response.completed` / `.failed`
+    // and can deliver further frames before `[DONE]`; treating any of them
+    // as a conflicting terminal turned a finished (or already classified
+    // failed) attempt into a malformed-stream error three retries in a row.
+    // Nothing after the first terminal boundary is committed: trailing text,
+    // tool fragments, usage, or a second terminal are dropped, and the event
+    // bound above still limits how long a misbehaving stream is drained.
     if state.pending_terminal.is_some() {
-        return Err(malformed(
-            "Responses stream emitted conflicting terminal events",
-        ));
+        return Ok(());
     }
     let kind = event_type(&event)?;
     match kind {
@@ -2727,6 +2733,84 @@ mod tests {
             assert_eq!(usage.get(CounterKind::InputCached), cached, "{name}");
             assert_eq!(usage.get(CounterKind::CacheWrite), written, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn frames_after_the_first_terminal_are_ignored_not_conflicting() {
+        // The ChatGPT Codex backend keeps sending frames after the terminal
+        // event. The attempt ends at the first terminal; nothing after it is
+        // committed and the trailing frames are not a malformed stream.
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"trailing\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":9}}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let provider = ResponsesProvider::new(
+            ReplayTransport::new(body),
+            ResponsesConfig::chatgpt("gpt-5.3"),
+        )
+        .expect("valid ChatGPT config");
+        let request = ProviderRequest::new(ModelId::new("gpt-5.3"), vec![Message::user("hi")]);
+        let mut stream = provider
+            .stream(request, ctx())
+            .await
+            .expect("stream begins");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "answer",
+            "nothing after the first terminal is committed"
+        );
+        let output_usage: u64 = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::Usage { delta } => Some(delta.get(CounterKind::Output)),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(output_usage, 1, "trailing terminal usage is not committed");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderStreamEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop
+            })
+        ));
+
+        // A failed attempt keeps its first classification even when the
+        // backend follows `response.failed` with a generic `error` frame.
+        let failed_then_error = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n",
+            "data: {\"type\":\"error\",\"code\":\"server_error\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let events = collect_events(
+            failed_then_error,
+            ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("hi")]),
+        )
+        .await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(events.last(), Some(ProviderStreamEvent::Error { error }) if error.kind == ProviderErrorKind::RateLimited),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]
