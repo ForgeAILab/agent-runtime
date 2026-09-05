@@ -102,7 +102,15 @@ use crate::usage::UsageRecord;
 ///
 /// Bumped to 14 for exact cache identities, typed synthetic purposes, and the
 /// canonical cache-operation lifecycle variants.
-pub const SCHEMA_VERSION: u32 = 14;
+///
+/// Bumped to 15 for externally executed turns: an installed agent reports the
+/// session it is continuing and the tools it ran itself
+/// ([`RuntimeEvent::ExternalSessionStarted`] through
+/// [`RuntimeEvent::ExternalToolCompleted`]). These are deliberately distinct
+/// from [`RuntimeEvent::ToolCallRequested`]: the runtime never dispatched
+/// them, never consulted approvals for them, and cannot vouch for them, so a
+/// host must be able to tell the two apart and say so.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +551,36 @@ pub enum RuntimeEvent {
         attempt: AttemptId,
     },
     /// A validated tool call was requested by the model.
+    /// An externally executed turn is running under this backend session.
+    ///
+    /// Hosts use it to show which installed agent is working, and to label the
+    /// turn as executed elsewhere.
+    ExternalSessionStarted {
+        /// The backend's own conversation identity, opaque to the runtime.
+        session: String,
+    },
+    /// An external agent reported running a tool itself.
+    ///
+    /// Observation only. The runtime did not dispatch this call, did not
+    /// consult approvals for it, and does not admit its result to canonical
+    /// tool history.
+    ExternalToolInvoked {
+        /// Backend-assigned call identity, correlating with its completion.
+        id: String,
+        /// Backend-reported tool name.
+        name: String,
+        /// Backend-reported invocation detail.
+        detail: serde_json::Value,
+    },
+    /// The outcome of a tool an external agent ran itself.
+    ExternalToolCompleted {
+        /// The identity reported by the matching invocation.
+        id: String,
+        /// Whether the backend considered the tool successful.
+        ok: bool,
+        /// Backend-reported outcome detail.
+        detail: serde_json::Value,
+    },
     ToolCallRequested {
         /// The tool-call id.
         call: ToolCallId,
