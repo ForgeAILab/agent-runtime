@@ -98,6 +98,10 @@ pub struct RuntimeBuilder {
     activation_policy: Arc<dyn ActivationPolicy>,
     activation_context: ActivationContext,
     activation_budget: Option<ActivationBudget>,
+    /// When set, every turn is executed by this backend instead of the
+    /// provider/tool loop.
+    #[cfg(feature = "external-agent")]
+    external_agent: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
     harness: HarnessPipelineBuilder,
     lcm: Option<Arc<LcmCoordinator>>,
 }
@@ -106,6 +110,8 @@ impl RuntimeBuilder {
     /// A builder targeting `model`.
     pub fn new(model: ModelId) -> Self {
         Self {
+            #[cfg(feature = "external-agent")]
+            external_agent: None,
             provider: None,
             tools: Vec::new(),
             approval: None,
@@ -299,6 +305,21 @@ impl RuntimeBuilder {
     }
 
     /// Caps initial and on-demand activation schema cost and cardinality.
+    /// Routes every turn to an installed external agent instead of the
+    /// provider/tool loop.
+    ///
+    /// The provider remains required: it supplies model identity and
+    /// capability resolution that the rest of the runtime still consults.
+    /// It is simply never called to produce a turn.
+    #[cfg(feature = "external-agent")]
+    pub fn external_agent(
+        mut self,
+        backend: Arc<dyn crate::agent::external::ExternalAgentBackend>,
+    ) -> Self {
+        self.external_agent = Some(backend);
+        self
+    }
+
     pub fn activation_budget(mut self, budget: ActivationBudget) -> Self {
         self.live_ability_routing = true;
         self.activation_budget = Some(budget);
@@ -847,6 +868,8 @@ impl RuntimeBuilder {
             harness,
             live_abilities,
         );
+        #[cfg(feature = "external-agent")]
+        let driver = driver.with_external_agent(self.external_agent);
 
         let shared = RuntimeShared {
             driver,
