@@ -40,6 +40,8 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ReasoningDelta { .. } => "reasoning_delta",
         RuntimeEvent::ProviderAttemptOutputCommitted { .. } => "provider_attempt_output_committed",
         RuntimeEvent::ProviderAttemptOutputDiscarded { .. } => "provider_attempt_output_discarded",
+        RuntimeEvent::ExternalText { .. } => "external_text",
+        RuntimeEvent::ExternalReasoning { .. } => "external_reasoning",
         RuntimeEvent::ExternalSessionStarted { .. } => "external_session_started",
         RuntimeEvent::ExternalToolInvoked { .. } => "external_tool_invoked",
         RuntimeEvent::ExternalToolCompleted { .. } => "external_tool_completed",
@@ -278,6 +280,14 @@ fn summary(payload: &RuntimeEvent) -> String {
         }
         RuntimeEvent::ProviderAttemptOutputDiscarded { request, attempt } => {
             format!("provider_attempt_output_discarded request={request} attempt={attempt}")
+        }
+        // Prose is withheld from the log line for the same reason committed
+        // provider text is: it is model output, not a diagnostic.
+        RuntimeEvent::ExternalText { text } => {
+            format!("external_text chars={}", text.chars().count())
+        }
+        RuntimeEvent::ExternalReasoning { text } => {
+            format!("external_reasoning chars={}", text.chars().count())
         }
         RuntimeEvent::ExternalSessionStarted { session } => {
             format!("external_session_started session={session}")
