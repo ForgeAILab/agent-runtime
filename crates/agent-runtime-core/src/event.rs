@@ -109,7 +109,9 @@ use crate::usage::UsageRecord;
 /// [`RuntimeEvent::ExternalToolCompleted`]). These are deliberately distinct
 /// from [`RuntimeEvent::ToolCallRequested`]: the runtime never dispatched
 /// them, never consulted approvals for them, and cannot vouch for them, so a
-/// host must be able to tell the two apart and say so.
+/// host must be able to tell the two apart and say so. Assistant output from
+/// such a turn arrives as [`RuntimeEvent::ExternalText`] rather than
+/// [`RuntimeEvent::TextDelta`], which is attempt-scoped and speculative.
 pub const SCHEMA_VERSION: u32 = 15;
 
 /// Why a canonical persistent goal projection changed.
@@ -551,6 +553,21 @@ pub enum RuntimeEvent {
         attempt: AttemptId,
     },
     /// A validated tool call was requested by the model.
+    /// Assistant prose from an externally executed turn.
+    ///
+    /// Distinct from [`RuntimeEvent::TextDelta`], which is attempt-scoped and
+    /// speculative: it carries the request and attempt whose output may still
+    /// be discarded. An external turn makes no provider attempt, so there is
+    /// no identity to carry and nothing to discard.
+    ExternalText {
+        /// The text fragment.
+        text: String,
+    },
+    /// Reasoning from an externally executed turn.
+    ExternalReasoning {
+        /// The reasoning fragment.
+        text: String,
+    },
     /// An externally executed turn is running under this backend session.
     ///
     /// Hosts use it to show which installed agent is working, and to label the

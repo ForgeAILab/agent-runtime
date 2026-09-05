@@ -121,6 +121,12 @@ pub enum UsageSource {
     ToolLoop,
     /// A dedicated semantic-context summary call.
     SemanticSummary,
+    /// A turn executed by an external agent backend.
+    ///
+    /// Distinct from [`UsageSource::ProviderAttempt`] because no provider
+    /// attempt was made: the counts are what the external agent reported for
+    /// work it did itself.
+    ExternalAgent,
     /// A consumer-facing aggregate.
     Rollup,
 }

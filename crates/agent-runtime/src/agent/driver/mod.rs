@@ -430,6 +430,11 @@ pub struct Driver {
     return_child_interactions_to_parent: bool,
     harness: Arc<HarnessPipeline>,
     live_abilities: Option<Arc<LiveAbilityRuntime>>,
+    /// When present, every turn is executed by this backend instead of the
+    /// provider/tool loop above. The two never interleave within one turn,
+    /// which is what keeps canonical history single-owner.
+    #[cfg(feature = "external-agent")]
+    external: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
 }
 
 impl Driver {
@@ -478,6 +483,8 @@ impl Driver {
             return_child_interactions_to_parent,
             harness,
             live_abilities,
+            #[cfg(feature = "external-agent")]
+            external: None,
         }
     }
 
@@ -674,22 +681,27 @@ impl Driver {
         turn_id: TurnId,
         input: UserInput,
     ) {
-        TurnMachine::new(
-            self,
-            TurnMachineContext {
-                state,
-                execution,
-                emitter,
-                minter,
-                cancel: turn_cancel,
-                inbox,
-                steer_mailbox: None,
-                turn_id,
-                acceptance: None,
-            },
-        )
-        .run(input)
-        .await;
+        let context = TurnMachineContext {
+            state,
+            execution,
+            emitter,
+            minter,
+            cancel: turn_cancel,
+            inbox,
+            steer_mailbox: None,
+            turn_id,
+            acceptance: None,
+        };
+
+        #[cfg(feature = "external-agent")]
+        if let Some(backend) = self.external.clone() {
+            external_turn::ExternalTurnMachine::new(self, context, backend)
+                .run(input)
+                .await;
+            return;
+        }
+
+        TurnMachine::new(self, context).run(input).await;
     }
 
     /// Runs a session-facade turn with its registered steering mailbox.
@@ -899,6 +911,8 @@ struct TurnMachineContext {
     acceptance: Option<Arc<TurnAcceptance>>,
 }
 
+#[cfg(feature = "external-agent")]
+mod external_turn;
 mod provider;
 mod recovery;
 mod tools;
