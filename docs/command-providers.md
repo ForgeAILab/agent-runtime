@@ -5,7 +5,7 @@ a native HTTP adapter. Enable the mechanism explicitly:
 
 ```toml
 [dependencies]
-agent-runtime = { version = "0.1", features = ["command-provider"] }
+agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "<reviewed-commit-sha>", features = ["command-provider"] }
 ```
 
 This is a provider transport, not an autonomous-agent bridge. Runtime remains
@@ -91,20 +91,19 @@ Adapter-specific settings stay in a consumer-owned namespace:
 - CLI home/authentication environment mapping;
 - CLI protocol flags and response normalization.
 
-## Smith/TUI handoff
+## Smith/TUI integration
 
-The later `../tui` integration can use its existing open provider-kind and
-`Arc<dyn Provider>` composition seam:
+Smith implements `command-jsonl`, a consumer-owned adapter for version 1 of the
+`smith-command-provider` protocol. It authorizes user-owned executable settings,
+runs an explicit compatibility probe, and constructs `CommandProvider` through
+its ordinary runtime factory. The same provider serves TUI and headless turns.
 
-1. Add a Smith-owned provider kind such as `codex-cli` and a namespaced CLI
-   section to `smith-config`.
-2. Resolve and authorize the executable, cwd, fixed arguments, and secret/home
-   references using Smith's existing provenance and credential layers.
-3. Implement one Smith-owned `CommandAdapter` for the exact supported CLI
-   protocol/version and enable `agent-runtime/command-provider`.
-4. Construct `CommandProvider` in the existing factory and leave all runtime
-   context, tool/MCP, security, event, and presentation paths unchanged.
-5. Add fixture and live-version gates in Smith before advertising the adapter.
+The executable must implement Smith's probe and request/frame protocol. Pointing
+this configuration at `claude`, `codex`, or another autonomous coding agent does
+not make that CLI a compatible model provider. This framework and the reference
+`agent-runtime run` command do not launch Claude Code or Codex as external agents.
+Such support needs a separate backend contract for history, tool execution,
+approvals, cancellation, and agent events.
 
 Smith should not reuse the reference `agent-runtime-cli` TOML parser: its
 layered configuration and trust model are already richer. This repository does
