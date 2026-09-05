@@ -41,6 +41,10 @@ url = "2.5"
 default = []
 obs = ["dep:agent-runtime-obs"]
 command-provider = ["agent-runtime-provider/command-provider"]
+# The external agent boundary: a turn executed by an installed coding agent
+# instead of by the provider/tool loop. Off by default; it adds no dependency,
+# only a seam.
+external-agent = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }

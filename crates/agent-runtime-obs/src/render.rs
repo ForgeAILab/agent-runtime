@@ -40,6 +40,9 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ReasoningDelta { .. } => "reasoning_delta",
         RuntimeEvent::ProviderAttemptOutputCommitted { .. } => "provider_attempt_output_committed",
         RuntimeEvent::ProviderAttemptOutputDiscarded { .. } => "provider_attempt_output_discarded",
+        RuntimeEvent::ExternalSessionStarted { .. } => "external_session_started",
+        RuntimeEvent::ExternalToolInvoked { .. } => "external_tool_invoked",
+        RuntimeEvent::ExternalToolCompleted { .. } => "external_tool_completed",
         RuntimeEvent::ToolCallRequested { .. } => "tool_call_requested",
         RuntimeEvent::InteractionRequested { .. } => "interaction_requested",
         RuntimeEvent::InteractionResolved { .. } => "interaction_resolved",
@@ -275,6 +278,18 @@ fn summary(payload: &RuntimeEvent) -> String {
         }
         RuntimeEvent::ProviderAttemptOutputDiscarded { request, attempt } => {
             format!("provider_attempt_output_discarded request={request} attempt={attempt}")
+        }
+        RuntimeEvent::ExternalSessionStarted { session } => {
+            format!("external_session_started session={session}")
+        }
+        // Detail is backend-reported and may echo workspace content, so the
+        // log line names the tool and withholds the payload, matching how
+        // dispatched tool arguments are handled above.
+        RuntimeEvent::ExternalToolInvoked { id, name, .. } => {
+            format!("external_tool_invoked id={id} name={name}")
+        }
+        RuntimeEvent::ExternalToolCompleted { id, ok, .. } => {
+            format!("external_tool_completed id={id} ok={ok}")
         }
         RuntimeEvent::ToolCallRequested {
             name,
