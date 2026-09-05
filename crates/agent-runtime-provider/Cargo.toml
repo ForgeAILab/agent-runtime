@@ -10,19 +10,33 @@ description = "Provider adapters (fake, OpenAI-compatible, native Responses, nat
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+command-provider = [
+    "dep:command-group",
+    "dep:thiserror",
+    "dep:zeroize",
+    "tokio/io-util",
+    "tokio/process",
+    "tokio/sync",
+]
+
 [dependencies]
 agent-runtime-core.workspace = true
 agent-runtime-registry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
 async-trait.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 async-stream.workspace = true
 tokio = { workspace = true, features = ["time"] }
+command-group = { version = "5.0.1", features = ["with-tokio"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "process", "sync", "rt", "macros", "time", "rt-multi-thread"] }
 
 [lints]
 workspace = true

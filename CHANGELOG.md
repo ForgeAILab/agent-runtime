@@ -125,6 +125,30 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- `agent-runtime-provider/command-provider`, an opt-in process-bounded
+  implementation of the canonical provider contract for trusted,
+  consumer-owned model CLI codecs. It provides exact capability validation,
+  shell-free direct argv, canonical executable/cwd resolution, a cleared and
+  explicit child environment, redacted config/attempt diagnostics, bounded
+  stdin/stdout/stderr, typed machine-output decoding, explicit compatibility
+  probing, and cancellation/deadline/drop-safe process-group cleanup. Runtime
+  retains canonical history, tools/MCP, approvals, retries, and events; named
+  Codex/Claude/other adapters and Smith configuration remain consumer work.
+- `agent-runtime-cli`, an isolated reference host that installs the
+  `agent-runtime run` command for one in-process turn. It supports the
+  first-party provider adapters, explicit model limits, positional or piped
+  prompts, credential-by-environment configuration, assistant-text or
+  canonical JSONL streaming, exact-origin HTTPS transport with restricted
+  address and redirect denial, Ctrl-C interruption, and stable process exits.
+  It now accepts one explicit strict version-1 TOML file for existing run
+  defaults and trusted local stdio MCP definitions. Static inspection,
+  per-run server consent, exact per-run tool approval, minimal child
+  environment mapping, conservative tool authority, optional/required failure
+  handling, and bounded connection shutdown keep a file from authorizing its
+  own process or tools. The CLI package declares Rust 1.88 for the official MCP
+  SDK while embeddable packages retain Rust 1.86. Interactive chat,
+  persistence, remote MCP/OAuth, ambient config discovery, daemons, and
+  consumer policy remain outside this command.
 - `agent-runtime-lcm`, a store- and provider-neutral package for immutable
   logical timelines, transactional leaf/condensed summary DAGs, deterministic
   tool-exchange-safe planning, bounded expansion, soft/hard pressure decisions,

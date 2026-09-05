@@ -11,7 +11,8 @@
 ## Tech Stack
 
 - Language: Rust 2024 edition
-- Minimum supported Rust version: 1.86
+- Minimum supported Rust version: 1.86 for embeddable packages; the isolated
+  MCP client and MCP-enabled CLI declare 1.88 for the official protocol SDK
 - Async runtime: Tokio
 - Serialization: Serde with versioned JSON-compatible public contracts
 - Streaming: asynchronous typed event streams
@@ -29,7 +30,8 @@
 - `agent-runtime-ability`: descriptor-first abilities and lazy, policy-checked
   activation. Depends on the registry kernel alone by default.
 - `agent-runtime-provider`: provider adapters, injectable transport, retry
-  classification, and optional remote catalog sources
+  classification, optional remote catalog sources, and an opt-in
+  process-bounded provider mechanism for consumer-owned model CLI protocols
 - `agent-runtime-context`: the authoritative context engine — versioned
   positioned fragments, complete token accounting, structural compaction, and
   cache-aware planning. Deterministic and network-free.
@@ -40,6 +42,10 @@
   checkpointable direct turn machine, prepared tool execution, host
   interaction, delegation, generic harness components including the LCM
   coordinator, and the session facade
+- `agent-runtime-cli`: isolated reference command-line host for one
+  non-interactive turn, with explicit/versioned provider/model configuration,
+  trusted stdio MCP tool injection, secret-safe process input, stable
+  text/JSONL output, and a restrictive concrete provider HTTPS transport
 - `agent-runtime-obs`: optional event sinks and projections, never on the
   execution path
 - `agent-runtime-testkit`: deterministic fake providers, clocks, event

@@ -2,6 +2,7 @@
 
 mod artifacts;
 mod capability_search;
+mod fetch;
 mod goals;
 mod lcm;
 mod legacy_semantic_summary;
@@ -23,6 +24,11 @@ pub use artifacts::{
 };
 pub use capability_search::{
     CAPABILITY_SEARCH_TOOL_NAME, CapabilitySearchTool, MAX_CAPABILITY_SEARCH_RESULTS,
+};
+pub use fetch::{
+    DEFAULT_MAX_FETCH_BYTES, DEFAULT_MAX_OUTPUT_CHARS, FETCH_TOOL_NAME, FetchFormat, FetchRequest,
+    FetchResponse, FetchSecurityPolicy, FetchTool, FetchTransport, ValidatedUrl,
+    format_untrusted_prefix, html_to_markdown, html_to_text,
 };
 pub use goals::{
     CREATE_GOAL_TOOL_NAME, CreateGoalTool, GET_GOAL_TOOL_NAME, GetGoalTool, GoalComponent,

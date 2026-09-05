@@ -21,16 +21,34 @@ types.
 | `agent-runtime-registry` | The dependency-light registry kernel: namespaced identities, revisions, provenance, layered sealing, scoped views, fingerprints, and the generic `Named`/`Registry<T>`/`Sealed<T>` collection. Std-only by default. |
 | `agent-runtime-core` | Host-neutral contracts: IDs, messages/content, structured errors, cancellation, deadlines, redaction-safe metadata, versioned events, disjoint usage counters, and the provider/tool/approval/workspace/store/observer/clock traits. |
 | `agent-runtime-ability` | Descriptor-first abilities on the registry kernel: bounded `AbilityDescriptor`s, dependency/conflict/readiness metadata, lazy policy-checked activation, and the unified `Ability`/`AbilityKind` view. Registry-only by default; `tool` bridges the runtime's `Tool`. |
-| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, configurable OpenAI-compatible, native Responses, and native Gemini Interactions adapters, a deterministic fake, and the attempt-recording retry/backoff classifier. |
+| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, configurable OpenAI-compatible, native Responses, and native Gemini Interactions adapters, a deterministic fake, the attempt-recording retry/backoff classifier, and an opt-in process-bounded command-provider framework for consumer-owned model CLI codecs. |
 | `agent-runtime-context` | The authoritative context engine: versioned and positioned `ContextFragment`s (including composable system-prompt sections), complete token accounting (`RequestSizer`/`CharRatioSizer`), deterministic structural compaction, and cache-aware planning through `ContextPlanner`. Deterministic and network-free. |
 | `agent-runtime-lcm` | Lossless Context Memory: immutable logical timelines, transactional hierarchical summary DAGs, deterministic tool-safe compaction planning, convergence-guaranteed summarization, and bounded expansion. Store- and provider-neutral. |
 | `agent-runtime-obs` | Observability facade over the event envelope: an async `EventSink`, `FanoutSink`, a `SinkObserver` bridge, an event-stream pump, an `ObsRow` SQL projection, and feature-gated CLI/file/SQLite sinks. |
 | `agent-runtime` | The embeddable runtime: session-scoped registry views and activation epochs, the checkpointable direct turn machine, prepared tool execution, host interaction, delegation, and reusable harness components for todos, memory, artifacts, and LCM. Re-exports `registry`, `ability`, `provider`, `context`, and `lcm`, and `obs` behind an opt-in feature. |
+| `agent-runtime-cli` | An isolated reference host and `agent-runtime` binary for one non-interactive turn with explicit/versioned configuration, trusted stdio MCP tool injection, text or JSONL streaming, restrictive provider HTTPS transport, and stable exit codes. |
 | `agent-runtime-testkit` | Deterministic fakes, clocks, event recorders, reusable conformance suites, and neutral consumer adapter fixtures. |
 
 All crates except `agent-runtime-testkit` are intended as production
-dependencies; pick just the mechanism each consumer needs. Minimum supported
-Rust version: **1.86** (edition 2024). License: **MIT**.
+dependencies; pick just the mechanism each consumer needs. The embeddable
+workspace baseline is Rust **1.86** (edition 2024); `agent-runtime-mcp` and the
+MCP-enabled `agent-runtime-cli` declare Rust **1.88** for the official protocol
+SDK. License: **MIT**.
+
+## Command-backed model providers
+
+Hosts may opt into `agent-runtime/command-provider` and install a trusted model
+CLI through the same `Provider` interface as a native API adapter. The shared
+mechanism owns shell-free process spawning, explicit environment isolation,
+bounded machine-output decoding, cancellation/deadlines, process-tree cleanup,
+and explicit version probing. The embedding product owns the named CLI codec,
+executable trust, authentication mapping, and adapter-specific settings.
+
+Runtime still owns canonical history, tools and MCP, approvals, retries, and
+events. Autonomous CLIs with hidden tool or retry loops are not transparent
+model providers. See [`docs/command-providers.md`](docs/command-providers.md)
+and the compile-checked
+[`command_provider` example](crates/agent-runtime-provider/examples/command_provider.rs).
 
 ## Renewable provider credentials
 
@@ -114,7 +132,41 @@ rejected before credentials or network I/O. Model limits and reasoning effort
 availability remain host/catalog policy; the adapter does not embed Grok Build
 defaults.
 
-## Quick start
+## Command-line quick start
+
+Build or install the isolated CLI package, then supply a provider credential
+through its environment variable. Model limits are intentionally explicit;
+use values published for the exact model and endpoint you selected.
+
+```sh
+cargo install --path crates/agent-runtime-cli
+
+export OPENAI_API_KEY='...'
+agent-runtime run \
+  --provider openai \
+  --model '<MODEL>' \
+  --context-tokens <CONTEXT_TOKENS> \
+  --max-input-tokens <MAX_INPUT_TOKENS> \
+  --max-output-tokens <MAX_OUTPUT_TOKENS> \
+  'Explain this repository in three sentences.'
+```
+
+Pipe a prompt by omitting the positional argument, or add `--output jsonl` to
+write one canonical schema-versioned event envelope per line. Credentials are
+accepted only through the documented environment variable (or a variable name
+selected with `--api-key-env`), never as a command argument. The CLI allows
+HTTPS provider endpoints only and denies redirects and restricted network
+destinations. See [`docs/cli.md`](docs/cli.md) for the full contract.
+
+The CLI can also load one explicit strict TOML file and inject trusted local
+MCP tools. A checked-in file grants no authority by itself: use
+`agent-runtime mcp inspect --config <PATH>` to review it, then pass both
+`--allow-mcp-server <SERVER>` and exact
+`--allow-mcp-tool <SERVER/TOOL>` values for that run. Stdio children receive
+only explicitly mapped environment variables; remote MCP and OAuth are not in
+the version-1 surface.
+
+## Rust quick start
 
 ```rust
 use std::sync::Arc;
@@ -221,6 +273,9 @@ cargo +1.86.0 build \
   -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-lcm \
   -p agent-runtime-obs \
   -p agent-runtime
+
+# The official MCP SDK raises the package-specific floor for these leaf hosts.
+cargo +1.88.0 build -p agent-runtime-mcp -p agent-runtime-cli --all-features
 
 # Dependency boundaries are contracts, not preferences.
 cargo tree -p agent-runtime-registry --no-default-features -e normal  # std-only

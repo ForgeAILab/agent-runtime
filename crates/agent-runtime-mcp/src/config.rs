@@ -5,6 +5,7 @@
 //! servers exist — those are product policy and stay in the embedding host.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use agent_runtime_ability::descriptor::ReadinessRequirement;
@@ -23,7 +24,7 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// How to reach a server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum McpTransport {
     /// Spawn a local command and speak the protocol over its stdio.
@@ -47,6 +48,30 @@ pub enum McpTransport {
         /// Headers to send, typically carrying a bearer credential.
         headers: BTreeMap<String, String>,
     },
+}
+
+impl fmt::Debug for McpTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => formatter
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("env_names", &env.keys().collect::<Vec<_>>())
+                .field("cwd", cwd)
+                .finish(),
+            Self::StreamableHttp { url, headers } => formatter
+                .debug_struct("StreamableHttp")
+                .field("url", url)
+                .field("header_names", &headers.keys().collect::<Vec<_>>())
+                .finish(),
+        }
+    }
 }
 
 impl McpTransport {
@@ -467,6 +492,26 @@ mod tests {
             .with_env("GITHUB_TOKEN", "x")
             .with_env("AWS_SECRET_ACCESS_KEY", "y");
         assert_ne!(before.identity(), after.identity());
+    }
+
+    #[test]
+    fn transport_debug_redacts_environment_and_header_values() {
+        let stdio = McpTransport::Stdio {
+            command: "server".to_owned(),
+            args: vec!["--safe".to_owned()],
+            env: BTreeMap::from([("TOKEN".to_owned(), "stdio-secret".to_owned())]),
+            cwd: None,
+        };
+        let http = McpTransport::StreamableHttp {
+            url: "https://mcp.example.test".to_owned(),
+            headers: BTreeMap::from([("Authorization".to_owned(), "http-secret".to_owned())]),
+        };
+
+        let debug = format!("{stdio:?} {http:?}");
+        assert!(debug.contains("TOKEN"));
+        assert!(debug.contains("Authorization"));
+        assert!(!debug.contains("stdio-secret"));
+        assert!(!debug.contains("http-secret"));
     }
 
     #[test]

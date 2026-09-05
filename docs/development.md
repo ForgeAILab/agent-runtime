@@ -129,7 +129,9 @@ from an opaque node or cursor supplied by a caller.
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo test -p agent-runtime-provider --features command-provider --test command_provider
 cargo build -p agent-runtime-core -p agent-runtime   # MSRV 1.86 build
+cargo +1.88.0 build -p agent-runtime-mcp -p agent-runtime-cli
 cargo deny check
 ```
 
@@ -177,8 +179,13 @@ cargo test -p agent-runtime-testkit --lib lcm
 cargo +1.86.0 build \
   -p agent-runtime-registry -p agent-runtime-core -p agent-runtime-ability \
   -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-lcm \
-  -p agent-runtime-obs \
-  -p agent-runtime --all-features
+  -p agent-runtime-obs -p agent-runtime --all-features
+
+# The command-provider feature remains on the embeddable Rust 1.86 lane.
+cargo +1.86.0 test -p agent-runtime-provider --features command-provider
+
+# The official MCP SDK sets the package-specific floor for these leaf hosts.
+cargo +1.88.0 build -p agent-runtime-mcp -p agent-runtime-cli --all-features
 ```
 
 The current event schema is v15. Golden fixtures cover the retained v5-v11 and

@@ -86,8 +86,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
-      - name: build the MCP client on its declared MSRV
-        run: cargo build --all-features -p agent-runtime-mcp
+      - name: build the MCP client and CLI on their declared MSRV
+        run: cargo build --all-features -p agent-runtime-mcp -p agent-runtime-cli
 
   # Default-feature dependency boundaries (package-architecture: "Dependency-light
   # registry and ability packages"). These are contracts, not preferences: a

@@ -26,10 +26,15 @@
 //!   to record every provider attempt.
 //! - [`catalog`] — optional remote model-catalog sources. Resolution reads a
 //!   host-owned cache and never the network; refresh is control-plane work.
+//! - [`command`] — an opt-in, process-bounded provider mechanism for trusted,
+//!   consumer-owned model CLI protocol adapters. Runtime still owns the agent
+//!   loop, tools, retries, and canonical history.
 #![forbid(unsafe_code)]
 
 pub mod anthropic;
 pub mod catalog;
+#[cfg(feature = "command-provider")]
+pub mod command;
 pub mod fake;
 pub mod gemini;
 pub mod openai;

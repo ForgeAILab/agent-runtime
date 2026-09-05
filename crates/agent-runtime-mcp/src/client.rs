@@ -27,7 +27,7 @@ use crate::error::{McpError, bound_server_message};
 #[derive(Debug)]
 pub struct McpConnection {
     server: String,
-    service: RunningService<RoleClient, ()>,
+    service: tokio::sync::RwLock<RunningService<RoleClient, ()>>,
 }
 
 impl McpConnection {
@@ -42,8 +42,8 @@ impl McpConnection {
     /// bindings it produces are bounded metadata, indexed and ranked with no
     /// further round trip.
     pub async fn list_tools(&self) -> Result<Vec<RemoteTool>, McpError> {
-        let tools = self
-            .service
+        let service = self.service.read().await;
+        let tools = service
             .list_all_tools()
             .await
             .map_err(|error| self.service_error(error))?;
@@ -75,7 +75,8 @@ impl McpConnection {
             }
         };
 
-        match tokio::time::timeout(timeout, self.service.call_tool(params)).await {
+        let service = self.service.read().await;
+        match tokio::time::timeout(timeout, service.call_tool(params)).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(self.service_error(error)),
             Err(_elapsed) => Err(McpError::CallTimeout {
@@ -89,10 +90,12 @@ impl McpConnection {
     ///
     /// A stdio child is terminated as a process group by the transport, so a
     /// server that spawned helpers of its own does not leave them behind.
-    pub async fn shutdown(self) -> Result<(), McpError> {
+    pub async fn shutdown(&self) -> Result<(), McpError> {
         let server = self.server.clone();
         self.service
-            .cancel()
+            .write()
+            .await
+            .close()
             .await
             .map(|_quit_reason| ())
             .map_err(|error| McpError::Protocol {
@@ -182,7 +185,13 @@ impl McpClient {
         config: &McpServerConfig,
     ) -> Result<(McpConnection, Vec<RemoteToolBinding>, Vec<McpError>), McpError> {
         let connection = self.connect(config).await?;
-        let advertised = connection.list_tools().await?;
+        let advertised = match connection.list_tools().await {
+            Ok(advertised) => advertised,
+            Err(error) => {
+                let _ = tokio::time::timeout(config.startup_timeout, connection.shutdown()).await;
+                return Err(error);
+            }
+        };
         let (bindings, rejected) = bind_all(config, &advertised);
         Ok((connection, bindings, rejected))
     }
@@ -199,12 +208,7 @@ impl McpClient {
             return self.dial_non_stdio(config).await;
         };
 
-        let mut process = tokio::process::Command::new(command);
-        process.args(args);
-        process.envs(env);
-        if let Some(cwd) = cwd {
-            process.current_dir(cwd);
-        }
+        let process = stdio_command(command, args, env, cwd.as_deref());
 
         let transport = rmcp::transport::TokioChildProcess::new(process).map_err(|error| {
             McpError::Startup {
@@ -275,6 +279,23 @@ impl McpClient {
             feature: config.transport.feature(),
         })
     }
+}
+
+#[cfg(feature = "stdio")]
+fn stdio_command(
+    command: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    cwd: Option<&str>,
+) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(command);
+    process.args(args);
+    process.env_clear();
+    process.envs(env);
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    process
 }
 
 /// Binds every advertised tool the filter accepts, rejecting duplicates.
@@ -367,7 +388,10 @@ async fn finish_connection(
         });
     }
 
-    Ok(McpConnection { server, service })
+    Ok(McpConnection {
+        server,
+        service: tokio::sync::RwLock::new(service),
+    })
 }
 
 /// Renders a version list for an error message.
@@ -426,6 +450,24 @@ fn kind_of(value: &Value) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::ToolFilter;
+
+    #[cfg(all(feature = "stdio", unix))]
+    #[tokio::test]
+    async fn stdio_command_receives_only_the_explicit_environment() {
+        let env = std::collections::BTreeMap::from([(
+            "AGENT_RUNTIME_MCP_EXPLICIT".to_owned(),
+            "present".to_owned(),
+        )]);
+        let output = stdio_command("/usr/bin/env", &[], &env, None)
+            .output()
+            .await
+            .expect("env command runs");
+        let stdout = String::from_utf8(output.stdout).expect("env output is UTF-8");
+
+        assert_eq!(stdout, "AGENT_RUNTIME_MCP_EXPLICIT=present\n");
+        assert!(!stdout.contains("PATH="));
+        assert!(!stdout.contains("HOME="));
+    }
 
     fn config() -> McpServerConfig {
         McpServerConfig::stdio("github", "npx")

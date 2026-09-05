@@ -1,11 +1,16 @@
-//! A replay HTTP transport that emits recorded SSE bytes offline.
+//! A replay HTTP transport that emits recorded SSE bytes offline and mock fetch transport.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_stream::stream;
 use async_trait::async_trait;
 
+use agent_runtime::harness::{FetchRequest, FetchResponse, FetchTransport};
 use agent_runtime::provider::transport::{ByteStream, HttpRequest, HttpResponse, HttpTransport};
+use agent_runtime_core::cancel::Cancellation;
+use agent_runtime_core::clock::Deadline;
+use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::provider::ProviderError;
 
 /// A transport that replays a fixed sequence of response byte chunks, ignoring
@@ -80,5 +85,56 @@ impl HttpTransport for ReplayTransport {
             headers: self.headers.clone(),
             body: self.replay(request),
         })
+    }
+}
+
+/// A mock [`FetchTransport`] mapping registered URLs to deterministic [`FetchResponse`]s.
+#[derive(Debug, Default)]
+pub struct MockFetchTransport {
+    responses: Mutex<HashMap<String, FetchResponse>>,
+    requests: Mutex<Vec<FetchRequest>>,
+}
+
+impl MockFetchTransport {
+    /// Creates an empty mock fetch transport.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a response for `url`.
+    pub fn with_response(self, url: impl Into<String>, response: FetchResponse) -> Self {
+        self.responses
+            .lock()
+            .expect("responses poisoned")
+            .insert(url.into(), response);
+        self
+    }
+
+    /// The list of fetch requests received so far.
+    pub fn requests(&self) -> Vec<FetchRequest> {
+        self.requests.lock().expect("requests poisoned").clone()
+    }
+}
+
+#[async_trait]
+impl FetchTransport for MockFetchTransport {
+    async fn fetch(
+        &self,
+        request: FetchRequest,
+        _deadline: Option<Deadline>,
+        cancellation: &Cancellation,
+    ) -> Result<FetchResponse, RuntimeError> {
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::cancelled("fetch request cancelled"));
+        }
+        self.requests
+            .lock()
+            .expect("requests poisoned")
+            .push(request.clone());
+
+        let map = self.responses.lock().expect("responses poisoned");
+        map.get(&request.url)
+            .cloned()
+            .ok_or_else(|| RuntimeError::tool(format!("mock url not found: {}", request.url)))
     }
 }

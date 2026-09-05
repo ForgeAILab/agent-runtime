@@ -1,0 +1,32 @@
+[package]
+name = "agent-runtime-cli"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Reference one-turn command-line host for agent-runtime"
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "agent-runtime"
+path = "src/main.rs"
+
+[dependencies]
+agent-runtime.workspace = true
+agent-runtime-mcp.workspace = true
+async-trait.workspace = true
+clap = { version = "4", features = ["derive"] }
+futures-util.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+url = "2"
+
+[lints]
+workspace = true
