@@ -28,5 +28,5 @@ pub use credentials::{
 };
 pub use recorder::RecordingObserver;
 pub use stores::{InMemoryCheckpointStore, InMemorySecretStore, InMemorySessionStore};
-pub use transport::ReplayTransport;
+pub use transport::{MockFetchTransport, ReplayTransport};
 pub use workspace::MemoryWorkspace;

@@ -29,6 +29,7 @@ pin-project-lite.workspace = true
 jsonschema.workspace = true
 uuid.workspace = true
 sha2.workspace = true
+url = "2.5"
 
 [features]
 # The core loop, registry hub, ability catalog, provider mechanism, and
@@ -38,6 +39,7 @@ sha2.workspace = true
 # feature pulls rusqlite).
 default = []
 obs = ["dep:agent-runtime-obs"]
+command-provider = ["agent-runtime-provider/command-provider"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }

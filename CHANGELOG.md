@@ -95,6 +95,17 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- Transport-neutral web fetch with canonical URL validation, loopback/private
+  literal rejection, HTML normalization, and Unicode-safe output bounds.
+- `agent-runtime-provider/command-provider`, an opt-in process-bounded
+  implementation of the canonical provider contract for trusted,
+  consumer-owned model CLI codecs. It provides exact capability validation,
+  shell-free direct argv, canonical executable/cwd resolution, a cleared and
+  explicit child environment, redacted config/attempt diagnostics, bounded
+  stdin/stdout/stderr, typed machine-output decoding, explicit compatibility
+  probing, and cancellation/deadline/drop-safe process-group cleanup. Runtime
+  retains canonical history, tools/MCP, approvals, retries, and events; named
+  Codex/Claude/other adapters and Smith configuration remain consumer work.
 - Native stateless OpenAI Responses provider, first fixture-verified against
   xAI Grok: bounded input-item encoding, session-keyed implicit prompt caching,
   encrypted reasoning replay, function-call streaming, structured output,
