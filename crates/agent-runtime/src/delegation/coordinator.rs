@@ -788,10 +788,10 @@ impl DelegationCoordinator {
                     .then_some((key, value.clone()))
                 })
                 .collect::<Vec<_>>();
-            if let Some(named) = request.named_outcome()
-                && !available.iter().any(|(key, _)| key == &named)
-            {
-                return Ok(ChildCompletionAdmission::Stale);
+            if let Some(named) = request.named_outcome() {
+                if !available.iter().any(|(key, _)| key == &named) {
+                    return Ok(ChildCompletionAdmission::Stale);
+                }
             }
             if available.is_empty() {
                 return Ok(ChildCompletionAdmission::Conflict {

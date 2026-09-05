@@ -574,9 +574,11 @@ impl TurnCheckpoint {
             | TurnState::CacheOperationResultReady { operation, .. }
             | TurnState::CacheOperationTerminal { operation, .. } => operation.validate()?,
         }
-        if let TurnState::CacheOperationStarted { operation } = &self.state
-            && operation.preflight_rejection.is_some()
-        {
+        if matches!(
+            &self.state,
+            TurnState::CacheOperationStarted { operation }
+                if operation.preflight_rejection.is_some()
+        ) {
             return Err(RuntimeError::conflict(
                 "cache checkpoint rejection crossed the provider-start boundary",
             ));

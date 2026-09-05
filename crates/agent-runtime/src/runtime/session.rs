@@ -1457,11 +1457,15 @@ impl SessionHandle {
             },
             None => None,
         };
-        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref()
-            && let TurnState::CacheOperationPrepared {
-                operation: checkpoint_operation,
-            } = &checkpoint.state
-            && let Some(reason) = checkpoint_operation.preflight_rejection
+        if let Some((checkpoint_operation, reason)) =
+            prepared_retry_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| match &checkpoint.state {
+                    TurnState::CacheOperationPrepared { operation } => operation
+                        .preflight_rejection
+                        .map(|reason| (operation, reason)),
+                    _ => None,
+                })
         {
             let result = self.cache_result_from_checkpoint(
                 checkpoint_operation,
@@ -1932,11 +1936,15 @@ impl SessionHandle {
             },
             None => None,
         };
-        if let Some(checkpoint) = prepared_retry_checkpoint.as_ref()
-            && let TurnState::CacheOperationPrepared {
-                operation: checkpoint_operation,
-            } = &checkpoint.state
-            && let Some(reason) = checkpoint_operation.preflight_rejection
+        if let Some((checkpoint_operation, reason)) =
+            prepared_retry_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| match &checkpoint.state {
+                    TurnState::CacheOperationPrepared { operation } => operation
+                        .preflight_rejection
+                        .map(|reason| (operation, reason)),
+                    _ => None,
+                })
         {
             let result = self.cache_result_from_checkpoint(
                 checkpoint_operation,

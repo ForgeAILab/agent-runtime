@@ -1149,9 +1149,9 @@ impl Driver {
                         write_tokens,
                     },
                 );
-                if let Some(identity) =
-                    cache.and_then(|projection| projection.cache_identity.clone())
-                    && cache_contract.evidence.stream
+                if let Some(identity) = cache
+                    .and_then(|projection| projection.cache_identity.clone())
+                    .filter(|_| cache_contract.evidence.stream)
                 {
                     let mut evidence = CacheAvailabilityEvidence::stream(
                         identity,
@@ -1168,15 +1168,16 @@ impl Driver {
                     if miss_observed {
                         evidence = evidence.with_kind(CacheEvidenceKind::Miss);
                     }
-                    if !miss_observed
-                        && let Some(cause) =
+                    if !miss_observed {
+                        if let Some(cause) =
                             correlated_refresh_cause(&cache_contract, read_tokens, write_tokens)
-                    {
-                        evidence = evidence.with_contract_refresh(
-                            &cache_contract,
-                            self.clock.now(),
-                            cause,
-                        );
+                        {
+                            evidence = evidence.with_contract_refresh(
+                                &cache_contract,
+                                self.clock.now(),
+                                cause,
+                            );
+                        }
                     }
                     // Do not promote an adapter-local malformed observation
                     // into canonical evidence or an event. Raw observation

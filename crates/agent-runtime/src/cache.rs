@@ -2488,8 +2488,9 @@ impl CacheMechanism {
         // Cache-scoped expiry is deferred until the complete admitted result
         // can be validated. A malformed envelope must not reduce or publish
         // provider evidence before it is normalized into a protocol failure.
-        if let Some(normalized) = evidence.clone()
-            && normalized.source == CacheEvidenceSource::CacheScopedError
+        if let Some(normalized) = evidence
+            .clone()
+            .filter(|normalized| normalized.source == CacheEvidenceSource::CacheScopedError)
         {
             let candidate = CacheOperationResult {
                 operation: operation.operation.clone(),
@@ -2547,9 +2548,10 @@ impl CacheMechanism {
             }
             if let (Some(expected), Some(observed)) =
                 (operation.expected_read_tokens(), read_tokens)
-                && observed < expected
             {
-                metrics.insert("cache_missed_tokens".into(), expected - observed);
+                if observed < expected {
+                    metrics.insert("cache_missed_tokens".into(), expected - observed);
+                }
             }
 
             // An explicit cache-scoped expiry is stronger than a preceding
@@ -2587,11 +2589,12 @@ impl CacheMechanism {
                 // canonical observation: miss evidence deliberately
                 // suspends this identity, and a refresh guarantee would be a
                 // contradictory claim about the unusable baseline.
-                if !miss_observed
-                    && let Some(cause) = select_refresh_cause(&contract, read_tokens, write_tokens)
-                {
-                    normalized =
-                        normalized.with_contract_refresh(&contract, self.clock.now(), cause);
+                if !miss_observed {
+                    if let Some(cause) = select_refresh_cause(&contract, read_tokens, write_tokens)
+                    {
+                        normalized =
+                            normalized.with_contract_refresh(&contract, self.clock.now(), cause);
+                    }
                 }
                 let candidate = CacheOperationResult {
                     operation: operation.operation.clone(),

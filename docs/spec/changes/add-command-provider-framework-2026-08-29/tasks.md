@@ -85,3 +85,8 @@ The release branch is based on Smith's existing e72390a runtime baseline.
 Runtime main removed semantic-summary APIs that Smith still consumes; adopting
 that unrelated LCM migration is deferred. This backport adds only command
 providers and hardened fetch, preserving manifest vocabulary version 1.
+
+The baseline also contained Rust 1.88 let-chain syntax despite declaring 1.86.
+The compatibility branch backports equivalent nested/filter/match forms in
+checkpoint validation, cache evidence, delegation, and session retry paths;
+this changes syntax only and preserves the existing control flow.
