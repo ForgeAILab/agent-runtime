@@ -329,3 +329,58 @@ async fn the_next_turn_is_offered_the_identity_the_backend_reported() {
 
     session.shutdown().await.expect("a clean shutdown");
 }
+
+#[tokio::test]
+async fn a_completed_external_turn_publishes_its_terminal_without_an_internal_failure() {
+    let backend = ScriptedBackend::new(vec![vec![
+        ExternalAgentEvent::Text {
+            text: "hello back".to_owned(),
+        },
+        ExternalAgentEvent::Completed,
+    ]]);
+
+    let runtime = runtime_with(backend).await;
+    let session = runtime
+        .start_session(StartSession::new())
+        .await
+        .expect("a session");
+    let mut events = session.subscribe();
+
+    session
+        .run(UserInput::text("hello"))
+        .await
+        .expect("the external turn completes");
+    session.shutdown().await.expect("a clean shutdown");
+
+    // Collected past the terminal event on purpose: a turn that publishes
+    // `TurnCompleted` and then reports a failure has still failed, and
+    // stopping at the terminal is exactly what hid that.
+    let mut seen = Vec::new();
+    while let Some(envelope) = events.next().await {
+        let last = matches!(envelope.payload, RuntimeEvent::SessionShutdown);
+        seen.push(envelope.payload);
+        if last {
+            break;
+        }
+    }
+
+    assert!(seen.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::Completed,
+            ..
+        }
+    )));
+
+    // An externally executed turn is still a turn: it accepts a checkpoint
+    // like any other, so its terminal transition has state to advance rather
+    // than failing closed on a turn that has none.
+    let errors: Vec<String> = seen
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Error { error } => Some(error.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(errors.is_empty(), "the turn reported {errors:?}");
+}

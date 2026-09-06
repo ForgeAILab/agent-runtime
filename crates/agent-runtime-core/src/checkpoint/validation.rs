@@ -354,12 +354,18 @@ impl TurnCheckpoint {
                 "checkpoint transition regressed committed visible output",
             ));
         }
+        // Visible output becomes durable at the checkpoint that carries what
+        // produced it: the model response for a turn this runtime planned, or
+        // the completing checkpoint for a turn an external agent executed —
+        // that turn has no model response to make durable, and the snapshot
+        // completion carries already holds the answer it committed.
         if !self.visible_output
             && visible_output
             && !matches!(
                 &next,
                 TurnState::ModelResponseReady { response, .. } if !response.text.is_empty()
             )
+            && !matches!(&next, TurnState::Completing { .. })
         {
             return Err(RuntimeError::conflict(
                 "checkpoint visible output advanced without a durable model response",
