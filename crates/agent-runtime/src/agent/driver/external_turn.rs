@@ -13,6 +13,8 @@
 //! dispatched, so emitting those would make attempt, cache, and tool
 //! accounting lie.
 
+use agent_runtime_core::cancel::CancelReason;
+use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::{ContentPart, Message, UserInput};
 use agent_runtime_core::error::{ErrorKind, RuntimeError};
 use agent_runtime_core::event::{RuntimeEvent, TurnFinish};
@@ -24,7 +26,7 @@ use crate::agent::external::{
     ExternalTurnRequest, SharedExternalAgentBackend,
 };
 
-use super::{TurnMachine, TurnMachineContext};
+use super::{TurnMachine, TurnMachineContext, discard_reason_for_finish, strip_stale_reasoning};
 
 /// Stable purpose label for usage a backend reported.
 const EXTERNAL_AGENT_USAGE_PURPOSE: &str = "agent.external";
@@ -67,36 +69,61 @@ impl<'a> ExternalTurnMachine<'a> {
 
     /// Runs the turn to completion.
     pub(super) async fn run(mut self, input: UserInput) {
+        let driver = self.machine.driver;
+        let state = self.machine.state.clone();
+        let execution = self.machine.execution.clone();
         let emitter = self.machine.emitter.clone();
+        let inbox = self.machine.inbox.clone();
+        let turn_cancel = self.machine.cancel.clone();
         let turn_id = self.machine.turn_id.clone();
         let turn = Some(turn_id.clone());
         emitter.emit(turn.clone(), RuntimeEvent::TurnStarted);
 
         // A queued turn may have been interrupted before reaching the serving
         // boundary. It still receives an attributed terminal event, but its
-        // input must never contaminate canonical history.
-        if self.machine.cancel.is_cancelled() {
+        // input must never contaminate canonical history. There is no
+        // acceptance checkpoint yet, so nothing may be transitioned: the
+        // terminal is published the way the direct path publishes a turn
+        // cancelled before acceptance.
+        if turn_cancel.is_cancelled() {
+            let finish = TurnFinish::Cancelled {
+                reason: turn_cancel.reason().unwrap_or(CancelReason::UserRequested),
+            };
             self.machine
-                .publish_terminal(
-                    TurnFinish::Cancelled {
-                        reason: self
-                            .machine
-                            .cancel
-                            .reason()
-                            .unwrap_or(agent_runtime_core::cancel::CancelReason::UserRequested),
-                    },
-                    false,
-                )
-                .await;
+                .close_and_discard_steers(discard_reason_for_finish(&finish));
+            driver.finish_cancelled(&emitter, &turn, &turn_cancel, false);
             return;
         }
 
-        self.machine
-            .state
-            .lock()
-            .expect("session state poisoned")
-            .history
-            .push(input.clone().into_message());
+        let turn_deadline = match driver.config.turn_time_limit_ms {
+            Some(ms) => Deadline::after(driver.clock.as_ref(), ms),
+            None => Deadline::never(),
+        };
+        let accepted_input = input.clone();
+        let active_history_start = {
+            let mut guard = state.lock().expect("session state poisoned");
+            strip_stale_reasoning(&mut guard.history);
+            let history_start = guard.history.len();
+            guard.history.push(input.clone().into_message());
+            history_start
+        };
+        execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
+        driver.drain_injected(&state, &inbox);
+
+        // An externally executed turn is still a turn: without its acceptance
+        // checkpoint there is no state to transition, so every terminal --
+        // including a completed one -- would fail to publish and the turn
+        // would leave nothing durable behind.
+        if let Err(error) = self
+            .machine
+            .checkpoint_accepted(accepted_input, active_history_start, turn_deadline)
+            .await
+        {
+            // No backend work has begun. A protected store failure is
+            // observable and fails closed before external I/O.
+            self.machine.emit_non_durable_failure(error, false);
+            return;
+        }
 
         let request = ExternalTurnRequest {
             input,
@@ -268,7 +295,11 @@ impl<'a> ExternalTurnMachine<'a> {
             self.store_session(session);
         }
 
-        self.machine.publish_terminal(finish, visible_output).await;
+        // The shared completion path, not a bespoke terminal: it closes the
+        // steer mailbox, runs the turn-commit hooks, and walks the checkpoint
+        // through `Completing` and `PublishingTerminal` so recovery sees the
+        // same terminal shape a direct turn leaves behind.
+        self.machine.complete(finish, visible_output).await;
     }
 
     /// Records the identity to offer the backend on the next turn.

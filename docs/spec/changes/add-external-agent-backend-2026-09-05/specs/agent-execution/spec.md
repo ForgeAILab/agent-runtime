@@ -35,6 +35,16 @@ between the turn starting and its terminal event.
 - **THEN** the turn completes with that failure recorded
 - **AND** canonical history retains no partial assistant message
 
+#### Scenario: External turn is durable like a direct one
+
+- **GIVEN** a session configured with an external agent backend
+- **WHEN** a turn is admitted
+- **THEN** the runtime accepts a turn checkpoint before it invokes the backend
+- **AND** the turn's terminal advances that checkpoint through completion and
+  publication rather than failing as a turn with no accepted state
+- **AND** a turn whose backend produced text reports visible output without
+  claiming a model response it never made
+
 #### Scenario: Turn is cancelled
 
 - **GIVEN** a running external turn
