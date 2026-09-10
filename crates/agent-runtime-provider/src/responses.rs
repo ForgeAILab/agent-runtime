@@ -56,6 +56,7 @@ const MAX_CONTENT_PARTS: usize = 8_192;
 const MAX_TEXT_CHARS: usize = 2 * 1024 * 1024;
 const MAX_SIGNATURE_CHARS: usize = 128 * 1024;
 const MAX_TOOL_NAME_CHARS: usize = 256;
+const MAX_REASONING_EFFORT_CHARS: usize = 64;
 const MAX_TOOL_CALLS: usize = 512;
 const MAX_ARGUMENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STREAM_EVENTS: usize = 200_000;
@@ -589,15 +590,10 @@ fn validate_request(
                 "Responses reasoning token budgets are not supported",
             ));
         }
-        if reasoning
-            .effort
-            .as_deref()
-            .is_some_and(|effort| !matches!(effort, "low" | "medium" | "high"))
-        {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Unsupported,
-                "Responses reasoning effort must be low, medium, or high",
-            ));
+        if let Some(effort) = reasoning.effort.as_deref() {
+            if effort.trim().is_empty() || effort.chars().count() > MAX_REASONING_EFFORT_CHARS {
+                return Err(bad_request("Responses reasoning effort is invalid"));
+            }
         }
     }
     let named_tool_missing = match &request.tool_choice {
@@ -2269,7 +2265,7 @@ mod tests {
             });
         request.tool_choice = ToolChoice::Required;
         request.reasoning = Some(agent_runtime_core::provider::ReasoningConfig {
-            effort: Some("high".into()),
+            effort: Some("ultra".into()),
             max_tokens: None,
         });
         request.max_output_tokens = Some(128);
@@ -2284,7 +2280,7 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["prompt_cache_key"], "session-test");
-        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["effort"], "ultra");
         assert_eq!(body["max_output_tokens"], 128);
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["tools"][0]["type"], "function");
@@ -2858,6 +2854,29 @@ mod tests {
         };
         assert_eq!(error.kind, ProviderErrorKind::Unsupported);
         assert!(provider.transport().requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_reasoning_effort_is_rejected_before_transport_io() {
+        for effort in [" ".to_owned(), "x".repeat(MAX_REASONING_EFFORT_CHARS + 1)] {
+            let transport = ReplayTransport::new("");
+            let mut config = ResponsesConfig::new("https://api.x.ai/v1", "grok-4.5");
+            config.api_key = Some(Secret::new("secret"));
+            let provider = ResponsesProvider::new(transport, config).unwrap();
+            let mut request =
+                ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("hi")]);
+            request.reasoning = Some(agent_runtime_core::provider::ReasoningConfig {
+                effort: Some(effort),
+                max_tokens: None,
+            });
+
+            let error = match provider.stream(request, ctx()).await {
+                Ok(_) => panic!("invalid reasoning effort unexpectedly started"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+            assert!(provider.transport().requests().is_empty());
+        }
     }
 
     #[tokio::test]

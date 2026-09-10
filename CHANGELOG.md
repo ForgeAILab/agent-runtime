@@ -125,6 +125,9 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- Responses adapters now forward bounded model-advertised reasoning efforts,
+  including Codex `xhigh`, `max`, and `ultra`, instead of imposing the legacy
+  `low`/`medium`/`high` allowlist.
 - `agent-runtime-provider/command-provider`, an opt-in process-bounded
   implementation of the canonical provider contract for trusted,
   consumer-owned model CLI codecs. It provides exact capability validation,
