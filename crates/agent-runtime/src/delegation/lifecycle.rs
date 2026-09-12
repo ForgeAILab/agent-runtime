@@ -981,6 +981,7 @@ impl DelegationCoordinator {
             last_artifacts: Vec::new(),
             updated_at: now,
             incompatibility: None,
+            last_error: None,
         });
 
         // Subscribe before sending the task so no lifecycle event is missed.

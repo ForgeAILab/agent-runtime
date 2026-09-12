@@ -188,6 +188,7 @@ pub async fn assert_resume_bind_save_failure_rolls_back_dormant_state() {
         last_artifacts: Vec::new(),
         updated_at: Timestamp::ZERO,
         incompatibility: None,
+        last_error: None,
     };
     let record = ChildSessionRecord {
         schema_version: 1,
@@ -826,6 +827,7 @@ pub async fn assert_interrupted_child_requires_explicit_idempotent_resume() {
         last_artifacts: Vec::new(),
         updated_at: Timestamp::ZERO,
         incompatibility: None,
+        last_error: None,
     };
     let record = ChildSessionRecord {
         schema_version: 1,
@@ -995,6 +997,7 @@ pub async fn assert_calling_model_checkpoint_refuses_resume_without_provider() {
         last_artifacts: Vec::new(),
         updated_at: Timestamp::ZERO,
         incompatibility: None,
+        last_error: None,
     };
     let record = ChildSessionRecord {
         schema_version: 1,

@@ -591,6 +591,14 @@ pub struct ChildStatus {
     /// Bounded compatibility reason when recovery cannot proceed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incompatibility: Option<String>,
+    /// Why the child's last task failed, when one did.
+    ///
+    /// A parent reads a child's outcome through this snapshot, so a failure
+    /// that names its cause only on the event stream is a failure the parent
+    /// cannot act on or report. Cleared when a later task starts, so it always
+    /// describes the state the child is in rather than one it recovered from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<RuntimeError>,
 }
 
 impl ChildStatus {
