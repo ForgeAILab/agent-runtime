@@ -112,7 +112,24 @@ use crate::usage::UsageRecord;
 /// Bumped to 15 for the redaction-safe, metadata-only LCM lifecycle
 /// projection. Envelopes written with v14 remain readable because every v14
 /// payload variant and field retains its serde shape.
-pub const SCHEMA_VERSION: u32 = 15;
+///
+/// Bumped to 16 for externally executed turns: an installed agent reports the
+/// session it is continuing and the tools it ran itself
+/// ([`RuntimeEvent::ExternalSessionStarted`] through
+/// [`RuntimeEvent::ExternalToolCompleted`]). These are deliberately distinct
+/// from [`RuntimeEvent::ToolCallRequested`]: the runtime never dispatched
+/// them, never consulted approvals for them, and cannot vouch for them, so a
+/// host must be able to tell the two apart and say so. Assistant output from
+/// such a turn arrives as [`RuntimeEvent::ExternalText`] rather than
+/// [`RuntimeEvent::TextDelta`], which is attempt-scoped and speculative.
+///
+/// This work was developed in parallel with the LCM projection above and each
+/// line claimed 15 independently. Landing them together makes that number
+/// ambiguous for envelopes already written by either one, so the combined
+/// vocabulary takes 16 and 15 is left meaning whichever of the two a reader
+/// already had. Both are additive, so a v15 envelope of either lineage still
+/// deserializes.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1078,6 +1095,51 @@ pub enum RuntimeEvent {
         attempt: AttemptId,
     },
     /// A validated tool call was requested by the model.
+    /// Assistant prose from an externally executed turn.
+    ///
+    /// Distinct from [`RuntimeEvent::TextDelta`], which is attempt-scoped and
+    /// speculative: it carries the request and attempt whose output may still
+    /// be discarded. An external turn makes no provider attempt, so there is
+    /// no identity to carry and nothing to discard.
+    ExternalText {
+        /// The text fragment.
+        text: String,
+    },
+    /// Reasoning from an externally executed turn.
+    ExternalReasoning {
+        /// The reasoning fragment.
+        text: String,
+    },
+    /// An externally executed turn is running under this backend session.
+    ///
+    /// Hosts use it to show which installed agent is working, and to label the
+    /// turn as executed elsewhere.
+    ExternalSessionStarted {
+        /// The backend's own conversation identity, opaque to the runtime.
+        session: String,
+    },
+    /// An external agent reported running a tool itself.
+    ///
+    /// Observation only. The runtime did not dispatch this call, did not
+    /// consult approvals for it, and does not admit its result to canonical
+    /// tool history.
+    ExternalToolInvoked {
+        /// Backend-assigned call identity, correlating with its completion.
+        id: String,
+        /// Backend-reported tool name.
+        name: String,
+        /// Backend-reported invocation detail.
+        detail: serde_json::Value,
+    },
+    /// The outcome of a tool an external agent ran itself.
+    ExternalToolCompleted {
+        /// The identity reported by the matching invocation.
+        id: String,
+        /// Whether the backend considered the tool successful.
+        ok: bool,
+        /// Backend-reported outcome detail.
+        detail: serde_json::Value,
+    },
     ToolCallRequested {
         /// The tool-call id.
         call: ToolCallId,

@@ -358,7 +358,11 @@ impl<'a> TurnMachine<'a> {
             || matches!(
                 &state,
                 TurnState::ModelResponseReady { response, .. } if !response.text.is_empty()
-            );
+            )
+            // A turn executed by an external agent reaches its terminal
+            // without a model response of its own; completion is where the
+            // answer it committed becomes durable progress.
+            || matches!(&state, TurnState::Completing { visible_output: true, .. });
         let next = current.transition_with_progress(
             state,
             snapshot,

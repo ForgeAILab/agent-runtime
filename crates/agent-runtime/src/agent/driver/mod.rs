@@ -436,9 +436,29 @@ pub struct Driver {
     return_child_interactions_to_parent: bool,
     harness: Arc<HarnessPipeline>,
     live_abilities: Option<Arc<LiveAbilityRuntime>>,
+    /// When present, every turn is executed by this backend instead of the
+    /// provider/tool loop above. The two never interleave within one turn,
+    /// which is what keeps canonical history single-owner.
+    #[cfg(feature = "external-agent")]
+    external: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
 }
 
 impl Driver {
+    /// Routes every turn to an external agent backend instead of the
+    /// provider/tool loop.
+    ///
+    /// `None` leaves the driver exactly as built, which is what keeps a
+    /// runtime without a backend byte-identical in behavior to one built
+    /// before this capability existed.
+    #[cfg(feature = "external-agent")]
+    pub(crate) fn with_external_agent(
+        mut self,
+        backend: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
+    ) -> Self {
+        self.external = backend;
+        self
+    }
+
     pub(crate) fn steer_limits(&self) -> SteerLimits {
         self.config.steer_limits
     }
@@ -476,6 +496,8 @@ impl Driver {
             return_child_interactions_to_parent,
             harness,
             live_abilities,
+            #[cfg(feature = "external-agent")]
+            external: None,
         }
     }
 
@@ -680,22 +702,27 @@ impl Driver {
         turn_id: TurnId,
         input: UserInput,
     ) {
-        TurnMachine::new(
-            self,
-            TurnMachineContext {
-                state,
-                execution,
-                emitter,
-                minter,
-                cancel: turn_cancel,
-                inbox,
-                steer_mailbox: None,
-                turn_id,
-                acceptance: None,
-            },
-        )
-        .run(input)
-        .await;
+        let context = TurnMachineContext {
+            state,
+            execution,
+            emitter,
+            minter,
+            cancel: turn_cancel,
+            inbox,
+            steer_mailbox: None,
+            turn_id,
+            acceptance: None,
+        };
+
+        #[cfg(feature = "external-agent")]
+        if let Some(backend) = self.external.clone() {
+            external_turn::ExternalTurnMachine::new(self, context, backend)
+                .run(input)
+                .await;
+            return;
+        }
+
+        TurnMachine::new(self, context).run(input).await;
     }
 
     /// Runs a session-facade turn with its registered steering mailbox.
@@ -712,22 +739,27 @@ impl Driver {
         turn_id: TurnId,
         input: UserInput,
     ) {
-        TurnMachine::new(
-            self,
-            TurnMachineContext {
-                state,
-                execution,
-                emitter,
-                minter,
-                cancel: turn_cancel,
-                inbox,
-                steer_mailbox: Some(steer_mailbox),
-                turn_id,
-                acceptance: None,
-            },
-        )
-        .run(input)
-        .await;
+        let context = TurnMachineContext {
+            state,
+            execution,
+            emitter,
+            minter,
+            cancel: turn_cancel,
+            inbox,
+            steer_mailbox: Some(steer_mailbox),
+            turn_id,
+            acceptance: None,
+        };
+
+        #[cfg(feature = "external-agent")]
+        if let Some(backend) = self.external.clone() {
+            external_turn::ExternalTurnMachine::new(self, context, backend)
+                .run(input)
+                .await;
+            return;
+        }
+
+        TurnMachine::new(self, context).run(input).await;
     }
 
     /// Runs one attributed internal turn without appending a user message to
@@ -905,6 +937,8 @@ struct TurnMachineContext {
     acceptance: Option<Arc<TurnAcceptance>>,
 }
 
+#[cfg(feature = "external-agent")]
+mod external_turn;
 mod provider;
 mod recovery;
 mod tools;

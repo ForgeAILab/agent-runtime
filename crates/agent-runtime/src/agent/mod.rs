@@ -5,10 +5,14 @@
 //! - [`planning`] — the run-scoped context planner ([`planning::RunPlanner`]),
 //!   which is the only path from a turn's inputs to a provider request.
 //! - [`driver`] — the one canonical provider/tool loop ([`driver::Driver`]).
+//! - [`external`] — the opt-in boundary for a turn executed by an installed
+//!   agent rather than by the loop above (feature `external-agent`).
 
 pub mod assembler;
 pub mod config;
 pub mod driver;
+#[cfg(feature = "external-agent")]
+pub mod external;
 pub mod planning;
 
 pub use config::{DowngradePolicy, LoopConfig};
