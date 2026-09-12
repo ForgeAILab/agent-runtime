@@ -213,10 +213,12 @@ pub fn assert_v15_lcm_golden_fixture() {
     let envelopes: Vec<EventEnvelope> =
         serde_json::from_value(expected.clone()).expect("v15 LCM fixture remains readable");
     assert_eq!(envelopes.len(), 9, "v15 fixture must cover every LCM kind");
+    // Pinned to the literal, as the v14 fixture above is: this asserts that a
+    // v15 envelope stays readable, not that 15 is still the current version.
     assert!(
         envelopes
             .iter()
-            .all(|envelope| envelope.schema_version == SCHEMA_VERSION)
+            .all(|envelope| envelope.schema_version == 15)
     );
     assert!(
         envelopes
