@@ -125,6 +125,9 @@ impl DelegationCoordinator {
                     // vocabulary the child already speaks in full.
                     RuntimeEvent::TurnStarted => {
                         last_error = None;
+                        update_status(&coordinator, &child, |status| {
+                            status.last_error = None;
+                        });
                     }
                     RuntimeEvent::Error { error } => {
                         last_error = Some(error);
@@ -187,8 +190,14 @@ impl DelegationCoordinator {
                             }
                             TurnFinish::Failed => {
                                 terminal = true;
+                                let error = child_failure(last_error.take());
                                 update_status(&coordinator, &child, |status| {
                                     status.state = ChildState::Failed;
+                                    // The same cause the event carries. A
+                                    // parent that polls status instead of
+                                    // watching the stream must not get a
+                                    // failure with no reason attached.
+                                    status.last_error = Some(error.clone());
                                     status.updated_at =
                                         coordinator.parent.inner().shared.clock.now();
                                 });
@@ -196,7 +205,7 @@ impl DelegationCoordinator {
                                     None,
                                     RuntimeEvent::ChildFailed {
                                         child: child.clone(),
-                                        error: child_failure(last_error.take()),
+                                        error,
                                     },
                                 );
                                 break;
@@ -583,6 +592,56 @@ fn child_failure(cause: Option<RuntimeError>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_failed_status_carries_the_same_cause_as_the_event() {
+        // The status snapshot and the event are the two ways a parent learns
+        // an outcome; a cause on only one of them is a cause half the callers
+        // cannot see.
+        let cause = RuntimeError::new(ErrorKind::Config, "Gemini provider rejected the request");
+        let reported = child_failure(Some(cause));
+        let mut status = child_status_fixture();
+        status.state = ChildState::Failed;
+        status.last_error = Some(reported.clone());
+
+        assert_eq!(
+            status.last_error.as_ref().map(|error| &error.message),
+            Some(&reported.message)
+        );
+        assert_eq!(
+            status.last_error.as_ref().map(|error| error.kind),
+            Some(ErrorKind::Config)
+        );
+    }
+
+    #[test]
+    fn a_status_error_is_dropped_from_the_wire_when_absent() {
+        let status = child_status_fixture();
+        let value = serde_json::to_value(&status).expect("a serializable status");
+        assert!(
+            value.get("last_error").is_none(),
+            "an absent cause must not appear as a null a reader has to interpret"
+        );
+    }
+
+    fn child_status_fixture() -> ChildStatus {
+        ChildStatus {
+            child: ChildId::new("child-1"),
+            parent: SessionId::new("session-parent"),
+            session: SessionId::new("session-child"),
+            durability: ChildDurability::Ephemeral,
+            state: ChildState::Running,
+            workspace: WorkspacePolicy::ReadOnlyView,
+            turns_used: 1,
+            max_turns: 1,
+            tokens_used: 0,
+            last_result: None,
+            last_artifacts: Vec::new(),
+            updated_at: Timestamp::ZERO,
+            incompatibility: None,
+            last_error: None,
+        }
+    }
     use super::*;
 
     #[test]
