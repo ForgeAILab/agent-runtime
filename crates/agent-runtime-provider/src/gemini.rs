@@ -805,6 +805,9 @@ async fn classify_auth_rejection(
     }
 }
 
+/// The metadata key a transport uses for the provider's own reason.
+const PROVIDER_DETAIL_KEY: &str = "provider.detail";
+
 fn sanitize_transport_error(error: ProviderError) -> ProviderError {
     let message = match error.kind {
         ProviderErrorKind::Network => "Gemini provider network failure",
@@ -819,9 +822,20 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::CacheExpired => "Gemini provider cache identity expired",
         ProviderErrorKind::LimitExhausted => "Gemini provider usage limit exhausted",
     };
+    // The transport classified the rejection and, where the provider named a
+    // reason in the error object it documents, carried it in metadata. Keeping
+    // that metadata is the whole difference between "rejected the request" and
+    // a rejection a reader can act on; the fixed message above still bounds
+    // what the adapter itself asserts.
     let mut sanitized = ProviderError::new(error.kind, message);
     sanitized.retryable = error.retryable;
     sanitized.retry_after_ms = error.retry_after_ms;
+    sanitized.limit_resets_at_ms = error.limit_resets_at_ms;
+    sanitized.credential_recovery = error.credential_recovery;
+    sanitized.metadata = error.metadata;
+    if let Some(detail) = sanitized.metadata.get(PROVIDER_DETAIL_KEY) {
+        sanitized.message = format!("{message}: {detail}");
+    }
     sanitized
 }
 
@@ -1622,6 +1636,33 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_sanitized_rejection_names_the_reason_the_provider_gave() {
+        let mut error = ProviderError::new(ProviderErrorKind::BadRequest, "raw transport text");
+        error
+            .metadata
+            .insert("provider.detail", "INVALID_ARGUMENT: Input blocked");
+        error.metadata.insert("http.status", 400u64);
+
+        let sanitized = sanitize_transport_error(error);
+
+        assert_eq!(sanitized.kind, ProviderErrorKind::BadRequest);
+        assert_eq!(
+            sanitized.message,
+            "Gemini provider rejected the request: INVALID_ARGUMENT: Input blocked"
+        );
+        // The transport's own text never survives; only the named reason does.
+        assert!(!sanitized.message.contains("raw transport text"));
+        assert!(sanitized.metadata.get("http.status").is_some());
+    }
+
+    #[test]
+    fn a_sanitized_rejection_without_a_reason_keeps_the_fixed_message() {
+        let error = ProviderError::new(ProviderErrorKind::BadRequest, "raw transport text");
+        let sanitized = sanitize_transport_error(error);
+        assert_eq!(sanitized.message, "Gemini provider rejected the request");
+    }
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
