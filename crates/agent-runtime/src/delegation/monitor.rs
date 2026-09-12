@@ -107,6 +107,12 @@ impl DelegationCoordinator {
                 .map(|entry| entry.status.borrow().tokens_used)
                 .unwrap_or(0);
             let mut terminal = false;
+            // Every `TurnFinish::Failed` path in the driver emits the cause
+            // as `RuntimeEvent::Error` immediately before it completes the
+            // turn. Hold the most recent one so a failed child reports what
+            // actually went wrong instead of a fixed internal string; the
+            // parent has no other channel to learn it.
+            let mut last_error: Option<RuntimeError> = None;
             while let Some(envelope) = events.next().await {
                 match envelope.payload {
                     // A child's tool activity is deliberately not mirrored
@@ -117,7 +123,12 @@ impl DelegationCoordinator {
                     // [`DelegationCoordinator::child_events`]. Re-narrating
                     // it here would mean re-deriving, event by event, a
                     // vocabulary the child already speaks in full.
-                    RuntimeEvent::TurnStarted => {}
+                    RuntimeEvent::TurnStarted => {
+                        last_error = None;
+                    }
+                    RuntimeEvent::Error { error } => {
+                        last_error = Some(error);
+                    }
                     RuntimeEvent::Usage { record } => {
                         tokens_used = tokens_used
                             .saturating_add(record.delta.get(CounterKind::InputUncached))
@@ -185,10 +196,7 @@ impl DelegationCoordinator {
                                     None,
                                     RuntimeEvent::ChildFailed {
                                         child: child.clone(),
-                                        error: RuntimeError::new(
-                                            ErrorKind::Internal,
-                                            "child turn failed",
-                                        ),
+                                        error: child_failure(last_error.take()),
                                     },
                                 );
                                 break;
@@ -546,4 +554,68 @@ pub(super) fn depth_violation() -> RuntimeError {
 
 pub(super) fn unknown_child(child: &ChildId) -> RuntimeError {
     RuntimeError::new(ErrorKind::NotFound, format!("unknown child `{child}`"))
+}
+
+/// Names a failed child turn's cause on the parent stream.
+///
+/// The driver emits the cause as `RuntimeEvent::Error` immediately before it
+/// completes a turn as [`TurnFinish::Failed`], and the parent sees only what
+/// [`RuntimeEvent::ChildFailed`] carries. Reporting a fixed internal string
+/// there discards the one description of the failure that ever existed: the
+/// child's own journal is not retained and its events are not mirrored.
+fn child_failure(cause: Option<RuntimeError>) -> RuntimeError {
+    // Not every failing path names a cause first. Keep the original wording
+    // rather than inventing one.
+    let Some(cause) = cause else {
+        return RuntimeError::new(ErrorKind::Internal, "child turn failed");
+    };
+    // The kind and retryability belong to the failure, not to delegation. A
+    // parent that retries on `retryable` must see the child's answer, not
+    // delegation's opinion of it.
+    let reported = RuntimeError::new(cause.kind, format!("child turn failed: {}", cause.message))
+        .with_metadata(cause.metadata);
+    if cause.retryable {
+        reported.retryable()
+    } else {
+        reported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_failure_reports_the_cause_the_child_named() {
+        let cause = RuntimeError::new(ErrorKind::Config, "Gemini provider rejected the request");
+        let reported = child_failure(Some(cause));
+        assert_eq!(reported.kind, ErrorKind::Config);
+        assert_eq!(
+            reported.message,
+            "child turn failed: Gemini provider rejected the request"
+        );
+        assert!(!reported.retryable);
+    }
+
+    #[test]
+    fn child_failure_preserves_retryability_and_metadata() {
+        let cause = RuntimeError::new(ErrorKind::Provider, "rate limit exceeded")
+            .retryable()
+            .with_metadata(
+                agent_runtime_core::metadata::Metadata::new().with("retry_after_ms", "1000"),
+            );
+        let reported = child_failure(Some(cause));
+        assert!(reported.retryable);
+        assert_eq!(
+            reported.metadata,
+            agent_runtime_core::metadata::Metadata::new().with("retry_after_ms", "1000")
+        );
+    }
+
+    #[test]
+    fn child_failure_without_a_cause_keeps_the_original_wording() {
+        let reported = child_failure(None);
+        assert_eq!(reported.kind, ErrorKind::Internal);
+        assert_eq!(reported.message, "child turn failed");
+    }
 }
