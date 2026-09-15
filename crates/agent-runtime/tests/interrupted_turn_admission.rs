@@ -597,3 +597,63 @@ async fn compatible_upgrade_policy_still_resumes_the_exact_saved_turn() {
     assert_eq!(provider.requests().len(), 1);
     resumed.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn upgrade_recovery_preserves_a_previously_decided_finish() {
+    for publishing in [false, true] {
+        let (id, sessions, checkpoints, original) = saved_upgrade_turn().await;
+        let mut checkpoint = original
+            .transition(
+                TurnState::Completing {
+                    finish: TurnFinish::Failed,
+                    visible_output: false,
+                    provider_error_kind: Some(
+                        agent_runtime::core::provider::ProviderErrorKind::Network,
+                    ),
+                },
+                original.snapshot.clone(),
+                original.watermark.event_sequence + 1,
+                Timestamp(1),
+            )
+            .unwrap();
+        if publishing {
+            checkpoint = checkpoint
+                .transition(
+                    TurnState::PublishingTerminal {
+                        finish: TurnFinish::Failed,
+                        visible_output: false,
+                    },
+                    checkpoint.snapshot.clone(),
+                    checkpoint.watermark.event_sequence + 1,
+                    Timestamp(2),
+                )
+                .unwrap();
+        }
+        checkpoints.seed(checkpoint.clone());
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![],
+        ));
+        let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
+        let resumed = runtime
+            .start_session(
+                StartSession::new()
+                    .with_id(id)
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.interrupted_on_resume(), Some(&checkpoint.turn));
+        assert_eq!(resumed.history(), checkpoint.snapshot.history);
+        assert!(provider.requests().is_empty());
+        assert!(matches!(
+            checkpoints.latest().unwrap().state,
+            TurnState::Terminal {
+                finish: TurnFinish::Failed,
+                ..
+            }
+        ));
+        resumed.shutdown().await.unwrap();
+    }
+}

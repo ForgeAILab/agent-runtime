@@ -52,7 +52,13 @@ impl<'a> TurnMachine<'a> {
             // The fallback is local recovery, not another turn. In particular
             // do not invoke a summary/model/tool hook merely by opening it.
             self.close_and_discard_steers(discard_reason_for_finish(&finish));
-            if !matches!(checkpoint.state, TurnState::PublishingTerminal { .. }) {
+            // A Completing record already owns its finish and provider-error
+            // classification. Rewriting that payload is not an idempotent
+            // transition; advance it directly to publication instead.
+            if !matches!(
+                checkpoint.state,
+                TurnState::Completing { .. } | TurnState::PublishingTerminal { .. }
+            ) {
                 if let Err(error) = self
                     .transition(TurnState::Completing {
                         finish: finish.clone(),
@@ -64,6 +70,8 @@ impl<'a> TurnMachine<'a> {
                     self.emit_non_durable_failure(error, checkpoint.visible_output);
                     return;
                 }
+            }
+            if !matches!(checkpoint.state, TurnState::PublishingTerminal { .. }) {
                 if let Err(error) = self
                     .transition(TurnState::PublishingTerminal {
                         finish: finish.clone(),
