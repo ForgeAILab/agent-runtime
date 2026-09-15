@@ -38,15 +38,30 @@ pub struct ActivationBudget {
     pub max_schema_tokens: u32,
     /// The maximum number of capabilities pre-activation may bind.
     pub max_candidates: usize,
+    /// The share of `max_schema_tokens` skill instructions may take.
+    ///
+    /// Defaults to the whole budget. A host that ships large reference
+    /// skills sets this lower so speculative instruction prose cannot crowd
+    /// out the tool schemas a task needs; see
+    /// [`crate::capability::SelectionBudgets::max_instruction_tokens`].
+    pub max_instruction_tokens: u32,
 }
 
 impl ActivationBudget {
-    /// An explicit token and cardinality budget.
+    /// An explicit token and cardinality budget, with skills free to take the
+    /// whole of it.
     pub fn new(max_schema_tokens: u32, max_candidates: usize) -> Self {
         Self {
             max_schema_tokens,
             max_candidates,
+            max_instruction_tokens: max_schema_tokens,
         }
+    }
+
+    /// Caps what skill instructions may take, clamped to the token budget.
+    pub fn with_instruction_budget(mut self, tokens: u32) -> Self {
+        self.max_instruction_tokens = tokens.min(self.max_schema_tokens);
+        self
     }
 }
 
@@ -118,7 +133,8 @@ pub fn pre_activate(
         u32::MAX,
         agent_runtime_ability::descriptor::RiskLevel::High,
         budget.max_candidates,
-    );
+    )
+    .with_instruction_budget(budget.max_instruction_tokens);
     let plan = select(view, &retrieval.candidates, &budgets, costs, &[]);
 
     let relevant_existed = !retrieval.candidates.is_empty();

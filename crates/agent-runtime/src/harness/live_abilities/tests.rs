@@ -5,6 +5,13 @@ use agent_runtime_core::store::SessionStateSensitivity;
 use crate::harness::{HarnessPipelineBuilder, QuestionnaireTool};
 
 fn live_runtime_with_context(context: ActivationContext) -> LiveAbilityRuntime {
+    live_runtime_with_budget(context, ActivationBudget::new(16_384, 8))
+}
+
+fn live_runtime_with_budget(
+    context: ActivationContext,
+    budget: ActivationBudget,
+) -> LiveAbilityRuntime {
     let sealed = LiveAbilityRuntime::seal(
         vec![Arc::new(QuestionnaireTool::new())],
         Vec::new(),
@@ -13,7 +20,7 @@ fn live_runtime_with_context(context: ActivationContext) -> LiveAbilityRuntime {
         Arc::new(FailClosedPolicy),
         context,
         ScopeInputs::new(),
-        ActivationBudget::new(16_384, 8),
+        budget,
     )
     .expect("test ability registry seals");
     Arc::into_inner(sealed.runtime).expect("the test owns the only runtime reference")
@@ -367,4 +374,80 @@ async fn capability_search_returns_no_cards_or_stage_when_policy_denies_activati
     assert!(state.staged.is_empty());
     assert!(state.pending.is_empty());
     assert!(!state.epochs.current().unwrap().contains(&ask_id));
+}
+
+/// Mid-turn staging spends what the activated set has already spent.
+///
+/// The context planner enforces one capability budget over *every* activated
+/// schema, and rejects the whole turn when the total overflows. So a
+/// `registry.search` that stages a capability must charge it against the
+/// budget left, not the budget as if nothing were active: a schema that fits
+/// on its own but not alongside what is already bound has to be refused here,
+/// where the model still gets a usable "nothing fit" answer, rather than
+/// downstream where it is an unrecoverable turn failure.
+#[tokio::test]
+async fn staging_charges_a_candidate_against_the_budget_the_active_set_leaves() {
+    let search_id = RegistryId::tool(CAPABILITY_SEARCH_TOOL_NAME);
+    let ask_id = RegistryId::tool(crate::harness::QUESTIONNAIRE_TOOL_NAME);
+    let query = RoutingQuery::derive("ask_user", Vec::<String>::new());
+
+    let probe = live_runtime_with_context(ActivationContext::new());
+    let pipeline = HarnessPipelineBuilder::new()
+        .seal()
+        .expect("empty pipeline seals");
+    let session = probe
+        .derive_session(
+            SessionId::new("session-budget-probe"),
+            None,
+            true,
+            &pipeline,
+            &BTreeMap::new(),
+            false,
+        )
+        .await
+        .expect("interactive scope derives");
+    let cost = |id: &RegistryId| {
+        session
+            .descriptor_view
+            .get(id)
+            .expect("the descriptor is in view")
+            .payload()
+            .context_cost()
+            .total_tokens()
+    };
+    let (active_cost, candidate_cost) = (cost(&search_id), cost(&ask_id));
+    assert!(
+        active_cost > 0 && candidate_cost > 0,
+        "the fixture must have real costs to budget against"
+    );
+
+    // Exactly enough for both: staging still admits the candidate, so the
+    // subtraction cannot be an off-by-one that starves a legitimate search.
+    let roomy = live_runtime_with_budget(
+        ActivationContext::new(),
+        ActivationBudget::new(active_cost + candidate_cost, 8),
+    );
+    let (_, plan) = roomy.select(
+        &session.descriptor_view,
+        &query,
+        std::slice::from_ref(&search_id),
+        8,
+    );
+    assert!(
+        plan.bindings.iter().any(|b| b.descriptor.id() == &ask_id),
+        "a candidate that fits beside the active set must still bind: {plan:?}"
+    );
+
+    // One token short of both, but still roomier than the candidate alone —
+    // the exact shape that used to bind and then fail the turn downstream.
+    let tight = live_runtime_with_budget(
+        ActivationContext::new(),
+        ActivationBudget::new(active_cost + candidate_cost - 1, 8),
+    );
+    let (_, plan) = tight.select(&session.descriptor_view, &query, &[search_id], 8);
+    assert!(
+        plan.bindings.is_empty(),
+        "a candidate that overflows the budget once the active set is charged \
+         must be refused at staging, not left for the planner: {plan:?}"
+    );
 }

@@ -25,8 +25,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use agent_runtime_ability::AbilityDescriptor;
 use agent_runtime_ability::descriptor::{Affordance, DependencyRequirement, RiskLevel};
+use agent_runtime_ability::{AbilityDescriptor, AbilityKind};
 use agent_runtime_registry::{RegistryId, RegistryView};
 
 use crate::capability::retrieval::RetrievedCandidate;
@@ -71,10 +71,23 @@ pub struct SelectionBudgets {
     /// The maximum number of ids the bundle may bind (matched candidates plus
     /// any dependency bindings they pull in).
     pub max_candidates: usize,
+    /// The share of `max_context_tokens` that [`AbilityKind::Skill`]
+    /// candidates may take between them.
+    ///
+    /// Skills carry instruction prose rather than a schema, so one can be an
+    /// order of magnitude larger than any tool and there is no natural
+    /// ceiling on how many a session accumulates: activation is monotonic
+    /// within an epoch chain, so a skill bound speculatively early keeps its
+    /// tokens for the rest of the session. Left unbounded, a few of them
+    /// crowd out the tool schemas the task actually needs. A host that does
+    /// not want the distinction sets this to `max_context_tokens`.
+    pub max_instruction_tokens: u32,
 }
 
 impl SelectionBudgets {
-    /// Explicit budgets along every dimension.
+    /// Explicit budgets along every dimension, with skills free to take the
+    /// whole context budget. Use [`Self::with_instruction_budget`] to reserve
+    /// most of it for tool schemas.
     pub fn new(
         max_context_tokens: u32,
         max_latency_ms: u32,
@@ -88,7 +101,14 @@ impl SelectionBudgets {
             max_monetary_cost_cents,
             max_risk,
             max_candidates,
+            max_instruction_tokens: max_context_tokens,
         }
+    }
+
+    /// Caps what skills may take, clamped to the overall context budget.
+    pub fn with_instruction_budget(mut self, tokens: u32) -> Self {
+        self.max_instruction_tokens = tokens.min(self.max_context_tokens);
+        self
     }
 
     /// Budgets wide enough that only dependency and conflict rules bind —
@@ -103,6 +123,8 @@ impl SelectionBudgets {
 pub enum BudgetDimension {
     /// Combined schema/instruction context tokens.
     ContextTokens,
+    /// The share of the context budget reserved for skill instructions.
+    InstructionTokens,
     /// Combined latency estimate.
     LatencyMs,
     /// Combined monetary cost estimate.
@@ -221,6 +243,7 @@ struct Admission {
     candidate_binding: Binding,
     extra_bindings: Vec<Binding>,
     delta_context: u32,
+    delta_instruction: u32,
     delta_latency: u32,
     delta_monetary: u32,
 }
@@ -282,6 +305,7 @@ fn try_admit(
     budgets: &SelectionBudgets,
     costs: &BTreeMap<RegistryId, CapabilityCostHint>,
     used_context: u32,
+    used_instruction: u32,
     used_latency: u32,
     used_monetary: u32,
 ) -> Result<Admission, RejectionReason> {
@@ -395,6 +419,18 @@ fn try_admit(
             dimension: BudgetDimension::ContextTokens,
         });
     }
+    // Charged over the candidate and anything it pulls in, so a small skill
+    // cannot smuggle a large one in as a dependency.
+    let delta_instruction = instruction_tokens(candidate)
+        + extra_bindings
+            .iter()
+            .map(|binding| instruction_tokens(&binding.descriptor))
+            .sum::<u32>();
+    if used_instruction + delta_instruction > budgets.max_instruction_tokens {
+        return Err(RejectionReason::BudgetExceeded {
+            dimension: BudgetDimension::InstructionTokens,
+        });
+    }
     if used_latency + delta_latency > budgets.max_latency_ms {
         return Err(RejectionReason::BudgetExceeded {
             dimension: BudgetDimension::LatencyMs,
@@ -416,9 +452,20 @@ fn try_admit(
         },
         extra_bindings,
         delta_context,
+        delta_instruction,
         delta_latency,
         delta_monetary,
     })
+}
+
+/// What `descriptor` charges against the skill sub-budget: its whole context
+/// cost when it is a skill, nothing otherwise.
+fn instruction_tokens(descriptor: &AbilityDescriptor) -> u32 {
+    if descriptor.kind() == &AbilityKind::Skill {
+        descriptor.context_cost().total_tokens()
+    } else {
+        0
+    }
 }
 
 /// Selects a dependency-complete, conflict-free bundle from `candidates`
@@ -453,6 +500,7 @@ pub fn select(
     let mut chosen: Vec<Binding> = Vec::new();
     let mut rejected: Vec<RejectedCandidate> = Vec::new();
     let mut used_context = 0u32;
+    let mut used_instruction = 0u32;
     let mut used_latency = 0u32;
     let mut used_monetary = 0u32;
 
@@ -483,6 +531,7 @@ pub fn select(
                 budgets,
                 costs,
                 used_context,
+                used_instruction,
                 used_latency,
                 used_monetary,
             ) {
@@ -536,6 +585,7 @@ pub fn select(
             }
             Some((id, admission, _, _)) => {
                 used_context += admission.delta_context;
+                used_instruction += admission.delta_instruction;
                 used_latency += admission.delta_latency;
                 used_monetary += admission.delta_monetary;
                 for covered in admission.candidate_binding.descriptor.affordances() {
@@ -610,6 +660,78 @@ mod tests {
                         RejectionReason::Conflict { with } if *with == fixtures::search_skill_id()
                     )),
             "the rejection must name the active entry it conflicts with"
+        );
+    }
+
+    /// A skill's instruction prose is charged to its own sub-budget, so a
+    /// large reference cannot take the room the tool schemas need.
+    ///
+    /// Skills are the asymmetric case: one can be an order of magnitude
+    /// larger than any tool, and because activation is monotonic, one bound
+    /// speculatively keeps its tokens for the rest of the session. Without
+    /// this cap a couple of them fill the capability budget and every later
+    /// tool activation overflows it.
+    #[test]
+    fn a_skill_is_charged_to_the_instruction_budget_while_a_tool_is_not() {
+        // Without the specialist agent, so the skill's only reason to be
+        // rejected is the budget rather than redundant affordance coverage.
+        let view = fixtures::research_view_without_agent();
+        let candidates = candidates_for(&view, "search the web and browse the results page");
+        let skill_cost = view
+            .get(&fixtures::search_skill_id())
+            .expect("the skill is in view")
+            .payload()
+            .context_cost()
+            .total_tokens();
+
+        // Generous overall, but the skill alone does not fit its share.
+        let budgets = SelectionBudgets::new(u32::MAX, u32::MAX, u32::MAX, RiskLevel::High, 8)
+            .with_instruction_budget(skill_cost - 1);
+        let plan = select(&view, &candidates, &budgets, &BTreeMap::new(), &[]);
+
+        assert!(
+            !plan
+                .bindings
+                .iter()
+                .any(|binding| { binding.descriptor.kind() == &AbilityKind::Skill }),
+            "no skill fits the instruction budget: {plan:?}"
+        );
+        assert!(
+            plan.rejected.iter().any(|rejected| matches!(
+                rejected.reason,
+                RejectionReason::BudgetExceeded {
+                    dimension: BudgetDimension::InstructionTokens
+                }
+            )),
+            "the rejection must name the instruction budget: {plan:?}"
+        );
+        // The tool is unaffected: the sub-budget narrows skills only.
+        assert!(
+            plan.bindings
+                .iter()
+                .any(|binding| binding.descriptor.kind() != &AbilityKind::Skill),
+            "a non-skill candidate must still bind: {plan:?}"
+        );
+    }
+
+    /// The default must stay backward compatible: a budget built without an
+    /// explicit instruction share lets skills use all of it.
+    #[test]
+    fn without_an_explicit_share_skills_may_use_the_whole_context_budget() {
+        let view = fixtures::research_view_without_agent();
+        let candidates = candidates_for(&view, "search the web");
+        let plan = select(
+            &view,
+            &candidates,
+            &SelectionBudgets::new(u32::MAX, u32::MAX, u32::MAX, RiskLevel::High, 8),
+            &BTreeMap::new(),
+            &[],
+        );
+        assert!(
+            plan.bindings
+                .iter()
+                .any(|binding| binding.descriptor.kind() == &AbilityKind::Skill),
+            "an uncapped budget must still admit a skill: {plan:?}"
         );
     }
 
