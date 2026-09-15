@@ -57,6 +57,18 @@ pub struct BudgetReport {
     pub sizer_revision: ComponentRef,
     /// Whether the counts are exact or a deterministic estimate.
     pub confidence: EstimationConfidence,
+    /// Tokens the capability sub-budget was over by, when it was: activated
+    /// tool schemas plus ability instructions beyond
+    /// [`ContextBudget::capability_budget`].
+    ///
+    /// Recorded rather than fatal. The capability budget is resolver
+    /// discipline — it bounds what activation *should* bind — while the
+    /// enforceable limit is the input budget. Overflow here means the
+    /// resolver's cost estimate and this sizer's count disagreed, which is a
+    /// signal worth surfacing but not a reason to fail a turn that otherwise
+    /// fits the model's window with room to spare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_overflow_tokens: Option<u32>,
 }
 
 impl BudgetReport {
@@ -87,7 +99,7 @@ impl BudgetReport {
         let total_input_tokens = categories
             .iter()
             .fold(0u32, |acc, category| acc.saturating_add(category.tokens));
-        Self {
+        let mut report = Self {
             categories,
             total_input_tokens,
             output_reserve: budget.output_reserve,
@@ -95,7 +107,15 @@ impl BudgetReport {
             input_budget: budget.input_budget,
             sizer_revision: sizer.revision(),
             confidence: sizer.confidence(),
-        }
+            capability_overflow_tokens: None,
+        };
+        let capability_tokens = report
+            .tokens_for(FragmentKind::ToolSchema)
+            .saturating_add(report.tokens_for(FragmentKind::AbilityInstruction));
+        report.capability_overflow_tokens = capability_tokens
+            .checked_sub(budget.capability_budget)
+            .filter(|overflow| *overflow > 0);
+        report
     }
 
     /// The tokens attributed to `kind`, or zero if it contributed nothing.
@@ -483,6 +503,7 @@ mod tests {
             input_budget: 100,
             sizer_revision: CharRatioSizer::default().revision(),
             confidence: EstimationConfidence::Estimated,
+            capability_overflow_tokens: None,
         };
         assert!(!report.fits_budget());
         assert_eq!(report.overage(), 110);

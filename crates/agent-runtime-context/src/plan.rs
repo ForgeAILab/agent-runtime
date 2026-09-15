@@ -301,6 +301,7 @@ mod tests {
                 RegistryRevision::new("1"),
             ),
             confidence: EstimationConfidence::Estimated,
+            capability_overflow_tokens: None,
         }
     }
 

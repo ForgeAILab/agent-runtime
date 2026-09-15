@@ -150,14 +150,18 @@ fn summary(payload: &RuntimeEvent) -> String {
             input_budget_tokens,
             reserved_tokens,
             confidence,
+            capability_overflow_tokens,
         } => {
             let totals_str = totals
                 .iter()
                 .map(|(kind, tokens)| format!("{kind}={tokens}"))
                 .collect::<Vec<_>>()
                 .join(",");
+            let overflow = capability_overflow_tokens
+                .map(|tokens| format!(" capability_overflow={tokens}"))
+                .unwrap_or_default();
             format!(
-                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_tokens={input_tokens} input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}",
+                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_tokens={input_tokens} input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}{overflow}",
                 totals_str
             )
         }
@@ -637,6 +641,7 @@ mod tests {
                 input_budget_tokens: 8000,
                 reserved_tokens: 512,
                 confidence: EstimationConfidence::Estimated,
+                capability_overflow_tokens: Some(101),
             },
         );
         let line = log_line(&env);
@@ -646,6 +651,8 @@ mod tests {
         assert!(line.contains("input_tokens=420"));
         assert!(line.contains("input_budget=8000"));
         assert!(line.contains("reserved=512"));
+        // Rendered only when there is one, so an ordinary plan stays quiet.
+        assert!(line.contains("capability_overflow=101"), "{line}");
     }
 
     #[test]
