@@ -25,6 +25,8 @@ pub(super) struct RebaseCandidate {
 
 /// Session-owned scoped view and activation history.
 pub(crate) struct SessionAbilities {
+    /// True only when validated persisted state was rebased during startup.
+    pub(crate) rebased: bool,
     pub(super) snapshot: Fingerprint,
     pub(super) scoped: ScopedRegistry,
     pub(super) descriptor_view: RegistryView<AbilityDescriptor>,
@@ -54,6 +56,14 @@ pub(super) struct SessionActivationState {
 }
 
 impl SessionAbilities {
+    /// An interrupted turn cannot promote its unfinished activation work.
+    /// Already active capabilities remain subject to the normal scoped rebase.
+    pub(crate) fn discard_uncommitted_activation(&self) {
+        let mut state = self.state.lock().expect("activation state poisoned");
+        state.pending.clear();
+        state.staged.clear();
+    }
+
     pub(crate) fn search_stage_guard(
         &self,
         call: &ToolCallId,

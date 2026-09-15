@@ -372,3 +372,288 @@ async fn dormant_interrupted_checkpoint_is_finalized_on_new_work() {
         observer.last_finish()
     );
 }
+
+fn upgrade_runtime(
+    provider: Arc<FakeProvider>,
+    sessions: Arc<MemorySessionStore>,
+    checkpoints: Arc<RecordingCheckpointStore>,
+    changed: bool,
+) -> Runtime {
+    let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider)
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(128_000, 128_000, 4_096),
+        ))
+        .session_store(sessions)
+        .checkpoint_store(checkpoints)
+        .live_ability_routing();
+    if changed {
+        builder = builder.tool(Arc::new(agent_runtime::harness::QuestionnaireTool::new()));
+    }
+    builder.build().expect("live-ability runtime builds")
+}
+
+async fn saved_upgrade_turn() -> (
+    SessionId,
+    Arc<MemorySessionStore>,
+    Arc<RecordingCheckpointStore>,
+    TurnCheckpoint,
+) {
+    let id = SessionId::new("upgrade-recovery");
+    let sessions = Arc::new(MemorySessionStore::default());
+    let checkpoints = Arc::new(RecordingCheckpointStore::default());
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![],
+    ));
+    let old = upgrade_runtime(provider, sessions.clone(), checkpoints.clone(), false);
+    let session = old
+        .start_session(StartSession::new().with_id(id.clone()))
+        .await
+        .unwrap();
+    let mut snapshot = session.snapshot();
+    session.shutdown().await.unwrap();
+    snapshot.history = vec![
+        Message::user("previous question"),
+        Message::assistant(vec![agent_runtime::core::content::ContentPart::text(
+            "previous answer",
+        )]),
+        Message::user("unfinished request"),
+    ];
+    let checkpoint = TurnCheckpoint::accepted(
+        TurnId::new("upgrade-turn"),
+        UserInput::text("unfinished request"),
+        snapshot.clone(),
+        2,
+        Deadline::never(),
+        1,
+        snapshot.identity.event_seq + 1,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    checkpoints.seed(checkpoint.clone());
+    (id, sessions, checkpoints, checkpoint)
+}
+
+#[tokio::test]
+async fn changed_activation_interrupts_without_replay_and_keeps_history() {
+    let (id, sessions, checkpoints, original) = saved_upgrade_turn().await;
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![text_reply_script("answer to the new request")],
+    ));
+    let runtime = upgrade_runtime(
+        provider.clone(),
+        sessions.clone(),
+        checkpoints.clone(),
+        true,
+    );
+    let resumed = runtime
+        .start_session(
+            StartSession::new()
+                .with_id(id.clone())
+                .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.interrupted_on_resume(), Some(&original.turn));
+    assert!(
+        provider.requests().is_empty(),
+        "opening an old session must not spend or replay"
+    );
+    assert_eq!(resumed.snapshot().history, original.snapshot.history);
+    assert_eq!(resumed.snapshot().usage, original.snapshot.usage);
+    let terminal = checkpoints.latest().unwrap();
+    assert!(matches!(
+        terminal.state,
+        TurnState::Terminal {
+            finish: TurnFinish::Failed,
+            ..
+        }
+    ));
+    assert!(terminal.watermark.event_sequence > original.watermark.event_sequence);
+    assert_ne!(
+        terminal.snapshot.extension_state["runtime.core.live_abilities"].value["snapshot"],
+        original.snapshot.extension_state["runtime.core.live_abilities"].value["snapshot"]
+    );
+    resumed.run(UserInput::text("new request")).await.unwrap();
+    assert_eq!(provider.requests().len(), 1);
+    resumed.shutdown().await.unwrap();
+    // The migrated terminal record resumes normally, rather than repeatedly
+    // interrupting on every start or requiring deletion of the old session.
+    let resumed = runtime
+        .start_session(StartSession::new().with_id(id))
+        .await
+        .unwrap();
+    assert!(resumed.interrupted_on_resume().is_none());
+    assert_eq!(provider.requests().len(), 1);
+    resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn strict_resume_still_rejects_changed_activation_without_writes() {
+    let (id, sessions, checkpoints, original) = saved_upgrade_turn().await;
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![],
+    ));
+    let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
+    let error = runtime
+        .start_session(StartSession::new().with_id(id))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("different registry snapshot or scoped view")
+    );
+    assert_eq!(checkpoints.latest().unwrap(), original);
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn upgrade_recovery_does_not_hide_invalid_activation_state() {
+    let (id, sessions, checkpoints, mut original) = saved_upgrade_turn().await;
+    original
+        .snapshot
+        .extension_state
+        .get_mut("runtime.core.live_abilities")
+        .unwrap()
+        .revision = agent_runtime::registry::RegistryRevision::new("future-unsupported-revision");
+    checkpoints.seed(original.clone());
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![],
+    ));
+    let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
+    let error = runtime
+        .start_session(
+            StartSession::new()
+                .with_id(id)
+                .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("activation state revision"));
+    assert_eq!(checkpoints.latest().unwrap(), original);
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn upgrade_recovery_requires_durable_interruption_before_returning() {
+    let (id, sessions, checkpoints, original) = saved_upgrade_turn().await;
+    checkpoints.fail_next_completing_save();
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![],
+    ));
+    let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
+    let request = StartSession::new()
+        .with_id(id)
+        .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt);
+    assert!(runtime.start_session(request.clone()).await.is_err());
+    assert_eq!(checkpoints.latest().unwrap(), original);
+    assert!(provider.requests().is_empty());
+    let resumed = runtime.start_session(request).await.unwrap();
+    assert_eq!(resumed.interrupted_on_resume(), Some(&original.turn));
+    resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compatible_upgrade_policy_still_resumes_the_exact_saved_turn() {
+    let (id, sessions, checkpoints, _) = saved_upgrade_turn().await;
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![text_reply_script("resumed answer")],
+    ));
+    let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), false);
+    let resumed = runtime
+        .start_session(
+            StartSession::new()
+                .with_id(id)
+                .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
+        )
+        .await
+        .unwrap();
+    assert!(resumed.interrupted_on_resume().is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !checkpoints
+            .latest()
+            .is_some_and(|checkpoint| checkpoint.state.is_terminal())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(provider.requests().len(), 1);
+    resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_recovery_preserves_a_previously_decided_finish() {
+    for publishing in [false, true] {
+        let (id, sessions, checkpoints, original) = saved_upgrade_turn().await;
+        let mut checkpoint = original
+            .transition(
+                TurnState::Completing {
+                    finish: TurnFinish::Failed,
+                    visible_output: false,
+                    provider_error_kind: Some(
+                        agent_runtime::core::provider::ProviderErrorKind::Network,
+                    ),
+                },
+                original.snapshot.clone(),
+                original.watermark.event_sequence + 1,
+                Timestamp(1),
+            )
+            .unwrap();
+        if publishing {
+            checkpoint = checkpoint
+                .transition(
+                    TurnState::PublishingTerminal {
+                        finish: TurnFinish::Failed,
+                        visible_output: false,
+                    },
+                    checkpoint.snapshot.clone(),
+                    checkpoint.watermark.event_sequence + 1,
+                    Timestamp(2),
+                )
+                .unwrap();
+        }
+        checkpoints.seed(checkpoint.clone());
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![],
+        ));
+        let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
+        let resumed = runtime
+            .start_session(
+                StartSession::new()
+                    .with_id(id)
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.interrupted_on_resume(), Some(&checkpoint.turn));
+        assert_eq!(resumed.history(), checkpoint.snapshot.history);
+        assert!(provider.requests().is_empty());
+        assert!(matches!(
+            checkpoints.latest().unwrap().state,
+            TurnState::Terminal {
+                finish: TurnFinish::Failed,
+                ..
+            }
+        ));
+        resumed.shutdown().await.unwrap();
+    }
+}
