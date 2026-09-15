@@ -204,6 +204,46 @@ impl LiveAbilityRuntime {
 }
 
 impl LiveAbilityRuntime {
+    /// The schema/instruction tokens `already_active` capabilities already
+    /// spend, resolved back through `view` the same way conflict checks do.
+    ///
+    /// [`crate::capability::select`] scores a candidate against a budget it
+    /// starts consuming from zero: `already_active` counts toward conflict
+    /// and dependency resolution there but deliberately not toward that
+    /// call's budget, because the same function also serves the first
+    /// selection of a turn, where nothing is active yet. Incremental staging
+    /// is the other case, and it is this caller's job to hand `select` the
+    /// budget that is actually left. Handing it the whole budget instead let
+    /// a mid-turn `registry.search` stage a capability whose schema did fit
+    /// on its own but pushed the activated set past the total — which the
+    /// context planner then rejected as an unrecoverable turn failure rather
+    /// than the "not enough budget" answer the model could have acted on.
+    fn active_context_tokens(
+        &self,
+        view: &RegistryView<AbilityDescriptor>,
+        already_active: &[RegistryId],
+    ) -> u32 {
+        already_active
+            .iter()
+            .filter_map(|id| view.get(id))
+            .map(|entry| entry.payload().context_cost().total_tokens())
+            .fold(0u32, u32::saturating_add)
+    }
+
+    /// The share of the skill sub-budget the active skills already hold.
+    fn active_instruction_tokens(
+        &self,
+        view: &RegistryView<AbilityDescriptor>,
+        already_active: &[RegistryId],
+    ) -> u32 {
+        already_active
+            .iter()
+            .filter_map(|id| view.get(id))
+            .filter(|entry| entry.payload().kind() == &AbilityKind::Skill)
+            .map(|entry| entry.payload().context_cost().total_tokens())
+            .fold(0u32, u32::saturating_add)
+    }
+
     pub(super) fn select(
         &self,
         view: &RegistryView<AbilityDescriptor>,
@@ -224,16 +264,36 @@ impl LiveAbilityRuntime {
             .take(max_candidates)
             .cloned()
             .collect::<Vec<_>>();
+        // Saturating, not wrapping: an activated set already at or over the
+        // budget leaves zero to spend, which admits nothing further rather
+        // than wrapping into an effectively unbounded budget.
+        let remaining_schema_tokens = self
+            .budget
+            .max_schema_tokens
+            .saturating_sub(self.active_context_tokens(view, already_active));
+        let remaining_candidates = self
+            .budget
+            .max_candidates
+            .saturating_sub(already_active.len())
+            .min(max_candidates);
+        // The skill sub-budget is charged the same way: what the active
+        // skills already hold is spent, and activation is monotonic, so a
+        // skill bound early keeps its share for the rest of the session.
+        let remaining_instruction_tokens = self
+            .budget
+            .max_instruction_tokens
+            .saturating_sub(self.active_instruction_tokens(view, already_active));
         let plan = self.resolver.select(
             view,
             &candidates,
             &SelectionBudgets::new(
-                self.budget.max_schema_tokens,
+                remaining_schema_tokens,
                 u32::MAX,
                 u32::MAX,
                 RiskLevel::High,
-                self.budget.max_candidates.min(max_candidates),
-            ),
+                remaining_candidates,
+            )
+            .with_instruction_budget(remaining_instruction_tokens),
             already_active,
         );
         (retrieval, plan)
