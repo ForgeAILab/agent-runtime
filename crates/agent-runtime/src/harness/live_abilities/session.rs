@@ -56,6 +56,14 @@ pub(super) struct SessionActivationState {
 }
 
 impl SessionAbilities {
+    /// An interrupted turn cannot promote its unfinished activation work.
+    /// Already active capabilities remain subject to the normal scoped rebase.
+    pub(crate) fn discard_uncommitted_activation(&self) {
+        let mut state = self.state.lock().expect("activation state poisoned");
+        state.pending.clear();
+        state.staged.clear();
+    }
+
     pub(crate) fn search_stage_guard(
         &self,
         call: &ToolCallId,

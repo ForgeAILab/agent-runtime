@@ -621,6 +621,11 @@ impl Runtime {
                     .is_some_and(|abilities| abilities.rebased))
             .then(|| checkpoint.turn.clone())
         });
+        if interrupted_on_resume.is_some() {
+            if let Some(abilities) = &execution.abilities {
+                abilities.discard_uncommitted_activation();
+            }
+        }
         let persist_gate = execution.persist_gate();
 
         let inner = Arc::new(SessionInner {
