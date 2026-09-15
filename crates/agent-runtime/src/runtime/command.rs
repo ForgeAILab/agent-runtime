@@ -27,6 +27,15 @@ pub enum CheckpointRecoveryPolicy {
     /// Resume every supported non-terminal checkpoint immediately.
     #[default]
     Resume,
+    /// Resume compatible checkpoints, but stop an unfinished ordinary turn
+    /// without replay when its saved activation scope has changed.
+    ///
+    /// The conversation and accounting survive; available abilities are
+    /// re-authorized against the current registry. No saved approval, tool
+    /// invocation, provider call, or turn-commit hook is replayed on this
+    /// fallback. Invalid state and cache-operation checkpoints remain strict.
+    /// Hosts must report `SessionHandle::interrupted_on_resume` to the user.
+    ResumeOrInterrupt,
     /// Leave only an unanswered `AwaitingInteraction` checkpoint dormant.
     ///
     /// Every other checkpoint resumes normally. This narrow mode lets a

@@ -25,6 +25,8 @@ pub(super) struct RebaseCandidate {
 
 /// Session-owned scoped view and activation history.
 pub(crate) struct SessionAbilities {
+    /// True only when validated persisted state was rebased during startup.
+    pub(crate) rebased: bool,
     pub(super) snapshot: Fingerprint,
     pub(super) scoped: ScopedRegistry,
     pub(super) descriptor_view: RegistryView<AbilityDescriptor>,

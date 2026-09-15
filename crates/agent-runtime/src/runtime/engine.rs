@@ -510,6 +510,20 @@ impl Runtime {
                 })
             )
         );
+        // Only this explicit policy may rebuild an unfinished ordinary
+        // turn's abilities. Its old execution will be finalized, not resumed.
+        // Cache-operation checkpoints keep their separate idempotency rules.
+        let allow_interrupted_rebase = checkpoint_recovery
+            == CheckpointRecoveryPolicy::ResumeOrInterrupt
+            && checkpoint.as_ref().is_some_and(|checkpoint| {
+                !checkpoint.state.is_terminal()
+                    && !matches!(
+                        checkpoint.state,
+                        TurnState::CacheOperationPrepared { .. }
+                            | TurnState::CacheOperationStarted { .. }
+                            | TurnState::CacheOperationResultReady { .. }
+                    )
+            });
         let rebase_completed_activation = !recovery_deferred
             && match checkpoint.as_ref() {
                 Some(checkpoint) => checkpoint.state.is_terminal(),
@@ -594,11 +608,19 @@ impl Runtime {
                     session_id.clone(),
                     parent.clone(),
                     recovery_deferred,
-                    rebase_completed_activation,
+                    rebase_completed_activation || allow_interrupted_rebase,
                     extension_state,
                 )
                 .await?,
         );
+        let interrupted_on_resume = checkpoint.as_ref().and_then(|checkpoint| {
+            (allow_interrupted_rebase
+                && execution
+                    .abilities
+                    .as_ref()
+                    .is_some_and(|abilities| abilities.rebased))
+            .then(|| checkpoint.turn.clone())
+        });
         let persist_gate = execution.persist_gate();
 
         let inner = Arc::new(SessionInner {
@@ -630,12 +652,49 @@ impl Runtime {
             idle_compaction_inflight: AtomicBool::new(false),
             idle_compaction_attempted: AtomicBool::new(false),
             recovery_deferred,
+            interrupted_on_resume: interrupted_on_resume.clone(),
         });
 
         inner.emitter.emit(None, RuntimeEvent::SessionStarted);
         self.shared
             .driver
             .emit_session_composition(&inner.emitter, &inner.execution);
+        if interrupted_on_resume.is_some() {
+            let checkpoint = checkpoint
+                .as_ref()
+                .expect("interrupted recovery has a checkpoint");
+            self.shared
+                .driver
+                .finalize_interrupted_turn(
+                    inner.state.clone(),
+                    inner.execution.clone(),
+                    inner.emitter.clone(),
+                    inner.minter.clone(),
+                    inner.cancel.child(),
+                    inner.inbox.clone(),
+                    checkpoint.clone(),
+                    true,
+                )
+                .await;
+            // Never return a writable session until the interruption has a
+            // durable terminal boundary. A failed save can be retried safely.
+            let recovered = self
+                .shared
+                .checkpoint_store
+                .as_ref()
+                .expect("loaded checkpoint has a store")
+                .load_latest(&inner.id)
+                .await?;
+            if !recovered
+                .as_ref()
+                .is_some_and(|saved| saved.turn == checkpoint.turn && saved.state.is_terminal())
+            {
+                return Err(RuntimeError::conflict(
+                    "could not save the interrupted turn after tools changed; retry resume before submitting new work",
+                ));
+            }
+            inner.execution.clear_turn(&checkpoint.turn);
+        }
         let session = SessionHandle::new(inner);
         let checkpoint = if request.checkpoint_recovery != CheckpointRecoveryPolicy::Defer
             && !recovery_deferred
@@ -644,7 +703,7 @@ impl Runtime {
         } else {
             None
         };
-        if let Some(checkpoint) = checkpoint {
+        if let Some(checkpoint) = checkpoint.filter(|_| interrupted_on_resume.is_none()) {
             if matches!(
                 checkpoint.state,
                 TurnState::CacheOperationPrepared { .. }
