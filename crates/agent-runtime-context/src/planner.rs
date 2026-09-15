@@ -417,21 +417,16 @@ impl<'a> ContextPlanner<'a> {
 
         let report = BudgetReport::compute(&fragments, self.sizer, &self.budget);
 
-        let capability_tokens = report
-            .tokens_for(FragmentKind::ToolSchema)
-            .saturating_add(report.tokens_for(FragmentKind::AbilityInstruction));
-        if capability_tokens > self.budget.capability_budget {
-            return Err(ContextError::budget_exceeded(
-                report,
-                format!(
-                    "capability budget exceeded: activated tool schemas and ability \
-                     instructions use {capability_tokens} tokens of {} available; \
-                     configure a larger capability budget or have the resolver \
-                     activate fewer or smaller capabilities",
-                    self.budget.capability_budget
-                ),
-            ));
-        }
+        // The capability sub-budget is resolver discipline, not an
+        // enforceable limit: it bounds what activation *should* bind, and the
+        // resolver charges every candidate against it before binding
+        // anything. Overflow here therefore means the resolver's cost
+        // estimate and this sizer's count disagreed — worth recording, and
+        // `BudgetReport::capability_overflow_tokens` carries it, but not a
+        // reason to refuse a plan that fits the model's window with room to
+        // spare. Failing it outright killed whole turns over a few percent
+        // while the input budget still had most of its space free. What does
+        // not fit the input budget is still rejected, immediately below.
 
         if !report.fits_budget() {
             let required: Vec<ContextFragment> = fragments
@@ -1409,10 +1404,16 @@ mod tests {
     }
 
     /// Requirement "Context-budgeted capability activation", scenario "Many
-    /// relevant capabilities are installed" (the planner's half: providing
-    /// and enforcing the explicit sub-budget without silently truncating).
+    /// relevant capabilities are installed" (the planner's half).
+    ///
+    /// The sub-budget is resolver discipline, and the resolver charges every
+    /// candidate against it before binding anything. By the time the planner
+    /// sees an overflow the capabilities are already bound, so refusing the
+    /// plan does not shed a single token — it only destroys a turn whose
+    /// input budget is almost entirely free. The overflow is recorded on the
+    /// report instead, and the enforceable limit below still bites.
     #[test]
-    fn activating_capability_schemas_beyond_the_configured_budget_fails_before_network_io() {
+    fn capability_overflow_is_recorded_rather_than_failing_a_plan_that_fits() {
         let p = profile(1_000_000, 1_000_000, 1_000);
         let sizer = CharRatioSizer::default();
         let planner = ContextPlanner::new(&p, &sizer, policy(1_000, 0).with_capability_budget(50));
@@ -1434,13 +1435,49 @@ mod tests {
             text_fragment("input", FragmentKind::UserInput, "hi"),
         ];
 
+        let plan = planner
+            .plan(fragments)
+            .expect("a plan that fits still plans");
+        let report = plan.budget_report();
+        assert!(report.tokens_for(FragmentKind::ToolSchema) > 400);
+        assert!(report.total_input_tokens < report.input_budget);
+        assert_eq!(
+            report.capability_overflow_tokens,
+            Some(report.tokens_for(FragmentKind::ToolSchema) - 50),
+            "the overflow must be visible even though it is not fatal"
+        );
+    }
+
+    /// The other half of the same rule: relaxing the sub-budget must not
+    /// relax the model's window. A plan that cannot fit is still refused.
+    #[test]
+    fn capability_overflow_past_the_input_budget_still_fails() {
+        let p = profile(1_000, 1_000, 100);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0).with_capability_budget(50));
+
+        let schema = ToolSchema {
+            name: "search".into(),
+            description: "x".repeat(20_000),
+            input_schema: serde_json::json!({}),
+        };
+        let fragments = vec![
+            text_fragment("sys", FragmentKind::SystemInstruction, "be helpful"),
+            ContextFragment::new(
+                "tool",
+                FragmentKind::ToolSchema,
+                FragmentSource::Host,
+                RegistryRevision::new("t1"),
+                FragmentContent::Tool(Box::new(schema)),
+            ),
+        ];
+
         let err = planner.plan(fragments).unwrap_err();
         assert_eq!(err.kind, ContextErrorKind::BudgetExceeded);
-        assert!(err.message.contains("capability budget"));
         let report = err
             .report
             .expect("a budget-exceeded error carries its report");
-        assert!(report.total_input_tokens < report.input_budget);
+        assert!(!report.fits_budget());
     }
 
     #[derive(Debug)]

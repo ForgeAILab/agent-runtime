@@ -591,6 +591,7 @@ impl Driver {
                     .output_reserve()
                     .saturating_add(plan.reasoning_reserve()),
                 confidence: map_confidence(plan.confidence()),
+                capability_overflow_tokens: plan.budget_report().capability_overflow_tokens,
             },
         );
 

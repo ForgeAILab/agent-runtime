@@ -969,6 +969,16 @@ pub enum RuntimeEvent {
         reserved_tokens: u32,
         /// How confidently the token counts were produced.
         confidence: EstimationConfidence,
+        /// Tokens the activated capabilities went over their sub-budget by,
+        /// when they did.
+        ///
+        /// Not a failure: the enforceable limit is `input_budget_tokens`.
+        /// This says the resolver's cost estimate and the planner's sizer
+        /// disagreed, which is worth seeing in a journal when tuning
+        /// `capability_budget` or diagnosing why a capability did not bind.
+        /// Absent on journals written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capability_overflow_tokens: Option<u32>,
     },
     /// Compaction changed the context plan.
     ContextCompacted {
@@ -1949,6 +1959,7 @@ mod tests {
                 input_budget_tokens: 8000,
                 reserved_tokens: 512,
                 confidence: EstimationConfidence::Estimated,
+                capability_overflow_tokens: None,
             },
         ];
 
