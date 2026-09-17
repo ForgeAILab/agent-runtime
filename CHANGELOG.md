@@ -319,6 +319,14 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   event-schema, shutdown) plus neutral consumer adapter fixtures.
 
 ### Fixed
+- A tool call that breaks a registered tool's schema is now answered instead
+  of fatal. The stream boundary rejected it as a malformed stream, which
+  failed the whole turn, while the executor -- which already validates the
+  same arguments -- would have returned a canonical tool error naming the
+  offending property. A model that makes the mistake deterministically (an
+  extra discriminator property on every attempt, say) could never get past
+  its first tool call. Arguments that are not an object at all, where the
+  schema requires one, remain a malformed stream.
 - Shedding a prior turn's unsigned reasoning is now a projection onto the
   model-facing request instead of a rewrite of canonical history. Rewriting
   history between turns diverged it from the immutable LCM entries and the

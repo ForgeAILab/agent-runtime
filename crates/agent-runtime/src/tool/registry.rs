@@ -164,33 +164,42 @@ impl SealedToolRegistry {
         })
     }
 
-    /// Validates one assembled model call against the registered tool's input
-    /// schema before the call is exposed to observers or invoked.
+    /// Rejects one assembled model call only when it is not a call at all.
+    ///
+    /// A registered tool's schema is a contract with the model, and breaking
+    /// it -- a missing field, an extra property, a wrong type -- is the
+    /// model's mistake to correct. The executor already answers such a call
+    /// with a canonical tool error carrying the validator's own message, so
+    /// the model reads what it got wrong and fixes it on the next step.
+    /// Failing the stream instead destroys the turn over a mistake that was
+    /// one step from repair, and a model that makes it deterministically --
+    /// every retry re-sends the same extra property -- can never get past it.
+    ///
+    /// What does not survive is an argument payload the runtime cannot
+    /// represent as arguments at all: a tool declaring object input whose
+    /// call carries a bare scalar or array did not come from a model filling
+    /// in a schema, it came from an assembler or a wire that lost the call.
     pub fn validate_call(&self, call: &ToolCall) -> Result<(), ProviderError> {
         let Some(spec) = self.spec(&call.name) else {
             // Unknown tools deliberately become canonical tool-error results;
             // only calls to registered schemas can claim validated arguments.
             return Ok(());
         };
-        let schema = spec.input_schema.clone();
-        let validator = jsonschema::validator_for(&schema).map_err(|error| {
-            ProviderError::new(
-                ProviderErrorKind::BadRequest,
-                format!(
-                    "registered tool `{}` has an invalid input schema: {error}",
-                    call.name
-                ),
-            )
-        })?;
-        validator.validate(&call.arguments).map_err(|error| {
-            ProviderError::new(
+        let expects_object = spec
+            .input_schema
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("object");
+        if expects_object && !call.arguments.is_object() {
+            return Err(ProviderError::new(
                 ProviderErrorKind::MalformedStream,
                 format!(
-                    "tool call `{}` arguments do not match its input schema: {error}",
+                    "tool call `{}` arguments are not an object, which its input schema requires",
                     call.name
                 ),
-            )
-        })
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -227,6 +236,38 @@ mod tests {
         }
     }
 
+    /// A tool with a closed schema, the shape every Forge operation tool
+    /// advertises.
+    #[derive(Debug)]
+    struct Strict(&'static str);
+    #[async_trait]
+    impl LegacyTool for Strict {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "strict"
+        }
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false,
+            })
+        }
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::new(vec![])
+        }
+        async fn invoke_legacy(
+            &self,
+            _arguments: Value,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::text("ok"))
+        }
+    }
+
     #[test]
     fn duplicate_names_are_rejected() {
         let mut reg = ToolRegistry::new();
@@ -248,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_call_arguments_against_registered_schema() {
+    fn a_call_whose_arguments_are_not_an_object_is_a_malformed_stream() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(Noop("read"))).unwrap();
         let sealed = reg.seal();
@@ -259,5 +300,30 @@ mod tests {
         };
         let error = sealed.validate_call(&call).unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::MalformedStream);
+    }
+
+    /// Arguments shaped like arguments pass this boundary even when they
+    /// break the schema: the executor answers them with a tool error the
+    /// model can correct, instead of the stream failing the whole turn.
+    #[test]
+    fn a_schema_violation_is_left_for_the_executor_to_answer() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Strict("write"))).unwrap();
+        let sealed = reg.seal();
+        let call = agent_runtime_core::content::ToolCall {
+            id: agent_runtime_core::ids::ToolCallId::new("c2"),
+            name: "write".into(),
+            arguments: json!({"path": "a.txt", "action": "write"}),
+        };
+
+        assert!(sealed.validate_call(&call).is_ok());
+        let rejected = sealed
+            .validate_arguments("write", &call.arguments)
+            .expect_err("the executor's own validation still rejects it");
+        assert!(
+            rejected.message.contains("'action' was unexpected"),
+            "the model is told exactly what to fix: {}",
+            rejected.message
+        );
     }
 }
