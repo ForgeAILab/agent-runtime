@@ -319,6 +319,16 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   event-schema, shutdown) plus neutral consumer adapter fixtures.
 
 ### Fixed
+- Shedding a prior turn's unsigned reasoning is now a projection onto the
+  model-facing request instead of a rewrite of canonical history. Rewriting
+  history between turns diverged it from the immutable LCM entries and the
+  protected checkpoint that fingerprinted them, so the second turn of any
+  session whose provider streams unsigned reasoning (every OpenAI-compatible
+  thinking endpoint, z.ai GLM among them) failed closed with "LCM canonical
+  history no longer matches its protected checkpoint" and stayed wedged.
+  Messages are projected one for one, so an assistant message that carried
+  nothing but shed reasoning arrives empty; the OpenAI-compatible wire drops
+  it rather than sending a blank assistant line.
 - `ContextPlanned::input_budget_tokens` now reports the enforced input budget
   it was always documented as, instead of the counted consumption (which
   moved to the new `input_tokens` field).

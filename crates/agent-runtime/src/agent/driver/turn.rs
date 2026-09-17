@@ -994,7 +994,6 @@ impl<'a> TurnMachine<'a> {
         let accepted_input = input.clone();
         let active_history_start = {
             let mut guard = state.lock().expect("session state poisoned");
-            strip_stale_reasoning(&mut guard.history);
             let history_start = guard.history.len();
             guard.history.push(input.into_message());
             history_start
@@ -1048,8 +1047,7 @@ impl<'a> TurnMachine<'a> {
             None => Deadline::never(),
         };
         let active_history_start = {
-            let mut guard = state.lock().expect("session state poisoned");
-            strip_stale_reasoning(&mut guard.history);
+            let guard = state.lock().expect("session state poisoned");
             guard.history.len()
         };
         execution.begin_internal_turn(

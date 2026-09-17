@@ -761,6 +761,13 @@ fn to_openai_messages(msg: &Message) -> Vec<Value> {
         Role::System => vec![json!({"role": "system", "content": msg.joined_text()})],
         Role::User => vec![json!({"role": "user", "content": user_content(msg)})],
         Role::Assistant => {
+            // An assistant message whose only content was unsigned reasoning
+            // shed before the request is left empty rather than removed from
+            // canonical history, and an empty assistant message has nothing
+            // to say on this wire.
+            if msg.content.is_empty() {
+                return Vec::new();
+            }
             let mut wire = json!({"role": "assistant", "content": msg.joined_text()});
             // Z.AI-style thinking endpoints require prior reasoning echoed
             // back on tool-call continuations as `reasoning_content`.
@@ -2501,6 +2508,16 @@ mod tests {
             .expect("unsupported stable tool-result content must fail closed");
         assert_eq!(error.kind, ProviderErrorKind::BadRequest);
         assert!(provider.transport().requests().is_empty());
+    }
+
+    #[test]
+    fn an_empty_assistant_message_never_reaches_the_wire() {
+        // The driver sheds a prior turn's unsigned reasoning from the request
+        // without removing the message, so a reasoning-only assistant turn
+        // arrives here empty and must not be sent as a blank assistant line.
+        let msg = Message::assistant(Vec::new());
+
+        assert!(to_openai_messages(&msg).is_empty());
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::agent::external::{
     ExternalTurnRequest, SharedExternalAgentBackend,
 };
 
-use super::{TurnMachine, TurnMachineContext, discard_reason_for_finish, strip_stale_reasoning};
+use super::{TurnMachine, TurnMachineContext, discard_reason_for_finish};
 
 /// Stable purpose label for usage a backend reported.
 const EXTERNAL_AGENT_USAGE_PURPOSE: &str = "agent.external";
@@ -102,7 +102,6 @@ impl<'a> ExternalTurnMachine<'a> {
         let accepted_input = input.clone();
         let active_history_start = {
             let mut guard = state.lock().expect("session state poisoned");
-            strip_stale_reasoning(&mut guard.history);
             let history_start = guard.history.len();
             guard.history.push(input.clone().into_message());
             history_start

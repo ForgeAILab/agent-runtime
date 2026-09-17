@@ -474,16 +474,38 @@ async fn a_new_turn_sheds_prior_reasoning() {
         "the visible answer survives the strip"
     );
 
-    // Turn two's assistant message was reasoning-only, so turn three's
-    // request drops the message entirely rather than sending it empty.
-    let assistant_count = requests[2]
+    // Turn two's assistant message was reasoning-only. Canonical history is
+    // addressed by index, so the message keeps its place in the request and
+    // arrives empty; each provider decides whether an empty assistant
+    // message reaches its wire.
+    let assistants: Vec<&Message> = requests[2]
         .messages
         .iter()
         .filter(|m| m.role == Role::Assistant)
-        .count();
-    assert_eq!(
-        assistant_count, 1,
-        "only turn one's answer remains as an assistant message"
+        .collect();
+    assert_eq!(assistants.len(), 2, "both assistant turns keep their place");
+    assert_eq!(assistants[0].joined_text(), "answer");
+    assert!(
+        assistants[1].content.is_empty(),
+        "the reasoning-only message is shed down to nothing"
     );
     assert!(reasoning_parts(&requests[2].messages).is_empty());
+
+    // Shedding is a projection: the session's canonical history -- what the
+    // LCM fingerprints and stores as immutable entries -- still carries both
+    // reasoning blocks after three turns.
+    let history = session.history();
+    assert_eq!(
+        reasoning_parts(&history),
+        vec![
+            ("thinking about the answer".to_owned(), false),
+            ("silent deliberation".to_owned(), false),
+        ],
+        "canonical history is never rewritten between turns"
+    );
+    assert_eq!(
+        history.iter().filter(|m| m.role == Role::Assistant).count(),
+        3,
+        "no assistant message is dropped from canonical history"
+    );
 }
