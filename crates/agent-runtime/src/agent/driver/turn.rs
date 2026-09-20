@@ -1321,9 +1321,18 @@ impl<'a> TurnMachine<'a> {
                     attempt_visible_output,
                     text,
                     reasoning,
-                    tool_calls,
+                    mut tool_calls,
                     finish,
                 } => {
+                    // Providers do not guarantee a tool-call id is unique
+                    // across a conversation. Canonical history is durable, so
+                    // one reused id makes the context planner see two calls
+                    // and two results for it and reject *every* later turn on
+                    // that timeline as `invalid_pairing` — the session never
+                    // recovers on its own. Re-id a colliding call before it
+                    // reaches dispatch or history, so the call and the result
+                    // the host returns for it agree on one unique id.
+                    reassign_colliding_tool_call_ids(&self.state, &mut tool_calls);
                     if let Err(error) = self
                         .transition(TurnState::ModelResponseReady {
                             request_id: request_id.clone(),
@@ -1569,5 +1578,112 @@ where
             )))
         }
         result = future => result,
+    }
+}
+
+/// Gives every tool call in `tool_calls` an id no earlier exchange in the
+/// session's canonical history already uses.
+///
+/// A provider that reuses an id — observed live with one id answering two
+/// different tools 168 messages apart — otherwise poisons the timeline
+/// permanently: the context planner requires exactly one call and one result
+/// fragment per id, and durable history keeps both forever, so every later
+/// turn fails `invalid_pairing`. Renaming here, before dispatch, keeps the
+/// call and its result on one id that is unique for this session.
+fn reassign_colliding_tool_call_ids(state: &Arc<Mutex<SessionState>>, tool_calls: &mut [ToolCall]) {
+    if tool_calls.is_empty() {
+        return;
+    }
+    let mut used: std::collections::BTreeSet<String> = {
+        let guard = state.lock().expect("session state poisoned");
+        guard
+            .history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolCall(call) => Some(call.id.as_str().to_owned()),
+                ContentPart::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
+                _ => None,
+            })
+            .collect()
+    };
+    for call in tool_calls.iter_mut() {
+        if used.insert(call.id.as_str().to_owned()) {
+            continue;
+        }
+        let mut suffix: u32 = 2;
+        loop {
+            let candidate = format!("{}#{suffix}", call.id.as_str());
+            if used.insert(candidate.clone()) {
+                call.id = agent_runtime_core::ids::ToolCallId::new(candidate);
+                break;
+            }
+            suffix = suffix.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_call_id_collision_tests {
+    use super::*;
+    use agent_runtime_core::ids::ToolCallId;
+    use serde_json::json;
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new(id),
+            name: name.to_owned(),
+            arguments: json!({}),
+        }
+    }
+
+    fn session_with(history: Vec<Message>) -> Arc<Mutex<SessionState>> {
+        Arc::new(Mutex::new(SessionState {
+            history,
+            ..SessionState::default()
+        }))
+    }
+
+    #[test]
+    fn a_reused_provider_id_is_re_idd_before_it_can_poison_the_timeline() {
+        // The live failure: z.ai answered `forge_scope_propose` and, 168
+        // messages later, `forge_task_command` with the same `call_130845`.
+        let state = session_with(vec![
+            Message::assistant(vec![ContentPart::ToolCall(call(
+                "call_130845",
+                "forge_scope_propose",
+            ))]),
+            Message::tool_result(ToolResultBlock {
+                call_id: ToolCallId::new("call_130845"),
+                name: "forge_scope_propose".to_owned(),
+                content: vec![ContentPart::text("{}")],
+                is_error: false,
+            }),
+        ]);
+        let mut incoming = vec![call("call_130845", "forge_task_command")];
+        reassign_colliding_tool_call_ids(&state, &mut incoming);
+        assert_ne!(incoming[0].id.as_str(), "call_130845");
+        assert_eq!(incoming[0].id.as_str(), "call_130845#2");
+    }
+
+    #[test]
+    fn an_unused_id_is_left_exactly_as_the_provider_sent_it() {
+        let state = session_with(vec![Message::assistant(vec![ContentPart::ToolCall(call(
+            "call_1", "a",
+        ))])]);
+        let mut incoming = vec![call("call_2", "b")];
+        reassign_colliding_tool_call_ids(&state, &mut incoming);
+        assert_eq!(incoming[0].id.as_str(), "call_2");
+    }
+
+    #[test]
+    fn two_colliding_calls_in_one_step_get_distinct_ids() {
+        let state = session_with(vec![Message::assistant(vec![ContentPart::ToolCall(call(
+            "dup", "a",
+        ))])]);
+        let mut incoming = vec![call("dup", "b"), call("dup", "c")];
+        reassign_colliding_tool_call_ids(&state, &mut incoming);
+        assert_eq!(incoming[0].id.as_str(), "dup#2");
+        assert_eq!(incoming[1].id.as_str(), "dup#3");
     }
 }
