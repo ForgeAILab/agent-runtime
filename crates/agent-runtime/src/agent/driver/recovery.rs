@@ -770,9 +770,12 @@ impl<'a> TurnMachine<'a> {
                 Some(self.turn_id.clone()),
                 RuntimeEvent::ProviderAttemptFinished {
                     attempt: response.attempt,
+                    index: None,
+                    max_attempts: None,
                     finish: response.finish,
                     retryable: false,
                     error: None,
+                    retry_delay_ms: None,
                 },
             );
             self.emitter.emit(
@@ -805,9 +808,12 @@ impl<'a> TurnMachine<'a> {
             Some(self.turn_id.clone()),
             RuntimeEvent::ProviderAttemptFinished {
                 attempt: response.attempt.clone(),
+                index: None,
+                max_attempts: None,
                 finish: response.finish,
                 retryable: false,
                 error: None,
+                retry_delay_ms: None,
             },
         );
         if matches!(

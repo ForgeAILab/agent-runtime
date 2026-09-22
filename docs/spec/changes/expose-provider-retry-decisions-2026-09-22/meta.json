@@ -1,0 +1,10 @@
+{
+  "change_id": "expose-provider-retry-decisions",
+  "change_ref": "expose-provider-retry-decisions-2026-09-22",
+  "created_at": "2026-09-22T04:50:37Z",
+  "updated_at": "2026-09-22T05:18:57Z",
+  "approved_at": "2026-09-22T04:54:10Z",
+  "completed_at": null,
+  "status": "implementing",
+  "implementation_started_at": "2026-09-22T04:54:10Z"
+}

@@ -1125,6 +1125,8 @@ impl<'a> TurnMachine<'a> {
                 }
                 ProviderTurnOutcome::Success {
                     attempt,
+                    attempt_index,
+                    max_attempts,
                     attempt_visible_output,
                     text,
                     reasoning,
@@ -1157,9 +1159,12 @@ impl<'a> TurnMachine<'a> {
                             turn.clone(),
                             RuntimeEvent::ProviderAttemptFinished {
                                 attempt,
+                                index: Some(attempt_index),
+                                max_attempts: Some(max_attempts),
                                 finish,
                                 retryable: false,
                                 error: None,
+                                retry_delay_ms: None,
                             },
                         );
                         emitter.emit(turn.clone(), RuntimeEvent::Error { error });
@@ -1178,9 +1183,12 @@ impl<'a> TurnMachine<'a> {
                         turn.clone(),
                         RuntimeEvent::ProviderAttemptFinished {
                             attempt,
+                            index: Some(attempt_index),
+                            max_attempts: Some(max_attempts),
                             finish,
                             retryable: false,
                             error: None,
+                            retry_delay_ms: None,
                         },
                     );
 

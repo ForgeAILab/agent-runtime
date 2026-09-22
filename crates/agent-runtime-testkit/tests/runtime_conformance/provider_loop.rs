@@ -186,6 +186,9 @@ async fn retries_keep_both_attempts_visible() {
     assert!(payloads.iter().any(|e| matches!(
         e,
         RuntimeEvent::ProviderAttemptFinished {
+            index: Some(0),
+            max_attempts: Some(3),
+            retry_delay_ms: Some(0),
             retryable: true,
             ..
         }
@@ -200,6 +203,225 @@ async fn retries_keep_both_attempts_visible() {
             .iter()
             .any(|m| m.role == Role::Assistant && m.joined_text().contains("ok"))
     );
+}
+
+#[tokio::test]
+async fn admitted_retry_reports_effective_exponential_delay() {
+    let provider = FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![
+            ScriptedStream::new(vec![ProviderStreamEvent::Error {
+                error: ProviderError::new(
+                    agent_runtime_core::provider::ProviderErrorKind::Server,
+                    "temporary 500",
+                ),
+            }]),
+            ScriptedStream::new(scenarios::stop_events("recovered")),
+        ],
+    );
+    let observer = RecordingObserver::shared();
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(Arc::new(provider))
+        .observer(observer.clone())
+        .retry(RetryPolicy {
+            max_attempts: 2,
+            initial_backoff_ms: 17,
+            max_backoff_ms: 100,
+        })
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    let payloads = observer.payloads();
+    assert!(payloads.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ProviderAttemptFinished {
+            index: Some(0),
+            max_attempts: Some(2),
+            retryable: true,
+            retry_delay_ms: Some(17),
+            ..
+        }
+    )));
+    assert!(
+        payloads
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ProviderAttemptStarted { index: 1, .. }))
+    );
+    assert!(payloads.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ProviderAttemptFinished {
+            index: Some(1),
+            max_attempts: Some(2),
+            retryable: false,
+            retry_delay_ms: None,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn admitted_retry_reports_provider_directed_delay() {
+    let provider = FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![
+            ScriptedStream::new(vec![ProviderStreamEvent::Error {
+                error: ProviderError::new(
+                    agent_runtime_core::provider::ProviderErrorKind::RateLimited,
+                    "try later",
+                )
+                .retry_after(37),
+            }]),
+            ScriptedStream::new(scenarios::stop_events("recovered")),
+        ],
+    );
+    let observer = RecordingObserver::shared();
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(Arc::new(provider))
+        .observer(observer.clone())
+        .retry(RetryPolicy {
+            max_attempts: 2,
+            initial_backoff_ms: 5,
+            max_backoff_ms: 100,
+        })
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    assert!(observer.payloads().iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ProviderAttemptFinished {
+            index: Some(0),
+            max_attempts: Some(2),
+            retryable: true,
+            retry_delay_ms: Some(37),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn retry_delay_is_absent_when_turn_deadline_refuses_attempt() {
+    let provider = FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![ProviderStreamEvent::Error {
+            error: ProviderError::new(
+                agent_runtime_core::provider::ProviderErrorKind::Server,
+                "deadline too close",
+            ),
+        }])],
+    );
+    let clock = agent_runtime_testkit::ManualClock::shared(0);
+    let mut config = LoopConfig::new(ModelId::new("fake"));
+    config.turn_time_limit_ms = Some(10);
+    config.retry = RetryPolicy {
+        max_attempts: 2,
+        initial_backoff_ms: 100,
+        max_backoff_ms: 100,
+    };
+    let observer = RecordingObserver::shared();
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(Arc::new(provider))
+        .observer(observer.clone())
+        .clock(clock)
+        .loop_config(config)
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+
+    let payloads = observer.payloads();
+    assert!(payloads.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ProviderAttemptFinished {
+            index: Some(0),
+            max_attempts: Some(2),
+            retryable: true,
+            retry_delay_ms: None,
+            ..
+        }
+    )));
+    assert!(
+        !payloads
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::ProviderAttemptStarted { index: 1, .. }))
+    );
+    assert!(matches!(
+        payloads.last(),
+        Some(RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::LimitReached {
+                limit: LimitKind::Time
+            },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn deadline_refused_retry_wait_remains_cancellable() {
+    let provider = FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![ProviderStreamEvent::Error {
+            error: ProviderError::new(
+                agent_runtime_core::provider::ProviderErrorKind::Server,
+                "deadline wait",
+            ),
+        }])],
+    );
+    let mut config = LoopConfig::new(ModelId::new("fake"));
+    config.turn_time_limit_ms = Some(5_000);
+    config.retry = RetryPolicy {
+        max_attempts: 2,
+        initial_backoff_ms: 10_000,
+        max_backoff_ms: 10_000,
+    };
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(Arc::new(provider))
+        .loop_config(config)
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    let mut stream = session.subscribe();
+    session.send(UserInput::text("hi")).unwrap();
+
+    while let Some(event) = stream.next().await {
+        if matches!(
+            event.payload,
+            RuntimeEvent::ProviderAttemptFinished {
+                index: Some(0),
+                max_attempts: Some(2),
+                retryable: true,
+                retry_delay_ms: None,
+                ..
+            }
+        ) {
+            session
+                .interrupt_current_turn(CancelReason::UserRequested)
+                .expect("the deadline-limited turn is still active");
+            break;
+        }
+    }
+    let terminal = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(event) = stream.next().await {
+            if let RuntimeEvent::TurnCompleted { finish, .. } = event.payload {
+                return finish;
+            }
+        }
+        panic!("event stream ended before turn completion");
+    })
+    .await
+    .expect("cancellation must interrupt the remaining deadline wait");
+    assert!(matches!(terminal, TurnFinish::Cancelled { .. }));
 }
 
 #[tokio::test]
@@ -241,6 +463,9 @@ async fn pre_output_credential_recovery_replays_once_as_a_visible_attempt() {
     assert!(payloads.iter().any(|event| matches!(
         event,
         RuntimeEvent::ProviderAttemptFinished {
+            index: Some(0),
+            max_attempts: Some(3),
+            retry_delay_ms: Some(0),
             retryable: true,
             ..
         }
@@ -785,6 +1010,9 @@ async fn exhausted_provider_attempts_emit_structured_limit() {
         event,
         RuntimeEvent::ProviderAttemptFinished {
             finish: FinishReason::Error,
+            index: Some(0),
+            max_attempts: Some(1),
+            retry_delay_ms: None,
             retryable: true,
             error: Some(error),
             ..
@@ -833,6 +1061,7 @@ async fn retry_backoff_stops_promptly_on_cancellation() {
             event.payload,
             RuntimeEvent::ProviderAttemptFinished {
                 retryable: true,
+                retry_delay_ms: Some(5_000),
                 ..
             }
         ) {

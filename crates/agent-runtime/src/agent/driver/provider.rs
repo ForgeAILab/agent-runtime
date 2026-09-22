@@ -1286,9 +1286,12 @@ impl Driver {
                     turn.clone(),
                     RuntimeEvent::ProviderAttemptFinished {
                         attempt: attempt_id,
+                        index: Some(attempt_index),
+                        max_attempts: Some(self.config.retry.max_attempts),
                         finish: FinishReason::Cancelled,
                         retryable: false,
                         error: None,
+                        retry_delay_ms: None,
                     },
                 );
                 return ProviderTurnOutcome::Cancelled;
@@ -1306,6 +1309,23 @@ impl Driver {
                 let ordinary_retryable =
                     perr.kind != ProviderErrorKind::Auth && is_retryable(&perr);
                 let retryable = credential_recovery || ordinary_retryable;
+                let retry_budget_available = self.config.retry.allows_retry(attempt_index);
+                let ordinary_retry_delay_ms = (ordinary_retryable && retry_budget_available)
+                    .then(|| self.config.retry.backoff_ms(attempt_index, &perr));
+                let remaining_before_retry = turn_deadline.remaining_millis(self.clock.as_ref());
+                let retry_delay_ms = if credential_recovery && retry_budget_available {
+                    // Credential renewal already had an immediate replay
+                    // contract before retry metadata existed. Keep that
+                    // behavior unchanged and report the admitted zero delay.
+                    Some(0)
+                } else {
+                    ordinary_retry_delay_ms.filter(|delay| {
+                        remaining_before_retry.is_none_or(|remaining| remaining > *delay)
+                    })
+                };
+                let retry_refused_by_deadline = ordinary_retry_delay_ms.is_some()
+                    && retry_delay_ms.is_none()
+                    && !credential_recovery;
                 emitter.emit(
                     turn.clone(),
                     RuntimeEvent::ProviderAttemptOutputDiscarded {
@@ -1317,45 +1337,54 @@ impl Driver {
                     turn.clone(),
                     RuntimeEvent::ProviderAttemptFinished {
                         attempt: attempt_id,
+                        index: Some(attempt_index),
+                        max_attempts: Some(self.config.retry.max_attempts),
                         finish: FinishReason::Error,
                         retryable,
                         error: Some(perr.clone()),
+                        retry_delay_ms,
                     },
                 );
                 if perr.kind == ProviderErrorKind::Cancelled {
                     return ProviderTurnOutcome::Cancelled;
                 }
-                if credential_recovery && self.config.retry.allows_retry(attempt_index) {
-                    credential_recovery_used = true;
+                if let Some(delay) = retry_delay_ms {
+                    if credential_recovery {
+                        credential_recovery_used = true;
+                    }
+                    if ordinary_retryable && delay > 0 {
+                        // `retry_delay_ms` was admitted against the deadline
+                        // before the finish event was emitted. Keep the wait
+                        // cancellable, as before, and do not turn cancellation
+                        // into a provider-attempt failure.
+                        tokio::select! {
+                            _ = turn_cancel.cancelled() => {
+                                return ProviderTurnOutcome::Cancelled;
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                        }
+                    }
                     attempt_index += 1;
                     continue;
                 }
-                if ordinary_retryable && self.config.retry.allows_retry(attempt_index) {
-                    let delay = self.config.retry.backoff_ms(attempt_index, &perr);
-                    if delay > 0 {
-                        let remaining = turn_deadline.remaining_millis(self.clock.as_ref());
-                        let wait_ms = remaining.map_or(delay, |remaining| remaining.min(delay));
-                        if wait_ms == 0 {
-                            return ProviderTurnOutcome::LimitReached {
-                                limit: LimitKind::Time,
-                                provider_error_kind: None,
-                            };
-                        }
+                if retry_refused_by_deadline {
+                    // Preserve the existing turn-deadline behavior: the
+                    // retry is not admitted (and therefore is not announced
+                    // as scheduled), but the turn remains cancellable while
+                    // the remaining deadline elapses.
+                    let wait_ms = remaining_before_retry.unwrap_or_default();
+                    if wait_ms > 0 {
                         tokio::select! {
                             _ = turn_cancel.cancelled() => {
                                 return ProviderTurnOutcome::Cancelled;
                             }
                             _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
                         }
-                        if remaining.is_some_and(|remaining| remaining <= delay) {
-                            return ProviderTurnOutcome::LimitReached {
-                                limit: LimitKind::Time,
-                                provider_error_kind: None,
-                            };
-                        }
                     }
-                    attempt_index += 1;
-                    continue;
+                    return ProviderTurnOutcome::LimitReached {
+                        limit: LimitKind::Time,
+                        provider_error_kind: None,
+                    };
                 }
                 if retryable {
                     return ProviderTurnOutcome::LimitReached {
@@ -1401,9 +1430,12 @@ impl Driver {
                     turn.clone(),
                     RuntimeEvent::ProviderAttemptFinished {
                         attempt: attempt_id,
+                        index: Some(attempt_index),
+                        max_attempts: Some(self.config.retry.max_attempts),
                         finish,
                         retryable: false,
                         error: None,
+                        retry_delay_ms: None,
                     },
                 );
                 return outcome;
@@ -1411,6 +1443,8 @@ impl Driver {
 
             return ProviderTurnOutcome::Success {
                 attempt: attempt_id,
+                attempt_index,
+                max_attempts: self.config.retry.max_attempts,
                 attempt_visible_output,
                 text,
                 reasoning: reasoning.into_parts(),

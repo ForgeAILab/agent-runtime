@@ -418,9 +418,9 @@ fn summary(payload: &RuntimeEvent) -> String {
             error,
             ..
         } => {
-            let error = error.as_ref().map_or_else(String::new, |error| {
-                format!(" error={error}")
-            });
+            let error = error
+                .as_ref()
+                .map_or_else(String::new, |error| format!(" error={error}"));
             format!("provider_attempt_finished finish={finish:?} retryable={retryable}{error}")
         }
         RuntimeEvent::LimitReached { limit } => format!("limit_reached {limit:?}"),

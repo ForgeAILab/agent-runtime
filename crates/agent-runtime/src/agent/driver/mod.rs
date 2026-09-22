@@ -295,6 +295,8 @@ fn validate_contributed_fragment(fragment: &ContextFragment) -> Result<(), Conte
 enum ProviderTurnOutcome {
     Success {
         attempt: agent_runtime_core::ids::AttemptId,
+        attempt_index: u32,
+        max_attempts: u32,
         attempt_visible_output: bool,
         text: String,
         reasoning: Vec<ContentPart>,
