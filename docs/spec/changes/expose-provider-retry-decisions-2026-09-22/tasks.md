@@ -31,6 +31,6 @@ completed_at:
 
 - [x] 4.1 Pass formatting, all-feature Clippy, workspace, docs, schema,
       cross-consumer, dependency-policy, and Rust 1.86 gates.
-- [ ] 4.2 Commit and push the immutable runtime revision.
+- [x] 4.2 Commit and push the immutable runtime revision.
 - [ ] 4.3 Pin Smith to that revision without a committed path override and pass
       the coordinated Smith product gates.
