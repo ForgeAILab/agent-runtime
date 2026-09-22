@@ -772,6 +772,7 @@ impl<'a> TurnMachine<'a> {
                     attempt: response.attempt,
                     finish: response.finish,
                     retryable: false,
+                    error: None,
                 },
             );
             self.emitter.emit(
@@ -806,6 +807,7 @@ impl<'a> TurnMachine<'a> {
                 attempt: response.attempt.clone(),
                 finish: response.finish,
                 retryable: false,
+                error: None,
             },
         );
         if matches!(

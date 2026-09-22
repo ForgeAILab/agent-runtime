@@ -1292,6 +1292,7 @@ impl Driver {
                         attempt: attempt_id,
                         finish: FinishReason::Cancelled,
                         retryable: false,
+                        error: None,
                     },
                 );
                 return ProviderTurnOutcome::Cancelled;
@@ -1322,6 +1323,7 @@ impl Driver {
                         attempt: attempt_id,
                         finish: FinishReason::Error,
                         retryable,
+                        error: Some(perr.clone()),
                     },
                 );
                 if perr.kind == ProviderErrorKind::Cancelled {
@@ -1405,6 +1407,7 @@ impl Driver {
                         attempt: attempt_id,
                         finish,
                         retryable: false,
+                        error: None,
                     },
                 );
                 return outcome;
