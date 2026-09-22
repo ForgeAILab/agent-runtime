@@ -413,8 +413,16 @@ fn summary(payload: &RuntimeEvent) -> String {
             )
         }
         RuntimeEvent::ProviderAttemptFinished {
-            finish, retryable, ..
-        } => format!("provider_attempt_finished finish={finish:?} retryable={retryable}"),
+            finish,
+            retryable,
+            error,
+            ..
+        } => {
+            let error = error.as_ref().map_or_else(String::new, |error| {
+                format!(" error={error}")
+            });
+            format!("provider_attempt_finished finish={finish:?} retryable={retryable}{error}")
+        }
         RuntimeEvent::LimitReached { limit } => format!("limit_reached {limit:?}"),
         RuntimeEvent::Error { error } => format!("error {error}"),
         RuntimeEvent::TurnSteerCommitted { steer, ordinal } => {

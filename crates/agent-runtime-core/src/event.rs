@@ -33,6 +33,7 @@ use crate::ids::{
 use crate::interaction::{InteractionOutcomeKind, InteractionSensitivity};
 use crate::manifest::{ActivatedCapability, SegmentId, SegmentKind, SummaryCoverage};
 use crate::metadata::Metadata;
+use crate::provider::ProviderError;
 
 /// Serde default for flags that are absent on the wire unless notable.
 fn default_true() -> bool {
@@ -838,6 +839,13 @@ pub enum RuntimeEvent {
         finish: FinishReason,
         /// Whether a failure was retryable.
         retryable: bool,
+        /// The error that ended the attempt, present only when `finish` is
+        /// [`FinishReason::Error`]. This is the attempt's own account of its
+        /// failure, emitted before the retry decision, so a client can show
+        /// why an attempt was discarded even when the attempt budget then
+        /// ends the turn without a terminal error event of its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProviderError>,
     },
     /// A configured limit was reached.
     LimitReached {

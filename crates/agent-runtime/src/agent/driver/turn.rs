@@ -1159,6 +1159,7 @@ impl<'a> TurnMachine<'a> {
                                 attempt,
                                 finish,
                                 retryable: false,
+                                error: None,
                             },
                         );
                         emitter.emit(turn.clone(), RuntimeEvent::Error { error });
@@ -1179,6 +1180,7 @@ impl<'a> TurnMachine<'a> {
                             attempt,
                             finish,
                             retryable: false,
+                            error: None,
                         },
                     );
 

@@ -778,6 +778,18 @@ async fn exhausted_provider_attempts_emit_structured_limit() {
             limit: LimitKind::ProviderAttempts
         }
     )));
+    // The attempt's own error must reach observers: the limit terminal
+    // carries no cause, so this event is the only account of why the
+    // attempt budget was spent.
+    assert!(payloads.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ProviderAttemptFinished {
+            finish: FinishReason::Error,
+            retryable: true,
+            error: Some(error),
+            ..
+        } if error.message == "retryable" && error.retryable
+    )));
     assert!(matches!(
         payloads.last(),
         Some(RuntimeEvent::TurnCompleted {
