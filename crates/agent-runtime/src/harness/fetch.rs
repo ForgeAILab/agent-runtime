@@ -598,6 +598,34 @@ pub fn html_to_text(html: &str) -> String {
     parser.finish()
 }
 
+/// Whether `tag` is an HTML void element: one that never has a closing tag
+/// and is almost never written with a trailing slash.
+///
+/// This matters because two of them — `meta` and `link` — are also
+/// content-skipping tags. Treating `<meta charset="utf-8">` as an opening tag
+/// raises the skip depth that nothing will ever lower, so a handful of them
+/// in `<head>` silently swallows the entire document and the converter
+/// returns an empty string for a page that fetched perfectly.
+fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
 struct HtmlConverter {
     markdown_mode: bool,
     output: String,
@@ -763,7 +791,7 @@ impl HtmlConverter {
         if is_skip_tag {
             if is_closing {
                 self.skip_depth = self.skip_depth.saturating_sub(1);
-            } else if !is_self_closing {
+            } else if !is_self_closing && !is_void_element(&tag_name) {
                 self.skip_depth += 1;
             }
             return;
@@ -1105,6 +1133,51 @@ mod tests {
     use agent_runtime_core::workspace::DenyAllWorkspace;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[test]
+    fn a_head_full_of_void_elements_does_not_swallow_the_document() {
+        // The shape every real page has: `meta` and `link` are skip tags AND
+        // void elements, written without a trailing slash. Counting them as
+        // open raised a skip depth nothing could lower, and a page that
+        // fetched perfectly converted to an empty string.
+        let html = concat!(
+            "<!DOCTYPE html><html lang=\"en\"><head>",
+            "<meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width\">",
+            "<link rel=\"stylesheet\" href=\"/style.css\">",
+            "<link rel=\"icon\" href=\"/favicon.ico\">",
+            "<title>Docs</title></head>",
+            "<body><h1>Crate docs</h1><p>The body survives.</p></body></html>",
+        );
+
+        let markdown = html_to_markdown(html);
+        assert!(
+            markdown.contains("Crate docs") && markdown.contains("The body survives."),
+            "the document must survive its own head: {markdown:?}"
+        );
+        assert!(markdown.contains("# Crate docs"), "headings still convert");
+
+        let text = html_to_text(html);
+        assert!(
+            text.contains("Crate docs") && text.contains("The body survives."),
+            "plain text too: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_skip_tag_still_hides_its_contents() {
+        // The void-element exemption must not weaken the skip list itself.
+        let html = "<body><script>var secret = 1;</script><p>visible</p>\
+                    <style>.a{color:red}</style><noscript>hidden</noscript></body>";
+        let markdown = html_to_markdown(html);
+        assert!(markdown.contains("visible"));
+        for hidden in ["secret", "color:red", "hidden"] {
+            assert!(
+                !markdown.contains(hidden),
+                "{hidden} must stay out of the conversion: {markdown:?}"
+            );
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MockTransport {
