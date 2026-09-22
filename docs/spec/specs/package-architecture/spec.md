@@ -133,6 +133,35 @@ boundaries.
 - **AND** existing callers continue to compile through the same supported path
 - **AND** focused and workspace conformance remain behaviorally unchanged
 
+#### Scenario: Cache maintenance responsibilities have stable owners
+
+- **GIVEN** cache maintenance request construction, operation fingerprints,
+  persisted state, dispatch, and result validation are implemented together
+- **WHEN** the cache mechanism is decomposed
+- **THEN** each responsibility belongs to a cohesive module behind the
+  existing `agent_runtime::cache` root
+- **AND** cache dispatch ordering, checkpoint semantics, and validation remain
+  unchanged
+
+#### Scenario: Session cache and recovery code is separated from turn lifecycle
+
+- **GIVEN** a session implementation combines cache checkpoint coordination,
+  interrupted-operation recovery, and turn admission/lifecycle
+- **WHEN** the session implementation is decomposed
+- **THEN** each responsibility has a cohesive module behind the existing
+  `agent_runtime::runtime::session` path
+- **AND** session, cache, and recovery events and checkpoint transitions retain
+  their existing order and behavior
+
+#### Scenario: Provider cache identity remains on its supported root path
+
+- **GIVEN** provider cache identity values, builder validation, and custom
+  deserialization rules form one cohesive type boundary
+- **WHEN** those declarations move into a private provider child module
+- **THEN** supported consumers continue to resolve the same types through
+  `agent_runtime_core::provider`
+- **AND** serialized identity forms and validation behavior remain unchanged
+
 #### Scenario: Exhaustive or security-critical logic remains cohesive
 
 - **GIVEN** a large function centralizes an exhaustive state transition or a
