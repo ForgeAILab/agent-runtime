@@ -27,6 +27,11 @@ use crate::provider::ToolSchema;
 use crate::security::{PermissionSet, SecurityResource};
 use crate::workspace::Workspace;
 
+/// Estimated token cost of an image content part, matching the context
+/// sizer's default image accounting. Core cannot depend on the context crate
+/// because the context crate depends on core.
+const IMAGE_TOKEN_COST: usize = 85;
+
 /// A single declared side effect of a tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "effect", rename_all = "snake_case")]
@@ -1075,7 +1080,8 @@ impl ToolOutcome {
     }
 
     /// Renders this outcome into a canonical, model-facing [`ToolResultBlock`],
-    /// truncating the complete rendered content to `output_limit` characters.
+    /// truncating the complete rendered content to `output_limit` units. Text
+    /// uses character counts; images use their estimated token cost.
     pub fn into_result_block(
         self,
         call_id: ToolCallId,
@@ -1122,14 +1128,7 @@ fn bound_content(content: Vec<ContentPart>, output_limit: usize) -> Vec<ContentP
 fn rendered_size(part: &ContentPart) -> usize {
     match part {
         ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => text.chars().count(),
-        ContentPart::Image { url, detail } => {
-            url.chars().count()
-                + detail
-                    .as_deref()
-                    .map(str::chars)
-                    .map(Iterator::count)
-                    .unwrap_or(0)
-        }
+        ContentPart::Image { .. } => IMAGE_TOKEN_COST,
         ContentPart::ToolCall(call) => {
             call.name.chars().count() + call.arguments.to_string().chars().count()
         }
@@ -1568,6 +1567,29 @@ mod tests {
         let rendered: usize = block.content.iter().map(rendered_size).sum();
         assert!(rendered <= 8);
         assert_eq!(block.content.len(), 2);
+    }
+
+    #[test]
+    fn outcome_keeps_large_image_when_image_cost_fits_output_limit() {
+        const DATA_URL_BYTES: usize = 2 * 1024 * 1024;
+        const DATA_URL_PREFIX: &str = "data:image/png;base64,";
+
+        let image = ContentPart::Image {
+            url: format!(
+                "{DATA_URL_PREFIX}{}",
+                "A".repeat(DATA_URL_BYTES - DATA_URL_PREFIX.len())
+            ),
+            detail: Some("high".into()),
+        };
+        let outcome = ToolOutcome {
+            value: Value::Null,
+            content: vec![image.clone()].into(),
+            is_error: false,
+        };
+        let block = outcome.into_result_block(ToolCallId::new("c"), "generate_image", 32 * 1024);
+
+        assert_eq!(block.content, [image]);
+        assert_eq!(rendered_size(&block.content[0]), IMAGE_TOKEN_COST);
     }
 
     #[test]
