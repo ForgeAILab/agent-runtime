@@ -77,6 +77,11 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   migration adapter, but cannot claim invocation-specific authority.
 
 ### Changed
+- `ProviderAttemptFinished` now carries optional zero-based attempt position,
+  configured attempt total, and the effective delay before an actually
+  admitted retry. Legacy journals deserialize the fields as absent, while
+  consumers can distinguish retryable classification from a scheduled retry
+  without duplicating runtime backoff or deadline policy.
 - The direct loop is a versioned, checkpointable turn machine. Mutable
   planning/cache/activation/extension state is session-owned, and completed
   turns are saved before `TurnCompleted` becomes the durable terminal
@@ -337,6 +342,8 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   Messages are projected one for one, so an assistant message that carried
   nothing but shed reasoning arrives empty; the OpenAI-compatible wire drops
   it rather than sending a blank assistant line.
+- The release lock now resolves `rustls` 0.23.45 and `rustls-webpki` 0.103.15,
+  clearing RUSTSEC-2026-0285 before publication.
 - `ContextPlanned::input_budget_tokens` now reports the enforced input budget
   it was always documented as, instead of the counted consumption (which
   moved to the new `input_tokens` field).
