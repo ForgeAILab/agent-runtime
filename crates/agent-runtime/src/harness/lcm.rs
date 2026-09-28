@@ -1889,8 +1889,24 @@ impl LcmCoordinator {
         {
             boundary -= 1;
         }
+        // The oldest canonical turn alone can exceed the leaf target, or
+        // reach into the retained tail. An agentic turn is not bounded by one
+        // reply: a long tool loop can fill the whole window with no user
+        // boundary inside it. Backing up to an earlier user boundary can then
+        // never produce a plan, so every admission would end in "cannot fit"
+        // with the frontier stuck in front of that turn. In that case the
+        // whole turn becomes one oversized leaf; the summary replaces it
+        // regardless of its source size. It ends at the next user entry, or
+        // at the end of the source, where the protected active turn begins.
+        let oldest_turn_end = raw_entries
+            .iter()
+            .skip(1)
+            .position(|entry| entry.content.role == Role::User)
+            .map_or(raw_entries.len(), |offset| offset + 1);
+        let mut target_tokens = self.policy.pressure.leaf_target_tokens;
         if boundary == 0 {
-            return Ok(None);
+            boundary = oldest_turn_end;
+            target_tokens = u64::MAX;
         }
         loop {
             let Some(first_entry) = raw_entries.first() else {
@@ -1898,7 +1914,7 @@ impl LcmCoordinator {
             };
             let Some(plan) = plan_leaf_with_frontier(
                 &raw_entries[..boundary],
-                self.policy.pressure.leaf_target_tokens,
+                target_tokens,
                 &format!("leaf:{history_len}:{boundary}"),
                 &self.policy.pressure.revision,
                 &self.policy.algorithm_revision,
@@ -1926,13 +1942,17 @@ impl LcmCoordinator {
             // source. Back up to the preceding user boundary; never ask the
             // leaf planner to manufacture a pair across that boundary.
             let search_before = selected.min(boundary).min(raw_entries.len());
-            let Some(previous_user) = raw_entries[..search_before]
+            match raw_entries[..search_before]
                 .iter()
                 .rposition(|entry| entry.content.role == Role::User)
-            else {
-                return Ok(None);
-            };
-            boundary = previous_user;
+            {
+                Some(previous_user) if previous_user > 0 => boundary = previous_user,
+                _ if target_tokens == u64::MAX => return Ok(None),
+                _ => {
+                    boundary = oldest_turn_end;
+                    target_tokens = u64::MAX;
+                }
+            }
         }
     }
 
@@ -4017,6 +4037,10 @@ mod tests {
         fn active_node_count(&self) -> usize {
             self.nodes.lock().expect("test store lock").len()
         }
+
+        fn active_nodes_for_test(&self) -> Vec<agent_runtime_lcm::LcmNode> {
+            self.nodes.lock().expect("test store lock").clone()
+        }
     }
 
     #[derive(Debug)]
@@ -4449,6 +4473,16 @@ mod tests {
         max_rounds: usize,
         leaf_target_tokens: u64,
     ) -> LcmCoordinator {
+        pressure_coordinator_retaining(store, budget, max_rounds, leaf_target_tokens, 0)
+    }
+
+    fn pressure_coordinator_retaining(
+        store: Arc<TestStore>,
+        budget: u64,
+        max_rounds: usize,
+        leaf_target_tokens: u64,
+        retain_recent_entries: usize,
+    ) -> LcmCoordinator {
         let session = SessionId::new("lcm-session");
         let binding = LcmTimelineBinding::new(
             session,
@@ -4464,7 +4498,7 @@ mod tests {
                 hard_threshold_percent: 80,
                 leaf_target_tokens,
                 condensation_fanout: 32,
-                retain_recent_entries: 0,
+                retain_recent_entries,
                 max_rounds,
                 ..LcmPressurePolicy::default()
             },
@@ -5053,6 +5087,66 @@ mod tests {
         );
         assert_eq!(error.metadata.get("rounds").unwrap().to_string(), "2");
         assert_eq!(store.leaf_commit_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// One agentic turn can hold many tool rounds and no user boundary. When
+    /// that turn alone exceeds the leaf target, backing up to a previous user
+    /// boundary finds nothing, so hard pressure must take the whole turn as
+    /// one oversized leaf rather than refusing every later admission.
+    #[tokio::test]
+    async fn hard_compaction_swallows_an_oversized_tool_loop_turn() {
+        // With no retained tail the turn outgrows the target; with the default
+        // retained tail it also reaches into the retained entries.
+        for retain in [0, LcmPressurePolicy::default().retain_recent_entries] {
+            swallow_oversized_tool_loop_turn(retain).await;
+        }
+    }
+
+    async fn swallow_oversized_tool_loop_turn(retain_recent_entries: usize) {
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let coordinator =
+            pressure_coordinator_retaining(store.clone(), 120, 4, 16, retain_recent_entries);
+        let mut history = vec![Message::user("split this task")];
+        for round in 0..8 {
+            let call_id = agent_runtime_core::ids::ToolCallId::new(format!("call-{round}"));
+            history.push(Message::assistant(vec![
+                ContentPart::text(format!(
+                    "round {round}: retrying the split with a different revision guess {}",
+                    "and a long explanation ".repeat(4)
+                )),
+                ContentPart::ToolCall(agent_runtime_core::content::ToolCall {
+                    id: call_id.clone(),
+                    name: "propose".into(),
+                    arguments: serde_json::json!({"revision": round}),
+                }),
+            ]));
+            history.push(Message::tool_result(
+                agent_runtime_core::content::ToolResultBlock {
+                    call_id,
+                    name: "propose".into(),
+                    content: vec![ContentPart::text("version_conflict")],
+                    is_error: true,
+                },
+            ));
+        }
+        let first_turn_len = history.len();
+        history.push(Message::user("split this task"));
+
+        let outcome = drain_before_provider(
+            &coordinator,
+            commit_view(&SessionId::new("lcm-session"), "retry-turn", &history, None),
+        )
+        .await;
+        assert!(
+            outcome.block.is_none(),
+            "an oversized tool-loop turn must compact, not refuse admission: {:?}",
+            outcome.block
+        );
+        assert_eq!(store.leaf_commit_count.load(Ordering::SeqCst), 1);
+        let nodes = store.active_nodes_for_test();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].range.start.get(), 0);
+        assert_eq!(nodes[0].range.end.get(), (first_turn_len - 1) as u64);
     }
 
     #[tokio::test]

@@ -324,6 +324,14 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   event-schema, shutdown) plus neutral consumer adapter fixtures.
 
 ### Fixed
+- LCM hard compaction no longer wedges a session behind one oversized agentic
+  turn. Leaf planning only cuts at user boundaries, so a single turn whose
+  tool loop outgrew `leaf_target_tokens` (many tool rounds, no user message
+  inside) could never be planned: every admission backed up to the frontier
+  and failed with "LCM context cannot fit after bounded hard compaction",
+  forever. The same wedge hit a turn that reached into the
+  `retain_recent_entries` tail. When the oldest raw turn cannot be cut, it is
+  now taken whole as one oversized leaf.
 - A tool call that breaks a registered tool's schema is now answered instead
   of fatal. The stream boundary rejected it as a malformed stream, which
   failed the whole turn, while the executor -- which already validates the
