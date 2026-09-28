@@ -39,6 +39,7 @@ use crate::manifest::{
     ActivatedCapability, SegmentId, SegmentKind, SegmentSensitivity, SummaryCoverage,
 };
 use crate::metadata::Metadata;
+use crate::provider::ProviderError;
 
 /// Serde default for flags that are absent on the wire unless notable.
 fn default_true() -> bool {
@@ -1376,10 +1377,31 @@ pub enum RuntimeEvent {
     ProviderAttemptFinished {
         /// The attempt id.
         attempt: AttemptId,
+        /// Zero-based position of the finished attempt, when emitted by the
+        /// live provider loop. Older journals may omit this metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+        /// Configured total number of provider attempts, including the first
+        /// attempt, when emitted by the live provider loop. Older journals may
+        /// omit this metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_attempts: Option<u32>,
         /// The finish reason.
         finish: FinishReason,
         /// Whether a failure was retryable.
         retryable: bool,
+        /// The error that ended the attempt, present only when `finish` is
+        /// [`FinishReason::Error`]. This is the attempt's own account of its
+        /// failure, emitted before the retry decision, so a client can show
+        /// why an attempt was discarded even when the attempt budget then
+        /// ends the turn without a terminal error event of its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProviderError>,
+        /// Effective delay before an admitted next attempt. `Some(0)` means
+        /// the next attempt is admitted immediately; `None` means that no
+        /// retry was admitted. Older journals may omit this metadata.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_delay_ms: Option<u64>,
     },
     /// A configured limit was reached.
     LimitReached {
@@ -1717,6 +1739,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_provider_attempt_finish_without_retry_metadata_remains_readable() {
+        let event: RuntimeEvent = serde_json::from_value(serde_json::json!({
+            "event": "provider_attempt_finished",
+            "attempt": "attempt-1",
+            "finish": "error",
+            "retryable": true,
+            "error": {
+                "kind": "server",
+                "message": "temporary outage",
+                "retryable": true
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::ProviderAttemptFinished {
+                index: None,
+                max_attempts: None,
+                retry_delay_ms: None,
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn lcm_lifecycle_round_trips_without_content_or_authority_fields() {
         let event = RuntimeEvent::LcmLifecycle {
             kind: LcmLifecycleKind::LeafCommit,
@@ -1892,6 +1940,24 @@ mod tests {
                 "opaque id leaked in Debug: {opaque}"
             );
         }
+    }
+
+    #[test]
+    fn provider_attempt_finish_retry_metadata_roundtrips_zero_delay() {
+        let event = RuntimeEvent::ProviderAttemptFinished {
+            attempt: AttemptId::new("attempt-1"),
+            index: Some(0),
+            max_attempts: Some(3),
+            finish: FinishReason::Error,
+            retryable: true,
+            error: None,
+            retry_delay_ms: Some(0),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["index"], 0);
+        assert_eq!(json["max_attempts"], 3);
+        assert_eq!(json["retry_delay_ms"], 0);
+        assert_eq!(serde_json::from_value::<RuntimeEvent>(json).unwrap(), event);
     }
 
     #[test]

@@ -179,7 +179,8 @@ impl LiveAbilityRuntime {
         )]);
         let mut materialized = BTreeMap::new();
         materialized.insert(search_id, search_payload);
-        let session = SessionAbilities {
+        let mut session = SessionAbilities {
+            rebased: false,
             snapshot: self.snapshot_fingerprint(),
             scoped,
             descriptor_view,
@@ -195,6 +196,7 @@ impl LiveAbilityRuntime {
         if let Some(persisted) = extension_state.get(ACTIVATION_STATE_NAMESPACE) {
             if rebase_completed && !self.persisted_scope_matches(&session, persisted)? {
                 self.rebase_session_state(&session, persisted)?;
+                session.rebased = true;
             } else {
                 self.restore_session_state(&session, persisted)?;
             }

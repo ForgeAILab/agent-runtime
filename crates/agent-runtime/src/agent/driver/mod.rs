@@ -302,6 +302,8 @@ fn validate_contributed_fragment(fragment: &ContextFragment) -> Result<(), Conte
 enum ProviderTurnOutcome {
     Success {
         attempt: agent_runtime_core::ids::AttemptId,
+        attempt_index: u32,
+        max_attempts: u32,
         attempt_visible_output: bool,
         text: String,
         reasoning: Vec<ContentPart>,
@@ -901,6 +903,7 @@ impl Driver {
         turn_cancel: Cancellation,
         inbox: Arc<Mutex<InjectionQueue>>,
         checkpoint: TurnCheckpoint,
+        activation_changed: bool,
     ) {
         let turn_id = checkpoint.turn.clone();
         TurnMachine::from_checkpoint(
@@ -918,7 +921,7 @@ impl Driver {
             },
             checkpoint,
         )
-        .abandon()
+        .abandon(activation_changed)
         .await;
     }
 }
