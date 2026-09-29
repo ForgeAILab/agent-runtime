@@ -102,6 +102,8 @@ pub struct RuntimeBuilder {
     /// provider/tool loop.
     #[cfg(feature = "external-agent")]
     external_agent: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
+    #[cfg(feature = "external-agent")]
+    external_capabilities: crate::agent::external::ExternalCapabilities,
     harness: HarnessPipelineBuilder,
     lcm: Option<Arc<LcmCoordinator>>,
 }
@@ -112,6 +114,8 @@ impl RuntimeBuilder {
         Self {
             #[cfg(feature = "external-agent")]
             external_agent: None,
+            #[cfg(feature = "external-agent")]
+            external_capabilities: Default::default(),
             provider: None,
             tools: Vec::new(),
             approval: None,
@@ -304,7 +308,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Caps initial and on-demand activation schema cost and cardinality.
     /// Routes every turn to an installed external agent instead of the
     /// provider/tool loop.
     ///
@@ -320,6 +323,19 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Skills, MCP servers, and tool policy injected into every external
+    /// turn. Validated at [`build`](Self::build); a runtime without an
+    /// external agent rejects a non-empty value rather than ignoring it.
+    #[cfg(feature = "external-agent")]
+    pub fn external_capabilities(
+        mut self,
+        capabilities: crate::agent::external::ExternalCapabilities,
+    ) -> Self {
+        self.external_capabilities = capabilities;
+        self
+    }
+
+    /// Caps initial and on-demand activation schema cost and cardinality.
     pub fn activation_budget(mut self, budget: ActivationBudget) -> Self {
         self.live_ability_routing = true;
         self.activation_budget = Some(budget);
@@ -647,6 +663,15 @@ impl RuntimeBuilder {
     /// failure above, not a guessed context window.
     pub fn build(mut self) -> Result<Runtime, RuntimeError> {
         self.config.steer_limits.validate()?;
+        #[cfg(feature = "external-agent")]
+        {
+            self.external_capabilities.validate()?;
+            if self.external_agent.is_none() && !self.external_capabilities.is_empty() {
+                return Err(RuntimeError::config(
+                    "external capabilities require an external agent backend",
+                ));
+            }
+        }
         let provider = self
             .provider
             .ok_or_else(|| RuntimeError::config("a provider is required"))?;
@@ -869,7 +894,7 @@ impl RuntimeBuilder {
             live_abilities,
         );
         #[cfg(feature = "external-agent")]
-        let driver = driver.with_external_agent(self.external_agent);
+        let driver = driver.with_external_agent(self.external_agent, self.external_capabilities);
 
         let shared = RuntimeShared {
             driver,

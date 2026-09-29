@@ -129,6 +129,8 @@ impl<'a> ExternalTurnMachine<'a> {
             resume: self.stored_session(),
             turn: turn_id.clone(),
             cancel: self.machine.cancel.clone(),
+            capabilities: driver.external_capabilities.clone(),
+            bridge: None,
         };
 
         let mut stream = match self.backend.run_turn(request).await {

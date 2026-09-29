@@ -13,6 +13,8 @@ pub mod config;
 pub mod driver;
 #[cfg(feature = "external-agent")]
 pub mod external;
+#[cfg(feature = "external-agent")]
+pub mod external_capabilities;
 pub mod planning;
 
 pub use config::{DowngradePolicy, LoopConfig};
