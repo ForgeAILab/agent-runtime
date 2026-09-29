@@ -29,5 +29,7 @@ tokio = { workspace = true, features = ["process", "io-util", "fs"] }
 uuid.workspace = true
 
 [dev-dependencies]
+# The live bridge test drives a real runtime whose tools the CLI calls back.
+agent-runtime = { workspace = true, features = ["external-agent-bridge"] }
 futures-util.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "fs", "rt-multi-thread"] }

@@ -79,6 +79,10 @@ pub struct CodexConfig {
     pub turn_dir_root: PathBuf,
     /// Optional API key. Credential files are never copied.
     pub api_key: Option<CodexApiKey>,
+    /// Pass `--skip-git-repo-check`. On by default: the host chose `cwd`
+    /// explicitly, and exec otherwise refuses any directory that is not a
+    /// trusted git repository. The sandbox mode still applies either way.
+    pub skip_git_repo_check: bool,
     /// Additional arguments placed before exec.
     pub extra_args: Vec<String>,
     /// Additional child environment entries.
@@ -95,6 +99,7 @@ impl Default for CodexConfig {
             sandbox: "read-only".to_owned(),
             turn_dir_root: session_dir::default_root(),
             api_key: None,
+            skip_git_repo_check: true,
             extra_args: Vec::new(),
             extra_env: BTreeMap::new(),
         }
@@ -271,6 +276,9 @@ impl CodexBackend {
             "--strict-config".to_owned(),
             "--ignore-user-config".to_owned(),
         ]);
+        if self.config.skip_git_repo_check {
+            args.push("--skip-git-repo-check".to_owned());
+        }
         if let Some(resume) = &request.resume {
             args.push(resume.as_str().to_owned());
         }

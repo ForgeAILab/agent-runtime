@@ -253,7 +253,9 @@ mod process_tests {
         assert!(argv.contains("--disable\napps\n"));
         assert!(argv.contains("--model\ngpt-6-luna\n"));
         assert!(argv.contains("model_reasoning_effort=\"low\""));
-        assert!(argv.contains("exec\n--json\n--strict-config\n--ignore-user-config\nprompt"));
+        assert!(argv.contains(
+            "exec\n--json\n--strict-config\n--ignore-user-config\n--skip-git-repo-check\nprompt"
+        ));
 
         let _ = run(
             &backend,
@@ -263,7 +265,9 @@ mod process_tests {
         )
         .await;
         let resumed = std::fs::read_to_string(&capture).unwrap();
-        assert!(resumed.contains("exec\nresume\n--json\n--strict-config\n--ignore-user-config\n"));
+        assert!(resumed.contains(
+            "exec\nresume\n--json\n--strict-config\n--ignore-user-config\n--skip-git-repo-check\n"
+        ));
 
         let bridge = ExternalToolBridge {
             url: "http://127.0.0.1:4242/mcp".to_owned(),
