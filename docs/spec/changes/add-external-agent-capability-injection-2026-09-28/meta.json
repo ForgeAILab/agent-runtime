@@ -2,7 +2,8 @@
   "change_id": "add-external-agent-capability-injection",
   "change_ref": "add-external-agent-capability-injection-2026-09-28",
   "created_at": "2026-09-28T22:30:00Z",
-  "updated_at": "2026-09-28T22:30:00Z",
+  "updated_at": "2026-09-29T03:30:00Z",
   "completed_at": null,
-  "status": "proposed"
+  "status": "implemented",
+  "implementation_started_at": "2026-09-28T23:00:00Z"
 }

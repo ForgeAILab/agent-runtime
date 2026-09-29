@@ -130,6 +130,16 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+- External agent capability injection: `ExternalCapabilities` (skills, MCP
+  servers, tool allowlist, runtime tools) attached with
+  `RuntimeBuilder::external_capabilities` and delivered on every
+  `ExternalTurnRequest`. Feature `external-agent-bridge` serves the session's
+  runtime tools to the CLI as a turn-scoped loopback MCP server whose calls go
+  through ordinary authorization and approval.
+- `agent-runtime-agent-cli`: `ClaudeCodeBackend` (`claude` feature) and
+  `CodexBackend` (`codex` feature) realize those capabilities with each CLI's
+  launch-scoped flags, never touching global CLI config. See
+  `docs/external-agents.md`.
 - Responses adapters now forward bounded model-advertised reasoning efforts,
   including Codex `xhigh`, `max`, and `ultra`, instead of imposing the legacy
   `low`/`medium`/`high` allowlist.
