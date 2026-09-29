@@ -39,14 +39,16 @@ loses keychain/OAuth logins (Claude, Cursor, Gemini) -- isolate by flags.
 - **Per-turn materialization dir.** The adapter writes generated files (plugin
   dir, mcp json, policy) under a runtime-owned session directory, never in the
   user's workspace or global config, and re-creates them for every turn.
-- **Tool bridge as an MCP server.** Runtime tools reach the CLI as one injected
-  MCP server named `runtime`. The CLI spawns a tiny stdio shim which connects to
-  a per-turn Unix socket (named pipe on Windows) owned by the turn driver; the
-  socket path and a one-turn token are passed via env. A call enters the
-  ordinary tool pipeline (authorize/approve/invoke) and its result is recorded
-  canonically. Alternatives: streamable-HTTP loopback server (works for all
-  four CLIs but needs a TCP listener and TLS-less auth token); rejected as the
-  default, kept as fallback for CLIs without stdio MCP.
+- **Tool bridge as a loopback HTTP MCP server.** Runtime tools reach the CLI
+  as one injected streamable-HTTP MCP server named `runtime`, bound to
+  `127.0.0.1` on an ephemeral port for the turn, authenticated by a per-turn
+  bearer token (`ExternalToolBridge`). Both Claude (`type: http` + `headers`)
+  and Codex (`mcp_servers.<n>.url` + `http_headers`) connect natively, so no
+  shim binary ships. A call enters the ordinary tool pipeline
+  (authorize/approve/invoke) and emits the ordinary tool events; it is not
+  inserted into message history, which for an external turn the CLI owns.
+  Alternative considered: stdio shim + Unix socket (no TCP listener, but a
+  binary to ship and locate per platform); rejected for v1.
 - **Approval bridging.** The CLI-side policy auto-allows the bridge's tools so
   the CLI never prompts; the real approval happens runtime-side inside the
   bridge call, which may block until the host answers. Third-party injected
@@ -82,12 +84,11 @@ struct literal are updated (crate-internal only).
 
 ## Open Questions
 
-1. Codex skills need `CODEX_HOME/skills` (or the workspace's `.codex/skills`).
-   Options: (a) session `CODEX_HOME` + require `CODEX_API_KEY`/`OPENAI_API_KEY`;
-   (b) session `CODEX_HOME` with `auth.json` symlinked to the user's (token
-   refresh may replace the link); (c) inline skill bodies via `AGENTS.md`-style
-   instructions instead of native skills. Recommended: (a) when a key is
-   configured, else (c).
+1. RESOLVED (2026-09-28): Codex skills need `CODEX_HOME/skills`. The adapter
+   uses a session `CODEX_HOME` only when the host configures an API key
+   credential; otherwise it keeps the user's `CODEX_HOME` and delivers skill
+   bodies as developer instructions (no native skill discovery). Credential
+   files are never copied.
 2. Should third-party MCP servers also be routed through the bridge (proxy) so
    their calls get runtime approval and canonical records? Deferred; costs a
    second hop and re-implements server lifecycles.

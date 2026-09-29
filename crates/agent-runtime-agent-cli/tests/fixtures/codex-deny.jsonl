@@ -1,0 +1,11 @@
+Reading additional input from stdin...
+{"type":"thread.started","thread_id":"01a0ea05-efa7-7073-a5c0-5a2ae062acff"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"/bin/zsh -lc 'pwd && rg -n \"lab_nonce\" .'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"/bin/zsh -lc 'pwd && rg -n \"lab_nonce\" .'","aggregated_output":"/lab/work/codex/live/session\n","exit_code":1,"status":"failed"}}
+{"type":"item.started","item":{"id":"item_3","type":"mcp_tool_call","server":"lab","tool":"lab_nonce","arguments":{"label":"deny"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"mcp_tool_call","server":"lab","tool":"lab_nonce","arguments":{"label":"deny"},"result":null,"error":{"message":"MCP tool call requires approval, but approval policy is never"},"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"The `lab_nonce` call was rejected because it requires approval, and the current approval policy is set to never. I can’t retrieve or print the nonce."}}
+{"type":"turn.completed","usage":{"input_tokens":79009,"cached_input_tokens":68608,"cache_write_input_tokens":0,"output_tokens":138,"reasoning_output_tokens":0}}

@@ -1,0 +1,33 @@
+[package]
+name = "agent-runtime-agent-cli"
+description = "External agent backends that run installed coding CLIs (Claude Code, Codex) with injected skills, MCP servers, and runtime tools."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# One feature per CLI so a host builds only the adapters it ships.
+claude = []
+codex = []
+
+[dependencies]
+agent-runtime = { workspace = true, features = ["external-agent"] }
+agent-runtime-core.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "fs"] }
+uuid.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "fs", "rt-multi-thread"] }
