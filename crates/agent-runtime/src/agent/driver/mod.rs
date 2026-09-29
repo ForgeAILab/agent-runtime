@@ -967,6 +967,8 @@ struct TurnMachineContext {
     acceptance: Option<Arc<TurnAcceptance>>,
 }
 
+#[cfg(feature = "external-agent-bridge")]
+mod external_bridge;
 #[cfg(feature = "external-agent")]
 mod external_turn;
 mod provider;

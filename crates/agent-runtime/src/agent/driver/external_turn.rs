@@ -26,6 +26,9 @@ use crate::agent::external::{
     ExternalTurnRequest, SharedExternalAgentBackend,
 };
 
+#[cfg(feature = "external-agent-bridge")]
+use super::external_bridge::ExternalToolBridgeServer;
+
 use super::{TurnMachine, TurnMachineContext, discard_reason_for_finish};
 
 /// Stable purpose label for usage a backend reported.
@@ -124,18 +127,54 @@ impl<'a> ExternalTurnMachine<'a> {
             return;
         }
 
+        #[cfg(feature = "external-agent-bridge")]
+        let mut bridge_server = if driver.external_capabilities.runtime_tools {
+            match ExternalToolBridgeServer::start(
+                driver,
+                state.clone(),
+                execution.clone(),
+                emitter.clone(),
+                self.machine.minter.clone(),
+                self.machine.cancel.clone(),
+                turn_id.clone(),
+                turn_deadline,
+            )
+            .await
+            {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    emitter.emit(turn.clone(), RuntimeEvent::Error { error });
+                    self.machine
+                        .publish_terminal(TurnFinish::Failed, false)
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        #[cfg(feature = "external-agent-bridge")]
+        let bridge = bridge_server.as_ref().map(|server| server.description());
+        #[cfg(not(feature = "external-agent-bridge"))]
+        let bridge = None;
+
         let request = ExternalTurnRequest {
             input,
             resume: self.stored_session(),
             turn: turn_id.clone(),
             cancel: self.machine.cancel.clone(),
             capabilities: driver.external_capabilities.clone(),
-            bridge: None,
+            bridge,
         };
 
         let mut stream = match self.backend.run_turn(request).await {
             Ok(stream) => stream,
             Err(error) => {
+                #[cfg(feature = "external-agent-bridge")]
+                if let Some(server) = &mut bridge_server {
+                    server.stop().await;
+                }
                 // The backend refused before producing anything, so there is
                 // no partial answer to reconcile.
                 emitter.emit(turn.clone(), RuntimeEvent::Error { error });
@@ -152,17 +191,24 @@ impl<'a> ExternalTurnMachine<'a> {
         let mut usage_delta = None;
         let mut finish: Option<TurnFinish> = None;
 
-        while let Some(event) = stream.next().await {
-            if self.machine.cancel.is_cancelled() {
-                finish = Some(TurnFinish::Cancelled {
-                    reason: self
-                        .machine
-                        .cancel
-                        .reason()
-                        .unwrap_or(agent_runtime_core::cancel::CancelReason::UserRequested),
-                });
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = self.machine.cancel.cancelled() => {
+                    finish = Some(TurnFinish::Cancelled {
+                        reason: self
+                            .machine
+                            .cancel
+                            .reason()
+                            .unwrap_or(agent_runtime_core::cancel::CancelReason::UserRequested),
+                    });
+                    break;
+                }
+                event = stream.next() => event,
+            };
+            let Some(event) = next else {
                 break;
-            }
+            };
 
             match event {
                 ExternalAgentEvent::SessionStarted { session: reported } => {
@@ -226,6 +272,11 @@ impl<'a> ExternalTurnMachine<'a> {
                     break;
                 }
             }
+        }
+
+        #[cfg(feature = "external-agent-bridge")]
+        if let Some(server) = &mut bridge_server {
+            server.stop().await;
         }
 
         // A stream that ends without a terminal event is a broken backend

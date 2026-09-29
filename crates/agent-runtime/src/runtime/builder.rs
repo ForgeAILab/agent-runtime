@@ -671,6 +671,12 @@ impl RuntimeBuilder {
                     "external capabilities require an external agent backend",
                 ));
             }
+            #[cfg(not(feature = "external-agent-bridge"))]
+            if self.external_capabilities.runtime_tools {
+                return Err(RuntimeError::config(
+                    "external runtime tools require the `external-agent-bridge` feature",
+                ));
+            }
         }
         let provider = self
             .provider
@@ -1123,6 +1129,19 @@ mod tests {
             .tool(Arc::new(PureTool))
             .build()
             .expect("authority-free tools need no authoritative coverage");
+    }
+
+    #[cfg(not(feature = "external-agent-bridge"))]
+    #[test]
+    fn runtime_without_external_bridge_feature_keeps_the_default_build_path() {
+        // The bridge is deliberately optional; this catches accidental
+        // references to its socket/runtime dependencies from the default
+        // runtime configuration.
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .build()
+            .expect("the default runtime must build without the bridge feature");
     }
 
     #[test]

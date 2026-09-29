@@ -1098,6 +1098,117 @@ impl<'a> TurnMachine<'a> {
         self.prepare_and_run_local(request_id, call, deadline).await
     }
 
+    /// Runs one MCP bridge call through the same executor pipeline as a
+    /// direct tool call, while deliberately omitting the direct loop's
+    /// checkpoint/history/terminal boundaries. The external CLI owns the
+    /// conversation for this turn; the runtime still owns authorization,
+    /// approval, invocation, and the ordinary tool lifecycle events.
+    #[cfg(feature = "external-agent-bridge")]
+    pub(super) async fn run_external_bridge_action(
+        &mut self,
+        call: ToolCall,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let request_id = self.minter.request();
+        self.emit_local_tool_requested(&call);
+        self.prepare_and_run_external(request_id, call, deadline)
+            .await
+    }
+
+    #[cfg(feature = "external-agent-bridge")]
+    async fn prepare_and_run_external(
+        &mut self,
+        request_id: RequestId,
+        mut call: ToolCall,
+        deadline: Deadline,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let mut approval_edits = 0usize;
+        loop {
+            match self
+                .driver
+                .executor
+                .prepare_and_authorize_once(
+                    &call,
+                    call.arguments.clone(),
+                    PreparationAuthorizationContext::new(
+                        &request_id,
+                        self.emitter.session(),
+                        Some(&self.turn_id),
+                        &self.cancel,
+                        deadline,
+                    ),
+                )
+                .await
+            {
+                PreparedAuthorization::Ready(ready) => {
+                    let raw = self
+                        .driver
+                        .executor
+                        .invoke_one_raw(ready, &request_id, &self.cancel, deadline)
+                        .await;
+                    let result = raw.outcome.into_result_block(
+                        raw.call.id.clone(),
+                        raw.call.name.clone(),
+                        self.driver.config.output_limit,
+                    );
+                    self.publish_local_result(&result);
+                    return Ok(result);
+                }
+                PreparedAuthorization::AwaitingApproval(pending) => {
+                    match self
+                        .driver
+                        .executor
+                        .decide_pending_approval(
+                            pending,
+                            &request_id,
+                            self.emitter.session(),
+                            &self.turn_id,
+                            &self.cancel,
+                            deadline,
+                        )
+                        .await
+                    {
+                        PendingApprovalResolution::Ready(ready) => {
+                            let raw = self
+                                .driver
+                                .executor
+                                .invoke_one_raw(ready, &request_id, &self.cancel, deadline)
+                                .await;
+                            let result = raw.outcome.into_result_block(
+                                raw.call.id.clone(),
+                                raw.call.name.clone(),
+                                self.driver.config.output_limit,
+                            );
+                            self.publish_local_result(&result);
+                            return Ok(result);
+                        }
+                        PendingApprovalResolution::Edited(edited) => {
+                            approval_edits = approval_edits.saturating_add(1);
+                            if approval_edits > 8 {
+                                let result = crate::tool::executor::error_block(
+                                    &edited,
+                                    "approval denied: too many edited action proposals",
+                                    self.driver.config.output_limit,
+                                );
+                                self.publish_local_result(&result);
+                                return Ok(result);
+                            }
+                            call = edited;
+                        }
+                        PendingApprovalResolution::Rejected(result) => {
+                            self.publish_local_result(&result);
+                            return Ok(result);
+                        }
+                    }
+                }
+                PreparedAuthorization::Rejected(result) => {
+                    self.publish_local_result(&result);
+                    return Ok(result);
+                }
+            }
+        }
+    }
+
     pub(super) fn emit_local_tool_requested(&self, call: &ToolCall) {
         self.emitter.emit(
             Some(self.turn_id.clone()),

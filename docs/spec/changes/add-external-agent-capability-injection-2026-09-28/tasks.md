@@ -9,9 +9,22 @@ completed_at:
 - [ ] 1.2 Carry capabilities on `ExternalTurnRequest`; builder/session API to attach them; default empty.
 
 ## 2. Runtime tool bridge
-- [ ] 2.1 `agent-runtime-mcp` feature `bridge`: MCP server over a per-turn local socket that lists the session's tools and dispatches calls through the ordinary tool pipeline.
-- [ ] 2.2 Stdio shim binary/entrypoint the CLI spawns; connects with socket path + one-turn token from env.
-- [ ] 2.3 Turn driver owns bridge lifetime; teardown on terminal/cancel; canonical recording of bridge calls.
+- [ ] 2.1 Add the `agent-runtime` feature `external-agent-bridge` (which implies
+  `external-agent` and Tokio `net`/`io-util`) and a minimal streamable-HTTP MCP
+  server bound to loopback on an ephemeral port. Authenticate every request
+  with a per-turn bearer token, bound request bodies, support initialize,
+  initialized notifications, tools/list, tools/call, ping, 405 for GET, and
+  minimal `Mcp-Session-Id` handling.
+- [ ] 2.2 Project the sealed runtime tool registry into MCP tool descriptors and
+  dispatch `tools/call` through the existing prepare/authorize/approve/invoke
+  executor path. Emit the ordinary runtime tool and approval lifecycle events,
+  return MCP text results (including structured output serialized as JSON),
+  map denials/failures to `isError: true`, and never append bridge exchanges to
+  canonical history because the external CLI owns that conversation.
+- [ ] 2.3 Start the bridge before `ExternalAgentBackend::run_turn`, put its
+  `ExternalToolBridge { url, bearer_token, tools }` description on the request,
+  allow bounded concurrent calls, and invalidate/stop the listener when the
+  backend refuses or the external turn completes, fails, or is cancelled.
 
 ## 3. `agent-runtime-agent-cli` package
 - [ ] 3.1 Scaffold crate, features `claude`/`codex`, process supervision reuse from command-provider (process group, stdin=/dev/null, bounded output).

@@ -384,3 +384,458 @@ async fn a_completed_external_turn_publishes_its_terminal_without_an_internal_fa
         .collect();
     assert!(errors.is_empty(), "the turn reported {errors:?}");
 }
+
+#[cfg(feature = "external-agent-bridge")]
+mod bridge_tests {
+    use super::*;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use agent_runtime::agent::external::{
+        AllowedTool, ExternalCapabilities, ExternalToolBridge, ExternalToolPolicy,
+        RUNTIME_BRIDGE_SERVER_NAME,
+    };
+    use agent_runtime::core::approval::DenyAll;
+    use agent_runtime::core::tool::{
+        Effect, InvocationContext, LegacyTool, Tool, ToolEffects, ToolOutcome, WriteScope,
+    };
+    use agent_runtime::core::workspace::Workspace;
+    use agent_runtime::runtime::Runtime;
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    #[derive(Debug, Clone, Copy)]
+    enum BridgeMode {
+        Success,
+        Denied,
+        WrongToken,
+        NoBridge,
+    }
+
+    #[derive(Debug)]
+    struct BridgeBackend {
+        mode: BridgeMode,
+        bridge: Mutex<Option<ExternalToolBridge>>,
+    }
+
+    impl BridgeBackend {
+        fn new(mode: BridgeMode) -> Arc<Self> {
+            Arc::new(Self {
+                mode,
+                bridge: Mutex::new(None),
+            })
+        }
+
+        fn bridge(&self) -> ExternalToolBridge {
+            self.bridge
+                .lock()
+                .expect("bridge poisoned")
+                .clone()
+                .expect("backend received a bridge")
+        }
+    }
+
+    #[async_trait]
+    impl ExternalAgentBackend for BridgeBackend {
+        async fn run_turn(
+            &self,
+            request: ExternalTurnRequest,
+        ) -> Result<ExternalTurnStream, RuntimeError> {
+            match self.mode {
+                BridgeMode::NoBridge => assert!(request.bridge.is_none()),
+                BridgeMode::Success | BridgeMode::Denied | BridgeMode::WrongToken => {
+                    let bridge = request.bridge.expect("runtime tools must expose a bridge");
+                    if matches!(self.mode, BridgeMode::Denied) {
+                        assert!(bridge.tools.iter().any(|name| name == "bridge_write"));
+                    } else {
+                        assert!(bridge.tools.iter().any(|name| name == "bridge_echo"));
+                    }
+                    *self.bridge.lock().expect("bridge poisoned") = Some(bridge.clone());
+
+                    let (status, initialize) = rpc(
+                        &bridge,
+                        &bridge.bearer_token,
+                        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+                    )
+                    .await
+                    .map_err(|error| RuntimeError::config(format!("initialize failed: {error}")))?;
+                    assert_eq!(status, 200);
+                    assert_eq!(initialize["result"]["serverInfo"]["name"], "agent-runtime");
+
+                    let (status, initialized) = rpc(
+                        &bridge,
+                        &bridge.bearer_token,
+                        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                    )
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::config(format!("initialized failed: {error}"))
+                    })?;
+                    assert_eq!(status, 202);
+                    assert_eq!(initialized, Value::Null);
+
+                    let (status, listed) = rpc(
+                        &bridge,
+                        &bridge.bearer_token,
+                        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+                    )
+                    .await
+                    .map_err(|error| RuntimeError::config(format!("tools/list failed: {error}")))?;
+                    assert_eq!(status, 200);
+                    assert_eq!(listed["result"]["tools"][0]["name"], "bridge_echo");
+                    assert!(listed["result"]["tools"][0]["inputSchema"].is_object());
+
+                    if matches!(self.mode, BridgeMode::WrongToken) {
+                        let (status, _) = rpc(
+                            &bridge,
+                            "wrong-token",
+                            json!({"jsonrpc":"2.0","id":3,"method":"ping"}),
+                        )
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::config(format!("wrong-token request failed: {error}"))
+                        })?;
+                        assert_eq!(status, 401);
+                    }
+
+                    let tool = if matches!(self.mode, BridgeMode::Denied) {
+                        "bridge_write"
+                    } else {
+                        "bridge_echo"
+                    };
+                    let (status, called) = rpc(
+                        &bridge,
+                        &bridge.bearer_token,
+                        json!({
+                            "jsonrpc":"2.0",
+                            "id":4,
+                            "method":"tools/call",
+                            "params":{"name":tool,"arguments":{"text":"hello"}}
+                        }),
+                    )
+                    .await
+                    .map_err(|error| RuntimeError::config(format!("tools/call failed: {error}")))?;
+                    assert_eq!(status, 200);
+                    if matches!(self.mode, BridgeMode::Denied) {
+                        assert_eq!(called["result"]["isError"], true);
+                    } else {
+                        assert_eq!(called["result"]["isError"], false);
+                        assert_eq!(called["result"]["content"][0]["type"], "text");
+                    }
+                }
+            }
+            Ok(Box::pin(futures_util::stream::iter([
+                ExternalAgentEvent::Text {
+                    text: "bridge turn complete".to_owned(),
+                },
+                ExternalAgentEvent::Completed,
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct EchoTool;
+
+    #[async_trait]
+    impl LegacyTool for EchoTool {
+        fn name(&self) -> &str {
+            "bridge_echo"
+        }
+
+        fn description(&self) -> &str {
+            "Returns a structured bridge result."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type":"object",
+                "properties":{"text":{"type":"string"}},
+                "additionalProperties":false
+            })
+        }
+
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::default()
+        }
+
+        async fn invoke_legacy(
+            &self,
+            arguments: Value,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::json(json!({
+                "echo": arguments["text"].as_str().unwrap_or_default()
+            })))
+        }
+    }
+
+    #[derive(Debug)]
+    struct WriteTool;
+
+    #[async_trait]
+    impl LegacyTool for WriteTool {
+        fn name(&self) -> &str {
+            "bridge_write"
+        }
+
+        fn description(&self) -> &str {
+            "Requires runtime approval."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type":"object", "additionalProperties":true})
+        }
+
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::new(vec![Effect::Write {
+                scope: WriteScope::new("/workspace/output"),
+            }])
+        }
+
+        async fn invoke_legacy(
+            &self,
+            _arguments: Value,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::text("must not run when denied"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestWorkspace;
+
+    impl Workspace for TestWorkspace {
+        fn root(&self) -> &str {
+            "/workspace"
+        }
+
+        fn contains(&self, path: &str) -> bool {
+            path == "/workspace" || path.starts_with("/workspace/")
+        }
+    }
+
+    fn bridge_runtime(
+        backend: Arc<BridgeBackend>,
+        tools: impl IntoIterator<Item = Arc<dyn Tool>>,
+        capabilities: ExternalCapabilities,
+        denied: bool,
+    ) -> Runtime {
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            Vec::new(),
+        ));
+        let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider)
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .external_agent(backend)
+            .external_capabilities(capabilities);
+        for tool in tools {
+            builder = builder.tool(tool);
+        }
+        if denied {
+            builder = builder
+                .approval(Arc::new(DenyAll))
+                .workspace(Arc::new(TestWorkspace))
+                .legacy_approval_authority();
+        }
+        builder.build().expect("bridge runtime")
+    }
+
+    async fn rpc(
+        bridge: &ExternalToolBridge,
+        token: &str,
+        payload: Value,
+    ) -> io::Result<(u16, Value)> {
+        let authority_path = bridge
+            .url
+            .strip_prefix("http://")
+            .expect("loopback HTTP bridge URL");
+        let (authority, path) = authority_path.split_once('/').expect("bridge path");
+        let mut stream = TcpStream::connect(authority).await?;
+        let body = serde_json::to_vec(&payload).expect("JSON-RPC payload");
+        let request = format!(
+            "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.write_all(&body).await?;
+
+        let mut header = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await?;
+            header.push(byte[0]);
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = String::from_utf8(header).expect("HTTP header");
+        let status = header
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("HTTP status")
+            .parse::<u16>()
+            .expect("numeric HTTP status");
+        let length = header
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("content length")
+            .parse::<usize>()
+            .expect("numeric content length");
+        let mut response_body = vec![0u8; length];
+        stream.read_exact(&mut response_body).await?;
+        let response = if response_body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&response_body).unwrap_or(Value::Null)
+        };
+        Ok((status, response))
+    }
+
+    async fn run_one(
+        runtime: Runtime,
+    ) -> (
+        Vec<RuntimeEvent>,
+        Vec<agent_runtime::core::content::Message>,
+    ) {
+        let session = runtime
+            .start_session(StartSession::new())
+            .await
+            .expect("session");
+        let mut events = session.subscribe();
+        session
+            .run(UserInput::text("use the bridge"))
+            .await
+            .expect("external turn");
+        let mut seen = Vec::new();
+        while let Ok(Some(envelope)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), events.next()).await
+        {
+            let terminal = matches!(envelope.payload, RuntimeEvent::TurnCompleted { .. });
+            seen.push(envelope.payload);
+            if terminal {
+                break;
+            }
+        }
+        let history = session.history();
+        session.shutdown().await.expect("shutdown");
+        (seen, history)
+    }
+
+    #[tokio::test]
+    async fn bridge_dispatches_success_and_keeps_tool_results_out_of_history() {
+        let backend = BridgeBackend::new(BridgeMode::Success);
+        let runtime = bridge_runtime(
+            backend.clone(),
+            [Arc::new(EchoTool) as Arc<dyn Tool>],
+            ExternalCapabilities {
+                runtime_tools: true,
+                tool_policy: ExternalToolPolicy {
+                    allow: vec![AllowedTool::new(RUNTIME_BRIDGE_SERVER_NAME, "*")],
+                },
+                ..Default::default()
+            },
+            false,
+        );
+        let (events, history) = run_one(runtime).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallRequested { name, .. } if name == "bridge_echo"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallCompleted { name, is_error: false, .. } if name == "bridge_echo"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::TurnCompleted {
+                finish: TurnFinish::Completed,
+                ..
+            }
+        )));
+        assert!(!history.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::ToolResult(_)))
+        }));
+    }
+
+    #[tokio::test]
+    async fn bridge_denial_returns_an_error_result_and_emits_tool_events() {
+        let backend = BridgeBackend::new(BridgeMode::Denied);
+        let runtime = bridge_runtime(
+            backend,
+            [
+                Arc::new(EchoTool) as Arc<dyn Tool>,
+                Arc::new(WriteTool) as Arc<dyn Tool>,
+            ],
+            ExternalCapabilities {
+                runtime_tools: true,
+                ..Default::default()
+            },
+            true,
+        );
+        let (events, _) = run_one(runtime).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallRequested { name, .. } if name == "bridge_write"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallCompleted { name, is_error: true, .. } if name == "bridge_write"
+        )));
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_wrong_tokens_and_closes_after_the_turn() {
+        let backend = BridgeBackend::new(BridgeMode::WrongToken);
+        let runtime = bridge_runtime(
+            backend.clone(),
+            [Arc::new(EchoTool) as Arc<dyn Tool>],
+            ExternalCapabilities {
+                runtime_tools: true,
+                ..Default::default()
+            },
+            false,
+        );
+        let _ = run_one(runtime).await;
+        let bridge = backend.bridge();
+        assert!(
+            rpc(
+                &bridge,
+                &bridge.bearer_token,
+                json!({"jsonrpc":"2.0","id":9,"method":"ping"})
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_tools_disabled_passes_no_bridge_to_the_backend() {
+        let backend = BridgeBackend::new(BridgeMode::NoBridge);
+        let runtime = bridge_runtime(
+            backend,
+            [Arc::new(EchoTool) as Arc<dyn Tool>],
+            ExternalCapabilities::default(),
+            false,
+        );
+        let (events, _) = run_one(runtime).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::TurnCompleted {
+                finish: TurnFinish::Completed,
+                ..
+            }
+        )));
+    }
+}
