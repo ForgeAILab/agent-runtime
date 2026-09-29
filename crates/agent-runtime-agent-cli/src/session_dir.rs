@@ -26,6 +26,14 @@ impl TurnDir {
                 path.display()
             ))
         })?;
+        // Generated config can carry credentials (bridge tokens, server env):
+        // only the owner may read it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| io_error(&path, error))?;
+        }
         Ok(Self { path, keep: false })
     }
 
