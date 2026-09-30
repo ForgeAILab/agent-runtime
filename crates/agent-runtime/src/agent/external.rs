@@ -29,6 +29,11 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
+pub use crate::agent::external_capabilities::{
+    AllowedTool, ExternalCapabilities, ExternalMcpServer, ExternalMcpTransport, ExternalToolBridge,
+    ExternalToolPolicy, RUNTIME_BRIDGE_SERVER_NAME, SkillBundle,
+};
+
 /// Extension-state namespace holding the continuation identity.
 pub const EXTERNAL_AGENT_STATE_NAMESPACE: &str = "agent.external";
 
@@ -97,6 +102,12 @@ pub struct ExternalTurnRequest {
     pub turn: TurnId,
     /// Cancelled when the turn is cancelled or the session shuts down.
     pub cancel: Cancellation,
+    /// What the session injects into this turn. Already validated; a backend
+    /// that supports injection re-applies all of it on every turn.
+    pub capabilities: Arc<ExternalCapabilities>,
+    /// The runtime tool bridge for this turn, when the session exposes its
+    /// tools. Valid until this turn's terminal event.
+    pub bridge: Option<ExternalToolBridge>,
 }
 
 /// Normalized events a backend streams while its turn runs.

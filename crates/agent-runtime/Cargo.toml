@@ -45,6 +45,10 @@ command-provider = ["agent-runtime-provider/command-provider"]
 # instead of by the provider/tool loop. Off by default; it adds no dependency,
 # only a seam.
 external-agent = []
+# Runtime-owned tools can optionally be exposed to an external agent through a
+# tiny streamable-HTTP MCP listener. Keep Tokio's socket APIs out of the
+# default graph: hosts that do not opt into the bridge pay no networking cost.
+external-agent-bridge = ["external-agent", "tokio/net", "tokio/io-util"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }

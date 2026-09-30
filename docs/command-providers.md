@@ -100,10 +100,9 @@ its ordinary runtime factory. The same provider serves TUI and headless turns.
 
 The executable must implement Smith's probe and request/frame protocol. Pointing
 this configuration at `claude`, `codex`, or another autonomous coding agent does
-not make that CLI a compatible model provider. This framework and the reference
-`agent-runtime run` command do not launch Claude Code or Codex as external agents.
-Such support needs a separate backend contract for history, tool execution,
-approvals, cancellation, and agent events.
+not make that CLI a compatible model provider. Running Claude Code or Codex as an
+agent is a different contract -- `ExternalAgentBackend`, with first-party
+backends in `agent-runtime-agent-cli`; see [external-agents.md](external-agents.md).
 
 Smith should not reuse the reference `agent-runtime-cli` TOML parser: its
 layered configuration and trust model are already richer. This repository does

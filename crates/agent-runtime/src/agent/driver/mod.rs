@@ -463,6 +463,9 @@ pub struct Driver {
     /// which is what keeps canonical history single-owner.
     #[cfg(feature = "external-agent")]
     external: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
+    /// Injected into every external turn; empty unless the host set it.
+    #[cfg(feature = "external-agent")]
+    external_capabilities: Arc<crate::agent::external::ExternalCapabilities>,
 }
 
 impl Driver {
@@ -476,8 +479,10 @@ impl Driver {
     pub(crate) fn with_external_agent(
         mut self,
         backend: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
+        capabilities: crate::agent::external::ExternalCapabilities,
     ) -> Self {
         self.external = backend;
+        self.external_capabilities = Arc::new(capabilities);
         self
     }
 
@@ -520,6 +525,8 @@ impl Driver {
             live_abilities,
             #[cfg(feature = "external-agent")]
             external: None,
+            #[cfg(feature = "external-agent")]
+            external_capabilities: Arc::default(),
         }
     }
 
@@ -960,6 +967,8 @@ struct TurnMachineContext {
     acceptance: Option<Arc<TurnAcceptance>>,
 }
 
+#[cfg(feature = "external-agent-bridge")]
+mod external_bridge;
 #[cfg(feature = "external-agent")]
 mod external_turn;
 mod provider;
