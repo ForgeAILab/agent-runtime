@@ -3,7 +3,7 @@
 `ExternalAgentBackend` (change `add-external-agent-backend`) runs one whole turn
 in a CLI and normalizes its events. This change lets the session give that CLI
 skills, MCP servers, and runtime tools. Evidence for every CLI mechanism below
-is in `target/cli-injection-lab/reports/{claude,codex,gemini,cursor}.md`
+is in `evidence/{claude,codex,gemini,cursor}.md` (brief: `evidence/BRIEF.md`)
 (fixture: stdio MCP server `lab_nonce` + skill `lab-greeting`).
 
 ## Goals / Non-Goals

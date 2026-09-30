@@ -109,8 +109,10 @@ AGENT_RUNTIME_LIVE_BRIDGE=claude cargo test -p agent-runtime-agent-cli --all-fea
 AGENT_RUNTIME_LIVE_BRIDGE=codex  cargo test -p agent-runtime-agent-cli --all-features --test bridge_live -- --ignored
 ```
 
-The skill/MCP tests expect the lab fixtures under `target/cli-injection-lab/`
-(a stdio MCP server exposing `lab_nonce` and a `lab-greeting` skill).
+The skill/MCP tests use the fixtures in
+`crates/agent-runtime-agent-cli/tests/fixtures/lab/`: a stdio MCP server
+exposing `lab_nonce` (it logs every call to `$LAB_MCP_LOG`) and a
+`lab-greeting` skill.
 
 ## Other CLIs (not shipped)
 

@@ -12,7 +12,7 @@ turn is therefore a weaker agent than a direct one, and every adopter who wants
 parity must learn each CLI's config surface and write it into the user's global
 config -- the one place they must not touch.
 
-A lab run against the installed CLIs (`target/cli-injection-lab/reports/`)
+A lab run against the installed CLIs (`evidence/` in this change)
 shows every surveyed CLI accepts per-run skills and MCP servers without editing
 global config, and that headless denial of an unapproved tool never hangs. The
 mechanisms differ per CLI, so the runtime needs one neutral description of

@@ -379,13 +379,10 @@ async fn live_codex_lab_injection() {
     if std::env::var("AGENT_RUNTIME_LIVE_CODEX").ok().as_deref() != Some("1") {
         return;
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/cli-injection-lab");
-    let root = root
-        .canonicalize()
-        .expect("lab directory (run the lab setup first)");
-    let fixture = root.join("fixtures/lab_mcp.py");
-    let skill = root.join("fixtures/skills/lab-greeting");
-    let cwd = root.join("work/codex/session");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lab");
+    let fixture = root.join("lab_mcp.py");
+    let skill = root.join("skills/lab-greeting");
+    let cwd = std::env::temp_dir().join("agent-runtime-codex-live");
     std::fs::create_dir_all(&cwd).expect("session cwd");
     if !fixture.is_file() || !skill.join("SKILL.md").is_file() {
         panic!("the checked-in Codex lab fixtures are missing");
@@ -397,7 +394,7 @@ async fn live_codex_lab_injection() {
         cwd,
         model: std::env::var("AGENT_RUNTIME_CODEX_MODEL").ok(),
         reasoning_effort: Some("low".to_owned()),
-        turn_dir_root: root.join("work/codex/live-adapter"),
+        turn_dir_root: std::env::temp_dir().join("agent-runtime-codex-live-turns"),
         ..Default::default()
     };
     config.api_key = std::env::var("OPENAI_API_KEY").ok().map(CodexApiKey::new);

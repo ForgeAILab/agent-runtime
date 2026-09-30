@@ -391,14 +391,16 @@ async fn live_claude_lab_scenario() {
     let capabilities = ExternalCapabilities {
         skills: vec![SkillBundle::new(
             "lab-greeting",
-            repo.join("target/cli-injection-lab/fixtures/skills/lab-greeting"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/lab/skills/lab-greeting"),
         )],
         mcp_servers: vec![ExternalMcpServer {
             name: "lab".to_owned(),
             transport: ExternalMcpTransport::Stdio {
                 command: PathBuf::from("python3"),
                 args: vec![
-                    repo.join("target/cli-injection-lab/fixtures/lab_mcp.py")
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/lab/lab_mcp.py")
                         .display()
                         .to_string(),
                 ],

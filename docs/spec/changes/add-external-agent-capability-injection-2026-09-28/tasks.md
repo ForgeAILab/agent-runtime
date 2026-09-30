@@ -33,7 +33,7 @@ completed_at: 2026-09-29T03:30:00Z
 - [x] 3.4 Version preflight for both.
 
 ## 4. Verification
-- [x] 4.1 Unit tests: argv/file materialization snapshots; event decoders against captured transcripts from `target/cli-injection-lab/work/*/` (checked in as trimmed fixtures).
+- [x] 4.1 Unit tests: argv/file materialization snapshots; event decoders against captured live transcripts checked in under `crates/agent-runtime-agent-cli/tests/fixtures/`.
 - [x] 4.2 Bridge tests with a scripted backend acting as the CLI over loopback: approval required/denied, teardown refuses late connections.
 - [x] 4.3 Ignored-by-default live tests (`--ignored`, env-gated) reproducing the lab scenarios for Claude and Codex.
 - [x] 4.4 Docs: `docs/external-agents.md` with per-CLI recipes incl. deferred Gemini/Cursor notes.
