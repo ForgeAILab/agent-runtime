@@ -458,6 +458,7 @@ pub struct Driver {
     return_child_interactions_to_parent: bool,
     harness: Arc<HarnessPipeline>,
     live_abilities: Option<Arc<LiveAbilityRuntime>>,
+    manifest_window: std::num::NonZeroUsize,
     /// When present, every turn is executed by this backend instead of the
     /// provider/tool loop above. The two never interleave within one turn,
     /// which is what keeps canonical history single-owner.
@@ -507,6 +508,7 @@ impl Driver {
         return_child_interactions_to_parent: bool,
         harness: Arc<HarnessPipeline>,
         live_abilities: Option<Arc<LiveAbilityRuntime>>,
+        manifest_window: std::num::NonZeroUsize,
     ) -> Self {
         Self {
             provider,
@@ -523,6 +525,7 @@ impl Driver {
             return_child_interactions_to_parent,
             harness,
             live_abilities,
+            manifest_window,
             #[cfg(feature = "external-agent")]
             external: None,
             #[cfg(feature = "external-agent")]

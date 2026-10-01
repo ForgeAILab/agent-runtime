@@ -25,6 +25,9 @@ use crate::ids::IdMinter;
 use crate::runtime::command::{COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession};
 use crate::runtime::emitter::EventEmitter;
 use crate::runtime::inject::InjectionQueue;
+use crate::runtime::manifests::{
+    carry_compatible_diagnostics, initialize_boundary, trim, validate_boundary_pair,
+};
 use crate::runtime::session::{SessionHandle, SessionInner};
 use crate::runtime::state::SessionState;
 
@@ -74,11 +77,7 @@ fn merge_terminal_checkpoint_snapshot(
             "canonical usage ledger and terminal checkpoint are from different boundaries",
         ));
     }
-    if canonical.manifests != protected.manifests {
-        return Err(RuntimeError::conflict(
-            "canonical turn manifests and terminal checkpoint are from different boundaries",
-        ));
-    }
+    validate_boundary_pair(canonical, protected)?;
 
     for (namespace, exact) in &protected.extension_state {
         // A successful one-time LCM import may be newer than the terminal
@@ -266,6 +265,8 @@ async fn prepare_lcm_resume(
             // A repaired successor is the new protected authority. Persist it
             // before constructing a live handle so a second crash cannot
             // discard the proof and repeat recovery work.
+            initialize_boundary(snapshot)?;
+            trim(&mut snapshot.manifests, shared.manifest_window);
             session_store.save(snapshot).await?;
         }
         return Ok((Vec::new(), true));
@@ -321,6 +322,8 @@ async fn prepare_lcm_resume(
     // checkpoint is reconciled by the narrow merge rules above. If this save
     // fails after the node commit, retry adopts the deterministic node and
     // attempts the replacement save again without another model call.
+    initialize_boundary(snapshot)?;
+    trim(&mut snapshot.manifests, shared.manifest_window);
     session_store.save(snapshot).await?;
     Ok((patch.events, true))
 }
@@ -511,6 +514,7 @@ pub struct RuntimeShared {
     /// paths use the same host-authorized component allocation as the sealed
     /// history projector and turn-commit hook.
     pub(crate) lcm: Option<Arc<LcmCoordinator>>,
+    pub(crate) manifest_window: std::num::NonZeroUsize,
 }
 
 /// In-process lease table preventing two handles from restoring and minting
@@ -653,8 +657,12 @@ impl Runtime {
             (true, Some(store)) => store.load_latest(&session_id).await?,
             _ => None,
         };
+        if let Some(snapshot) = &snapshot {
+            crate::runtime::manifests::snapshot_planned_steps(snapshot)?;
+        }
         if let Some(checkpoint) = &checkpoint {
             checkpoint.validate()?;
+            crate::runtime::manifests::snapshot_planned_steps(&checkpoint.snapshot)?;
             if checkpoint.session != session_id {
                 return Err(RuntimeError::conflict(
                     "checkpoint store returned another session's state",
@@ -728,6 +736,11 @@ impl Runtime {
                 // and never require stale usage/history equality here.
                 let mut protected = checkpoint.snapshot.clone();
                 merge_newer_nonterminal_delegation_state(&mut protected, &snapshot)?;
+                carry_compatible_diagnostics(
+                    &mut protected,
+                    &snapshot,
+                    self.shared.manifest_window,
+                )?;
                 // The ordinary store may have durably minted unrelated
                 // request/event identities after the cache ResultReady
                 // boundary. Preserve that monotonic floor without allowing
@@ -739,6 +752,11 @@ impl Runtime {
             (Some(checkpoint), Some(snapshot)) => {
                 let mut protected = checkpoint.snapshot.clone();
                 merge_newer_nonterminal_delegation_state(&mut protected, &snapshot)?;
+                carry_compatible_diagnostics(
+                    &mut protected,
+                    &snapshot,
+                    self.shared.manifest_window,
+                )?;
                 // The protected cache projection owns lifecycle/result state,
                 // but an ordinary save may have minted unrelated request,
                 // turn, attempt, tool, or event identities while the cache
@@ -773,13 +791,18 @@ impl Runtime {
         } else {
             (Vec::new(), false)
         };
-        if let Some(snapshot) = snapshot {
+        if let Some(mut snapshot) = snapshot {
+            initialize_boundary(&mut snapshot)?;
+            trim(&mut snapshot.manifests, self.shared.manifest_window);
             state.history = snapshot.history;
             state.usage = snapshot.usage;
             state.manifests = snapshot.manifests;
             identity = snapshot.identity;
             extension_state = snapshot.extension_state;
         }
+        extension_state
+            .entry(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE.to_owned())
+            .or_insert_with(|| crate::runtime::manifests::boundary_record(0));
         if let Some(floor) = &resume_identity_floor {
             identity.advance_to_floor(floor);
         }

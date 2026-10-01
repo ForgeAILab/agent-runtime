@@ -25,3 +25,8 @@ async fn nyx_adapter_passes_shared_conformance() {
     assert!(rt::has_tool_completed(&payloads, "echo"));
     event_schema::assert_versioned_and_roundtrips(&observer.events());
 }
+
+#[tokio::test]
+async fn consumer_nyx_accepts_recent_manifest_diagnostics() {
+    agent_runtime_testkit::conformance::manifests::assert_storeless_recent_window().await;
+}

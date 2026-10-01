@@ -1,0 +1,802 @@
+{
+  "active_history_start": 8,
+  "deadline": {
+    "at": null
+  },
+  "operation_fingerprint": "5a0cc7251800e6931599bb2e8f723229",
+  "schema_version": 3,
+  "session": "legacy-manifests",
+  "snapshot": {
+    "extension_state": {
+      "agent-runtime.cache-mechanism": {
+        "revision": "cache-mechanism-1",
+        "sensitivity": "sensitive",
+        "value": {
+          "identities": {},
+          "operation_fingerprints": {},
+          "operations": [],
+          "results": {}
+        }
+      },
+      "fixture.protected": {
+        "revision": "fixture-protected-1",
+        "sensitivity": "sensitive",
+        "value": {
+          "opaque": "exact-only"
+        }
+      },
+      "runtime.core.previous_cache": {
+        "revision": "previous-cache-state-1",
+        "sensitivity": "redaction_safe",
+        "value": {
+          "changed_segments": [
+            "history:6",
+            "history:7",
+            "history:8"
+          ],
+          "declared_stable_prefix_len": 8,
+          "has_comparable_predecessor": false,
+          "identity": "8cab125acdb652cb3dd6f928012b0176",
+          "invalidated_tokens": 20,
+          "local_compiled_context_key": "e4c172a6f2d0af6b2393a0ee2f509640",
+          "preserved_prefix_len": 6,
+          "preserved_prefix_tokens": 39,
+          "provider_baseline_available": false,
+          "provider_cache": {
+            "capability": {
+              "contract": {
+                "behavior": "unsupported",
+                "evidence": {
+                  "cache_scoped_errors": false,
+                  "resource_operations": false,
+                  "stream": false
+                },
+                "retention": {
+                  "read_refreshes": false,
+                  "write_refreshes": false
+                }
+              },
+              "provider": "unspecified",
+              "revision": "no-provider-cache-1",
+              "supports_ephemeral": false,
+              "supports_stable": false
+            },
+            "unsupported": [
+              "stable",
+              "ephemeral"
+            ]
+          },
+          "segments": [
+            {
+              "cache_class": "stable",
+              "content_hash": "e8fc12fe24715ab76f6945498eb43972",
+              "fragment": "history:0",
+              "tokens": 7
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "211cd1c9e02b5962096cb386355c1541",
+              "fragment": "history:1",
+              "tokens": 6
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "d61e2fb301f42329859e092e6a0563e2",
+              "fragment": "history:2",
+              "tokens": 7
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "fbcaa6837b2fc48c3e523f813fc52a5e",
+              "fragment": "history:3",
+              "tokens": 6
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "64f028779dd95002d1764c58fd7b56ac",
+              "fragment": "history:4",
+              "tokens": 7
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "0721f8f1c3f6aaa3d99c26ee1c2ece94",
+              "fragment": "history:5",
+              "tokens": 6
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "d2226e3031fbb96a191a346bb5186ef2",
+              "fragment": "history:6",
+              "tokens": 7
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "3ef2673f7c95988733b1f0ded0fc70a7",
+              "fragment": "history:7",
+              "tokens": 6
+            },
+            {
+              "cache_class": "ephemeral",
+              "content_hash": "93d152c322cee9a0b591b24da7b3286b",
+              "fragment": "history:8",
+              "tokens": 7
+            }
+          ]
+        }
+      }
+    },
+    "history": [
+      {
+        "content": [
+          {
+            "text": "question 0",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "answer 0",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "question 1",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "answer 1",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "question 2",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "answer 2",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "question 3",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "answer 3",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "question 4",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "answer 4",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      }
+    ],
+    "id": "legacy-manifests",
+    "identity": {
+      "attempt": 5,
+      "event": 52,
+      "event_seq": 52,
+      "request": 5,
+      "steer": 0,
+      "tool_call": 0,
+      "turn": 5
+    },
+    "manifests": [
+      {
+        "manifest": {
+          "cache_plan_fingerprint": "f9d40fc5a148398e1c1d4660a0f71c22",
+          "capability_resolution": {
+            "resolver_revision": "capability-retrieval.deterministic.v1"
+          },
+          "context_fingerprint": "645fbe737d5d2dc494a75199c364431f",
+          "model": {
+            "field_provenance": {
+              "capabilities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "context_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "input_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "max_input_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "max_output_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "output_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              }
+            },
+            "model": "fake",
+            "profile_fingerprint": "8cab125acdb652cb3dd6f928012b0176",
+            "provider": "fake"
+          },
+          "policy_revisions": {
+            "context_policy": {
+              "id": {
+                "domain": "context_policy",
+                "name": "context_policy"
+              },
+              "revision": "default-context-policy-1"
+            },
+            "tokenizer": {
+              "id": {
+                "domain": "tokenizer",
+                "name": "agent-runtime-context/char-ratio"
+              },
+              "revision": "char-ratio-1"
+            }
+          },
+          "registry_snapshot": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "schema_version": 2,
+          "scoped_view": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "segments": [
+            {
+              "content_hash": "827828faa7288171d949e221405ca35b",
+              "id": "history:0",
+              "kind": "user_input",
+              "sensitivity": "internal",
+              "tokens": 7
+            }
+          ]
+        },
+        "turn": "turn-1"
+      },
+      {
+        "manifest": {
+          "cache_plan_fingerprint": "7407cd7606b94bb8c212fefcb0f39cc2",
+          "capability_resolution": {
+            "resolver_revision": "capability-retrieval.deterministic.v1"
+          },
+          "context_fingerprint": "4b5c1b4de2fcd85a41d9a22b7b6836fb",
+          "model": {
+            "field_provenance": {
+              "capabilities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "context_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "input_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "max_input_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "max_output_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "output_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              }
+            },
+            "model": "fake",
+            "profile_fingerprint": "8cab125acdb652cb3dd6f928012b0176",
+            "provider": "fake"
+          },
+          "policy_revisions": {
+            "context_policy": {
+              "id": {
+                "domain": "context_policy",
+                "name": "context_policy"
+              },
+              "revision": "default-context-policy-1"
+            },
+            "tokenizer": {
+              "id": {
+                "domain": "tokenizer",
+                "name": "agent-runtime-context/char-ratio"
+              },
+              "revision": "char-ratio-1"
+            }
+          },
+          "registry_snapshot": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "schema_version": 2,
+          "scoped_view": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "segments": [
+            {
+              "content_hash": "e8fc12fe24715ab76f6945498eb43972",
+              "id": "history:0",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "211cd1c9e02b5962096cb386355c1541",
+              "id": "history:1",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "b4f384f08fe0ce4ef5468967d4e899ad",
+              "id": "history:2",
+              "kind": "user_input",
+              "sensitivity": "internal",
+              "tokens": 7
+            }
+          ]
+        },
+        "turn": "turn-2"
+      },
+      {
+        "manifest": {
+          "cache_plan_fingerprint": "9a2d7b9fa8f55e30d0e58b348666a07a",
+          "capability_resolution": {
+            "resolver_revision": "capability-retrieval.deterministic.v1"
+          },
+          "context_fingerprint": "596b322fa5b9cbd17c33c82f4f2de327",
+          "model": {
+            "field_provenance": {
+              "capabilities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "context_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "input_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "max_input_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "max_output_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "output_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              }
+            },
+            "model": "fake",
+            "profile_fingerprint": "8cab125acdb652cb3dd6f928012b0176",
+            "provider": "fake"
+          },
+          "policy_revisions": {
+            "context_policy": {
+              "id": {
+                "domain": "context_policy",
+                "name": "context_policy"
+              },
+              "revision": "default-context-policy-1"
+            },
+            "tokenizer": {
+              "id": {
+                "domain": "tokenizer",
+                "name": "agent-runtime-context/char-ratio"
+              },
+              "revision": "char-ratio-1"
+            }
+          },
+          "registry_snapshot": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "schema_version": 2,
+          "scoped_view": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "segments": [
+            {
+              "content_hash": "e8fc12fe24715ab76f6945498eb43972",
+              "id": "history:0",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "211cd1c9e02b5962096cb386355c1541",
+              "id": "history:1",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "d61e2fb301f42329859e092e6a0563e2",
+              "id": "history:2",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "fbcaa6837b2fc48c3e523f813fc52a5e",
+              "id": "history:3",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "64173e6bdf95e3324f385d36ffff7339",
+              "id": "history:4",
+              "kind": "user_input",
+              "sensitivity": "internal",
+              "tokens": 7
+            }
+          ]
+        },
+        "turn": "turn-3"
+      },
+      {
+        "manifest": {
+          "cache_plan_fingerprint": "2febe70acf1a2528bdd3d34d9ecafcc9",
+          "capability_resolution": {
+            "resolver_revision": "capability-retrieval.deterministic.v1"
+          },
+          "context_fingerprint": "f151ecbf7d640c4214b3b6183704c1b8",
+          "model": {
+            "field_provenance": {
+              "capabilities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "context_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "input_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "max_input_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "max_output_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "output_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              }
+            },
+            "model": "fake",
+            "profile_fingerprint": "8cab125acdb652cb3dd6f928012b0176",
+            "provider": "fake"
+          },
+          "policy_revisions": {
+            "context_policy": {
+              "id": {
+                "domain": "context_policy",
+                "name": "context_policy"
+              },
+              "revision": "default-context-policy-1"
+            },
+            "tokenizer": {
+              "id": {
+                "domain": "tokenizer",
+                "name": "agent-runtime-context/char-ratio"
+              },
+              "revision": "char-ratio-1"
+            }
+          },
+          "registry_snapshot": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "schema_version": 2,
+          "scoped_view": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "segments": [
+            {
+              "content_hash": "e8fc12fe24715ab76f6945498eb43972",
+              "id": "history:0",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "211cd1c9e02b5962096cb386355c1541",
+              "id": "history:1",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "d61e2fb301f42329859e092e6a0563e2",
+              "id": "history:2",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "fbcaa6837b2fc48c3e523f813fc52a5e",
+              "id": "history:3",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "64f028779dd95002d1764c58fd7b56ac",
+              "id": "history:4",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "0721f8f1c3f6aaa3d99c26ee1c2ece94",
+              "id": "history:5",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "c9e62337d851684da539e7911bcd9d99",
+              "id": "history:6",
+              "kind": "user_input",
+              "sensitivity": "internal",
+              "tokens": 7
+            }
+          ]
+        },
+        "turn": "turn-4"
+      },
+      {
+        "manifest": {
+          "cache_plan_fingerprint": "29084c21f8eb90806ad1ed196e0822f0",
+          "capability_resolution": {
+            "resolver_revision": "capability-retrieval.deterministic.v1"
+          },
+          "context_fingerprint": "7934b91223a4553408de2cd83e4691f7",
+          "model": {
+            "field_provenance": {
+              "capabilities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "context_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "input_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              },
+              "max_input_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "max_output_tokens": {
+                "confidence": "authoritative",
+                "source": "explicit"
+              },
+              "output_modalities": {
+                "confidence": "fallback",
+                "source": "explicit"
+              }
+            },
+            "model": "fake",
+            "profile_fingerprint": "8cab125acdb652cb3dd6f928012b0176",
+            "provider": "fake"
+          },
+          "policy_revisions": {
+            "context_policy": {
+              "id": {
+                "domain": "context_policy",
+                "name": "context_policy"
+              },
+              "revision": "default-context-policy-1"
+            },
+            "tokenizer": {
+              "id": {
+                "domain": "tokenizer",
+                "name": "agent-runtime-context/char-ratio"
+              },
+              "revision": "char-ratio-1"
+            }
+          },
+          "registry_snapshot": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "schema_version": 2,
+          "scoped_view": "c4b4464b0b2502fc5e5df04178a0bbb9",
+          "segments": [
+            {
+              "content_hash": "e8fc12fe24715ab76f6945498eb43972",
+              "id": "history:0",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "211cd1c9e02b5962096cb386355c1541",
+              "id": "history:1",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "d61e2fb301f42329859e092e6a0563e2",
+              "id": "history:2",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "fbcaa6837b2fc48c3e523f813fc52a5e",
+              "id": "history:3",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "64f028779dd95002d1764c58fd7b56ac",
+              "id": "history:4",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "0721f8f1c3f6aaa3d99c26ee1c2ece94",
+              "id": "history:5",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "d2226e3031fbb96a191a346bb5186ef2",
+              "id": "history:6",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 7
+            },
+            {
+              "content_hash": "3ef2673f7c95988733b1f0ded0fc70a7",
+              "id": "history:7",
+              "kind": "history",
+              "sensitivity": "internal",
+              "tokens": 6
+            },
+            {
+              "content_hash": "93d152c322cee9a0b591b24da7b3286b",
+              "id": "history:8",
+              "kind": "user_input",
+              "sensitivity": "internal",
+              "tokens": 7
+            }
+          ]
+        },
+        "turn": "turn-5"
+      }
+    ],
+    "updated": 0,
+    "usage": [
+      {
+        "delta": {
+          "input_uncached": 10,
+          "output": 2
+        },
+        "provenance": {
+          "attempt": "att-1",
+          "attempt_purpose": "ordinary",
+          "failed": false,
+          "request": "req-1"
+        },
+        "source": "provider_attempt"
+      },
+      {
+        "delta": {
+          "input_uncached": 11,
+          "output": 2
+        },
+        "provenance": {
+          "attempt": "att-2",
+          "attempt_purpose": "ordinary",
+          "failed": false,
+          "request": "req-2"
+        },
+        "source": "provider_attempt"
+      },
+      {
+        "delta": {
+          "input_uncached": 12,
+          "output": 2
+        },
+        "provenance": {
+          "attempt": "att-3",
+          "attempt_purpose": "ordinary",
+          "failed": false,
+          "request": "req-3"
+        },
+        "source": "provider_attempt"
+      },
+      {
+        "delta": {
+          "input_uncached": 13,
+          "output": 2
+        },
+        "provenance": {
+          "attempt": "att-4",
+          "attempt_purpose": "ordinary",
+          "failed": false,
+          "request": "req-4"
+        },
+        "source": "provider_attempt"
+      },
+      {
+        "delta": {
+          "input_uncached": 14,
+          "output": 2
+        },
+        "provenance": {
+          "attempt": "att-5",
+          "attempt_purpose": "ordinary",
+          "failed": false,
+          "request": "req-5"
+        },
+        "source": "provider_attempt"
+      }
+    ]
+  },
+  "state": {
+    "finish": {
+      "outcome": "completed"
+    },
+    "state": "terminal",
+    "visible_output": true
+  },
+  "state_revision": 6,
+  "transition_revision": 4,
+  "turn": "turn-5",
+  "updated": 0,
+  "visible_output": true,
+  "watermark": {
+    "checkpoint_sequence": 35,
+    "event_sequence": 52
+  }
+}

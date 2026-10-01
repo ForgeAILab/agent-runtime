@@ -86,11 +86,12 @@ impl SessionHandle {
                 ));
             }
         };
+        let snapshot = self.checkpoint_snapshot()?;
         let event_sequence = self.inner.emitter.begin_checkpoint_barrier();
         let checkpoint = TurnCheckpoint::cache_operation(
             turn,
             operation,
-            self.snapshot(),
+            snapshot,
             deadline,
             checkpoint_sequence,
             event_sequence,
@@ -128,10 +129,11 @@ impl SessionHandle {
         checkpoint: TurnCheckpoint,
         state: TurnState,
     ) -> Result<TurnCheckpoint, RuntimeError> {
+        let snapshot = self.checkpoint_snapshot()?;
         let event_sequence = self.inner.emitter.begin_checkpoint_barrier();
         let next = match checkpoint.transition(
             state,
-            self.snapshot(),
+            snapshot,
             event_sequence,
             self.inner.shared.clock.now(),
         ) {

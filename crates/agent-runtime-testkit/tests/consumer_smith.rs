@@ -82,3 +82,8 @@ async fn smith_adapter_consumes_typed_steering_without_a_future_turn() {
             .contains("real user correction")
     }));
 }
+
+#[tokio::test]
+async fn consumer_smith_accepts_recent_manifest_diagnostics() {
+    agent_runtime_testkit::conformance::manifests::assert_file_store_manifest_migration().await;
+}

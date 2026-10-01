@@ -26,3 +26,8 @@ async fn open_forge_adapter_passes_shared_conformance() {
     assert!(rt::has_tool_completed(&payloads, "echo"));
     event_schema::assert_versioned_and_roundtrips(&observer.events());
 }
+
+#[tokio::test]
+async fn open_forge_recovers_exact_boundaries_with_bounded_diagnostics() {
+    agent_runtime_testkit::conformance::manifests::assert_protected_manifest_recovery().await;
+}

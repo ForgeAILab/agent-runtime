@@ -129,7 +129,24 @@ impl SessionHandle {
         self.inner.interrupted_on_resume.as_ref()
     }
 
-    /// A snapshot of the session's canonical state.
+    /// The ordered recent diagnostic manifest window, identical to
+    /// `snapshot().manifests`. Empty does not imply no provider activity.
+    pub fn recent_manifests(&self) -> Vec<agent_runtime_core::store::TurnManifest> {
+        let state = self.inner.state.lock().expect("session state poisoned");
+        crate::runtime::manifests::recent(&state.manifests, self.inner.shared.manifest_window)
+    }
+
+    pub(crate) fn manifest_window(&self) -> std::num::NonZeroUsize {
+        self.inner.shared.manifest_window
+    }
+
+    pub(super) fn checkpoint_snapshot(&self) -> Result<SessionSnapshot, RuntimeError> {
+        let mut snapshot = self.snapshot();
+        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// A snapshot of the session's canonical state with recent diagnostics.
     pub fn snapshot(&self) -> SessionSnapshot {
         let state = self.inner.state.lock().expect("session state poisoned");
         let mut extension_state = self.inner.execution.snapshot_extension_state();
@@ -143,7 +160,10 @@ impl SessionHandle {
             id: self.inner.id.clone(),
             history: state.history.clone(),
             usage: state.usage.clone(),
-            manifests: state.manifests.clone(),
+            manifests: crate::runtime::manifests::recent(
+                &state.manifests,
+                self.inner.shared.manifest_window,
+            ),
             identity: self
                 .inner
                 .minter

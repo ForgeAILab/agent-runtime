@@ -1941,4 +1941,91 @@ mod tests {
             .expect("a later ordinary turn is admitted");
         assert_eq!(resumed_provider.requests().len(), 1);
     }
+    #[tokio::test]
+    async fn manifest_free_cache_result_recovers_without_ordinary_snapshot_or_io() {
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+        let provider = Arc::new(FakeProvider::new(
+            "fixture-model",
+            synthetic_capabilities(),
+            (0..6)
+                .map(|_| {
+                    ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    }])
+                })
+                .collect(),
+        ));
+        let id = SessionId::new("manifest-cache-recovery");
+        let runtime = persisted_cache_runtime(provider.clone(), sessions.clone())
+            .manifest_window(std::num::NonZeroUsize::new(2).unwrap())
+            .checkpoint_store(checkpoints.clone())
+            .build()
+            .unwrap();
+        let session = runtime
+            .start_session(StartSession::new().with_id(id.clone()))
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            session.run(UserInput::text("seed")).await.unwrap();
+        }
+        let operation = session
+            .cache_operation_from_last_plan(
+                CacheOperationId::new("manifest-cache"),
+                ProviderAttemptPurpose::CacheKeepalive,
+                CacheAuthority::new("fixture-authority"),
+                CacheOperationBudget::default(),
+                Cancellation::new(),
+                Deadline::after(&agent_runtime_core::clock::SystemClock, 60_000),
+            )
+            .unwrap();
+        let result = session
+            .dispatch_cache_operation(operation.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, CacheOperationOutcome::Completed);
+        let all = checkpoints.history(&id);
+        assert!(all.iter().all(|cp| {
+            cp.snapshot.manifests.is_empty()
+                && serde_json::to_value(cp).unwrap()["snapshot"]
+                    .get("manifests")
+                    .is_none()
+        }));
+        let ready = all
+            .into_iter()
+            .find(|cp| matches!(cp.state, TurnState::CacheOperationResultReady { .. }))
+            .unwrap();
+        session.shutdown().await.unwrap();
+        let recovered_checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+        recovered_checkpoints.seed(ready).unwrap();
+        let recovered_provider = Arc::new(FakeProvider::new(
+            "fixture-model",
+            synthetic_capabilities(),
+            vec![],
+        ));
+        // Configure an empty ordinary store to prove protected-only recovery.
+        let runtime = persisted_cache_runtime(
+            recovered_provider.clone(),
+            Arc::new(InMemorySessionStore::new()),
+        )
+        .manifest_window(std::num::NonZeroUsize::new(2).unwrap())
+        .checkpoint_store(recovered_checkpoints)
+        .build()
+        .unwrap();
+        let resumed = runtime
+            .start_session(StartSession::new().with_id(id))
+            .await
+            .unwrap();
+        assert!(resumed.recent_manifests().is_empty());
+        assert_eq!(
+            resumed.snapshot().extension_state["runtime.manifest_boundary"].value["planned_steps"],
+            5
+        );
+        assert_eq!(
+            resumed.dispatch_cache_operation(operation).await.unwrap(),
+            result
+        );
+        assert!(recovered_provider.calls().is_empty());
+        resumed.shutdown().await.unwrap();
+    }
 }
