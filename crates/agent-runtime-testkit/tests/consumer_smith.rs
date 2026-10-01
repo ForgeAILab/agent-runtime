@@ -175,3 +175,8 @@ async fn smith_contributor_preserves_class_and_provider_evidence_with_legacy_pro
         event_schema::assert_versioned_and_roundtrips(&observer.events());
     }
 }
+
+#[tokio::test]
+async fn consumer_smith_accepts_recent_manifest_diagnostics() {
+    agent_runtime_testkit::conformance::manifests::assert_file_store_manifest_migration().await;
+}

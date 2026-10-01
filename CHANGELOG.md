@@ -18,7 +18,20 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   `FailureStage` and `FailureComponent` are non-exhaustive, and
   `FailureComponent` adds `Unknown`, so enum matches need a wildcard arm.
   Actual consumer builds remain a release gate.
-
+- Session manifest retention is now a finite recent window (default 32
+  planned steps). `snapshot.manifests` remains an ordered `Vec<TurnManifest>`;
+  `RuntimeBuilder::manifest_window(NonZeroUsize)` and
+  `SessionHandle::recent_manifests()` expose configuration and the same recent
+  suffix. Hosts requiring lifetime audit/replay must archive records. New
+  protected checkpoints omit diagnostic manifests and preserve exact execution
+  state using a RedactionSafe planned-step boundary record. Legacy JSON remains
+  readable; older binaries can reject a new terminal checkpoint paired with
+  nonempty ordinary diagnostics. Roll-forward repairs an opaque pre-U3
+  under-count when the longer legacy list still proves it, and nonterminal
+  crash recovery retains diagnostics from a lagging ordinary snapshot. The
+  namespace is exported as `runtime::MANIFEST_BOUNDARY_NAMESPACE`; additive
+  fields in its value remain readable. See the retention and downgrade
+  migration.
 - The removed session-scoped rolling-summary contract is replaced by Lossless
   Context Memory (LCM). Hosts bind an authorized logical timeline and compose
   `LcmCoordinator`; when `.lcm` is configured, resume automatically imports

@@ -550,7 +550,8 @@ pub struct TurnCheckpoint {
     pub visible_output: bool,
     /// Current direct-machine state.
     pub state: TurnState,
-    /// Exact canonical session state at this boundary.
+    /// Exact execution state at this boundary. Newly generated runtime
+    /// snapshots omit diagnostic manifests; legacy lists remain readable.
     pub snapshot: SessionSnapshot,
     /// Absolute turn deadline retained across restart.
     pub deadline: Deadline,

@@ -11,6 +11,7 @@ pub mod emitter;
 pub mod engine;
 pub mod goal;
 pub mod inject;
+pub(crate) mod manifests;
 pub mod session;
 pub mod state;
 pub(crate) mod steer;
@@ -24,6 +25,7 @@ pub use emitter::{EventEmitter, RuntimeEventStream};
 pub use engine::Runtime;
 pub use goal::{GoalAdmissionGate, GoalController, GoalControllerConfig};
 pub use inject::InjectedContent;
+pub use manifests::MANIFEST_BOUNDARY_NAMESPACE;
 pub use session::{
     CurrentCacheIdentityLease, IdleCompactionAdmission, InternalTurnAdmission, SessionHandle,
     TurnHandle,

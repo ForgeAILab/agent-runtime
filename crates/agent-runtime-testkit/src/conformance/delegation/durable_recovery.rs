@@ -1064,3 +1064,68 @@ pub async fn assert_calling_model_checkpoint_refuses_resume_without_provider() {
         "unsafe resume must fail before constructing a provider"
     );
 }
+
+#[tokio::test]
+async fn child_inherits_the_parent_manifest_window_across_follow_up() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(Arc::new(FakeProvider::text_reply("unused parent")))
+        .model_profile(profile())
+        .manifest_window(std::num::NonZeroUsize::new(2).unwrap())
+        .session_store(sessions.clone())
+        .checkpoint_store(checkpoints.clone())
+        .security_check(
+            Arc::new(AllowAllCheck {
+                id: SecurityCheckId::new("manifest-delegation"),
+                revision: SecurityCheckRevision::new("v1"),
+            }),
+            SecurityCheckMode::Authoritative,
+            PermissionSet::single(Permission::other(DELEGATION_PERMISSION.to_string())),
+            ActionClass::new("delegation"),
+        )
+        .build()
+        .unwrap();
+    let parent = runtime.start_session(StartSession::new()).await.unwrap();
+    let scripts = (0..5)
+        .map(|i| text_child_script(&format!("answer {i}")).remove(0))
+        .collect();
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![scripts])
+            .with_durable_stores(sessions.clone(), checkpoints.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+    let mut spec = child_spec("first");
+    spec.limits = ChildLimits::turns(5);
+    let (child, handle) = match coordinator.spawn(spec).await.unwrap() {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("{other:?}"),
+    };
+    coordinator.wait(&child).await.unwrap();
+    for _ in 0..4 {
+        coordinator
+            .follow_up(&child, UserInput::text("next"))
+            .await
+            .unwrap();
+        coordinator.wait(&child).await.unwrap();
+    }
+    assert_eq!(handle.recent_manifests().len(), 2);
+    assert_eq!(handle.history().len(), 10);
+    assert_eq!(
+        handle.snapshot().extension_state["runtime.manifest_boundary"].value["planned_steps"],
+        5
+    );
+    assert_eq!(coordinator.status(&child).unwrap().turns_used, 5);
+    let saved = sessions.load(handle.id()).await.unwrap().unwrap();
+    assert_eq!(saved.manifests, handle.recent_manifests());
+    assert!(
+        checkpoints
+            .history(handle.id())
+            .iter()
+            .all(|cp| cp.snapshot.manifests.is_empty())
+    );
+    handle.shutdown().await.unwrap();
+    coordinator.flush().await.unwrap();
+    parent.shutdown().await.unwrap();
+}

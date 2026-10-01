@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-01T00:00:00Z
-updated_at: 2026-10-01T00:00:00Z
+updated_at: 2026-10-01T21:32:43Z
 ---
 
 # Design: A bounded diagnostic window with exact execution checkpoints
@@ -44,14 +44,20 @@ No new event or archival service is introduced. Hosts requiring longer audit
 retention own their archive and migration plan; increasing a future window
 cannot recover already evicted records.
 
-Add a runtime-owned `runtime.manifest_boundary` extension namespace with a
-versioned, RedactionSafe value containing only a checked monotonic
+Add a runtime-owned `runtime.manifest_boundary` extension namespace, exported
+as `agent_runtime::runtime::MANIFEST_BOUNDARY_NAMESPACE`, with a versioned,
+RedactionSafe value containing only a checked monotonic
 `planned_steps: u64`. It counts successful manifest-producing planning steps,
 not network attempts. Copy it into ordinary and protected snapshots. Increment
 at the manifest append owner; overflow fails explicitly. No manifest body,
 source content, credential, or authority grant enters this constant-size record.
 Its purpose is boundary validation, not archive reconstruction or usage billing.
 Stores must preserve this safe record; no store trait or public field changes.
+If a pre-U3 binary preserves the record opaquely while appending manifests, a
+later U3 resume treats a full stored list longer than the record as legacy
+evidence and re-bootstraps from that length before pruning. This can repair only
+an under-count still exposed by the list; the frontier remains a diagnostic
+ordering aid rather than reconstructed lifetime history.
 
 Keep checkpoint-independent cache planner state and extension revisions;
 manifests must not become the cache baseline or execution authority. Verify
@@ -75,9 +81,12 @@ planned-step boundary counters before overlaying protected extensions. Replace
 the existing manifest-list equality check with that counter comparison; do not
 simply delete a boundary check. Diagnostic absence, pruning, or differing
 archive retention must not establish permission to overlay an incompatible
-checkpoint. Nonterminal recovery retains
-the checkpoint's exact execution snapshot; carry an ordinary store's compatible
-recent diagnostic suffix separately only after normal boundary validation.
+checkpoint. Nonterminal recovery retains the checkpoint's exact execution
+snapshot; a valid ordinary snapshot whose frontier is behind or equal may
+contribute its trimmed recent suffix as older diagnostics. An equal legacy pair
+with different lists contributes nothing instead of failing protected
+recovery. The manifest for the in-flight request is not recoverable from a
+manifest-free checkpoint and must not be invented.
 When the ordinary snapshot is unavailable, new checkpoint-only recovery has
 an empty diagnostic window and still resumes exact execution.
 

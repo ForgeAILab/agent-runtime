@@ -172,6 +172,12 @@ version, tag, or Git revision.
 # Current event vocabulary plus every retained compatibility fixture.
 cargo test -p agent-runtime-testkit event_schema
 
+# Bounded diagnostics, frozen legacy readers, mixed migration restarts,
+# protected recovery, and manifest replay reproducibility.
+cargo test -p agent-runtime-testkit --lib manifest
+cargo test -p agent-runtime-testkit --lib conformance::replay
+cargo test -p agent-runtime manifest_tests
+
 # LCM package and shared-store conformance unit suites.
 cargo test -p agent-runtime-testkit --lib lcm
 

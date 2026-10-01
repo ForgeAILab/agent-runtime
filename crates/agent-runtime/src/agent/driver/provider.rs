@@ -653,11 +653,27 @@ impl Driver {
         if let Some(input) = internal_input {
             turn_manifest = turn_manifest.with_internal_source(input.source);
         }
-        state
-            .lock()
-            .expect("session state poisoned")
-            .manifests
-            .push(turn_manifest);
+        {
+            let mut state = state.lock().expect("session state poisoned");
+            let mut extensions = execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            let count = crate::runtime::manifests::planned_steps(
+                extensions.get(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE),
+                &state.manifests,
+            )
+            .map_err(manifest_boundary_error)?
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::conflict("manifest planned-step counter overflow"))
+            .map_err(manifest_boundary_error)?;
+            extensions.insert(
+                crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
+                crate::runtime::manifests::boundary_record(count),
+            );
+            state.manifests.push(turn_manifest);
+            crate::runtime::manifests::trim(&mut state.manifests, self.manifest_window);
+        }
 
         let mut request = plan.to_provider_request(self.config.model.clone());
         request.sampling = self.config.sampling.clone();
