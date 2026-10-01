@@ -24,7 +24,7 @@ use agent_runtime_registry::{Fingerprint, FingerprintHasher, RegistryRevision};
 use crate::cancel::Cancellation;
 use crate::clock::{Deadline, Timestamp};
 use crate::content::Message;
-use crate::error::{ErrorKind, RuntimeError};
+use crate::error::{ErrorKind, FailureClass, FailureStage, RuntimeError};
 use crate::ids::{AttemptId, CacheOperationId, RequestId, SessionId};
 use crate::metadata::Metadata;
 use crate::provider_credential::ProviderCredentialRecovery;
@@ -1586,6 +1586,21 @@ impl std::error::Error for ProviderError {}
 
 impl From<ProviderError> for RuntimeError {
     fn from(err: ProviderError) -> Self {
+        // Conversion by itself does not prove a provider invocation occurred.
+        let stage = FailureStage::Unknown;
+        let class = match err.kind {
+            ProviderErrorKind::Network
+            | ProviderErrorKind::Timeout
+            | ProviderErrorKind::MalformedStream
+            | ProviderErrorKind::Server => FailureClass::Transient { stage },
+            ProviderErrorKind::RateLimited => FailureClass::RateLimited { stage },
+            ProviderErrorKind::LimitExhausted => FailureClass::QuotaExhausted { stage },
+            ProviderErrorKind::Auth => FailureClass::Auth { stage },
+            ProviderErrorKind::Cancelled => FailureClass::Cancelled { stage },
+            ProviderErrorKind::Unsupported
+            | ProviderErrorKind::BadRequest
+            | ProviderErrorKind::CacheExpired => FailureClass::RequestRejected { stage },
+        };
         let kind = match err.kind {
             ProviderErrorKind::Cancelled => ErrorKind::Cancelled,
             ProviderErrorKind::Timeout => ErrorKind::Timeout,
@@ -1598,6 +1613,10 @@ impl From<ProviderError> for RuntimeError {
             message: err.message,
             retryable: err.retryable,
             metadata: err.metadata,
+            class,
+            retry_after_ms: err.retry_after_ms,
+            limit_resets_at_ms: err.limit_resets_at_ms,
+            credential_recovery: err.credential_recovery,
         }
     }
 }

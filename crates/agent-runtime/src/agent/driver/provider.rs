@@ -376,7 +376,7 @@ impl Driver {
         step: u32,
         cancel: &Cancellation,
         deadline: Deadline,
-    ) -> Result<PlannedProviderRequest, ContextError> {
+    ) -> Result<PlannedProviderRequest, RequestBuildError> {
         debug_assert_eq!(
             execution.active_history_start(turn_id),
             Some(active_history_start),
@@ -499,7 +499,7 @@ impl Driver {
             .extend((history_offset..history.len()).map(|index| format!("history:{index}")));
         for fragment in &contributed {
             if !fragment_ids.insert(fragment.id.as_str().to_owned()) {
-                return Err(ContextError::compaction(format!(
+                return Err(request_rejected(format!(
                     "duplicate context fragment id `{}`",
                     fragment.id
                 )));
@@ -532,7 +532,7 @@ impl Driver {
             for fragment in patch.fragments {
                 validate_contributed_fragment(&fragment)?;
                 if !fragment_ids.insert(fragment.id.as_str().to_owned()) {
-                    return Err(ContextError::compaction(format!(
+                    return Err(request_rejected(format!(
                         "duplicate context fragment id `{}`",
                         fragment.id
                     )));
@@ -694,12 +694,12 @@ impl Driver {
                 ToolChoice::Named(name)
                     if !request.tools.iter().any(|schema| &schema.name == name) =>
                 {
-                    return Err(ContextError::compaction(format!(
+                    return Err(request_rejected(format!(
                         "model interceptor selected inactive tool `{name}`"
                     )));
                 }
                 ToolChoice::Required if request.tools.is_empty() => {
-                    return Err(ContextError::compaction(
+                    return Err(request_rejected(
                         "model interceptor requires a tool but the frozen activation has none",
                     ));
                 }

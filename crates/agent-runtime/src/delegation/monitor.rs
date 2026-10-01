@@ -578,12 +578,26 @@ fn child_failure(cause: Option<RuntimeError>) -> RuntimeError {
     let Some(cause) = cause else {
         return RuntimeError::new(ErrorKind::Internal, "child turn failed");
     };
-    // The kind and retryability belong to the failure, not to delegation. A
-    // parent that retries on `retryable` must see the child's answer, not
-    // delegation's opinion of it.
-    let reported = RuntimeError::new(cause.kind, format!("child turn failed: {}", cause.message))
-        .with_metadata(cause.metadata);
-    if cause.retryable {
+    // The kind, retryability, and diagnostic evidence belong to the failure,
+    // not to delegation. A parent that retries on `retryable` must see the
+    // child's answer, not delegation's opinion of it.
+    let RuntimeError {
+        kind,
+        message,
+        retryable,
+        metadata,
+        class,
+        retry_after_ms,
+        limit_resets_at_ms,
+        credential_recovery,
+    } = cause;
+    let mut reported = RuntimeError::new(kind, format!("child turn failed: {message}"))
+        .with_metadata(metadata)
+        .with_class(class);
+    reported.retry_after_ms = retry_after_ms;
+    reported.limit_resets_at_ms = limit_resets_at_ms;
+    reported.credential_recovery = credential_recovery;
+    if retryable {
         reported.retryable()
     } else {
         reported
@@ -669,6 +683,27 @@ mod tests {
             reported.metadata,
             agent_runtime_core::metadata::Metadata::new().with("retry_after_ms", "1000")
         );
+    }
+
+    #[test]
+    fn child_failure_preserves_classification_and_recovery_evidence() {
+        let mut cause = RuntimeError::new(ErrorKind::Provider, "rate limit exceeded").with_class(
+            agent_runtime_core::error::FailureClass::RateLimited {
+                stage: agent_runtime_core::error::FailureStage::Provider,
+            },
+        );
+        cause.retry_after_ms = Some(25);
+        cause.limit_resets_at_ms = Some(1_700_000_000_123);
+        cause.credential_recovery = Some(
+            agent_runtime_core::provider_credential::ProviderCredentialRecovery::RetryWithRenewedCredential,
+        );
+
+        let reported = child_failure(Some(cause.clone()));
+
+        assert_eq!(reported.class, cause.class);
+        assert_eq!(reported.retry_after_ms, cause.retry_after_ms);
+        assert_eq!(reported.limit_resets_at_ms, cause.limit_resets_at_ms);
+        assert_eq!(reported.credential_recovery, cause.credential_recovery);
     }
 
     #[test]

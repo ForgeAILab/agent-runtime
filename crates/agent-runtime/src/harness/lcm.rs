@@ -24,7 +24,9 @@ use agent_runtime_core::artifact::{ArtifactRead, ArtifactStore, MAX_ARTIFACT_REA
 use agent_runtime_core::cancel::Cancellation;
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::{ContentPart, Message, Role};
-use agent_runtime_core::error::{ErrorKind, RuntimeError};
+use agent_runtime_core::error::{
+    ErrorKind, FailureClass, FailureComponent, FailureStage, RuntimeError,
+};
 use agent_runtime_core::event::{
     LcmLifecycleKind, LcmLifecycleMetadata, LcmLifecycleReason, TurnFinish,
 };
@@ -725,7 +727,7 @@ impl LcmCoordinator {
             ));
         }
         let state: LcmState = serde_json::from_value(persisted.value.clone())
-            .map_err(|error| RuntimeError::conflict(format!("LCM state is malformed: {error}")))?;
+            .map_err(|_| RuntimeError::conflict("LCM state is malformed"))?;
         if state.schema_version != LCM_STATE_SCHEMA_VERSION
             || state.timeline_id != binding.timeline
             || state.binding_revision != binding.authorization_revision
@@ -867,7 +869,10 @@ impl LcmCoordinator {
         }
         Err(
             RuntimeError::conflict("LCM content guard rejected summary output")
-                .with_metadata(metadata),
+                .with_metadata(metadata)
+                .with_class(FailureClass::PolicyDenied {
+                    stage: FailureStage::Unknown,
+                }),
         )
     }
 
@@ -1310,7 +1315,7 @@ impl LcmCoordinator {
             .await
             .map_err(map_lcm_error)?;
         if revision_before != dag_revision {
-            return Err(RuntimeError::conflict(
+            return Err(lcm_revision_conflict(
                 "LCM store changed while capturing checkpoint state",
             ));
         }
@@ -1497,6 +1502,11 @@ impl LcmCoordinator {
             .insert("max_rounds", self.policy.pressure.max_rounds as u64);
         RuntimeError::limit("LCM context cannot fit after bounded hard compaction")
             .with_metadata(metadata)
+            .with_class(FailureClass::ContextOverflow {
+                stage: FailureStage::PreProvider,
+                required_tokens: u32::try_from(required_tokens).ok(),
+                available_tokens: u32::try_from(self.policy.input_budget_tokens).ok(),
+            })
     }
 
     fn pressure_event(
@@ -2280,7 +2290,7 @@ impl LcmCoordinator {
             .await
             .map_err(map_lcm_error)?;
         if current_revision != expected_revision {
-            return Err(RuntimeError::conflict(
+            return Err(lcm_revision_conflict(
                 "LCM pending summary DAG revision is stale",
             ));
         }
@@ -2489,7 +2499,7 @@ impl LcmCoordinator {
             .await
             .map_err(map_lcm_error)?;
         if revision_after_active_nodes != current_revision {
-            return Err(RuntimeError::conflict(
+            return Err(lcm_revision_conflict(
                 "LCM pending successor changed while reading its predecessor DAG",
             ));
         }
@@ -2664,7 +2674,7 @@ impl LcmCoordinator {
             .await
             .map_err(map_lcm_error)?;
         if revision_after_active_nodes != current_revision {
-            return Err(RuntimeError::conflict(
+            return Err(lcm_revision_conflict(
                 "LCM append successor changed while reading its active DAG",
             ));
         }
@@ -3105,7 +3115,7 @@ impl LcmCoordinator {
             .await
             .map_err(map_lcm_error)?;
         if revision_after != revision {
-            return Err(RuntimeError::conflict(
+            return Err(lcm_revision_conflict(
                 "LCM store changed while projecting its protected checkpoint",
             ));
         }
@@ -3450,7 +3460,13 @@ impl TurnCommitHook for LcmCoordinator {
         &self,
         view: &TurnCommitView,
     ) -> Result<BeforeProviderPatch, RuntimeError> {
-        self.compact_hard_result(view).await
+        self.compact_hard_result(view)
+            .await
+            .map(|mut patch| {
+                patch.block = patch.block.map(lcm_pre_provider_error);
+                patch
+            })
+            .map_err(lcm_pre_provider_error)
     }
 
     async fn after_commit(&self, view: &TurnCommitView) -> Result<TurnCommitPatch, RuntimeError> {
@@ -3871,6 +3887,25 @@ fn legacy_node_matches(
 }
 
 fn map_summary_error(error: LcmSummaryError) -> RuntimeError {
+    let stage = FailureStage::Unknown;
+    let class = match &error {
+        LcmSummaryError::EmptySource => FailureClass::RequestRejected { stage },
+        LcmSummaryError::SecretSource => FailureClass::PolicyDenied { stage },
+        LcmSummaryError::ModelFailure | LcmSummaryError::ModelFailureWithUsage { .. } => {
+            FailureClass::HostComponent {
+                stage,
+                component: FailureComponent::Lcm,
+            }
+        }
+        LcmSummaryError::CannotFit | LcmSummaryError::CannotFitWithUsage { .. } => {
+            FailureClass::ContextOverflow {
+                stage,
+                required_tokens: None,
+                available_tokens: None,
+            }
+        }
+        LcmSummaryError::InvalidConfiguration { .. } => FailureClass::RequestRejected { stage },
+    };
     let reported_usage = error.reported_usage();
     let attempts = error.attempts().map(|attempts| {
         attempts
@@ -3908,7 +3943,8 @@ fn map_summary_error(error: LcmSummaryError) -> RuntimeError {
         LcmSummaryError::InvalidConfiguration { .. } => {
             RuntimeError::config("LCM summary configuration is invalid")
         }
-    };
+    }
+    .with_class(class);
     if metadata.is_empty() {
         mapped
     } else {
@@ -3917,6 +3953,7 @@ fn map_summary_error(error: LcmSummaryError) -> RuntimeError {
 }
 
 fn map_lcm_error(error: LcmError) -> RuntimeError {
+    let class = lcm_failure_class(&error, FailureStage::Unknown);
     match error {
         LcmError::CannotFit {
             required_tokens,
@@ -3944,10 +3981,11 @@ fn map_lcm_error(error: LcmError) -> RuntimeError {
         LcmError::InvalidBound => RuntimeError::limit("LCM read or expansion bound is invalid"),
         LcmError::SecretSource => RuntimeError::conflict("LCM secret source cannot be summarized"),
         LcmError::StoreFailure => RuntimeError::internal("LCM store backend failed"),
-    }
+    }.with_class(class)
 }
 
 fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
+    let class = lcm_failure_class(&error, FailureStage::Unknown);
     match error {
         LcmError::Unauthorized => RuntimeError::approval("LCM timeline view is unauthorized"),
         LcmError::MissingSource => RuntimeError::not_found("LCM expansion target was not found"),
@@ -3966,10 +4004,192 @@ fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
             RuntimeError::config("LCM expansion request is invalid")
         }
     }
+    .with_class(class)
+}
+
+fn lcm_failure_class(error: &LcmError, stage: FailureStage) -> FailureClass {
+    match error {
+        LcmError::CannotFit {
+            required_tokens,
+            available_tokens,
+        } => FailureClass::ContextOverflow {
+            stage,
+            required_tokens: u32::try_from(*required_tokens).ok(),
+            available_tokens: u32::try_from(*available_tokens).ok(),
+        },
+        LcmError::Unauthorized | LcmError::SecretSource => FailureClass::PolicyDenied { stage },
+        LcmError::Invalid { .. }
+        | LcmError::InvalidCursor
+        | LcmError::InvalidBound
+        | LcmError::CrossTimeline
+        | LcmError::MissingSource => FailureClass::RequestRejected { stage },
+        LcmError::StoreFailure => FailureClass::HostComponent {
+            stage,
+            component: FailureComponent::Lcm,
+        },
+        LcmError::RevisionConflict { .. }
+        | LcmError::IdempotencyConflict
+        | LcmError::SequenceGap { .. }
+        | LcmError::EntryConflict
+        | LcmError::RangeOverlap
+        | LcmError::InactiveChild => FailureClass::StateConflict {
+            stage,
+            component: FailureComponent::Lcm,
+        },
+    }
+}
+
+fn lcm_revision_conflict(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::conflict(message).with_class(FailureClass::StateConflict {
+        stage: FailureStage::Unknown,
+        component: FailureComponent::Lcm,
+    })
+}
+
+fn lcm_pre_provider_error(mut error: RuntimeError) -> RuntimeError {
+    if error.class.is_unclassified() {
+        error.class = FailureClass::HostComponent {
+            stage: FailureStage::PreProvider,
+            component: FailureComponent::Lcm,
+        };
+    } else if error.class.stage() == FailureStage::Unknown {
+        error = error.with_failure_stage(FailureStage::PreProvider);
+    }
+    error
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_checkpoint_failure_does_not_echo_protected_values() {
+        use super::*;
+        let coordinator =
+            test_coordinator(Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline"))));
+        let binding = coordinator
+            .timeline_binding(&SessionId::new("lcm-session"))
+            .unwrap();
+        let persisted = VersionedSessionState::new(
+            coordinator.descriptor_value().revision().clone(),
+            serde_json::json!({"schema_version": "private checkpoint body canary"}),
+        );
+        let error = coordinator.decode_state(&binding, &persisted).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Conflict);
+        assert_eq!(error.class, FailureClass::Unclassified);
+        assert!(
+            !serde_json::to_string(&error)
+                .unwrap()
+                .contains("private checkpoint body canary")
+        );
+        assert!(!format!("{error:?}").contains("private checkpoint body canary"));
+        assert_eq!(
+            lcm_pre_provider_error(error).class,
+            FailureClass::HostComponent {
+                stage: FailureStage::PreProvider,
+                component: FailureComponent::Lcm,
+            }
+        );
+    }
+
+    #[test]
+    fn typed_failure_classes_retain_coarse_kinds_and_redact_store_reasons() {
+        use super::*;
+        let stage = FailureStage::Unknown;
+        for (source, kind, class) in [
+            (
+                LcmError::CannotFit {
+                    required_tokens: 110,
+                    available_tokens: 100,
+                },
+                ErrorKind::Limit,
+                FailureClass::ContextOverflow {
+                    stage,
+                    required_tokens: Some(110),
+                    available_tokens: Some(100),
+                },
+            ),
+            (
+                LcmError::Unauthorized,
+                ErrorKind::Approval,
+                FailureClass::PolicyDenied { stage },
+            ),
+            (
+                LcmError::RevisionConflict {
+                    expected: LcmRevision::INITIAL,
+                    actual: LcmRevision::new(1),
+                },
+                ErrorKind::Conflict,
+                FailureClass::StateConflict {
+                    stage,
+                    component: FailureComponent::Lcm,
+                },
+            ),
+            (
+                LcmError::IdempotencyConflict,
+                ErrorKind::Conflict,
+                FailureClass::StateConflict {
+                    stage,
+                    component: FailureComponent::Lcm,
+                },
+            ),
+            (
+                LcmError::Invalid {
+                    reason: "private store text canary".to_owned(),
+                },
+                ErrorKind::Conflict,
+                FailureClass::RequestRejected { stage },
+            ),
+            (
+                LcmError::StoreFailure,
+                ErrorKind::Internal,
+                FailureClass::HostComponent {
+                    stage,
+                    component: FailureComponent::Lcm,
+                },
+            ),
+        ] {
+            let error = map_lcm_error(source.clone());
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.class, class);
+            assert!(!error.retryable);
+            let wire = serde_json::to_string(&error).unwrap();
+            assert!(!wire.contains("private store text canary"));
+            assert!(!format!("{error:?}").contains("private store text canary"));
+            let expansion = map_expansion_lcm_error(source);
+            assert_eq!(expansion.class.stage(), FailureStage::Unknown);
+            assert!(
+                !serde_json::to_string(&expansion)
+                    .unwrap()
+                    .contains("private store text canary")
+            );
+        }
+        let summary = map_summary_error(LcmSummaryError::ModelFailure);
+        assert_eq!(summary.kind, ErrorKind::Provider);
+        assert!(summary.retryable);
+        assert_eq!(
+            summary.class,
+            FailureClass::HostComponent {
+                stage,
+                component: FailureComponent::Lcm
+            }
+        );
+        assert_eq!(
+            map_summary_error(LcmSummaryError::CannotFit).class,
+            FailureClass::ContextOverflow {
+                stage,
+                required_tokens: None,
+                available_tokens: None
+            }
+        );
+        let missing = map_expansion_lcm_error(LcmError::MissingSource);
+        assert_eq!(missing.kind, ErrorKind::NotFound);
+        assert_eq!(
+            missing.class,
+            FailureClass::RequestRejected {
+                stage: FailureStage::Unknown
+            }
+        );
+    }
+
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

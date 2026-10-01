@@ -1,0 +1,20 @@
+{
+  "schema_version": 15,
+  "seq": 4,
+  "id": "evt-child-error-1",
+  "session": "session-error-1",
+  "turn": "turn-error-1",
+  "timestamp": 0,
+  "payload": {
+    "event": "child_failed",
+    "child": "child-error-1",
+    "error": {
+      "kind": "provider",
+      "message": "fixture failure",
+      "retryable": false,
+      "metadata": {
+        "source": "fixture"
+      }
+    }
+  }
+}

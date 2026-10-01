@@ -1,0 +1,18 @@
+{
+  "kind": "provider",
+  "message": "fixture failure",
+  "retryable": false,
+  "metadata": {
+    "source": "fixture"
+  },
+  "class": {
+    "reason": "future_reason",
+    "stage": "future_stage",
+    "unknown_payload": {
+      "value": 12
+    }
+  },
+  "retry_after_ms": 0,
+  "limit_resets_at_ms": 1700000000123,
+  "credential_recovery": "retry_with_renewed_credential"
+}

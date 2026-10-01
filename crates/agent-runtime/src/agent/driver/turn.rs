@@ -1202,7 +1202,7 @@ impl<'a> TurnMachine<'a> {
                     // Planning failed before any network I/O — that is the
                     // point of preflight enforcement, so report the budget
                     // category rather than letting an oversized request go.
-                    if let Some(report) = &err.report {
+                    if let Some(report) = err.report() {
                         emitter.emit(
                             turn.clone(),
                             RuntimeEvent::BudgetFailure {
@@ -1215,7 +1215,7 @@ impl<'a> TurnMachine<'a> {
                     emitter.emit(
                         turn.clone(),
                         RuntimeEvent::Error {
-                            error: RuntimeError::config(err.to_string()),
+                            error: err.into_runtime_error(),
                         },
                     );
                     self.complete(TurnFinish::Failed, visible_output).await;
@@ -1226,7 +1226,13 @@ impl<'a> TurnMachine<'a> {
             let planned_with_tools = !planned_request.request.tools.is_empty();
             let mut request = planned_request.request;
             if let Err(err) = driver.validate_and_downgrade(&mut request, &emitter, &turn) {
-                emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
+                emitter.emit(
+                    turn.clone(),
+                    RuntimeEvent::Error {
+                        error: RuntimeError::from(err)
+                            .with_failure_stage(FailureStage::PreProvider),
+                    },
+                );
                 self.complete(TurnFinish::Failed, visible_output).await;
                 return;
             }
@@ -1294,7 +1300,13 @@ impl<'a> TurnMachine<'a> {
                 }
                 ProviderTurnOutcome::Failed(err) => {
                     let provider_error_kind = err.kind;
-                    emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::Error {
+                            error: RuntimeError::from(err)
+                                .with_failure_stage(FailureStage::Provider),
+                        },
+                    );
                     self.complete_with_provider_error(
                         TurnFinish::Failed,
                         visible_output,
@@ -1447,11 +1459,11 @@ impl<'a> TurnMachine<'a> {
                             emitter.emit(
                                 turn.clone(),
                                 RuntimeEvent::Error {
-                                    error: ProviderError::new(
+                                    error: RuntimeError::from(ProviderError::new(
                                         ProviderErrorKind::BadRequest,
                                         "provider filtered the response",
-                                    )
-                                    .into(),
+                                    ))
+                                    .with_failure_stage(FailureStage::Provider),
                                 },
                             );
                             self.complete(TurnFinish::Failed, visible_output).await;
@@ -1475,11 +1487,11 @@ impl<'a> TurnMachine<'a> {
                             emitter.emit(
                                 turn.clone(),
                                 RuntimeEvent::Error {
-                                    error: ProviderError::new(
+                                    error: RuntimeError::from(ProviderError::new(
                                         ProviderErrorKind::MalformedStream,
                                         "provider finish reason did not match its streamed output",
-                                    )
-                                    .into(),
+                                    ))
+                                    .with_failure_stage(FailureStage::Provider),
                                 },
                             );
                             self.complete(TurnFinish::Failed, visible_output).await;

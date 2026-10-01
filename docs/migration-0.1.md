@@ -586,9 +586,90 @@ retention policy, scheduling, or a concrete database. Consumer bindings remain
 separate: Nyx binds a timeline to its authorized channel, Smith to a persistent
 agent session, and Open Forge to its authorized Room + AgentIdentity context.
 
+## 18. Runtime failure evidence
+
+`RuntimeError` now carries `class: FailureClass`, plus optional
+`retry_after_ms`, `limit_resets_at_ms`, and `credential_recovery`. The class
+uses an internally tagged JSON object (`reason`, snake-case names); classified
+variants carry a `FailureStage`: `PreProvider`, `Provider`, `Tool`, or
+`Unknown`. The stage describes origin, not provider cost, committed history,
+or retry admission. State/component failures use the fixed neutral
+`FailureComponent` identifiers (`ContextPlanner`, `Harness`, `Lcm`,
+`Checkpoint`, or `Unknown`), so backend prose cannot enter that field. Both
+`FailureStage` and `FailureComponent` are non-exhaustive; downstream matches
+must retain a wildcard arm.
+
+Context overflow counts are `Option<u32>` in Rust, matching planner counts and
+serializing as ordinary optional JSON numbers. LCM `u64` counts are retained
+only when they fit in `u32`; otherwise they remain unknown.
+
+Known schema/configuration failures use `RequestRejected`, policy denials use
+`PolicyDenied`, and typed input-budget failures use `ContextOverflow` with
+known counts only. Capability sub-budget overflow remains nonfatal when the
+model-input budget fits. The `BudgetExceeded` path whose accounting still fits
+the input budget is the configured estimated-slack margin rejection; it uses
+`RequestRejected` and still emits the existing input budget failure event.
+Arbitrary compaction or host failures do not imply context overflow or
+transience. LCM mappings retain safe typed conflict/denial evidence and discard
+backend reason text. Only typed LCM conflicts and concurrent revision reads are
+`StateConflict`; invariant, corruption, and configuration checks keep their
+historical unclassified projection. Private request-building errors still
+project as Config/nonretryable, even when preserved evidence says `Transient`.
+
+`From<ProviderError>` preserves every source field and starts with an unknown
+stage. The driver records `PreProvider` for its local capability checks and
+`Provider` for invocation failures. `retry_after_ms` is a duration;
+`limit_resets_at_ms` is an absolute Unix-millisecond timestamp. Both preserve
+zero and absence. Credential recovery carries only the existing fixed enum,
+never a lease or secret. These fields describe evidence only: retry admission,
+credential replay fences, `ProviderAttemptFinished.retry_delay_ms`, and
+`TurnFinish` keep their existing semantics.
+
+Missing fields deserialize as `Unclassified`/`None`; unclassified and absent
+fields are omitted on serialization. Unknown future reason tags fall back to
+`Unclassified`, while unknown stage/component names use `Unknown`. A malformed
+class of any kind falls back to `Unclassified`; timing that is not a
+non-negative integer and an unknown credential-recovery value become `None`.
+Separately valid evidence remains readable. No event or checkpoint schema
+revision changes.
+
+The source migration covers `RuntimeError` literals/destructuring, failure-enum
+matches, and context-overflow count construction:
+
+```rust
+use agent_runtime::core::error::{FailureClass, RuntimeError};
+
+let error = RuntimeError {
+    kind,
+    message,
+    retryable,
+    metadata,
+    class: FailureClass::Unclassified,
+    retry_after_ms: None,
+    limit_resets_at_ms: None,
+    credential_recovery: None,
+};
+let RuntimeError { kind, message, .. } = error;
+```
+
+Existing constructors remain available. Use `with_class(...)` and
+`with_failure_stage(...)` only with typed origin evidence. Event matches,
+`StartSession::new().with_history`, subscribe-before-send, store traits, and
+command shapes need no change for this addition. All three actual consumer
+integrations must compile against the candidate before release; passing the
+neutral testkit targets alone does not establish product source compatibility.
+
+When constructing `FailureClass::ContextOverflow`, pass counts directly (for
+example, `required_tokens: Some(1024)`) rather than boxing `u64` values. Match
+`FailureClass`, `FailureStage`, and `FailureComponent` with a wildcard arm.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.
+- [ ] Supply the new `RuntimeError` literal fields or use existing constructors;
+      add `..` to field-exhaustive destructuring and compile all three consumers.
+- [ ] Replace boxed context-overflow counts with direct `u32` values and add
+      wildcard arms to failure-class/stage/component matches.
 - [ ] Replace `agent_runtime_prompt` imports with `agent_runtime::context`.
 - [ ] Replace `TokenEstimator`/`CharBasedEstimator` with a `RequestSizer`.
 - [ ] Replace the removed rolling summary path with an authorized LCM timeline,

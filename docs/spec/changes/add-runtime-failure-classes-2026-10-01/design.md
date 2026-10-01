@@ -34,10 +34,16 @@ parsing or consumer source literals is needed for this slice.
 
 Use a new non-exhaustive `FailureClass` enum, serialized as an internally
 tagged object (`reason`, snake-case names). Its `Unclassified` unit variant is
-the serde default and fallback for unknown future reason tags. Known malformed
-payloads still fail deserialization. Reason-bearing variants carry a fixed
+the serde default and fallback for unknown future reason tags. On
+`RuntimeError`, any class value that cannot be decoded falls back to
+`Unclassified`; unknown stage and component names use their `Unknown`
+fallbacks. Timing values that are not non-negative integers and unknown fixed
+credential-recovery values become absent evidence. Diagnostic evidence never
+makes an enclosing record unreadable. Reason-bearing variants carry a fixed
 `FailureStage`: `PreProvider`, `Provider`, `Tool`, or `Unknown`. Stage names a
-failure's origin, not proof of cost incurred or of history commitment.
+failure's origin, not proof of cost incurred or of history commitment. The
+stage and component enums are non-exhaustive so future variants are not a Rust
+source break for wildcard-matching consumers.
 
 | Class | Evidence and intended host interpretation |
 | --- | --- |
@@ -79,28 +85,31 @@ inside the private carrier so its typed origin determines the class; do not
 replace that origin with a Compaction string. Other direct runtime/provider
 error paths retain their current kind and retryable values. Where no class
 exists, attach a bounded component identity and unknown retry semantics. Set
-LCM classes at the typed match before the harness boundary, without carrying
-backend reason text into diagnostics. The new class can say StateConflict even
-when the historical coarse projection is Config; it is the additive evidence
-hosts should use, rather than a change to their existing kind match.
+LCM classes at the typed match before the harness boundary, or when two reads
+directly prove a concurrent revision change, without carrying backend reason
+text into diagnostics. The new class can say StateConflict even when the
+historical coarse projection is Config; it is the additive evidence hosts
+should use, rather than a change to their existing kind match.
 
-Input-budget overflow is distinguished from capability sub-budget overflow:
-the latter uses `RequestRejected` unless a typed input-budget failure also
-exists. Do not manufacture required/available counts for arbitrary Compaction
-strings or provider BadRequest bodies. Provider context-overflow detection is
-deferred until adapters have independently reviewed structured evidence.
+Input-budget overflow is distinguished from the estimated-slack margin path:
+the latter has a fitting budget report and uses `RequestRejected`. Capability
+sub-budget overflow remains non-fatal when the whole input fits. Do not
+manufacture required/available counts for arbitrary Compaction strings or
+provider BadRequest bodies. Provider context-overflow detection is deferred
+until adapters have independently reviewed structured evidence.
 
 ### Wire and release behavior
 
 All new RuntimeError fields are serde-defaulted; `Unclassified` and absent
-options are omitted. Legacy JSON remains readable, including nested Error
-events and checkpoints. Older current readers ignore unknown struct fields;
-test this using frozen main-shaped fixtures, not an assumption about all
-third-party parsers. No schema-version bump or RuntimeEvent variant is needed.
-Adding a field can break Rust literals despite compatible JSON. Actual consumer
-compilation and projections, not the audit's search result, decide release
-eligibility. Preserve retry admission and existing coarse projections at the
-final host boundary; no automatic runtime retry is added for preflight errors.
+options are omitted. Legacy JSON remains readable, including nested Error and
+ChildFailed event-log records. Older current readers ignore unknown struct
+fields; test this using frozen main-shaped fixtures, not an assumption about
+all third-party parsers. No schema-version bump or RuntimeEvent variant is
+needed. Adding a field can break Rust literals despite compatible JSON. Actual
+consumer compilation and projections, not the audit's search result, decide
+release eligibility. Preserve retry admission and existing coarse projections
+at the final host boundary; no automatic runtime retry is added for preflight
+errors.
 
 ## Risks and Migration
 
@@ -110,10 +119,11 @@ proposal does not silently rewrite flags. Secret-bearing free-form component
 text is prohibited. Failure stage must be set at the actual origin, especially
 for local errors constructed using ProviderError.
 
-Fixtures must check legacy absence, future unknown reason tags, exact timing
-preservation including zero values, planner budget categories, classified
-contributor failures, LCM policy/conflict errors, and unchanged provider retry
-counts/delays. Adoption of class-based presentation is optional in all hosts.
+Fixtures must check legacy absence on records that actually contain an error,
+future and malformed class evidence, exact timing preservation including zero
+values, planner budget categories, classified contributor failures, LCM
+policy/conflict errors, and unchanged provider retry counts/delays. Adoption of
+class-based presentation is optional in all hosts.
 
 ## Open Questions
 

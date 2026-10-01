@@ -82,3 +82,96 @@ async fn smith_adapter_consumes_typed_steering_without_a_future_turn() {
             .contains("real user correction")
     }));
 }
+
+#[derive(Debug)]
+struct FailingContributor(RuntimeError);
+
+#[async_trait::async_trait]
+impl agent_runtime::harness::ContextContributor for FailingContributor {
+    fn descriptor(&self) -> agent_runtime::harness::ComponentDescriptor {
+        agent_runtime::harness::ComponentDescriptor::new(
+            "fixture.contributor",
+            RegistryRevision::new("1"),
+        )
+    }
+
+    async fn contribute(
+        &self,
+        _view: &agent_runtime::harness::ContextView,
+    ) -> Result<agent_runtime::harness::ContextPatch, RuntimeError> {
+        Err(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn smith_contributor_preserves_class_and_provider_evidence_with_legacy_projection() {
+    use agent_runtime_core::metadata::Metadata;
+    use agent_runtime_core::provider::{ProviderError, ProviderErrorKind};
+    use agent_runtime_core::provider_credential::ProviderCredentialRecovery;
+
+    event_schema::assert_failure_fixtures();
+    let mut classified = RuntimeError::from(
+        ProviderError::new(ProviderErrorKind::RateLimited, "safe contributor failure")
+            .retry_after(0),
+    )
+    .with_failure_stage(FailureStage::Provider);
+    classified.limit_resets_at_ms = Some(1_700_000_000_123);
+    classified.credential_recovery = Some(ProviderCredentialRecovery::RetryWithRenewedCredential);
+    classified.metadata = Metadata::new().with("origin", "fixture");
+    for source in [
+        classified,
+        RuntimeError::internal("unknown host failure").retryable(),
+    ] {
+        let observer = RecordingObserver::shared();
+        let provider = Arc::new(scenarios::fake_text("unused"));
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(scenarios::fake_model_profile())
+            .provider(provider.clone())
+            .context_contributor(Arc::new(FailingContributor(source.clone())))
+            .observer(observer.clone())
+            .retry(RetryPolicy::immediate(3))
+            .build()
+            .unwrap();
+        let session = runtime.start_session(StartSession::new()).await.unwrap();
+        session.run(UserInput::text("hi")).await.unwrap();
+        let events = observer.payloads();
+        let errors = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Error { error } => Some(error),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        let error = errors[0];
+        let expected = if source.class.is_unclassified() {
+            FailureClass::HostComponent {
+                stage: FailureStage::PreProvider,
+                component: FailureComponent::Harness,
+            }
+        } else {
+            source.class.clone()
+        };
+        assert_eq!(error.class, expected);
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(!error.retryable);
+        assert_eq!(error.metadata, source.metadata);
+        assert_eq!(error.retry_after_ms, source.retry_after_ms);
+        assert_eq!(error.limit_resets_at_ms, source.limit_resets_at_ms);
+        assert_eq!(error.credential_recovery, source.credential_recovery);
+        assert!(provider.requests().is_empty());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ProviderAttemptStarted { .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(RuntimeEvent::TurnCompleted {
+                finish: TurnFinish::Failed,
+                ..
+            })
+        ));
+        event_schema::assert_versioned_and_roundtrips(&observer.events());
+    }
+}

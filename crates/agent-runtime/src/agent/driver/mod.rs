@@ -17,7 +17,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use agent_runtime_context::budget::ContextError;
+use agent_runtime_context::budget::{BudgetReport, ContextError, ContextErrorKind};
 use agent_runtime_context::cache::CachePlan;
 use agent_runtime_context::plan::ContextPlan;
 use agent_runtime_context::sizing::EstimationConfidence as SizerConfidence;
@@ -34,7 +34,9 @@ use agent_runtime_core::content::{
     ContentPart, InternalTurnInput, InternalTurnSensitivity, Message, Role, ToolCall,
     ToolResultBlock, UserInput,
 };
-use agent_runtime_core::error::RuntimeError;
+use agent_runtime_core::error::{
+    ErrorKind, FailureClass, FailureComponent, FailureStage, RuntimeError,
+};
 use agent_runtime_core::event::{
     BudgetCategory, CacheState, CompactionReason, EstimationConfidence, LimitKind, RuntimeEvent,
     TurnFinish,
@@ -262,11 +264,92 @@ fn map_confidence(confidence: SizerConfidence) -> EstimationConfidence {
     }
 }
 
-fn harness_context_error(error: RuntimeError) -> ContextError {
-    ContextError::compaction(format!("harness component failed: {}", error.message))
+/// Keep typed origins until the historical Config/nonretryable host projection.
+enum RequestBuildError {
+    Planner(ContextError),
+    Harness(Box<RuntimeError>),
 }
 
-fn validate_contributed_fragment(fragment: &ContextFragment) -> Result<(), ContextError> {
+impl From<ContextError> for RequestBuildError {
+    fn from(error: ContextError) -> Self {
+        Self::Planner(error)
+    }
+}
+
+impl RequestBuildError {
+    fn report(&self) -> Option<&BudgetReport> {
+        match self {
+            Self::Planner(error) => error.report.as_deref(),
+            Self::Harness(_) => None,
+        }
+    }
+
+    fn into_runtime_error(self) -> RuntimeError {
+        let stage = FailureStage::PreProvider;
+        match self {
+            Self::Planner(error) => {
+                let class = match error.kind {
+                    ContextErrorKind::BudgetExceeded => match error.report.as_deref() {
+                        Some(report) if !report.fits_budget() => FailureClass::ContextOverflow {
+                            stage,
+                            required_tokens: Some(report.total_input_tokens),
+                            available_tokens: Some(report.input_budget),
+                        },
+                        Some(_) => FailureClass::RequestRejected { stage },
+                        // This kind also covers capability budgets. Without
+                        // accounting there is no proof of model-input overflow.
+                        None => FailureClass::RequestRejected { stage },
+                    },
+                    ContextErrorKind::Compaction => FailureClass::HostComponent {
+                        stage,
+                        component: FailureComponent::ContextPlanner,
+                    },
+                    ContextErrorKind::MissingModelProfile
+                    | ContextErrorKind::InvalidPairing
+                    | ContextErrorKind::DuplicateFragmentId
+                    | ContextErrorKind::InvalidCacheIdentity => {
+                        FailureClass::RequestRejected { stage }
+                    }
+                };
+                RuntimeError::config(error.to_string()).with_class(class)
+            }
+            Self::Harness(error) => {
+                let mut error = *error;
+                let request_rejected = matches!(error.class, FailureClass::RequestRejected { .. });
+                if error.class.is_unclassified() {
+                    error.class = FailureClass::HostComponent {
+                        stage,
+                        component: FailureComponent::Harness,
+                    };
+                }
+                // Retain original evidence and the old display/coarse projection.
+                error.kind = ErrorKind::Config;
+                error.retryable = false;
+                error.message = if request_rejected {
+                    format!("compaction: {}", error.message)
+                } else {
+                    format!("compaction: harness component failed: {}", error.message)
+                };
+                error
+            }
+        }
+    }
+}
+
+fn harness_context_error(mut error: RuntimeError) -> RequestBuildError {
+    if error.class.stage() == FailureStage::Unknown {
+        error = error.with_failure_stage(FailureStage::PreProvider);
+    }
+    RequestBuildError::Harness(Box::new(error))
+}
+
+fn request_rejected(message: impl Into<String>) -> RequestBuildError {
+    harness_context_error(
+        RuntimeError::config(message).with_failure_stage(FailureStage::PreProvider),
+    )
+}
+
+fn validate_contributed_fragment(fragment: &ContextFragment) -> Result<(), RequestBuildError> {
     let valid_placement = matches!(
         (fragment.kind, fragment.position.lane),
         (
@@ -278,7 +361,7 @@ fn validate_contributed_fragment(fragment: &ContextFragment) -> Result<(), Conte
         ) | (FragmentKind::Continuation, ContextLane::TailContext)
     );
     if !valid_placement {
-        return Err(ContextError::compaction(format!(
+        return Err(request_rejected(format!(
             "context contributor fragment `{}` uses protected kind/lane placement",
             fragment.id
         )));
@@ -289,7 +372,7 @@ fn validate_contributed_fragment(fragment: &ContextFragment) -> Result<(), Conte
         || !fragment.pairings.is_empty()
         || fragment.conversation_group.is_some()
     {
-        return Err(ContextError::compaction(format!(
+        return Err(request_rejected(format!(
             "context contributor fragment `{}` attempts to inject conversation, tool, \
              ability, or pairing authority",
             fragment.id
@@ -975,3 +1058,113 @@ mod provider;
 mod recovery;
 mod tools;
 mod turn;
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use agent_runtime_context::{CharRatioSizer, RequestSizer};
+
+    #[test]
+    fn planner_failure_classes_use_typed_input_budget_evidence() {
+        let mut report = BudgetReport {
+            categories: Vec::new(),
+            total_input_tokens: 110,
+            input_budget: 100,
+            output_reserve: 0,
+            reasoning_reserve: 0,
+            sizer_revision: CharRatioSizer::default().revision(),
+            confidence: SizerConfidence::Estimated,
+            capability_overflow_tokens: Some(20),
+        };
+        let convert = |error: ContextError| RequestBuildError::from(error).into_runtime_error();
+        let input = convert(ContextError::budget_exceeded(report.clone(), "budget"));
+        assert_eq!(
+            input.class,
+            FailureClass::ContextOverflow {
+                stage: FailureStage::PreProvider,
+                required_tokens: Some(110),
+                available_tokens: Some(100),
+            }
+        );
+        assert_eq!(input.kind, ErrorKind::Config);
+        assert!(!input.retryable);
+        report.total_input_tokens = 90;
+        let capability = convert(ContextError::budget_exceeded(report, "capability budget"));
+        assert_eq!(
+            capability.class,
+            FailureClass::RequestRejected {
+                stage: FailureStage::PreProvider
+            }
+        );
+        assert_eq!(
+            convert(ContextError::compaction("cannot fit 999 tokens")).class,
+            FailureClass::HostComponent {
+                stage: FailureStage::PreProvider,
+                component: FailureComponent::ContextPlanner
+            }
+        );
+        for error in [
+            ContextError::missing_model_profile("missing"),
+            ContextError::invalid_pairing(
+                agent_runtime_core::ids::ToolCallId::new("call"),
+                "pairing",
+            ),
+            ContextError::duplicate_fragment_id("duplicate"),
+            ContextError::invalid_cache_identity("cache"),
+        ] {
+            assert_eq!(
+                convert(error).class,
+                FailureClass::RequestRejected {
+                    stage: FailureStage::PreProvider
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn harness_carrier_preserves_evidence_and_legacy_projection() {
+        let mut original = RuntimeError::from(
+            ProviderError::new(ProviderErrorKind::RateLimited, "safe").retry_after(0),
+        );
+        original.limit_resets_at_ms = Some(0);
+        original.credential_recovery = Some(ProviderCredentialRecovery::RetryWithRenewedCredential);
+        original.metadata = agent_runtime_core::metadata::Metadata::new().with("source", "fixture");
+        original = original.with_failure_stage(FailureStage::Provider);
+        let mapped = harness_context_error(original.clone()).into_runtime_error();
+        assert_eq!(mapped.class, original.class);
+        assert_eq!(mapped.retry_after_ms, original.retry_after_ms);
+        assert_eq!(mapped.limit_resets_at_ms, original.limit_resets_at_ms);
+        assert_eq!(mapped.credential_recovery, original.credential_recovery);
+        assert_eq!(mapped.metadata, original.metadata);
+        assert_eq!(mapped.kind, ErrorKind::Config);
+        assert!(!mapped.retryable);
+        assert_eq!(mapped.message, "compaction: harness component failed: safe");
+        assert_eq!(
+            harness_context_error(RuntimeError::internal("host failed"))
+                .into_runtime_error()
+                .class,
+            FailureClass::HostComponent {
+                stage: FailureStage::PreProvider,
+                component: FailureComponent::Harness
+            }
+        );
+    }
+
+    #[test]
+    fn request_rejection_preserves_the_legacy_message() {
+        let mapped =
+            request_rejected("duplicate context fragment id `duplicate`").into_runtime_error();
+        assert_eq!(mapped.kind, ErrorKind::Config);
+        assert!(!mapped.retryable);
+        assert_eq!(
+            mapped.message,
+            "compaction: duplicate context fragment id `duplicate`"
+        );
+        assert_eq!(
+            mapped.class,
+            FailureClass::RequestRejected {
+                stage: FailureStage::PreProvider
+            }
+        );
+    }
+}
