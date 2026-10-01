@@ -2,8 +2,8 @@
   "change_id": "add-cache-diagnostics-and-argument-normalization",
   "change_ref": "add-cache-diagnostics-and-argument-normalization-2026-10-01",
   "created_at": "2026-10-01T00:00:00Z",
-  "updated_at": "2026-10-01T00:00:00Z",
-  "approved_at": null,
+  "updated_at": "2026-10-01T19:59:00Z",
+  "approved_at": "2026-10-01T19:59:00Z",
   "completed_at": null,
-  "status": "proposed"
+  "status": "approved"
 }
