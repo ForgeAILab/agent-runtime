@@ -586,6 +586,7 @@ async fn planning_calling_and_completing_boundaries_have_explicit_recovery_polic
 #[tokio::test]
 async fn awaiting_approval_reauthorizes_exact_preparation_without_persisting_a_grant() {
     let id = SessionId::new("exact-approval-recovery");
+    let source_normalizations = Arc::new(AtomicUsize::new(0));
     let source_prepares = Arc::new(AtomicUsize::new(0));
     let source_invocations = Arc::new(AtomicUsize::new(0));
     let source_checkpoints = Arc::new(agent_runtime_testkit::InMemoryCheckpointStore::new());
@@ -595,12 +596,14 @@ async fn awaiting_approval_reauthorizes_exact_preparation_without_persisting_a_g
             &[(
                 "call-exact",
                 "exact_prepared_write",
-                json!({"path":"out.txt"}),
+                json!({"parameters":{"path":"out.txt"}}),
             )],
             "source done",
         )))
         .workspace(Arc::new(agent_runtime_testkit::MemoryWorkspace::new("/ws")))
         .tool(Arc::new(ExactPreparedWriteTool {
+            normalizations: source_normalizations.clone(),
+            reject_normalization: false,
             prepares: source_prepares.clone(),
             invocations: source_invocations,
         }))
@@ -614,6 +617,7 @@ async fn awaiting_approval_reauthorizes_exact_preparation_without_persisting_a_g
         .await
         .unwrap();
     source.run(UserInput::text("write")).await.unwrap();
+    assert_eq!(source_normalizations.load(Ordering::Acquire), 1);
     assert_eq!(source_prepares.load(Ordering::Acquire), 1);
     let checkpoint = source_checkpoints
         .history(&id)
@@ -621,6 +625,24 @@ async fn awaiting_approval_reauthorizes_exact_preparation_without_persisting_a_g
         .find(|checkpoint| matches!(checkpoint.state, TurnState::AwaitingApproval { .. }))
         .expect("approval boundary");
 
+    let TurnState::AwaitingApproval {
+        ref slots,
+        ref source_calls,
+        ..
+    } = checkpoint.state
+    else {
+        panic!("approval state");
+    };
+    let ToolSlotCheckpoint::Prepared(prepared) = &slots[0] else {
+        panic!("prepared slot");
+    };
+    assert_eq!(prepared.arguments(), &json!({"path":"out.txt"}));
+    assert_eq!(
+        source_calls[0].arguments,
+        json!({"parameters":{"path":"out.txt"}})
+    );
+    assert!(prepared.verify_fingerprint());
+    let recovery_normalizations = Arc::new(AtomicUsize::new(0));
     let recovery_prepares = Arc::new(AtomicUsize::new(0));
     let recovery_invocations = Arc::new(AtomicUsize::new(0));
     let recovery_approval = Arc::new(OriginRecordingApproval::default());
@@ -632,6 +654,8 @@ async fn awaiting_approval_reauthorizes_exact_preparation_without_persisting_a_g
         .provider(continuation_provider("recovered done"))
         .workspace(Arc::new(agent_runtime_testkit::MemoryWorkspace::new("/ws")))
         .tool(Arc::new(ExactPreparedWriteTool {
+            normalizations: recovery_normalizations.clone(),
+            reject_normalization: true,
             prepares: recovery_prepares.clone(),
             invocations: recovery_invocations.clone(),
         }))
@@ -647,6 +671,7 @@ async fn awaiting_approval_reauthorizes_exact_preparation_without_persisting_a_g
         .unwrap();
     wait_for_terminal(&observer).await;
 
+    assert_eq!(recovery_normalizations.load(Ordering::Acquire), 0);
     assert_eq!(
         recovery_prepares.load(Ordering::Acquire),
         0,

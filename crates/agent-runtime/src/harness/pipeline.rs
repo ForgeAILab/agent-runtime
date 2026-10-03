@@ -472,7 +472,9 @@ pub struct ToolOutputView {
     pub turn: TurnId,
     /// Originating provider request.
     pub request: agent_runtime_core::ids::RequestId,
-    /// Canonical tool call.
+    /// Execution-facing tool call. For tools opting into argument
+    /// normalization, the turn machine supplies normalized arguments here;
+    /// canonical model history retains the raw model arguments.
     pub call: ToolCall,
     /// This processor's own versioned state namespace, if initialized.
     pub state: Option<VersionedSessionState>,

@@ -391,4 +391,59 @@ mod tests {
     fn v1_golden_fixture_is_rejected_by_the_current_schema() {
         assert_v1_fixture_rejected_by_current_schema();
     }
+
+    #[test]
+    fn legacy_cache_plan_diagnostics_default_to_absent() {
+        use agent_runtime::context::{CachePlan, FragmentId};
+        let value: Value =
+            serde_json::from_str(include_str!("fixtures/cache-plan-legacy.json")).unwrap();
+        let mut plan: CachePlan = serde_json::from_value(value.clone()).unwrap();
+        assert!(plan.first_changed_fragment().is_none());
+        let encoded = serde_json::to_value(&plan).unwrap();
+        assert!(encoded.get("first_changed_fragment").is_none());
+        for (key, original) in value.as_object().unwrap() {
+            if key != "provider_cache" {
+                assert_eq!(&encoded[key], original);
+            }
+        }
+        let fingerprint = plan.fingerprint();
+        plan.first_changed_fragment = Some(FragmentId::new("instruction.one"));
+        let encoded = serde_json::to_value(&plan).unwrap();
+        assert_eq!(encoded["first_changed_fragment"], "instruction.one");
+        assert_eq!(plan.fingerprint(), fingerprint);
+        assert_eq!(serde_json::from_value::<CachePlan>(encoded).unwrap(), plan);
+    }
+
+    #[test]
+    fn legacy_cache_plan_events_roundtrip_and_new_diagnostics_are_optional() {
+        let expected: Value = serde_json::from_str(include_str!(
+            "fixtures/event-envelope-legacy-cache-plan.json"
+        ))
+        .unwrap();
+        let mut events: Vec<EventEnvelope> = serde_json::from_value(expected.clone()).unwrap();
+        assert!(matches!(
+            &events[0].payload,
+            RuntimeEvent::CachePlanChanged {
+                first_changed_fragment: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&events).unwrap(), expected);
+        if let RuntimeEvent::CachePlanChanged {
+            first_changed_fragment,
+            ..
+        } = &mut events[0].payload
+        {
+            *first_changed_fragment = Some("instruction.one".into());
+        }
+        let encoded = serde_json::to_value(&events).unwrap();
+        assert_eq!(
+            encoded[0]["payload"]["first_changed_fragment"],
+            "instruction.one"
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<EventEnvelope>>(encoded).unwrap(),
+            events
+        );
+    }
 }

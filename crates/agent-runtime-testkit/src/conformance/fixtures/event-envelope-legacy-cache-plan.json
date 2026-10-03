@@ -1,0 +1,17 @@
+[
+  {
+    "schema_version": 15,
+    "seq": 0,
+    "id": "evt-cache",
+    "session": "session-cache",
+    "turn": "turn-cache",
+    "timestamp": 100,
+    "payload": {
+      "event": "cache_plan_changed",
+      "cache_plan": "0123456789abcdef0123456789abcdef",
+      "preserved_prefix_tokens": 0,
+      "invalidated_prefix_tokens": 10,
+      "provider_cache_supported": true
+    }
+  }
+]

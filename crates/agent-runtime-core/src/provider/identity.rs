@@ -505,23 +505,8 @@ impl CacheIdentity {
     /// already-sealed fragment, tool/revision/endpoint/model component, or
     /// resource fails this comparison.
     pub fn comparable_with(&self, previous: &Self) -> bool {
-        self.provider == previous.provider
-            && self.endpoint == previous.endpoint
-            && self.adapter_partition_revision == previous.adapter_partition_revision
-            && self.model == previous.model
-            && self.profile == previous.profile
-            && self.tokenizer_revision == previous.tokenizer_revision
-            && self.request_adapter_revision == previous.request_adapter_revision
-            && self.cache_control == previous.cache_control
-            && self.provider_key == previous.provider_key
-            && self.breakpoint_revision == previous.breakpoint_revision
-            && self.resource == previous.resource
+        self.same_non_fragment_partition(previous)
             && self.tools == previous.tools
-            && self.registry_snapshot == previous.registry_snapshot
-            && self.scoped_view == previous.scoped_view
-            && self.activation_revision == previous.activation_revision
-            && self.harness_revision == previous.harness_revision
-            && self.cache_policy_revision == previous.cache_policy_revision
             && self.stable_prefix.len() >= previous.stable_prefix.len()
             && previous
                 .stable_prefix
@@ -534,6 +519,32 @@ impl CacheIdentity {
                 .iter()
                 .zip(&self.stable_history)
                 .all(|(old, new)| old == new)
+    }
+
+    /// Whether the fixed, non-fragment cache partition is unchanged.
+    ///
+    /// This comparison is for attributing diagnostics to ordered fragments,
+    /// even when their changes also change the identity digest. It excludes
+    /// the fragment-derived stable prefix/history and tool projections and
+    /// is not a cache-reuse test;
+    /// use [`CacheIdentity::comparable_with`] for reuse expectations.
+    pub fn same_non_fragment_partition(&self, previous: &Self) -> bool {
+        self.provider == previous.provider
+            && self.endpoint == previous.endpoint
+            && self.adapter_partition_revision == previous.adapter_partition_revision
+            && self.model == previous.model
+            && self.profile == previous.profile
+            && self.tokenizer_revision == previous.tokenizer_revision
+            && self.request_adapter_revision == previous.request_adapter_revision
+            && self.cache_control == previous.cache_control
+            && self.provider_key == previous.provider_key
+            && self.breakpoint_revision == previous.breakpoint_revision
+            && self.resource == previous.resource
+            && self.registry_snapshot == previous.registry_snapshot
+            && self.scoped_view == previous.scoped_view
+            && self.activation_revision == previous.activation_revision
+            && self.harness_revision == previous.harness_revision
+            && self.cache_policy_revision == previous.cache_policy_revision
     }
 
     /// Builds a legacy-compatible identity from the existing profile

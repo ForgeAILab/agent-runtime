@@ -627,6 +627,8 @@ impl LegacyTool for CountingPureTool {
 
 #[derive(Debug)]
 struct ExactPreparedWriteTool {
+    normalizations: Arc<AtomicUsize>,
+    reject_normalization: bool,
     prepares: Arc<AtomicUsize>,
     invocations: Arc<AtomicUsize>,
 }
@@ -645,6 +647,14 @@ impl Tool for ExactPreparedWriteTool {
             }),
             ToolEffects::default().with_write("/ws"),
         )
+    }
+
+    fn normalize_arguments(&self, mut arguments: serde_json::Value) -> Result<serde_json::Value, RuntimeError> {
+        self.normalizations.fetch_add(1, Ordering::AcqRel);
+        if self.reject_normalization {
+            return Err(RuntimeError::tool("replacement hook must not run on recovery"));
+        }
+        Ok(arguments.as_object_mut().and_then(|object| object.remove("parameters")).unwrap_or(arguments))
     }
 
     async fn prepare(
