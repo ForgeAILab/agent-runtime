@@ -10,7 +10,7 @@ impl<'a> TurnMachine<'a> {
     /// indeterminate, so this never replays it: the turn is attributed an
     /// error and completes through the ordinary terminal publication path,
     /// keeping the checkpoint chain -- and therefore replay -- continuous.
-    pub(super) async fn abandon(mut self) {
+    pub(super) async fn abandon(mut self, activation_changed: bool) {
         let checkpoint = self
             .checkpoint
             .as_ref()
@@ -34,16 +34,119 @@ impl<'a> TurnMachine<'a> {
                 self.driver.clock.now(),
             );
         }
-        self.emitter.emit(
-            Some(self.turn_id.clone()),
-            RuntimeEvent::Error {
-                error: RuntimeError::conflict(
-                    "interrupted turn left no durable terminal boundary; finalized as failed without replay",
-                ),
-            },
-        );
-        self.complete(TurnFinish::Failed, checkpoint.visible_output)
-            .await;
+        if activation_changed {
+            self.close_upgrade_tool_calls(&checkpoint);
+            let finish = match &checkpoint.state {
+                TurnState::Completing { finish, .. }
+                | TurnState::PublishingTerminal { finish, .. } => finish.clone(),
+                _ => TurnFinish::Failed,
+            };
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::Error {
+                    error: RuntimeError::conflict(
+                        "available tools changed since this turn was saved; conversation restored without retrying the unfinished action; check previous changes before retrying",
+                    ),
+                },
+            );
+            // The fallback is local recovery, not another turn. In particular
+            // do not invoke a summary/model/tool hook merely by opening it.
+            self.close_and_discard_steers(discard_reason_for_finish(&finish));
+            // A Completing record already owns its finish and provider-error
+            // classification. Rewriting that payload is not an idempotent
+            // transition; advance it directly to publication instead.
+            if !matches!(
+                checkpoint.state,
+                TurnState::Completing { .. } | TurnState::PublishingTerminal { .. }
+            ) {
+                if let Err(error) = self
+                    .transition(TurnState::Completing {
+                        finish: finish.clone(),
+                        visible_output: checkpoint.visible_output,
+                        provider_error_kind: None,
+                    })
+                    .await
+                {
+                    self.emit_non_durable_failure(error, checkpoint.visible_output);
+                    return;
+                }
+            }
+            if !matches!(checkpoint.state, TurnState::PublishingTerminal { .. }) {
+                if let Err(error) = self
+                    .transition(TurnState::PublishingTerminal {
+                        finish: finish.clone(),
+                        visible_output: checkpoint.visible_output,
+                    })
+                    .await
+                {
+                    self.emit_non_durable_failure(error, checkpoint.visible_output);
+                    return;
+                }
+            }
+            self.publish_terminal(finish, checkpoint.visible_output)
+                .await;
+        } else {
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::Error {
+                    error: RuntimeError::conflict(
+                        "interrupted turn left no durable terminal boundary; finalized as failed without replay",
+                    ),
+                },
+            );
+            self.complete(TurnFinish::Failed, checkpoint.visible_output)
+                .await;
+        }
+    }
+
+    /// Close only unmatched tool calls from the interrupted turn. Committed
+    /// results stay byte-for-byte intact; unknown outcomes never become a
+    /// success claim or a replay of the original invocation.
+    fn close_upgrade_tool_calls(&self, checkpoint: &TurnCheckpoint) {
+        let known = match &checkpoint.state {
+            TurnState::AwaitingApproval { slots, .. }
+            | TurnState::AwaitingInteraction { slots, .. }
+            | TurnState::ToolOutcomeReady { slots, .. }
+            | TurnState::ExecutingTools { slots, .. } => slots
+                .iter()
+                .filter_map(|slot| {
+                    if let ToolSlotCheckpoint::CanonicalResult(result) = slot {
+                        Some((result.call_id.clone(), result.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<BTreeMap<_, _>>(),
+            _ => BTreeMap::new(),
+        };
+        let calls = self.active_tool_calls(checkpoint.active_history_start);
+        let mut state = self.state.lock().expect("session state poisoned");
+        for call in calls {
+            let already_recorded = state.history.iter().any(|message| {
+                message.content.iter().any(|part| {
+                    matches!(part, ContentPart::ToolResult(result) if result.call_id == call.id)
+                })
+            });
+            if already_recorded {
+                continue;
+            }
+            let result = known.get(&call.id).cloned().unwrap_or_else(|| {
+                crate::tool::executor::error_block(
+                    &call,
+                    "this unfinished action was not retried after the available tools changed; its outcome is unverified; inspect previous changes before retrying",
+                    self.driver.config.output_limit,
+                )
+            });
+            state.history.push(Message::tool_result(result.clone()));
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::ToolCallCompleted {
+                    call: result.call_id,
+                    name: result.name,
+                    is_error: result.is_error,
+                },
+            );
+        }
     }
 
     pub(super) async fn resume(mut self) {

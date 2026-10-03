@@ -875,6 +875,7 @@ impl Driver {
         turn_cancel: Cancellation,
         inbox: Arc<Mutex<InjectionQueue>>,
         checkpoint: TurnCheckpoint,
+        activation_changed: bool,
     ) {
         let turn_id = checkpoint.turn.clone();
         TurnMachine::from_checkpoint(
@@ -892,7 +893,7 @@ impl Driver {
             },
             checkpoint,
         )
-        .abandon()
+        .abandon(activation_changed)
         .await;
     }
 }

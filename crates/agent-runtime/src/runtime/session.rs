@@ -104,6 +104,8 @@ pub struct SessionInner {
     pub(crate) idle_compaction_attempted: AtomicBool,
     /// An unanswered interaction checkpoint was intentionally left dormant.
     pub(crate) recovery_deferred: bool,
+    /// Startup interrupted this turn after re-authorizing changed abilities.
+    pub(crate) interrupted_on_resume: Option<TurnId>,
 }
 
 impl SessionInner {
@@ -160,6 +162,7 @@ impl SessionInner {
                 self.cancel.child(),
                 self.inbox.clone(),
                 checkpoint,
+                false,
             )
             .await;
     }
@@ -3406,6 +3409,14 @@ impl SessionHandle {
             .expect("session extension state poisoned")
             .insert(SEMANTIC_SUMMARY_COMPONENT_ID.to_owned(), persisted);
         Ok(true)
+    }
+
+    /// The turn stopped without replay because its activation scope changed.
+    ///
+    /// Presentations should tell the user that history was retained and the
+    /// previous action was not retried. A normal or exact resume returns None.
+    pub fn interrupted_on_resume(&self) -> Option<&TurnId> {
+        self.inner.interrupted_on_resume.as_ref()
     }
 
     /// A snapshot of the session's canonical state.
