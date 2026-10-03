@@ -6,14 +6,18 @@ is imported from the read-only Smith or Open Forge repositories.
 
 ## Decisions
 
-- `DestinationPolicy::{PublicHttps, Loopback}` is mandatory in
+- `DestinationPolicy::{PublicHttps, Loopback, ConfiguredOrigin}` (non-exhaustive) is mandatory in
   `ReqwestTransport::new(policy)`. There is no default destination policy.
   `with_origin(&str)` validates and pins scheme, normalized host, and effective
   port; paths/queries are not part of an origin. CLI always pins its base URL.
 - PublicHttps keeps the CLI's exact HTTPS, hostname, and restricted IPv4/IPv6
   checks. Loopback permits HTTP/HTTPS, only literal 127/8 or ::1 and exact
   localhost (case/trailing-dot normalized), never other DNS names or mapped
-  IPv6 loopback. Both refuse userinfo and fragments before network I/O.
+  IPv6 loopback. ConfiguredOrigin permits HTTP/HTTPS to the one origin given to
+  `with_origin`, whatever address class it resolves to, and rejects every
+  request when no origin is pinned: NovelKit's users point model profiles at
+  LAN servers, and that choice is the user's explicit configuration, not a
+  default. All three refuse userinfo and fragments before network I/O.
 - Resolve each domain for each request and refuse empty/mixed forbidden answers.
   Build a fresh reqwest client using only those checked addresses; no proxy,
   no redirects, no injectable client that could weaken checks. DNS injection
@@ -29,8 +33,10 @@ is imported from the read-only Smith or Open Forge repositories.
   too, since paths and queries may carry keys.
 - Use optional reqwest 0.12 with rustls-tls/stream and optional url, matching
   the existing CLI dependency. Enable Tokio net only with the feature.
-  The locked graph will be checked on Rust 1.86; default provider stays 1.86
-  even if a feature-only dependency floor needs separate documentation.
+  The locked reqwest 0.12.28/rustls 0.23/ICU 2.2 graph builds on Rust 1.86,
+  verified with `cargo +1.86.0 build -p agent-runtime-provider --features
+  reqwest-transport`. No feature-only higher floor is needed. Newer unpinned
+  transitive versions remain subject to Cargo MSRV-aware resolution.
 
 ## Migration and verification
 

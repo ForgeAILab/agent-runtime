@@ -2,9 +2,9 @@
 
 ### Requirement: Explicit reqwest destination policy
 
-The optional ReqwestTransport SHALL require an explicit PublicHttps or Loopback
-policy, enforce it on every request, and optionally pin scheme/host/effective
-port. Neither feature unification nor configuration MUST bypass a check.
+The optional ReqwestTransport SHALL require an explicit PublicHttps, Loopback or
+ConfiguredOrigin policy, enforce it on every request, and optionally pin scheme/host/effective
+port. Feature unification and configuration MUST NOT bypass a check.
 
 #### Scenario: Public HTTPS endpoint
 
@@ -17,6 +17,12 @@ port. Neither feature unification nor configuration MUST bypass a check.
 - **WHEN** Loopback receives HTTP or HTTPS to 127/8, ::1, or localhost
 - **THEN** it permits only nonempty all-loopback address sets
 - **AND** rejects private/public IPs, other DNS names and non-loopback localhost answers.
+
+#### Scenario: User-configured self-hosted endpoint
+
+- **WHEN** ConfiguredOrigin pins an HTTP or HTTPS origin on a private address
+- **THEN** it permits requests to exactly that scheme, host and effective port
+- **AND** rejects any other origin, and every request when no origin is pinned.
 
 #### Scenario: DNS rebinding or origin change
 
