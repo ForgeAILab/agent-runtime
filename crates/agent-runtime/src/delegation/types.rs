@@ -112,6 +112,9 @@ impl DelegationCapacity {
         }
     }
 
+    // `fetch_update` is deprecated on newer toolchains; its replacement is not
+    // available at the declared MSRV (1.86).
+    #[allow(deprecated)]
     pub(super) fn release(&self) {
         // Saturating: release is only called after a successful acquire.
         let _ = self
