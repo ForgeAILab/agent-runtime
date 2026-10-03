@@ -376,7 +376,7 @@ impl Driver {
         step: u32,
         cancel: &Cancellation,
         deadline: Deadline,
-    ) -> Result<PlannedProviderRequest, ContextError> {
+    ) -> Result<PlannedProviderRequest, RequestBuildError> {
         debug_assert_eq!(
             execution.active_history_start(turn_id),
             Some(active_history_start),
@@ -499,7 +499,7 @@ impl Driver {
             .extend((history_offset..history.len()).map(|index| format!("history:{index}")));
         for fragment in &contributed {
             if !fragment_ids.insert(fragment.id.as_str().to_owned()) {
-                return Err(ContextError::compaction(format!(
+                return Err(request_rejected(format!(
                     "duplicate context fragment id `{}`",
                     fragment.id
                 )));
@@ -532,7 +532,7 @@ impl Driver {
             for fragment in patch.fragments {
                 validate_contributed_fragment(&fragment)?;
                 if !fragment_ids.insert(fragment.id.as_str().to_owned()) {
-                    return Err(ContextError::compaction(format!(
+                    return Err(request_rejected(format!(
                         "duplicate context fragment id `{}`",
                         fragment.id
                     )));
@@ -653,11 +653,27 @@ impl Driver {
         if let Some(input) = internal_input {
             turn_manifest = turn_manifest.with_internal_source(input.source);
         }
-        state
-            .lock()
-            .expect("session state poisoned")
-            .manifests
-            .push(turn_manifest);
+        {
+            let mut state = state.lock().expect("session state poisoned");
+            let mut extensions = execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            let count = crate::runtime::manifests::planned_steps(
+                extensions.get(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE),
+                &state.manifests,
+            )
+            .map_err(manifest_boundary_error)?
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::conflict("manifest planned-step counter overflow"))
+            .map_err(manifest_boundary_error)?;
+            extensions.insert(
+                crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
+                crate::runtime::manifests::boundary_record(count),
+            );
+            state.manifests.push(turn_manifest);
+            crate::runtime::manifests::trim(&mut state.manifests, self.manifest_window);
+        }
 
         let mut request = plan.to_provider_request(self.config.model.clone());
         request.sampling = self.config.sampling.clone();
@@ -694,12 +710,12 @@ impl Driver {
                 ToolChoice::Named(name)
                     if !request.tools.iter().any(|schema| &schema.name == name) =>
                 {
-                    return Err(ContextError::compaction(format!(
+                    return Err(request_rejected(format!(
                         "model interceptor selected inactive tool `{name}`"
                     )));
                 }
                 ToolChoice::Required if request.tools.is_empty() => {
-                    return Err(ContextError::compaction(
+                    return Err(request_rejected(
                         "model interceptor requires a tool but the frozen activation has none",
                     ));
                 }

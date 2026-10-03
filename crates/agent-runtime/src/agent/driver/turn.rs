@@ -72,7 +72,7 @@ impl<'a> TurnMachine<'a> {
         }
     }
 
-    pub(super) fn snapshot(&self) -> SessionSnapshot {
+    fn capture_snapshot(&self, include_manifests: bool) -> SessionSnapshot {
         let state = self.state.lock().expect("session state poisoned");
         let mut extension_state = self.execution.snapshot_extension_state_with_staged();
         if let Some(cache) = self.driver.cache.persisted_session(self.emitter.session()) {
@@ -85,11 +85,25 @@ impl<'a> TurnMachine<'a> {
             id: self.emitter.session().clone(),
             history: state.history.clone(),
             usage: state.usage.clone(),
-            manifests: state.manifests.clone(),
+            manifests: if include_manifests {
+                crate::runtime::manifests::recent(&state.manifests, self.driver.manifest_window)
+            } else {
+                Vec::new()
+            },
             identity: self.minter.snapshot(self.emitter.next_sequence()),
             extension_state,
             updated: self.driver.clock.now(),
         }
+    }
+
+    pub(super) fn snapshot(&self) -> SessionSnapshot {
+        self.capture_snapshot(true)
+    }
+
+    fn checkpoint_snapshot(&self) -> Result<SessionSnapshot, RuntimeError> {
+        let mut snapshot = self.capture_snapshot(false);
+        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
+        Ok(snapshot)
     }
 
     pub(super) fn emit_discarded_steers(
@@ -241,7 +255,7 @@ impl<'a> TurnMachine<'a> {
         let checkpoint = TurnCheckpoint::accepted(
             self.turn_id.clone(),
             input,
-            self.snapshot(),
+            self.checkpoint_snapshot()?,
             active_history_start,
             deadline,
             checkpoint_sequence,
@@ -284,7 +298,7 @@ impl<'a> TurnMachine<'a> {
         let checkpoint = TurnCheckpoint::internal_accepted(
             self.turn_id.clone(),
             input,
-            self.snapshot(),
+            self.checkpoint_snapshot()?,
             active_history_start,
             deadline,
             checkpoint_sequence,
@@ -328,7 +342,7 @@ impl<'a> TurnMachine<'a> {
             self.turn_id.clone(),
             request_id,
             call,
-            self.snapshot(),
+            self.checkpoint_snapshot()?,
             deadline,
             checkpoint_sequence,
             self.emitter.next_sequence(),
@@ -342,18 +356,33 @@ impl<'a> TurnMachine<'a> {
     }
 
     pub(super) async fn transition(&mut self, state: TurnState) -> Result<(), RuntimeError> {
-        self.transition_with_snapshot(state, self.snapshot()).await
+        self.transition_with_snapshot(state, self.checkpoint_snapshot()?)
+            .await
     }
 
     pub(super) async fn transition_with_snapshot(
         &mut self,
         state: TurnState,
-        snapshot: SessionSnapshot,
+        mut snapshot: SessionSnapshot,
     ) -> Result<(), RuntimeError> {
         let current = self
             .checkpoint
             .as_ref()
             .ok_or_else(|| RuntimeError::internal("turn has no accepted checkpoint"))?;
+        let normalized = if current.snapshot.manifests.is_empty()
+            && current
+                .snapshot
+                .extension_state
+                .contains_key(crate::runtime::MANIFEST_BOUNDARY_NAMESPACE)
+        {
+            None
+        } else {
+            let mut normalized = current.clone();
+            crate::runtime::manifests::normalize_checkpoint_snapshot(&mut normalized.snapshot)?;
+            Some(normalized)
+        };
+        let current = normalized.as_ref().unwrap_or(current);
+        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
         let visible_output = current.visible_output
             || matches!(
                 &state,
@@ -1202,7 +1231,7 @@ impl<'a> TurnMachine<'a> {
                     // Planning failed before any network I/O — that is the
                     // point of preflight enforcement, so report the budget
                     // category rather than letting an oversized request go.
-                    if let Some(report) = &err.report {
+                    if let Some(report) = err.report() {
                         emitter.emit(
                             turn.clone(),
                             RuntimeEvent::BudgetFailure {
@@ -1215,7 +1244,7 @@ impl<'a> TurnMachine<'a> {
                     emitter.emit(
                         turn.clone(),
                         RuntimeEvent::Error {
-                            error: RuntimeError::config(err.to_string()),
+                            error: err.into_runtime_error(),
                         },
                     );
                     self.complete(TurnFinish::Failed, visible_output).await;
@@ -1226,7 +1255,13 @@ impl<'a> TurnMachine<'a> {
             let planned_with_tools = !planned_request.request.tools.is_empty();
             let mut request = planned_request.request;
             if let Err(err) = driver.validate_and_downgrade(&mut request, &emitter, &turn) {
-                emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
+                emitter.emit(
+                    turn.clone(),
+                    RuntimeEvent::Error {
+                        error: RuntimeError::from(err)
+                            .with_failure_stage(FailureStage::PreProvider),
+                    },
+                );
                 self.complete(TurnFinish::Failed, visible_output).await;
                 return;
             }
@@ -1294,7 +1329,13 @@ impl<'a> TurnMachine<'a> {
                 }
                 ProviderTurnOutcome::Failed(err) => {
                     let provider_error_kind = err.kind;
-                    emitter.emit(turn.clone(), RuntimeEvent::Error { error: err.into() });
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::Error {
+                            error: RuntimeError::from(err)
+                                .with_failure_stage(FailureStage::Provider),
+                        },
+                    );
                     self.complete_with_provider_error(
                         TurnFinish::Failed,
                         visible_output,
@@ -1447,11 +1488,11 @@ impl<'a> TurnMachine<'a> {
                             emitter.emit(
                                 turn.clone(),
                                 RuntimeEvent::Error {
-                                    error: ProviderError::new(
+                                    error: RuntimeError::from(ProviderError::new(
                                         ProviderErrorKind::BadRequest,
                                         "provider filtered the response",
-                                    )
-                                    .into(),
+                                    ))
+                                    .with_failure_stage(FailureStage::Provider),
                                 },
                             );
                             self.complete(TurnFinish::Failed, visible_output).await;
@@ -1475,11 +1516,11 @@ impl<'a> TurnMachine<'a> {
                             emitter.emit(
                                 turn.clone(),
                                 RuntimeEvent::Error {
-                                    error: ProviderError::new(
+                                    error: RuntimeError::from(ProviderError::new(
                                         ProviderErrorKind::MalformedStream,
                                         "provider finish reason did not match its streamed output",
-                                    )
-                                    .into(),
+                                    ))
+                                    .with_failure_stage(FailureStage::Provider),
                                 },
                             );
                             self.complete(TurnFinish::Failed, visible_output).await;
@@ -1695,5 +1736,124 @@ mod tool_call_id_collision_tests {
         reassign_colliding_tool_call_ids(&state, &mut incoming);
         assert_eq!(incoming[0].id.as_str(), "dup#2");
         assert_eq!(incoming[1].id.as_str(), "dup#3");
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+    use crate::runtime::{RuntimeBuilder, StartSession};
+    use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
+    use agent_runtime_core::provider::{Capabilities, ModelId, ProviderStreamEvent};
+    use agent_runtime_core::store::VersionedSessionState;
+    use agent_runtime_provider::fake::{FakeProvider, ScriptedStream};
+
+    #[tokio::test]
+    async fn diagnostic_normalization_does_not_refresh_a_legacy_planning_revision() {
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            (0..5)
+                .map(|_| {
+                    ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    }])
+                })
+                .collect(),
+        ));
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .provider(provider)
+            .manifest_window(std::num::NonZeroUsize::new(2).unwrap())
+            .build()
+            .unwrap();
+        let session = runtime.start_session(StartSession::new()).await.unwrap();
+        let mut archive = Vec::new();
+        for _ in 0..5 {
+            session.run(UserInput::text("next")).await.unwrap();
+            archive.push(session.recent_manifests().last().unwrap().clone());
+        }
+        let inner = session.inner();
+        let mut legacy = session.snapshot();
+        legacy.manifests = archive;
+        legacy
+            .extension_state
+            .remove(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE);
+        let accepted = TurnCheckpoint::accepted(
+            TurnId::new("refresh-fixture"),
+            UserInput::text("next"),
+            legacy.clone(),
+            0,
+            Deadline::never(),
+            1,
+            inner.emitter.next_sequence(),
+            legacy.updated,
+        )
+        .unwrap();
+        let planning = TurnState::Planning { step: 0 };
+        let checkpoint = accepted
+            .transition(
+                planning.clone(),
+                legacy.clone(),
+                inner.emitter.next_sequence(),
+                legacy.updated,
+            )
+            .unwrap();
+        let mut bounded = legacy;
+        crate::runtime::manifests::initialize_boundary(&mut bounded).unwrap();
+        crate::runtime::manifests::trim(
+            &mut bounded.manifests,
+            std::num::NonZeroUsize::new(2).unwrap(),
+        );
+        let mut machine = TurnMachine::from_checkpoint(
+            &inner.shared.driver,
+            TurnMachineContext {
+                state: inner.state.clone(),
+                execution: inner.execution.clone(),
+                emitter: inner.emitter.clone(),
+                minter: inner.minter.clone(),
+                cancel: inner.cancel.child(),
+                inbox: inner.inbox.clone(),
+                steer_mailbox: None,
+                turn_id: checkpoint.turn.clone(),
+                acceptance: None,
+            },
+            checkpoint.clone(),
+        );
+        machine
+            .transition_with_snapshot(planning.clone(), bounded.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            machine.checkpoint.as_ref().unwrap(),
+            &checkpoint,
+            "same revision keeps the original legacy payload"
+        );
+        bounded.extension_state.insert(
+            "refresh-fixture".into(),
+            VersionedSessionState::new(
+                RegistryRevision::new("v1"),
+                serde_json::json!({"committed": true}),
+            ),
+        );
+        machine
+            .transition_with_snapshot(planning, bounded)
+            .await
+            .unwrap();
+        let refreshed = machine.checkpoint.as_ref().unwrap();
+        assert_eq!(refreshed.state_revision, checkpoint.state_revision + 1);
+        assert!(refreshed.snapshot.manifests.is_empty());
+        assert_eq!(
+            refreshed.snapshot.extension_state
+                [crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE]
+                .value["planned_steps"],
+            5
+        );
+        checkpoint.validate_successor(refreshed).unwrap();
+        session.shutdown().await.unwrap();
     }
 }

@@ -121,9 +121,9 @@ the same fix the ability crate uses for `AbilityEntry`/`ToolEntry`.
 
 ## 5. Session snapshots carry run manifests
 
-`SessionSnapshot` gained `manifests: Vec<TurnManifest>`, recording per-turn
-registry, model, resolver, tokenizer, adapter, context, compaction, and cache
-revisions and fingerprints.
+`SessionSnapshot.manifests: Vec<TurnManifest>` records planned-step registry,
+model, resolver, tokenizer, adapter, context, compaction, and cache revisions
+and fingerprints in original append order.
 
 `RunManifest` is now manifest schema v2. Its redaction-safe lossless LCM
 records and their fingerprints are part of the manifest's replay semantics;
@@ -132,6 +132,70 @@ summary and source bodies remain outside the manifest.
 This is a **migration, not a breaking read**: the field is `#[serde(default)]`,
 so a snapshot persisted before manifests existed still loads with an empty
 list.
+
+Runtime retention is a positive finite recent window, default 32 records per
+session. Configure `RuntimeBuilder::manifest_window(NonZeroUsize)` to change
+it; delegated children inherit the parent's setting, and internal-turn records
+count toward the same window. Retries of a frozen provider request do not add
+records. `SessionHandle::recent_manifests() -> Vec<TurnManifest>` and
+`snapshot().manifests` expose the same newest K records in append order. An
+empty list means no retained diagnostic record; it does not establish that no
+provider activity occurred. Increasing the window cannot recover evicted data.
+Hosts needing a lifetime audit or equivalent historical replay own the archive
+and must fail explicitly before I/O when the requested manifest is unavailable.
+There is no session replay/archival service; the existing manifest revision
+checks require an explicitly supplied retained or archived record.
+
+Raw serde readers preserve every stored legacy manifest; absent lists still
+default to empty. The first runtime resume counts full legacy lists before
+dropping entries beyond K from live state. Shutdown saves and startup repair
+saves write that trimmed list, so a host that needs the evicted legacy entries
+must archive them before the first resume. History, usage, identity, signed
+continuation, and protected extensions are unaffected. Ordinary stores must
+preserve the runtime-owned
+`agent_runtime::runtime::MANIFEST_BOUNDARY_NAMESPACE` (`runtime.manifest_boundary`)
+RedactionSafe extension: revision
+`manifest-boundary-1`, value `{"schema_version":1,"planned_steps":N}`. This
+checked `u64` frontier counts manifest-producing planning steps, including
+steps that fail before I/O. It contains no manifest body or authority grant.
+Stores must not strip it when redacting sensitive namespaces; missing or
+malformed required evidence rejects unsafe ordinary/protected overlay. A store
+that strips unknown extension records breaks resume once a session passes K
+steps: the bounded manifest list can no longer reconstruct the lifetime
+frontier needed to match its protected checkpoint.
+
+After rollback to a pre-U3 binary, that binary preserves the boundary record as
+an opaque extension but does not increment it when it plans more steps. On
+roll-forward, a retained manifest list longer than the recorded count is
+treated as legacy evidence: resume re-bootstraps the count from the full list
+before trimming. This repair is exact only while the list stayed longer than
+the record; already-evicted steps cannot be inferred. The count is a diagnostic
+ordering aid, not usage or an archive. After a detectable round trip it again
+orders subsequent U3 planning monotonically, without reconstructing older
+evicted manifests.
+
+New runtime-generated checkpoints contain an empty manifest vector in memory
+and omit the array from JSON. They still protect exact history, usage,
+identities, provider requests, prepared actions/arguments, outcome watermarks,
+and sensitive extensions. Schema 3 and transition revision 4 remain. Direct
+readers of legacy checkpoints still see the original list; duplicate revisions
+retain their original payload. Checkpoint-only recovery uses legacy manifests
+as a bounded diagnostic fallback; new checkpoint-only recovery has an empty
+window and resumes the same exact execution. Compatible ordinary diagnostics
+at or behind the protected frontier are carried as an older suffix, separately
+from nonterminal protected execution state. The manifest for the in-flight
+request is not recoverable from a manifest-free checkpoint; recovery retains
+the pre-crash ordinary suffix and continues without inventing that record.
+
+JSON read compatibility is bidirectional, but execution downgrade is limited:
+the pre-window reader's terminal overlay requires equal manifest lists and
+rejects a new manifest-free checkpoint paired with nonempty ordinary
+diagnostics. Pin consumers to the gated candidate runtime, then a tag or exact
+landed revision; do not downgrade persisted sessions assuming unchanged schema
+numbers imply execution compatibility. Consumer owners must accept recent
+retention and decide whether archival is needed before a compatible release.
+The testkit freezes the old serde shape and overlay check; it does not build or
+run an older runtime binary.
 
 Manifests store identifiers, classifications, content hashes, token counts, and
 decisions — never raw fragment content, credentials, or secrets. There is no
@@ -586,9 +650,90 @@ retention policy, scheduling, or a concrete database. Consumer bindings remain
 separate: Nyx binds a timeline to its authorized channel, Smith to a persistent
 agent session, and Open Forge to its authorized Room + AgentIdentity context.
 
+## 18. Runtime failure evidence
+
+`RuntimeError` now carries `class: FailureClass`, plus optional
+`retry_after_ms`, `limit_resets_at_ms`, and `credential_recovery`. The class
+uses an internally tagged JSON object (`reason`, snake-case names); classified
+variants carry a `FailureStage`: `PreProvider`, `Provider`, `Tool`, or
+`Unknown`. The stage describes origin, not provider cost, committed history,
+or retry admission. State/component failures use the fixed neutral
+`FailureComponent` identifiers (`ContextPlanner`, `Harness`, `Lcm`,
+`Checkpoint`, or `Unknown`), so backend prose cannot enter that field. Both
+`FailureStage` and `FailureComponent` are non-exhaustive; downstream matches
+must retain a wildcard arm.
+
+Context overflow counts are `Option<u32>` in Rust, matching planner counts and
+serializing as ordinary optional JSON numbers. LCM `u64` counts are retained
+only when they fit in `u32`; otherwise they remain unknown.
+
+Known schema/configuration failures use `RequestRejected`, policy denials use
+`PolicyDenied`, and typed input-budget failures use `ContextOverflow` with
+known counts only. Capability sub-budget overflow remains nonfatal when the
+model-input budget fits. The `BudgetExceeded` path whose accounting still fits
+the input budget is the configured estimated-slack margin rejection; it uses
+`RequestRejected` and still emits the existing input budget failure event.
+Arbitrary compaction or host failures do not imply context overflow or
+transience. LCM mappings retain safe typed conflict/denial evidence and discard
+backend reason text. Only typed LCM conflicts and concurrent revision reads are
+`StateConflict`; invariant, corruption, and configuration checks keep their
+historical unclassified projection. Private request-building errors still
+project as Config/nonretryable, even when preserved evidence says `Transient`.
+
+`From<ProviderError>` preserves every source field and starts with an unknown
+stage. The driver records `PreProvider` for its local capability checks and
+`Provider` for invocation failures. `retry_after_ms` is a duration;
+`limit_resets_at_ms` is an absolute Unix-millisecond timestamp. Both preserve
+zero and absence. Credential recovery carries only the existing fixed enum,
+never a lease or secret. These fields describe evidence only: retry admission,
+credential replay fences, `ProviderAttemptFinished.retry_delay_ms`, and
+`TurnFinish` keep their existing semantics.
+
+Missing fields deserialize as `Unclassified`/`None`; unclassified and absent
+fields are omitted on serialization. Unknown future reason tags fall back to
+`Unclassified`, while unknown stage/component names use `Unknown`. A malformed
+class of any kind falls back to `Unclassified`; timing that is not a
+non-negative integer and an unknown credential-recovery value become `None`.
+Separately valid evidence remains readable. No event or checkpoint schema
+revision changes.
+
+The source migration covers `RuntimeError` literals/destructuring, failure-enum
+matches, and context-overflow count construction:
+
+```rust
+use agent_runtime::core::error::{FailureClass, RuntimeError};
+
+let error = RuntimeError {
+    kind,
+    message,
+    retryable,
+    metadata,
+    class: FailureClass::Unclassified,
+    retry_after_ms: None,
+    limit_resets_at_ms: None,
+    credential_recovery: None,
+};
+let RuntimeError { kind, message, .. } = error;
+```
+
+Existing constructors remain available. Use `with_class(...)` and
+`with_failure_stage(...)` only with typed origin evidence. Event matches,
+`StartSession::new().with_history`, subscribe-before-send, store traits, and
+command shapes need no change for this addition. All three actual consumer
+integrations must compile against the candidate before release; passing the
+neutral testkit targets alone does not establish product source compatibility.
+
+When constructing `FailureClass::ContextOverflow`, pass counts directly (for
+example, `required_tokens: Some(1024)`) rather than boxing `u64` values. Match
+`FailureClass`, `FailureStage`, and `FailureComponent` with a wildcard arm.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.
+- [ ] Supply the new `RuntimeError` literal fields or use existing constructors;
+      add `..` to field-exhaustive destructuring and compile all three consumers.
+- [ ] Replace boxed context-overflow counts with direct `u32` values and add
+      wildcard arms to failure-class/stage/component matches.
 - [ ] Replace `agent_runtime_prompt` imports with `agent_runtime::context`.
 - [ ] Replace `TokenEstimator`/`CharBasedEstimator` with a `RequestSizer`.
 - [ ] Replace the removed rolling summary path with an authorized LCM timeline,

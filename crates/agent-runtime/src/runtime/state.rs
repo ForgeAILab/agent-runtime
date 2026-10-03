@@ -516,7 +516,7 @@ pub struct SessionState {
     pub history: Vec<Message>,
     /// The accumulated usage ledger.
     pub usage: UsageLedger,
-    /// The run manifest recorded for each completed turn, in turn order.
+    /// The ordered recent window of planned-step diagnostic manifests.
     pub manifests: Vec<TurnManifest>,
 }
 

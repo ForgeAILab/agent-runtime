@@ -4,6 +4,9 @@ use agent_runtime_core::event::{EventEnvelope, RuntimeEvent, SCHEMA_VERSION, can
 use agent_runtime_core::metadata::Metadata;
 use serde_json::Value;
 
+mod failures;
+pub use failures::assert_failure_fixtures;
+
 const EVENT_ENVELOPE_V1: &str = include_str!("fixtures/event-envelope-v1.json");
 const EVENT_ENVELOPE_V3: &str = include_str!("fixtures/event-envelope-v3.json");
 const EVENT_ENVELOPE_V4: &str = include_str!("fixtures/event-envelope-v4.json");

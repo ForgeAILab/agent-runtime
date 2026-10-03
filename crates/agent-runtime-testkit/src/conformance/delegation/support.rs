@@ -230,6 +230,9 @@ impl SessionStore for FailNextParentSessionStore {
         self.inner.load(id).await
     }
 
+    // `fetch_update` is deprecated on newer toolchains; its replacement is not
+    // available at the declared MSRV (1.86).
+    #[allow(deprecated)]
     async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
         let should_fail = snapshot.id == self.parent
             && self
@@ -395,6 +398,7 @@ impl ChildRuntimeFactory for ScriptedChildFactory {
         self.checkpoint_store.clone()
     }
 
+    #[allow(deprecated)] // `fetch_update`; see `save` above.
     fn policy_fingerprint(
         &self,
         spec: &agent_runtime::delegation::DurableChildSpec,

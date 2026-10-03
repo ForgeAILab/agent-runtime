@@ -5,6 +5,7 @@
 //! fail-closed defaults: no approval policy → [`UnavailableApproval`]; no
 //! workspace → [`DenyAllWorkspace`]; no observers → none.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use agent_runtime_ability::activation::{ActivationContext, ActivationPolicy, FailClosedPolicy};
@@ -106,6 +107,7 @@ pub struct RuntimeBuilder {
     external_capabilities: crate::agent::external::ExternalCapabilities,
     harness: HarnessPipelineBuilder,
     lcm: Option<Arc<LcmCoordinator>>,
+    manifest_window: NonZeroUsize,
 }
 
 impl RuntimeBuilder {
@@ -163,6 +165,7 @@ impl RuntimeBuilder {
             activation_budget: None,
             harness: HarnessPipelineBuilder::new(),
             lcm: None,
+            manifest_window: crate::runtime::manifests::DEFAULT_MANIFEST_WINDOW,
         }
     }
 
@@ -466,6 +469,14 @@ impl RuntimeBuilder {
     /// or register its own authoritative check.
     pub fn legacy_approval_authority(mut self) -> Self {
         self.legacy_approval_authority = true;
+        self
+    }
+
+    /// Retains the newest positive finite number of planned-step manifests.
+    /// Defaults to 32; delegated children inherit this setting. Evicted
+    /// diagnostics require a host archive for historical equivalent replay.
+    pub fn manifest_window(mut self, window: NonZeroUsize) -> Self {
+        self.manifest_window = window;
         self
     }
 
@@ -898,6 +909,7 @@ impl RuntimeBuilder {
             self.return_child_interactions_to_parent,
             harness,
             live_abilities,
+            self.manifest_window,
         );
         #[cfg(feature = "external-agent")]
         let driver = driver.with_external_agent(self.external_agent, self.external_capabilities);
@@ -915,6 +927,7 @@ impl RuntimeBuilder {
             injection_queue_limit: self.injection_queue_limit,
             active_sessions: Arc::new(ActiveSessionRegistry::default()),
             lcm: self.lcm,
+            manifest_window: self.manifest_window,
         };
         Ok(Runtime::from_shared(Arc::new(shared)))
     }

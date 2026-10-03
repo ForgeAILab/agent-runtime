@@ -650,6 +650,9 @@ impl CapabilityGrant {
     /// request must satisfy — never by `covers` itself, which must not
     /// consume or alter a grant on a failed check, per the spec's own
     /// "without consuming or altering another grant".
+    // `fetch_update` is deprecated on newer toolchains; its replacement is not
+    // available at the declared MSRV (1.86).
+    #[allow(deprecated)]
     pub(crate) fn consume(&self) -> bool {
         self.remaining_uses
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {

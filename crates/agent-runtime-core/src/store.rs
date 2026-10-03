@@ -217,8 +217,11 @@ pub struct SessionSnapshot {
     /// Monotonic identity counters restored when this session resumes.
     #[serde(default)]
     pub identity: SessionIdentityState,
-    /// Per-turn run manifests, for audit and replay. Empty (and absent from
-    /// the wire form) for snapshots persisted before this field existed.
+    /// Ordered recent planned-step manifests for diagnostics and replay.
+    /// Runtime retention defaults to the newest 32 records; longer retention
+    /// is host-owned. Newly generated protected checkpoints omit this list.
+    /// Raw deserialization preserves legacy lists and defaults absent lists
+    /// to empty. Empty does not imply no provider activity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manifests: Vec<TurnManifest>,
     /// Versioned state owned by session-scoped runtime/harness components.

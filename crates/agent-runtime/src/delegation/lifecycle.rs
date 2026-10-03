@@ -1096,7 +1096,11 @@ impl DelegationCoordinator {
         session: Option<&SessionId>,
     ) -> Result<(Runtime, SessionHandle), RuntimeError> {
         let spec = durable_spec.rebuild_spec();
-        let mut builder = self.inner.factory.child_builder(&spec)?;
+        let mut builder = self
+            .inner
+            .factory
+            .child_builder(&spec)?
+            .manifest_window(self.inner.parent.manifest_window());
 
         // Delegation-management tools never reach a child view, whatever the
         // requested scope.

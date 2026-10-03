@@ -11,6 +11,27 @@ contain breaking changes and are coordinated with consumer proposals.
 
 See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 
+- `RuntimeError` adds `class`, `retry_after_ms`, `limit_resets_at_ms`, and
+  `credential_recovery`. Rust struct literals must supply the new fields;
+  exhaustive destructuring must include them or use `..`. Existing JSON stays
+  readable in both directions, and context-overflow counts are `Option<u32>`.
+  `FailureStage` and `FailureComponent` are non-exhaustive, and
+  `FailureComponent` adds `Unknown`, so enum matches need a wildcard arm.
+  Actual consumer builds remain a release gate.
+- Session manifest retention is now a finite recent window (default 32
+  planned steps). `snapshot.manifests` remains an ordered `Vec<TurnManifest>`;
+  `RuntimeBuilder::manifest_window(NonZeroUsize)` and
+  `SessionHandle::recent_manifests()` expose configuration and the same recent
+  suffix. Hosts requiring lifetime audit/replay must archive records. New
+  protected checkpoints omit diagnostic manifests and preserve exact execution
+  state using a RedactionSafe planned-step boundary record. Legacy JSON remains
+  readable; older binaries can reject a new terminal checkpoint paired with
+  nonempty ordinary diagnostics. Roll-forward repairs an opaque pre-U3
+  under-count when the longer legacy list still proves it, and nonterminal
+  crash recovery retains diagnostics from a lagging ordinary snapshot. The
+  namespace is exported as `runtime::MANIFEST_BOUNDARY_NAMESPACE`; additive
+  fields in its value remain readable. See the retention and downgrade
+  migration.
 - The removed session-scoped rolling-summary contract is replaced by Lossless
   Context Memory (LCM). Hosts bind an authorized logical timeline and compose
   `LcmCoordinator`; when `.lcm` is configured, resume automatically imports
@@ -130,6 +151,19 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+
+- Neutral `FailureClass`, `FailureStage`, and fixed `FailureComponent`
+  evidence on runtime errors. Legacy, future, and malformed classification
+  evidence cannot make a record unreadable; stages/components have `Unknown`
+  fallbacks, invalid optional timing/recovery evidence becomes absent, and zero
+  remains explicit. Delegated child failures retain all four evidence fields.
+  Provider conversion preserves timing and credential recovery, while private
+  request construction retains planner/harness evidence and LCM typed or
+  genuine concurrent-revision classifications with the existing coarse kind,
+  retryability, error channel, and terminal outcome.
+  Classification and timing hints never admit a retry. Frozen error/event/
+  child-failure fixtures and all three neutral consumer suites cover the
+  contract.
 - External agent capability injection: `ExternalCapabilities` (skills, MCP
   servers, tool allowlist, runtime tools) attached with
   `RuntimeBuilder::external_capabilities` and delivered on every

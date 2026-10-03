@@ -1,0 +1,10 @@
+{
+  "change_id": "add-runtime-failure-classes",
+  "change_ref": "add-runtime-failure-classes-2026-10-01",
+  "created_at": "2026-10-01T00:00:00Z",
+  "updated_at": "2026-10-01T19:59:00Z",
+  "approved_at": "2026-10-01T19:59:00Z",
+  "completed_at": null,
+  "status": "implementing",
+  "implementation_started_at": "2026-10-01T19:59:00Z"
+}

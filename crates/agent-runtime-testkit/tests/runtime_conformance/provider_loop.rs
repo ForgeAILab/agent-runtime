@@ -1318,3 +1318,54 @@ async fn registered_tool_arguments_are_schema_validated_before_exposure() {
 }
 
 // source-ownership / runtime-api: sessions resume from a persisted snapshot.
+
+#[tokio::test]
+async fn classified_provider_hints_do_not_admit_retry_or_change_terminal_outcome() {
+    use agent_runtime_core::provider::ProviderErrorKind;
+    let observer = RecordingObserver::shared();
+    let mut source =
+        ProviderError::new(ProviderErrorKind::LimitExhausted, "safe quota evidence").retryable();
+    source.retry_after_ms = Some(0);
+    source.limit_resets_at_ms = Some(1_700_000_000_123);
+    // Even a timing hint plus an explicit retryable flag cannot bypass the
+    // existing exhausted-window fence. U1 preserves that flag as evidence.
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![ProviderStreamEvent::Error {
+            error: source.clone(),
+        }])],
+    ));
+    let runtime = build(provider.clone(), observer.clone());
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hi")).await.unwrap();
+    let payloads = observer.payloads();
+    let errors = payloads
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::Error { error } => Some(error),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0],
+        &RuntimeError::from(source).with_failure_stage(FailureStage::Provider)
+    );
+    assert_eq!(provider.requests().len(), 1);
+    let delays = payloads
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::ProviderAttemptFinished { retry_delay_ms, .. } => Some(*retry_delay_ms),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(delays, vec![None]);
+    assert!(matches!(
+        payloads.last(),
+        Some(RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::Failed,
+            ..
+        })
+    ));
+}

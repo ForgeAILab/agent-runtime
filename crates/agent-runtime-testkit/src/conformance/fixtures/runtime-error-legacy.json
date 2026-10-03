@@ -1,0 +1,8 @@
+{
+  "kind": "provider",
+  "message": "fixture failure",
+  "retryable": false,
+  "metadata": {
+    "source": "fixture"
+  }
+}

@@ -128,7 +128,9 @@ pub mod prelude {
     pub use crate::delegation::{
         ChildLimits, ChildModelSelection, ChildSpec, ToolViewScope, WorkspacePolicy,
     };
-    pub use crate::error::{ErrorKind, Result, RuntimeError};
+    pub use crate::error::{
+        ErrorKind, FailureClass, FailureComponent, FailureStage, Result, RuntimeError,
+    };
     pub use crate::event::{
         BudgetCategory, CacheOperationOutcome, CacheOperationReason, CacheState, CacheStateKind,
         ChildPhase, ChildRecoveryState, CompactionReason, EstimationConfidence, EventEnvelope,
