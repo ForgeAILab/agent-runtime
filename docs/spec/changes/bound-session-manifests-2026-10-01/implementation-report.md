@@ -125,7 +125,7 @@ set `RUSTC_WRAPPER=/usr/bin/env`; this does not change the build/test contracts.
 
 | Exact command | Result |
 | --- | --- |
-| `cargo test -p agent-runtime-testkit --test runtime_conformance` | Passed: 73 tests. |
+| `cargo test -p agent-runtime-testkit --test conformance runtime_conformance::` | Passed: 73 tests. |
 | `cargo test -p agent-runtime-testkit --lib` | Passed: 81 tests before the final refresh fixture; the final workspace run passed all 82 library tests. |
 | `cargo test -p agent-runtime manifest_tests` | Passed: direct private-owner same-state refresh regression. |
 | `cargo test -p agent-runtime-testkit --test consumer_smith --test consumer_open_forge --test consumer_nyx` | Passed: Nyx 2, Forge 2, Smith 4 tests (8 total). |
@@ -165,7 +165,7 @@ multi-target dependency audit, and advisory check must run in an environment
 with the required socket/cache access before release.
 
 Development iterations also ran
-`cargo test -p agent-runtime-testkit --test runtime_conformance --no-fail-fast`
+`cargo test -p agent-runtime-testkit --test conformance --no-fail-fast runtime_conformance::`
 (initial compile failed while the new RuntimeError checks lacked the existing
 ContextError conversion), and
 `cargo test -p agent-runtime-testkit --lib conformance::manifests` (9 early

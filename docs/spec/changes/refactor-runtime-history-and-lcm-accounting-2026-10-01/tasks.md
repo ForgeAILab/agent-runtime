@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-01T00:00:00Z
-updated_at: 2026-10-03T04:57:19Z
+updated_at: 2026-10-03T09:22:39Z
 completed_at:
 ---
 
@@ -19,10 +19,13 @@ completed_at:
 - [x] 2.3 Make append-aware fingerprint output byte-identical to main; test all content parts/escaping and invalidate on untrusted/replaced/truncated generations.
 - [x] 2.4 Add counting store/sizer oracle fixtures for unchanged/append/compaction/cold resume, overflow, changed revisions and grants; distinguish accounting from other O(history) work.
 
+- [x] 2.5 Prove an authorized binding/component/DAG mismatch rebuilds accounting once and retains totals for the next warm lookup; retain the existing cold-rebuild path.
+- [x] 2.6 Clear per-entry accounting after successful provisional-tail truncation and cover a later canonical append with a focused regression.
+
 ## 3. Test Organization and Consumer Seams
 
-- [ ] 3.1 Inventory all 20 runtime and seven testkit integration roots and qualified cases before moving; consolidate runtime to one and testkit conformance to one while retaining its three consumer target names.
-- [ ] 3.2 Verify scenario counts, feature/ignored coverage, isolation, deterministic fixtures and existing consumer CI commands after consolidation.
+- [x] 3.1 Inventory all 20 runtime and seven testkit integration roots and qualified cases before moving; consolidate runtime to one and testkit conformance to one while retaining its three consumer target names.
+- [x] 3.2 Verify scenario counts, feature/ignored coverage, isolation, deterministic fixtures and existing consumer CI commands after consolidation.
 - [x] 3.3 Add/reuse the Smith contributor/store/held-view, Forge protected-LCM/counting-authority, and Nyx ephemeral-seeded/held-history fixtures listed in proposal.md without consumer dependencies.
 
 ## 4. Gates
@@ -31,7 +34,7 @@ completed_at:
 - [ ] 4.2 Pass all actual consumers and named testkit targets, workspace/schema/doc tests, formatting, all-feature Clippy, dependency/license and declared MSRV checks.
 - [ ] 4.3 Report remaining copies and optional allocation/link measurements; publish only after the compatible-release gate passes and immutable pins are available.
 
-## Scoped implementation evidence
+## Part A implementation evidence (prior run)
 
 This job implements groups 1/2, the history/LCM portions of 3.3, and 4.1 on
 `11ca2bd` (the separately landed U1/U3 contracts). All 20 runtime and seven
@@ -90,3 +93,53 @@ advisory database lock. Native all-feature bans/licenses/sources checks passed
 using filtered local metadata. No packages or advisory data were downloaded.
 Actual external consumer compile/contract gates, the full dependency/advisory
 gate and release pins/publication are still required for a compatible release.
+
+## Part B implementation evidence
+
+The test organization and audit hardening are complete. See
+[implementation-report.md](implementation-report.md) for every changed path,
+exact gate command/result, public baseline comparison, and release blockers.
+
+- Before/after qualified inventories are `/Volumes/Data/tmp/rt/u11b/inventory-before.txt`
+  and `inventory-after.txt`. Runtime targets went from 20 to one, with 126
+  default-feature / 135 all-feature cases preserved. Testkit went from seven
+  targets to four, preserving 158 conformance cases and the unchanged named
+  consumer cases: Forge 5, Smith 8, Nyx 6. The 101 inventory/source checks pass;
+  all feature gates, ignore status (none in the moved targets), Tokio attributes,
+  fixtures and assertions are preserved. No exact duplicate test bodies were
+  found among the 312 integration cases; no case was deleted or deduplicated.
+- The sole runtime static OnceLock stores an immutable revision. Other runtime
+  OnceLocks are per fixture. Testkit file stores use distinct prefixes plus
+  PID/atomic counters and Drop cleanup. No moved test mutates the environment
+  or shares a mutable fixture directory. Both consolidated harnesses pass with
+  normal parallel execution. CI/consumer source/manifests remain unchanged.
+- Binding/component/DAG mismatch already took the cold rebuild-and-store path
+  on current main; the new counting regression verifies one rebuild followed
+  by no reads/sizing. Successful truncate_from now explicitly clears counts;
+  its regression failed before that fix and passes after it. No public or
+  persisted fields, signatures, descriptor revisions or fingerprints changed.
+- Final local gates exited 0: new focused tests 1/1 each, history 3/3, accounting
+  10/10, LCM hooks 28/28, runtime integration 135/135, testkit conformance
+  158/158, schema/context/LCM 394/394, consumer Forge/Smith/Nyx 5/5, 8/8, 6/6,
+  workspace all-feature tests 1,479 passed, docs 7 passed, formatting, Clippy
+  and all declared MSRV builds. Final test FAILED names: none. Actual Forge
+  source compiled and its LCM/authority targets passed all 22 cases using a
+  scratch manifest referencing the original source and command-local patches.
+- The capture allocation harness exactly reproduces part A: baseline 1,024
+  copies / 2,055 allocation calls / 1,196,080 requested bytes; current fresh
+  generation 256 / 515 / 292,976; current warm generation 0 / 0 / 0. Copies at
+  changed generations and existing owned public/planner/checkpoint boundaries
+  remain. Integration harnesses total 27 -> 5; no link-speed claim is made.
+
+4.2 remains open: full offline cargo deny exits 1 for uncached windows 0.61.3;
+its native bans/licenses/sources check passes, while advisory checking exits 1
+for the read-only advisory database lock. The original external consumer gate
+attempts exit 101 because command-local candidate patches require lockfile
+updates. Safe scratch manifests avoid writing those workspaces: Forge passes;
+Smith exits 101 on six legacy semantic-summary API errors already present
+against current main; Nyx exits 101 for uncached addr2line 0.26.1. Their contract
+gates remain blocked. No consumer files or lockfiles were changed.
+
+4.3's measurement/report work is complete above. Its compatible-release
+publication/pin condition remains open with 4.2; this job neither commits nor
+publishes. completed_at remains unset. No CHANGELOG.md edit was made.

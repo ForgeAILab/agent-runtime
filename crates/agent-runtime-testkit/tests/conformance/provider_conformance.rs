@@ -112,7 +112,7 @@ fn gemini_config() -> GeminiInteractionsConfig {
 
 fn gemini_two_chunk_text() -> GeminiInteractionsProvider<ReplayTransport> {
     GeminiInteractionsProvider::new(
-        ReplayTransport::single(include_str!("fixtures/gemini-text.sse")),
+        ReplayTransport::single(include_str!("../fixtures/gemini-text.sse")),
         gemini_config(),
     )
     .expect("Gemini fixture config")
@@ -126,7 +126,7 @@ fn responses_config() -> ResponsesConfig {
 
 fn responses_two_chunk_text() -> ResponsesProvider<ReplayTransport> {
     ResponsesProvider::new(
-        ReplayTransport::single(include_str!("fixtures/responses-text.sse")),
+        ReplayTransport::single(include_str!("../fixtures/responses-text.sse")),
         responses_config(),
     )
     .expect("Responses fixture config")
@@ -477,7 +477,7 @@ async fn gemini_adapter_normalizes_signed_reasoning() {
     let mut config = gemini_config();
     config.capabilities.reasoning = ReasoningSupport::Controllable;
     let provider = GeminiInteractionsProvider::new(
-        ReplayTransport::single(include_str!("fixtures/gemini-reasoning.sse")),
+        ReplayTransport::single(include_str!("../fixtures/gemini-reasoning.sse")),
         config,
     )
     .expect("Gemini fixture config");
@@ -491,7 +491,7 @@ async fn gemini_adapter_normalizes_signed_reasoning() {
 #[tokio::test]
 async fn responses_adapter_normalizes_encrypted_reasoning() {
     let provider = ResponsesProvider::new(
-        ReplayTransport::single(include_str!("fixtures/responses-reasoning.sse")),
+        ReplayTransport::single(include_str!("../fixtures/responses-reasoning.sse")),
         responses_config(),
     )
     .expect("Responses fixture config");
@@ -505,7 +505,9 @@ async fn responses_adapter_normalizes_encrypted_reasoning() {
 #[tokio::test]
 async fn responses_adapter_preserves_unsigned_signed_and_encrypted_only_reasoning() {
     let provider = ResponsesProvider::new(
-        ReplayTransport::single(include_str!("fixtures/responses-reasoning-signatures.sse")),
+        ReplayTransport::single(include_str!(
+            "../fixtures/responses-reasoning-signatures.sse"
+        )),
         responses_config(),
     )
     .expect("Responses fixture config");
@@ -544,7 +546,7 @@ async fn responses_adapter_preserves_unsigned_signed_and_encrypted_only_reasonin
 #[tokio::test]
 async fn responses_adapter_normalizes_parallel_function_calls() {
     let provider = ResponsesProvider::new(
-        ReplayTransport::single(include_str!("fixtures/responses-tools.sse")),
+        ReplayTransport::single(include_str!("../fixtures/responses-tools.sse")),
         responses_config(),
     )
     .expect("Responses fixture config");
@@ -595,7 +597,7 @@ async fn responses_adapter_normalizes_parallel_function_calls() {
 #[tokio::test]
 async fn responses_adapter_redacts_auth_failure_details() {
     let provider = ResponsesProvider::new(
-        ReplayTransport::single(include_str!("fixtures/responses-auth.sse")),
+        ReplayTransport::single(include_str!("../fixtures/responses-auth.sse")),
         responses_config(),
     )
     .expect("Responses fixture config");

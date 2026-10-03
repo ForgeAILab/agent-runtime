@@ -8,7 +8,7 @@ Verified on 2026-08-02 against the coordinated Smith working tree.
 - `cargo test --workspace --all-targets` — passed.
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo +1.86.0 build --all-features -p agent-runtime-registry -p agent-runtime-core -p agent-runtime-ability -p agent-runtime-provider -p agent-runtime-context -p agent-runtime-obs -p agent-runtime` — passed.
-- `cargo test -p agent-runtime --test active_turn_steering` — 6 passed.
+- `cargo test -p agent-runtime --test integration active_turn_steering::` — 6 passed.
 - `cargo test -p agent-runtime-testkit` — passed, including the Smith steering consumer and reusable steering-barrier scenario.
 - Event-schema conformance passed with the v11 golden fixture.
 

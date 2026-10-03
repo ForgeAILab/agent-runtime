@@ -22,7 +22,7 @@ and 19,894 edges.
 | --- | ---: |
 | `crates/agent-runtime/src/agent/driver.rs` | 4,951 |
 | `crates/agent-runtime/src/delegation/mod.rs` | 2,953 |
-| `crates/agent-runtime-testkit/tests/runtime_conformance.rs` | 4,983 |
+| `crates/agent-runtime-testkit/tests/conformance/runtime_conformance.rs` | 4,983 |
 | `crates/agent-runtime-core/src/checkpoint.rs` | 1,991 |
 | `crates/agent-runtime-testkit/src/conformance/delegation.rs` | 2,130 |
 | `crates/agent-runtime/src/harness/live_abilities.rs` | 1,482 |

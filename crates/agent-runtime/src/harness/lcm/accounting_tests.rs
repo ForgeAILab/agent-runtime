@@ -185,6 +185,61 @@ async fn warm_unchanged_append_and_cold_resume_match_full_oracle() {
 }
 
 #[tokio::test]
+async fn mismatched_accounting_evidence_rebuilds_once_then_stays_warm() {
+    let (store, sizer, coordinator, mut binding) = fixture();
+    let mut generations = HistoryGenerations::default();
+    let generation = generations.capture(&[Message::user("first"), Message::user("second")]);
+    coordinator.register_history(&binding.session, &generation);
+    let mut state = coordinator
+        .synchronize(&binding, None, &generation.history)
+        .await
+        .unwrap();
+    coordinator
+        .accounted_context_tokens(&binding, &generation.history, &state)
+        .await
+        .unwrap();
+
+    for mismatch in 0..3 {
+        match mismatch {
+            0 => binding.authorization_revision = RegistryRevision::new("new authorized binding"),
+            1 => {
+                sizer.revision.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {
+                *store.revision.lock().unwrap() = state.dag_revision.next().unwrap();
+            }
+        }
+        state = coordinator
+            .checkpoint_state(&binding, &generation.history, &[], None, None, 0)
+            .await
+            .unwrap();
+        let expected = oracle(&coordinator, &binding, generation.history.len())
+            .await
+            .unwrap();
+        reset(&store, &sizer);
+        assert_eq!(
+            coordinator
+                .accounted_context_tokens(&binding, &generation.history, &state)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(*sizer.entries.lock().unwrap(), [0, 1]);
+        assert_eq!(*store.read_ranges.lock().unwrap(), [(0, 1)]);
+        reset(&store, &sizer);
+        assert_eq!(
+            coordinator
+                .accounted_context_tokens(&binding, &generation.history, &state)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(sizer.entries.lock().unwrap().is_empty());
+        assert!(store.read_ranges.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn committed_summary_reuses_source_totals_and_strict_projection_reads_sources() {
     let (store, sizer, mut coordinator, binding) = fixture();
     coordinator.policy.pressure.retain_recent_entries = 0;
