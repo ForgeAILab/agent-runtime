@@ -114,6 +114,14 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   revisions and fingerprints are unchanged. A DAG revision change between
   checkpoint and pressure accounting now fails the turn with the existing
   revision-conflict error instead of accounting against the newer DAG.
+  Truncating the stored tail now drops the cached totals, so a later append
+  cannot reuse counts for removed entries.
+- Integration tests build as fewer binaries: the 20 `agent-runtime` test
+  targets are one `integration` target and the four testkit conformance
+  targets are one `conformance` target. Every case is kept; the consumer
+  targets `consumer_open_forge`, `consumer_smith` and `consumer_nyx` keep their
+  names. Run a moved case with `--test integration <module>::` or
+  `--test conformance <module>::`.
 - `ProviderAttemptFinished` now carries optional zero-based attempt position,
   configured attempt total, and the effective delay before an actually
   admitted retry. Legacy journals deserialize the fields as absent, while

@@ -1155,6 +1155,9 @@ impl LcmCoordinator {
                     .truncate_from(&view, LcmSequence::new(sequence as u64))
                     .await
                     .map_err(map_lcm_error)?;
+                // A later append cannot inherit counts for the removed tail,
+                // even if it advances revision evidence through a local commit.
+                self.invalidate_accounting(&binding.session);
                 sequence
             }
             None => start + stored.len(),

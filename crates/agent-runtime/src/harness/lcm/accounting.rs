@@ -25,6 +25,13 @@ struct EntryTotals {
 }
 
 impl LcmCoordinator {
+    pub(super) fn invalidate_accounting(&self, session: &SessionId) {
+        let mut slots = self.accounting.lock().expect("LCM accounting poisoned");
+        if let Some(slot) = slots.get_mut(session) {
+            slot.totals = None;
+        }
+    }
+
     pub(crate) fn release_history(&self, session: &SessionId, generation: &Arc<HistoryGeneration>) {
         let mut slots = self.accounting.lock().expect("LCM accounting poisoned");
         if slots
@@ -275,3 +282,93 @@ impl LcmCoordinator {
 }
 
 pub(super) type Accounting = Arc<Mutex<BTreeMap<SessionId, AccountingSlot>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::lcm::tests::{TestStore, test_coordinator};
+    use crate::runtime::history::HistoryGenerations;
+
+    #[tokio::test]
+    async fn truncated_store_tail_discards_removed_entry_totals() {
+        let mut coordinator =
+            test_coordinator(Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline"))));
+        let store = Arc::new(agent_runtime_lcm::testing::InMemoryLcmStore::new(
+            LcmTimelineId::new("lcm-timeline"),
+        ));
+        let binding = LcmTimelineBinding::new(
+            SessionId::new("lcm-session"),
+            LcmTimelineId::new("lcm-timeline"),
+            RegistryRevision::new("lcm-auth-v1"),
+            store.authority(),
+        )
+        .unwrap();
+        coordinator.store = store;
+        let mut generations = HistoryGenerations::default();
+        let mut history = vec![
+            Message::user("retained"),
+            Message::user("orphan".repeat(100)),
+        ];
+        let generation = generations.capture(&history);
+        coordinator.register_history(&binding.session, &generation);
+        let state = coordinator
+            .synchronize(&binding, None, &generation.history)
+            .await
+            .unwrap();
+        coordinator
+            .accounted_context_tokens(&binding, &generation.history, &state)
+            .await
+            .unwrap();
+        assert!(
+            coordinator.accounting.lock().unwrap()[&binding.session]
+                .totals
+                .is_some()
+        );
+
+        // Recover only the terminal prefix first. No append has yet occurred
+        // to force a revision-mismatch lookup of the orphan's cached totals.
+        coordinator
+            .reconcile_diverged_store(&binding, &history[..1], 1, None)
+            .await
+            .unwrap();
+        assert!(
+            coordinator.accounting.lock().unwrap()[&binding.session]
+                .totals
+                .is_none()
+        );
+
+        history[1] = Message::user("new canonical tail");
+        let generation = generations.capture(&history);
+        coordinator.register_history(&binding.session, &generation);
+        assert!(
+            coordinator
+                .try_append_range(&binding, &generation.history, 1)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        let state = coordinator
+            .checkpoint_state(&binding, &generation.history, &[], None, None, 0)
+            .await
+            .unwrap();
+        let expected = history
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let entry = coordinator
+                    .entry_for(&binding, index as u64, message)
+                    .unwrap();
+                coordinator.policy.sizer.entry_tokens(&entry)
+            })
+            .sum::<u64>();
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator
+                    .accounted_context_tokens(&binding, &generation.history, &state)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+}

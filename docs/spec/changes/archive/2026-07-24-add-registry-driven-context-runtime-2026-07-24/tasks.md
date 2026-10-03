@@ -245,7 +245,7 @@ completed_at:
   `ContextSegmentRecord` has no field a raw fragment could occupy.)_
 - [x] 8.5 Add equivalent replay, revision-mismatch failure, explicitly
   non-equivalent replay, restart, and persistence migration tests.
-  _(`crates/agent-runtime/tests/replay_and_persistence.rs`. A pre-manifest
+  _(`crates/agent-runtime/tests/integration/replay_and_persistence.rs`. A pre-manifest
   snapshot still deserializes, so this is a persistence migration rather than a
   breaking read.)_
 

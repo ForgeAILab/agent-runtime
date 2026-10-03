@@ -11,7 +11,7 @@ completed_at:
 - [x] 1.1 Accumulate `ReasoningDelta` events into merged `ContentPart::Reasoning` parts (`ReasoningAccumulator` in `crates/agent-runtime/src/agent/driver.rs`)
 - [x] 1.2 Carry reasoning through `ProviderTurnOutcome::Success` and prepend it to the assistant history message
 - [x] 1.3 Strip prior-turn reasoning at turn start; drop assistant messages left empty (`strip_stale_reasoning`)
-- [x] 1.4 Integration tests: round-trip within a turn, redacted separation, cross-turn strip (`crates/agent-runtime/tests/reasoning_preservation.rs`)
+- [x] 1.4 Integration tests: round-trip within a turn, redacted separation, cross-turn strip (`crates/agent-runtime/tests/integration/reasoning_preservation.rs`)
 
 ## 2. OpenAI adapter round-trip
 
