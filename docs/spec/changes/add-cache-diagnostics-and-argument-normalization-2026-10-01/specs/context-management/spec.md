@@ -5,8 +5,12 @@
 Cache plans and CachePlanChanged SHALL expose optional first_changed_fragment
 evidence from their committed predecessor comparison. The diagnostic MUST name
 the earliest changed ID, content hash, or cache class within an established
-stable prefix, using the current ID or the removed predecessor ID when no
-current item exists. It MUST NOT change cache identity, fingerprints, provider
+stable prefix in plan-segment order (Instructions before Capabilities), not
+provider wire byte order. When IDs differ and the predecessor ID is absent
+from the current leading Stable segments, it MUST name that removed
+predecessor ID, including when a neighbour or tail occupies its old position.
+It SHALL otherwise use the current ID, or the predecessor ID when no current
+item exists. It MUST NOT change cache identity, fingerprints, provider
 wire output, or canonical cache metrics.
 
 #### Scenario: A stable instruction changes
@@ -21,6 +25,13 @@ wire output, or canonical cache metrics.
 - **WHEN** a comparable request removes the final stable-prefix segment or makes it ephemeral
 - **THEN** the diagnostic names the removed predecessor ID or the changed current ID respectively
 - **AND** no sensitive fragment content is emitted
+
+#### Scenario: Prefix deletion leaves a neighbour or ephemeral tail
+
+- **GIVEN** a comparable predecessor has stable segments a, b, c followed by an Ephemeral user tail
+- **WHEN** the current plan removes the final, middle, or first stable segment
+- **THEN** the diagnostic names c, b, or a respectively, even if a neighbour or user tail occupies the removed segment's old position
+- **AND** changing or retaining the tail does not change the deletion attribution
 
 #### Scenario: New tail does not invalidate an established prefix
 

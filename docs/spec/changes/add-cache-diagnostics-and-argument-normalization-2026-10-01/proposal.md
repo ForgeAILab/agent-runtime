@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-01T00:00:00Z
-updated_at: 2026-10-03T05:00:57Z
+updated_at: 2026-10-03T05:26:44Z
 ---
 
 # Proposal: Add cache diagnostics and argument normalization (U2)
@@ -43,6 +43,46 @@ opt-in tool contract without provider-specific policy in the library.
 
 ## Compatibility and Consumer Gates
 
+### Rust field updates
+
+Two additive JSON fields require updates to field-exact Rust construction or
+destructuring in Smith, Forge, and Nyx:
+
+- `agent_runtime::context::CachePlan.first_changed_fragment` is
+  `Option<FragmentId>`. Direct `CachePlan { ... }` literals must add
+  `first_changed_fragment: None` when no predecessor evidence is available,
+  or use the existing `build`/`build_with_identity` constructors. Field-exact
+  patterns must bind/ignore the field or add `..`.
+- `RuntimeEvent::CachePlanChanged.first_changed_fragment` is `Option<String>`.
+  Constructors listing `cache_plan`, `preserved_prefix_tokens`,
+  `invalidated_prefix_tokens`, and `provider_cache_supported` must add
+  `first_changed_fragment: None` or the runtime's safe projected evidence.
+  Field-exact patterns must bind/ignore the field or add `..`. Smith/Forge
+  event projections and constructors, and Nyx event constructors if present,
+  need this source update. Exhaustive matches over event variants are unchanged.
+
+The optional fields default to absent for legacy JSON and are omitted when
+unavailable. Existing Tool/LegacyTool implementations need no new method;
+normalization remains an explicit choice by individual Tool implementations.
+
+### Execution-facing argument and error-text compatibility
+
+For opt-in tools, turn-machine preparation stores normalized arguments in
+`ReadyToolCall.call`, which supplies `ToolOutputView.call` and the
+`LocalActionExecuting` checkpoint's `call`. Canonical model history retains
+the raw model arguments for replay. Exact prepared-action recovery uses the
+checkpointed prepared arguments without normalizing again; `Tool::prepare`
+may still perform its existing deeper canonicalization.
+
+Pre-hook cancellation and deadline tool-result text now says
+`cancelled before tool normalization` and
+`deadline elapsed before tool normalization`, replacing the previous
+`...before tool preparation` wording. This applies to identity-default tools
+as well as opt-in tools; consumers matching these strings must update their
+assertions or projections.
+
+### Consumer gates
+
 | Consumer | Required work before release | Testkit proof to add |
 | --- | --- | --- |
 | Forge | Compile event projections/constructors; optionally implement normalization in its own tools and remove its widened schema after its gate passes. No automatic envelope repair is enabled. | `consumer_open_forge`: strict canonical schema, explicit envelope normalizer, then workspace/policy denial prevents execution; unchanged schema bytes are advertised. |
@@ -54,6 +94,12 @@ cache-plan, event-schema, invalid-argument, and prepared-action/recovery
 conformance. These fixtures are proposed implementation work. Actual consumer
 builds and all three gates must pass; failure blocks a compatible release.
 Published consumer dependencies must use a tag or exact landed revision.
+
+The local implementation gate compiles the workspace and all three named
+testkit targets. Actual product-tree builds remain required before release.
+Native-target bans/licenses/sources passed in the implementation run; the
+full multi-target and advisory audits remain release follow-ups where their
+dependency cache and advisory database are available.
 
 All audit §5 surfaces remain: Nyx's `StartSession::new().with_history` and
 subscription ordering; Smith's file/session/checkpoint stores, explicit

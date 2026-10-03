@@ -1207,6 +1207,9 @@ pub(crate) struct RawToolResult {
 
 #[derive(Debug)]
 pub(crate) struct ReadyToolCall {
+    /// Turn-machine preparation carries normalized arguments for opt-in
+    /// tools; recovery carries the exact prepared arguments. Canonical model
+    /// history retains raw arguments independently of this execution call.
     pub(crate) call: ToolCall,
     pub(crate) tool: Arc<dyn Tool>,
     pub(crate) prepared: PreparedToolCall,

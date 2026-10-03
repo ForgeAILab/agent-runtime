@@ -316,7 +316,9 @@ pub struct CachePlan {
     /// committed predecessor's stable prefix. Absent when the prefix is
     /// unchanged, the provider boundary is unavailable, or a non-fragment
     /// identity partition also changed. This diagnostic never affects cache
-    /// fingerprints or reuse metrics. Fragment IDs are host-owned and must
+    /// fingerprints or reuse metrics. "First" means plan-segment order
+    /// (Instructions before Capabilities), not provider wire byte order.
+    /// Fragment IDs are host-owned and must
     /// not contain sensitive content; event projection additionally omits
     /// IDs outside its bounded safe-identifier contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,6 +438,16 @@ impl CachePlan {
                                 && current.cache_class == old.cache_class =>
                         {
                             None
+                        }
+                        Some(current)
+                            if current.fragment != old.fragment
+                                && !segments[..declared_stable_prefix_len]
+                                    .iter()
+                                    .any(|segment| segment.fragment == old.fragment) =>
+                        {
+                            // A removed prefix item may be replaced at this
+                            // position by an unchanged neighbour or the tail.
+                            Some(old.fragment.clone())
                         }
                         Some(current) => Some(current.fragment.clone()),
                         None => Some(old.fragment.clone()),
@@ -1259,7 +1271,7 @@ mod tests {
         for (current, expected) in [
             (changed_hash, "b"),
             (inserted, "new"),
-            (removed, "c"),
+            (removed, "b"),
             (reordered, "b"),
             (ephemeral, "a"),
             (no_cache, "b"),
@@ -1286,6 +1298,54 @@ mod tests {
                 without.local_compiled_context_key
             );
             assert_eq!(plan.expected_read_tokens(), without.expected_read_tokens());
+        }
+    }
+
+    #[test]
+    fn first_changed_fragment_reports_deletions_before_an_ephemeral_tail() {
+        let capability = full_capability();
+        let identity = Fingerprint::of("profile");
+        let mut original = diagnostic_segments();
+        original.push(segment(
+            "user:1",
+            FragmentKind::UserInput,
+            CacheClass::Ephemeral,
+            "first user input",
+            5,
+        ));
+        let prior = CachePlan::build_with_identity(
+            identity.clone(),
+            diagnostic_identity(&original),
+            &original,
+            None,
+            &capability,
+        );
+        for removed_index in [2, 1, 0] {
+            for tail_changed in [false, true] {
+                let mut current = original.clone();
+                let removed = current.remove(removed_index);
+                if tail_changed {
+                    *current.last_mut().unwrap() = segment(
+                        "user:2",
+                        FragmentKind::UserInput,
+                        CacheClass::Ephemeral,
+                        "second user input",
+                        6,
+                    );
+                }
+                let plan = CachePlan::build_with_identity(
+                    identity.clone(),
+                    diagnostic_identity(&current),
+                    &current,
+                    Some(&prior),
+                    &capability,
+                );
+                assert_eq!(
+                    plan.first_changed_fragment(),
+                    Some(&removed.fragment),
+                    "deletion at {removed_index}, tail changed: {tail_changed}"
+                );
+            }
         }
     }
 
