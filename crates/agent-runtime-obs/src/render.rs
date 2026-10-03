@@ -247,6 +247,7 @@ fn summary(payload: &RuntimeEvent) -> String {
             preserved_prefix_tokens,
             invalidated_prefix_tokens,
             provider_cache_supported,
+            ..
         } => format!(
             "cache_plan_changed cache_plan={cache_plan} preserved={preserved_prefix_tokens} invalidated={invalidated_prefix_tokens} provider_cache_supported={provider_cache_supported}"
         ),

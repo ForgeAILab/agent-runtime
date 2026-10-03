@@ -216,3 +216,8 @@ async fn open_forge_authorized_conflict_and_revoked_view_retain_classes_without_
 async fn open_forge_recovers_exact_boundaries_with_bounded_diagnostics() {
     agent_runtime_testkit::conformance::manifests::assert_protected_manifest_recovery().await;
 }
+
+#[tokio::test]
+async fn forge_opt_in_normalization_keeps_canonical_schema_and_denial() {
+    agent_runtime_testkit::conformance::normalization::assert_opt_in_normalization_preserves_denial_and_schema().await;
+}

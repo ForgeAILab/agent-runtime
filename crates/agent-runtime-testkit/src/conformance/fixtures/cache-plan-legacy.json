@@ -1,0 +1,32 @@
+{
+  "identity": "0123456789abcdef0123456789abcdef",
+  "segments": [
+    {
+      "fragment": "instruction.one",
+      "cache_class": "stable",
+      "content_hash": "0123456789abcdef0123456789abcdef",
+      "tokens": 10
+    }
+  ],
+  "declared_stable_prefix_len": 1,
+  "preserved_prefix_len": 0,
+  "has_comparable_predecessor": true,
+  "provider_baseline_available": true,
+  "preserved_prefix_tokens": 0,
+  "invalidated_tokens": 10,
+  "changed_segments": [
+    "instruction.one"
+  ],
+  "local_compiled_context_key": "0123456789abcdef0123456789abcdef",
+  "provider_cache": {
+    "capability": {
+      "revision": "legacy",
+      "provider": "fixture",
+      "supports_stable": false,
+      "supports_ephemeral": false
+    },
+    "unsupported": [
+      "stable"
+    ]
+  }
+}

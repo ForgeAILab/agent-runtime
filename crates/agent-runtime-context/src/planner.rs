@@ -1127,6 +1127,20 @@ mod tests {
             Some(ProviderCacheBoundary::default())
         );
         assert_eq!(first.cache_plan().unwrap().expected_read_tokens(), None);
+        assert!(
+            first
+                .cache_plan()
+                .unwrap()
+                .first_changed_fragment()
+                .is_none()
+        );
+        assert!(
+            second
+                .cache_plan()
+                .unwrap()
+                .first_changed_fragment()
+                .is_none()
+        );
         assert_eq!(
             second.cache_plan().unwrap().expected_read_tokens(),
             None,

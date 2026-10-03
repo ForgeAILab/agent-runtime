@@ -312,6 +312,15 @@ pub struct CachePlan {
     /// a real prefix-based provider cache would also miss on, even one whose
     /// own bytes are unchanged, because it follows a break in the prefix.
     pub changed_segments: Vec<FragmentId>,
+    /// Earliest changed ordered ID, content hash, or cache class within the
+    /// committed predecessor's stable prefix. Absent when the prefix is
+    /// unchanged, the provider boundary is unavailable, or a non-fragment
+    /// identity partition also changed. This diagnostic never affects cache
+    /// fingerprints or reuse metrics. Fragment IDs are host-owned and must
+    /// not contain sensitive content; event projection additionally omits
+    /// IDs outside its bounded safe-identifier contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_changed_fragment: Option<FragmentId>,
     /// The local compiled-context cache key: a fingerprint of the complete
     /// ordered segment sequence (identity, hash, cache class — not token
     /// count, since a different sizer does not change the compiled bytes).
@@ -333,6 +342,7 @@ impl CachePlan {
         self.provider_baseline_available = false;
         self.preserved_prefix_tokens = 0;
         self.cache_identity = None;
+        self.first_changed_fragment = None;
         self.invalidated_tokens = self
             .segments
             .iter()
@@ -399,6 +409,38 @@ impl CachePlan {
         let has_comparable_predecessor = declared_stable_prefix_len > 0
             && capability_can_represent_stable
             && previous.is_some_and(|plan| plan.provider_baseline_available);
+        // Diagnose the predecessor's established boundary, including deletion
+        // or demotion of its first segment. Digest equality would hide real
+        // fragment causes because stable fragments themselves enter it.
+        let first_changed_fragment = previous
+            .filter(|prior| {
+                capability_can_represent_stable
+                    && prior.provider_baseline_available
+                    && prior.provider_cache.capability == capability
+                    && match (&prior.cache_identity, &cache_identity_for_comparison) {
+                        (Some(prior), Some(current)) => current.same_non_fragment_partition(prior),
+                        (None, _) => prior.identity == identity,
+                        _ => false,
+                    }
+            })
+            .and_then(|prior| {
+                prior
+                    .segments
+                    .iter()
+                    .take(prior.declared_stable_prefix_len)
+                    .enumerate()
+                    .find_map(|(index, old)| match segments.get(index) {
+                        Some(current)
+                            if current.fragment == old.fragment
+                                && current.content_hash == old.content_hash
+                                && current.cache_class == old.cache_class =>
+                        {
+                            None
+                        }
+                        Some(current) => Some(current.fragment.clone()),
+                        None => Some(old.fragment.clone()),
+                    })
+            });
         let preserved_prefix_len = match previous {
             Some(previous)
                 if previous
@@ -462,6 +504,7 @@ impl CachePlan {
             preserved_prefix_tokens,
             invalidated_tokens,
             changed_segments,
+            first_changed_fragment,
             local_compiled_context_key,
             provider_cache,
             cache_identity: cache_identity_for_comparison,
@@ -481,6 +524,12 @@ impl CachePlan {
     /// Whether this plan was compared against a prior provider request.
     pub fn has_comparable_predecessor(&self) -> bool {
         self.has_comparable_predecessor
+    }
+
+    /// The first changed fragment in the established provider prefix, when
+    /// the committed predecessor comparison permits fragment attribution.
+    pub fn first_changed_fragment(&self) -> Option<&FragmentId> {
+        self.first_changed_fragment.as_ref()
     }
 
     /// Returns the exact opaque identity when this plan was built by the
@@ -1140,5 +1189,311 @@ mod tests {
             plan_a.local_compiled_context_key,
             plan_b.local_compiled_context_key
         );
+    }
+
+    fn diagnostic_segments() -> Vec<PlanSegment> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                segment(
+                    id,
+                    FragmentKind::SystemInstruction,
+                    CacheClass::Stable,
+                    id,
+                    10,
+                )
+            })
+            .collect()
+    }
+
+    fn diagnostic_identity(segments: &[PlanSegment]) -> CacheIdentity {
+        use agent_runtime_core::provider::CacheIdentityFragment;
+        CacheIdentity::legacy(
+            Fingerprint::of("profile"),
+            "test-provider",
+            ModelId::new("model"),
+            segments
+                .iter()
+                .take_while(|s| s.cache_class == CacheClass::Stable)
+                .map(|s| CacheIdentityFragment::new(s.fragment.as_str(), s.content_hash.clone())),
+            PromptCacheControl::Explicit {
+                max_breakpoints: u8::MAX,
+            },
+        )
+    }
+
+    #[test]
+    fn first_changed_fragment_compares_ordered_ids_hashes_and_classes() {
+        let original = diagnostic_segments();
+        let capability = full_capability();
+        let identity = Fingerprint::of("profile");
+        let prior = CachePlan::build_with_identity(
+            identity.clone(),
+            diagnostic_identity(&original),
+            &original,
+            None,
+            &capability,
+        );
+        assert!(prior.first_changed_fragment().is_none());
+        let mut changed_hash = original.clone();
+        changed_hash[1].content_hash = Fingerprint::of("changed");
+        let mut inserted = original.clone();
+        inserted.insert(
+            1,
+            segment(
+                "new",
+                FragmentKind::SystemInstruction,
+                CacheClass::Stable,
+                "new",
+                2,
+            ),
+        );
+        let mut removed = original.clone();
+        removed.remove(1);
+        let mut reordered = original.clone();
+        reordered.swap(0, 1);
+        let mut ephemeral = original.clone();
+        ephemeral[0].cache_class = CacheClass::Ephemeral;
+        let mut no_cache = original.clone();
+        no_cache[1].cache_class = CacheClass::NoCache;
+        for (current, expected) in [
+            (changed_hash, "b"),
+            (inserted, "new"),
+            (removed, "c"),
+            (reordered, "b"),
+            (ephemeral, "a"),
+            (no_cache, "b"),
+            (original[..2].to_vec(), "c"),
+            (Vec::new(), "a"),
+        ] {
+            let plan = CachePlan::build_with_identity(
+                identity.clone(),
+                diagnostic_identity(&current),
+                &current,
+                Some(&prior),
+                &capability,
+            );
+            assert_eq!(
+                plan.first_changed_fragment().map(FragmentId::as_str),
+                Some(expected)
+            );
+            // The diagnostic is excluded from every cache behavior/fingerprint.
+            let mut without = plan.clone();
+            without.first_changed_fragment = None;
+            assert_eq!(plan.fingerprint(), without.fingerprint());
+            assert_eq!(
+                plan.local_compiled_context_key,
+                without.local_compiled_context_key
+            );
+            assert_eq!(plan.expected_read_tokens(), without.expected_read_tokens());
+        }
+    }
+
+    #[test]
+    fn first_changed_fragment_ignores_unchanged_appended_and_promoted_tail() {
+        let capability = full_capability();
+        let identity = Fingerprint::of("profile");
+        let mut original = diagnostic_segments();
+        original[2].cache_class = CacheClass::Ephemeral;
+        let prior = CachePlan::build_with_identity(
+            identity.clone(),
+            diagnostic_identity(&original),
+            &original,
+            None,
+            &capability,
+        );
+        let mut promoted = original.clone();
+        promoted[2].cache_class = CacheClass::Stable;
+        let mut appended = original.clone();
+        appended.push(segment(
+            "tail",
+            FragmentKind::UserInput,
+            CacheClass::Ephemeral,
+            "tail",
+            5,
+        ));
+        for current in [original, promoted, appended] {
+            let plan = CachePlan::build_with_identity(
+                identity.clone(),
+                diagnostic_identity(&current),
+                &current,
+                Some(&prior),
+                &capability,
+            );
+            assert!(plan.first_changed_fragment().is_none());
+            assert_eq!(plan.preserved_prefix_len, 2);
+        }
+    }
+
+    #[test]
+    fn first_changed_fragment_requires_an_unchanged_non_fragment_partition() {
+        use agent_runtime_core::provider::{CacheEndpointIdentity, CacheIdentityFragment};
+        let original = diagnostic_segments();
+        let capability = full_capability();
+        let identity = Fingerprint::of("profile");
+        let prior = CachePlan::build_with_identity(
+            identity.clone(),
+            diagnostic_identity(&original),
+            &original,
+            None,
+            &capability,
+        );
+        for fragments_changed in [false, true] {
+            let mut current = original.clone();
+            if fragments_changed {
+                current[0].content_hash = Fingerprint::of("changed");
+            }
+            for partition in 0..13 {
+                let mut builder = CacheIdentity::builder(
+                    if partition == 0 {
+                        "other"
+                    } else {
+                        "test-provider"
+                    },
+                    ModelId::new(if partition == 1 { "other" } else { "model" }),
+                    CacheEndpointIdentity::from_opaque(
+                        if partition == 2 {
+                            "other"
+                        } else {
+                            "legacy-endpoint"
+                        },
+                        RegistryRevision::new("legacy"),
+                    ),
+                    RegistryRevision::new(if partition == 3 { "other" } else { "legacy" }),
+                    Fingerprint::of(if partition == 4 { "other" } else { "profile" }),
+                )
+                .cache_control(PromptCacheControl::Explicit {
+                    max_breakpoints: u8::MAX,
+                })
+                .stable_prefix(current.iter().map(|s| {
+                    CacheIdentityFragment::new(s.fragment.as_str(), s.content_hash.clone())
+                }));
+                builder = match partition {
+                    5 => builder.tokenizer_revision(RegistryRevision::new("other")),
+                    6 => builder.request_adapter_revision(RegistryRevision::new("other")),
+                    7 => builder.provider_key(Fingerprint::of("other")),
+                    8 => builder.breakpoint_revision(RegistryRevision::new("other")),
+                    9 => builder.resource(CacheResourceIdentity::new(
+                        Fingerprint::of("other"),
+                        RegistryRevision::new("other"),
+                    )),
+                    10 => builder.registry_revisions(Some(Fingerprint::of("other")), None, None),
+                    11 => builder.registry_revisions(
+                        None,
+                        Some(Fingerprint::of("other")),
+                        Some(Fingerprint::of("other")),
+                    ),
+                    12 => builder.runtime_revisions(
+                        Some(Fingerprint::of("other")),
+                        Some(RegistryRevision::new("other")),
+                    ),
+                    _ => builder,
+                };
+                let plan = CachePlan::build_with_identity(
+                    identity.clone(),
+                    builder.build(),
+                    &current,
+                    Some(&prior),
+                    &capability,
+                );
+                assert!(
+                    plan.first_changed_fragment().is_none(),
+                    "partition {partition}, fragments changed {fragments_changed}"
+                );
+                assert_eq!(plan.preserved_prefix_len, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn first_changed_fragment_requires_a_supported_marked_predecessor() {
+        let original = diagnostic_segments();
+        let mut changed = original.clone();
+        changed[0].content_hash = Fingerprint::of("changed");
+        let identity = Fingerprint::of("profile");
+        let capability = full_capability();
+        let mut prior = CachePlan::build(identity.clone(), &original, None, &capability);
+        prior.suppress_provider_expectation();
+        let plan = CachePlan::build(identity.clone(), &changed, Some(&prior), &capability);
+        assert!(plan.first_changed_fragment().is_none());
+        let prior = CachePlan::build(identity.clone(), &original, None, &capability);
+        let unsupported =
+            ProviderCacheCapability::none(RegistryRevision::new("none"), "test-provider");
+        let plan = CachePlan::build(identity.clone(), &changed, Some(&prior), &unsupported);
+        assert!(plan.first_changed_fragment().is_none());
+        let mut plan = CachePlan::build(identity, &changed, Some(&prior), &capability);
+        assert!(plan.first_changed_fragment().is_some());
+        plan.suppress_provider_expectation();
+        assert!(plan.first_changed_fragment().is_none());
+    }
+
+    #[test]
+    fn first_changed_fragment_attributes_tool_projection_changes_to_segments() {
+        use agent_runtime_core::provider::CacheIdentityTool;
+        let mut original = diagnostic_segments();
+        original[1].kind = FragmentKind::ToolSchema;
+        let identity = Fingerprint::of("profile");
+        let cache_identity = |segments: &[PlanSegment], schema: &str| {
+            CacheIdentity::builder(
+                "test-provider",
+                ModelId::new("model"),
+                agent_runtime_core::provider::CacheEndpointIdentity::from_opaque(
+                    "endpoint",
+                    RegistryRevision::new("1"),
+                ),
+                RegistryRevision::new("1"),
+                identity.clone(),
+            )
+            .cache_control(PromptCacheControl::Explicit {
+                max_breakpoints: u8::MAX,
+            })
+            .stable_prefix(segments.iter().map(|s| {
+                agent_runtime_core::provider::CacheIdentityFragment::new(
+                    s.fragment.as_str(),
+                    s.content_hash.clone(),
+                )
+            }))
+            .tools([CacheIdentityTool::new("tool", "description", schema, 0)])
+            .build()
+        };
+        let capability = full_capability();
+        let prior = CachePlan::build_with_identity(
+            identity.clone(),
+            cache_identity(&original, "schema-old"),
+            &original,
+            None,
+            &capability,
+        );
+        let mut current = original.clone();
+        current[1].content_hash = Fingerprint::of("schema-new");
+        let plan = CachePlan::build_with_identity(
+            identity.clone(),
+            cache_identity(&current, "schema-new"),
+            &current,
+            Some(&prior),
+            &capability,
+        );
+        assert_eq!(
+            plan.first_changed_fragment().map(FragmentId::as_str),
+            Some("b")
+        );
+        assert_eq!(
+            plan.preserved_prefix_len, 0,
+            "existing cache identity comparability remains unchanged"
+        );
+    }
+
+    #[test]
+    fn first_changed_fragment_keeps_arbitrary_internal_fragment_ids() {
+        let mut original = diagnostic_segments();
+        original[0].fragment = FragmentId::new("private host text\nunsafe");
+        let capability = full_capability();
+        let identity = Fingerprint::of("profile");
+        let prior = CachePlan::build(identity.clone(), &original, None, &capability);
+        let mut current = original.clone();
+        current[0].content_hash = Fingerprint::of("changed");
+        let plan = CachePlan::build(identity, &current, Some(&prior), &capability);
+        assert_eq!(plan.first_changed_fragment(), Some(&original[0].fragment));
+        assert_eq!(plan.segments[0].fragment, original[0].fragment);
     }
 }

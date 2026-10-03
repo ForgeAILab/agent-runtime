@@ -295,7 +295,7 @@ impl ToolExecutor {
             .collect()
     }
 
-    /// Runs exactly one validate → prepare → authorize cycle.
+    /// Runs exactly one normalize → validate → prepare → authorize cycle.
     ///
     /// `AwaitingApproval` returns before consulting the approval host so the
     /// turn machine can durably checkpoint the exact preparation first.
@@ -329,20 +329,23 @@ impl ToolExecutor {
             ));
         };
 
-        if let Err(message) = self.ensure_active(cancel, deadline, "before tool preparation") {
-            return PreparedAuthorization::Rejected(error_block(
-                &authoritative_call,
-                message,
-                self.output_limit,
-            ));
-        }
-        if let Err(error) = self.registry.validate_arguments(&call.name, &arguments) {
-            return PreparedAuthorization::Rejected(error_block(
-                &authoritative_call,
-                error.message,
-                self.output_limit,
-            ));
-        }
+        let arguments = match self.normalize_and_validate(
+            tool.as_ref(),
+            &call.name,
+            arguments,
+            cancel,
+            deadline,
+        ) {
+            Ok(arguments) => arguments,
+            Err(message) => {
+                return PreparedAuthorization::Rejected(error_block(
+                    &authoritative_call,
+                    message,
+                    self.output_limit,
+                ));
+            }
+        };
+        authoritative_call.arguments = arguments.clone();
 
         let preparation_context = PreparationContext {
             session: session.clone(),
@@ -470,7 +473,7 @@ impl ToolExecutor {
     }
 
     /// Reauthorizes one exact checkpointed preparation without calling
-    /// `Tool::prepare` again.
+    /// `Tool::normalize_arguments` or `Tool::prepare` again.
     ///
     /// This is the recovery path for `AwaitingApproval`: policy/revocation is
     /// evaluated fresh, while canonical arguments/resource/effects remain the
@@ -687,10 +690,13 @@ impl ToolExecutor {
         let mut edit_count = 0usize;
 
         loop {
-            self.ensure_active(cancel, deadline, "before tool preparation")?;
-            self.registry
-                .validate_arguments(&call.name, &arguments)
-                .map_err(|error| error.message)?;
+            arguments = self.normalize_and_validate(
+                tool.as_ref(),
+                &call.name,
+                arguments,
+                cancel,
+                deadline,
+            )?;
 
             let preparation_context = PreparationContext {
                 session: session.clone(),
@@ -833,6 +839,25 @@ impl ToolExecutor {
                 }
             }
         }
+    }
+
+    fn normalize_and_validate(
+        &self,
+        tool: &dyn Tool,
+        name: &str,
+        arguments: Value,
+        cancel: &Cancellation,
+        deadline: Deadline,
+    ) -> Result<Value, String> {
+        self.ensure_active(cancel, deadline, "before tool normalization")?;
+        let normalized = tool.normalize_arguments(arguments);
+        // Even a failed synchronous hook must not mask a newly elapsed bound.
+        self.ensure_active(cancel, deadline, "after tool normalization")?;
+        let arguments = normalized.map_err(|error| error.message)?;
+        self.registry
+            .validate_arguments(name, &arguments)
+            .map_err(|error| error.message)?;
+        Ok(arguments)
     }
 
     fn ensure_active(

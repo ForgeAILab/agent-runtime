@@ -1246,6 +1246,22 @@ pub trait Tool: Send + Sync + fmt::Debug {
     /// The advertised specification.
     fn spec(&self) -> ToolSpec;
 
+    /// Normalizes a newly assembled call or approval edit before validation
+    /// against the frozen advertised input schema. Existing tools retain
+    /// identity behavior; wrapping/coercion rules belong to the host's tool,
+    /// never to provider adapters.
+    ///
+    /// Implementations must be pure, deterministic, side-effect-free, and
+    /// bounded: this synchronous hook receives no invocation authority or
+    /// context. The executor checks cancellation/deadlines before and after
+    /// it, with no fallback to raw arguments on error. Output and errors obey
+    /// the tool's existing redaction contract. Prepared checkpoint actions
+    /// resume exactly without calling this hook again; [`Tool::prepare`] may
+    /// still perform its existing deeper canonicalization.
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        Ok(arguments)
+    }
+
     /// Canonicalizes arguments and resolves concrete authority before any
     /// authorization, approval, scheduling, or side effect.
     ///

@@ -1050,6 +1050,13 @@ pub enum RuntimeEvent {
         /// implicitly or via explicit breakpoints). Individual unhonored
         /// cache classes are recorded in the plan manifest, not here.
         provider_cache_supported: bool,
+        /// First changed fragment in a comparable established prefix, using
+        /// the transparent fragment ID string. Hosts must keep sensitive
+        /// content out of IDs. Runtime projection accepts only non-empty
+        /// ASCII identifier characters (letters, digits, `_`, `-`, `.`, `:`)
+        /// within 256 UTF-8 bytes; unsafe IDs are omitted, never truncated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_changed_fragment: Option<String>,
     },
     /// A context or output budget could not be satisfied.
     BudgetFailure {

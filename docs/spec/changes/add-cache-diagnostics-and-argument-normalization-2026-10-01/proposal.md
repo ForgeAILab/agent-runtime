@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-01T00:00:00Z
-updated_at: 2026-10-01T00:00:00Z
+updated_at: 2026-10-03T05:00:57Z
 ---
 
 # Proposal: Add cache diagnostics and argument normalization (U2)
