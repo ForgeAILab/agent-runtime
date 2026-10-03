@@ -4,8 +4,8 @@
 //! is transport-agnostic: it depends only on this trait, not on any HTTP
 //! client. Production hosts supply a real transport (e.g. `reqwest`); tests and
 //! conformance fixtures supply a replay transport that emits recorded SSE bytes.
-//! Keeping the trait here means the production packages carry no networking
-//! dependency and every test runs fully offline.
+//! Default builds carry no networking dependency. Hosts may opt into the
+//! `reqwest-transport` feature for the shared policy-explicit implementation.
 
 use std::fmt;
 use std::pin::Pin;
@@ -34,7 +34,7 @@ impl fmt::Debug for HttpRequest {
             .map(|(name, _)| (name.as_str(), "[redacted]"))
             .collect();
         f.debug_struct("HttpRequest")
-            .field("url", &self.url)
+            .field("url", &"[redacted]")
             .field("headers", &headers)
             .field("body_len", &self.body.len())
             .finish()
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn request_debug_redacts_all_header_values_and_body() {
         let request = HttpRequest {
-            url: "https://example.test".into(),
+            url: "https://example.test/private?key=url-secret".into(),
             headers: vec![
                 ("authorization".into(), "Bearer very-secret".into()),
                 ("x-custom-credential".into(), "also-secret".into()),
@@ -130,6 +130,8 @@ mod tests {
         let rendered = format!("{request:?}");
         assert!(rendered.contains("authorization"));
         assert!(rendered.contains("x-custom-credential"));
+        assert!(!rendered.contains("url-secret"));
+        assert!(!rendered.contains("example.test"));
         assert!(!rendered.contains("very-secret"));
         assert!(!rendered.contains("also-secret"));
         assert!(!rendered.contains("private"));
