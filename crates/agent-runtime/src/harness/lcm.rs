@@ -55,6 +55,8 @@ use super::pipeline::{
     TurnCommitView,
 };
 
+mod accounting;
+
 /// Protected LCM state wire version.
 pub const LCM_STATE_SCHEMA_VERSION: u32 = 1;
 /// Stable runtime component identity and state namespace.
@@ -438,6 +440,7 @@ struct LcmState {
 /// implements both checkpointed turn commits and read-only history projection.
 #[derive(Clone)]
 pub struct LcmCoordinator {
+    accounting: accounting::Accounting,
     store: Arc<dyn LcmStore>,
     model: Arc<dyn LcmSummaryModel>,
     summarizer: LcmEscalatingSummarizer,
@@ -492,6 +495,7 @@ impl LcmCoordinator {
             .map_err(|_| RuntimeError::config("LCM summary escalation policy is invalid"))?;
         let classifier = Arc::new(DefaultLcmSourceClassifier::new(policy.source_sensitivity));
         Ok(Self {
+            accounting: Arc::default(),
             store,
             model: model.clone(),
             summarizer,
@@ -1032,7 +1036,7 @@ impl LcmCoordinator {
             ));
         }
         if let Some(previous) = previous {
-            let prefix_fingerprint = Self::history_fingerprint(&history[..start])?;
+            let prefix_fingerprint = self.canonical_fingerprint(binding, history, start)?;
             if prefix_fingerprint != previous.history_fingerprint {
                 return Err(RuntimeError::conflict(
                     "LCM checkpoint prefix no longer matches canonical history",
@@ -1076,11 +1080,20 @@ impl LcmCoordinator {
         let operation_id =
             LcmOperationId::new(format!("history:{}:{}", from, Fingerprint::of(encoded)));
         let request = LcmAppendRequest::new(operation_id, entries);
-        Ok(self
+        let view = binding.view();
+        self.store.authorize_view(&view).map_err(map_lcm_error)?;
+        let before = self
             .store
-            .append(&binding.view(), request)
+            .current_revision(&view)
             .await
-            .map(|_: AppendResult| ()))
+            .map_err(map_lcm_error)?;
+        let result = self.store.append(&view, request).await;
+        if let Ok(committed) = &result {
+            if !committed.already_committed {
+                self.accounting_commit(binding, before, committed.revision, None);
+            }
+        }
+        Ok(result.map(|_: AppendResult| ()))
     }
 
     /// Re-anchors a history append whose checkpointed frontier disagrees with
@@ -1395,7 +1408,7 @@ impl LcmCoordinator {
                 .len()
                 .checked_sub(1)
                 .map(|sequence| LcmSequence::new(sequence as u64)),
-            history_fingerprint: Self::history_fingerprint(history)?,
+            history_fingerprint: self.canonical_fingerprint(binding, history, history.len())?,
             dag_revision,
             active_nodes,
             policy_revision: self.policy.pressure.revision.clone(),
@@ -1436,60 +1449,6 @@ impl LcmCoordinator {
             previous.map_or(0, |state| state.hard_rounds),
         )
         .await
-    }
-
-    /// Estimates the provider-facing conversation footprint represented by
-    /// the current LCM view. Active summaries are charged at their persisted
-    /// token counts; only the raw suffix not covered by an active node is
-    /// charged as source entries. This keeps summary work out of the normal
-    /// provider usage ledger and uses the same versioned sizer that guards
-    /// strict source shrinkage.
-    async fn estimated_context_tokens(
-        &self,
-        binding: &LcmTimelineBinding,
-        history_len: usize,
-    ) -> Result<u64, RuntimeError> {
-        let view = binding.view();
-        let mut active_nodes = self
-            .store
-            .active_nodes(&view)
-            .await
-            .map_err(map_lcm_error)?;
-        active_nodes.sort_by_key(|node| (node.range.start, node.range.end, node.id.clone()));
-        let mut covered_end = 0_u64;
-        for node in &active_nodes {
-            if node.range.start.get() != covered_end {
-                return Err(RuntimeError::conflict(
-                    "LCM active nodes do not cover one canonical prefix",
-                ));
-            }
-            covered_end = node.range.end.get().checked_add(1).ok_or_else(|| {
-                RuntimeError::conflict("LCM active node range exceeds the sequence space")
-            })?;
-        }
-        let active_tokens = active_nodes
-            .iter()
-            .map(|node| node.token_count)
-            .try_fold(0_u64, u64::checked_add)
-            .ok_or_else(|| RuntimeError::conflict("LCM active token count overflowed"))?;
-        let raw_start = covered_end;
-        let entries = self.load_entries(&view, history_len).await?;
-        let history_len = u64::try_from(history_len)
-            .map_err(|_| RuntimeError::conflict("LCM history length exceeds sequence bounds"))?;
-        if raw_start > history_len {
-            return Err(RuntimeError::conflict(
-                "LCM active node frontier exceeds canonical history",
-            ));
-        }
-        let raw_tokens = entries
-            .iter()
-            .filter(|entry| entry.sequence.get() >= raw_start)
-            .map(|entry| self.policy.sizer.entry_tokens(entry))
-            .try_fold(0_u64, u64::checked_add)
-            .ok_or_else(|| RuntimeError::conflict("LCM raw suffix token count overflowed"))?;
-        active_tokens
-            .checked_add(raw_tokens)
-            .ok_or_else(|| RuntimeError::conflict("LCM context token count overflowed"))
     }
 
     fn cannot_fit_error(&self, required_tokens: u64, rounds: usize) -> RuntimeError {
@@ -2466,7 +2425,7 @@ impl LcmCoordinator {
         }
         if state.history_len > view.history.len()
             || state.history_fingerprint
-                != Self::history_fingerprint(&view.history[..state.history_len])?
+                != self.canonical_fingerprint(binding, &view.history, state.history_len)?
         {
             return Err(RuntimeError::conflict(
                 "LCM canonical history no longer matches its pending checkpoint",
@@ -2617,7 +2576,7 @@ impl LcmCoordinator {
         }
         if state.history_len >= view.history.len()
             || state.history_fingerprint
-                != Self::history_fingerprint(&view.history[..state.history_len])?
+                != self.canonical_fingerprint(binding, &view.history, state.history_len)?
         {
             return Err(RuntimeError::conflict(
                 "LCM append successor does not extend its protected history",
@@ -2768,6 +2727,12 @@ impl LcmCoordinator {
                         "LCM store returned a mismatched leaf for the pending operation",
                     ));
                 }
+                self.accounting_commit(
+                    binding,
+                    current_revision,
+                    committed.revision,
+                    Some(&committed.node),
+                );
                 Ok((committed.node, committed.revision))
             }
             LcmPendingSummary::Condensation { commit, .. } => {
@@ -2802,6 +2767,12 @@ impl LcmCoordinator {
                         "LCM store returned a mismatched condensation for the pending operation",
                     ));
                 }
+                self.accounting_commit(
+                    binding,
+                    current_revision,
+                    committed.revision,
+                    Some(&committed.node),
+                );
                 Ok((committed.node, committed.revision))
             }
         }
@@ -2901,7 +2872,7 @@ impl LcmCoordinator {
         }
 
         let required_tokens = self
-            .estimated_context_tokens(&binding, view.history.len())
+            .accounted_context_tokens(&binding, &view.history, &state)
             .await?;
         let decision = decide_pressure(
             required_tokens,
@@ -3071,7 +3042,7 @@ impl LcmCoordinator {
     ) -> Result<HistoryProjection, RuntimeError> {
         if state.history_len > view.history.len()
             || state.history_fingerprint
-                != Self::history_fingerprint(&view.history[..state.history_len])?
+                != self.canonical_fingerprint(binding, &view.history, state.history_len)?
         {
             return Err(RuntimeError::conflict(
                 "LCM canonical history no longer matches its protected checkpoint",
@@ -3494,7 +3465,7 @@ impl TurnCommitHook for LcmCoordinator {
             events: Vec::new(),
         };
         let required_tokens = self
-            .estimated_context_tokens(&binding, view.history.len())
+            .accounted_context_tokens(&binding, &view.history, &state)
             .await?;
         let decision = decide_pressure(
             required_tokens,
@@ -3573,7 +3544,7 @@ impl TurnCommitHook for LcmCoordinator {
         }
 
         let required_tokens = self
-            .estimated_context_tokens(&binding, view.history.len())
+            .accounted_context_tokens(&binding, &view.history, &state)
             .await?;
         let decision = decide_pressure(
             required_tokens,
@@ -4059,6 +4030,10 @@ fn lcm_pre_provider_error(mut error: RuntimeError) -> RuntimeError {
 }
 
 #[cfg(test)]
+#[path = "lcm/accounting_tests.rs"]
+mod accounting_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn malformed_checkpoint_failure_does_not_echo_protected_values() {
@@ -4214,26 +4189,30 @@ mod tests {
     };
 
     #[derive(Debug)]
-    struct TestStore {
+    pub(super) struct TestStore {
         timeline: LcmTimelineId,
         authority: LcmViewAuthority,
         entries: Mutex<Vec<LcmEntry>>,
         nodes: Mutex<Vec<agent_runtime_lcm::LcmNode>>,
-        revision: Mutex<LcmRevision>,
+        pub(super) revision: Mutex<LcmRevision>,
+        pub(super) store_revision_override: Mutex<Option<RegistryRevision>>,
         append_count: AtomicUsize,
         leaf_commit_count: AtomicUsize,
+        pub(super) read_ranges: Mutex<Vec<(u64, u64)>>,
     }
 
     impl TestStore {
-        fn new(timeline: LcmTimelineId) -> Self {
+        pub(super) fn new(timeline: LcmTimelineId) -> Self {
             Self {
                 timeline,
                 authority: LcmViewAuthority::new(),
                 entries: Mutex::new(Vec::new()),
                 nodes: Mutex::new(Vec::new()),
                 revision: Mutex::new(LcmRevision::INITIAL),
+                store_revision_override: Mutex::new(None),
                 append_count: AtomicUsize::new(0),
                 leaf_commit_count: AtomicUsize::new(0),
+                read_ranges: Mutex::new(Vec::new()),
             }
         }
 
@@ -4308,7 +4287,11 @@ mod tests {
     #[async_trait]
     impl agent_runtime_lcm::LcmReader for TestStore {
         fn store_revision(&self) -> RegistryRevision {
-            RegistryRevision::new("test-store-v1")
+            self.store_revision_override
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| RegistryRevision::new("test-store-v1"))
         }
 
         fn authorize_view(&self, view: &LcmView) -> Result<(), LcmError> {
@@ -4327,6 +4310,10 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<LcmEntry>, LcmError> {
             self.validate_view(view)?;
+            self.read_ranges
+                .lock()
+                .unwrap()
+                .push((range.start.get(), range.end.get()));
             let mut entries = self
                 .entries
                 .lock()
@@ -4519,7 +4506,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TestContentGuard {
+    pub(super) struct TestContentGuard {
         id: ContentGuardId,
         revision: ContentGuardRevision,
         calls: Arc<AtomicUsize>,
@@ -4528,7 +4515,7 @@ mod tests {
     }
 
     impl TestContentGuard {
-        fn clean(calls: Arc<AtomicUsize>) -> Self {
+        pub(super) fn clean(calls: Arc<AtomicUsize>) -> Self {
             Self {
                 id: ContentGuardId::new("lcm-test-guard"),
                 revision: ContentGuardRevision::new("lcm-guard-v1"),
@@ -4663,7 +4650,7 @@ mod tests {
         }
     }
 
-    fn test_coordinator(store: Arc<TestStore>) -> LcmCoordinator {
+    pub(super) fn test_coordinator(store: Arc<TestStore>) -> LcmCoordinator {
         let session = SessionId::new("lcm-session");
         let binding = LcmTimelineBinding::new(
             session,

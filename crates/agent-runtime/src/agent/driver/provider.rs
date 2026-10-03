@@ -377,7 +377,7 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_request(
         &self,
-        history: &[Message],
+        history: &Arc<[Message]>,
         emitter: &EventEmitter,
         turn: &Option<TurnId>,
         state: &Arc<Mutex<SessionState>>,
@@ -437,7 +437,7 @@ impl Driver {
             self.registry.schemas_with_interaction(interaction_ready)
         };
 
-        let history_view: Arc<[Message]> = Arc::from(history.to_vec().into_boxed_slice());
+        let history_view = history.clone();
         let mut history_offset = 0usize;
         let mut projected_active_start = active_history_start;
         let mut semantic_provenance = Vec::new();

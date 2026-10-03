@@ -155,6 +155,11 @@ async fn consumer_nyx_accepts_recent_manifest_diagnostics() {
 }
 
 #[tokio::test]
+async fn nyx_history_lcm_isolation_gate() {
+    agent_runtime_testkit::conformance::history::assert_storeless_held_history().await;
+}
+
+#[tokio::test]
 async fn nyx_legacy_identity_rejects_envelopes_with_seeded_subscription() {
     agent_runtime_testkit::conformance::normalization::assert_legacy_identity_with_seeded_history_and_subscription().await;
 }

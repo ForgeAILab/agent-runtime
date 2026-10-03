@@ -179,7 +179,11 @@ impl SessionHandle {
                 .map(|manifest| manifest.turn.clone())
                 .unwrap_or_else(|| TurnId::new("idle-compaction-boundary"));
             (
-                Arc::from(state.history.clone().into_boxed_slice()),
+                self.inner.execution.shared_history(
+                    &self.inner.id,
+                    &state.history,
+                    self.inner.shared.lcm.as_ref(),
+                ),
                 Arc::from(state.usage.records().to_vec().into_boxed_slice()),
                 boundary_turn,
             )

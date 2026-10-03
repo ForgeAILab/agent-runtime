@@ -514,13 +514,10 @@ impl<'a> TurnMachine<'a> {
             .as_ref()
             .map(|checkpoint| checkpoint.deadline)
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
-        let history: Arc<[Message]> = Arc::from(
-            self.state
-                .lock()
-                .expect("session state poisoned")
-                .history
-                .clone()
-                .into_boxed_slice(),
+        let history = self.execution.shared_history(
+            self.emitter.session(),
+            &self.state.lock().expect("session state poisoned").history,
+            self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
             self.state
@@ -685,13 +682,10 @@ impl<'a> TurnMachine<'a> {
             .as_ref()
             .map(|checkpoint| checkpoint.deadline)
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
-        let history: Arc<[Message]> = Arc::from(
-            self.state
-                .lock()
-                .expect("session state poisoned")
-                .history
-                .clone()
-                .into_boxed_slice(),
+        let history = self.execution.shared_history(
+            self.emitter.session(),
+            &self.state.lock().expect("session state poisoned").history,
+            self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
             self.state
@@ -1180,11 +1174,11 @@ impl<'a> TurnMachine<'a> {
                 return;
             }
 
-            let history = state
-                .lock()
-                .expect("session state poisoned")
-                .history
-                .clone();
+            let history = execution.shared_history(
+                emitter.session(),
+                &state.lock().expect("session state poisoned").history,
+                driver.history_lcm.as_ref(),
+            );
             let mut planned_request = match driver
                 .build_request(
                     &history,

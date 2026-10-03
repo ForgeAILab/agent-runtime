@@ -182,6 +182,11 @@ async fn consumer_smith_accepts_recent_manifest_diagnostics() {
 }
 
 #[tokio::test]
+async fn smith_history_lcm_isolation_gate() {
+    agent_runtime_testkit::conformance::history::assert_file_backed_held_views().await;
+}
+
+#[tokio::test]
 async fn smith_approval_edits_normalize_and_refresh_authority() {
     agent_runtime_testkit::conformance::normalization::assert_approval_edits_are_normalized_and_reauthorized().await;
 }

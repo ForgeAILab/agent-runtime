@@ -309,6 +309,8 @@ async fn signature_only_reasoning_survives_serialization_and_a_later_turn() {
 
     session.run(UserInput::text("first")).await.unwrap();
     let snapshot = session.snapshot();
+    let frozen = provider.requests()[0].clone();
+    let frozen_bytes = serde_json::to_vec(&frozen).unwrap();
     let encoded = serde_json::to_vec(&snapshot).expect("snapshot serializes");
     let restored: SessionSnapshot =
         serde_json::from_slice(&encoded).expect("snapshot remains backward-compatible");
@@ -326,6 +328,8 @@ async fn signature_only_reasoning_survives_serialization_and_a_later_turn() {
     }));
 
     session.run(UserInput::text("second")).await.unwrap();
+    assert_eq!(serde_json::to_vec(&snapshot).unwrap(), encoded);
+    assert_eq!(serde_json::to_vec(&frozen).unwrap(), frozen_bytes);
     let requests = provider.requests();
     assert!(requests[1].messages.iter().any(|message| {
         message.content.iter().any(|part| {

@@ -104,6 +104,16 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   migration adapter, but cannot claim invocation-specific authority.
 
 ### Changed
+
+- History and LCM accounting do less repeated work per provider call.
+  Private history captures share immutable generations instead of copying
+  every message (about 4x fewer message copies per call in the benchmark),
+  and LCM keeps authorized, revision-bound, process-local token totals so an
+  unchanged or appended history only accounts for the new entries. Public
+  owned history, request and checkpoint types, serde formats, persisted LCM
+  revisions and fingerprints are unchanged. A DAG revision change between
+  checkpoint and pressure accounting now fails the turn with the existing
+  revision-conflict error instead of accounting against the newer DAG.
 - `ProviderAttemptFinished` now carries optional zero-based attempt position,
   configured attempt total, and the effective delay before an actually
   admitted retry. Legacy journals deserialize the fields as absent, while

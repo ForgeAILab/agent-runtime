@@ -218,6 +218,11 @@ async fn open_forge_recovers_exact_boundaries_with_bounded_diagnostics() {
 }
 
 #[tokio::test]
+async fn open_forge_history_lcm_isolation_gate() {
+    agent_runtime_testkit::conformance::history::assert_authorized_accounting().await;
+}
+
+#[tokio::test]
 async fn forge_opt_in_normalization_keeps_canonical_schema_and_denial() {
     agent_runtime_testkit::conformance::normalization::assert_opt_in_normalization_preserves_denial_and_schema().await;
 }

@@ -10,6 +10,7 @@ pub mod command;
 pub mod emitter;
 pub mod engine;
 pub mod goal;
+pub(crate) mod history;
 pub mod inject;
 pub(crate) mod manifests;
 pub mod session;

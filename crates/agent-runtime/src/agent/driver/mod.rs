@@ -550,6 +550,7 @@ pub struct Driver {
     harness: Arc<HarnessPipeline>,
     live_abilities: Option<Arc<LiveAbilityRuntime>>,
     manifest_window: std::num::NonZeroUsize,
+    history_lcm: Option<Arc<crate::harness::LcmCoordinator>>,
     /// When present, every turn is executed by this backend instead of the
     /// provider/tool loop above. The two never interleave within one turn,
     /// which is what keeps canonical history single-owner.
@@ -561,6 +562,14 @@ pub struct Driver {
 }
 
 impl Driver {
+    pub(crate) fn with_history_lcm(
+        mut self,
+        lcm: Option<Arc<crate::harness::LcmCoordinator>>,
+    ) -> Self {
+        self.history_lcm = lcm;
+        self
+    }
+
     /// Routes every turn to an external agent backend instead of the
     /// provider/tool loop.
     ///
@@ -617,6 +626,7 @@ impl Driver {
             harness,
             live_abilities,
             manifest_window,
+            history_lcm: None,
             #[cfg(feature = "external-agent")]
             external: None,
             #[cfg(feature = "external-agent")]
