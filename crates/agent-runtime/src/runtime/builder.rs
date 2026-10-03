@@ -910,7 +910,8 @@ impl RuntimeBuilder {
             harness,
             live_abilities,
             self.manifest_window,
-        );
+        )
+        .with_history_lcm(self.lcm.clone());
         #[cfg(feature = "external-agent")]
         let driver = driver.with_external_agent(self.external_agent, self.external_capabilities);
 

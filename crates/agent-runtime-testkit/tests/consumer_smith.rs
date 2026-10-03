@@ -180,3 +180,8 @@ async fn smith_contributor_preserves_class_and_provider_evidence_with_legacy_pro
 async fn consumer_smith_accepts_recent_manifest_diagnostics() {
     agent_runtime_testkit::conformance::manifests::assert_file_store_manifest_migration().await;
 }
+
+#[tokio::test]
+async fn smith_history_lcm_isolation_gate() {
+    agent_runtime_testkit::conformance::history::assert_file_backed_held_views().await;
+}

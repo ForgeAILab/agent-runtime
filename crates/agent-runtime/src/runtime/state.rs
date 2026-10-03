@@ -62,6 +62,7 @@ pub struct ActiveTurn {
 /// Mutable execution metadata owned by exactly one session.
 #[derive(Debug)]
 pub struct SessionExecutionContext {
+    history_generations: Mutex<super::history::HistoryGenerations>,
     /// Cache-aware planner with session-local prior-plan state.
     pub(crate) planner: RunPlanner,
     /// Session-scoped registry view and activation history when live routing
@@ -104,6 +105,7 @@ impl SessionExecutionContext {
         let artifacts = restore_artifact_references(&extension_state, session)?;
         Ok(Self {
             planner,
+            history_generations: Mutex::new(super::history::HistoryGenerations::default()),
             abilities,
             extension_state: Mutex::new(extension_state),
             staged_extension_state: Mutex::new(BTreeMap::new()),
@@ -114,6 +116,24 @@ impl SessionExecutionContext {
             returned_interaction: Mutex::new(returned_interaction),
             artifacts: Mutex::new(artifacts),
         })
+    }
+
+    pub(crate) fn shared_history(
+        &self,
+        session: &SessionId,
+        history: &[Message],
+        lcm: Option<&Arc<crate::harness::LcmCoordinator>>,
+    ) -> Arc<[Message]> {
+        let mut generations = self
+            .history_generations
+            .lock()
+            .expect("history generations poisoned");
+        let generation = generations.capture(history);
+        if let Some(lcm) = lcm {
+            lcm.register_history(session, &generation);
+            generations.register_cleanup(session, lcm);
+        }
+        generation.history.clone()
     }
 
     pub(crate) fn persist_gate(&self) -> Arc<AsyncMutex<()>> {

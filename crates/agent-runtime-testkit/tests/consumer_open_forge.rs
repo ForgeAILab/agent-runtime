@@ -216,3 +216,8 @@ async fn open_forge_authorized_conflict_and_revoked_view_retain_classes_without_
 async fn open_forge_recovers_exact_boundaries_with_bounded_diagnostics() {
     agent_runtime_testkit::conformance::manifests::assert_protected_manifest_recovery().await;
 }
+
+#[tokio::test]
+async fn open_forge_history_lcm_isolation_gate() {
+    agent_runtime_testkit::conformance::history::assert_authorized_accounting().await;
+}

@@ -153,3 +153,8 @@ async fn nyx_input_budget_failure_keeps_known_counts_and_no_provider_attempt() {
 async fn consumer_nyx_accepts_recent_manifest_diagnostics() {
     agent_runtime_testkit::conformance::manifests::assert_storeless_recent_window().await;
 }
+
+#[tokio::test]
+async fn nyx_history_lcm_isolation_gate() {
+    agent_runtime_testkit::conformance::history::assert_storeless_held_history().await;
+}
