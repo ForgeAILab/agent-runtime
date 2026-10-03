@@ -70,7 +70,7 @@ changes are included.
   292,976 bytes; already materialized generation 0 copies/allocations/bytes.
   This isolates private captures, not full turn cost, peak/live memory, provider
   planning or checkpoint copies. The small counting-allocator harness and gate
-  logs live under `/Volumes/Data/tmp/rt`; no link-speed claim is made.
+  logs were kept outside the repository; no link-speed claim is made.
 
 Task 4.3's measurement/report portion is recorded above; its compatible-release
 publication/pin requirement and 4.2's actual external-consumer release gates
