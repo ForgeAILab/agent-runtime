@@ -346,7 +346,9 @@ pub enum TurnState {
     LocalActionExecuting {
         /// Stable local request identity.
         request_id: RequestId,
-        /// Exact host-supplied call.
+        /// Execution-facing call, carrying normalized arguments for tools
+        /// opting into normalization. Raw model calls remain in canonical
+        /// history; this local checkpoint records the call being executed.
         call: ToolCall,
         /// Exact prepared action that may have executed.
         prepared: PreparedToolCall,

@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-01T00:00:00Z
-updated_at: 2026-10-01T00:00:00Z
+updated_at: 2026-10-03T05:26:44Z
 ---
 
 # Design: Explain prefix changes and normalize before validation
@@ -40,9 +40,14 @@ transparent FragmentId wire representation, not a new ID namespace.
 
 Use the same committed predecessor and provider representability gates as
 cache expectations. Within the predecessor's declared stable prefix, compare
-ordered ID, content hash, and cache class. Report the current ID at the earliest
-differing position; for deletion with no current item, report the removed
-predecessor ID. A Stable-to-Ephemeral/NoCache change at an existing prefix
+ordered ID, content hash, and cache class. "First" means plan-segment order
+(Instructions before Capabilities), not provider wire byte order. At the
+earliest differing position, if the IDs differ and the predecessor ID is
+absent from the current plan's leading Stable segments, report that removed
+predecessor ID, even when an unchanged neighbour or Ephemeral tail occupies
+its old position. If no current item exists, also report the predecessor ID.
+Otherwise report the current ID, preserving insertion and reorder attribution.
+A Stable-to-Ephemeral/NoCache change at an existing prefix
 position is a change even if bytes are equal. A pure appended/promoted tail
 outside the predecessor's stable prefix is not an invalidation.
 
@@ -85,11 +90,21 @@ deadline/cancellation after the synchronous hook; hosts must keep it bounded.
 There is no retry with raw arguments when normalization fails. Unknown tools
 retain their canonical error-result behavior.
 
+The pre-hook bounds checks change tool-result wording from
+`cancelled before tool preparation` / `deadline elapsed before tool preparation`
+to `cancelled before tool normalization` / `deadline elapsed before tool normalization`.
+This text change also applies to tools using the default identity hook.
+
 Checkpoint the exact prepared normalized arguments and fingerprint. Resume a
 prepared action without re-normalizing it. Approval edits create a new
 normalization/validation/preparation cycle and invalidate old grants. Both
 executor paths share this order; raw model arguments remain in canonical
 model history for replay, while the prepared action is the execution authority.
+In turn-machine preparation, opt-in tools' `ReadyToolCall.call` carries the
+normalized arguments; these feed `ToolOutputView.call` and the
+`LocalActionExecuting` checkpoint's `call`. Those execution-facing values are
+distinct from the raw model arguments retained in canonical history. On
+recovery they carry the exact checkpointed prepared arguments instead.
 Normalization output/errors obey the existing tool redaction contract and do
 not enter cache telemetry. The hook does not promise that Tool::prepare cannot
 perform its existing deeper canonicalization.

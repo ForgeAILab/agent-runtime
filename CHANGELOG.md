@@ -18,6 +18,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   `FailureStage` and `FailureComponent` are non-exhaustive, and
   `FailureComponent` adds `Unknown`, so enum matches need a wildcard arm.
   Actual consumer builds remain a release gate.
+- `CachePlan` and `RuntimeEvent::CachePlanChanged` add an optional
+  `first_changed_fragment`. Rust struct literals must supply it (`None` is
+  fine) and field-exact patterns must bind it or use `..`. JSON without the
+  field stays readable, and it is omitted when unknown. The pre-hook tool
+  error text now says "before tool normalization" instead of "before tool
+  preparation".
 - Session manifest retention is now a finite recent window (default 32
   planned steps). `snapshot.manifests` remains an ordered `Vec<TurnManifest>`;
   `RuntimeBuilder::manifest_window(NonZeroUsize)` and
@@ -161,6 +167,20 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
+
+- Cache diagnostics: `first_changed_fragment` names the first plan segment
+  (in plan-segment order) that differs from the committed predecessor,
+  including a removed segment, without changing fingerprints, cache
+  identities or provider requests.
+- `Tool::normalize_arguments`: an identity-default hook that runs before full
+  schema validation in both executor paths and on approval edits, so a host
+  can accept a model's wrapped arguments while advertising the canonical
+  schema. Edited arguments are re-normalized and re-authorized; checkpointed
+  prepared actions resume without normalization. For opt-in tools the
+  execution-facing call carries the normalized arguments; history keeps the
+  raw ones.
+- The sealed tool registry reuses each tool's compiled validator instead of
+  recompiling it on every call.
 
 - Neutral `FailureClass`, `FailureStage`, and fixed `FailureComponent`
   evidence on runtime errors. Legacy, future, and malformed classification

@@ -727,6 +727,45 @@ When constructing `FailureClass::ContextOverflow`, pass counts directly (for
 example, `required_tokens: Some(1024)`) rather than boxing `u64` values. Match
 `FailureClass`, `FailureStage`, and `FailureComponent` with a wildcard arm.
 
+## 19. Cache diagnostics and tool argument normalization
+
+Two optional diagnostic fields are additive in JSON but require updates to
+field-exact Rust constructors and patterns:
+
+- `CachePlan.first_changed_fragment: Option<FragmentId>`: add
+  `first_changed_fragment: None` to direct `CachePlan { ... }` literals that
+  lack predecessor evidence, or use the existing `build`/`build_with_identity`
+  constructors. Bind/ignore the field or add `..` in field-exact patterns.
+- `RuntimeEvent::CachePlanChanged.first_changed_fragment: Option<String>`:
+  constructors previously listing only `cache_plan`, `preserved_prefix_tokens`,
+  `invalidated_prefix_tokens`, and `provider_cache_supported` must add
+  `first_changed_fragment: None` or safe runtime-projected evidence. Bind/ignore
+  the field or add `..` in exact variant patterns. The event variant set and
+  schema versions do not change.
+
+Legacy plan/event JSON without these fields reads them as absent, and absent
+diagnostics are omitted on serialization. "First" means plan-segment order
+(Instructions before Capabilities), not provider wire byte order. A removed
+prefix ID is reported even when a neighbour or Ephemeral tail now occupies its
+old position. Unsafe or unbounded IDs are omitted from event projection;
+hosts must keep sensitive content out of fragment IDs.
+
+`Tool::normalize_arguments` defaults to identity, so existing Tool/LegacyTool
+implementations need no new method. Hosts may opt individual tools into a pure,
+bounded transformation before validation against the frozen advertised schema.
+For opt-in tools, the turn machine's `ReadyToolCall.call`,
+`ToolOutputView.call`, and `LocalActionExecuting` checkpoint `call` carry the
+normalized arguments, while canonical model history retains raw model
+arguments. Exact prepared-action recovery uses checkpointed prepared arguments
+without normalization; `Tool::prepare` may still canonicalize more deeply.
+
+Pre-hook cancellation/deadline tool-result strings now read
+`cancelled before tool normalization` and
+`deadline elapsed before tool normalization`, replacing
+`cancelled before tool preparation` and
+`deadline elapsed before tool preparation`. This affects identity-default tools
+too; update any exact string assertions or projections.
+
 ## Checklist
 
 - [ ] Declare a `model_profile` or `model_catalog` on every `RuntimeBuilder`.
@@ -734,6 +773,10 @@ example, `required_tokens: Some(1024)`) rather than boxing `u64` values. Match
       add `..` to field-exhaustive destructuring and compile all three consumers.
 - [ ] Replace boxed context-overflow counts with direct `u32` values and add
       wildcard arms to failure-class/stage/component matches.
+- [ ] Add `first_changed_fragment` to CachePlan and CachePlanChanged struct/variant
+      literals, or use existing constructors; add `..` to exact patterns.
+- [ ] Update pre-hook tool-result string assertions and opt-in tool-output
+      processors to use the documented normalized execution-facing arguments.
 - [ ] Replace `agent_runtime_prompt` imports with `agent_runtime::context`.
 - [ ] Replace `TokenEstimator`/`CharBasedEstimator` with a `RequestSizer`.
 - [ ] Replace the removed rolling summary path with an authorized LCM timeline,

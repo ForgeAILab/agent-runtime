@@ -1,6 +1,17 @@
 use super::turn::await_harness_phase;
 use super::*;
 
+fn cache_fragment_diagnostic(id: Option<&str>) -> Option<String> {
+    id.filter(|id| {
+        !id.is_empty()
+            && id.len() <= 256
+            && id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+    })
+    .map(str::to_owned)
+}
+
 /// A pending coalesced `TextDelta` buffer, anchored to the clock instant its
 /// first byte since the last flush arrived (used to test the coalescing
 /// window).
@@ -644,6 +655,9 @@ impl Driver {
                     // was doing. Unhonored classes remain observable through
                     // the plan manifest.
                     provider_cache_supported: cache_plan.provider_cache.capability.supports_stable,
+                    first_changed_fragment: cache_fragment_diagnostic(
+                        cache_plan.first_changed_fragment().map(|id| id.as_str()),
+                    ),
                 },
             );
         }
@@ -1477,6 +1491,37 @@ impl Driver {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_fragment_diagnostic_omits_unsafe_ids_without_truncation() {
+        for id in [
+            "",
+            "host secret text",
+            "id\nsecret",
+            "id\0secret",
+            "id/secret",
+            "é",
+            &"x".repeat(257),
+        ] {
+            let event = RuntimeEvent::CachePlanChanged {
+                cache_plan: Fingerprint::of("plan"),
+                preserved_prefix_tokens: 0,
+                invalidated_prefix_tokens: 1,
+                provider_cache_supported: true,
+                first_changed_fragment: cache_fragment_diagnostic(Some(id)),
+            };
+            let encoded = serde_json::to_value(event).unwrap();
+            assert!(encoded.get("first_changed_fragment").is_none());
+        }
+        assert_eq!(cache_fragment_diagnostic(None), None);
+        assert_eq!(
+            cache_fragment_diagnostic(Some(&"x".repeat(256))),
+            Some("x".repeat(256))
+        );
+        assert_eq!(
+            cache_fragment_diagnostic(Some("instruction:host._-123")),
+            Some("instruction:host._-123".into())
+        );
+    }
     use super::*;
 
     fn projection(expected_read_tokens: Option<u64>) -> ProviderCacheProjection {

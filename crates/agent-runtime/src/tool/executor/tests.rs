@@ -1610,3 +1610,5 @@ async fn an_out_of_workspace_resource_runs_only_through_approval() {
         "approval-routed authorization must have seen the escaped resource"
     );
 }
+
+mod normalization;

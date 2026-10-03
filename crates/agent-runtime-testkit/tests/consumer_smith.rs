@@ -185,3 +185,149 @@ async fn consumer_smith_accepts_recent_manifest_diagnostics() {
 async fn smith_history_lcm_isolation_gate() {
     agent_runtime_testkit::conformance::history::assert_file_backed_held_views().await;
 }
+
+#[tokio::test]
+async fn smith_approval_edits_normalize_and_refresh_authority() {
+    agent_runtime_testkit::conformance::normalization::assert_approval_edits_are_normalized_and_reauthorized().await;
+}
+
+#[derive(Debug)]
+struct InstructionContributor {
+    id: &'static str,
+    sequence: u64,
+    text: std::sync::Mutex<String>,
+}
+
+#[async_trait::async_trait]
+impl agent_runtime::harness::ContextContributor for InstructionContributor {
+    fn descriptor(&self) -> agent_runtime::harness::ComponentDescriptor {
+        agent_runtime::harness::ComponentDescriptor::new(self.id, RegistryRevision::new("1"))
+    }
+    async fn contribute(
+        &self,
+        _view: &agent_runtime::harness::ContextView,
+    ) -> Result<agent_runtime::harness::ContextPatch, RuntimeError> {
+        use agent_runtime::context::{
+            CacheClass, ContextLane, ContextPosition, FragmentContent, FragmentSource, Sensitivity,
+        };
+        let text = self.text.lock().unwrap().clone();
+        Ok(agent_runtime::harness::ContextPatch::new(vec![
+            ContextFragment::new(
+                self.id,
+                FragmentKind::SystemInstruction,
+                FragmentSource::Host,
+                RegistryRevision::from_content(&text),
+                FragmentContent::Text(text),
+            )
+            .with_position(ContextPosition::new(
+                ContextLane::Instructions,
+                self.sequence,
+            ))
+            .with_cache_class(CacheClass::Stable)
+            .with_sensitivity(Sensitivity::Internal),
+        ]))
+    }
+}
+
+#[tokio::test]
+async fn smith_instruction_contributors_report_the_first_changed_prefix_id() {
+    use agent_runtime::provider::fake::ScriptedStream;
+    use agent_runtime_core::provider::{CacheEndpointIdentity, PromptCacheControl};
+    let first = Arc::new(InstructionContributor {
+        id: "instruction.first",
+        sequence: 10,
+        text: std::sync::Mutex::new("first private instructions".into()),
+    });
+    let second = Arc::new(InstructionContributor {
+        id: "instruction.second",
+        sequence: 20,
+        text: std::sync::Mutex::new("second private instructions".into()),
+    });
+    let capabilities = Capabilities {
+        cache: true,
+        prompt_cache: PromptCacheControl::Implicit,
+        ..Capabilities::basic_streaming()
+    };
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        capabilities.clone(),
+        vec![
+            ScriptedStream::new(scenarios::stop_events("one")),
+            ScriptedStream::new(scenarios::stop_events("two")),
+            ScriptedStream::new(scenarios::stop_events("three")),
+        ],
+    ));
+    let mut profile = scenarios::fake_model_profile();
+    profile.capabilities = capabilities;
+    let observer = RecordingObserver::shared();
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(profile)
+        .provider(provider.clone())
+        .cache_capability(
+            agent_runtime::context::ProviderCacheCapability::from_control(
+                RegistryRevision::new("cache-1"),
+                "fake",
+                PromptCacheControl::Implicit,
+            ),
+        )
+        .cache_endpoint_identity(CacheEndpointIdentity::from_opaque(
+            "fixture.endpoint",
+            RegistryRevision::new("1"),
+        ))
+        .context_contributor(first.clone())
+        .context_contributor(second.clone())
+        .observer(observer.clone())
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("one")).await.unwrap();
+    *second.text.lock().unwrap() = "changed second private instructions".into();
+    session.run(UserInput::text("two")).await.unwrap();
+    *first.text.lock().unwrap() = "changed first private instructions".into();
+    *second.text.lock().unwrap() = "changed again second private instructions".into();
+    session.run(UserInput::text("three")).await.unwrap();
+    let diagnostics = observer
+        .payloads()
+        .into_iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::CachePlanChanged {
+                first_changed_fragment,
+                ..
+            } => Some(first_changed_fragment),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diagnostics,
+        [
+            None,
+            Some("instruction.second".into()),
+            Some("instruction.first".into())
+        ]
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_ne!(
+        requests[0].cache_identity.as_ref().unwrap().digest(),
+        requests[1].cache_identity.as_ref().unwrap().digest()
+    );
+    let wire = serde_json::to_string(&requests[1]).unwrap();
+    assert!(!wire.contains("first_changed_fragment"));
+    let instruction_text = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(Message::joined_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        instruction_text.find("first private").unwrap()
+            < instruction_text.find("changed second private").unwrap()
+    );
+    assert!(
+        !serde_json::to_string(&observer.events())
+            .unwrap()
+            .contains("private instructions")
+    );
+    event_schema::assert_versioned_and_roundtrips(&observer.events());
+}

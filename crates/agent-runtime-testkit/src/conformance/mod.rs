@@ -16,6 +16,7 @@ pub mod event_schema;
 pub mod history;
 pub mod lcm;
 pub mod manifests;
+pub mod normalization;
 pub mod provider;
 pub mod registry;
 pub mod replay;

@@ -11,6 +11,7 @@
 //! the registry kernel's `Named` can't be implemented directly for the
 //! foreign `Arc<dyn Tool>`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agent_runtime_ability::{Registry, Sealed, ToolEntry};
@@ -23,6 +24,9 @@ use agent_runtime_core::tool::{Tool, ToolSpec};
 #[derive(Debug, Default)]
 pub struct ToolRegistry {
     inner: Registry<ToolEntry>,
+    // A name uniquely identifies the exact ToolEntry spec frozen at
+    // registration. Never reread Tool::spec or compile at invocation time.
+    validators: BTreeMap<String, Arc<jsonschema::Validator>>,
 }
 
 impl ToolRegistry {
@@ -39,14 +43,16 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), RuntimeError> {
         let entry = ToolEntry::new(tool);
         let name = entry.spec().name.clone();
-        jsonschema::validator_for(&entry.spec().input_schema).map_err(|error| {
+        let validator = jsonschema::validator_for(&entry.spec().input_schema).map_err(|error| {
             RuntimeError::config(format!(
                 "tool `{name}` has an invalid input schema: {error}"
             ))
         })?;
         self.inner
             .register(entry)
-            .map_err(|error| RuntimeError::conflict(error.to_string()))
+            .map_err(|error| RuntimeError::conflict(error.to_string()))?;
+        self.validators.insert(name, Arc::new(validator));
+        Ok(())
     }
 
     /// Registers many tools, failing on the first conflict.
@@ -64,6 +70,7 @@ impl ToolRegistry {
     pub fn seal(self) -> SealedToolRegistry {
         SealedToolRegistry {
             inner: self.inner.seal(),
+            validators: Arc::new(self.validators),
         }
     }
 }
@@ -72,14 +79,13 @@ impl ToolRegistry {
 #[derive(Debug, Clone)]
 pub struct SealedToolRegistry {
     inner: Sealed<ToolEntry>,
+    validators: Arc<BTreeMap<String, Arc<jsonschema::Validator>>>,
 }
 
 impl SealedToolRegistry {
     /// An empty sealed registry.
     pub fn empty() -> Self {
-        Self {
-            inner: Sealed::empty(),
-        }
+        ToolRegistry::new().seal()
     }
 
     /// The number of tools.
@@ -140,23 +146,19 @@ impl SealedToolRegistry {
             .collect()
     }
 
-    /// Validates arguments for one registered tool. Exact approval edits pass
-    /// through this same validator before they can be prepared again.
+    /// Validates already-canonical arguments against the exact frozen schema.
+    /// Does not normalize; executor-owned normalization of new calls and
+    /// approval edits precedes this validation-only boundary.
     pub fn validate_arguments(
         &self,
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<(), RuntimeError> {
-        let Some(entry) = self.inner.get(name) else {
+        let Some(validator) = self.validators.get(name) else {
             return Err(RuntimeError::tool(format!(
                 "tool `{name}` is not available"
             )));
         };
-        let validator = jsonschema::validator_for(&entry.spec().input_schema).map_err(|error| {
-            RuntimeError::config(format!(
-                "registered tool `{name}` has an invalid input schema: {error}"
-            ))
-        })?;
         validator.validate(arguments).map_err(|error| {
             RuntimeError::tool(format!(
                 "tool call `{name}` arguments do not match its input schema: {error}"
@@ -325,5 +327,93 @@ mod tests {
             "the model is told exactly what to fix: {}",
             rejected.message
         );
+    }
+
+    #[derive(Debug)]
+    struct SchemaTool {
+        schema: std::sync::Mutex<Value>,
+    }
+
+    #[async_trait]
+    impl Tool for SchemaTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(
+                "frozen",
+                "schema fixture",
+                self.schema.lock().unwrap().clone(),
+                ToolEffects::new(vec![]),
+            )
+        }
+        async fn invoke(
+            &self,
+            prepared: agent_runtime_core::tool::PreparedToolCall,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::json(prepared.into_arguments()))
+        }
+    }
+
+    #[test]
+    fn cached_validator_tracks_frozen_schema_and_is_shared_by_clones() {
+        let schema = json!({"type":"object", "properties":{"path":{"type":"string"}}, "required":["path"], "additionalProperties":false});
+        let tool = Arc::new(SchemaTool {
+            schema: std::sync::Mutex::new(schema.clone()),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(tool.clone()).unwrap();
+        *tool.schema.lock().unwrap() = json!({"type":"object"});
+        // A conflicting registration must not replace the frozen validator.
+        assert_eq!(
+            registry.register(tool.clone()).unwrap_err().kind,
+            ErrorKind::Conflict
+        );
+        let sealed = registry.seal();
+        let cloned = sealed.clone();
+        assert!(Arc::ptr_eq(&sealed.validators, &cloned.validators));
+        assert!(Arc::ptr_eq(
+            &sealed.validators["frozen"],
+            &cloned.validators["frozen"]
+        ));
+        for registry in [&sealed, &cloned] {
+            assert_eq!(registry.schemas()[0].input_schema, schema);
+            assert!(
+                registry
+                    .validate_arguments("frozen", &json!({"path":"a"}))
+                    .is_ok()
+            );
+            assert!(registry.validate_arguments("frozen", &json!({})).is_err());
+            assert!(
+                registry
+                    .validate_arguments("frozen", &json!({"parameters":{"path":"a"}}))
+                    .is_err()
+            );
+        }
+        // A replacement registry compiles its new exact spec independently.
+        let mut replacement = ToolRegistry::new();
+        replacement.register(tool).unwrap();
+        assert!(
+            replacement
+                .seal()
+                .validate_arguments("frozen", &json!({}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn invalid_schema_registration_does_not_reserve_a_name_or_validator() {
+        let tool = Arc::new(SchemaTool {
+            schema: std::sync::Mutex::new(json!({"type":"invalid"})),
+        });
+        let mut registry = ToolRegistry::new();
+        assert_eq!(
+            registry.register(tool.clone()).unwrap_err().kind,
+            ErrorKind::Config
+        );
+        assert!(registry.validators.is_empty());
+        *tool.schema.lock().unwrap() = json!({"type":"object"});
+        registry.register(tool).unwrap();
+        let sealed = registry.seal();
+        assert_eq!(sealed.len(), 1);
+        assert!(sealed.validate_arguments("frozen", &json!({})).is_ok());
     }
 }
