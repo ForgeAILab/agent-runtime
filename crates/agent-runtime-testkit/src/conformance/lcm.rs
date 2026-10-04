@@ -1432,8 +1432,35 @@ pub async fn assert_planning_pressure_and_classification_conformance() {
         }
     ));
     assert_eq!(soft, decide_pressure(80, 100, 50_000, &policy));
+    // The default policy derives its bound with the one shared formula:
+    // overage 15 above the soft threshold at 1,536 reclaimed per leaf round
+    // (2,048 x 0.75) is one round, plus two of slack.
+    let defaults = agent_runtime_lcm::LcmEscalationPolicy::default();
+    let derived = agent_runtime_lcm::derive_hard_rounds(
+        95,
+        100,
+        policy.soft_threshold_percent,
+        agent_runtime_lcm::expected_leaf_reclaim_tokens(
+            policy.leaf_target_tokens,
+            defaults.summary_max_ratio,
+            defaults.min_reclaim_ratio,
+        ),
+    );
+    assert_eq!(derived, 3);
     assert!(
-        matches!(decide_pressure(95, 100, 0, &policy), LcmPressureDecision::Hard { pressure_percent: 95, max_rounds, .. } if max_rounds == policy.max_rounds)
+        matches!(decide_pressure(95, 100, 0, &policy), LcmPressureDecision::Hard { pressure_percent: 95, max_rounds, .. } if max_rounds == derived)
+    );
+    let explicit = LcmPressurePolicy {
+        max_rounds: 5,
+        ..policy.clone()
+    };
+    assert!(matches!(
+        decide_pressure(95, 100, 0, &explicit),
+        LcmPressureDecision::Hard { max_rounds: 5, .. }
+    ));
+    assert_eq!(
+        agent_runtime_lcm::derive_hard_rounds(u64::MAX, 100, 80, 1),
+        agent_runtime_lcm::MAX_DERIVED_HARD_ROUNDS
     );
     assert_eq!(
         decide_pressure(0, 0, 0, &policy),
@@ -1503,7 +1530,8 @@ pub async fn assert_summarization_conformance() {
     let first_stage = LcmEscalatingSummarizer::with_policy(
         first_stage_model.clone(),
         LcmEscalationPolicy {
-            target_tokens: 64,
+            leaf_source_target_tokens: 256,
+            summary_max_ratio: 0.08,
             deterministic_token_cap: 16,
             ..LcmEscalationPolicy::default()
         },
@@ -1539,7 +1567,8 @@ pub async fn assert_summarization_conformance() {
     let escalating = LcmEscalatingSummarizer::with_policy(
         escalating_model.clone(),
         LcmEscalationPolicy {
-            target_tokens: 64,
+            leaf_source_target_tokens: 256,
+            summary_max_ratio: 0.08,
             deterministic_token_cap: 16,
             ..LcmEscalationPolicy::default()
         },

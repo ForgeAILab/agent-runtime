@@ -348,13 +348,24 @@ impl LcmSummaryError {
 }
 
 /// Escalation configuration; prompts remain host-owned.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LcmEscalationPolicy {
     /// Policy revision.
     pub policy_revision: RegistryRevision,
-    /// First-stage target.
-    pub target_tokens: u64,
-    /// Deterministic fallback cap.
+    /// Desired source span for leaf selection, separate from output size.
+    pub leaf_source_target_tokens: u64,
+    /// Maximum measured summary/source ratio for model output (default 0.25).
+    /// The deterministic fallback is not ratio-capped; it only has to fit
+    /// `deterministic_token_cap` and strictly shrink its source.
+    pub summary_max_ratio: f64,
+    /// Minimum reclaimed source fraction for model output (default 0.5);
+    /// weaker summaries escalate. It caps output at `1 - min_reclaim_ratio`
+    /// of the source, so it binds only when `summary_max_ratio` is above
+    /// that. At the defaults the 0.25 ratio is stricter and this guard has no
+    /// effect; it exists for hosts that raise `summary_max_ratio`.
+    pub min_reclaim_ratio: f64,
+    /// Deterministic fallback cap. The fallback target is
+    /// `min(deterministic_token_cap, source_tokens - 1)`.
     pub deterministic_token_cap: u64,
     /// Deterministic algorithm revision.
     pub algorithm_revision: RegistryRevision,
@@ -363,10 +374,14 @@ pub struct LcmEscalationPolicy {
 impl Default for LcmEscalationPolicy {
     fn default() -> Self {
         Self {
-            policy_revision: RegistryRevision::from_content("lcm-summary-policy-1"),
-            target_tokens: 512,
+            policy_revision: RegistryRevision::from_content("lcm-summary-policy-2"),
+            leaf_source_target_tokens: 2_048,
+            summary_max_ratio: 0.25,
+            min_reclaim_ratio: 0.5,
             deterministic_token_cap: 512,
-            algorithm_revision: RegistryRevision::from_content("lcm-deterministic-head-tail-1"),
+            algorithm_revision: RegistryRevision::from_content(
+                "lcm-deterministic-head-tail-tools-2",
+            ),
         }
     }
 }
@@ -376,7 +391,13 @@ impl LcmEscalationPolicy {
     pub fn validate(&self) -> Result<(), LcmSummaryError> {
         if !valid_revision(&self.policy_revision)
             || !valid_revision(&self.algorithm_revision)
-            || self.target_tokens == 0
+            || self.leaf_source_target_tokens == 0
+            || !self.summary_max_ratio.is_finite()
+            || !(0.0..1.0).contains(&self.summary_max_ratio)
+            || self.summary_max_ratio == 0.0
+            || !self.min_reclaim_ratio.is_finite()
+            || !(0.0..1.0).contains(&self.min_reclaim_ratio)
+            || self.min_reclaim_ratio == 0.0
             || self.deterministic_token_cap == 0
         {
             return Err(LcmSummaryError::InvalidConfiguration {
@@ -384,6 +405,16 @@ impl LcmEscalationPolicy {
             });
         }
         Ok(())
+    }
+
+    /// Tokens one leaf round of this policy is expected to reclaim; the
+    /// input to [`crate::derive_hard_rounds`].
+    pub fn expected_reclaim_tokens(&self) -> u64 {
+        crate::expected_leaf_reclaim_tokens(
+            self.leaf_source_target_tokens,
+            self.summary_max_ratio,
+            self.min_reclaim_ratio,
+        )
     }
 }
 
@@ -584,6 +615,52 @@ impl LcmEscalatingSummarizer {
         .await
     }
 
+    /// Whether the level-3 deterministic fallback strictly shrinks `entries`.
+    /// When it does, summarizing them always succeeds whatever the model
+    /// returns. When it does not (a source smaller than the fallback's own
+    /// framing), no summary is guaranteed, so a planner should widen the
+    /// source instead of selecting it alone.
+    pub fn can_always_summarize(&self, entries: &[LcmEntry], sizer: &dyn LcmSizer) -> bool {
+        let Some(source_tokens) = entries
+            .iter()
+            .map(|entry| sizer.entry_tokens(entry))
+            .try_fold(0_u64, u64::checked_add)
+        else {
+            return false;
+        };
+        let messages = entries
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect::<Vec<_>>();
+        source_tokens > 1
+            && self
+                .deterministic_fallback(&messages, source_tokens, sizer)
+                .is_ok()
+    }
+
+    /// The deterministic fallback, or its target when it cannot strictly
+    /// shrink the source. The ratio cap governs model output only: the
+    /// fallback target is `min(deterministic_token_cap, source_tokens - 1)`,
+    /// so any source that can strictly shrink at all gets a summary.
+    fn deterministic_fallback(
+        &self,
+        messages: &[Message],
+        source_tokens: u64,
+        sizer: &dyn LcmSizer,
+    ) -> Result<(String, u64), u64> {
+        let serialized = render_summary_source(messages, Some(256));
+        let target = self
+            .policy
+            .deterministic_token_cap
+            .min(source_tokens.saturating_sub(1));
+        let text = truncate_head_tail_to_cap(&serialized, target, sizer);
+        let token_count = sizer.summary_tokens(&text);
+        if text.trim().is_empty() || token_count >= source_tokens {
+            return Err(target);
+        }
+        Ok((text, token_count))
+    }
+
     async fn summarize_prepared(
         &self,
         source: PreparedSummarySource,
@@ -596,13 +673,17 @@ impl LcmEscalatingSummarizer {
                 reason: "summary sizer revision is invalid".into(),
             });
         }
+        let maximum =
+            ((source.source_tokens as f64) * self.policy.summary_max_ratio).floor() as u64;
+        let reclaim_cap =
+            ((source.source_tokens as f64) * (1.0 - self.policy.min_reclaim_ratio)).floor() as u64;
+        let maximum = maximum
+            .min(reclaim_cap)
+            .min(source.source_tokens.saturating_sub(1));
         let mut attempts = Vec::new();
         for (level, target_tokens) in [
-            (EscalationLevel::PreserveDetails, self.policy.target_tokens),
-            (
-                EscalationLevel::ReducedDetail,
-                self.policy.target_tokens / 2,
-            ),
+            (EscalationLevel::PreserveDetails, maximum),
+            (EscalationLevel::ReducedDetail, maximum / 2),
         ] {
             if target_tokens == 0 {
                 continue;
@@ -635,10 +716,10 @@ impl LcmEscalatingSummarizer {
             let token_count = sizer.summary_tokens(&text);
             let outcome = if text.is_empty() {
                 LcmSummaryAttemptOutcome::EmptyOutput
-            } else if token_count > target_tokens {
-                LcmSummaryAttemptOutcome::OverBudget
             } else if token_count >= source.source_tokens {
                 LcmSummaryAttemptOutcome::NonShrinking
+            } else if token_count > target_tokens {
+                LcmSummaryAttemptOutcome::OverBudget
             } else {
                 LcmSummaryAttemptOutcome::Accepted
             };
@@ -680,23 +761,20 @@ impl LcmEscalatingSummarizer {
                 attempts,
             });
         }
-        let serialized = serialize_messages(&source.messages);
-        let target = self
-            .policy
-            .deterministic_token_cap
-            .min(source.source_tokens.saturating_sub(1));
-        let text = truncate_head_tail_to_cap(&serialized, target, sizer);
-        let token_count = sizer.summary_tokens(&text);
-        if text.trim().is_empty() || token_count >= source.source_tokens {
-            let (input_tokens, output_tokens) = total_attempt_usage(&attempts)?;
-            return Err(LcmSummaryError::CannotFitWithUsage {
-                required_tokens: source.source_tokens,
-                available_tokens: target,
-                input_tokens,
-                output_tokens,
-                attempts,
-            });
-        }
+        let (text, token_count) =
+            match self.deterministic_fallback(&source.messages, source.source_tokens, sizer) {
+                Ok(fallback) => fallback,
+                Err(target) => {
+                    let (input_tokens, output_tokens) = total_attempt_usage(&attempts)?;
+                    return Err(LcmSummaryError::CannotFitWithUsage {
+                        required_tokens: source.source_tokens,
+                        available_tokens: target,
+                        input_tokens,
+                        output_tokens,
+                        attempts,
+                    });
+                }
+            };
         let (input_tokens, output_tokens) = total_attempt_usage(&attempts)?;
         Ok(LcmSummaryOutcome {
             text,
@@ -758,21 +836,59 @@ fn total_attempt_usage(attempts: &[LcmSummaryAttempt]) -> Result<(u64, u64), Lcm
     Ok((input_tokens, output_tokens))
 }
 
-fn serialize_messages(messages: &[Message]) -> String {
-    let mut serialized = String::new();
-    for message in messages {
-        let role = match message.role {
-            agent_runtime_core::content::Role::System => "system",
-            agent_runtime_core::content::Role::User => "user",
-            agent_runtime_core::content::Role::Assistant => "assistant",
-            agent_runtime_core::content::Role::Tool => "tool",
-        };
-        serialized.push_str(role);
-        serialized.push_str(": ");
-        serialized.push_str(&message.joined_text());
-        serialized.push('\n');
+/// Renders source bodies compactly, preserving tool names, arguments and results.
+/// `part_chars` bounds individual excerpts for deterministic fallback; `None`
+/// preserves the full source for measured provider map-reduce.
+pub fn render_summary_source(messages: &[Message], part_chars: Option<usize>) -> String {
+    fn excerpt(text: &str, cap: Option<usize>) -> String {
+        match cap {
+            Some(cap) if text.chars().count() > cap => {
+                let mut result: String = text.chars().take(cap / 2).collect();
+                result.push_str(" … ");
+                let tail: String = text.chars().rev().take(cap / 2).collect();
+                result.extend(tail.chars().rev());
+                result
+            }
+            _ => text.to_owned(),
+        }
     }
-    serialized
+    fn render(parts: &[ContentPart], cap: Option<usize>, out: &mut String) {
+        for part in parts {
+            match part {
+                ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+                    out.push_str(&excerpt(text, cap));
+                }
+                ContentPart::ToolCall(call) => {
+                    out.push_str(&format!(
+                        "call {}({})",
+                        call.name,
+                        excerpt(&call.arguments.to_string(), cap)
+                    ));
+                }
+                ContentPart::ToolResult(result) => {
+                    out.push_str(&format!(
+                        "result {}{}: ",
+                        result.name,
+                        if result.is_error { " [error]" } else { "" }
+                    ));
+                    render(&result.content, cap, out);
+                }
+                ContentPart::Image { .. } => out.push_str("[image]"),
+            }
+            out.push('\n');
+        }
+    }
+    let mut out = String::new();
+    for message in messages {
+        out.push_str(match message.role {
+            crate::Role::System => "system: ",
+            crate::Role::User => "user: ",
+            crate::Role::Assistant => "assistant: ",
+            crate::Role::Tool => "tool: ",
+        });
+        render(&message.content, part_chars, &mut out);
+    }
+    out
 }
 
 /// Deterministic Unicode-safe head/tail reduction with explicit elision.
@@ -920,7 +1036,8 @@ mod tests {
         let summarizer = LcmEscalatingSummarizer::with_policy(
             model,
             LcmEscalationPolicy {
-                target_tokens: 12,
+                leaf_source_target_tokens: 48,
+                summary_max_ratio: 0.07,
                 deterministic_token_cap: 5,
                 ..LcmEscalationPolicy::default()
             },
@@ -948,7 +1065,7 @@ mod tests {
         assert_eq!(outcome.attempts.len(), 2);
         assert!(matches!(
             outcome.attempts[0].outcome,
-            LcmSummaryAttemptOutcome::OverBudget
+            LcmSummaryAttemptOutcome::NonShrinking
         ));
         assert!(matches!(
             outcome.attempts[1].outcome,
@@ -965,7 +1082,8 @@ mod tests {
         let outcome = LcmEscalatingSummarizer::with_policy(
             model,
             LcmEscalationPolicy {
-                target_tokens: 12,
+                leaf_source_target_tokens: 48,
+                summary_max_ratio: 0.06,
                 ..LcmEscalationPolicy::default()
             },
         )
@@ -997,7 +1115,9 @@ mod tests {
         let outcome = LcmEscalatingSummarizer::with_policy(
             model,
             LcmEscalationPolicy {
-                target_tokens: 8,
+                leaf_source_target_tokens: 32,
+                summary_max_ratio: 0.9,
+                min_reclaim_ratio: 0.1,
                 deterministic_token_cap: 3,
                 ..LcmEscalationPolicy::default()
             },
@@ -1028,18 +1148,26 @@ mod tests {
             child_node(1, classification.clone()),
             child_node(2, classification.clone()),
         ];
-        let outcome = LcmEscalatingSummarizer::new(model)
-            .summarize_nodes(
-                &nodes,
-                LcmOperationFingerprint::from_fields(["node-summary"]),
-                &CharRatioSizer::new()
-                    .with_chars_per_token(1)
-                    .with_entry_overhead_tokens(0)
-                    .with_summary_overhead_tokens(0),
-                "test.summary",
-            )
-            .await
-            .unwrap();
+        let outcome = LcmEscalatingSummarizer::with_policy(
+            model,
+            LcmEscalationPolicy {
+                summary_max_ratio: 0.75,
+                min_reclaim_ratio: 0.25,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .summarize_nodes(
+            &nodes,
+            LcmOperationFingerprint::from_fields(["node-summary"]),
+            &CharRatioSizer::new()
+                .with_chars_per_token(1)
+                .with_entry_overhead_tokens(0)
+                .with_summary_overhead_tokens(0),
+            "test.summary",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome.source_range,
             LcmRange::new(LcmSequence::new(1), LcmSequence::new(2)).unwrap()
@@ -1152,7 +1280,8 @@ mod tests {
         let outcome = LcmEscalatingSummarizer::with_policy(
             model,
             LcmEscalationPolicy {
-                target_tokens: 12,
+                leaf_source_target_tokens: 48,
+                summary_max_ratio: 0.07,
                 deterministic_token_cap: 5,
                 ..LcmEscalationPolicy::default()
             },

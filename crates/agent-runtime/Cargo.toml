@@ -39,6 +39,7 @@ url = "2.5"
 # off to keep the graph lean (it pulls tokio channels, and its own `sqlite`
 # feature pulls rusqlite).
 default = []
+provider-summary = ["agent-runtime-lcm/provider-summary"]
 obs = ["dep:agent-runtime-obs"]
 command-provider = ["agent-runtime-provider/command-provider"]
 # The external agent boundary: a turn executed by an installed coding agent

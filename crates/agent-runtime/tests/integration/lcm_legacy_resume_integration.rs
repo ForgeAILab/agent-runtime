@@ -2014,3 +2014,87 @@ async fn conflicting_old_and_new_namespaces_fail_closed_deterministically() {
     assert!(persisted.extension_state.contains_key(LEGACY_NAMESPACE));
     assert!(persisted.extension_state.contains_key(LCM_COMPONENT_ID));
 }
+
+#[derive(Debug, Default)]
+struct AuditFlakyCheckpointStore {
+    armed: AtomicBool,
+    loads: AtomicUsize,
+}
+
+#[async_trait]
+impl CheckpointStore for AuditFlakyCheckpointStore {
+    async fn load_latest(
+        &self,
+        _session: &SessionId,
+    ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        if self.armed.load(Ordering::Acquire) && self.loads.fetch_add(1, Ordering::AcqRel) == 1 {
+            return Err(RuntimeError::conflict(
+                "audit: transient checkpoint read failure",
+            ));
+        }
+        Ok(None)
+    }
+
+    async fn save(&self, _checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn audit_idle_checkpoint_failure_rolls_back_pending_memory() {
+    let session_id = SessionId::new("audit-idle-checkpoint-failure");
+    let sessions = Arc::new(SessionFixtureStore::default());
+    let checkpoints = Arc::new(AuditFlakyCheckpointStore::default());
+    let lcm_store = Arc::new(LcmFixtureStore::new(LcmTimelineId::new(TIMELINE_ID)));
+    let model = Arc::new(CountingSummaryModel::new());
+    let coordinator = hard_pressure_coordinator(&session_id, lcm_store.clone(), model.clone());
+    let provider = Arc::new(FakeProvider::text_reply("must not run"));
+    let runtime = RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+        .provider(provider)
+        .model_profile(
+            agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                "fake",
+                agent_runtime::core::provider::ModelId::new("fake"),
+                agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+            ),
+        )
+        .session_store(sessions.clone())
+        .checkpoint_store(checkpoints.clone())
+        .lcm(coordinator)
+        .build()
+        .expect("runtime builds");
+    let session = runtime
+        .start_session(
+            StartSession::new()
+                .with_id(session_id.clone())
+                .with_history(idle_history()),
+        )
+        .await
+        .expect("idle session starts");
+    let saves_before = sessions.saves().len();
+    checkpoints.armed.store(true, Ordering::Release);
+
+    let result = session.try_idle_compaction().await;
+    assert!(result.is_err(), "the injected checkpoint failure surfaces");
+    assert_eq!(model.calls(), 1);
+    assert_eq!(lcm_store.node_count(), 0, "CAS is after the stage save");
+    assert_eq!(
+        sessions.saves().len(),
+        saves_before,
+        "nothing reached durable storage"
+    );
+    let snapshot = session.snapshot();
+    eprintln!(
+        "AUDIT ext keys={:?} usage_records={}",
+        snapshot.extension_state.keys().collect::<Vec<_>>(),
+        snapshot.usage.records().len()
+    );
+    assert!(
+        !snapshot.extension_state.contains_key(LCM_COMPONENT_ID),
+        "an unsaved pending response must not remain in memory"
+    );
+    assert!(
+        snapshot.usage.records().is_empty(),
+        "unsaved usage must roll back"
+    );
+}

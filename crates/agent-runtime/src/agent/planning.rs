@@ -121,6 +121,7 @@ pub struct RunPlanner {
     /// across turns. Behind a lock because turns run serially but share the
     /// planner.
     previous_cache: Mutex<Option<CachePlan>>,
+    input_cap: Option<u32>,
     /// The exact immutable plan that crossed the provider-start boundary for
     /// the latest turn. It is retained only as a Runtime-owned maintenance
     /// seam; callers cannot replace its identity or prompt contents.
@@ -158,8 +159,15 @@ impl RunPlanner {
             cache_endpoint_identity: None,
             cache_session_partition: None,
             previous_cache: Mutex::new(None),
+            input_cap: None,
             last_plan: Mutex::new(None),
         }
+    }
+
+    /// Caps provider input at a host working-set ceiling.
+    pub fn with_input_cap(mut self, hard_tokens: u32) -> Self {
+        self.input_cap = Some(hard_tokens);
+        self
     }
 
     /// The frozen model profile this session plans against.
@@ -197,6 +205,7 @@ impl RunPlanner {
         if let Some(endpoint) = &self.cache_endpoint_identity {
             planner = planner.with_cache_endpoint_identity(endpoint.clone());
         }
+        planner.input_cap = self.input_cap;
         planner.cache_session_partition =
             Some(Fingerprint::of_fields(["session", session.as_str()]));
         planner
@@ -442,6 +451,9 @@ impl RunPlanner {
 
         let mut planner =
             ContextPlanner::new(&self.profile, self.sizer.as_ref(), self.policy.clone());
+        if let Some(cap) = self.input_cap {
+            planner = planner.with_input_cap(cap);
+        }
         if let Some(endpoint) = &self.cache_endpoint_identity {
             planner = planner.with_cache_endpoint_identity(endpoint.clone());
         }

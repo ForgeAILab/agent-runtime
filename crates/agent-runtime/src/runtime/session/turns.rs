@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::engine::IDLE_BOUNDARY_NAMESPACE;
 
 impl SessionHandle {
     /// Attempts one LCM compaction at the current idle turn boundary.
@@ -21,6 +22,57 @@ impl SessionHandle {
             checkpoint.state,
             TurnState::Terminal { .. } | TurnState::CacheOperationTerminal { .. }
         ))
+    }
+
+    /// Refreshes only post-terminal extension/usage progress. The existing
+    /// checkpoint successor validator fences session, turn, history boundary,
+    /// operation identity and monotonically increasing revisions.
+    async fn checkpoint_idle_batch(&self) -> Result<bool, RuntimeError> {
+        let Some(store) = &self.inner.shared.checkpoint_store else {
+            return Ok(false);
+        };
+        let Some(previous) = store.load_latest(&self.inner.id).await? else {
+            return Ok(false);
+        };
+        if !previous.state.is_terminal() {
+            return Err(RuntimeError::conflict(
+                "idle LCM progress requires a terminal checkpoint",
+            ));
+        }
+        let predecessor =
+            agent_runtime_registry::Fingerprint::of(serde_json::to_vec(&previous.snapshot.usage)?);
+        self.inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .insert(
+                IDLE_BOUNDARY_NAMESPACE.into(),
+                VersionedSessionState::new(
+                    agent_runtime_registry::RegistryRevision::new("lcm-idle-boundary-1"),
+                    serde_json::json!({ "predecessor_usage": predecessor }),
+                )
+                .redaction_safe(),
+            );
+        let snapshot = self.checkpoint_snapshot()?;
+        let state_revision = previous
+            .state_revision
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::conflict("idle checkpoint revision exhausted"))?;
+        let sequence = self.inner.emitter.begin_checkpoint_barrier();
+        let mut next = previous.clone();
+        next.state_revision = state_revision;
+        next.watermark = previous.watermark.clone().next(sequence);
+        next.snapshot = snapshot;
+        next.updated = self.inner.shared.clock.now();
+        let result = async {
+            previous.validate_successor(&next)?;
+            store.save(&next).await
+        }
+        .await;
+        self.inner.emitter.end_checkpoint_barrier();
+        result?;
+        Ok(true)
     }
 
     /// Applies one idle result and crosses the ordinary durable snapshot
@@ -53,11 +105,15 @@ impl SessionHandle {
             }
             previous
         };
-        let result = match store {
-            Some(store) => store.save(&self.snapshot()).await,
-            None => Ok(()),
-        };
-        if result.is_err() {
+        let previous_marker = self
+            .inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .get(IDLE_BOUNDARY_NAMESPACE)
+            .cloned();
+        let rollback = |previous_extensions: Vec<(String, Option<VersionedSessionState>)>| {
             {
                 let mut extensions = self
                     .inner
@@ -65,7 +121,10 @@ impl SessionHandle {
                     .extension_state
                     .lock()
                     .expect("session extension state poisoned");
-                for (namespace, previous) in previous_extensions {
+                for (namespace, previous) in previous_extensions
+                    .into_iter()
+                    .chain([(IDLE_BOUNDARY_NAMESPACE.to_owned(), previous_marker)])
+                {
                     match previous {
                         Some(state) => {
                             extensions.insert(namespace, state);
@@ -81,6 +140,27 @@ impl SessionHandle {
                 .lock()
                 .expect("session state poisoned")
                 .usage = previous_usage;
+        };
+        // Nothing from this batch may stay in memory without a saved
+        // counterpart: a failed exact checkpoint rolls back the extension
+        // updates, the usage records and the idle-boundary marker.
+        let protected = match self.checkpoint_idle_batch().await {
+            Ok(protected) => protected,
+            Err(error) => {
+                rollback(previous_extensions);
+                return Err(error);
+            }
+        };
+        let result = match store {
+            Some(store) => store.save(&self.snapshot()).await,
+            None => Ok(()),
+        };
+        // Once exact progress is durable, keep it on ordinary-save failure:
+        // the exact checkpoint is its saved counterpart, and cold restore
+        // rolls the ordinary ledger forward from its fenced predecessor. An
+        // unprotected save failure still rolls back locally.
+        if result.is_err() && !protected {
+            rollback(previous_extensions);
         }
         result
     }
@@ -522,7 +602,18 @@ impl SessionHandle {
                 .await;
             let finish = inner.execution.take_turn_finish(&tid);
             let returned_interaction = inner.execution.returned_interaction_value();
+            let completed = matches!(finish, Some(TurnFinish::Completed));
             task_completion.finish(finish, returned_interaction);
+            drop(_turn);
+            drop(_active);
+            if completed && inner.shared.soft_on_turn_boundary {
+                let session = SessionHandle {
+                    inner: inner.clone(),
+                };
+                if let Err(error) = session.try_idle_compaction().await {
+                    inner.emitter.emit(None, RuntimeEvent::Error { error });
+                }
+            }
         });
         turns.aborts.push(task.abort_handle());
         drop(turns);
@@ -890,7 +981,18 @@ impl SessionHandle {
                 .await;
             let finish = inner.execution.take_turn_finish(&tid);
             let returned_interaction = inner.execution.returned_interaction_value();
+            let completed = matches!(finish, Some(TurnFinish::Completed));
             task_completion.finish(finish, returned_interaction);
+            drop(_turn);
+            drop(_active);
+            if completed && inner.shared.soft_on_turn_boundary {
+                let session = SessionHandle {
+                    inner: inner.clone(),
+                };
+                if let Err(error) = session.try_idle_compaction().await {
+                    inner.emitter.emit(None, RuntimeEvent::Error { error });
+                }
+            }
         });
         turns.aborts.push(task.abort_handle());
         drop(turns);
@@ -994,7 +1096,18 @@ impl SessionHandle {
                 .await;
             let returned_interaction = inner.execution.returned_interaction_value();
             let finish = inner.execution.take_turn_finish(&completion_turn);
+            let completed = matches!(finish, Some(TurnFinish::Completed));
             task_completion.finish(finish, returned_interaction);
+            drop(_turn);
+            drop(_active);
+            if completed && inner.shared.soft_on_turn_boundary {
+                let session = SessionHandle {
+                    inner: inner.clone(),
+                };
+                if let Err(error) = session.try_idle_compaction().await {
+                    inner.emitter.emit(None, RuntimeEvent::Error { error });
+                }
+            }
         });
         turns.aborts.push(task.abort_handle());
         drop(turns);

@@ -40,6 +40,14 @@ impl LcmCoordinator {
             .is_some_and(|current| Arc::ptr_eq(&current, generation))
         {
             slots.remove(session);
+            self.overheads
+                .lock()
+                .expect("LCM overheads poisoned")
+                .remove(session);
+            self.conversation_tokens
+                .lock()
+                .expect("LCM conversation counts poisoned")
+                .remove(session);
         }
     }
 
@@ -130,20 +138,16 @@ impl LcmCoordinator {
                                 let end = node.range.end.get().checked_add(1)?;
                                 (
                                     usize::try_from(end).ok()?,
-                                    active.checked_add(node.token_count)?,
+                                    active.checked_add(
+                                        self.policy.sizer.summary_tokens(&node.summary),
+                                    )?,
                                 )
                             }
-                            agent_runtime_lcm::LcmNodeKind::Condensed => {
-                                if node.range.end.get() >= covered as u64 {
-                                    return None;
-                                }
-                                (
-                                    covered,
-                                    active
-                                        .checked_sub(node.source_token_count)?
-                                        .checked_add(node.token_count)?,
-                                )
-                            }
+                            // Children can carry different historical sizing
+                            // revisions. Recompute the active-node total after
+                            // condensation rather than subtracting their old
+                            // persisted count from a current measured total.
+                            agent_runtime_lcm::LcmNodeKind::Condensed => return None,
                         },
                     };
                     Some((after, covered, active))
@@ -232,7 +236,17 @@ impl LcmCoordinator {
                                 "LCM active node range exceeds the sequence space",
                             )
                         })?;
-                    active = active.checked_add(node.token_count).ok_or_else(|| {
+                    let measured = if node.sizer_revision == self.policy.sizer.revision() {
+                        node.token_count
+                    } else {
+                        let stored = self
+                            .store
+                            .node(&view, &node.id)
+                            .await
+                            .map_err(map_lcm_error)?;
+                        self.policy.sizer.summary_tokens(&stored.summary)
+                    };
+                    active = active.checked_add(measured).ok_or_else(|| {
                         RuntimeError::conflict("LCM active token count overflowed")
                     })?;
                 }
@@ -277,6 +291,10 @@ impl LcmCoordinator {
                 }
             }
         }
+        self.conversation_tokens
+            .lock()
+            .expect("LCM conversation counts poisoned")
+            .insert(binding.session.clone(), result);
         Ok(result)
     }
 }

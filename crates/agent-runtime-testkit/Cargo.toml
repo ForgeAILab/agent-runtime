@@ -22,6 +22,10 @@ futures-core.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 
+[features]
+default = []
+provider-summary = ["agent-runtime/provider-summary", "agent-runtime-lcm/provider-summary"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
 

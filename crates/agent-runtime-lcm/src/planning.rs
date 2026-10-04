@@ -27,6 +27,42 @@ pub trait LcmSizer: Send + Sync + fmt::Debug {
     fn revision(&self) -> RegistryRevision;
 }
 
+/// Adapts the authoritative request sizer to LCM source and summary messages.
+#[derive(Debug, Clone)]
+pub struct RequestSizerAdapter {
+    sizer: std::sync::Arc<dyn agent_runtime_context::RequestSizer>,
+}
+
+impl RequestSizerAdapter {
+    /// Shares the exact sizer used by the provider context planner.
+    pub fn new(sizer: std::sync::Arc<dyn agent_runtime_context::RequestSizer>) -> Self {
+        Self { sizer }
+    }
+}
+
+impl LcmSizer for RequestSizerAdapter {
+    fn entry_tokens(&self, entry: &LcmEntry) -> u64 {
+        u64::from(self.sizer.size_message(&entry.content))
+    }
+
+    fn summary_tokens(&self, summary: &str) -> u64 {
+        u64::from(
+            self.sizer
+                .size_message(&crate::Message::text(crate::Role::System, summary)),
+        )
+    }
+
+    fn revision(&self) -> RegistryRevision {
+        let component = self.sizer.revision();
+        RegistryRevision::from_content(format!(
+            "lcm-request-sizer-1|{}|{}|{}",
+            component.id,
+            component.revision,
+            self.sizer.confidence().as_str()
+        ))
+    }
+}
+
 /// Deterministic offline character-ratio sizer for tests and hosts without a
 /// provider tokenizer.  It is conservative and versioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,22 +120,12 @@ impl CharRatioSizer {
 
 impl LcmSizer for CharRatioSizer {
     fn entry_tokens(&self, entry: &LcmEntry) -> u64 {
-        self.entry_overhead_tokens
-            .saturating_add(self.ratio(&entry.content.joined_text()))
-            .saturating_add(
-                entry
-                    .content
-                    .content
-                    .iter()
-                    .filter(|part| {
-                        matches!(
-                            part,
-                            agent_runtime_core::content::ContentPart::ToolCall(_)
-                                | agent_runtime_core::content::ContentPart::ToolResult(_)
-                        )
-                    })
-                    .count() as u64,
-            )
+        let sizer = agent_runtime_context::CharRatioSizer::default()
+            .with_chars_per_token(u32::try_from(self.chars_per_token).unwrap_or(u32::MAX))
+            .with_message_framing_tokens(0);
+        self.entry_overhead_tokens.saturating_add(u64::from(
+            agent_runtime_context::RequestSizer::size_message(&sizer, &entry.content),
+        ))
     }
 
     fn summary_tokens(&self, summary: &str) -> u64 {
@@ -109,7 +135,7 @@ impl LcmSizer for CharRatioSizer {
 
     fn revision(&self) -> RegistryRevision {
         RegistryRevision::from_content(format!(
-            "char-ratio|{}|{}|{}",
+            "char-ratio-content-2|{}|{}|{}",
             self.chars_per_token, self.entry_overhead_tokens, self.summary_overhead_tokens
         ))
     }
