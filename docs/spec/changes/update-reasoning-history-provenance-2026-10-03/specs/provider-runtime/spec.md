@@ -37,3 +37,11 @@ this requirement.
 - **GIVEN** a reasoning part with no recorded producer
 - **WHEN** any request is built
 - **THEN** the part is sent exactly as before
+
+#### Scenario: Continuing on Gemini after another provider's tool calls
+
+- **GIVEN** an earlier turn on another provider made tool calls
+- **WHEN** the session continues on a Gemini model with reasoning enabled
+- **THEN** the request is accepted with those calls unsigned
+- **AND** tool calls in the active continuation still require Gemini's
+  signed thought

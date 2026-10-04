@@ -521,8 +521,11 @@ fn translate_history(
     let mut input = Vec::new();
     let mut calls = BTreeMap::<String, String>::new();
     let mut results = BTreeSet::new();
+    let last_user_index = messages
+        .iter()
+        .rposition(|message| message.role == Role::User);
 
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         match message.role {
             Role::System => {
                 for part in &message.content {
@@ -581,7 +584,10 @@ fn translate_history(
                             // continuation and has no native step representation.
                         }
                         ContentPart::ToolCall(call) => {
+                            // Earlier turns may have had another provider's reasoning omitted.
                             if config.capabilities.reasoning != ReasoningSupport::Unsupported
+                                && last_user_index
+                                    .is_none_or(|last_user_index| message_index > last_user_index)
                                 && !saw_signed_thought
                             {
                                 return Err(compatibility_error());
@@ -2034,6 +2040,96 @@ mod tests {
         assert_eq!(body["input"][6]["type"], "thought");
         assert_eq!(body["input"][7]["type"], "function_call");
         assert_eq!(body["input"][8]["type"], "function_result");
+        let expected = json!({
+            "model": "gemini-test",
+            "input": [
+                {
+                    "type": "user_input",
+                    "content": [
+                        {"type": "text", "text": "inspect this"},
+                        {
+                            "type": "image",
+                            "mime_type": "image/png",
+                            "data": "AAAA",
+                            "resolution": "high",
+                        },
+                    ],
+                },
+                {
+                    "type": "thought",
+                    "signature": "thought-signature-canary",
+                    "summary": [{"type": "text", "text": "checking"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "call-1",
+                    "name": "inspect",
+                    "arguments": {"path": "a.png"},
+                },
+                {
+                    "type": "function_call",
+                    "id": "call-2",
+                    "name": "inspect",
+                    "arguments": {"path": "b.png"},
+                },
+                {
+                    "type": "function_result",
+                    "name": "inspect",
+                    "call_id": "call-1",
+                    "result": [
+                        {"type": "text", "text": "ok"},
+                        {"type": "image", "uri": "https://example.test/result.png"},
+                    ],
+                    "is_error": false,
+                },
+                {
+                    "type": "function_result",
+                    "name": "inspect",
+                    "call_id": "call-2",
+                    "result": [{"type": "text", "text": "second ok"}],
+                    "is_error": false,
+                },
+                {
+                    "type": "thought",
+                    "signature": "second-thought-signature",
+                    "summary": [],
+                },
+                {
+                    "type": "function_call",
+                    "id": "call-3",
+                    "name": "inspect",
+                    "arguments": {"path": "c.png"},
+                },
+                {
+                    "type": "function_result",
+                    "name": "inspect",
+                    "call_id": "call-3",
+                    "result": [{"type": "text", "text": "third ok"}],
+                    "is_error": false,
+                },
+            ],
+            "stream": true,
+            "store": false,
+            "system_instruction": "be precise",
+            "tools": [{
+                "type": "function",
+                "name": "inspect",
+                "description": "Inspect an image",
+                "parameters": {"type": "object"},
+            }],
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": {"type": "object"},
+            },
+            "generation_config": {
+                "max_output_tokens": 1_024,
+                "thinking_summaries": "auto",
+                "thinking_level": "high",
+                "tool_choice": {"allowed_tools": {"mode": "any", "tools": ["inspect"]}},
+            },
+        });
+        assert_eq!(sent[0].body, serde_json::to_vec(&expected).unwrap());
     }
 
     #[tokio::test]
@@ -2070,6 +2166,104 @@ mod tests {
             "Gemini signed continuation is incomplete or out of order"
         );
         assert!(provider.transport().requests().is_empty());
+    }
+
+    #[test]
+    fn earlier_turn_unsigned_tool_history_is_accepted_without_a_thought_step() {
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
+                .unwrap();
+        let mut request = ProviderRequest::new(
+            ModelId::new("gemini-test"),
+            vec![
+                Message::user("use a tool"),
+                Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                    id: ToolCallId::new("call-1"),
+                    name: "inspect".into(),
+                    arguments: json!({"path": "a.png"}),
+                })]),
+                Message::tool_result(ToolResultBlock {
+                    call_id: ToolCallId::new("call-1"),
+                    name: "inspect".into(),
+                    content: vec![ContentPart::text("ok")],
+                    is_error: false,
+                }),
+                Message::user("continue on Gemini"),
+            ],
+        );
+        request.reasoning = Some(ReasoningConfig {
+            effort: Some("high".into()),
+            max_tokens: None,
+        });
+
+        let body = provider.build_payload(&request).unwrap();
+        assert_eq!(
+            body["input"],
+            json!([
+                {
+                    "type": "user_input",
+                    "content": [{"type": "text", "text": "use a tool"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "call-1",
+                    "name": "inspect",
+                    "arguments": {"path": "a.png"},
+                },
+                {
+                    "type": "function_result",
+                    "name": "inspect",
+                    "call_id": "call-1",
+                    "result": [{"type": "text", "text": "ok"}],
+                    "is_error": false,
+                },
+                {
+                    "type": "user_input",
+                    "content": [{"type": "text", "text": "continue on Gemini"}],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn active_continuation_unsigned_tool_call_is_rejected_after_an_unsigned_earlier_turn() {
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
+                .unwrap();
+        let mut request = ProviderRequest::new(
+            ModelId::new("gemini-test"),
+            vec![
+                Message::user("use a tool"),
+                Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                    id: ToolCallId::new("call-1"),
+                    name: "inspect".into(),
+                    arguments: json!({}),
+                })]),
+                Message::tool_result(ToolResultBlock {
+                    call_id: ToolCallId::new("call-1"),
+                    name: "inspect".into(),
+                    content: vec![ContentPart::text("ok")],
+                    is_error: false,
+                }),
+                Message::user("continue on Gemini"),
+                Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                    id: ToolCallId::new("call-2"),
+                    name: "inspect".into(),
+                    arguments: json!({}),
+                })]),
+            ],
+        );
+        request.reasoning = Some(ReasoningConfig {
+            effort: Some("high".into()),
+            max_tokens: None,
+        });
+
+        let error = provider.build_payload(&request).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert_eq!(
+            error.message,
+            "Gemini signed continuation is incomplete or out of order"
+        );
     }
 
     #[tokio::test]
