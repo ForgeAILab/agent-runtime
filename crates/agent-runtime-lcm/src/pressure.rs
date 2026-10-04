@@ -30,8 +30,9 @@ pub struct LcmPressurePolicy {
     pub condensation_fanout: usize,
     /// Recent raw entries retained by the host projection.
     pub retain_recent_entries: usize,
-    /// Maximum checkpointed compaction rounds at hard pressure. Zero derives
-    /// a bounded limit from overage and expected reclaim (the default).
+    /// Maximum checkpointed compaction rounds at hard pressure. Zero (the
+    /// default) derives the bound once per admission epoch with
+    /// [`derive_hard_rounds`], never above [`MAX_DERIVED_HARD_ROUNDS`].
     pub max_rounds: usize,
     /// Deterministic fallback cap before strict-shrink adjustment.
     pub deterministic_token_cap: u64,
@@ -125,12 +126,83 @@ impl LcmPressureDecision {
     }
 }
 
+/// Upper bound on derived hard-compaction rounds in one admission epoch.
+///
+/// A derived bound (`LcmPressurePolicy::max_rounds == 0`) never exceeds this
+/// value. Each round is one checkpointed leaf or condensation operation, and
+/// one round may take several summary-model calls. Hosts that need a
+/// different bound set `max_rounds` explicitly.
+pub const MAX_DERIVED_HARD_ROUNDS: usize = 64;
+
+/// Tokens one leaf round is expected to reclaim: the source span times the
+/// guaranteed shrink, `max(1 - summary_max_ratio, min_reclaim_ratio)`.
+/// Never zero.
+pub fn expected_leaf_reclaim_tokens(
+    leaf_source_tokens: u64,
+    summary_max_ratio: f64,
+    min_reclaim_ratio: f64,
+) -> u64 {
+    let shrink = (1.0 - summary_max_ratio).max(min_reclaim_ratio);
+    if !shrink.is_finite() || shrink <= 0.0 {
+        return 1;
+    }
+    ((leaf_source_tokens as f64) * shrink.min(1.0))
+        .floor()
+        .max(1.0) as u64
+}
+
+/// The one derived hard-round formula, shared by the library decision and
+/// the runtime coordinator: enough rounds to reclaim the overage above the
+/// soft threshold at `reclaim_per_round`, plus two rounds of slack for
+/// condensation, clamped to `2..=MAX_DERIVED_HARD_ROUNDS`. The runtime fixes
+/// this value once per admission epoch; it is not recomputed per round.
+pub fn derive_hard_rounds(
+    conversation_tokens: u64,
+    input_budget_tokens: u64,
+    soft_threshold_percent: u8,
+    reclaim_per_round: u64,
+) -> usize {
+    let threshold = (u128::from(input_budget_tokens) * u128::from(soft_threshold_percent) / 100)
+        .min(u128::from(u64::MAX)) as u64;
+    let overage = conversation_tokens.saturating_sub(threshold);
+    usize::try_from(overage.div_ceil(reclaim_per_round.max(1)).saturating_add(2))
+        .unwrap_or(MAX_DERIVED_HARD_ROUNDS)
+        .clamp(2, MAX_DERIVED_HARD_ROUNDS)
+}
+
 /// Evaluates soft/hard pressure against a resolved context input budget.
+///
+/// A derived hard-round bound assumes the default summary ratios of
+/// [`crate::LcmEscalationPolicy`] over `leaf_target_tokens`. Callers with
+/// their own escalation policy use [`decide_pressure_with_reclaim`].
 pub fn decide_pressure(
+    conversation_tokens: u64,
+    input_budget_tokens: u64,
+    summary_usage_tokens: u64,
+    policy: &LcmPressurePolicy,
+) -> LcmPressureDecision {
+    let defaults = crate::LcmEscalationPolicy::default();
+    decide_pressure_with_reclaim(
+        conversation_tokens,
+        input_budget_tokens,
+        summary_usage_tokens,
+        policy,
+        expected_leaf_reclaim_tokens(
+            policy.leaf_target_tokens,
+            defaults.summary_max_ratio,
+            defaults.min_reclaim_ratio,
+        ),
+    )
+}
+
+/// [`decide_pressure`] with the caller's expected reclaim per leaf round,
+/// used only when `policy.max_rounds == 0` derives the hard-round bound.
+pub fn decide_pressure_with_reclaim(
     conversation_tokens: u64,
     input_budget_tokens: u64,
     _summary_usage_tokens: u64,
     policy: &LcmPressurePolicy,
+    reclaim_per_round: u64,
 ) -> LcmPressureDecision {
     if policy.validate().is_err() || input_budget_tokens == 0 {
         return LcmPressureDecision::CannotFit {
@@ -154,19 +226,12 @@ pub fn decide_pressure(
             pressure_percent,
             operation_fingerprint: operation_fingerprint(),
             max_rounds: if policy.max_rounds == 0 {
-                let threshold = ((input_budget_tokens as u128)
-                    * u128::from(policy.soft_threshold_percent)
-                    / 100) as u64;
-                let overage = conversation_tokens.saturating_sub(threshold);
-                let reclaim = policy
-                    .leaf_target_tokens
-                    .saturating_mul(3)
-                    .checked_div(4)
-                    .unwrap_or(0)
-                    .max(1);
-                usize::try_from(overage.div_ceil(reclaim).saturating_add(2))
-                    .unwrap_or(1_024)
-                    .clamp(2, 1_024)
+                derive_hard_rounds(
+                    conversation_tokens,
+                    input_budget_tokens,
+                    policy.soft_threshold_percent,
+                    reclaim_per_round,
+                )
             } else {
                 policy.max_rounds
             },

@@ -31,6 +31,10 @@ use crate::runtime::manifests::{
 use crate::runtime::session::{SessionHandle, SessionInner};
 use crate::runtime::state::SessionState;
 
+/// Redaction-safe extension namespace that fences one idle LCM batch to the
+/// usage ledger of its terminal predecessor checkpoint.
+pub(crate) const IDLE_BOUNDARY_NAMESPACE: &str = "runtime.lcm.idle_boundary";
+
 /// Combines the host-policy SessionStore view with the exact protected state
 /// retained by a terminal checkpoint.
 ///
@@ -77,7 +81,7 @@ fn merge_terminal_checkpoint_snapshot(
             agent_runtime_registry::Fingerprint::of(serde_json::to_vec(&canonical.usage)?);
         let idle_successor = protected
             .extension_state
-            .get("runtime.lcm.idle_boundary")
+            .get(IDLE_BOUNDARY_NAMESPACE)
             .is_some_and(|state| {
                 state.revision.as_str() == "lcm-idle-boundary-1"
                     && state.sensitivity

@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::engine::IDLE_BOUNDARY_NAMESPACE;
 
 impl SessionHandle {
     /// Attempts one LCM compaction at the current idle turn boundary.
@@ -46,7 +47,7 @@ impl SessionHandle {
             .lock()
             .expect("session extension state poisoned")
             .insert(
-                "runtime.lcm.idle_boundary".into(),
+                IDLE_BOUNDARY_NAMESPACE.into(),
                 VersionedSessionState::new(
                     agent_runtime_registry::RegistryRevision::new("lcm-idle-boundary-1"),
                     serde_json::json!({ "predecessor_usage": predecessor }),
@@ -104,15 +105,15 @@ impl SessionHandle {
             }
             previous
         };
-        let protected = self.checkpoint_idle_batch().await?;
-        let result = match store {
-            Some(store) => store.save(&self.snapshot()).await,
-            None => Ok(()),
-        };
-        // Once exact progress is durable, keep it on ordinary-save failure;
-        // cold restore can roll the ordinary ledger forward from its fenced
-        // predecessor. An unprotected save failure still rolls back locally.
-        if result.is_err() && !protected {
+        let previous_marker = self
+            .inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .get(IDLE_BOUNDARY_NAMESPACE)
+            .cloned();
+        let rollback = |previous_extensions: Vec<(String, Option<VersionedSessionState>)>| {
             {
                 let mut extensions = self
                     .inner
@@ -120,7 +121,10 @@ impl SessionHandle {
                     .extension_state
                     .lock()
                     .expect("session extension state poisoned");
-                for (namespace, previous) in previous_extensions {
+                for (namespace, previous) in previous_extensions
+                    .into_iter()
+                    .chain([(IDLE_BOUNDARY_NAMESPACE.to_owned(), previous_marker)])
+                {
                     match previous {
                         Some(state) => {
                             extensions.insert(namespace, state);
@@ -136,6 +140,27 @@ impl SessionHandle {
                 .lock()
                 .expect("session state poisoned")
                 .usage = previous_usage;
+        };
+        // Nothing from this batch may stay in memory without a saved
+        // counterpart: a failed exact checkpoint rolls back the extension
+        // updates, the usage records and the idle-boundary marker.
+        let protected = match self.checkpoint_idle_batch().await {
+            Ok(protected) => protected,
+            Err(error) => {
+                rollback(previous_extensions);
+                return Err(error);
+            }
+        };
+        let result = match store {
+            Some(store) => store.save(&self.snapshot()).await,
+            None => Ok(()),
+        };
+        // Once exact progress is durable, keep it on ordinary-save failure:
+        // the exact checkpoint is its saved counterpart, and cold restore
+        // rolls the ordinary ledger forward from its fenced predecessor. An
+        // unprotected save failure still rolls back locally.
+        if result.is_err() && !protected {
+            rollback(previous_extensions);
         }
         result
     }

@@ -43,7 +43,7 @@ use agent_runtime_lcm::{
     LcmNodeId, LcmOperationFingerprint, LcmOperationId, LcmPressureDecision, LcmPressurePolicy,
     LcmRange, LcmRevision, LcmSequence, LcmSizer, LcmStore, LcmSummaryAttemptOutcome,
     LcmSummaryError, LcmSummaryModel, LcmSummaryOutcome, LcmTimelineId, LcmView, LcmViewAuthority,
-    LeafCommit, decide_pressure, plan_condensations, plan_leaf_with_frontier,
+    LeafCommit, decide_pressure_with_reclaim, plan_condensations, plan_leaf_with_frontier,
     project_active_context,
 };
 use agent_runtime_registry::{Fingerprint, RegistryRevision, TrustClass};
@@ -67,6 +67,9 @@ pub use agent_runtime_lcm::LCM_SUMMARY_PURPOSE;
 pub const LCM_IDLE_COMPACTION_PURPOSE: &str = "cache_idle_compaction";
 /// Maximum page requested from a host LCM store by this adapter.
 const LCM_READ_PAGE_SIZE: usize = 1_024;
+/// Share of the working-set target that LCM pressure always grants the
+/// conversation, even when measured fixed overhead leaves less.
+const WORKING_SET_FLOOR_PERCENT: u64 = 25;
 
 /// A host-authorized binding between one runtime session and one logical LCM
 /// timeline.  The two identifiers deliberately remain different types: a
@@ -261,7 +264,11 @@ pub struct LcmCoordinatorPolicy {
     pub algorithm_revision: RegistryRevision,
     /// Resolved provider input budget used for pressure decisions.
     pub input_budget_tokens: u64,
-    /// Versioned source/node sizer.
+    /// Versioned source/node sizer. The default shares the runtime's request
+    /// sizer: `RuntimeBuilder::lcm` replaces the default instance with the
+    /// planner's `RequestSizer`. A host-supplied sizer is kept as given; with
+    /// a `WorkingSetPolicy` it should approximate the request sizer, because
+    /// measured overhead is the planner total minus the LCM-sized history.
     pub sizer: Arc<dyn LcmSizer>,
     /// Default source sensitivity when no host classifier is supplied.
     pub source_sensitivity: Sensitivity,
@@ -277,12 +284,32 @@ impl Default for LcmCoordinatorPolicy {
             // A resolved provider window is required from the host.  The
             // adapter must never guess a model limit in a default policy.
             input_budget_tokens: 0,
-            sizer: Arc::new(agent_runtime_lcm::RequestSizerAdapter::new(Arc::new(
-                agent_runtime_context::CharRatioSizer::default(),
-            ))),
+            sizer: default_lcm_sizer(),
             source_sensitivity: Sensitivity::Sensitive,
         }
     }
+}
+
+/// The one default LCM sizer instance: the shared request-sizer adapter over
+/// the default character-ratio sizer. `RuntimeBuilder::lcm` replaces exactly
+/// this instance (by identity) with the planner's request sizer, so a
+/// host-supplied sizer is never discarded.
+fn default_lcm_sizer() -> Arc<dyn LcmSizer> {
+    static DEFAULT: std::sync::OnceLock<Arc<dyn LcmSizer>> = std::sync::OnceLock::new();
+    DEFAULT
+        .get_or_init(|| {
+            Arc::new(agent_runtime_lcm::RequestSizerAdapter::new(Arc::new(
+                agent_runtime_context::CharRatioSizer::default(),
+            )))
+        })
+        .clone()
+}
+
+fn is_default_lcm_sizer(sizer: &Arc<dyn LcmSizer>) -> bool {
+    std::ptr::eq(
+        Arc::as_ptr(sizer).cast::<()>(),
+        Arc::as_ptr(&default_lcm_sizer()).cast::<()>(),
+    )
 }
 
 impl LcmCoordinatorPolicy {
@@ -436,6 +463,12 @@ struct LcmState {
     /// Number of hard-pressure operations staged for this admission epoch.
     #[serde(default)]
     hard_rounds: usize,
+    /// Hard-round bound fixed when this admission epoch started; zero when
+    /// no epoch is open. Only used when the policy derives its bound.
+    #[serde(default)]
+    hard_round_limit: usize,
+    /// Fixed request overhead measured at the latest plan. Trusted only until
+    /// the next plan re-measures it; the pressure floor bounds its effect.
     #[serde(default)]
     fixed_overhead_tokens: u64,
 }
@@ -528,12 +561,16 @@ impl LcmCoordinator {
         Ok(self)
     }
 
+    /// Builder composition. Only the default LCM sizer is replaced with the
+    /// planner's request sizer; a host-supplied `LcmSizer` is kept as given.
     pub(crate) fn with_planner_policy(
         mut self,
         sizer: Arc<dyn agent_runtime_context::RequestSizer>,
         working_set: Option<crate::runtime::WorkingSetPolicy>,
     ) -> Self {
-        self.policy.sizer = Arc::new(agent_runtime_lcm::RequestSizerAdapter::new(sizer));
+        if is_default_lcm_sizer(&self.policy.sizer) {
+            self.policy.sizer = Arc::new(agent_runtime_lcm::RequestSizerAdapter::new(sizer));
+        }
         self.working_set = working_set;
         self.accounting = Arc::default();
         self.overheads = Arc::default();
@@ -575,36 +612,91 @@ impl LcmCoordinator {
         overhead
     }
 
+    /// One pressure decision for every admission path. A derived hard-round
+    /// bound uses the shared library formula with this coordinator's summary
+    /// policy, and is fixed for the rest of an open admission epoch.
     fn pressure_decision(&self, state: &LcmState, tokens: u64) -> LcmPressureDecision {
-        let budget = self.pressure_budget(state);
-        let mut decision = decide_pressure(tokens, budget, 0, &self.policy.pressure);
+        let mut decision = decide_pressure_with_reclaim(
+            tokens,
+            self.pressure_budget(state),
+            0,
+            &self.policy.pressure,
+            self.summarizer.policy().expected_reclaim_tokens(),
+        );
         if let LcmPressureDecision::Hard { max_rounds, .. } = &mut decision {
-            if self.policy.pressure.max_rounds == 0 {
-                let threshold = ((budget as u128)
-                    * u128::from(self.policy.pressure.soft_threshold_percent)
-                    / 100) as u64;
-                let ratio = (1.0 - self.summarizer.policy().summary_max_ratio)
-                    .max(self.summarizer.policy().min_reclaim_ratio);
-                let reclaim = ((self.summarizer.policy().leaf_source_target_tokens as f64) * ratio)
-                    .floor() as u64;
-                *max_rounds = usize::try_from(
-                    tokens
-                        .saturating_sub(threshold)
-                        .div_ceil(reclaim.max(1))
-                        .saturating_add(2),
-                )
-                .unwrap_or(1_024)
-                .clamp(2, 1_024);
+            if self.policy.pressure.max_rounds == 0
+                && state.hard_rounds > 0
+                && state.hard_round_limit > 0
+            {
+                *max_rounds = state.hard_round_limit;
             }
         }
         decision
     }
 
     fn pressure_budget(&self, state: &LcmState) -> u64 {
-        self.working_set
-            .map_or(self.policy.input_budget_tokens, |policy| {
-                u64::from(policy.target_tokens).saturating_sub(state.fixed_overhead_tokens)
-            })
+        self.working_set_budget(state).0
+    }
+
+    /// The conversation budget under a working set, and whether the measured
+    /// overhead left less than the floor so the floor applies instead.
+    ///
+    /// The floor is a fixed share of the target rather than one turn pair:
+    /// it is independent of turn shape and tokenizer, and a single agentic
+    /// turn can be larger than the whole target. The planner's hard input cap
+    /// still bounds the real request, so the floor never admits an
+    /// over-limit request; it only stops LCM from refusing every turn.
+    fn working_set_budget(&self, state: &LcmState) -> (u64, bool) {
+        let Some(policy) = self.working_set else {
+            return (self.policy.input_budget_tokens, false);
+        };
+        let target = u64::from(policy.target_tokens);
+        let floor = (target * WORKING_SET_FLOOR_PERCENT / 100).max(1);
+        let remaining = target.saturating_sub(state.fixed_overhead_tokens);
+        if remaining < floor {
+            (floor, true)
+        } else {
+            (remaining, false)
+        }
+    }
+
+    /// Typed diagnostic for a clamped working-set budget. It carries the
+    /// clamped thresholds, the measured overhead and the working-set target;
+    /// no content.
+    fn overhead_clamp_event(
+        &self,
+        binding: &LcmTimelineBinding,
+        state: &LcmState,
+    ) -> Result<Option<HarnessEvent>, RuntimeError> {
+        let (budget, clamped) = self.working_set_budget(state);
+        let Some(policy) = self.working_set.filter(|_| clamped) else {
+            return Ok(None);
+        };
+        let threshold_tokens = |percent: u8| {
+            ((u128::from(budget) * u128::from(percent)) / 100).min(u128::from(u32::MAX)) as u32
+        };
+        Self::validated_lifecycle_event(
+            LcmLifecycleKind::PressureDecision,
+            Some(LcmLifecycleReason::OverheadExceedsTarget),
+            LcmLifecycleMetadata {
+                timeline_id: Some(Self::event_id(binding.timeline.as_str())),
+                dag_revision: Some(state.dag_revision.get()),
+                soft_threshold_tokens: Some(threshold_tokens(
+                    self.policy.pressure.soft_threshold_percent,
+                )),
+                hard_threshold_tokens: Some(threshold_tokens(
+                    self.policy.pressure.hard_threshold_percent,
+                )),
+                policy_revision: Some(self.policy.pressure.revision.clone()),
+                sizer_revision: Some(self.policy.sizer.revision()),
+                overhead_tokens: Some(
+                    u32::try_from(state.fixed_overhead_tokens).unwrap_or(u32::MAX),
+                ),
+                target_tokens: Some(policy.target_tokens),
+                ..LcmLifecycleMetadata::default()
+            },
+        )
+        .map(Some)
     }
 
     /// Replaces the conservative role-aware classifier with a host-owned one.
@@ -1578,6 +1670,7 @@ impl LcmCoordinator {
             operation_watermarks,
             pending_summary,
             hard_rounds,
+            hard_round_limit: 0,
             fixed_overhead_tokens: self
                 .overheads
                 .lock()
@@ -1602,21 +1695,37 @@ impl LcmCoordinator {
         history: &[Message],
     ) -> Result<LcmState, RuntimeError> {
         self.append_history(binding, previous, history).await?;
-        self.checkpoint_state(
-            binding,
-            history,
-            previous.map_or(&[], |state| state.operation_watermarks.as_slice()),
-            previous.and_then(|state| state.model_purpose.clone()),
-            previous.and_then(|state| state.pending_summary.clone()),
-            previous.map_or(0, |state| state.hard_rounds),
-        )
-        .await
+        let mut state = self
+            .checkpoint_state(
+                binding,
+                history,
+                previous.map_or(&[], |state| state.operation_watermarks.as_slice()),
+                previous.and_then(|state| state.model_purpose.clone()),
+                previous.and_then(|state| state.pending_summary.clone()),
+                previous.map_or(0, |state| state.hard_rounds),
+            )
+            .await?;
+        if state.hard_rounds > 0 {
+            state.hard_round_limit = previous.map_or(0, |state| state.hard_round_limit);
+        }
+        Ok(state)
+    }
+
+    /// The hard-round bound to report: the explicit policy value, or the
+    /// derived bound of the open epoch (zero when none is open).
+    fn reported_max_rounds(&self, state: &LcmState) -> usize {
+        if self.policy.pressure.max_rounds == 0 {
+            state.hard_round_limit
+        } else {
+            self.policy.pressure.max_rounds
+        }
     }
 
     fn cannot_fit_error(
         &self,
         required_tokens: u64,
         rounds: usize,
+        max_rounds: usize,
         available_tokens: u64,
     ) -> RuntimeError {
         let mut metadata = Metadata::new();
@@ -1625,7 +1734,7 @@ impl LcmCoordinator {
             .insert("required_tokens", required_tokens)
             .insert("available_tokens", available_tokens)
             .insert("rounds", rounds as u64)
-            .insert("max_rounds", self.policy.pressure.max_rounds as u64);
+            .insert("max_rounds", max_rounds as u64);
         RuntimeError::limit("LCM context cannot fit after bounded hard compaction")
             .with_metadata(metadata)
             .with_class(FailureClass::ContextOverflow {
@@ -2007,10 +2116,15 @@ impl LcmCoordinator {
         })
     }
 
+    /// `widen_into_retained` lets an unsummarizable leaf widen into the
+    /// retained recent entries. Hard admission sets it (its source already
+    /// ends before the active turn); idle compaction does not, so an idle
+    /// pass never summarizes the newest retained turns to absorb a tiny one.
     fn plan_canonical_leaf(
         &self,
         raw_entries: &[LcmEntry],
         history_len: usize,
+        widen_into_retained: bool,
     ) -> Result<Option<agent_runtime_lcm::LeafPlan>, RuntimeError> {
         let retained_limit = raw_entries
             .len()
@@ -2045,9 +2159,13 @@ impl LcmCoordinator {
             boundary = oldest_turn_end;
             target_tokens = u64::MAX;
         }
+        // The narrowest valid plan that the deterministic fallback cannot
+        // shrink, kept while wider plans are tried. Returned (and then failing
+        // as a structured `cannot_fit`) only when no wider plan exists.
+        let mut unsummarizable: Option<agent_runtime_lcm::LeafPlan> = None;
         loop {
             let Some(first_entry) = raw_entries.first() else {
-                return Ok(None);
+                return Ok(unsummarizable);
             };
             let Some(plan) = plan_leaf_with_frontier(
                 &raw_entries[..boundary],
@@ -2060,11 +2178,11 @@ impl LcmCoordinator {
             )
             .map_err(map_lcm_error)?
             else {
-                return Ok(None);
+                return Ok(unsummarizable);
             };
             let selected = plan.entries.len();
             if selected == 0 {
-                return Ok(None);
+                return Ok(unsummarizable);
             }
             let at_user_boundary = selected == boundary
                 || selected == raw_entries.len()
@@ -2072,7 +2190,41 @@ impl LcmCoordinator {
                     .get(selected)
                     .is_some_and(|entry| entry.content.role == Role::User);
             if at_user_boundary && complete_tool_exchanges(&plan.entries) {
-                return Ok(Some(plan));
+                if self
+                    .summarizer
+                    .can_always_summarize(&plan.entries, self.policy.sizer.as_ref())
+                {
+                    return Ok(Some(plan));
+                }
+                let widen_limit = if widen_into_retained {
+                    raw_entries.len()
+                } else {
+                    raw_entries
+                        .len()
+                        .saturating_sub(self.policy.pressure.retain_recent_entries)
+                };
+                let next_end = raw_entries
+                    .iter()
+                    .enumerate()
+                    .skip(selected + 1)
+                    .find(|(_, entry)| entry.content.role == Role::User)
+                    .map_or(raw_entries.len(), |(index, _)| index);
+                if selected >= raw_entries.len() || next_end > widen_limit {
+                    return Ok(Some(unsummarizable.unwrap_or(plan)));
+                }
+                // A source smaller than the fallback's own framing (one short
+                // turn such as "start"/"ok") cannot be summarized at any
+                // level. Widen it through the next turn rather than failing
+                // on it at every admission. The plan stays deterministic, so
+                // pending-response validation recomputes the same source.
+                boundary = next_end;
+                target_tokens = u64::MAX;
+                unsummarizable.get_or_insert(plan);
+                continue;
+            }
+            if unsummarizable.is_some() {
+                // The widened source is not a valid leaf; keep the narrowest.
+                return Ok(unsummarizable);
             }
             // A target-sized plan can stop in the middle of a canonical turn,
             // or the retain boundary can leave a tool call/result half in the
@@ -2128,7 +2280,7 @@ impl LcmCoordinator {
             LCM_SUMMARY_PURPOSE
         };
         let mut report = CompactionReport::default();
-        if let Some(plan) = self.plan_canonical_leaf(&raw_entries, history_len)? {
+        if let Some(plan) = self.plan_canonical_leaf(&raw_entries, history_len, !idle)? {
             if plan.eligible_for_model {
                 let operation_id = Self::operation_id("leaf", &plan.operation_fingerprint);
                 // Admission is recorded before any model attempt. The
@@ -2323,6 +2475,55 @@ impl LcmCoordinator {
         Ok(report)
     }
 
+    /// Whether a protected pending response was produced under the current
+    /// summary model, policies, algorithm and sizer. Only such a response is
+    /// validated by recomputing its exact plan; any other one must pass the
+    /// source-identity validation for responses that predate a tuning change.
+    fn pending_tunables_current(&self, pending: &LcmPendingSummary) -> bool {
+        let (model_id, model_revision, summary_policy_revision, policy, algorithm, sizer) =
+            match pending {
+                LcmPendingSummary::Leaf {
+                    model_id,
+                    model_revision,
+                    summary_policy_revision,
+                    commit,
+                    ..
+                } => (
+                    model_id,
+                    model_revision,
+                    summary_policy_revision,
+                    &commit.policy_revision,
+                    &commit.algorithm_revision,
+                    &commit.sizer_revision,
+                ),
+                LcmPendingSummary::Condensation {
+                    model_id,
+                    model_revision,
+                    summary_policy_revision,
+                    commit,
+                    ..
+                } => (
+                    model_id,
+                    model_revision,
+                    summary_policy_revision,
+                    &commit.policy_revision,
+                    &commit.algorithm_revision,
+                    &commit.sizer_revision,
+                ),
+            };
+        model_id == self.model.id()
+            && model_revision == self.model.revision()
+            && summary_policy_revision == &self.summarizer.policy().policy_revision
+            && policy == &self.policy.pressure.revision
+            && algorithm == &self.policy.algorithm_revision
+            && *sizer == self.policy.sizer.revision()
+    }
+
+    /// Envelope checks. Timeline, classifier and operation identity are
+    /// always exact. Tunable revisions must be well formed here; a response
+    /// whose tunables differ from the current ones is accepted only through
+    /// the source-identity validation in plan validation (see
+    /// [`Self::pending_tunables_current`]), never by this check alone.
     fn validate_pending_metadata(
         &self,
         binding: &LcmTimelineBinding,
@@ -2458,18 +2659,7 @@ impl LcmCoordinator {
         // A response protected under older tunables retains its own sizing
         // and plan provenance. Validate canonical source identity rather than
         // attempting to reproduce its selection using a different policy.
-        let older = match pending {
-            LcmPendingSummary::Leaf { commit, .. } => {
-                commit.policy_revision != self.policy.pressure.revision
-                    || commit.algorithm_revision != self.policy.algorithm_revision
-                    || commit.sizer_revision != self.policy.sizer.revision()
-            }
-            LcmPendingSummary::Condensation { commit, .. } => {
-                commit.policy_revision != self.policy.pressure.revision
-                    || commit.algorithm_revision != self.policy.algorithm_revision
-                    || commit.sizer_revision != self.policy.sizer.revision()
-            }
-        };
+        let older = !self.pending_tunables_current(pending);
         if older {
             match pending {
                 LcmPendingSummary::Leaf { commit, .. } => {
@@ -2572,7 +2762,11 @@ impl LcmCoordinator {
                     .cloned()
                     .collect::<Vec<_>>();
                 let plan = self
-                    .plan_canonical_leaf(&raw_entries, history.len())?
+                    .plan_canonical_leaf(
+                        &raw_entries,
+                        history.len(),
+                        purpose == LCM_SUMMARY_PURPOSE,
+                    )?
                     .ok_or_else(|| {
                         RuntimeError::conflict("LCM pending summary source plan disappeared")
                     })?;
@@ -3095,7 +3289,7 @@ impl LcmCoordinator {
                             &operations,
                             state.model_purpose.clone(),
                             state.pending_summary.clone(),
-                            state.hard_rounds,
+                            (state.hard_rounds, state.hard_round_limit),
                             usage,
                             events,
                             error,
@@ -3120,6 +3314,7 @@ impl LcmCoordinator {
             // Clearing the pending body is itself protected state progress.
             // The driver checkpoints this patch in `Planning` before any
             // provider call (or before another staged round).
+            let hard_round_limit = state.hard_round_limit;
             state = self
                 .checkpoint_state(
                     &binding,
@@ -3130,12 +3325,17 @@ impl LcmCoordinator {
                     state.hard_rounds,
                 )
                 .await?;
+            if state.hard_rounds > 0 {
+                state.hard_round_limit = hard_round_limit;
+            }
         }
 
         let required_tokens = self
             .accounted_context_tokens(&binding, &view.history, &state)
             .await?;
         let decision = self.pressure_decision(&state, required_tokens);
+        // Emitted once per admission pass, where a clamp changes the outcome.
+        events.extend(self.overhead_clamp_event(&binding, &state)?);
         events.push(self.pressure_event(&binding, &state, required_tokens, &decision)?);
         match decision {
             LcmPressureDecision::None { .. } | LcmPressureDecision::Soft { .. } => {
@@ -3165,23 +3365,21 @@ impl LcmCoordinator {
                     &operations,
                     state.model_purpose.clone(),
                     state.pending_summary.clone(),
-                    state.hard_rounds,
+                    (state.hard_rounds, state.hard_round_limit),
                     usage,
                     events,
                     self.cannot_fit_error(
                         required_tokens,
                         state.hard_rounds,
+                        self.reported_max_rounds(&state),
                         self.pressure_budget(&state),
                     ),
                 )
                 .await
             }
             LcmPressureDecision::Hard { max_rounds, .. } => {
-                let max_rounds = if self.policy.pressure.max_rounds == 0 {
-                    max_rounds.saturating_add(state.hard_rounds).min(1_024)
-                } else {
-                    max_rounds
-                };
+                // `pressure_decision` keeps a derived bound fixed for the
+                // whole admission epoch, so this is a real limit.
                 if state.hard_rounds >= max_rounds {
                     return self
                         .checkpointed_block(
@@ -3190,12 +3388,13 @@ impl LcmCoordinator {
                             &operations,
                             state.model_purpose.clone(),
                             state.pending_summary.clone(),
-                            state.hard_rounds,
+                            (state.hard_rounds, max_rounds),
                             usage,
                             events,
                             self.cannot_fit_error(
                                 required_tokens,
                                 state.hard_rounds,
+                                max_rounds,
                                 self.pressure_budget(&state),
                             ),
                         )
@@ -3217,6 +3416,24 @@ impl LcmCoordinator {
                         {
                             usage.push(record);
                         }
+                        // A source that cannot be summarized under hard
+                        // pressure ends the epoch like an exhausted round
+                        // budget: what fit stays committed and the host gets
+                        // the structured `cannot_fit`, with the summary
+                        // diagnostics carried over.
+                        let error = if is_cannot_fit(&error) {
+                            with_summary_diagnostics(
+                                self.cannot_fit_error(
+                                    required_tokens,
+                                    state.hard_rounds,
+                                    max_rounds,
+                                    self.pressure_budget(&state),
+                                ),
+                                &error,
+                            )
+                        } else {
+                            error
+                        };
                         return self
                             .checkpointed_block(
                                 &binding,
@@ -3224,7 +3441,7 @@ impl LcmCoordinator {
                                 &operations,
                                 state.model_purpose.clone(),
                                 state.pending_summary.clone(),
-                                state.hard_rounds,
+                                (state.hard_rounds, max_rounds),
                                 usage,
                                 events,
                                 error,
@@ -3240,12 +3457,13 @@ impl LcmCoordinator {
                             &operations,
                             state.model_purpose.clone(),
                             state.pending_summary.clone(),
-                            state.hard_rounds,
+                            (state.hard_rounds, max_rounds),
                             usage,
                             events,
                             self.cannot_fit_error(
                                 required_tokens,
                                 state.hard_rounds,
+                                max_rounds,
                                 self.pressure_budget(&state),
                             ),
                         )
@@ -3264,6 +3482,7 @@ impl LcmCoordinator {
                         hard_rounds,
                     )
                     .await?;
+                state.hard_round_limit = max_rounds;
                 Ok(BeforeProviderPatch::checkpoint_and_retry(TurnCommitPatch {
                     state: Some(self.state_patch(&state)?),
                     usage,
@@ -3281,12 +3500,12 @@ impl LcmCoordinator {
         operations: &[LcmOperationWatermark],
         model_purpose: Option<String>,
         pending_summary: Option<LcmPendingSummary>,
-        hard_rounds: usize,
+        (hard_rounds, hard_round_limit): (usize, usize),
         usage: Vec<UsageRecord>,
         mut events: Vec<HarnessEvent>,
         error: RuntimeError,
     ) -> Result<BeforeProviderPatch, RuntimeError> {
-        let state = self
+        let mut state = self
             .checkpoint_state(
                 binding,
                 history,
@@ -3296,6 +3515,9 @@ impl LcmCoordinator {
                 hard_rounds,
             )
             .await?;
+        if hard_rounds > 0 {
+            state.hard_round_limit = hard_round_limit;
+        }
         events.push(self.failure_event(binding, &state, &error)?);
         Ok(BeforeProviderPatch::blocked(
             TurnCommitPatch {
@@ -4124,6 +4346,26 @@ fn legacy_node_matches(
         && node.classification == commit.classification
         && node.operation_id == commit.operation_id
         && node.operation_fingerprint == expected_operation_fingerprint
+}
+
+/// Whether an LCM operation failed because its source cannot fit (a
+/// summary that cannot strictly shrink, or a store-level cannot-fit).
+fn is_cannot_fit(error: &RuntimeError) -> bool {
+    error.kind == ErrorKind::Limit && matches!(error.class, FailureClass::ContextOverflow { .. })
+}
+
+/// Carries summary usage and escalation diagnostics onto a replacement error.
+fn with_summary_diagnostics(mut error: RuntimeError, source: &RuntimeError) -> RuntimeError {
+    for key in [
+        "summary_attempts",
+        "summary_input_tokens",
+        "summary_output_tokens",
+    ] {
+        if let Some(value) = source.metadata.get(key) {
+            error.metadata.insert(key, value.clone());
+        }
+    }
+    error
 }
 
 fn map_summary_error(error: LcmSummaryError) -> RuntimeError {
@@ -5434,6 +5676,7 @@ mod tests {
             operation_watermarks: Vec::new(),
             pending_summary: None,
             hard_rounds: 0,
+            hard_round_limit: 0,
             fixed_overhead_tokens: 0,
         };
         let value = serde_json::to_value(state).unwrap();
@@ -5537,17 +5780,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_tiny_first_turn_then_large_turns() {
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let coordinator = pressure_coordinator_retaining(store.clone(), 8_000, 3, 2_048, 4);
+        let big = "x".repeat(12_000);
+        let mut history = vec![
+            Message::user("start"),
+            Message::assistant(vec![ContentPart::text("ok")]),
+        ];
+        for _ in 0..3 {
+            history.push(Message::user(big.clone()));
+            history.push(Message::assistant(vec![ContentPart::text(big.clone())]));
+        }
+        history.push(Message::user("next"));
+        let outcome = drain_before_provider(
+            &coordinator,
+            commit_view(&SessionId::new("lcm-session"), "hard-turn", &history, None),
+        )
+        .await;
+        eprintln!(
+            "AUDIT block={:?} leafs={}",
+            outcome.block.as_ref().map(|e| (&e.message, &e.metadata)),
+            store.leaf_commit_count.load(Ordering::SeqCst)
+        );
+        if let Some(error) = outcome.block {
+            assert_eq!(
+                error
+                    .metadata
+                    .get("category")
+                    .map(|v| v.to_string())
+                    .as_deref(),
+                Some("cannot_fit"),
+                "tiny oldest turn must not wedge compaction with an unstructured summary error"
+            );
+        }
+        assert!(store.leaf_commit_count.load(Ordering::SeqCst) >= 1);
+        // Right reason: the 11-token "start"/"ok" turn is smaller than the
+        // deterministic fallback's framing, so the planner widened the first
+        // leaf through the next turn instead of selecting it alone.
+        assert_eq!(store.leaf_commit_count.load(Ordering::SeqCst), 2);
+        let first = store
+            .active_nodes_for_test()
+            .into_iter()
+            .min_by_key(|node| node.range.start)
+            .expect("committed leaf");
+        assert_eq!(first.range.start.get(), 0);
+        assert_eq!(first.range.end.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn audit_overhead_at_or_above_target_blocks_every_turn() {
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let mut coordinator = pressure_coordinator_retaining(store.clone(), 100_000, 0, 2_048, 4);
+        coordinator.working_set = Some(crate::runtime::WorkingSetPolicy {
+            target_tokens: 1_000,
+            hard_tokens: 2_000,
+        });
+        let session = SessionId::new("lcm-session");
+        coordinator
+            .overheads
+            .lock()
+            .unwrap()
+            .insert(session.clone(), 1_000);
+        let history = vec![
+            Message::user("hello"),
+            Message::assistant(vec![ContentPart::text("hi")]),
+            Message::user("next"),
+        ];
+        let outcome =
+            drain_before_provider(&coordinator, commit_view(&session, "turn", &history, None))
+                .await;
+        let persisted = outcome.patch.state.clone();
+        eprintln!(
+            "AUDIT block={:?} persisted_overhead={:?}",
+            outcome.block.as_ref().map(|e| (&e.message, &e.metadata)),
+            persisted
+                .as_ref()
+                .map(|s| s.value["fixed_overhead_tokens"].clone())
+        );
+        assert!(
+            outcome.block.is_none(),
+            "a ~20-token conversation must not be refused because measured overhead reached the target"
+        );
+        // The clamp is reported as a typed diagnostic carrying the floor
+        // (25% of the 1,000-token target) as the pressure budget.
+        let clamp = outcome
+            .patch
+            .events
+            .iter()
+            .find_map(|event| match event {
+                HarnessEvent::LcmLifecycle {
+                    reason: Some(LcmLifecycleReason::OverheadExceedsTarget),
+                    metadata,
+                    ..
+                } => Some(metadata.clone()),
+                _ => None,
+            })
+            .expect("a clamped working-set budget emits a typed diagnostic");
+        assert_eq!(clamp.overhead_tokens, Some(1_000));
+        assert_eq!(clamp.target_tokens, Some(1_000));
+        assert_eq!(clamp.input_tokens, None);
+        assert_eq!(clamp.output_tokens, None);
+        assert_eq!(
+            clamp.hard_threshold_tokens,
+            Some((250 * u32::from(coordinator.policy.pressure.hard_threshold_percent)) / 100)
+        );
+    }
+
+    #[tokio::test]
     async fn hard_compaction_stops_at_max_rounds_and_returns_structured_cannot_fit() {
         let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
         let coordinator = pressure_coordinator(store.clone(), 15, 2, 16);
         let history = (0..8)
             .flat_map(|index| {
                 [
-                    Message::user(format!("request {index} {}", "large source ".repeat(20))),
-                    Message::assistant(vec![ContentPart::text(format!(
-                        "answer {index} {}",
-                        "large source ".repeat(20)
-                    ))]),
+                    Message::user(format!("request {index}")),
+                    Message::assistant(vec![ContentPart::text(format!("answer {index}"))]),
                 ]
             })
             .collect::<Vec<_>>();
@@ -5556,6 +5904,101 @@ mod tests {
             commit_view(&SessionId::new("lcm-session"), "hard-turn", &history, None),
         )
         .await;
+        let error = outcome
+            .block
+            .expect("remaining hard pressure must block provider admission");
+        assert!(outcome.patch.state.is_some());
+        assert_eq!(error.kind, agent_runtime_core::error::ErrorKind::Limit);
+        assert_eq!(
+            error.metadata.get("category").unwrap().to_string(),
+            "cannot_fit"
+        );
+        assert_eq!(error.metadata.get("rounds").unwrap().to_string(), "2");
+        assert_eq!(store.leaf_commit_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// `RuntimeBuilder::lcm` shares the planner sizer only in place of the
+    /// default; a host-supplied `LcmSizer` survives composition.
+    #[test]
+    fn planner_composition_replaces_only_the_default_sizer() {
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let planner: Arc<dyn agent_runtime_context::RequestSizer> =
+            Arc::new(agent_runtime_context::CharRatioSizer::default().with_chars_per_token(2));
+        let shared = agent_runtime_lcm::RequestSizerAdapter::new(planner.clone()).revision();
+        let defaulted = pressure_coordinator(store.clone(), 15, 2, 16)
+            .with_planner_policy(planner.clone(), None);
+        assert_eq!(defaulted.policy.sizer.revision(), shared);
+        let host = agent_runtime_lcm::CharRatioSizer::default().with_chars_per_token(3);
+        let mut custom = pressure_coordinator(store, 15, 2, 16);
+        custom.policy.sizer = Arc::new(host);
+        let custom = custom.with_planner_policy(planner, None);
+        assert_eq!(custom.policy.sizer.revision(), host.revision());
+    }
+
+    /// A derived hard-round bound is fixed when the admission epoch starts;
+    /// later rounds in the same epoch do not extend it.
+    #[tokio::test]
+    async fn derived_hard_round_bound_is_fixed_per_admission_epoch() {
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let coordinator = pressure_coordinator(store.clone(), 15, 0, 16);
+        let history = (0..8)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("request {index}")),
+                    Message::assistant(vec![ContentPart::text(format!("answer {index}"))]),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let session = SessionId::new("lcm-session");
+        let first = coordinator
+            .before_provider(&commit_view(&session, "hard-turn", &history, None))
+            .await
+            .unwrap();
+        assert!(first.retry_admission);
+        let persisted = first.patch.state.clone().unwrap().into_state();
+        let binding = coordinator.timeline_binding(&session).unwrap();
+        let state = coordinator.decode_state(&binding, &persisted).unwrap();
+        assert_eq!(state.hard_rounds, 1);
+        let limit = state.hard_round_limit;
+        assert!((2..=agent_runtime_lcm::MAX_DERIVED_HARD_ROUNDS).contains(&limit));
+        let outcome = drain_before_provider(
+            &coordinator,
+            commit_view(&session, "hard-turn", &history, Some(persisted)),
+        )
+        .await;
+        let error = outcome.block.expect("15-token budget cannot fit");
+        assert_eq!(
+            error.metadata.get("max_rounds").unwrap().to_string(),
+            limit.to_string()
+        );
+        assert!(
+            store.leaf_commit_count.load(Ordering::SeqCst) <= limit,
+            "rounds stop at the bound fixed by the first round"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_small_turns_hard_compaction() {
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let coordinator = pressure_coordinator(store.clone(), 15, 2, 16);
+        let history = (0..8)
+            .flat_map(|index| {
+                [
+                    Message::user(format!("request {index}")),
+                    Message::assistant(vec![ContentPart::text(format!("answer {index}"))]),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let outcome = drain_before_provider(
+            &coordinator,
+            commit_view(&SessionId::new("lcm-session"), "hard-turn", &history, None),
+        )
+        .await;
+        eprintln!(
+            "AUDIT block={:?} leafs={}",
+            outcome.block,
+            store.leaf_commit_count.load(Ordering::SeqCst)
+        );
         let error = outcome
             .block
             .expect("remaining hard pressure must block provider admission");

@@ -17,3 +17,12 @@ completed_at: 2026-10-04T22:10:00Z
 - [x] 2.2 Run changed-crate tests, testkit conformance and consumer fixtures.
 - [x] 2.3 Run final fmt, workspace clippy, docs, MSRV and deny gates once; rerun failures only.
 - [x] 2.4 Update Unreleased changelog and record API/adoption/results in journal.
+
+## 3. Audit fix round
+- [x] 3.1 Deterministic fallback keeps min(cap, source - 1); widen unsummarizable leaves; structured cannot_fit for summary cannot-fit under hard pressure.
+- [x] 3.2 Floor the working-set pressure budget at 25% of target with a typed OverheadExceedsTarget diagnostic.
+- [x] 3.3 Roll back idle batch memory when the exact idle checkpoint fails.
+- [x] 3.4 Keep a host LcmSizer; share the planner sizer only in place of the default.
+- [x] 3.5 One shared derived-rounds formula, fixed per admission epoch, capped at 64.
+- [x] 3.6 Provider summary per-call/per-operation limits, trigger purpose and per-operation cancellation.
+- [x] 3.7 Changelog consumer-break list; pending checks route every tunable mismatch through source identity.

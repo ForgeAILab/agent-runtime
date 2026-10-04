@@ -354,11 +354,18 @@ pub struct LcmEscalationPolicy {
     pub policy_revision: RegistryRevision,
     /// Desired source span for leaf selection, separate from output size.
     pub leaf_source_target_tokens: u64,
-    /// Maximum measured summary/source ratio (default 0.25).
+    /// Maximum measured summary/source ratio for model output (default 0.25).
+    /// The deterministic fallback is not ratio-capped; it only has to fit
+    /// `deterministic_token_cap` and strictly shrink its source.
     pub summary_max_ratio: f64,
-    /// Minimum reclaimed source fraction; weaker summaries escalate.
+    /// Minimum reclaimed source fraction for model output (default 0.5);
+    /// weaker summaries escalate. It caps output at `1 - min_reclaim_ratio`
+    /// of the source, so it binds only when `summary_max_ratio` is above
+    /// that. At the defaults the 0.25 ratio is stricter and this guard has no
+    /// effect; it exists for hosts that raise `summary_max_ratio`.
     pub min_reclaim_ratio: f64,
-    /// Deterministic fallback cap.
+    /// Deterministic fallback cap. The fallback target is
+    /// `min(deterministic_token_cap, source_tokens - 1)`.
     pub deterministic_token_cap: u64,
     /// Deterministic algorithm revision.
     pub algorithm_revision: RegistryRevision,
@@ -398,6 +405,16 @@ impl LcmEscalationPolicy {
             });
         }
         Ok(())
+    }
+
+    /// Tokens one leaf round of this policy is expected to reclaim; the
+    /// input to [`crate::derive_hard_rounds`].
+    pub fn expected_reclaim_tokens(&self) -> u64 {
+        crate::expected_leaf_reclaim_tokens(
+            self.leaf_source_target_tokens,
+            self.summary_max_ratio,
+            self.min_reclaim_ratio,
+        )
     }
 }
 
@@ -598,6 +615,52 @@ impl LcmEscalatingSummarizer {
         .await
     }
 
+    /// Whether the level-3 deterministic fallback strictly shrinks `entries`.
+    /// When it does, summarizing them always succeeds whatever the model
+    /// returns. When it does not (a source smaller than the fallback's own
+    /// framing), no summary is guaranteed, so a planner should widen the
+    /// source instead of selecting it alone.
+    pub fn can_always_summarize(&self, entries: &[LcmEntry], sizer: &dyn LcmSizer) -> bool {
+        let Some(source_tokens) = entries
+            .iter()
+            .map(|entry| sizer.entry_tokens(entry))
+            .try_fold(0_u64, u64::checked_add)
+        else {
+            return false;
+        };
+        let messages = entries
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect::<Vec<_>>();
+        source_tokens > 1
+            && self
+                .deterministic_fallback(&messages, source_tokens, sizer)
+                .is_ok()
+    }
+
+    /// The deterministic fallback, or its target when it cannot strictly
+    /// shrink the source. The ratio cap governs model output only: the
+    /// fallback target is `min(deterministic_token_cap, source_tokens - 1)`,
+    /// so any source that can strictly shrink at all gets a summary.
+    fn deterministic_fallback(
+        &self,
+        messages: &[Message],
+        source_tokens: u64,
+        sizer: &dyn LcmSizer,
+    ) -> Result<(String, u64), u64> {
+        let serialized = render_summary_source(messages, Some(256));
+        let target = self
+            .policy
+            .deterministic_token_cap
+            .min(source_tokens.saturating_sub(1));
+        let text = truncate_head_tail_to_cap(&serialized, target, sizer);
+        let token_count = sizer.summary_tokens(&text);
+        if text.trim().is_empty() || token_count >= source_tokens {
+            return Err(target);
+        }
+        Ok((text, token_count))
+    }
+
     async fn summarize_prepared(
         &self,
         source: PreparedSummarySource,
@@ -698,20 +761,20 @@ impl LcmEscalatingSummarizer {
                 attempts,
             });
         }
-        let serialized = render_summary_source(&source.messages, Some(256));
-        let target = self.policy.deterministic_token_cap.min(maximum);
-        let text = truncate_head_tail_to_cap(&serialized, target, sizer);
-        let token_count = sizer.summary_tokens(&text);
-        if text.trim().is_empty() || token_count > target || token_count >= source.source_tokens {
-            let (input_tokens, output_tokens) = total_attempt_usage(&attempts)?;
-            return Err(LcmSummaryError::CannotFitWithUsage {
-                required_tokens: source.source_tokens,
-                available_tokens: target,
-                input_tokens,
-                output_tokens,
-                attempts,
-            });
-        }
+        let (text, token_count) =
+            match self.deterministic_fallback(&source.messages, source.source_tokens, sizer) {
+                Ok(fallback) => fallback,
+                Err(target) => {
+                    let (input_tokens, output_tokens) = total_attempt_usage(&attempts)?;
+                    return Err(LcmSummaryError::CannotFitWithUsage {
+                        required_tokens: source.source_tokens,
+                        available_tokens: target,
+                        input_tokens,
+                        output_tokens,
+                        attempts,
+                    });
+                }
+            };
         let (input_tokens, output_tokens) = total_attempt_usage(&attempts)?;
         Ok(LcmSummaryOutcome {
             text,
@@ -1020,7 +1083,7 @@ mod tests {
             model,
             LcmEscalationPolicy {
                 leaf_source_target_tokens: 48,
-                summary_max_ratio: 0.07,
+                summary_max_ratio: 0.06,
                 ..LcmEscalationPolicy::default()
             },
         )

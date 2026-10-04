@@ -169,10 +169,10 @@ impl LcmWriter for CountingStore {
 }
 
 #[derive(Debug, Default)]
-struct CountingSizer(Mutex<Vec<String>>);
+struct CountingSizer(Mutex<Vec<u64>>);
 impl LcmSizer for CountingSizer {
     fn entry_tokens(&self, entry: &LcmEntry) -> u64 {
-        self.0.lock().unwrap().push(entry.content.joined_text());
+        self.0.lock().unwrap().push(entry.sequence.get());
         CharRatioSizer::default().entry_tokens(entry)
     }
     fn summary_tokens(&self, text: &str) -> u64 {
@@ -180,38 +180,6 @@ impl LcmSizer for CountingSizer {
     }
     fn revision(&self) -> RegistryRevision {
         CharRatioSizer::default().revision()
-    }
-}
-
-impl agent_runtime::context::RequestSizer for CountingSizer {
-    fn size_fragment(&self, fragment: &agent_runtime::context::ContextFragment) -> u32 {
-        agent_runtime::context::RequestSizer::size_fragment(
-            &agent_runtime::context::CharRatioSizer::default(),
-            fragment,
-        )
-    }
-    fn size_message(&self, message: &Message) -> u32 {
-        if message.role != agent_runtime_core::content::Role::System {
-            self.0.lock().unwrap().push(message.joined_text());
-        }
-        agent_runtime::context::RequestSizer::size_message(
-            &agent_runtime::context::CharRatioSizer::default(),
-            message,
-        )
-    }
-    fn size_tool_schema(&self, schema: &agent_runtime_core::provider::ToolSchema) -> u32 {
-        agent_runtime::context::RequestSizer::size_tool_schema(
-            &agent_runtime::context::CharRatioSizer::default(),
-            schema,
-        )
-    }
-    fn revision(&self) -> agent_runtime_core::catalog::ComponentRef {
-        agent_runtime::context::RequestSizer::revision(
-            &agent_runtime::context::CharRatioSizer::default(),
-        )
-    }
-    fn confidence(&self) -> agent_runtime::context::EstimationConfidence {
-        agent_runtime::context::EstimationConfidence::Estimated
     }
 }
 
@@ -420,7 +388,6 @@ pub async fn assert_authorized_accounting() {
         .session_store(sessions.clone())
         .checkpoint_store(exact.clone())
         .observer(observer.clone())
-        .request_sizer(sizer.clone())
         .lcm(coordinator(&id, store.clone(), sizer.clone(), false))
         .build()
         .unwrap();
@@ -429,25 +396,12 @@ pub async fn assert_authorized_accounting() {
         .await
         .unwrap();
     session.run(UserInput::text("first")).await.unwrap();
-    assert_eq!(
-        *sizer.0.lock().unwrap(),
-        session
-            .history()
-            .iter()
-            .map(Message::joined_text)
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(*sizer.0.lock().unwrap(), [0, 1]);
     sizer.0.lock().unwrap().clear();
     store.ranges.lock().unwrap().clear();
     let authorizations = store.authorizations.load(Ordering::SeqCst);
     session.run(UserInput::text("second")).await.unwrap();
-    assert_eq!(
-        *sizer.0.lock().unwrap(),
-        session.history()[2..]
-            .iter()
-            .map(Message::joined_text)
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(*sizer.0.lock().unwrap(), [2, 3]);
     assert!(store.authorizations.load(Ordering::SeqCst) > authorizations);
     assert!(
         store.ranges.lock().unwrap().contains(&(0, 2)),
@@ -474,7 +428,6 @@ pub async fn assert_authorized_accounting() {
         .session_store(sessions)
         .checkpoint_store(exact)
         .observer(observer.clone())
-        .request_sizer(sizer.clone())
         .lcm(coordinator(&id, store.clone(), sizer.clone(), false))
         .build()
         .unwrap();
@@ -489,13 +442,7 @@ pub async fn assert_authorized_accounting() {
         "cold resume validates canonical source content"
     );
     resumed.try_idle_compaction().await.unwrap();
-    assert_eq!(
-        *sizer.0.lock().unwrap(),
-        held.history
-            .iter()
-            .map(Message::joined_text)
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(*sizer.0.lock().unwrap(), [0, 1, 2, 3]);
     let calls = provider.requests().len();
     store.inner.authority().revoke();
     resumed.run(UserInput::text("denied")).await.unwrap();

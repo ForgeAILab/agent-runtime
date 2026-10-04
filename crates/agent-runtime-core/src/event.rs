@@ -313,6 +313,11 @@ pub enum LcmLifecycleReason {
     SoftThresholdExceeded,
     /// The observed pressure crossed the hard threshold.
     HardThresholdExceeded,
+    /// Measured fixed request overhead left less than the working-set floor,
+    /// so pressure used the floor instead of refusing the turn. Thresholds
+    /// carry the clamped budget, `overhead_tokens` the measured overhead and
+    /// `target_tokens` the working-set target.
+    OverheadExceedsTarget,
     /// The operation won admission for its checkpoint.
     Admitted,
     /// Another compatible operation already owns the checkpoint.
@@ -532,6 +537,13 @@ pub struct LcmLifecycleMetadata {
     /// Tokens reclaimed by the committed operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reclaimed_tokens: Option<u32>,
+    /// Measured fixed request overhead (planner input outside the projected
+    /// history), reported by working-set diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_tokens: Option<u32>,
+    /// Working-set pressure target, reported by working-set diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_tokens: Option<u32>,
 }
 
 impl fmt::Debug for LcmLifecycleMetadata {
@@ -577,6 +589,8 @@ impl fmt::Debug for LcmLifecycleMetadata {
             .field("input_tokens", &self.input_tokens)
             .field("output_tokens", &self.output_tokens)
             .field("reclaimed_tokens", &self.reclaimed_tokens)
+            .field("overhead_tokens", &self.overhead_tokens)
+            .field("target_tokens", &self.target_tokens)
             .finish()
     }
 }
@@ -1807,10 +1821,16 @@ mod tests {
                 input_tokens: Some(500),
                 output_tokens: Some(120),
                 reclaimed_tokens: Some(380),
+                overhead_tokens: None,
+                target_tokens: None,
             },
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["event"], "lcm_lifecycle");
+        // Absent working-set fields are omitted, so pre-existing readers and
+        // stored events see the same shape.
+        assert!(json.get("overhead_tokens").is_none());
+        assert!(json.get("target_tokens").is_none());
         assert_eq!(json["kind"], "leaf_commit");
         assert_eq!(json["reason"], "admitted");
         assert!(json.get("summary").is_none());
@@ -1820,6 +1840,26 @@ mod tests {
         assert!(json.get("authorization").is_none());
         let back: RuntimeEvent = serde_json::from_value(json).unwrap();
         assert_eq!(event, back);
+    }
+
+    #[test]
+    fn lcm_working_set_diagnostic_fields_round_trip_and_default_when_absent() {
+        let metadata = LcmLifecycleMetadata {
+            overhead_tokens: Some(1_000),
+            target_tokens: Some(48_000),
+            ..LcmLifecycleMetadata::default()
+        };
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(json["overhead_tokens"], 1_000);
+        assert_eq!(json["target_tokens"], 48_000);
+        assert_eq!(
+            serde_json::from_value::<LcmLifecycleMetadata>(json).unwrap(),
+            metadata
+        );
+        let stored: LcmLifecycleMetadata =
+            serde_json::from_value(serde_json::json!({ "input_tokens": 5 })).unwrap();
+        assert_eq!(stored.overhead_tokens, None);
+        assert_eq!(stored.target_tokens, None);
     }
 
     #[test]

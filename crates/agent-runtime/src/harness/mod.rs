@@ -13,7 +13,7 @@ mod questionnaire;
 mod todos;
 
 #[cfg(feature = "provider-summary")]
-pub use agent_runtime_lcm::ProviderLcmSummaryModel;
+pub use agent_runtime_lcm::{ProviderLcmSummaryModel, ProviderSummaryLimits, ProviderSummaryScope};
 
 pub use agent_runtime_lcm::{
     ExpansionItem, ExpansionRequest, LcmExpansion, LcmExpansionCursor, LcmNodeId, LcmReader,

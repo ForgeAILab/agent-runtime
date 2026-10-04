@@ -22,7 +22,7 @@ pub mod pressure;
 #[cfg(feature = "provider-summary")]
 pub mod provider_summary;
 #[cfg(feature = "provider-summary")]
-pub use provider_summary::ProviderLcmSummaryModel;
+pub use provider_summary::{ProviderLcmSummaryModel, ProviderSummaryLimits, ProviderSummaryScope};
 pub mod projection;
 pub mod store;
 pub mod summarize;
@@ -49,7 +49,11 @@ pub use planning::{
     plan_leaf_with_frontier, select_tool_safe_blocks, source_fingerprint_entries,
     source_fingerprint_nodes, tool_exchange_blocks,
 };
-pub use pressure::{CompactionMode, LcmPressureDecision, LcmPressurePolicy, decide_pressure};
+pub use pressure::{
+    CompactionMode, LcmPressureDecision, LcmPressurePolicy, MAX_DERIVED_HARD_ROUNDS,
+    decide_pressure, decide_pressure_with_reclaim, derive_hard_rounds,
+    expected_leaf_reclaim_tokens,
+};
 pub use projection::{
     ActiveProjection, LcmCandidateContent, LcmContextCandidate, LcmPointerAnnotation,
     ProjectionItem, project_active_context, project_active_context_with_suffix,

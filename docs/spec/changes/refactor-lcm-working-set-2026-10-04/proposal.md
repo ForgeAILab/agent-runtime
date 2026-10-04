@@ -21,14 +21,17 @@ provider-backed summary mechanism.
   measured fixed overhead from the last successful plan into LCM state.
 - Add optional WorkingSetPolicy { target_tokens, hard_tokens } to RuntimeBuilder.
   Cap planner input at min(window minus reserves, hard); evaluate LCM pressure
-  against target minus measured overhead. Absence preserves budget selection.
+  against target minus measured overhead, floored at 25% of target with a typed
+  diagnostic. Absence preserves budget selection. A host LcmSizer is kept; only
+  the default shares the planner RequestSizer.
 - Ensure leaf selection can include one full turn pair, derive hard rounds from
   overage and expected reclaim, and offer opt-in soft compaction after
   TurnCompleted through the existing idle admission/persistence path.
 - **BREAKING:** replace escalation target_tokens with
   leaf_source_target_tokens, summary_max_ratio (default 0.25), and
   min_reclaim_ratio. Enforce measured output/source and reclaim ratios at every
-  escalation level and deterministic fallback.
+  model escalation level; the deterministic fallback keeps the base
+  min(cap, source - 1) target, and unsummarizable tiny leaves are widened.
 - Add feature-gated ProviderLcmSummaryModel<P: Provider>. Hosts supply all
   instruction text. Runtime rendering preserves compact tool calls/results,
   every request crosses ContextPlanner, and bounded map-reduce handles source

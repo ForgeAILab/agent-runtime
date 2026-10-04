@@ -1,6 +1,7 @@
 use super::tests::{TestStore, test_coordinator};
 use super::*;
 use crate::runtime::history::HistoryGenerations;
+use agent_runtime_lcm::decide_pressure;
 use std::sync::{
     Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -677,8 +678,6 @@ async fn warm_leaf_and_condensation_deltas_match_reference_store_oracle() {
     coordinator = coordinator
         .with_summary_policy(LcmEscalationPolicy {
             leaf_source_target_tokens: 50,
-            summary_max_ratio: 0.75,
-            min_reclaim_ratio: 0.25,
             ..Default::default()
         })
         .unwrap();

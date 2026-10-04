@@ -9,37 +9,113 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Breaking
 
-- U6 advances `LCM_ALGORITHM_REVISION` to `agent-runtime-lcm-2`.
-  `LcmEscalationPolicy::target_tokens` is replaced by
-  `leaf_source_target_tokens`, `summary_max_ratio` (default 0.25), and
-  `min_reclaim_ratio` (default 0.5); update literals or use `..Default::default()`.
-  Output caps and minimum reclaim are measured independently of source spans.
-  Default hard rounds are derived (`LcmPressurePolicy::max_rounds = 0`);
-  positive values remain explicit limits. Ratio fields use `f64`, so policy
-  equality is `PartialEq`; remove downstream `Eq` bounds and migrate serialized
-  escalation settings to the new fields. The coordinator admits an oversized
-  full turn when needed, including across the retention boundary.
-- LCM tunable policy/sizer/model/algorithm changes rebuild derived state from
-  authorized active nodes. Timeline, binding, store schema, classifier and
-  guard mismatches remain fail-closed; historical node provenance and protected
-  pending responses remain recoverable. No store migration or stale-state
-  deletion is needed for tuning changes. `RequestSizerAdapter` and the default
-  LCM character sizer count structured tool/reasoning content; builder `.lcm`
-  composition shares the planner request sizer. Custom character-sizer settings
-  now have distinct revisions while the default revision remains unchanged.
+- U6 (LCM working sets, one sizer, provider summaries). Consumer-break list:
+  - `LCM_ALGORITHM_REVISION` is now `agent-runtime-lcm-2`; persisted LCM state
+    from `-1` rebuilds its derived metadata once on resume (see below).
+  - `LcmEscalationPolicy::target_tokens` is replaced by
+    `leaf_source_target_tokens`, `summary_max_ratio` (default 0.25) and
+    `min_reclaim_ratio` (default 0.5). Update struct literals or use
+    `..Default::default()`. The struct lost `Eq` (ratio fields are `f64`);
+    remove downstream `Eq` bounds. Serialized escalation settings have no
+    serde default or alias: old JSON without the new fields fails to
+    deserialize and must be migrated. `policy_revision` defaults to
+    `lcm-summary-policy-2`.
+  - Ratio enforcement: model summaries must meet `summary_max_ratio` and
+    `min_reclaim_ratio` at every escalation level, so fewer model outputs are
+    accepted than before. The deterministic fallback keeps the base target,
+    `min(deterministic_token_cap, source_tokens - 1)`, and is not ratio-capped.
+    At the defaults the 0.25 ratio is stricter than the 0.5 reclaim floor, so
+    `min_reclaim_ratio` only binds when a host raises `summary_max_ratio` above
+    `1 - min_reclaim_ratio`.
+  - A leaf the deterministic fallback cannot strictly shrink (one short turn,
+    smaller than the fallback's own framing) is widened through the next turn
+    instead of wedging compaction (on the hard path up to the active turn;
+    idle compaction never widens into the retained recent entries). A summary
+    that still cannot fit under hard
+    pressure now ends as the structured `cannot_fit` limit error (with
+    `summary_attempts` and summary usage metadata) instead of an unstructured
+    "cannot fit after escalation" limit.
+  - `LcmSummaryAttemptOutcome::NonShrinking` is now reported before
+    `OverBudget`: under ratio caps every non-shrinking output is also over
+    budget, so the old order made `NonShrinking` unreachable.
+  - `LcmPressurePolicy::max_rounds` defaults to 0 (was 3) and `validate`
+    accepts 0, which derives the bound. The one shared formula is
+    `derive_hard_rounds` (overage above the soft threshold divided by
+    `expected_leaf_reclaim_tokens`, plus two), fixed once per admission epoch
+    and never above `MAX_DERIVED_HARD_ROUNDS` (64). Positive values remain
+    explicit limits. The structured `cannot_fit` error's `max_rounds` now
+    reports the effective bound, not the configured 0. Added
+    `decide_pressure_with_reclaim`, `derive_hard_rounds`,
+    `expected_leaf_reclaim_tokens`, `MAX_DERIVED_HARD_ROUNDS` and
+    `LcmEscalationPolicy::expected_reclaim_tokens`.
+  - Default sizer: `LcmCoordinatorPolicy::default().sizer` is now the shared
+    `RequestSizerAdapter` over the default request sizer, and
+    `RuntimeBuilder::lcm` replaces exactly that default with the planner's
+    `RequestSizer`. A host-supplied `LcmSizer` is kept as given; it is never
+    discarded. With a host sizer and a `WorkingSetPolicy`, measured overhead is
+    the planner total minus the host-sized history, so the host sizer should
+    approximate the request sizer (or omit it to share). The LCM
+    `CharRatioSizer` now counts all content parts (revision
+    `char-ratio-content-2`), and non-default context `CharRatioSizer` settings
+    get distinct revisions; the default revision is unchanged.
+  - `RuntimeBuilder::lcm` registers the coordinator's history projector and
+    turn-commit hook at `build()` instead of at call time, because the
+    coordinator is rebuilt with the final request sizer and working set.
+    Execution order is unchanged: the sealed pipeline orders components by
+    declared constraints and then component id, never by registration order.
+  - `LcmLifecycleReason` adds `OverheadExceedsTarget`. Exhaustive matches need
+    the new arm, and readers of stored events must accept the new
+    `overhead_exceeds_target` value. `LcmLifecycleMetadata` adds optional
+    `overhead_tokens` and `target_tokens` (serde default, omitted when `None`,
+    so stored events still read); struct literals without `..Default::default()`
+    and exhaustive destructuring must include them.
+  - Revision bump and tuning: LCM tunable policy, sizer, model and algorithm
+    changes rebuild derived state from authorized active nodes instead of
+    failing with a conflict. Timeline, binding, store schema, classifier and
+    guard mismatches remain fail-closed. A protected pending response from
+    older tunables is accepted only after source-identity validation against
+    canonical history; one from current tunables is validated by recomputing
+    its exact plan. No store migration or stale-state deletion is needed.
+  - Persistence: private LCM state adds `fixed_overhead_tokens` and
+    `hard_round_limit` (both `serde(default)`). Idle LCM batches write the
+    redaction-safe extension namespace `runtime.lcm.idle_boundary` (revision
+    `lcm-idle-boundary-1`, a fingerprint of the predecessor usage ledger) and
+    refresh the exact terminal checkpoint; the namespace is kept, not removed.
+    `merge_terminal_checkpoint_snapshot` now accepts a usage ledger skew when
+    that marker proves the protected ledger extends the ordinary one with
+    semantic-summary records only, and takes the protected LCM state when the
+    ordinary copy has a different revision but the same identity fields.
+    A failed exact idle checkpoint rolls back the batch's extension state,
+    usage records and marker; once the exact checkpoint is saved, an ordinary
+    save failure keeps the progress (the checkpoint is its saved counterpart).
+- U6 additive API: `LcmCoordinator::with_summary_policy`,
+  `ContextPlanner::with_input_cap` and `RunPlanner::with_input_cap`,
+  `lcm::RequestSizerAdapter`, `lcm::summarize::render_summary_source`,
+  `lcm::LCM_SUMMARY_PURPOSE` (now defined in the LCM crate and re-exported by
+  `harness`), `LcmEscalatingSummarizer::can_always_summarize`, and the
+  derived-rounds helpers listed above.
 - Add `WorkingSetPolicy { target_tokens, hard_tokens }` through
-  `RuntimeBuilder::working_set_policy`, measured `fixed_overhead_tokens` in
-  private persisted LCM state, and opt-in `soft_on_turn_boundary(bool)`.
-  The planner enforces `min(resolved input, hard)` and pressure uses
-  `target - measured overhead`. Without a working set, existing budgets remain.
-  Idle progress refreshes the exact terminal checkpoint and usage ledger,
-  preserving the ordinary/protected split and crash recovery.
+  `RuntimeBuilder::working_set_policy`, measured `fixed_overhead_tokens`, and
+  opt-in `soft_on_turn_boundary(bool)`. The planner enforces
+  `min(resolved input, hard)`; pressure uses `target - measured overhead`, but
+  never less than 25% of the target. When that floor applies the admission
+  pass emits `LcmLifecycle { reason: OverheadExceedsTarget }` with the clamped
+  thresholds and the new optional `LcmLifecycleMetadata::overhead_tokens`
+  (measured overhead) and `target_tokens` (working-set target) fields. A persisted overhead is trusted only until the next plan
+  re-measures it. Without a working set, existing budgets remain.
 - Add feature `provider-summary` and `ProviderLcmSummaryModel<P: Provider>`
-  (re-exported through `harness` and `lcm`), with host-supplied instructions,
-  planner-admitted tool-aware map-reduce, aggregate usage, cancellation and a
-  bounded deadline. Deterministic fallback preserves bounded tool arguments
-  and results. Forge can replace its private sizer/summarizer and tuning-state
-  deletion; timeline ownership/V149 retirement still depends on U7.
+  (re-exported through `harness` and `lcm`) with host-supplied instructions,
+  planner-admitted tool-aware map-reduce and aggregate usage.
+  `ProviderSummaryLimits` sets a per-call deadline (default 60 s) and an
+  operation ceiling (default 10 min); the operation budget is the per-call
+  deadline times the calls planned so far, up to the ceiling.
+  `with_operation_scope` supplies the host's cancellation and deadline per
+  summary operation (`ProviderSummaryScope`), so cancelling one operation never
+  poisons the next; `with_clock` replaces the clock. Calls are attributed
+  `IdleCompaction` only for idle-boundary summaries, `Ordinary` otherwise.
+  Deterministic fallback preserves bounded tool arguments and results. Forge
+  can replace its private summarizer and tuning-state deletion; timeline
+  ownership/V149 retirement still depends on U7.
 
 See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 

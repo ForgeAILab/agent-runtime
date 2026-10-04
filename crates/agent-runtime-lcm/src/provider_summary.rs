@@ -24,10 +24,61 @@ use futures_util::StreamExt;
 use crate::summarize::render_summary_source;
 use crate::{LcmSummaryError, LcmSummaryModel, LcmSummaryModelRequest, LcmSummaryModelResponse};
 
-use crate::LCM_SUMMARY_PURPOSE;
 const MAX_CALLS: usize = 1_024;
 const MAX_REDUCTIONS: usize = 16;
-const DEFAULT_DEADLINE_MS: u64 = 60_000;
+
+/// Time limits for summary provider calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderSummaryLimits {
+    /// Deadline for one provider call (default 60 s).
+    pub call_timeout: Duration,
+    /// Ceiling for one summary operation (default 10 min). The operation
+    /// budget is `call_timeout` times the map-reduce calls planned so far,
+    /// and never more than this ceiling.
+    pub max_operation_timeout: Duration,
+}
+
+impl Default for ProviderSummaryLimits {
+    fn default() -> Self {
+        Self {
+            call_timeout: Duration::from_secs(60),
+            max_operation_timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+impl ProviderSummaryLimits {
+    /// Checks `0 < call_timeout <= max_operation_timeout`.
+    pub fn validate(&self) -> Result<(), LcmSummaryError> {
+        if self.call_timeout.is_zero() || self.call_timeout > self.max_operation_timeout {
+            return Err(LcmSummaryError::InvalidConfiguration {
+                reason: "summary limits need 0 < call_timeout <= max_operation_timeout".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Host cancellation and deadline for one summary operation.
+#[derive(Debug, Clone)]
+pub struct ProviderSummaryScope {
+    /// Cancels this operation only. The adapter derives a child token, so
+    /// ending one operation never cancels the next.
+    pub cancel: Cancellation,
+    /// Absolute deadline for this operation, combined with the limits.
+    pub deadline: Deadline,
+}
+
+impl Default for ProviderSummaryScope {
+    fn default() -> Self {
+        Self {
+            cancel: Cancellation::new(),
+            deadline: Deadline::never(),
+        }
+    }
+}
+
+type ScopeFn = dyn Fn(&LcmSummaryModelRequest) -> ProviderSummaryScope + Send + Sync;
 
 /// A real summary adapter. Instructions and model selection belong to the host;
 /// rendering, window partitioning, admission and usage belong to the runtime.
@@ -37,8 +88,8 @@ pub struct ProviderLcmSummaryModel<P: Provider + ?Sized> {
     instructions: String,
     sizer: Arc<dyn RequestSizer>,
     revision: RegistryRevision,
-    cancel: Cancellation,
-    deadline: Deadline,
+    scope: Arc<ScopeFn>,
+    limits: ProviderSummaryLimits,
     clock: Arc<dyn Clock>,
 }
 
@@ -82,24 +133,39 @@ impl<P: Provider + ?Sized> ProviderLcmSummaryModel<P> {
             instructions,
             sizer,
             revision,
-            cancel: Cancellation::new(),
-            deadline: Deadline::never(),
+            scope: Arc::new(|_: &LcmSummaryModelRequest| ProviderSummaryScope::default()),
+            limits: ProviderSummaryLimits::default(),
             clock: Arc::new(SystemClock),
         })
     }
 
-    /// Adds host cancellation/deadline constraints. Each operation also has a
-    /// runtime-owned 60-second upper deadline; dropping it cancels in-flight I/O.
-    pub fn with_execution_context(
+    /// Supplies the host's cancellation and deadline per summary operation,
+    /// for example the current turn's token. The default is a fresh,
+    /// uncancelled scope with no deadline beyond the limits. Dropping an
+    /// operation cancels its in-flight provider I/O either way.
+    pub fn with_operation_scope(
         mut self,
-        cancel: Cancellation,
-        deadline: Deadline,
-        clock: Arc<dyn Clock>,
+        scope: impl Fn(&LcmSummaryModelRequest) -> ProviderSummaryScope + Send + Sync + 'static,
     ) -> Self {
-        self.cancel = cancel;
-        self.deadline = deadline;
+        self.scope = Arc::new(scope);
+        self
+    }
+
+    /// Replaces the per-call and per-operation time limits.
+    pub fn with_limits(mut self, limits: ProviderSummaryLimits) -> Result<Self, LcmSummaryError> {
+        limits.validate()?;
+        self.limits = limits;
+        Ok(self)
+    }
+
+    /// Replaces the clock used for deadlines.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    fn millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
 
     fn plan(&self, source: &str, output_cap: u32) -> Result<ProviderRequest, LcmSummaryError> {
@@ -223,7 +289,7 @@ impl<P: Provider + ?Sized> ProviderLcmSummaryModel<P> {
         let millis = context
             .deadline
             .remaining_millis(self.clock.as_ref())
-            .unwrap_or(DEFAULT_DEADLINE_MS);
+            .unwrap_or_else(|| Self::millis(self.limits.call_timeout));
         tokio::select! {
             biased;
             _ = context.cancel.cancelled() => Err(LcmSummaryError::ModelFailure),
@@ -253,11 +319,19 @@ impl<P: Provider + ?Sized> LcmSummaryModel for ProviderLcmSummaryModel<P> {
         &self,
         request: &LcmSummaryModelRequest,
     ) -> Result<LcmSummaryModelResponse, LcmSummaryError> {
-        let cancel = self.cancel.child();
+        let scope = (self.scope)(request);
+        let cancel = scope.cancel.child();
         let _cancel_on_drop = CancelOnDrop(cancel.clone());
-        let deadline = self
-            .deadline
-            .earliest(Deadline::after(self.clock.as_ref(), DEFAULT_DEADLINE_MS));
+        let started = self.clock.now();
+        let call_millis = Self::millis(self.limits.call_timeout);
+        let ceiling_millis = Self::millis(self.limits.max_operation_timeout);
+        // Foreground (hard-pressure) summaries are ordinary internal work;
+        // only idle-boundary summaries are attributed as idle compaction.
+        let purpose = if request.purpose == ProviderAttemptPurpose::IdleCompaction.as_str() {
+            ProviderAttemptPurpose::IdleCompaction
+        } else {
+            ProviderAttemptPurpose::Ordinary
+        };
         let cap = u32::try_from(request.target_tokens)
             .unwrap_or(u32::MAX)
             .min(self.profile.limits.max_output_tokens)
@@ -268,20 +342,34 @@ impl<P: Provider + ?Sized> LcmSummaryModel for ProviderLcmSummaryModel<P> {
         let mut source = render_summary_source(&request.messages, None);
         let mut usage = UsageDelta::new();
         let mut calls = 0usize;
+        let mut planned_calls = 0u64;
         let result = async {
             for _ in 0..MAX_REDUCTIONS {
-                if cancel.is_cancelled() || deadline.is_expired(self.clock.as_ref()) {
+                let chunks = self.chunks(&source, cap)?;
+                // The operation budget grows with the calls actually planned,
+                // up to the ceiling; every call also has its own deadline.
+                planned_calls = planned_calls.saturating_add(chunks.len() as u64);
+                let operation_deadline = scope.deadline.earliest(Deadline::at(
+                    started.plus_millis(
+                        call_millis
+                            .saturating_mul(planned_calls)
+                            .min(ceiling_millis),
+                    ),
+                ));
+                if cancel.is_cancelled() || operation_deadline.is_expired(self.clock.as_ref()) {
                     return Err(LcmSummaryError::ModelFailure);
                 }
-                let chunks = self.chunks(&source, cap)?;
                 let final_call = chunks.len() == 1;
                 let mut summaries = Vec::with_capacity(chunks.len());
                 for chunk in chunks {
                     if calls >= MAX_CALLS {
                         return Err(LcmSummaryError::CannotFit);
                     }
+                    if cancel.is_cancelled() || operation_deadline.is_expired(self.clock.as_ref()) {
+                        return Err(LcmSummaryError::ModelFailure);
+                    }
                     let identity = Fingerprint::of_fields([
-                        LCM_SUMMARY_PURPOSE,
+                        request.purpose.as_str(),
                         request.operation_fingerprint.as_str(),
                         &request.level.number().to_string(),
                         &calls.to_string(),
@@ -295,9 +383,10 @@ impl<P: Provider + ?Sized> LcmSummaryModel for ProviderLcmSummaryModel<P> {
                         request_id: RequestId::new(identity.as_str()),
                         attempt_id: AttemptId::new(identity.as_str()),
                         cache_identity: None,
-                        purpose: ProviderAttemptPurpose::IdleCompaction,
+                        purpose,
                         cancel: cancel.clone(),
-                        deadline,
+                        deadline: operation_deadline
+                            .earliest(Deadline::after(self.clock.as_ref(), call_millis)),
                     };
                     let summary = self
                         .call(self.plan(&chunk, cap)?, context, cap, &mut usage)
