@@ -20,7 +20,7 @@ pub(crate) mod steer;
 pub use agent_runtime_core::steer::{
     SteerLimits, SteerReceipt, SteerRejection, SteerRejectionReason,
 };
-pub use builder::RuntimeBuilder;
+pub use builder::{RuntimeBuilder, WorkingSetPolicy};
 pub use command::{COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession};
 pub use emitter::{EventEmitter, RuntimeEventStream};
 pub use engine::Runtime;

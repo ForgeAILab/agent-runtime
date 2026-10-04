@@ -52,6 +52,27 @@ use crate::tool::registry::ToolRegistry;
 use crate::tool::scheduler::ConflictPolicy;
 use crate::tool::{SecurityConfig, ToolExecutor};
 
+/// Host-owned per-request working set, independent of the provider window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkingSetPolicy {
+    /// LCM pressure target, including measured fixed request overhead.
+    pub target_tokens: u32,
+    /// Hard input ceiling enforced by the authoritative planner.
+    pub hard_tokens: u32,
+}
+
+impl WorkingSetPolicy {
+    /// Checks positive ordered limits. Provider limits still take precedence.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.target_tokens == 0 || self.target_tokens > self.hard_tokens {
+            return Err(RuntimeError::config(
+                "working set requires 0 < target_tokens <= hard_tokens",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Builds a [`Runtime`] from host services and configuration.
 #[derive(Debug)]
 pub struct RuntimeBuilder {
@@ -107,6 +128,8 @@ pub struct RuntimeBuilder {
     external_capabilities: crate::agent::external::ExternalCapabilities,
     harness: HarnessPipelineBuilder,
     lcm: Option<Arc<LcmCoordinator>>,
+    working_set: Option<WorkingSetPolicy>,
+    soft_on_turn_boundary: bool,
     manifest_window: NonZeroUsize,
 }
 
@@ -165,6 +188,8 @@ impl RuntimeBuilder {
             activation_budget: None,
             harness: HarnessPipelineBuilder::new(),
             lcm: None,
+            working_set: None,
+            soft_on_turn_boundary: false,
             manifest_window: crate::runtime::manifests::DEFAULT_MANIFEST_WINDOW,
         }
     }
@@ -370,9 +395,26 @@ impl RuntimeBuilder {
     /// it with another history projector, is rejected when the harness
     /// pipeline is sealed rather than silently composing two histories.
     pub fn lcm(mut self, coordinator: Arc<LcmCoordinator>) -> Self {
-        self.harness.history_projector(coordinator.clone());
-        self.harness.turn_commit_hook(coordinator.clone());
+        if let Some(previous) = self.lcm.as_ref() {
+            // Preserve duplicate-registration rejection when the configured
+            // coordinator is installed at build time.
+            self.harness.history_projector(previous.clone());
+            self.harness.turn_commit_hook(previous.clone());
+        }
         self.lcm = Some(coordinator);
+        self
+    }
+
+    /// Sets an optional pressure target and hard provider-input ceiling.
+    pub fn working_set_policy(mut self, policy: WorkingSetPolicy) -> Self {
+        self.working_set = Some(policy);
+        self
+    }
+
+    /// Attempts durable soft LCM compaction after each completed turn.
+    /// Queued turns retain priority through the existing idle admission gate.
+    pub fn soft_on_turn_boundary(mut self, enabled: bool) -> Self {
+        self.soft_on_turn_boundary = enabled;
         self
     }
 
@@ -734,8 +776,35 @@ impl RuntimeBuilder {
                 0,
             )
         });
+        if let Some(policy) = self.working_set {
+            policy.validate()?;
+            if policy.target_tokens
+                > ContextBudget::from_limits(&profile.limits, &context_policy).input_budget
+            {
+                return Err(RuntimeError::config(
+                    "working-set target exceeds the resolved provider input budget",
+                ));
+            }
+        }
+        let sizer = self
+            .sizer
+            .take()
+            .unwrap_or_else(|| Arc::new(CharRatioSizer::default()));
+        if let Some(coordinator) = self.lcm.take() {
+            let coordinator = Arc::new(
+                (*coordinator)
+                    .clone()
+                    .with_planner_policy(sizer.clone(), self.working_set),
+            );
+            self.harness.history_projector(coordinator.clone());
+            self.harness.turn_commit_hook(coordinator.clone());
+            self.lcm = Some(coordinator);
+        }
         let activation_budget = self.activation_budget.unwrap_or_else(|| {
-            let resolved = ContextBudget::from_limits(&profile.limits, &context_policy);
+            let mut resolved = ContextBudget::from_limits(&profile.limits, &context_policy);
+            if let Some(policy) = self.working_set {
+                resolved.capability_budget = resolved.capability_budget.min(policy.hard_tokens);
+            }
             ActivationBudget::new(resolved.capability_budget, 8)
         });
         let harness = Arc::new(self.harness.seal()?);
@@ -879,13 +948,15 @@ impl RuntimeBuilder {
         let mut planner = RunPlanner::new(
             profile,
             provider_name,
-            self.sizer
-                .unwrap_or_else(|| Arc::new(CharRatioSizer::default())),
+            sizer,
             context_policy,
             self.compactor,
             cache_capability,
             self.revisions,
         );
+        if let Some(policy) = self.working_set {
+            planner = planner.with_input_cap(policy.hard_tokens);
+        }
         if let Some(endpoint) = self.cache_endpoint_identity {
             planner = planner.with_cache_endpoint_identity(endpoint);
         }
@@ -928,6 +999,7 @@ impl RuntimeBuilder {
             injection_queue_limit: self.injection_queue_limit,
             active_sessions: Arc::new(ActiveSessionRegistry::default()),
             lcm: self.lcm,
+            soft_on_turn_boundary: self.soft_on_turn_boundary,
             manifest_window: self.manifest_window,
         };
         Ok(Runtime::from_shared(Arc::new(shared)))

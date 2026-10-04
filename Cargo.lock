@@ -110,6 +110,7 @@ dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
  "async-trait",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror",

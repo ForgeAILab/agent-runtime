@@ -9,6 +9,38 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Breaking
 
+- U6 advances `LCM_ALGORITHM_REVISION` to `agent-runtime-lcm-2`.
+  `LcmEscalationPolicy::target_tokens` is replaced by
+  `leaf_source_target_tokens`, `summary_max_ratio` (default 0.25), and
+  `min_reclaim_ratio` (default 0.5); update literals or use `..Default::default()`.
+  Output caps and minimum reclaim are measured independently of source spans.
+  Default hard rounds are derived (`LcmPressurePolicy::max_rounds = 0`);
+  positive values remain explicit limits. Ratio fields use `f64`, so policy
+  equality is `PartialEq`; remove downstream `Eq` bounds and migrate serialized
+  escalation settings to the new fields. The coordinator admits an oversized
+  full turn when needed, including across the retention boundary.
+- LCM tunable policy/sizer/model/algorithm changes rebuild derived state from
+  authorized active nodes. Timeline, binding, store schema, classifier and
+  guard mismatches remain fail-closed; historical node provenance and protected
+  pending responses remain recoverable. No store migration or stale-state
+  deletion is needed for tuning changes. `RequestSizerAdapter` and the default
+  LCM character sizer count structured tool/reasoning content; builder `.lcm`
+  composition shares the planner request sizer. Custom character-sizer settings
+  now have distinct revisions while the default revision remains unchanged.
+- Add `WorkingSetPolicy { target_tokens, hard_tokens }` through
+  `RuntimeBuilder::working_set_policy`, measured `fixed_overhead_tokens` in
+  private persisted LCM state, and opt-in `soft_on_turn_boundary(bool)`.
+  The planner enforces `min(resolved input, hard)` and pressure uses
+  `target - measured overhead`. Without a working set, existing budgets remain.
+  Idle progress refreshes the exact terminal checkpoint and usage ledger,
+  preserving the ordinary/protected split and crash recovery.
+- Add feature `provider-summary` and `ProviderLcmSummaryModel<P: Provider>`
+  (re-exported through `harness` and `lcm`), with host-supplied instructions,
+  planner-admitted tool-aware map-reduce, aggregate usage, cancellation and a
+  bounded deadline. Deterministic fallback preserves bounded tool arguments
+  and results. Forge can replace its private sizer/summarizer and tuning-state
+  deletion; timeline ownership/V149 retirement still depends on U7.
+
 See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 
 - `RuntimeError` adds `class`, `retry_after_ms`, `limit_resets_at_ms`, and

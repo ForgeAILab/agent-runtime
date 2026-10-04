@@ -55,8 +55,8 @@ fn reset(store: &TestStore, sizer: &CountingSizer) {
     sizer.entries.lock().unwrap().clear();
 }
 
-// Independent full-recompute oracle: the original pressure algorithm, with
-// checked u64 summation over active nodes plus only the uncovered raw suffix.
+// Independent full-recompute oracle: current sizer counts active summaries
+// plus only the uncovered raw suffix, with checked accumulation.
 async fn oracle(
     coordinator: &LcmCoordinator,
     binding: &LcmTimelineBinding,
@@ -72,7 +72,7 @@ async fn oracle(
     let end = nodes.last().map_or(0, |node| node.range.end.get() + 1);
     let active = nodes
         .iter()
-        .map(|node| node.token_count)
+        .map(|node| coordinator.policy.sizer.summary_tokens(&node.summary))
         .try_fold(0u64, u64::checked_add)
         .ok_or_else(|| RuntimeError::conflict("active overflow"))?;
     let entries = coordinator.load_entries(&view, len).await?;
@@ -362,12 +362,19 @@ async fn changed_revisions_grants_and_untrusted_history_cannot_reuse_accounting(
         serde_json::to_value(&updated).unwrap(),
     );
     sizer.revision.fetch_add(1, Ordering::SeqCst);
+    let decoded = coordinator.decode_state(&binding, &persisted).unwrap();
+    assert!(coordinator.tunables_changed(&persisted, &decoded));
+    let rebuilt = coordinator
+        .validate_resume_state(&binding.session, &generation.history, &persisted)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         coordinator
-            .decode_state(&binding, &persisted)
-            .unwrap_err()
-            .kind,
-        ErrorKind::Conflict
+            .decode_state(&binding, &rebuilt)
+            .unwrap()
+            .sizer_revision,
+        sizer.revision()
     );
     reset(&store, &sizer);
     coordinator
@@ -667,6 +674,14 @@ async fn warm_leaf_and_condensation_deltas_match_reference_store_oracle() {
     coordinator.resolver = Arc::new(StaticLcmTimelineResolver::new(binding.clone()));
     coordinator.policy.pressure.retain_recent_entries = 0;
     coordinator.policy.pressure.leaf_target_tokens = 50;
+    coordinator = coordinator
+        .with_summary_policy(LcmEscalationPolicy {
+            leaf_source_target_tokens: 50,
+            summary_max_ratio: 0.75,
+            min_reclaim_ratio: 0.25,
+            ..Default::default()
+        })
+        .unwrap();
     coordinator.policy.pressure.condensation_fanout = 2;
     let mut history = Vec::new();
     for turn in 0..3 {

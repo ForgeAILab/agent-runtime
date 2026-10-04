@@ -62,7 +62,7 @@ pub const LCM_STATE_SCHEMA_VERSION: u32 = 1;
 /// Stable runtime component identity and state namespace.
 pub const LCM_COMPONENT_ID: &str = "harness.lcm";
 /// Stable purpose used for separately attributed LCM model work.
-pub const LCM_SUMMARY_PURPOSE: &str = "context.semantic_summary";
+pub use agent_runtime_lcm::LCM_SUMMARY_PURPOSE;
 /// Stable purpose used for explicit idle-boundary LCM work.
 pub const LCM_IDLE_COMPACTION_PURPOSE: &str = "cache_idle_compaction";
 /// Maximum page requested from a host LCM store by this adapter.
@@ -277,7 +277,9 @@ impl Default for LcmCoordinatorPolicy {
             // A resolved provider window is required from the host.  The
             // adapter must never guess a model limit in a default policy.
             input_budget_tokens: 0,
-            sizer: Arc::new(agent_runtime_lcm::CharRatioSizer::default()),
+            sizer: Arc::new(agent_runtime_lcm::RequestSizerAdapter::new(Arc::new(
+                agent_runtime_context::CharRatioSizer::default(),
+            ))),
             source_sensitivity: Sensitivity::Sensitive,
         }
     }
@@ -434,6 +436,8 @@ struct LcmState {
     /// Number of hard-pressure operations staged for this admission epoch.
     #[serde(default)]
     hard_rounds: usize,
+    #[serde(default)]
+    fixed_overhead_tokens: u64,
 }
 
 /// One runtime LCM coordinator.  It is deliberately a single component that
@@ -441,6 +445,9 @@ struct LcmState {
 #[derive(Clone)]
 pub struct LcmCoordinator {
     accounting: accounting::Accounting,
+    overheads: Arc<std::sync::Mutex<BTreeMap<SessionId, u64>>>,
+    conversation_tokens: Arc<std::sync::Mutex<BTreeMap<SessionId, u64>>>,
+    working_set: Option<crate::runtime::WorkingSetPolicy>,
     store: Arc<dyn LcmStore>,
     model: Arc<dyn LcmSummaryModel>,
     summarizer: LcmEscalatingSummarizer,
@@ -487,15 +494,19 @@ impl LcmCoordinator {
         }
         let escalation_policy = LcmEscalationPolicy {
             policy_revision: policy.pressure.revision.clone(),
-            target_tokens: policy.pressure.leaf_target_tokens,
+            leaf_source_target_tokens: policy.pressure.leaf_target_tokens,
             deterministic_token_cap: policy.pressure.deterministic_token_cap,
             algorithm_revision: policy.algorithm_revision.clone(),
+            ..LcmEscalationPolicy::default()
         };
         let summarizer = LcmEscalatingSummarizer::with_policy(model.clone(), escalation_policy)
             .map_err(|_| RuntimeError::config("LCM summary escalation policy is invalid"))?;
         let classifier = Arc::new(DefaultLcmSourceClassifier::new(policy.source_sensitivity));
         Ok(Self {
             accounting: Arc::default(),
+            overheads: Arc::default(),
+            conversation_tokens: Arc::default(),
+            working_set: None,
             store,
             model: model.clone(),
             summarizer,
@@ -505,6 +516,95 @@ impl LcmCoordinator {
             legacy_artifact_store: None,
             policy,
         })
+    }
+
+    /// Configures independent source and output/reclaim targets.
+    pub fn with_summary_policy(
+        mut self,
+        policy: LcmEscalationPolicy,
+    ) -> Result<Self, RuntimeError> {
+        self.summarizer = LcmEscalatingSummarizer::with_policy(self.model.clone(), policy)
+            .map_err(|_| RuntimeError::config("LCM summary escalation policy is invalid"))?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_planner_policy(
+        mut self,
+        sizer: Arc<dyn agent_runtime_context::RequestSizer>,
+        working_set: Option<crate::runtime::WorkingSetPolicy>,
+    ) -> Self {
+        self.policy.sizer = Arc::new(agent_runtime_lcm::RequestSizerAdapter::new(sizer));
+        self.working_set = working_set;
+        self.accounting = Arc::default();
+        self.overheads = Arc::default();
+        self.conversation_tokens = Arc::default();
+        self
+    }
+
+    pub(crate) fn observe_plan(
+        &self,
+        session: &SessionId,
+        report: &agent_runtime_context::BudgetReport,
+    ) -> u64 {
+        let conversation = [
+            FragmentKind::History,
+            FragmentKind::ToolResult,
+            FragmentKind::UserInput,
+            FragmentKind::Summary,
+        ]
+        .iter()
+        .fold(0u64, |sum, kind| {
+            sum.saturating_add(u64::from(report.tokens_for(*kind)))
+        });
+        // Pressure accounting measured the exact projected conversation
+        // before planning. The difference also charges generated node pointer
+        // annotations and provider-role framing, which category subtraction
+        // alone would miss. Category attribution is the cold fallback only.
+        let conversation = self
+            .conversation_tokens
+            .lock()
+            .expect("LCM conversation counts poisoned")
+            .get(session)
+            .copied()
+            .unwrap_or(conversation);
+        let overhead = u64::from(report.total_input_tokens).saturating_sub(conversation);
+        self.overheads
+            .lock()
+            .expect("LCM overheads poisoned")
+            .insert(session.clone(), overhead);
+        overhead
+    }
+
+    fn pressure_decision(&self, state: &LcmState, tokens: u64) -> LcmPressureDecision {
+        let budget = self.pressure_budget(state);
+        let mut decision = decide_pressure(tokens, budget, 0, &self.policy.pressure);
+        if let LcmPressureDecision::Hard { max_rounds, .. } = &mut decision {
+            if self.policy.pressure.max_rounds == 0 {
+                let threshold = ((budget as u128)
+                    * u128::from(self.policy.pressure.soft_threshold_percent)
+                    / 100) as u64;
+                let ratio = (1.0 - self.summarizer.policy().summary_max_ratio)
+                    .max(self.summarizer.policy().min_reclaim_ratio);
+                let reclaim = ((self.summarizer.policy().leaf_source_target_tokens as f64) * ratio)
+                    .floor() as u64;
+                *max_rounds = usize::try_from(
+                    tokens
+                        .saturating_sub(threshold)
+                        .div_ceil(reclaim.max(1))
+                        .saturating_add(2),
+                )
+                .unwrap_or(1_024)
+                .clamp(2, 1_024);
+            }
+        }
+        decision
+    }
+
+    fn pressure_budget(&self, state: &LcmState) -> u64 {
+        self.working_set
+            .map_or(self.policy.input_budget_tokens, |policy| {
+                u64::from(policy.target_tokens).saturating_sub(state.fixed_overhead_tokens)
+            })
     }
 
     /// Replaces the conservative role-aware classifier with a host-owned one.
@@ -691,7 +791,15 @@ impl LcmCoordinator {
                     LCM_STATE_SCHEMA_VERSION.to_string(),
                     self.policy.pressure.revision.as_str().to_owned(),
                     self.summarizer.policy().policy_revision.as_str().to_owned(),
-                    self.summarizer.policy().target_tokens.to_string(),
+                    self.summarizer
+                        .policy()
+                        .leaf_source_target_tokens
+                        .to_string(),
+                    self.summarizer.policy().summary_max_ratio.to_string(),
+                    self.summarizer.policy().min_reclaim_ratio.to_string(),
+                    format!("{:?}", self.policy.pressure),
+                    self.policy.input_budget_tokens.to_string(),
+                    format!("{:?}", self.working_set),
                     self.summarizer.policy().deterministic_token_cap.to_string(),
                     self.summarizer
                         .policy()
@@ -722,9 +830,6 @@ impl LcmCoordinator {
         binding: &LcmTimelineBinding,
         persisted: &VersionedSessionState,
     ) -> Result<LcmState, RuntimeError> {
-        if persisted.revision != *self.descriptor_value().revision() {
-            return Err(RuntimeError::conflict("LCM component revision changed"));
-        }
         if persisted.sensitivity != SessionStateSensitivity::Sensitive {
             return Err(RuntimeError::conflict(
                 "LCM checkpoint state must remain Sensitive",
@@ -744,17 +849,10 @@ impl LcmCoordinator {
                         .active_nodes
                         .iter()
                         .any(|node| Self::classification_has_guard_revision(&node.classification))))
-            || state.policy_revision != self.policy.pressure.revision
-            || state.summary_policy_revision != self.summarizer.policy().policy_revision
-            || state.algorithm_revision != self.policy.algorithm_revision
-            || state.sizer_revision != self.policy.sizer.revision()
-            || state.model_id != self.model.id()
-            || state.model_revision != *self.model.revision()
             || state.classifier_revision != self.classifier.revision()
             || state.model_purpose.as_deref().is_some_and(|purpose| {
                 !matches!(purpose, LCM_SUMMARY_PURPOSE | LCM_IDLE_COMPACTION_PURPOSE)
             })
-            || state.hard_rounds > self.policy.pressure.max_rounds
             || (state.history_len == 0) != state.immutable_frontier.is_none()
             || state.immutable_frontier.is_some_and(|frontier| {
                 frontier.get() != state.history_len.saturating_sub(1) as u64
@@ -764,7 +862,42 @@ impl LcmCoordinator {
                 "LCM state failed identity, binding, or frontier validation",
             ));
         }
+        self.overheads
+            .lock()
+            .expect("LCM overheads poisoned")
+            .entry(binding.session.clone())
+            .or_insert(state.fixed_overhead_tokens);
         Ok(state)
+    }
+
+    fn tunables_changed(&self, persisted: &VersionedSessionState, state: &LcmState) -> bool {
+        persisted.revision != *self.descriptor_value().revision()
+            || state.policy_revision != self.policy.pressure.revision
+            || state.summary_policy_revision != self.summarizer.policy().policy_revision
+            || state.algorithm_revision != self.policy.algorithm_revision
+            || state.sizer_revision != self.policy.sizer.revision()
+            || state.model_id != self.model.id()
+            || state.model_revision != *self.model.revision()
+    }
+
+    async fn restore_state(
+        &self,
+        binding: &LcmTimelineBinding,
+        persisted: &VersionedSessionState,
+        history: &Arc<[Message]>,
+    ) -> Result<LcmState, RuntimeError> {
+        let state = self.decode_state(binding, persisted)?;
+        if !self.tunables_changed(persisted, &state) {
+            return Ok(state);
+        }
+        // Validate the old protected identity and DAG before rebuilding any
+        // derived metadata. A tuning change never authorizes external writes.
+        let repaired = self
+            .validate_resume_state(&binding.session, history, persisted)
+            .await?;
+        repaired.map_or(Ok(state), |persisted| {
+            self.decode_state(binding, &persisted)
+        })
     }
 
     fn content_guard_id(&self) -> Option<String> {
@@ -908,7 +1041,7 @@ impl LcmCoordinator {
             // record from becoming an authority at the next admission pass.
             self.validate_pending_metadata(&binding, pending)?;
         }
-        match self.project_state(&binding, &state, &view).await {
+        let repaired = match self.project_state(&binding, &state, &view).await {
             Ok(_) => Ok(None),
             Err(_strict_error) if state.pending_summary.is_some() => self
                 .validate_pending_successor(&binding, &state, &view)
@@ -921,7 +1054,26 @@ impl LcmCoordinator {
                 Ok(repaired) => Ok(Some(repaired)),
                 Err(_append_error) => Err(strict_error),
             },
+        }?;
+        if !self.tunables_changed(persisted, &state) {
+            return Ok(repaired);
         }
+        let validated = match repaired.as_ref() {
+            Some(repaired) => self.decode_state(&binding, repaired)?,
+            None => state,
+        };
+        self.invalidate_accounting(session);
+        let rebuilt = self
+            .checkpoint_state(
+                &binding,
+                &history[..validated.history_len],
+                &validated.operation_watermarks,
+                validated.model_purpose,
+                validated.pending_summary,
+                0,
+            )
+            .await?;
+        Ok(Some(self.state_patch(&rebuilt)?.into_state()))
     }
 
     fn history_fingerprint(history: &[Message]) -> Result<Fingerprint, RuntimeError> {
@@ -1426,6 +1578,13 @@ impl LcmCoordinator {
             operation_watermarks,
             pending_summary,
             hard_rounds,
+            fixed_overhead_tokens: self
+                .overheads
+                .lock()
+                .expect("LCM overheads poisoned")
+                .get(&binding.session)
+                .copied()
+                .unwrap_or(0),
         })
     }
 
@@ -1454,12 +1613,17 @@ impl LcmCoordinator {
         .await
     }
 
-    fn cannot_fit_error(&self, required_tokens: u64, rounds: usize) -> RuntimeError {
+    fn cannot_fit_error(
+        &self,
+        required_tokens: u64,
+        rounds: usize,
+        available_tokens: u64,
+    ) -> RuntimeError {
         let mut metadata = Metadata::new();
         metadata
             .insert("category", "cannot_fit")
             .insert("required_tokens", required_tokens)
-            .insert("available_tokens", self.policy.input_budget_tokens)
+            .insert("available_tokens", available_tokens)
             .insert("rounds", rounds as u64)
             .insert("max_rounds", self.policy.pressure.max_rounds as u64);
         RuntimeError::limit("LCM context cannot fit after bounded hard compaction")
@@ -1467,7 +1631,7 @@ impl LcmCoordinator {
             .with_class(FailureClass::ContextOverflow {
                 stage: FailureStage::PreProvider,
                 required_tokens: u32::try_from(required_tokens).ok(),
-                available_tokens: u32::try_from(self.policy.input_budget_tokens).ok(),
+                available_tokens: u32::try_from(available_tokens).ok(),
             })
     }
 
@@ -1512,7 +1676,7 @@ impl LcmCoordinator {
             ),
         };
         let threshold_tokens = |percent: u8| {
-            (((self.policy.input_budget_tokens as u128) * u128::from(percent)) / 100)
+            (((self.pressure_budget(state) as u128) * u128::from(percent)) / 100)
                 .min(u128::from(u32::MAX)) as u32
         };
         Self::validated_lifecycle_event(
@@ -1850,7 +2014,8 @@ impl LcmCoordinator {
     ) -> Result<Option<agent_runtime_lcm::LeafPlan>, RuntimeError> {
         let retained_limit = raw_entries
             .len()
-            .saturating_sub(self.policy.pressure.retain_recent_entries);
+            .saturating_sub(self.policy.pressure.retain_recent_entries)
+            .max(usize::from(!raw_entries.is_empty()));
         if retained_limit == 0 {
             return Ok(None);
         }
@@ -1875,7 +2040,7 @@ impl LcmCoordinator {
             .skip(1)
             .position(|entry| entry.content.role == Role::User)
             .map_or(raw_entries.len(), |offset| offset + 1);
-        let mut target_tokens = self.policy.pressure.leaf_target_tokens;
+        let mut target_tokens = self.summarizer.policy().leaf_source_target_tokens;
         if boundary == 0 {
             boundary = oldest_turn_end;
             target_tokens = u64::MAX;
@@ -2175,13 +2340,13 @@ impl LcmCoordinator {
                 commit,
             } => {
                 if timeline_id != &binding.timeline
-                    || model_id != self.model.id()
-                    || model_revision != self.model.revision()
-                    || summary_policy_revision != &self.summarizer.policy().policy_revision
+                    || model_id.trim().is_empty()
+                    || model_revision.as_str().trim().is_empty()
+                    || summary_policy_revision.as_str().trim().is_empty()
                     || classifier_revision != &self.classifier.revision()
-                    || commit.policy_revision != self.policy.pressure.revision
-                    || commit.algorithm_revision != self.policy.algorithm_revision
-                    || commit.sizer_revision != self.policy.sizer.revision()
+                    || commit.policy_revision.as_str().trim().is_empty()
+                    || commit.algorithm_revision.as_str().trim().is_empty()
+                    || commit.sizer_revision.as_str().trim().is_empty()
                     || commit.operation_id != Self::operation_id("leaf", plan_operation_fingerprint)
                     || commit.operation_fingerprint.as_ref()
                         != Some(&commit.computed_operation_fingerprint(&binding.timeline))
@@ -2199,13 +2364,13 @@ impl LcmCoordinator {
                 commit,
             } => {
                 if timeline_id != &binding.timeline
-                    || model_id != self.model.id()
-                    || model_revision != self.model.revision()
-                    || summary_policy_revision != &self.summarizer.policy().policy_revision
+                    || model_id.trim().is_empty()
+                    || model_revision.as_str().trim().is_empty()
+                    || summary_policy_revision.as_str().trim().is_empty()
                     || classifier_revision != &self.classifier.revision()
-                    || commit.policy_revision != self.policy.pressure.revision
-                    || commit.algorithm_revision != self.policy.algorithm_revision
-                    || commit.sizer_revision != self.policy.sizer.revision()
+                    || commit.policy_revision.as_str().trim().is_empty()
+                    || commit.algorithm_revision.as_str().trim().is_empty()
+                    || commit.sizer_revision.as_str().trim().is_empty()
                     || commit.operation_id
                         != Self::operation_id("condensation", plan_operation_fingerprint)
                     || commit.operation_fingerprint.as_ref()
@@ -2290,6 +2455,97 @@ impl LcmCoordinator {
     ) -> Result<(), RuntimeError> {
         Self::validate_pending_purpose(purpose)?;
         let view = binding.view();
+        // A response protected under older tunables retains its own sizing
+        // and plan provenance. Validate canonical source identity rather than
+        // attempting to reproduce its selection using a different policy.
+        let older = match pending {
+            LcmPendingSummary::Leaf { commit, .. } => {
+                commit.policy_revision != self.policy.pressure.revision
+                    || commit.algorithm_revision != self.policy.algorithm_revision
+                    || commit.sizer_revision != self.policy.sizer.revision()
+            }
+            LcmPendingSummary::Condensation { commit, .. } => {
+                commit.policy_revision != self.policy.pressure.revision
+                    || commit.algorithm_revision != self.policy.algorithm_revision
+                    || commit.sizer_revision != self.policy.sizer.revision()
+            }
+        };
+        if older {
+            match pending {
+                LcmPendingSummary::Leaf { commit, .. } => {
+                    let entries = self
+                        .load_range_paged(
+                            &view,
+                            commit.range.start.get() as usize,
+                            commit.range.end.get() as usize + 1,
+                        )
+                        .await?;
+                    let raw_start = active_nodes
+                        .iter()
+                        .map(|node| node.range.end.get() + 1)
+                        .max()
+                        .unwrap_or(0);
+                    let protected_start = if purpose == LCM_SUMMARY_PURPOSE {
+                        Self::latest_active_user_boundary(history)
+                    } else {
+                        history.len()
+                    };
+                    if commit.range.start.get() != raw_start
+                        || commit.range.end.get() >= protected_start as u64
+                        || entries
+                            .iter()
+                            .map(|entry| entry.id.clone())
+                            .collect::<Vec<_>>()
+                            != commit.entry_ids
+                        || agent_runtime_lcm::source_fingerprint_entries(&entries)
+                            != commit.source_fingerprint
+                        || !complete_tool_exchanges(&entries)
+                        || entries.iter().any(|entry| {
+                            history.get(entry.sequence.get() as usize) != Some(&entry.content)
+                        })
+                        || self.classification_with_active_guard(LcmClassification::join_all(
+                            entries
+                                .iter()
+                                .map(|entry| entry.source.classification.clone()),
+                        ))? != commit.classification
+                    {
+                        return Err(RuntimeError::conflict(
+                            "LCM pending summary source identity changed",
+                        ));
+                    }
+                }
+                LcmPendingSummary::Condensation { commit, .. } => {
+                    let children = active_nodes
+                        .iter()
+                        .filter(|node| commit.child_ids.contains(&node.id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if children
+                        .iter()
+                        .map(|node| node.id.clone())
+                        .collect::<Vec<_>>()
+                        != commit.child_ids
+                        || agent_runtime_lcm::source_fingerprint_nodes(&children)
+                            != commit.source_fingerprint
+                        || children.first().map(|node| node.range.start) != Some(commit.range.start)
+                        || children.last().map(|node| node.range.end) != Some(commit.range.end)
+                        || children
+                            .iter()
+                            .map(|node| node.token_count)
+                            .try_fold(0u64, u64::checked_add)
+                            != Some(commit.source_token_count)
+                        || self.classification_with_active_guard(LcmClassification::join_all(
+                            children.iter().map(|node| node.classification.clone()),
+                        ))? != commit.classification
+                    {
+                        return Err(RuntimeError::conflict(
+                            "LCM pending condensation source identity changed",
+                        ));
+                    }
+                }
+            }
+            return Ok(());
+        }
         match pending {
             LcmPendingSummary::Leaf {
                 plan_operation_fingerprint,
@@ -2805,11 +3061,13 @@ impl LcmCoordinator {
         view: &TurnCommitView,
     ) -> Result<BeforeProviderPatch, RuntimeError> {
         let binding = self.timeline_binding(&view.session)?;
-        let previous = view
-            .state
-            .as_ref()
-            .map(|persisted| self.decode_state(&binding, persisted))
-            .transpose()?;
+        let previous = match view.state.as_ref() {
+            Some(persisted) => Some(
+                self.restore_state(&binding, persisted, &view.history)
+                    .await?,
+            ),
+            None => None,
+        };
         let mut state = self
             .synchronize(&binding, previous.as_ref(), &view.history)
             .await?;
@@ -2877,12 +3135,7 @@ impl LcmCoordinator {
         let required_tokens = self
             .accounted_context_tokens(&binding, &view.history, &state)
             .await?;
-        let decision = decide_pressure(
-            required_tokens,
-            self.policy.input_budget_tokens,
-            0,
-            &self.policy.pressure,
-        );
+        let decision = self.pressure_decision(&state, required_tokens);
         events.push(self.pressure_event(&binding, &state, required_tokens, &decision)?);
         match decision {
             LcmPressureDecision::None { .. } | LcmPressureDecision::Soft { .. } => {
@@ -2915,11 +3168,20 @@ impl LcmCoordinator {
                     state.hard_rounds,
                     usage,
                     events,
-                    self.cannot_fit_error(required_tokens, state.hard_rounds),
+                    self.cannot_fit_error(
+                        required_tokens,
+                        state.hard_rounds,
+                        self.pressure_budget(&state),
+                    ),
                 )
                 .await
             }
             LcmPressureDecision::Hard { max_rounds, .. } => {
+                let max_rounds = if self.policy.pressure.max_rounds == 0 {
+                    max_rounds.saturating_add(state.hard_rounds).min(1_024)
+                } else {
+                    max_rounds
+                };
                 if state.hard_rounds >= max_rounds {
                     return self
                         .checkpointed_block(
@@ -2931,7 +3193,11 @@ impl LcmCoordinator {
                             state.hard_rounds,
                             usage,
                             events,
-                            self.cannot_fit_error(required_tokens, state.hard_rounds),
+                            self.cannot_fit_error(
+                                required_tokens,
+                                state.hard_rounds,
+                                self.pressure_budget(&state),
+                            ),
                         )
                         .await;
                 }
@@ -2977,7 +3243,11 @@ impl LcmCoordinator {
                             state.hard_rounds,
                             usage,
                             events,
-                            self.cannot_fit_error(required_tokens, state.hard_rounds),
+                            self.cannot_fit_error(
+                                required_tokens,
+                                state.hard_rounds,
+                                self.pressure_budget(&state),
+                            ),
                         )
                         .await;
                 };
@@ -3454,11 +3724,13 @@ impl TurnCommitHook for LcmCoordinator {
             return Ok(TurnCommitPatch::default());
         }
         let binding = self.timeline_binding(&view.session)?;
-        let previous = view
-            .state
-            .as_ref()
-            .map(|persisted| self.decode_state(&binding, persisted))
-            .transpose()?;
+        let previous = match view.state.as_ref() {
+            Some(persisted) => Some(
+                self.restore_state(&binding, persisted, &view.history)
+                    .await?,
+            ),
+            None => None,
+        };
         let state = self
             .synchronize(&binding, previous.as_ref(), &view.history)
             .await?;
@@ -3470,12 +3742,7 @@ impl TurnCommitHook for LcmCoordinator {
         let required_tokens = self
             .accounted_context_tokens(&binding, &view.history, &state)
             .await?;
-        let decision = decide_pressure(
-            required_tokens,
-            self.policy.input_budget_tokens,
-            0,
-            &self.policy.pressure,
-        );
+        let decision = self.pressure_decision(&state, required_tokens);
         // Terminal persistence records the pressure decision only. Model
         // summarization is reserved for the explicit idle admission phase;
         // a completed turn must not wait on an uncheckpointed soft operation.
@@ -3490,11 +3757,13 @@ impl TurnCommitHook for LcmCoordinator {
         view: &TurnCommitView,
     ) -> Result<IdleCompactionResult, RuntimeError> {
         let binding = self.timeline_binding(&view.session)?;
-        let previous = view
-            .state
-            .as_ref()
-            .map(|persisted| self.decode_state(&binding, persisted))
-            .transpose()?;
+        let previous = match view.state.as_ref() {
+            Some(persisted) => Some(
+                self.restore_state(&binding, persisted, &view.history)
+                    .await?,
+            ),
+            None => None,
+        };
         let state = self
             .synchronize(&binding, previous.as_ref(), &view.history)
             .await?;
@@ -3549,12 +3818,7 @@ impl TurnCommitHook for LcmCoordinator {
         let required_tokens = self
             .accounted_context_tokens(&binding, &view.history, &state)
             .await?;
-        let decision = decide_pressure(
-            required_tokens,
-            self.policy.input_budget_tokens,
-            0,
-            &self.policy.pressure,
-        );
+        let decision = self.pressure_decision(&state, required_tokens);
         let pressure_event = self.pressure_event(&binding, &state, required_tokens, &decision)?;
         if matches!(
             decision,
@@ -3661,7 +3925,9 @@ impl HistoryProjector for LcmCoordinator {
             return Ok(HistoryProjection::default());
         };
         let binding = self.timeline_binding(&view.session)?;
-        let state = self.decode_state(&binding, persisted)?;
+        let state = self
+            .restore_state(&binding, persisted, &view.history)
+            .await?;
         self.project_state(&binding, &state, view).await
     }
 }
@@ -5168,6 +5434,7 @@ mod tests {
             operation_watermarks: Vec::new(),
             pending_summary: None,
             hard_rounds: 0,
+            fixed_overhead_tokens: 0,
         };
         let value = serde_json::to_value(state).unwrap();
         assert_eq!(value["schema_version"], LCM_STATE_SCHEMA_VERSION);
@@ -5276,8 +5543,11 @@ mod tests {
         let history = (0..8)
             .flat_map(|index| {
                 [
-                    Message::user(format!("request {index}")),
-                    Message::assistant(vec![ContentPart::text(format!("answer {index}"))]),
+                    Message::user(format!("request {index} {}", "large source ".repeat(20))),
+                    Message::assistant(vec![ContentPart::text(format!(
+                        "answer {index} {}",
+                        "large source ".repeat(20)
+                    ))]),
                 ]
             })
             .collect::<Vec<_>>();
@@ -5619,6 +5889,67 @@ mod tests {
             .expect("repaired append state decodes");
         assert_eq!(repaired_state.history_len, next_history.len());
         assert_eq!(repaired_state.dag_revision, LcmRevision::new(2));
+    }
+
+    #[tokio::test]
+    async fn tuning_change_preserves_pending_response_and_exact_cas_successor() {
+        for committed in [false, true] {
+            let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let original = counting_pressure_coordinator(store.clone(), calls.clone());
+            let session = SessionId::new("lcm-session");
+            let history = (0..8)
+                .flat_map(|index| {
+                    [
+                        Message::user(format!("request {index}")),
+                        Message::assistant(vec![ContentPart::text(format!("answer {index}"))]),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let staged = original
+                .before_provider(&commit_view(&session, "hard-turn", &history, None))
+                .await
+                .unwrap();
+            let persisted = staged.patch.state.unwrap().into_state();
+            let binding = original.timeline_binding(&session).unwrap();
+            let old = original.decode_state(&binding, &persisted).unwrap();
+            if committed {
+                original
+                    .commit_pending_summary(
+                        &binding,
+                        &history,
+                        old.pending_summary.as_ref().unwrap(),
+                        LCM_SUMMARY_PURPOSE,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut tuned = original.clone();
+            tuned.policy.pressure.revision = RegistryRevision::new("tuned-policy");
+            tuned.policy.input_budget_tokens = 10_000;
+            tuned.policy.sizer = Arc::new(agent_runtime_lcm::RequestSizerAdapter::new(Arc::new(
+                agent_runtime_context::CharRatioSizer::default().with_chars_per_token(2),
+            )));
+            let rebuilt = tuned
+                .validate_resume_state(&session, &history, &persisted)
+                .await
+                .unwrap()
+                .unwrap();
+            let restored = tuned.decode_state(&binding, &rebuilt).unwrap();
+            assert_eq!(
+                restored.policy_revision,
+                RegistryRevision::new("tuned-policy")
+            );
+            assert_eq!(restored.hard_rounds, 0);
+            let result = drain_before_provider(
+                &tuned,
+                commit_view(&session, "tuned-turn", &history, Some(rebuilt)),
+            )
+            .await;
+            assert!(result.block.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(store.active_nodes_for_test().len(), 1);
+        }
     }
 
     #[tokio::test]

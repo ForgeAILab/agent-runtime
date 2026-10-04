@@ -237,7 +237,11 @@ impl RequestSizer for CharRatioSizer {
     fn revision(&self) -> ComponentRef {
         ComponentRef::new(
             RegistryId::tokenizer("agent-runtime-context/char-ratio"),
-            RegistryRevision::new(CHAR_RATIO_SIZER_REVISION),
+            if *self == Self::default() {
+                RegistryRevision::new(CHAR_RATIO_SIZER_REVISION)
+            } else {
+                RegistryRevision::from_content(format!("{CHAR_RATIO_SIZER_REVISION}|{self:?}"))
+            },
         )
     }
 

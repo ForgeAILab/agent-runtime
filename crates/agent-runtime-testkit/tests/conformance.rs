@@ -8,3 +8,6 @@ mod goal_conformance;
 mod provider_conformance;
 #[path = "conformance/runtime_conformance.rs"]
 mod runtime_conformance;
+
+#[path = "conformance/lcm_working_set.rs"]
+mod lcm_working_set;

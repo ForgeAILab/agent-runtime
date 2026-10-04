@@ -960,7 +960,13 @@ fn condensation_pressure_coordinator(
                 ..LcmCoordinatorPolicy::default()
             },
         )
-        .expect("valid condensation-pressure coordinator"),
+        .expect("valid condensation-pressure coordinator")
+        .with_summary_policy(agent_runtime::lcm::LcmEscalationPolicy {
+            summary_max_ratio: 0.75,
+            min_reclaim_ratio: 0.25,
+            ..Default::default()
+        })
+        .unwrap(),
     )
 }
 

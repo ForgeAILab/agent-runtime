@@ -30,7 +30,8 @@ pub struct LcmPressurePolicy {
     pub condensation_fanout: usize,
     /// Recent raw entries retained by the host projection.
     pub retain_recent_entries: usize,
-    /// Maximum checkpointed compaction rounds at hard pressure.
+    /// Maximum checkpointed compaction rounds at hard pressure. Zero derives
+    /// a bounded limit from overage and expected reclaim (the default).
     pub max_rounds: usize,
     /// Deterministic fallback cap before strict-shrink adjustment.
     pub deterministic_token_cap: u64,
@@ -45,7 +46,7 @@ impl Default for LcmPressurePolicy {
             leaf_target_tokens: 2_048,
             condensation_fanout: 4,
             retain_recent_entries: 4,
-            max_rounds: 3,
+            max_rounds: 0,
             deterministic_token_cap: 512,
         }
     }
@@ -67,7 +68,6 @@ impl LcmPressurePolicy {
         }
         if self.leaf_target_tokens == 0
             || self.condensation_fanout < 2
-            || self.max_rounds == 0
             || self.deterministic_token_cap == 0
         {
             return Err(
@@ -153,7 +153,23 @@ pub fn decide_pressure(
         LcmPressureDecision::Hard {
             pressure_percent,
             operation_fingerprint: operation_fingerprint(),
-            max_rounds: policy.max_rounds,
+            max_rounds: if policy.max_rounds == 0 {
+                let threshold = ((input_budget_tokens as u128)
+                    * u128::from(policy.soft_threshold_percent)
+                    / 100) as u64;
+                let overage = conversation_tokens.saturating_sub(threshold);
+                let reclaim = policy
+                    .leaf_target_tokens
+                    .saturating_mul(3)
+                    .checked_div(4)
+                    .unwrap_or(0)
+                    .max(1);
+                usize::try_from(overage.div_ceil(reclaim).saturating_add(2))
+                    .unwrap_or(1_024)
+                    .clamp(2, 1_024)
+            } else {
+                policy.max_rounds
+            },
         }
     } else if pressure_percent >= policy.soft_threshold_percent {
         LcmPressureDecision::Soft {

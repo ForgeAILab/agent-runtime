@@ -94,6 +94,13 @@ impl<'a> ContextPlanner<'a> {
         }
     }
 
+    /// Caps input without changing the model profile or output/reasoning reserves.
+    pub fn with_input_cap(mut self, hard_tokens: u32) -> Self {
+        self.budget.input_budget = self.budget.input_budget.min(hard_tokens);
+        self.budget.capability_budget = self.budget.capability_budget.min(self.budget.input_budget);
+        self
+    }
+
     /// Attaches the compaction hook. See [`Compactor`] and the module
     /// documentation for the exact contract.
     pub fn with_compactor(mut self, compactor: &'a dyn Compactor) -> Self {

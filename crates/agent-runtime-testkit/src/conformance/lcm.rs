@@ -1433,7 +1433,7 @@ pub async fn assert_planning_pressure_and_classification_conformance() {
     ));
     assert_eq!(soft, decide_pressure(80, 100, 50_000, &policy));
     assert!(
-        matches!(decide_pressure(95, 100, 0, &policy), LcmPressureDecision::Hard { pressure_percent: 95, max_rounds, .. } if max_rounds == policy.max_rounds)
+        matches!(decide_pressure(95, 100, 0, &policy), LcmPressureDecision::Hard { pressure_percent: 95, max_rounds, .. } if max_rounds >= 2 && (policy.max_rounds == 0 || max_rounds == policy.max_rounds))
     );
     assert_eq!(
         decide_pressure(0, 0, 0, &policy),
@@ -1503,7 +1503,8 @@ pub async fn assert_summarization_conformance() {
     let first_stage = LcmEscalatingSummarizer::with_policy(
         first_stage_model.clone(),
         LcmEscalationPolicy {
-            target_tokens: 64,
+            leaf_source_target_tokens: 256,
+            summary_max_ratio: 0.08,
             deterministic_token_cap: 16,
             ..LcmEscalationPolicy::default()
         },
@@ -1539,7 +1540,8 @@ pub async fn assert_summarization_conformance() {
     let escalating = LcmEscalatingSummarizer::with_policy(
         escalating_model.clone(),
         LcmEscalationPolicy {
-            target_tokens: 64,
+            leaf_source_target_tokens: 256,
+            summary_max_ratio: 0.08,
             deterministic_token_cap: 16,
             ..LcmEscalationPolicy::default()
         },

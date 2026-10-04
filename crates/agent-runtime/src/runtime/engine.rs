@@ -73,9 +73,35 @@ fn merge_terminal_checkpoint_snapshot(
         ));
     }
     if canonical.usage != protected.usage {
-        return Err(RuntimeError::conflict(
-            "canonical usage ledger and terminal checkpoint are from different boundaries",
-        ));
+        let predecessor =
+            agent_runtime_registry::Fingerprint::of(serde_json::to_vec(&canonical.usage)?);
+        let idle_successor = protected
+            .extension_state
+            .get("runtime.lcm.idle_boundary")
+            .is_some_and(|state| {
+                state.revision.as_str() == "lcm-idle-boundary-1"
+                    && state.sensitivity
+                        == agent_runtime_core::store::SessionStateSensitivity::RedactionSafe
+                    && state.value["predecessor_usage"] == serde_json::json!(predecessor)
+                    && protected
+                        .usage
+                        .records()
+                        .starts_with(canonical.usage.records())
+                    && protected.usage.records()[canonical.usage.records().len()..]
+                        .iter()
+                        .all(|record| {
+                            matches!(
+                                record.source,
+                                agent_runtime_core::usage::UsageSource::SemanticSummary
+                            )
+                        })
+            });
+        if !idle_successor {
+            return Err(RuntimeError::conflict(
+                "canonical usage ledger and terminal checkpoint are from different boundaries",
+            ));
+        }
+        canonical.usage = protected.usage.clone();
     }
     validate_boundary_pair(canonical, protected)?;
 
@@ -94,6 +120,31 @@ fn merge_terminal_checkpoint_snapshot(
         }
         if let Some(ordinary) = canonical.extension_state.get(namespace) {
             if ordinary.revision != exact.revision {
+                if namespace == LCM_COMPONENT_ID {
+                    let same_identity = [
+                        "schema_version",
+                        "timeline_id",
+                        "binding_revision",
+                        "store_revision",
+                        "classifier_revision",
+                        "content_guard_id",
+                        "content_guard_revision",
+                    ]
+                    .iter()
+                    .all(|field| ordinary.value[field] == exact.value[field]);
+                    if !same_identity {
+                        return Err(RuntimeError::conflict(
+                            "ordinary and protected LCM identities differ",
+                        ));
+                    }
+                    // The exact checkpoint remains authority. Coordinator
+                    // validation rebuilds tunables after overlay, even when
+                    // an earlier rebuild was saved only to ordinary storage.
+                    canonical
+                        .extension_state
+                        .insert(namespace.clone(), exact.clone());
+                    continue;
+                }
                 return Err(RuntimeError::conflict(format!(
                     "extension state namespace `{namespace}` has incompatible revisions \
                      (session store `{}`, checkpoint `{}`)",
@@ -514,6 +565,7 @@ pub struct RuntimeShared {
     /// paths use the same host-authorized component allocation as the sealed
     /// history projector and turn-commit hook.
     pub(crate) lcm: Option<Arc<LcmCoordinator>>,
+    pub(crate) soft_on_turn_boundary: bool,
     pub(crate) manifest_window: std::num::NonZeroUsize,
 }
 

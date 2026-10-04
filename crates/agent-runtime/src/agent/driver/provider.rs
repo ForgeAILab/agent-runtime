@@ -590,6 +590,17 @@ impl Driver {
         };
 
         let plan = &planned.plan;
+        if let Some(lcm) = &self.history_lcm {
+            let overhead = lcm.observe_plan(emitter.session(), plan.budget_report());
+            if let Some(state) = execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned")
+                .get_mut(crate::harness::LCM_COMPONENT_ID)
+            {
+                state.value["fixed_overhead_tokens"] = serde_json::json!(overhead);
+            }
+        }
         emitter.emit(
             turn.clone(),
             RuntimeEvent::ContextPlanned {
