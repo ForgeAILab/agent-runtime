@@ -390,6 +390,7 @@ impl ReasoningAccumulator {
                 text: part.text,
                 redacted: part.redacted,
                 signature: part.signature,
+                producer: None,
             })
             .collect()
     }

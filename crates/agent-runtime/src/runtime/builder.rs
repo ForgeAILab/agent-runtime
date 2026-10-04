@@ -827,7 +827,8 @@ impl RuntimeBuilder {
             self.compactor,
             cache_capability,
             self.revisions,
-        );
+        )
+        .with_nonempty_assistant_content(provider.requires_nonempty_assistant_content());
         if let Some(endpoint) = self.cache_endpoint_identity {
             planner = planner.with_cache_endpoint_identity(endpoint);
         }

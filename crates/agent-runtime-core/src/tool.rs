@@ -1145,6 +1145,7 @@ fn truncate_part(part: ContentPart, limit: usize) -> ContentPart {
             text,
             redacted,
             signature,
+            producer,
         } => {
             let truncated = truncate_text(&text, limit);
             // A signature only vouches for the exact text it signed.
@@ -1153,6 +1154,7 @@ fn truncate_part(part: ContentPart, limit: usize) -> ContentPart {
                 text: truncated,
                 redacted,
                 signature,
+                producer,
             }
         }
         ContentPart::Image { .. } | ContentPart::ToolCall(_) | ContentPart::ToolResult(_) => {

@@ -2357,11 +2357,13 @@ mod tests {
                 text: "step one".into(),
                 redacted: false,
                 signature: None,
+                producer: None,
             },
             ContentPart::Reasoning {
                 text: "step two".into(),
                 redacted: false,
                 signature: None,
+                producer: None,
             },
             ContentPart::text("calling a tool"),
             ContentPart::ToolCall(ToolCall {
@@ -2377,6 +2379,54 @@ mod tests {
         assert_eq!(wire[0]["content"], "calling a tool");
         assert_eq!(wire[0]["tool_calls"][0]["id"], "c1");
         assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn same_producer_reasoning_keeps_openai_request_bytes() {
+        use crate::reasoning_history_tests::{history, producer, request};
+
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let current = producer("openai-compatible", "gpt-x");
+        let canonical = history(Some(current.clone()), false);
+        let own = request(&canonical, &current, &provider);
+        assert_eq!(own.messages, canonical);
+        let legacy = request(&history(None, false), &current, &provider);
+        validate_openai_messages(&own).unwrap();
+        validate_openai_messages(&legacy).unwrap();
+        let session = SessionId::new("s");
+        assert_eq!(
+            serde_json::to_vec(&provider.build_payload(&own, &session)).unwrap(),
+            serde_json::to_vec(&provider.build_payload(&legacy, &session)).unwrap()
+        );
+    }
+
+    #[test]
+    fn foreign_reasoning_is_omitted_before_openai_validation() {
+        use crate::reasoning_history_tests::{
+            assert_no_foreign_reasoning, history, producer, request,
+        };
+
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let current = producer("openai-compatible", "gpt-x");
+        let canonical = history(Some(producer("foreign-provider", "foreign-model")), true);
+        let unprojected = ProviderRequest::new(current.model.clone(), canonical.clone());
+        assert!(validate_openai_messages(&unprojected).is_err());
+        let projected = request(&canonical, &current, &provider);
+        validate_openai_messages(&projected).unwrap();
+        assert_eq!(projected.messages.len(), canonical.len());
+        assert!(projected.messages[2].content.is_empty());
+        let body = provider.build_payload(&projected, &SessionId::new("s"));
+        assert_no_foreign_reasoning(&body);
+        assert_eq!(
+            body["messages"][2],
+            json!({"role": "assistant", "content": ""})
+        );
     }
 
     #[test]
@@ -2439,6 +2489,7 @@ mod tests {
                 text: "hidden".into(),
                 redacted: true,
                 signature: None,
+                producer: None,
             },
             ContentPart::text("visible"),
         ]);

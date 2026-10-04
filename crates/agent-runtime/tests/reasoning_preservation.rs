@@ -74,6 +74,142 @@ fn reasoning_parts(messages: &[Message]) -> Vec<(String, bool)> {
         .collect()
 }
 
+#[tokio::test]
+async fn committed_reasoning_uses_run_manifest_identity() {
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![
+            ProviderStreamEvent::ReasoningDelta {
+                text: "signed thought".into(),
+                redacted: false,
+                signature: Some("signed-canary".into()),
+            },
+            ProviderStreamEvent::ReasoningDelta {
+                text: "opaque payload".into(),
+                redacted: true,
+                signature: Some("redacted-canary".into()),
+            },
+            ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])],
+    ));
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider)
+        .provider_name("serving-provider")
+        .model_profile(profile())
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("think")).await.unwrap();
+    let snapshot = session.snapshot();
+    let model = &snapshot.manifests[0].manifest.model;
+    assert_eq!(model.provider, "serving-provider");
+    assert_eq!(model.model, ModelId::new("fake"));
+    let expected = ReasoningProducer {
+        provider: model.provider.clone(),
+        model: model.model.clone(),
+    };
+    let parts = &snapshot.history[1].content;
+    assert_eq!(
+        parts,
+        &vec![
+            ContentPart::Reasoning {
+                text: "signed thought".into(),
+                redacted: false,
+                signature: Some("signed-canary".into()),
+                producer: Some(expected.clone()),
+            },
+            ContentPart::Reasoning {
+                text: "opaque payload".into(),
+                redacted: true,
+                signature: Some("redacted-canary".into()),
+                producer: Some(expected),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn switching_producer_a_b_a_restores_signed_reasoning_without_rewriting_history() {
+    let a = ReasoningProducer {
+        provider: "provider-a".into(),
+        model: ModelId::new("model-a"),
+    };
+    let original = Message::assistant(vec![
+        ContentPart::Reasoning {
+            text: "A's signed thought".into(),
+            redacted: false,
+            signature: Some("A-signature-canary".into()),
+            producer: Some(a.clone()),
+        },
+        ContentPart::Reasoning {
+            text: "A's opaque payload".into(),
+            redacted: true,
+            signature: Some("A-redacted-signature-canary".into()),
+            producer: Some(a.clone()),
+        },
+        ContentPart::text("A's answer"),
+    ]);
+    for b in [
+        ReasoningProducer {
+            provider: "provider-b".into(),
+            ..a.clone()
+        },
+        ReasoningProducer {
+            model: ModelId::new("model-b"),
+            ..a.clone()
+        },
+    ] {
+        let mut canonical = vec![Message::user("original question"), original.clone()];
+        let mut requests = Vec::new();
+        for current in [&a, &b, &a] {
+            let provider = Arc::new(FakeProvider::new(
+                current.model.as_str(),
+                Capabilities::basic_streaming(),
+                vec![ScriptedStream::new(vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "continued".into(),
+                    },
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ])],
+            ));
+            let runtime = RuntimeBuilder::new(current.model.clone())
+                .provider(provider.clone())
+                .model_profile(ResolvedModelProfile::explicit(
+                    current.provider.clone(),
+                    current.model.clone(),
+                    ModelLimits::new(128_000, 128_000, 4_096),
+                ))
+                .build()
+                .unwrap();
+            let session = runtime
+                .start_session(StartSession::new().with_history(canonical))
+                .await
+                .unwrap();
+            session.run(UserInput::text("continue")).await.unwrap();
+            requests.push(provider.requests().pop().unwrap());
+            canonical = session.snapshot().history;
+            assert_eq!(
+                canonical[1], original,
+                "canonical reasoning stays intact on every turn"
+            );
+        }
+        assert_eq!(requests[0].messages[1], original);
+        assert_eq!(
+            requests[1].messages[1],
+            Message::assistant(vec![ContentPart::text("A's answer")])
+        );
+        assert_eq!(
+            requests[2].messages[1], original,
+            "A's exact reasoning and signatures return"
+        );
+    }
+}
+
 /// Streamed reasoning must land in history ahead of the visible answer and be
 /// carried on the continuation request of the same turn.
 #[tokio::test]
@@ -320,6 +456,7 @@ async fn signature_only_reasoning_survives_serialization_and_a_later_turn() {
                     text,
                     redacted: true,
                     signature: Some(signature),
+                    producer: Some(_),
                 } if text.is_empty() && signature == "signature-only-canary"
             )
         })

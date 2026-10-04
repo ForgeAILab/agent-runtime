@@ -275,6 +275,7 @@ impl<'a> ExternalTurnMachine<'a> {
                     text: reasoning,
                     redacted: false,
                     signature: None,
+                    producer: Some(self.machine.execution.planner.reasoning_producer()),
                 });
             }
             if !text.is_empty() {

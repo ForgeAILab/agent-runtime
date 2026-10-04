@@ -449,6 +449,7 @@ fn reasoning_continuation(model: &str) -> ProviderRequest {
                         text: "prior thought".into(),
                         redacted: false,
                         signature: None,
+                        producer: None,
                     },
                     ContentPart::text("so far so good"),
                 ],

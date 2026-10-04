@@ -1861,6 +1861,43 @@ mod tests {
         )
     }
 
+    #[test]
+    fn same_producer_reasoning_keeps_gemini_request_bytes() {
+        use crate::reasoning_history_tests::{history, producer, request};
+
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new(Vec::<Vec<u8>>::new()), config())
+                .unwrap();
+        let current = producer("google", "gemini-test");
+        let canonical = history(Some(current.clone()), true);
+        let own = request(&canonical, &current, &provider);
+        assert_eq!(own.messages, canonical);
+        let legacy = request(&history(None, true), &current, &provider);
+        assert_eq!(
+            serde_json::to_vec(&provider.build_payload(&own).unwrap()).unwrap(),
+            serde_json::to_vec(&provider.build_payload(&legacy).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn foreign_reasoning_is_omitted_before_gemini_validation() {
+        use crate::reasoning_history_tests::{
+            assert_no_foreign_reasoning, history, producer, request,
+        };
+
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new(Vec::<Vec<u8>>::new()), config())
+                .unwrap();
+        let current = producer("google", "gemini-test");
+        let canonical = history(Some(producer("foreign-provider", "foreign-model")), true);
+        let projected = request(&canonical, &current, &provider);
+        assert_eq!(projected.messages.len(), canonical.len());
+        assert!(projected.messages[2].content.is_empty());
+        let body = provider.build_payload(&projected).unwrap();
+        assert_no_foreign_reasoning(&body);
+        assert_eq!(body["input"].as_array().unwrap().len(), 3);
+    }
+
     #[tokio::test]
     async fn request_is_stateless_native_and_replays_signed_tool_history_exactly() {
         let provider =
@@ -1885,6 +1922,7 @@ mod tests {
                         text: "checking".into(),
                         redacted: true,
                         signature: Some("thought-signature-canary".into()),
+                        producer: None,
                     },
                     ContentPart::ToolCall(ToolCall {
                         id: ToolCallId::new("call-1"),
@@ -1920,6 +1958,7 @@ mod tests {
                         text: String::new(),
                         redacted: true,
                         signature: Some("second-thought-signature".into()),
+                        producer: None,
                     },
                     ContentPart::ToolCall(ToolCall {
                         id: ToolCallId::new("call-3"),
@@ -2471,6 +2510,7 @@ mod tests {
             text: String::new(),
             redacted: true,
             signature: Some("sig-only".into()),
+            producer: None,
         };
         assert_eq!(
             serde_json::from_str::<ContentPart>(&serde_json::to_string(&signature_only).unwrap())

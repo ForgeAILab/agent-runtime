@@ -1129,10 +1129,19 @@ impl<'a> TurnMachine<'a> {
                     max_attempts,
                     attempt_visible_output,
                     text,
-                    reasoning,
+                    mut reasoning,
                     tool_calls,
                     finish,
                 } => {
+                    let producer = execution.planner.reasoning_producer();
+                    for part in &mut reasoning {
+                        if let ContentPart::Reasoning {
+                            producer: recorded, ..
+                        } = part
+                        {
+                            *recorded = Some(producer.clone());
+                        }
+                    }
                     if let Err(error) = self
                         .transition(TurnState::ModelResponseReady {
                             request_id: request_id.clone(),
