@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-03T00:00:00Z
-updated_at: 2026-10-04T00:15:16Z
-completed_at:
+updated_at: 2026-10-04T02:19:56Z
+completed_at: 2026-10-04T02:19:56Z
 ---
 
 Approved 2026-10-03 by the Smith owner ("continue with the road map ... good
@@ -43,5 +43,5 @@ Branch `fix/smith-cross-provider-reasoning` from Smith's pin `9bbfdd1`.
 
 - [x] 3.1 `cargo fmt --all -- --check`, Clippy with `-D warnings`, workspace
   tests.
-- [ ] 3.2 Push the branch; Smith bumps its pin and runs its live
+- [x] 3.2 Push the branch; Smith bumps its pin and runs its live
   cross-provider matrix and cache comparison.
