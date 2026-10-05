@@ -1032,13 +1032,7 @@ impl ToolExecutor {
                 }
                 continue;
             }
-            if !self.workspace.contains(scope.as_str()) {
-                return Err(format!(
-                    "workspace violation: `{}` is outside `{}`",
-                    scope.as_str(),
-                    self.workspace.root()
-                ));
-            }
+            super::validate_write_scope(self.workspace.as_ref(), scope)?;
             let relative = scope
                 .as_str()
                 .strip_prefix(self.workspace.root())

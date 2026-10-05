@@ -9,6 +9,15 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Breaking
 
+- U.1: `RuntimeBuilder::build()` now rejects static workspace write scopes
+  outside an explicitly configured workspace, returning `ErrorKind::Config`
+  with `FailureClass::InvalidToolWriteScope(Box<ToolWriteScopeViolation>)`
+  carrying tool name, rejected scope, and workspace root.
+  Replace declarations such as `with_write("/")` with a scope the workspace
+  contains, for example `with_write(workspace.root())` for workspace-wide
+  access when the root is contained. Absolute contained paths remain valid;
+  standalone registration and builds without a workspace are unaffected.
+  Invocation checks remain in place for prepared, argument-dependent scopes.
 - U6 (LCM working sets, one sizer, provider summaries). Consumer-break list:
   - `LCM_ALGORITHM_REVISION` is now `agent-runtime-lcm-2`; persisted LCM state
     from `-1` rebuilds its derived metadata once on resume (see below).

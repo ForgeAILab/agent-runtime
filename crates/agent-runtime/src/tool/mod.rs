@@ -12,3 +12,19 @@ pub mod scheduler;
 pub use executor::{SecurityConfig, ToolExecutor};
 pub use registry::{SealedToolRegistry, ToolRegistry};
 pub use scheduler::{ConflictPolicy, plan_batches};
+
+/// The shared containment check for static and prepared workspace write scopes.
+pub(crate) fn validate_write_scope(
+    workspace: &dyn agent_runtime_core::workspace::Workspace,
+    scope: &agent_runtime_core::tool::WriteScope,
+) -> Result<(), String> {
+    if workspace.contains(scope.as_str()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "workspace violation: `{}` is outside `{}`",
+            scope.as_str(),
+            workspace.root()
+        ))
+    }
+}

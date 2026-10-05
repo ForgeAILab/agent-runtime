@@ -20,7 +20,7 @@ use agent_runtime_core::check_set::{ActionClass, EnforcementLimits, SecurityChec
 use agent_runtime_core::checkpoint::CheckpointStore;
 use agent_runtime_core::clock::{Clock, SystemClock};
 use agent_runtime_core::compat::LegacyApprovalAuthority;
-use agent_runtime_core::error::RuntimeError;
+use agent_runtime_core::error::{FailureClass, RuntimeError, ToolWriteScopeViolation};
 use agent_runtime_core::grant::{SecurityCheck, SecurityCheckMode};
 use agent_runtime_core::ids::TenantId;
 use agent_runtime_core::interaction::{InteractionBroker, UnavailableInteractionBroker};
@@ -705,6 +705,12 @@ impl RuntimeBuilder {
     /// `SecurityCheckSet`, and applying fail-closed defaults for any omitted
     /// services.
     ///
+    /// When a workspace is configured, rejects a static tool write scope that
+    /// it does not contain, with [`agent_runtime_core::error::ErrorKind::Config`]
+    /// and [`agent_runtime_core::error::FailureClass::InvalidToolWriteScope`].
+    /// With no configured workspace, only invocation enforces the default
+    /// [`DenyAllWorkspace`].
+    ///
     /// Fails when any registered tool declares a non-empty typed permission
     /// upper bound but the host supplied neither an `Authoritative` check via
     /// [`RuntimeBuilder::security_check`] nor
@@ -886,6 +892,25 @@ impl RuntimeBuilder {
         let mut registry = ToolRegistry::new();
         registry.register_all(self.tools)?;
         let registry = registry.seal();
+
+        if let Some(workspace) = &self.workspace {
+            for spec in registry.specs() {
+                for scope in spec.effects.write_scopes() {
+                    crate::tool::validate_write_scope(workspace.as_ref(), scope).map_err(
+                        |message| {
+                            RuntimeError::config(format!("tool `{}`: {message}", spec.name))
+                                .with_class(FailureClass::InvalidToolWriteScope(Box::new(
+                                    ToolWriteScopeViolation {
+                                        tool: spec.name.clone(),
+                                        scope: scope.as_str().to_owned(),
+                                        workspace: workspace.root().to_owned(),
+                                    },
+                                )))
+                        },
+                    )?;
+                }
+            }
+        }
 
         let approval = self
             .approval
@@ -1192,6 +1217,157 @@ mod tests {
                 constraints: GrantConstraints::unconstrained(),
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct ScopedTool(ToolEffects);
+
+    #[async_trait]
+    impl Tool for ScopedTool {
+        fn spec(&self) -> agent_runtime_core::tool::ToolSpec {
+            agent_runtime_core::tool::ToolSpec::new(
+                "scoped_writer",
+                "declares configured scopes",
+                json!({"type":"object"}),
+                self.0.clone(),
+            )
+        }
+
+        async fn invoke(
+            &self,
+            _prepared: agent_runtime_core::tool::PreparedToolCall,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            panic!("build must not invoke tools")
+        }
+    }
+
+    #[derive(Debug)]
+    struct RootWorkspace(&'static str);
+
+    impl Workspace for RootWorkspace {
+        fn root(&self) -> &str {
+            self.0
+        }
+
+        fn contains(&self, path: &str) -> bool {
+            path == self.0 || path.starts_with(&format!("{}/", self.0))
+        }
+    }
+
+    fn scoped_builder(effects: ToolEffects) -> RuntimeBuilder {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(profile())
+            .provider(Arc::new(FakeProvider::text_reply("hi")))
+            .tool(Arc::new(ScopedTool(effects)))
+            .legacy_approval_authority()
+    }
+
+    #[test]
+    fn build_rejects_statically_declared_scope_outside_workspace_with_typed_tool_and_scope() {
+        let error = scoped_builder(ToolEffects::read_only().with_write("/"))
+            .workspace(Arc::new(RootWorkspace("/ws")))
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind, agent_runtime_core::error::ErrorKind::Config);
+        assert_eq!(
+            error.class,
+            FailureClass::InvalidToolWriteScope(Box::new(ToolWriteScopeViolation {
+                tool: "scoped_writer".into(),
+                scope: "/".into(),
+                workspace: "/ws".into(),
+            }))
+        );
+        assert_eq!(
+            error.class.stage(),
+            agent_runtime_core::error::FailureStage::PreProvider
+        );
+        assert!(!error.retryable);
+        assert!(error.message.contains("scoped_writer"));
+        assert!(
+            error
+                .message
+                .contains("workspace violation: `/` is outside `/ws`")
+        );
+        // Structured host evidence also survives serialization.
+        let wire = serde_json::to_value(&error).unwrap();
+        let decoded: RuntimeError = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn build_rejects_invalid_static_scope_with_live_ability_routing() {
+        let error = scoped_builder(ToolEffects::new(vec![]).with_write("/"))
+            .live_ability_routing()
+            .workspace(Arc::new(RootWorkspace("/ws")))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            error.class,
+            FailureClass::InvalidToolWriteScope(violation)
+                if violation.tool == "scoped_writer" && violation.scope == "/"
+        ));
+    }
+
+    #[test]
+    fn build_accepts_workspace_root_and_ordinary_in_workspace_scopes() {
+        scoped_builder(
+            ToolEffects::new(vec![])
+                .with_write("/ws")
+                .with_write("/ws/out"),
+        )
+        .workspace(Arc::new(RootWorkspace("/ws")))
+        .build()
+        .unwrap();
+    }
+
+    #[test]
+    fn build_validates_absolute_scopes_against_the_configured_workspace() {
+        let effects = ToolEffects::new(vec![]).with_write("/ws/out");
+        scoped_builder(effects.clone())
+            .workspace(Arc::new(RootWorkspace("/ws")))
+            .build()
+            .unwrap();
+        let error = scoped_builder(effects)
+            .workspace(Arc::new(RootWorkspace("/other")))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            error.class,
+            FailureClass::InvalidToolWriteScope(violation)
+                if violation.scope == "/ws/out"
+        ));
+    }
+
+    #[test]
+    fn build_with_no_workspace_is_unaffected_by_static_write_scopes() {
+        scoped_builder(ToolEffects::read_only().with_write("/"))
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn build_does_not_validate_host_or_external_conflict_scopes_as_workspace_paths() {
+        scoped_builder(
+            ToolEffects::new(vec![])
+                .with_host_write("host-shell", "host:filesystem")
+                .with_external_write("mcp:service"),
+        )
+        .workspace(Arc::new(DenyAllWorkspace))
+        .build()
+        .unwrap();
+    }
+
+    #[test]
+    fn build_rejects_static_write_scope_when_explicit_workspace_denies_every_path() {
+        let error = scoped_builder(ToolEffects::new(vec![]).with_write("<none>"))
+            .workspace(Arc::new(DenyAllWorkspace))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            error.class,
+            FailureClass::InvalidToolWriteScope(_)
+        ));
     }
 
     #[test]
