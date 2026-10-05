@@ -222,6 +222,13 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 
 ### Security
 
+- Provider configuration Debug output now hides all Anthropic extra-header
+  values while retaining header names and non-secret settings. Anthropic,
+  OpenAI, Responses, HTTP requests, and catalog refreshers also redact URLs
+  containing query strings, userinfo, or fragments, using the existing secret
+  redaction. API keys and transport header values remain non-disclosing in
+  both compact and pretty Debug output; Gemini was already redacted.
+
 - Redact Anthropic in-stream error messages and Anthropic/OpenAI transport
   diagnostics; retain typed error classes and numeric retry hints. Gemini
   transport details and unknown terminal statuses no longer echo provider text

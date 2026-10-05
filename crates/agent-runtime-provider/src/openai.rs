@@ -65,7 +65,10 @@ impl fmt::Debug for OpenAiConfig {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
         f.debug_struct("OpenAiConfig")
-            .field("base_url", &self.base_url)
+            .field(
+                "base_url",
+                &super::error_redaction::url_for_debug(&self.base_url),
+            )
             .field("model", &self.model)
             .field("capabilities", &self.capabilities)
             .field("api_key_configured", &self.api_key.is_some())

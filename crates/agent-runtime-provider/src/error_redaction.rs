@@ -1,5 +1,17 @@
-//! Transport errors may carry provider text; retain only typed retry metadata.
+//! Redaction for provider diagnostics and configuration Debug output.
 use agent_runtime_core::provider::{ProviderError, ProviderErrorKind};
+use agent_runtime_core::store::Secret;
+
+/// Keep ordinary endpoints useful in Debug, but hide URLs that may contain
+/// query credentials, userinfo, or fragments. This also covers unvalidated
+/// configuration strings without parsing them or guessing secret key names.
+pub(crate) fn url_for_debug(url: &str) -> String {
+    if url.contains(['?', '#', '@']) {
+        Secret::new(url).to_string()
+    } else {
+        url.to_owned()
+    }
+}
 
 pub(crate) fn sanitize(error: ProviderError) -> ProviderError {
     let message = match error.kind {

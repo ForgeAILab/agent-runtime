@@ -25,6 +25,7 @@
 //! the request's `system` field.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::pending;
 use std::time::Duration;
 
@@ -56,7 +57,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 /// Configuration for an [`AnthropicProvider`].
-#[derive(Debug)]
 pub struct AnthropicConfig {
     /// The API base URL (e.g. `https://api.anthropic.com/v1`).
     pub base_url: String,
@@ -68,6 +68,26 @@ pub struct AnthropicConfig {
     pub api_key: Option<Secret>,
     /// Additional headers to send with every request (e.g. beta flags).
     pub extra_headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let header_names = self
+            .extra_headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        f.debug_struct("AnthropicConfig")
+            .field(
+                "base_url",
+                &super::error_redaction::url_for_debug(&self.base_url),
+            )
+            .field("model", &self.model)
+            .field("capabilities", &self.capabilities)
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("extra_header_names", &header_names)
+            .finish()
+    }
 }
 
 impl AnthropicConfig {
