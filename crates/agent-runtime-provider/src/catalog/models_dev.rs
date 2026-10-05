@@ -19,6 +19,7 @@
 //! are ignored, malformed entries are skipped rather than poisoning the batch,
 //! and absurd limits are rejected.
 
+use std::fmt;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -95,12 +96,23 @@ impl ModelCatalogSource for ModelsDevSource {
 }
 
 /// Refreshes the models.dev cache. Control-plane only.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelsDevRefresher {
     transport: Arc<dyn CatalogTransport>,
     cache: Arc<dyn CatalogCache>,
     clock: Arc<dyn Clock>,
     url: String,
+}
+
+impl fmt::Debug for ModelsDevRefresher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModelsDevRefresher")
+            .field("transport", &self.transport)
+            .field("cache", &self.cache)
+            .field("clock", &self.clock)
+            .field("url", &crate::error_redaction::url_for_debug(&self.url))
+            .finish()
+    }
 }
 
 /// What one refresh did.

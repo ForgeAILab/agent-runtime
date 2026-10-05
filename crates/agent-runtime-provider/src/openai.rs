@@ -65,7 +65,10 @@ impl fmt::Debug for OpenAiConfig {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
         f.debug_struct("OpenAiConfig")
-            .field("base_url", &self.base_url)
+            .field(
+                "base_url",
+                &super::error_redaction::url_for_debug(&self.base_url),
+            )
             .field("model", &self.model)
             .field("capabilities", &self.capabilities)
             .field("api_key_configured", &self.api_key.is_some())
@@ -342,6 +345,9 @@ impl<T: HttpTransport> OpenAiProvider<T> {
     /// to earn. Keying by request id would be just as bad — it changes every
     /// turn.
     fn build_payload(&self, request: &ProviderRequest, session: &SessionId) -> Value {
+        let tool_names = super::tool_names::ToolNames::new(request);
+        let wire_request = tool_names.project(request);
+        let request = wire_request.as_ref();
         let mut messages = Vec::new();
         for msg in &request.messages {
             messages.extend(to_openai_messages(msg));
@@ -828,8 +834,6 @@ struct StreamChunk {
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
-    #[serde(default)]
-    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -910,17 +914,212 @@ fn stream_error() -> ProviderError {
     .retryable()
 }
 
+// Exact wire identifiers only: never infer a class from provider messages or
+// recursively inspect gateway metadata (which may contain raw upstream bodies).
+// Numeric gateway codes follow OpenRouter's HTTP-valued `error.code` and the
+// explicit Z.ai business-code table: https://docs.z.ai/api-reference/api-code.
+// CamelCase identifiers accommodate Azure-style errors; matching is otherwise
+// exact, and unrecognized identifiers do not select a non-server class.
+fn envelope_error_kind(value: &Value) -> Option<ProviderErrorKind> {
+    let code = match value {
+        Value::String(code) => code.to_ascii_lowercase(),
+        Value::Number(code) => code.to_string(),
+        _ => return None,
+    };
+    Some(match code.as_str() {
+        "401"
+        | "403"
+        | "unauthorized"
+        | "unauthenticated"
+        | "forbidden"
+        | "authentication_error"
+        | "authenticationerror"
+        | "invalidauthorization"
+        | "insufficientauthorization"
+        | "invalid_api_key"
+        | "invalid_api_key_error"
+        | "permission_error"
+        | "permission_denied"
+        | "permissiondenied"
+        | "1000"
+        | "1001"
+        | "1003"
+        | "1005"
+        | "1220" => ProviderErrorKind::Auth,
+        "402"
+        | "insufficient_quota"
+        | "usage_limit_reached"
+        | "credit_balance_exhausted"
+        | "1113"
+        | "1308"
+        | "1309"
+        | "1310" => ProviderErrorKind::LimitExhausted,
+        "429"
+        | "rate_limit_error"
+        | "rate_limit_exceeded"
+        | "rate_limited"
+        | "ratelimitexceeded"
+        | "toomanyrequests"
+        | "1302" => ProviderErrorKind::RateLimited,
+        "invalid_request_error"
+        | "invalid_request"
+        | "invalidrequest"
+        | "bad_request"
+        | "model_not_found"
+        | "not_found_error"
+        | "context_length_exceeded"
+        | "context_window_exceeded"
+        | "1210"
+        | "1211"
+        | "1212"
+        | "1213"
+        | "1214"
+        | "1215"
+        | "1221"
+        | "1222"
+        | "1261"
+        | "1301" => ProviderErrorKind::BadRequest,
+        "server_error"
+        | "api_error"
+        | "overloaded_error"
+        | "server_overloaded"
+        | "server_is_overloaded"
+        | "1305" => ProviderErrorKind::Server,
+        _ => match code.parse::<u16>().ok()? {
+            400..=499 => ProviderErrorKind::BadRequest,
+            500..=599 => ProviderErrorKind::Server,
+            _ => return None,
+        },
+    })
+}
+
+fn wire_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn retry_seconds_ms(value: &str) -> Option<u64> {
+    let seconds: f64 = value.trim().parse().ok()?;
+    // Duration performs checked conversion, rejecting negatives, NaN and
+    // overflow rather than turning a malformed hint into an invented wait.
+    let duration = Duration::try_from_secs_f64(seconds).ok()?;
+    u64::try_from(duration.as_millis()).ok()
+}
+
+fn envelope_error(envelope: &Value) -> ProviderError {
+    let error = envelope.get("error").unwrap_or(envelope);
+    let type_kind = error.get("type").and_then(envelope_error_kind);
+    let code_kind = error.get("code").and_then(envelope_error_kind);
+    // OpenAI uses the broad invalid_request_error type even for auth errors.
+    // A recognized code or embedded status must take precedence over it.
+    let kind = match (code_kind, type_kind) {
+        // A gateway's generic 429 code does not erase explicit quota exhaustion.
+        (Some(ProviderErrorKind::RateLimited), Some(ProviderErrorKind::LimitExhausted)) => {
+            Some(ProviderErrorKind::LimitExhausted)
+        }
+        _ => code_kind,
+    }
+    .or(type_kind.filter(|kind| *kind != ProviderErrorKind::BadRequest))
+    .or_else(|| {
+        [error, envelope].into_iter().find_map(|object| {
+            ["status", "status_code", "statusCode"]
+                .into_iter()
+                .find_map(|field| object.get(field).and_then(envelope_error_kind))
+        })
+    })
+    .or(type_kind)
+    .unwrap_or(ProviderErrorKind::Server);
+    let message = match kind {
+        ProviderErrorKind::Auth => "provider authentication rejected",
+        ProviderErrorKind::RateLimited => "OpenAI-compatible provider rate limit exceeded",
+        ProviderErrorKind::LimitExhausted => "OpenAI-compatible provider usage limit reached",
+        ProviderErrorKind::BadRequest => "OpenAI-compatible provider rejected the request",
+        _ => "OpenAI-compatible provider reported a stream error",
+    };
+    let mut mapped = ProviderError::new(kind, message);
+    if matches!(
+        kind,
+        ProviderErrorKind::Server | ProviderErrorKind::RateLimited
+    ) {
+        mapped.retryable = true;
+        mapped.retry_after_ms = error.get("retry_after_ms").and_then(wire_u64).or_else(|| {
+            error.get("retry_after").and_then(|value| match value {
+                Value::String(seconds) => retry_seconds_ms(seconds),
+                Value::Number(seconds) => retry_seconds_ms(&seconds.to_string()),
+                _ => None,
+            })
+        });
+    }
+    mapped
+}
+
 fn decode_stream_chunk(data: &str) -> Result<StreamChunk, ProviderError> {
-    let chunk = serde_json::from_str::<StreamChunk>(data).map_err(|_| {
+    let malformed = || {
         ProviderError::new(
             ProviderErrorKind::MalformedStream,
             "invalid OpenAI stream chunk",
         )
-    })?;
-    if chunk.error.is_some() {
-        return Err(stream_error());
+    };
+    let value: Value = serde_json::from_str(data).map_err(|_| malformed())?;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(envelope_error(&value));
     }
-    Ok(chunk)
+    serde_json::from_value(value).map_err(|_| malformed())
+}
+
+fn decode_stream_frame(data: &str, is_error: bool) -> Result<StreamChunk, ProviderError> {
+    if is_error {
+        return Err(serde_json::from_str::<Value>(data)
+            .map(|value| envelope_error(&value))
+            .unwrap_or_else(|_| stream_error()));
+    }
+    decode_stream_chunk(data)
+}
+
+/// Applies the same pre-output credential fence and rate-limit policy to
+/// complete frames, trailing frames and plain JSON response bodies.
+struct EnvelopeRejectionContext {
+    source: Option<Arc<dyn ProviderCredentialSource>>,
+    target: ProviderCredentialTarget,
+    revision: Option<ProviderCredentialRevision>,
+    cancel: Cancellation,
+    deadline: Deadline,
+    clock: Arc<dyn Clock>,
+    rate_limits: agent_runtime_core::provider::RateLimitSnapshot,
+    retry_after_ms: Option<u64>,
+}
+
+impl EnvelopeRejectionContext {
+    async fn classify(&self, mut error: ProviderError, saw_semantic_event: bool) -> ProviderError {
+        if matches!(
+            error.kind,
+            ProviderErrorKind::Server | ProviderErrorKind::RateLimited
+        ) {
+            error.retry_after_ms = error.retry_after_ms.or(self.retry_after_ms);
+        }
+        if error.kind == ProviderErrorKind::RateLimited {
+            if let Some(exhaustion) = ratelimit::classify_rejection(
+                429,
+                &self.rate_limits,
+                error.retry_after_ms,
+                self.clock.now().as_millis(),
+            ) {
+                error = ratelimit::apply_exhaustion(error, exhaustion);
+            }
+        }
+        if saw_semantic_event {
+            return error;
+        }
+        classify_auth_rejection(
+            error,
+            self.source.clone(),
+            self.target.clone(),
+            self.revision.clone(),
+            &self.cancel,
+            self.deadline,
+            self.clock.clone(),
+        )
+        .await
+    }
 }
 
 /// A cumulative cache usage snapshot gathered while an OpenAI stream is
@@ -1072,6 +1271,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        let tool_names = super::tool_names::ToolNames::new(&request);
         if request.model != self.config.model {
             return Err(ProviderError::new(
                 ProviderErrorKind::BadRequest,
@@ -1117,6 +1317,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             result = &mut post => match result {
                 Ok(response) => response,
                 Err(error) => {
+                    let error = super::error_redaction::sanitize(error);
                     return Err(classify_auth_rejection(
                         error,
                         credential_source,
@@ -1133,6 +1334,10 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         // that served this attempt, and nothing downstream can recover them
         // once the stream is running.
         let rate_limits = ratelimit::snapshot_from_headers(&response.headers);
+        let retry_after_ms = response
+            .header("retry-after-ms")
+            .and_then(|value| value.parse().ok())
+            .or_else(|| response.header("retry-after").and_then(retry_seconds_ms));
         let mut bytes = response.body;
         let cancel = ctx.cancel.clone();
         let deadline = ctx.deadline;
@@ -1141,6 +1346,16 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
         let clock = self.clock.clone();
 
+        let rejection = EnvelopeRejectionContext {
+            source: credential_source.clone(),
+            target: credential_target.clone(),
+            revision: rejected_revision.clone(),
+            cancel: cancel.clone(),
+            deadline,
+            clock: clock.clone(),
+            rate_limits: rate_limits.clone(),
+            retry_after_ms,
+        };
         let out = stream! {
             // Emitted first so a consumer sees the limit state that governed
             // this attempt before any of its output.
@@ -1149,6 +1364,9 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
+            let mut body_prefix = String::new();
+            let mut json_body = None::<String>;
+            let mut body_mode_selected = false;
             let mut saw_chunk = false;
             let mut saw_semantic_event = false;
             let mut emitted_finish = false;
@@ -1187,6 +1405,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(error) => {
+                        let error = super::error_redaction::sanitize(error);
                         let error = if saw_semantic_event {
                             if error.kind == ProviderErrorKind::Auth {
                                 ProviderError::new(
@@ -1225,22 +1444,33 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         return;
                     }
                 };
+                let text = if !body_mode_selected {
+                    body_prefix.push_str(&text);
+                    let prefix = body_prefix.trim_start();
+                    if prefix.is_empty() {
+                        continue;
+                    }
+                    body_mode_selected = true;
+                    if prefix.starts_with('{') {
+                        json_body = Some(std::mem::take(&mut body_prefix));
+                        continue;
+                    }
+                    std::mem::take(&mut body_prefix)
+                } else {
+                    text
+                };
+                if let Some(body) = json_body.as_mut() {
+                    body.push_str(&text);
+                    continue;
+                }
                 parser.push_str(&text);
                 for frame in parser.drain_frames() {
                     let data = frame.data.trim();
-                    if frame.event.as_deref() == Some("error") {
-                        for event in cache.take_events() {
-                            yield event;
-                        }
-                        yield ProviderStreamEvent::Error {
-                            error: stream_error(),
-                        };
-                        return;
-                    }
-                    if data.is_empty() {
+                    let is_error = frame.event.as_deref() == Some("error");
+                    if data.is_empty() && !is_error {
                         continue;
                     }
-                    if data == "[DONE]" {
+                    if data == "[DONE]" && !is_error {
                         for event in cache.take_events() {
                             yield event;
                         }
@@ -1250,7 +1480,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         emitted_finish = true;
                         break 'outer;
                     }
-                    match decode_stream_chunk(data) {
+                    match decode_stream_frame(data, is_error) {
                         Ok(parsed) => {
                             saw_chunk = true;
                             let mut events = Vec::new();
@@ -1272,7 +1502,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                                 yield event;
                             }
                             yield ProviderStreamEvent::Error {
-                                error,
+                                error: rejection.classify(error, saw_semantic_event).await,
                             };
                             return;
                         }
@@ -1293,19 +1523,23 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 return;
             }
 
+            if let Some(body) = json_body {
+                let error = decode_stream_chunk(&body).err().unwrap_or_else(|| {
+                    ProviderError::new(ProviderErrorKind::MalformedStream,
+                        "OpenAI streaming response was not an SSE stream")
+                });
+                yield ProviderStreamEvent::Error {
+                    error: rejection.classify(error, saw_semantic_event).await,
+                };
+                return;
+            }
+
             // Flush any trailing partial frame.
             if !emitted_finish {
                 if let Some(frame) = parser.finish() {
                     let data = frame.data.trim();
-                    if frame.event.as_deref() == Some("error") {
-                        for event in cache.take_events() {
-                            yield event;
-                        }
-                        yield ProviderStreamEvent::Error {
-                            error: stream_error(),
-                        };
-                        return;
-                    } else if data == "[DONE]" {
+                    let is_error = frame.event.as_deref() == Some("error");
+                    if data == "[DONE]" && !is_error {
                         for event in cache.take_events() {
                             yield event;
                         }
@@ -1313,8 +1547,8 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                             reason: pending_finish.unwrap_or(FinishReason::Stop),
                         };
                         emitted_finish = true;
-                    } else if !data.is_empty() {
-                        match decode_stream_chunk(data) {
+                    } else if !data.is_empty() || is_error {
+                        match decode_stream_frame(data, is_error) {
                             Ok(parsed) => {
                                 saw_chunk = true;
                                 let mut events = Vec::new();
@@ -1331,7 +1565,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                                     yield event;
                                 }
                                 yield ProviderStreamEvent::Error {
-                                    error,
+                                    error: rejection.classify(error, saw_semantic_event).await,
                                 };
                                 return;
                             }
@@ -1351,7 +1585,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 };
             }
         };
-        Ok(Box::pin(out))
+        Ok(tool_names.restore_stream(Box::pin(out), true))
     }
 }
 
@@ -2327,6 +2561,248 @@ mod tests {
         assert_eq!(error.kind, ProviderErrorKind::Server);
         assert!(error.retryable);
         assert!(!format!("{error:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn auth_envelope_is_not_retryable_and_invalidates_exact_revision_once() {
+        for chunks in [
+            vec![
+                "data: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\",\"message\":\"secret-canary\"}}\n\ndata: [DONE]\n\n",
+            ],
+            vec!["event: error\ndata: {\"error\":{\"code\":401}}\n\n"],
+            vec!["data: {\"error\":{\"status_code\":\"403\"}}"],
+            vec!["event: error\ndata: {\"type\":\"authentication_error\"}"],
+            vec![
+                "data: {\"error\":{\"code\":\"future_auth_code\",\"type\":\"invalid_request_error\"},\"statusCode\":401}\n\n",
+            ],
+            vec![
+                " \n",
+                "{\"error\":{\"code\":\"1003\",",
+                "\"message\":\"secret-canary\"}}",
+            ],
+        ] {
+            let source = Arc::new(ScriptedCredentialSource::new(
+                vec![Ok(lease("token-canary", None, "revision-canary"))],
+                vec![Ok(CredentialInvalidation::ReplacementPossible)],
+            ));
+            let provider = OpenAiProvider::with_credential_source(
+                ReplayTransport::new(chunks),
+                OpenAiConfig::new("http://x/v1", "gpt-x"),
+                target(),
+                source.clone(),
+            )
+            .unwrap();
+            let events = collect(
+                provider
+                    .stream(ProviderRequest::new(ModelId::new("gpt-x"), vec![]), ctx())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let [ProviderStreamEvent::Error { error }] = events.as_slice() else {
+                panic!("expected one terminal authentication error");
+            };
+            assert_eq!(error.kind, ProviderErrorKind::Auth);
+            assert!(!crate::retry::is_retryable(error));
+            assert_eq!(
+                error.credential_recovery,
+                Some(ProviderCredentialRecovery::RetryWithRenewedCredential)
+            );
+            assert_eq!(
+                *source.invalidated.lock().unwrap(),
+                vec![ProviderCredentialRevision::new("revision-canary").unwrap()]
+            );
+            assert_eq!(source.acquire_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.transport().requests().len(), 1);
+            assert!(!format!("{events:?}").contains("canary"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_envelope_preserves_retry_hint() {
+        for (body, headers, expected) in [
+            (
+                "data: {\"error\":{\"type\":\"rate_limit_error\",\"retry_after_ms\":1250}}\n\n",
+                vec![],
+                Some(1250),
+            ),
+            (
+                "event: error\ndata: {\"error\":{\"code\":429,\"retry_after\":\"1.5\"}}",
+                vec![],
+                Some(1500),
+            ),
+            (
+                "data: {\"error\":{\"code\":\"1302\"}}\n\n",
+                vec![("Retry-After", "2")],
+                Some(2000),
+            ),
+            (
+                "data: {\"error\":{\"status\":429}}\n\n",
+                vec![("retry-after", "garbage")],
+                None,
+            ),
+            (
+                "{\"error\":{\"code\":\"RateLimitExceeded\"}}",
+                vec![("retry-after-ms", "123")],
+                Some(123),
+            ),
+        ] {
+            let provider = OpenAiProvider::new(
+                HeaderTransport::new(body, &headers),
+                OpenAiConfig::new("http://x/v1", "gpt-x"),
+            );
+            let events = collect(
+                provider
+                    .stream(ProviderRequest::new(ModelId::new("gpt-x"), vec![]), ctx())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let [ProviderStreamEvent::Error { error }] = events.as_slice() else {
+                panic!("expected rate limit error");
+            };
+            assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+            assert_eq!(error.retry_after_ms, expected);
+            assert!(crate::retry::is_retryable(error));
+        }
+    }
+
+    #[test]
+    fn malformed_retry_hints_are_ignored_and_unknown_codes_use_known_types() {
+        for hint in [
+            json!(-1),
+            json!("NaN"),
+            json!("inf"),
+            json!("1e100"),
+            json!({"seconds":1}),
+        ] {
+            let error = decode_stream_chunk(&json!({"error":{"code":"new_code", "type":"rate_limit_error", "retry_after":hint}}).to_string()).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+            assert_eq!(error.retry_after_ms, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_envelope_with_spent_headers_uses_existing_exhaustion_policy() {
+        let provider = OpenAiProvider::new(
+            HeaderTransport::new(
+                "data: {\"error\":{\"code\":429}}\n\n",
+                &[
+                    ("x-ratelimit-limit-requests", "100"),
+                    ("x-ratelimit-remaining-requests", "0"),
+                    ("x-ratelimit-reset-requests", "2s"),
+                ],
+            ),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        )
+        .with_clock(Arc::new(FixedClock(Timestamp(1000))));
+        let events = collect(
+            provider
+                .stream(ProviderRequest::new(ModelId::new("gpt-x"), vec![]), ctx())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let [
+            ProviderStreamEvent::RateLimit { .. },
+            ProviderStreamEvent::Error { error },
+        ] = events.as_slice()
+        else {
+            panic!("expected limit snapshot and error");
+        };
+        assert_eq!(error.kind, ProviderErrorKind::LimitExhausted);
+        assert_eq!(error.limit_resets_at_ms, Some(3000));
+        assert!(!crate::retry::is_retryable(error));
+    }
+
+    #[test]
+    fn invalid_request_envelope_is_non_retryable_including_context_length() {
+        for error in [
+            json!({"type":"invalid_request_error"}),
+            json!({"code":"InvalidRequest"}),
+            json!({"type":"invalid_request_error", "code":"context_length_exceeded"}),
+            json!({"code":"1261"}),
+            json!({"status_code":422}),
+        ] {
+            let error = decode_stream_chunk(&json!({"error":error}).to_string()).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+            assert!(!crate::retry::is_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn quota_envelope_is_non_retryable_limit_exhaustion() {
+        for error in [
+            json!({"code":"insufficient_quota"}),
+            json!({"code":429,"type":"insufficient_quota"}),
+            json!({"type":"usage_limit_reached"}),
+            json!({"code":"1113"}),
+            json!({"code":402}),
+        ] {
+            let error = decode_stream_chunk(&json!({"error":error}).to_string()).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::LimitExhausted);
+            assert!(!crate::retry::is_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn unknown_envelope_stays_server_without_disclosing_payload() {
+        for error in [
+            json!({"code":"future_error", "message":"invalid API key secret-canary", "metadata":{"raw":"secret-canary"}}),
+            json!("secret-canary"),
+            json!({"code":9999}),
+            json!({"type":"overloaded_error"}),
+        ] {
+            let error = decode_stream_chunk(&json!({"error":error}).to_string()).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::Server);
+            assert!(crate::retry::is_retryable(&error));
+            assert!(!format!("{error:?}").contains("canary"));
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_envelope_after_visible_output_keeps_post_output_semantics() {
+        for output in [
+            "{\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}",
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":\"partial\"}}]}",
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"tool\"}}]}}]}",
+            "{\"usage\":{\"prompt_tokens\":1}}",
+            "{\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":0}}}",
+            "{\"choices\":[{\"finish_reason\":\"stop\"}]}",
+        ] {
+            for ending in ["\n\n", ""] {
+                let body = format!(
+                    "data: {output}\n\nevent: error\ndata: {{\"error\":{{\"code\":\"invalid_api_key\",\"message\":\"secret-canary\"}}}}{ending}"
+                );
+                let source = Arc::new(ScriptedCredentialSource::new(
+                    vec![Ok(lease("token", None, "revision"))],
+                    vec![Ok(CredentialInvalidation::ReplacementPossible)],
+                ));
+                let provider = OpenAiProvider::with_credential_source(
+                    ReplayTransport::new(vec![&body]),
+                    OpenAiConfig::new("http://x/v1", "gpt-x"),
+                    target(),
+                    source.clone(),
+                )
+                .unwrap();
+                let events = collect(
+                    provider
+                        .stream(ProviderRequest::new(ModelId::new("gpt-x"), vec![]), ctx())
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                let Some(ProviderStreamEvent::Error { error }) = events.last() else {
+                    panic!("expected auth error");
+                };
+                assert_eq!(error.kind, ProviderErrorKind::Auth);
+                assert_eq!(error.credential_recovery, None);
+                assert!(!crate::retry::is_retryable(error));
+                assert!(source.invalidated.lock().unwrap().is_empty());
+                assert_eq!(provider.transport().requests().len(), 1);
+                assert!(!format!("{events:?}").contains("canary"));
+            }
+        }
     }
 
     #[tokio::test]

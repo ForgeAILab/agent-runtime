@@ -805,9 +805,6 @@ async fn classify_auth_rejection(
     }
 }
 
-/// The metadata key a transport uses for the provider's own reason.
-const PROVIDER_DETAIL_KEY: &str = "provider.detail";
-
 fn sanitize_transport_error(error: ProviderError) -> ProviderError {
     let message = match error.kind {
         ProviderErrorKind::Network => "Gemini provider network failure",
@@ -822,20 +819,11 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::CacheExpired => "Gemini provider cache identity expired",
         ProviderErrorKind::LimitExhausted => "Gemini provider usage limit exhausted",
     };
-    // The transport classified the rejection and, where the provider named a
-    // reason in the error object it documents, carried it in metadata. Keeping
-    // that metadata is the whole difference between "rejected the request" and
-    // a rejection a reader can act on; the fixed message above still bounds
-    // what the adapter itself asserts.
     let mut sanitized = ProviderError::new(error.kind, message);
     sanitized.retryable = error.retryable;
     sanitized.retry_after_ms = error.retry_after_ms;
     sanitized.limit_resets_at_ms = error.limit_resets_at_ms;
     sanitized.credential_recovery = error.credential_recovery;
-    sanitized.metadata = error.metadata;
-    if let Some(detail) = sanitized.metadata.get(PROVIDER_DETAIL_KEY) {
-        sanitized.message = format!("{message}: {detail}");
-    }
     sanitized
 }
 
@@ -1236,14 +1224,7 @@ fn event_to_events(
                 "incomplete" | "budget_exceeded" => FinishReason::Length,
                 "cancelled" => FinishReason::Cancelled,
                 "failed" => FinishReason::Error,
-                // Name the status. An adapter that refuses a terminal it does
-                // not know, without saying which, cannot be fixed from a
-                // report of the failure.
-                other => {
-                    return Err(malformed(format!(
-                        "invalid Gemini interaction terminal status `{other}`"
-                    )));
-                }
+                _ => return Err(malformed("invalid Gemini interaction terminal status")),
             };
             state.pending_terminal = Some(PendingTerminal::Finish(reason));
         }
@@ -1638,7 +1619,25 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
 mod tests {
 
     #[test]
-    fn a_sanitized_rejection_names_the_reason_the_provider_gave() {
+    fn echoed_credential_in_transport_detail_is_redacted() {
+        let mut error = ProviderError::new(ProviderErrorKind::BadRequest, "sk-echoed-credential");
+        error
+            .metadata
+            .insert("provider.detail", "sk-echoed-credential private prompt");
+        let sanitized = sanitize_transport_error(error);
+        assert!(!format!("{sanitized:?} {sanitized}").contains("sk-echoed-credential"));
+    }
+
+    #[test]
+    fn echoed_credential_in_unknown_terminal_status_is_redacted() {
+        let event = decode_event(r#"{"event_type":"interaction.completed","interaction":{"status":"sk-echoed-credential"}}"#).unwrap();
+        let error =
+            event_to_events(event, &mut StreamState::default(), &mut Vec::new()).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("sk-echoed-credential"));
+    }
+
+    #[test]
+    fn a_sanitized_rejection_discards_provider_owned_reason() {
         let mut error = ProviderError::new(ProviderErrorKind::BadRequest, "raw transport text");
         error
             .metadata
@@ -1648,13 +1647,10 @@ mod tests {
         let sanitized = sanitize_transport_error(error);
 
         assert_eq!(sanitized.kind, ProviderErrorKind::BadRequest);
-        assert_eq!(
-            sanitized.message,
-            "Gemini provider rejected the request: INVALID_ARGUMENT: Input blocked"
-        );
-        // The transport's own text never survives; only the named reason does.
+        assert_eq!(sanitized.message, "Gemini provider rejected the request");
+        // Neither transport text nor untrusted provider metadata survives.
         assert!(!sanitized.message.contains("raw transport text"));
-        assert!(sanitized.metadata.get("http.status").is_some());
+        assert!(sanitized.metadata.is_empty());
     }
 
     #[test]
@@ -1859,6 +1855,41 @@ mod tests {
             "event: done\n",
             "data: [DONE]\n\n",
         )
+    }
+
+    #[tokio::test]
+    async fn interactions_preserves_dotted_and_bounded_long_names_without_foreign_constraints() {
+        for name in [
+            "memory.search".to_owned(),
+            format!("mcp__server__{}", "tool".repeat(40)),
+        ] {
+            let provider = GeminiInteractionsProvider::new(
+                ReplayTransport::new([completed_stream()]),
+                config(),
+            )
+            .unwrap();
+            let mut request =
+                ProviderRequest::new(ModelId::new("gemini-test"), vec![Message::user("hi")]);
+            request.tools.push(ToolSchema {
+                name: name.clone(),
+                description: "tool".into(),
+                input_schema: json!({"type":"object"}),
+            });
+            request.tool_choice = ToolChoice::Named(name.clone());
+            let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::Error { .. }))
+            );
+            let payload: Value =
+                serde_json::from_slice(&provider.transport().requests()[0].body).unwrap();
+            assert_eq!(payload["tools"][0]["name"], name);
+            assert_eq!(
+                payload["generation_config"]["tool_choice"]["allowed_tools"]["tools"][0],
+                name
+            );
+        }
     }
 
     #[tokio::test]
@@ -2403,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_terminal_status_is_named_in_the_error() {
+    fn an_unknown_terminal_status_is_rejected_without_echoing_it() {
         let mut state = StreamState::default();
         let mut out = Vec::new();
         let error = event_to_events(
@@ -2418,8 +2449,8 @@ mod tests {
         )
         .expect_err("an unknown terminal is refused");
         assert!(
-            error.to_string().contains("surprising"),
-            "the error must name the status it refused: {error}"
+            !error.to_string().contains("surprising"),
+            "the error must not echo provider-owned status: {error}"
         );
     }
 

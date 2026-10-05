@@ -104,7 +104,10 @@ impl fmt::Debug for ResponsesConfig {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
         f.debug_struct("ResponsesConfig")
-            .field("base_url", &self.base_url)
+            .field(
+                "base_url",
+                &super::error_redaction::url_for_debug(&self.base_url),
+            )
             .field("model", &self.model)
             .field("capabilities", &self.capabilities)
             .field("api_key_configured", &self.api_key.is_some())
@@ -314,6 +317,9 @@ impl<T: HttpTransport> ResponsesProvider<T> {
         request: &ProviderRequest,
         session: &SessionId,
     ) -> Result<Value, ProviderError> {
+        let tool_names = super::tool_names::ToolNames::new(request);
+        let wire_request = tool_names.project(request);
+        let request = wire_request.as_ref();
         validate_request(&self.config, request)?;
         let input = translate_history(&request.messages)?;
 
@@ -1873,6 +1879,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        let tool_names = super::tool_names::ToolNames::new(&request);
         // Validation and serialization are deliberately before credential
         // acquisition. Unsupported stateful/hosted overrides therefore cannot
         // trigger credential refresh or provider I/O.
@@ -2109,7 +2116,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
                 Err(error) => yield ProviderStreamEvent::Error { error },
             }
         };
-        Ok(Box::pin(out))
+        Ok(tool_names.restore_stream(Box::pin(out), false))
     }
 }
 

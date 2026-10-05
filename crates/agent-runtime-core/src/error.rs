@@ -47,6 +47,18 @@ pub enum FailureComponent {
     Unknown,
 }
 
+/// Host-visible details of a static tool write scope rejected during build.
+/// Declared tool/scope/root strings are configuration evidence, not telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolWriteScopeViolation {
+    /// The registered tool name.
+    pub tool: String,
+    /// The scope rejected by the configured workspace.
+    pub scope: String,
+    /// The configured workspace root.
+    pub workspace: String,
+}
+
 /// Typed failure evidence. Classification never grants retry or lookup authority.
 /// Unknown future reason tags deserialize as [`Self::Unclassified`]. On a
 /// [`RuntimeError`], any malformed classification also becomes unclassified so
@@ -55,6 +67,9 @@ pub enum FailureComponent {
 #[non_exhaustive]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum FailureClass {
+    /// A static workspace write scope was rejected during runtime build.
+    /// Host-visible configuration evidence; declared paths are not telemetry.
+    InvalidToolWriteScope(Box<ToolWriteScopeViolation>),
     /// Configuration, schema, pairing, capability, or cache rejection.
     RequestRejected { stage: FailureStage },
     /// Approval, workspace, or timeline authority was denied.
@@ -104,6 +119,7 @@ impl FailureClass {
     /// The originating stage, or unknown for legacy/unclassified evidence.
     pub fn stage(&self) -> FailureStage {
         match self {
+            Self::InvalidToolWriteScope(_) => FailureStage::PreProvider,
             Self::Unclassified => FailureStage::Unknown,
             Self::RequestRejected { stage }
             | Self::PolicyDenied { stage }
@@ -126,9 +142,10 @@ impl FailureClass {
     }
 
     /// Sets a known origin without changing the category or retry semantics.
+    /// Static write-scope violations retain their build-time `PreProvider` origin.
     pub fn with_stage(mut self, origin: FailureStage) -> Self {
         match &mut self {
-            Self::Unclassified => {}
+            Self::Unclassified | Self::InvalidToolWriteScope(_) => {}
             Self::RequestRejected { stage }
             | Self::PolicyDenied { stage }
             | Self::ContextOverflow { stage, .. }

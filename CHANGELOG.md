@@ -9,6 +9,15 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Breaking
 
+- U.1: `RuntimeBuilder::build()` now rejects static workspace write scopes
+  outside an explicitly configured workspace, returning `ErrorKind::Config`
+  with `FailureClass::InvalidToolWriteScope(Box<ToolWriteScopeViolation>)`
+  carrying tool name, rejected scope, and workspace root.
+  Replace declarations such as `with_write("/")` with a scope the workspace
+  contains, for example `with_write(workspace.root())` for workspace-wide
+  access when the root is contained. Absolute contained paths remain valid;
+  standalone registration and builds without a workspace are unaffected.
+  Invocation checks remain in place for prepared, argument-dependent scopes.
 - U7/U8 (explicit session and timeline lifecycle). Full consumer-break list:
   - `COMMAND_SCHEMA_VERSION` is 2. `StartSession` now requires explicit `mode`
     on the wire; `initial_history` becomes `seed`. Schema 1/unknown legacy
@@ -288,7 +297,29 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   `invoke(PreparedToolCall, ..)`. `LegacyTool` remains as a conservative
   migration adapter, but cannot claim invocation-specific authority.
 
+### Security
+
+- Provider configuration Debug output now hides all Anthropic extra-header
+  values while retaining header names and non-secret settings. Anthropic,
+  OpenAI, Responses, HTTP requests, and catalog refreshers also redact URLs
+  containing query strings, userinfo, or fragments, using the existing secret
+  redaction. API keys and transport header values remain non-disclosing in
+  both compact and pretty Debug output; Gemini was already redacted.
+
+- Redact Anthropic in-stream error messages and Anthropic/OpenAI transport
+  diagnostics; retain typed error classes and numeric retry hints. Gemini
+  transport details and unknown terminal statuses no longer echo provider text
+  into printable errors, events, metadata or Debug output. Responses already
+  redacts these diagnostic paths.
+
 ### Changed
+
+- Anthropic, OpenAI-compatible Chat Completions and Responses now map canonical
+  tool names to deterministic, collision-safe 1–64 character wire aliases for
+  definitions, named choices and history replay, and restore canonical names in
+  model calls. Valid names and unknown model names remain unchanged. OpenAI
+  name fragments are assembled before canonical emission when aliases are in
+  use. Gemini Interactions retains its native name handling.
 
 - History and LCM accounting do less repeated work per provider call.
   Private history captures share immutable generations instead of copying
@@ -591,6 +622,17 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   event-schema, shutdown) plus neutral consumer adapter fixtures.
 
 ### Fixed
+
+- Anthropic preserves non-empty initial tool input when no JSON deltas arrive;
+  any JSON delta supersedes initial input. Compatible-gateway `[DONE]` stream
+  endings are tolerated, and image data URIs with an empty media type or
+  payload fail as BadRequest before transport I/O, including tool-result images.
+- OpenAI-compatible JSON error envelopes now preserve authentication,
+  rate-limit/quota, and invalid-request classifications instead of always
+  becoming retryable server errors. Pre-output authentication failures
+  invalidate the exact credential revision once; errors after semantic output
+  do not trigger credential recovery. Rate-limit retry hints are retained,
+  unknown errors remain server failures, and provider bodies stay redacted.
 - LCM hard compaction no longer wedges a session behind one oversized agentic
   turn. Leaf planning only cuts at user boundaries, so a single turn whose
   tool loop outgrew `leaf_target_tokens` (many tool rounds, no user message

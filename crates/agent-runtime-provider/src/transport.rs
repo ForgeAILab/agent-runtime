@@ -34,7 +34,7 @@ impl fmt::Debug for HttpRequest {
             .map(|(name, _)| (name.as_str(), "[redacted]"))
             .collect();
         f.debug_struct("HttpRequest")
-            .field("url", &self.url)
+            .field("url", &super::error_redaction::url_for_debug(&self.url))
             .field("headers", &headers)
             .field("body_len", &self.body.len())
             .finish()

@@ -35,6 +35,7 @@ pub mod anthropic;
 pub mod catalog;
 #[cfg(feature = "command-provider")]
 pub mod command;
+mod error_redaction;
 pub mod fake;
 pub mod gemini;
 pub mod openai;
@@ -42,6 +43,7 @@ pub mod ratelimit;
 pub mod responses;
 pub mod retry;
 pub mod sse;
+mod tool_names;
 pub mod transport;
 
 pub use agent_runtime_core as core;

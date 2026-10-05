@@ -1084,6 +1084,49 @@ async fn approval_cannot_widen_authorization_beyond_the_composed_grant() {
 }
 
 #[tokio::test]
+async fn invocation_rejects_argument_dependent_scope_outside_workspace_before_authorization() {
+    // Preparation constructs an exact /ws/blocked resource from valid arguments,
+    // but this host workspace excludes it while accepting the static /ws root.
+    #[derive(Debug)]
+    struct ExcludingWorkspace;
+    impl Workspace for ExcludingWorkspace {
+        fn root(&self) -> &str {
+            "/ws"
+        }
+        fn contains(&self, path: &str) -> bool {
+            (path == "/ws" || path.starts_with("/ws/")) && path != "/ws/blocked"
+        }
+    }
+    let invoked = Arc::new(Mutex::new(Vec::new()));
+    let resources = Arc::new(Mutex::new(Vec::new()));
+    let executor = ToolExecutor::new(
+        exact_edit_registry(invoked.clone()),
+        Arc::new(AllowAll),
+        Arc::new(ExcludingWorkspace),
+        Arc::new(SystemClock),
+        10_000,
+        ConflictPolicy::ScopeOverlap,
+        recording_approval_security(resources.clone()),
+    );
+    let output = executor
+        .execute(
+            &[call("exact_edit", "escape", json!({"path": "blocked"}))],
+            &RequestId::new("r"),
+            &SessionId::new("s1"),
+            &Cancellation::new(),
+            Deadline::never(),
+        )
+        .await;
+    assert!(output[0].is_error);
+    assert_eq!(
+        output[0].content[0].as_text().unwrap(),
+        "workspace violation: `/ws/blocked` is outside `/ws`"
+    );
+    assert!(resources.lock().unwrap().is_empty());
+    assert!(invoked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn prepared_edit_authorizes_the_exact_canonical_path() {
     let invoked = Arc::new(Mutex::new(Vec::new()));
     let resources = Arc::new(Mutex::new(Vec::new()));

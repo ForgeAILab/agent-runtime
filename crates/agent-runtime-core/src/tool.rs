@@ -169,7 +169,19 @@ impl ToolEffects {
         self.effects.is_empty()
     }
 
-    /// Adds a write scope.
+    /// Adds a workspace filesystem write scope.
+    ///
+    /// For "anywhere inside the session workspace", declare the configured
+    /// [`Workspace::root`] when [`Workspace::contains`] accepts that root
+    /// (for example, `"/ws"` for the testkit's `MemoryWorkspace`). There is no
+    /// universal wildcard: `"/"` is valid only if that workspace contains it,
+    /// and `"."` is not implicitly resolved to the root. Hosts define containment;
+    /// [`crate::workspace::DenyAllWorkspace`] accepts no scope, even its root.
+    ///
+    /// Static scopes on [`ToolSpec`] are checked at runtime build when a
+    /// workspace is configured; prepared scopes are still checked at invocation.
+    /// Use [`Self::with_host_write`] for same-user host authority outside the
+    /// workspace, with a matching prepared host resource.
     pub fn with_write(mut self, scope: impl Into<String>) -> Self {
         self.effects.push(Effect::Write {
             scope: WriteScope::new(scope),

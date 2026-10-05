@@ -295,6 +295,22 @@ an incompatible revision fails explicitly.
 
 ## 9. Tools prepare exact authority before approval
 
+When a workspace is explicitly configured, `RuntimeBuilder::build()` now
+validates every static workspace write scope on the sealed tool specifications.
+A rejected scope returns `RuntimeError` with `ErrorKind::Config` and
+`FailureClass::InvalidToolWriteScope(Box<ToolWriteScopeViolation>)` before session
+start. `ToolWriteScopeViolation` carries `tool`, `scope`, and `workspace`
+strings. Hosts can match this typed evidence without parsing the message.
+For workspace-wide access, replace `with_write("/")` with
+`with_write(workspace.root())` when the workspace contains its root (as the
+testkit's `MemoryWorkspace` does). There is no implicit `"."` or wildcard;
+absolute paths are valid whenever that workspace contains them. Host-defined
+containment remains authoritative, and `DenyAllWorkspace` accepts no scope.
+Use host effects for same-user host authority outside the workspace.
+Registration before a workspace exists and builds with no configured workspace
+remain supported; the latter still use `DenyAllWorkspace` at invocation.
+Prepared argument-dependent scopes retain invocation-time checks.
+
 New tools implement `Tool` directly:
 
 ```rust
