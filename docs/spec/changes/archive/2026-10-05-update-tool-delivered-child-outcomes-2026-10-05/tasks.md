@@ -1,6 +1,7 @@
 ---
 created_at: 2026-10-05T00:00:00Z
 updated_at: 2026-10-05T00:00:00Z
+completed_at: 2026-10-05T00:00:00Z
 ---
 
 Approved 2026-10-05 by the Smith owner ("we need to fix the double delivery").
@@ -32,5 +33,6 @@ Branch `fix/smith-agent-result-delivery` from Smith's pin `b1d1974`
 
 - [x] 3.1 `cargo fmt --all -- --check`, Clippy with `-D warnings`, workspace
   tests.
-- [ ] 3.2 Push the branch; Smith bumps its pin and runs its delegation and
-  headless tests.
+- [x] 3.2 Push the branch; Smith bumps its pin and runs its delegation and
+  headless tests. Shipped in Smith v0.3.8 (pin `fc92efb`, tagged
+  `smith-baseline-v0.3.8`).
