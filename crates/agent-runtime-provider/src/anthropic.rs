@@ -24,6 +24,7 @@
 //! top-level only** — every `Role::System` message is folded, in order, into
 //! the request's `system` field.
 
+use std::collections::BTreeMap;
 use std::future::pending;
 use std::time::Duration;
 
@@ -280,6 +281,9 @@ impl<T: HttpTransport> AnthropicProvider<T> {
     }
 
     fn build_payload(&self, request: &ProviderRequest) -> Result<Value, ProviderError> {
+        let tool_names = super::tool_names::ToolNames::new(request);
+        let wire_request = tool_names.project(request);
+        let request = wire_request.as_ref();
         if request.model != self.config.model {
             return Err(ProviderError::new(
                 ProviderErrorKind::BadRequest,
@@ -290,6 +294,7 @@ impl<T: HttpTransport> AnthropicProvider<T> {
             .validate_cache_identity()
             .map_err(|error| ProviderError::new(ProviderErrorKind::BadRequest, error))?;
         validate_cacheable_messages(request)?;
+        validate_images(&request.messages)?;
         let mut system_parts: Vec<String> = Vec::new();
         let mut messages = Vec::new();
         for msg in &request.messages {
@@ -676,6 +681,37 @@ fn image_source(url: &str) -> Value {
     json!({"type": "url", "url": url})
 }
 
+// Validate images before serialization and transport, including nested tool results.
+fn validate_images(messages: &[Message]) -> Result<(), ProviderError> {
+    fn validate_parts(parts: &[ContentPart]) -> Result<(), ProviderError> {
+        for part in parts {
+            match part {
+                ContentPart::Image { url, .. } => {
+                    if let Some((header, payload)) = url
+                        .strip_prefix("data:")
+                        .and_then(|rest| rest.split_once(','))
+                    {
+                        let media_type = header.split(';').next().unwrap_or_default();
+                        if media_type.trim().is_empty() || payload.trim().is_empty() {
+                            return Err(ProviderError::new(
+                                ProviderErrorKind::BadRequest,
+                                "Anthropic image data URI requires a media type and payload",
+                            ));
+                        }
+                    }
+                }
+                ContentPart::ToolResult(result) => validate_parts(&result.content)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    for message in messages {
+        validate_parts(&message.content)?;
+    }
+    Ok(())
+}
+
 async fn wait_for_deadline(deadline: Deadline) {
     match deadline.remaining_millis(&SystemClock) {
         Some(0) => {}
@@ -771,6 +807,8 @@ enum WireContentBlock {
     ToolUse {
         id: String,
         name: String,
+        #[serde(default)]
+        input: Value,
     },
     #[serde(other)]
     Unknown,
@@ -822,7 +860,7 @@ struct WireError {
     #[serde(default, rename = "type")]
     kind: Option<String>,
     #[serde(default)]
-    message: Option<String>,
+    retry_after_ms: Option<u64>,
 }
 
 fn map_stop_reason(raw: &str) -> FinishReason {
@@ -837,28 +875,64 @@ fn map_stop_reason(raw: &str) -> FinishReason {
 }
 
 fn map_error(error: WireError) -> ProviderError {
-    let message = error
-        .message
-        .unwrap_or_else(|| "Anthropic provider reported a stream error".to_owned());
-    match error.kind.as_deref() {
-        Some("overloaded_error") => {
-            ProviderError::new(ProviderErrorKind::Server, message).retryable()
-        }
-        Some("rate_limit_error") => {
-            ProviderError::new(ProviderErrorKind::RateLimited, message).retryable()
-        }
-        Some("authentication_error") | Some("permission_error") => {
-            ProviderError::new(ProviderErrorKind::Auth, message)
-        }
-        Some("invalid_request_error") | Some("not_found_error") => {
-            ProviderError::new(ProviderErrorKind::BadRequest, message)
-        }
-        Some("api_error") => ProviderError::new(ProviderErrorKind::Server, message).retryable(),
-        _ => ProviderError::new(ProviderErrorKind::Server, message).retryable(),
+    let (kind, message, safe_type) = match error.kind.as_deref() {
+        Some("overloaded_error") => (
+            ProviderErrorKind::Server,
+            "Anthropic provider is overloaded",
+            "overloaded_error",
+        ),
+        Some("rate_limit_error") => (
+            ProviderErrorKind::RateLimited,
+            "Anthropic provider rate limit exceeded",
+            "rate_limit_error",
+        ),
+        Some("authentication_error") => (
+            ProviderErrorKind::Auth,
+            "Anthropic provider authentication rejected",
+            "authentication_error",
+        ),
+        Some("permission_error") => (
+            ProviderErrorKind::Auth,
+            "Anthropic provider permission denied",
+            "permission_error",
+        ),
+        Some("invalid_request_error") => (
+            ProviderErrorKind::BadRequest,
+            "Anthropic provider rejected the request",
+            "invalid_request_error",
+        ),
+        Some("not_found_error") => (
+            ProviderErrorKind::BadRequest,
+            "Anthropic provider resource not found",
+            "not_found_error",
+        ),
+        Some("api_error") => (
+            ProviderErrorKind::Server,
+            "Anthropic provider service failure",
+            "api_error",
+        ),
+        _ => (
+            ProviderErrorKind::Server,
+            "Anthropic provider reported a stream error",
+            "unknown",
+        ),
+    };
+    let mut mapped = ProviderError::new(kind, message);
+    mapped.metadata.insert("provider.error_type", safe_type);
+    if matches!(
+        kind,
+        ProviderErrorKind::Server | ProviderErrorKind::RateLimited
+    ) {
+        mapped.retryable = true;
+        mapped.retry_after_ms = error.retry_after_ms;
     }
+    mapped
 }
 
 fn decode_event(data: &str) -> Result<WireEvent, ProviderError> {
+    if data == "[DONE]" {
+        return Ok(WireEvent::MessageStop);
+    }
     serde_json::from_str::<WireEvent>(data).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::MalformedStream,
@@ -878,6 +952,23 @@ struct StreamState {
     /// The finish reason reported by `message_delta`, held until the stream
     /// terminates.
     pending_finish: Option<FinishReason>,
+    /// Initial tool input waits until block stop; any JSON delta supersedes it.
+    initial_inputs: BTreeMap<u32, Value>,
+}
+
+fn emit_initial_input(index: u32, input: Value, out: &mut Vec<ProviderStreamEvent>) {
+    out.push(ProviderStreamEvent::ToolCallDelta {
+        index,
+        id: None,
+        name: None,
+        arguments_fragment: input.to_string(),
+    });
+}
+
+fn flush_initial_inputs(state: &mut StreamState, out: &mut Vec<ProviderStreamEvent>) {
+    for (index, input) in std::mem::take(&mut state.initial_inputs) {
+        emit_initial_input(index, input, out);
+    }
 }
 
 /// Maps one decoded event to zero or more neutral events.
@@ -949,7 +1040,10 @@ fn event_to_events(
                     signature: None,
                 });
             }
-            WireContentBlock::ToolUse { id, name } => {
+            WireContentBlock::ToolUse { id, name, input } => {
+                if input.as_object().is_some_and(|object| !object.is_empty()) {
+                    state.initial_inputs.insert(index, input);
+                }
                 out.push(ProviderStreamEvent::ToolCallDelta {
                     index,
                     id: Some(id),
@@ -987,6 +1081,7 @@ fn event_to_events(
                 }
             }
             WireBlockDelta::InputJsonDelta { partial_json } => {
+                state.initial_inputs.remove(&index);
                 if !partial_json.is_empty() {
                     out.push(ProviderStreamEvent::ToolCallDelta {
                         index,
@@ -1013,9 +1108,17 @@ fn event_to_events(
                 state.pending_finish = Some(map_stop_reason(reason));
             }
         }
-        WireEvent::MessageStop => return Ok(true),
+        WireEvent::MessageStop => {
+            flush_initial_inputs(state, out);
+            return Ok(true);
+        }
         WireEvent::Error { error } => return Err(map_error(error)),
-        WireEvent::ContentBlockStop { .. } | WireEvent::Ping | WireEvent::Unknown => {}
+        WireEvent::ContentBlockStop { index } => {
+            if let Some(input) = state.initial_inputs.remove(&index) {
+                emit_initial_input(index, input, out);
+            }
+        }
+        WireEvent::Ping | WireEvent::Unknown => {}
     }
     Ok(false)
 }
@@ -1040,9 +1143,14 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        let tool_names = super::tool_names::ToolNames::new(&request);
         let payload = self.build_payload(&request)?;
-        let body = serde_json::to_vec(&payload)
-            .map_err(|e| ProviderError::new(ProviderErrorKind::BadRequest, e.to_string()))?;
+        let body = serde_json::to_vec(&payload).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "Anthropic request could not be encoded",
+            )
+        })?;
         let mut headers = vec![
             ("content-type".to_string(), "application/json".to_string()),
             (
@@ -1073,7 +1181,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
                     "provider deadline elapsed",
                 ));
             }
-            result = &mut post => result?,
+            result = &mut post => result.map_err(super::error_redaction::sanitize)?,
         };
         // Read before the body moves: these headers describe the credential
         // that served this attempt, and nothing downstream can recover them
@@ -1121,7 +1229,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        yield ProviderStreamEvent::Error { error: e };
+                        yield ProviderStreamEvent::Error { error: super::error_redaction::sanitize(e) };
                         return;
                     }
                 };
@@ -1229,12 +1337,15 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
             // A stream that ended without `message_stop` but did carry events
             // still terminates with an honest Finish.
             if !emitted_finish && (saw_event || state.pending_finish.is_some()) {
+                let mut events = Vec::new();
+                flush_initial_inputs(&mut state, &mut events);
+                for event in events { yield event; }
                 yield ProviderStreamEvent::Finish {
                     reason: state.pending_finish.unwrap_or(FinishReason::Stop),
                 };
             }
         };
-        Ok(Box::pin(out))
+        Ok(tool_names.restore_stream(Box::pin(out), false))
     }
 }
 
@@ -1316,6 +1427,308 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn echoed_credential_in_stream_error_is_absent_from_display_debug_and_events() {
+        for kind in [
+            "overloaded_error",
+            "rate_limit_error",
+            "authentication_error",
+            "permission_error",
+            "invalid_request_error",
+            "not_found_error",
+            "api_error",
+            "sk-echoed-credential",
+        ] {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"type":"error", "error":{"type":kind,"message":"sk-echoed-credential private prompt", "retry_after_ms":123}})
+            );
+            let provider = AnthropicProvider::new(
+                ReplayTransport::new(vec![&frame]),
+                AnthropicConfig::new("http://x/v1", "claude-test"),
+            );
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(ModelId::new("claude-test"), vec![]),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let ProviderStreamEvent::Error { error } = &events[0] else {
+                panic!("expected error")
+            };
+            for rendered in [
+                error.to_string(),
+                format!("{error:?}"),
+                format!("{events:?}"),
+                serde_json::to_string(&events).unwrap(),
+            ] {
+                assert!(!rendered.contains("sk-echoed-credential"));
+                assert!(!rendered.contains("private prompt"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_input_only_tool_call_preserves_arguments() {
+        let frame = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"read\",\"input\":{\"path\":\"file\"}}}\n\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+        let provider = AnthropicProvider::new(
+            ReplayTransport::new(vec![frame, EMPTY_STREAM]),
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let events = collect(
+            provider
+                .stream(
+                    ProviderRequest::new(ModelId::new("claude-test"), vec![]),
+                    ctx(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let arguments: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::ToolCallDelta {
+                    arguments_fragment, ..
+                } => Some(arguments_fragment.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap(),
+            json!({"path":"file"})
+        );
+    }
+
+    #[tokio::test]
+    async fn json_deltas_supersede_initial_input_and_other_blocks_keep_their_input() {
+        let frames = [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"read","input":{"old":true}}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c2","name":"write","input":{"kept":true}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"new\":"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"true}"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let sse: String = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        let provider = AnthropicProvider::new(
+            ReplayTransport::new(vec![&sse]),
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let events = collect(
+            provider
+                .stream(
+                    ProviderRequest::new(ModelId::new("claude-test"), vec![]),
+                    ctx(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        for (index, expected) in [(0, json!({"new":true})), (1, json!({"kept":true}))] {
+            let arguments: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::ToolCallDelta {
+                        index: i,
+                        arguments_fragment,
+                        ..
+                    } if *i == index => Some(arguments_fragment.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(serde_json::from_str::<Value>(&arguments).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_input_is_flushed_at_done_or_eof_without_block_stop() {
+        for terminal in ["data: [DONE]", ""] {
+            let start = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"read\",\"input\":{\"path\":\"file\"}}}\n\n";
+            let provider = AnthropicProvider::new(
+                ReplayTransport::new(vec![start, terminal]),
+                AnthropicConfig::new("http://x/v1", "claude-test"),
+            );
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(ModelId::new("claude-test"), vec![]),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::ToolCallDelta { arguments_fragment, .. } if arguments_fragment == "{\"path\":\"file\"}")));
+            assert!(matches!(
+                events.last(),
+                Some(ProviderStreamEvent::Finish { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn empty_json_delta_supersedes_initial_input() {
+        let mut state = StreamState::default();
+        state.initial_inputs.insert(0, json!({"old":true}));
+        let mut events = Vec::new();
+        event_to_events(
+            WireEvent::ContentBlockDelta {
+                index: 0,
+                delta: WireBlockDelta::InputJsonDelta {
+                    partial_json: String::new(),
+                },
+            },
+            &mut state,
+            &mut events,
+        )
+        .unwrap();
+        event_to_events(WireEvent::MessageStop, &mut state, &mut events).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn done_sentinel_is_tolerated_in_complete_and_trailing_frames() {
+        for frame in ["data: [DONE]\n\n", "data: [DONE]"] {
+            let provider = AnthropicProvider::new(
+                ReplayTransport::new(vec![frame]),
+                AnthropicConfig::new("http://x/v1", "claude-test"),
+            );
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(ModelId::new("claude-test"), vec![]),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(matches!(
+                events.as_slice(),
+                [ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop
+                }]
+            ));
+        }
+    }
+
+    #[test]
+    fn data_uri_parameters_do_not_substitute_for_an_empty_media_type() {
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentPart::Image {
+                url: "data:;charset=utf-8;base64,AAAA".into(),
+                detail: None,
+            }],
+        };
+        assert_eq!(
+            validate_images(&[message]).unwrap_err().kind,
+            ProviderErrorKind::BadRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_data_uri_image_is_rejected_before_io() {
+        for url in [
+            "data:;base64,AAAA",
+            "data:image/png;base64,",
+            "data:;base64,",
+        ] {
+            for nested in [false, true] {
+                let image = ContentPart::Image {
+                    url: url.into(),
+                    detail: None,
+                };
+                let message = if nested {
+                    Message::tool_result(ToolResultBlock {
+                        call_id: ToolCallId::new("c1"),
+                        name: "read".into(),
+                        content: vec![image],
+                        is_error: false,
+                    })
+                } else {
+                    Message {
+                        role: Role::User,
+                        content: vec![image],
+                    }
+                };
+                let provider = AnthropicProvider::new(
+                    ReplayTransport::new(vec![EMPTY_STREAM]),
+                    AnthropicConfig::new("http://x/v1", "claude-test"),
+                );
+                let error = provider
+                    .stream(
+                        ProviderRequest::new(ModelId::new("claude-test"), vec![message]),
+                        ctx(),
+                    )
+                    .await
+                    .err()
+                    .expect("invalid image must fail");
+                assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+                assert!(!provider.transport().was_called());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dotted_and_overlong_names_round_trip_definition_model_and_history() {
+        for name in [
+            "memory.search".to_owned(),
+            format!("mcp__server__{}", "tool".repeat(40)),
+        ] {
+            let mut request =
+                ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
+            request.tools.push(ToolSchema {
+                name: name.clone(),
+                description: "tool".into(),
+                input_schema: json!({"type":"object"}),
+            });
+            request.tool_choice = ToolChoice::Named(name.clone());
+            let payload = sent_payload(request.clone()).await;
+            let wire = payload["tools"][0]["name"].as_str().unwrap();
+            assert!(
+                wire.len() <= 64
+                    && wire
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            );
+            assert_eq!(payload["tool_choice"]["name"], wire);
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":wire,"input":{}}})
+            );
+            let provider = AnthropicProvider::new(
+                ReplayTransport::new(vec![&frame, EMPTY_STREAM]),
+                AnthropicConfig::new("http://x/v1", "claude-test"),
+            );
+            let events = collect(provider.stream(request.clone(), ctx()).await.unwrap()).await;
+            assert!(events.iter().any(|e| matches!(e, ProviderStreamEvent::ToolCallDelta { name: Some(n), .. } if n == &name)));
+            request
+                .messages
+                .push(Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                    id: ToolCallId::new("c1"),
+                    name: name.clone(),
+                    arguments: json!({}),
+                })]));
+            request.messages.push(Message::tool_result(ToolResultBlock {
+                call_id: ToolCallId::new("c1"),
+                name,
+                content: vec![ContentPart::text("ok")],
+                is_error: false,
+            }));
+            let replay = sent_payload(request).await;
+            assert_eq!(replay["tools"][0]["name"], wire);
+            assert_eq!(replay["messages"][1]["content"][0]["name"], wire);
+        }
     }
 
     const EMPTY_STREAM: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";

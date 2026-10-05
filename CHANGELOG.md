@@ -220,7 +220,22 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   `invoke(PreparedToolCall, ..)`. `LegacyTool` remains as a conservative
   migration adapter, but cannot claim invocation-specific authority.
 
+### Security
+
+- Redact Anthropic in-stream error messages and Anthropic/OpenAI transport
+  diagnostics; retain typed error classes and numeric retry hints. Gemini
+  transport details and unknown terminal statuses no longer echo provider text
+  into printable errors, events, metadata or Debug output. Responses already
+  redacts these diagnostic paths.
+
 ### Changed
+
+- Anthropic, OpenAI-compatible Chat Completions and Responses now map canonical
+  tool names to deterministic, collision-safe 1–64 character wire aliases for
+  definitions, named choices and history replay, and restore canonical names in
+  model calls. Valid names and unknown model names remain unchanged. OpenAI
+  name fragments are assembled before canonical emission when aliases are in
+  use. Gemini Interactions retains its native name handling.
 
 - History and LCM accounting do less repeated work per provider call.
   Private history captures share immutable generations instead of copying
@@ -523,6 +538,11 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   event-schema, shutdown) plus neutral consumer adapter fixtures.
 
 ### Fixed
+
+- Anthropic preserves non-empty initial tool input when no JSON deltas arrive;
+  any JSON delta supersedes initial input. Compatible-gateway `[DONE]` stream
+  endings are tolerated, and image data URIs with an empty media type or
+  payload fail as BadRequest before transport I/O, including tool-result images.
 - OpenAI-compatible JSON error envelopes now preserve authentication,
   rate-limit/quota, and invalid-request classifications instead of always
   becoming retryable server errors. Pre-output authentication failures

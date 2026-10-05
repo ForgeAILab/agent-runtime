@@ -342,6 +342,9 @@ impl<T: HttpTransport> OpenAiProvider<T> {
     /// to earn. Keying by request id would be just as bad — it changes every
     /// turn.
     fn build_payload(&self, request: &ProviderRequest, session: &SessionId) -> Value {
+        let tool_names = super::tool_names::ToolNames::new(request);
+        let wire_request = tool_names.project(request);
+        let request = wire_request.as_ref();
         let mut messages = Vec::new();
         for msg in &request.messages {
             messages.extend(to_openai_messages(msg));
@@ -1265,6 +1268,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        let tool_names = super::tool_names::ToolNames::new(&request);
         if request.model != self.config.model {
             return Err(ProviderError::new(
                 ProviderErrorKind::BadRequest,
@@ -1310,6 +1314,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             result = &mut post => match result {
                 Ok(response) => response,
                 Err(error) => {
+                    let error = super::error_redaction::sanitize(error);
                     return Err(classify_auth_rejection(
                         error,
                         credential_source,
@@ -1397,6 +1402,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(error) => {
+                        let error = super::error_redaction::sanitize(error);
                         let error = if saw_semantic_event {
                             if error.kind == ProviderErrorKind::Auth {
                                 ProviderError::new(
@@ -1576,7 +1582,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 };
             }
         };
-        Ok(Box::pin(out))
+        Ok(tool_names.restore_stream(Box::pin(out), true))
     }
 }
 
