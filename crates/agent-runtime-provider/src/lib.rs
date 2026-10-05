@@ -6,9 +6,10 @@
 //! deterministic scriptable fake, and the retryability/backoff classifier the
 //! agent loop uses to record every attempt.
 //!
-//! It depends only on [`agent_runtime_core`] and injects all network I/O through
+//! It injects all adapter network I/O through
 //! [`transport::HttpTransport`], so every adapter is fully offline-testable. It
-//! contains **no** cost table or consumer domain type — those stay product
+//! offers an optional policy-explicit reqwest implementation. It contains
+//! **no** cost table or consumer domain type — those stay product
 //! policy in the consuming host.
 //!
 //! - [`fake::FakeProvider`] — a deterministic, scriptable provider.
@@ -22,6 +23,8 @@
 //!   protocol adapter, first fixture-verified against xAI's Grok deployment.
 //! - [`ratelimit`] — normalization of the provider rate-limit header families
 //!   into one snapshot, and the transient-throttle/spent-window split.
+//! - `reqwest_transport` — opt-in streaming HTTP with explicit destination
+//!   policy, origin pinning, DNS checks, and bounded redaction-safe responses.
 //! - [`retry`] — retryability classification and backoff used by the agent loop
 //!   to record every provider attempt.
 //! - [`catalog`] — optional remote model-catalog sources. Resolution reads a
@@ -39,6 +42,10 @@ pub mod fake;
 pub mod gemini;
 pub mod openai;
 pub mod ratelimit;
+#[cfg(feature = "reqwest-transport")]
+pub mod reqwest_transport;
+#[cfg(feature = "reqwest-transport")]
+pub use reqwest_transport::{DestinationPolicy, ReqwestTransport};
 pub mod responses;
 pub mod retry;
 pub mod sse;

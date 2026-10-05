@@ -1,0 +1,13 @@
+{
+  "change_id": "add-reqwest-transport",
+  "change_ref": "add-reqwest-transport-2026-10-03",
+  "created_at": "2026-10-03T00:00:00Z",
+  "updated_at": "2026-10-03T09:13:27Z",
+  "approved_at": "2026-10-03T00:01:00Z",
+  "completed_at": null,
+  "status": "implemented",
+  "implementation_started_at": "2026-10-03T00:01:00Z",
+  "verification_completed_at": "2026-10-03T09:13:27Z",
+  "commit_status": "blocked",
+  "commit_blocker": "Sandbox denied creating worktree index.lock; owner fallback requires remaining work uncommitted."
+}
