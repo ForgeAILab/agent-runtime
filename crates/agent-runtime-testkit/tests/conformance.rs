@@ -11,3 +11,6 @@ mod runtime_conformance;
 
 #[path = "conformance/lcm_working_set.rs"]
 mod lcm_working_set;
+
+#[path = "conformance/session_timeline.rs"]
+mod session_timeline;

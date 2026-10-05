@@ -538,7 +538,8 @@ pub struct TurnCheckpoint {
     pub session: SessionId,
     /// Turn identity.
     pub turn: TurnId,
-    /// Monotonic state revision within this turn, starting at zero.
+    /// Monotonic state revision within a turn, starting at zero for admission.
+    /// An initial idle session boundary uses terminal revision one.
     pub state_revision: u64,
     /// Fingerprint binding the exact operation represented by `state`.
     pub operation_fingerprint: Fingerprint,

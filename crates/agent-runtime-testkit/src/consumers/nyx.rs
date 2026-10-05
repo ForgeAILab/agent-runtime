@@ -52,3 +52,8 @@ pub fn build(
         .clock(Arc::new(SystemClock))
         .build()
 }
+
+/// Rebuilt per-call history is explicitly ephemeral, even with stores configured.
+pub fn start_request(history: Vec<Message>) -> StartSession {
+    StartSession::ephemeral(history)
+}

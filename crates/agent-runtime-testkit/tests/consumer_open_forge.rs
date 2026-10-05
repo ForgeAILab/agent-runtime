@@ -78,6 +78,17 @@ impl LcmReader for ConflictingStore {
 
 #[async_trait::async_trait]
 impl LcmWriter for ConflictingStore {
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
+        let _ = (owner, generation);
+        self.authorize_view(view)?;
+        Ok(agent_runtime::lcm::LcmClaimResult::Claimed)
+    }
+
     async fn append(
         &self,
         view: &LcmView,

@@ -314,7 +314,7 @@ async fn failed_turn_appends_nothing_and_session_accepts_the_next_turn() {
         observer.clone(),
     );
     let session = second
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("session restarts over the failed turn's checkpoint");
     session
@@ -377,6 +377,10 @@ async fn diverged_lcm_timeline_heals_on_the_next_completed_turn() {
         })
         .collect::<Vec<_>>();
     lcm_store
+        .claim(&lcm_store.view(), &session_id, 0)
+        .await
+        .expect("same-session orphan owner");
+    lcm_store
         .append(
             &lcm_store.view(),
             LcmAppendRequest::new(LcmOperationId::new("history:0:orphans"), orphan_entries),
@@ -402,7 +406,7 @@ async fn diverged_lcm_timeline_heals_on_the_next_completed_turn() {
         observer.clone(),
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
         .await
         .expect("session starts over the diverged timeline");
 

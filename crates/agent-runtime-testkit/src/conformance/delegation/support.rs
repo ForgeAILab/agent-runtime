@@ -163,6 +163,13 @@ async fn durable_parent_session(
     session_store: Arc<dyn SessionStore>,
     checkpoint_store: Arc<dyn CheckpointStore>,
 ) -> (Runtime, SessionHandle) {
+    let id = agent_runtime_core::ids::SessionId::new(id);
+    // This shared fixture starts both first-time and restart scenarios. Decide
+    // intent explicitly from the deterministic stores before constructing it.
+    let request = if session_store.load(&id).await.expect("parent snapshot loads").is_some()
+        || checkpoint_store.load_latest(&id).await.expect("parent checkpoint loads").is_some() {
+        StartSession::resume(id)
+    } else { StartSession::create(id, Vec::new()) };
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
         .provider(Arc::new(FakeProvider::text_reply("parent")))
         .model_profile(profile())
@@ -180,7 +187,7 @@ async fn durable_parent_session(
         .build()
         .expect("durable parent runtime builds");
     let session = runtime
-        .start_session(StartSession::new().with_id(agent_runtime_core::ids::SessionId::new(id)))
+        .start_session(request)
         .await
         .expect("durable parent session starts");
     (runtime, session)

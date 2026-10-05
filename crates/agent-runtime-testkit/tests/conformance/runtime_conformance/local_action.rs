@@ -301,7 +301,7 @@ async fn local_tool_recovery_executes_prepared_once_and_never_replays_a_durable_
         .build()
         .unwrap();
     prepared_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     wait_for_terminal(&prepared_observer).await;
@@ -325,7 +325,7 @@ async fn local_tool_recovery_executes_prepared_once_and_never_replays_a_durable_
         .build()
         .unwrap();
     outcome_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&outcome_observer).await;

@@ -142,6 +142,24 @@ impl LcmTimelineBinding {
     }
 }
 
+/// Explicit host recovery choice; absence fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LcmRecoveryPolicy {
+    /// Retain canonical source identity and project the existing summaries.
+    Adopt,
+    /// Replace the timeline and carry its projected summary.
+    Fork,
+    /// Logically retire the old binding and start an empty replacement.
+    Retire,
+}
+
+pub(crate) struct LcmSessionInitialization {
+    pub(crate) history: Vec<Message>,
+    pub(crate) state: Option<VersionedSessionState>,
+    pub(crate) summary: Option<String>,
+}
+
 /// Host-owned resolver used at construction and resume boundaries.
 ///
 /// Implementations perform the authorization decision.  The coordinator never
@@ -150,6 +168,29 @@ impl LcmTimelineBinding {
 pub trait LcmTimelineResolver: Send + Sync + fmt::Debug {
     /// Resolves the authorized timeline for one runtime session.
     fn resolve(&self, session: &SessionId) -> Result<LcmTimelineBinding, RuntimeError>;
+
+    /// Allocates and durably binds a fresh authorized timeline to `session`.
+    /// Implementations must preserve the old immutable timeline and return a
+    /// different empty timeline. No authority is inferred from its identity.
+    fn new_timeline(
+        &self,
+        session: &SessionId,
+        previous: &LcmTimelineBinding,
+    ) -> Result<LcmTimelineBinding, RuntimeError> {
+        let _ = (session, previous);
+        Err(map_lcm_error(LcmError::ForkRequired))
+    }
+
+    /// Durably binds the parent's authorized timeline to a successor session.
+    /// Default denies; hosts explicitly authorize the ownership transfer.
+    fn continue_timeline(
+        &self,
+        session: &SessionId,
+        previous: &LcmTimelineBinding,
+    ) -> Result<LcmTimelineBinding, RuntimeError> {
+        let _ = (session, previous);
+        Err(map_lcm_error(LcmError::ForkRequired))
+    }
 }
 
 /// A small resolver for hosts which have already made one binding decision.
@@ -471,6 +512,8 @@ struct LcmState {
     /// the next plan re-measures it; the pressure floor bounds its effect.
     #[serde(default)]
     fixed_overhead_tokens: u64,
+    #[serde(default)]
+    claim_generation: u64,
 }
 
 /// One runtime LCM coordinator.  It is deliberately a single component that
@@ -478,6 +521,7 @@ struct LcmState {
 #[derive(Clone)]
 pub struct LcmCoordinator {
     accounting: accounting::Accounting,
+    claim_generations: Arc<std::sync::Mutex<BTreeMap<SessionId, u64>>>,
     overheads: Arc<std::sync::Mutex<BTreeMap<SessionId, u64>>>,
     conversation_tokens: Arc<std::sync::Mutex<BTreeMap<SessionId, u64>>>,
     working_set: Option<crate::runtime::WorkingSetPolicy>,
@@ -537,6 +581,7 @@ impl LcmCoordinator {
         let classifier = Arc::new(DefaultLcmSourceClassifier::new(policy.source_sensitivity));
         Ok(Self {
             accounting: Arc::default(),
+            claim_generations: Arc::default(),
             overheads: Arc::default(),
             conversation_tokens: Arc::default(),
             working_set: None,
@@ -549,6 +594,331 @@ impl LcmCoordinator {
             legacy_artifact_store: None,
             policy,
         })
+    }
+
+    /// Claims a fresh binding before a writable session exists.
+    pub(crate) async fn claim_session(
+        &self,
+        session: &SessionId,
+        history: &[Message],
+        policy: Option<LcmRecoveryPolicy>,
+    ) -> Result<LcmSessionInitialization, RuntimeError> {
+        let binding = self.timeline_binding(session)?;
+        let claim = self.store.claim(&binding.view(), session, 0).await;
+        match claim {
+            Ok(agent_runtime_lcm::LcmClaimResult::Claimed) => Ok(LcmSessionInitialization {
+                history: history.to_vec(),
+                state: None,
+                summary: None,
+            }),
+            Ok(agent_runtime_lcm::LcmClaimResult::Fork) => {
+                self.recover_binding(binding, history, policy, LcmError::ForkRequired)
+                    .await
+            }
+            Err(error @ LcmError::TimelineOwned { .. }) => {
+                self.recover_binding(binding, history, policy, error).await
+            }
+            Err(error) => Err(map_lcm_error(error)),
+        }
+    }
+
+    async fn recover_binding(
+        &self,
+        binding: LcmTimelineBinding,
+        history: &[Message],
+        policy: Option<LcmRecoveryPolicy>,
+        error: LcmError,
+    ) -> Result<LcmSessionInitialization, RuntimeError> {
+        let Some(policy) = policy else {
+            return Err(map_lcm_error(error));
+        };
+        match policy {
+            LcmRecoveryPolicy::Adopt => {
+                let generation = match error {
+                    LcmError::TimelineOwned { generation, .. } => generation
+                        .checked_add(1)
+                        .ok_or_else(|| map_lcm_error(LcmError::ForkRequired))?,
+                    _ => return Err(map_lcm_error(error)),
+                };
+                let history = self.timeline_history(&binding).await?;
+                let mut state = self
+                    .checkpoint_state(&binding, &history, &[], None, None, 0)
+                    .await?;
+                self.project_state(
+                    &binding,
+                    &state,
+                    &HistoryView {
+                        session: binding.session.clone(),
+                        turn: TurnId::new("lcm-adopt-validation"),
+                        history: Arc::from(history.clone()),
+                        active_history_start: history.len(),
+                        state: None,
+                    },
+                )
+                .await?;
+                self.require_claim(&binding, generation).await?;
+                state.claim_generation = generation;
+                Ok(LcmSessionInitialization {
+                    history,
+                    state: Some(self.state_patch(&state)?.into_state()),
+                    summary: None,
+                })
+            }
+            LcmRecoveryPolicy::Fork | LcmRecoveryPolicy::Retire => {
+                let summary = if policy == LcmRecoveryPolicy::Fork {
+                    Some(self.timeline_summary(&binding).await?)
+                } else {
+                    None
+                };
+                let replacement = self.resolver.new_timeline(&binding.session, &binding)?;
+                self.validate_replacement(&binding, &replacement, &binding.session)?;
+                self.require_empty(&replacement).await?;
+                self.require_claim(&replacement, 0).await?;
+                Ok(LcmSessionInitialization {
+                    history: history.to_vec(),
+                    state: None,
+                    summary,
+                })
+            }
+        }
+    }
+
+    fn validate_replacement(
+        &self,
+        previous: &LcmTimelineBinding,
+        replacement: &LcmTimelineBinding,
+        session: &SessionId,
+    ) -> Result<(), RuntimeError> {
+        replacement.validate_for(session)?;
+        if replacement.timeline == previous.timeline {
+            return Err(map_lcm_error(LcmError::ForkRequired));
+        }
+        let resolved = self.timeline_binding(&replacement.session)?;
+        if resolved != *replacement {
+            return Err(RuntimeError::conflict(
+                "replacement binding was not retained by host resolver",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates identity and authority for explicit archival, without admitting
+    /// the divergent source projection to a provider request.
+    pub(crate) fn validate_fork_source(
+        &self,
+        session: &SessionId,
+        persisted: Option<&VersionedSessionState>,
+    ) -> Result<(), RuntimeError> {
+        let binding = self.timeline_binding(session)?;
+        self.store
+            .authorize_view(&binding.view())
+            .map_err(map_lcm_error)?;
+        if let Some(persisted) = persisted {
+            self.decode_state(&binding, persisted)?;
+        }
+        Ok(())
+    }
+
+    async fn claim_commit_view(&self, view: &TurnCommitView) -> Result<(), RuntimeError> {
+        let binding = self.timeline_binding(&view.session)?;
+        let generation = match &view.state {
+            Some(persisted) => self.decode_state(&binding, persisted)?.claim_generation,
+            None => self
+                .claim_generations
+                .lock()
+                .expect("claim generations poisoned")
+                .get(&view.session)
+                .copied()
+                .unwrap_or(0),
+        };
+        self.require_claim(&binding, generation).await
+    }
+
+    async fn divergence_below_frontier(
+        &self,
+        binding: &LcmTimelineBinding,
+        history: &[Message],
+    ) -> Result<Option<RuntimeError>, RuntimeError> {
+        let view = binding.view();
+        let frontier =
+            self.store
+                .active_nodes(&view)
+                .await
+                .map_err(map_lcm_error)?
+                .iter()
+                .map(|node| {
+                    node.range.end.get().checked_add(1).ok_or_else(|| {
+                        RuntimeError::conflict("LCM frontier exceeds sequence space")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+        let end = history
+            .len()
+            .min(usize::try_from(frontier).unwrap_or(usize::MAX));
+        let stored = self.load_stored_overlap(&view, 0, end).await?;
+        let at = stored
+            .iter()
+            .zip(history)
+            .position(|(entry, message)| entry.content != *message)
+            .or_else(|| (stored.len() < end).then_some(stored.len()))
+            .or_else(|| ((history.len() as u64) < frontier).then_some(history.len()));
+        Ok(at.map(|at| {
+            map_lcm_error(LcmError::LcmDivergence {
+                frontier,
+                at: at as u64,
+            })
+        }))
+    }
+
+    async fn require_empty(&self, binding: &LcmTimelineBinding) -> Result<(), RuntimeError> {
+        if !self
+            .store
+            .active_nodes(&binding.view())
+            .await
+            .map_err(map_lcm_error)?
+            .is_empty()
+            || self.store_has_entry_at(&binding.view(), 0).await?
+        {
+            return Err(map_lcm_error(LcmError::ForkRequired));
+        }
+        Ok(())
+    }
+
+    async fn require_claim(
+        &self,
+        binding: &LcmTimelineBinding,
+        generation: u64,
+    ) -> Result<(), RuntimeError> {
+        match self
+            .store
+            .claim(&binding.view(), &binding.session, generation)
+            .await
+            .map_err(map_lcm_error)?
+        {
+            agent_runtime_lcm::LcmClaimResult::Claimed => {
+                self.claim_generations
+                    .lock()
+                    .expect("claim generations poisoned")
+                    .insert(binding.session.clone(), generation);
+                Ok(())
+            }
+            agent_runtime_lcm::LcmClaimResult::Fork => Err(map_lcm_error(LcmError::ForkRequired)),
+        }
+    }
+
+    async fn timeline_history(
+        &self,
+        binding: &LcmTimelineBinding,
+    ) -> Result<Vec<Message>, RuntimeError> {
+        let view = binding.view();
+        let revision = self
+            .store
+            .current_revision(&view)
+            .await
+            .map_err(map_lcm_error)?;
+        let mut entries = Vec::new();
+        loop {
+            let start = entries.len() as u64;
+            let page = self
+                .store
+                .load_range(
+                    &view,
+                    LcmRange::new(LcmSequence::new(start), LcmSequence::new(u64::MAX))
+                        .map_err(|_| RuntimeError::conflict("invalid LCM read range"))?,
+                    LCM_READ_PAGE_SIZE,
+                )
+                .await
+                .map_err(map_lcm_error)?;
+            if page.is_empty() {
+                break;
+            }
+            for entry in page {
+                if entry.sequence.get() != entries.len() as u64
+                    || entry.timeline_id != binding.timeline
+                {
+                    return Err(RuntimeError::conflict(
+                        "LCM adoption source is not contiguous",
+                    ));
+                }
+                entries.push(entry);
+            }
+        }
+        if self
+            .store
+            .current_revision(&view)
+            .await
+            .map_err(map_lcm_error)?
+            != revision
+        {
+            return Err(lcm_revision_conflict("LCM adoption source changed"));
+        }
+        Ok(entries.into_iter().map(|entry| entry.content).collect())
+    }
+
+    async fn timeline_summary(&self, binding: &LcmTimelineBinding) -> Result<String, RuntimeError> {
+        let history = self.timeline_history(binding).await?;
+        let state = self
+            .checkpoint_state(binding, &history, &[], None, None, 0)
+            .await?;
+        let projection = self
+            .project_state(
+                binding,
+                &state,
+                &HistoryView {
+                    session: binding.session.clone(),
+                    turn: TurnId::new("lcm-fork-projection"),
+                    history: Arc::from(history.clone()),
+                    active_history_start: history.len(),
+                    state: None,
+                },
+            )
+            .await?;
+        let mut output = Vec::new();
+        for fragment in projection.summaries {
+            if let FragmentContent::Text(text) = fragment.content {
+                output.push(text);
+            }
+        }
+        for message in &history[projection.omit_prefix..] {
+            // Preserve tool arguments/results and other non-text context in
+            // the projected tail. This is rendering, never an instruction.
+            output.push(serde_json::to_string(message)?);
+        }
+        Ok(output.join("\n"))
+    }
+
+    pub(crate) async fn fork_binding(
+        &self,
+        from: &SessionId,
+        new_id: &SessionId,
+        choice: crate::runtime::ForkLcm,
+    ) -> Result<(), RuntimeError> {
+        let previous = self.timeline_binding(from)?;
+        self.store
+            .authorize_view(&previous.view())
+            .map_err(map_lcm_error)?;
+        let binding = match choice {
+            crate::runtime::ForkLcm::NewTimeline => {
+                self.resolver.new_timeline(new_id, &previous)?
+            }
+            crate::runtime::ForkLcm::Continue => {
+                self.resolver.continue_timeline(new_id, &previous)?
+            }
+        };
+        binding.validate_for(new_id)?;
+        if choice == crate::runtime::ForkLcm::NewTimeline {
+            self.validate_replacement(&previous, &binding, new_id)?;
+            self.require_empty(&binding).await?;
+        } else if binding.timeline != previous.timeline || self.timeline_binding(new_id)? != binding
+        {
+            return Err(RuntimeError::conflict(
+                "continued binding differs from parent timeline",
+            ));
+        }
+        Ok(())
     }
 
     /// Configures independent source and output/reclaim targets.
@@ -1120,6 +1490,7 @@ impl LcmCoordinator {
     ) -> Result<Option<VersionedSessionState>, RuntimeError> {
         let binding = self.timeline_binding(session)?;
         let state = self.decode_state(&binding, persisted)?;
+        self.require_claim(&binding, state.claim_generation).await?;
         let view = HistoryView {
             session: session.clone(),
             turn: TurnId::new("lcm-resume-validation"),
@@ -1368,6 +1739,27 @@ impl LcmCoordinator {
                 RuntimeError::conflict("LCM store tail exceeds addressable history")
             })?;
             if tail < start {
+                let frontier = self
+                    .store
+                    .active_nodes(&view)
+                    .await
+                    .map_err(map_lcm_error)?
+                    .iter()
+                    .map(|node| {
+                        node.range.end.get().checked_add(1).ok_or_else(|| {
+                            RuntimeError::conflict("LCM frontier exceeds sequence space")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                if (tail as u64) < frontier {
+                    return Err(map_lcm_error(LcmError::LcmDivergence {
+                        frontier,
+                        at: tail as u64,
+                    }));
+                }
                 return match self.try_append_range(binding, history, tail).await? {
                     Ok(()) => Ok(()),
                     Err(error) => Err(map_lcm_error(error)),
@@ -1395,6 +1787,27 @@ impl LcmCoordinator {
         let truncate_at = divergence.or_else(|| beyond_canonical.then_some(history.len()));
         let resume_from = match truncate_at {
             Some(sequence) => {
+                let frontier = self
+                    .store
+                    .active_nodes(&view)
+                    .await
+                    .map_err(map_lcm_error)?
+                    .iter()
+                    .map(|node| {
+                        node.range.end.get().checked_add(1).ok_or_else(|| {
+                            RuntimeError::conflict("LCM frontier exceeds sequence space")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                if (sequence as u64) < frontier {
+                    return Err(map_lcm_error(LcmError::LcmDivergence {
+                        frontier,
+                        at: sequence as u64,
+                    }));
+                }
                 self.store
                     .truncate_from(&view, LcmSequence::new(sequence as u64))
                     .await
@@ -1671,6 +2084,13 @@ impl LcmCoordinator {
             pending_summary,
             hard_rounds,
             hard_round_limit: 0,
+            claim_generation: self
+                .claim_generations
+                .lock()
+                .expect("claim generations poisoned")
+                .get(&binding.session)
+                .copied()
+                .unwrap_or(0),
             fixed_overhead_tokens: self
                 .overheads
                 .lock()
@@ -2887,6 +3307,12 @@ impl LcmCoordinator {
         let entries = self.load_entries(&store_view, state.history_len).await?;
         for (index, (entry, message)) in entries.iter().zip(view.history.iter()).enumerate() {
             if entry.sequence.get() != index as u64 || entry.content != *message {
+                if let Some(error) = self
+                    .divergence_below_frontier(binding, &view.history)
+                    .await?
+                {
+                    return Err(error);
+                }
                 return Err(RuntimeError::conflict(
                     "LCM immutable entry no longer matches canonical history",
                 ));
@@ -3539,6 +3965,12 @@ impl LcmCoordinator {
             || state.history_fingerprint
                 != self.canonical_fingerprint(binding, &view.history, state.history_len)?
         {
+            if let Some(error) = self
+                .divergence_below_frontier(binding, &view.history)
+                .await?
+            {
+                return Err(error);
+            }
             return Err(RuntimeError::conflict(
                 "LCM canonical history no longer matches its protected checkpoint",
             ));
@@ -3926,6 +4358,9 @@ impl TurnCommitHook for LcmCoordinator {
         &self,
         view: &TurnCommitView,
     ) -> Result<BeforeProviderPatch, RuntimeError> {
+        self.claim_commit_view(view)
+            .await
+            .map_err(lcm_pre_provider_error)?;
         self.compact_hard_result(view)
             .await
             .map(|mut patch| {
@@ -3945,6 +4380,7 @@ impl TurnCommitHook for LcmCoordinator {
         if view.finish != TurnFinish::Completed {
             return Ok(TurnCommitPatch::default());
         }
+        self.claim_commit_view(view).await?;
         let binding = self.timeline_binding(&view.session)?;
         let previous = match view.state.as_ref() {
             Some(persisted) => Some(
@@ -3978,6 +4414,7 @@ impl TurnCommitHook for LcmCoordinator {
         &self,
         view: &TurnCommitView,
     ) -> Result<IdleCompactionResult, RuntimeError> {
+        self.claim_commit_view(view).await?;
         let binding = self.timeline_binding(&view.session)?;
         let previous = match view.state.as_ref() {
             Some(persisted) => Some(
@@ -4436,6 +4873,7 @@ fn map_summary_error(error: LcmSummaryError) -> RuntimeError {
 
 fn map_lcm_error(error: LcmError) -> RuntimeError {
     let class = lcm_failure_class(&error, FailureStage::Unknown);
+    let evidence = lcm_failure_evidence(&error);
     match error {
         LcmError::CannotFit {
             required_tokens,
@@ -4456,6 +4894,9 @@ fn map_lcm_error(error: LcmError) -> RuntimeError {
         LcmError::RangeOverlap => {
             RuntimeError::conflict("LCM source range overlaps an active node")
         }
+        LcmError::TimelineOwned { .. } => RuntimeError::conflict("LCM timeline requires ownership policy"),
+        LcmError::LcmDivergence { .. } => RuntimeError::conflict("LCM divergence crosses summary frontier"),
+        LcmError::ForkRequired => RuntimeError::conflict("LCM requires a new authorized timeline"),
         LcmError::MissingSource => RuntimeError::conflict("LCM source identity is missing"),
         LcmError::InactiveChild => RuntimeError::conflict("LCM condensation child is inactive"),
         LcmError::CrossTimeline => RuntimeError::conflict("LCM operation crossed timelines"),
@@ -4463,11 +4904,12 @@ fn map_lcm_error(error: LcmError) -> RuntimeError {
         LcmError::InvalidBound => RuntimeError::limit("LCM read or expansion bound is invalid"),
         LcmError::SecretSource => RuntimeError::conflict("LCM secret source cannot be summarized"),
         LcmError::StoreFailure => RuntimeError::internal("LCM store backend failed"),
-    }.with_class(class)
+    }.with_class(class).with_lcm_failure(evidence)
 }
 
 fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
     let class = lcm_failure_class(&error, FailureStage::Unknown);
+    let evidence = lcm_failure_evidence(&error);
     match error {
         LcmError::Unauthorized => RuntimeError::approval("LCM timeline view is unauthorized"),
         LcmError::MissingSource => RuntimeError::not_found("LCM expansion target was not found"),
@@ -4480,6 +4922,9 @@ fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
         | LcmError::SequenceGap { .. }
         | LcmError::EntryConflict
         | LcmError::RangeOverlap
+        | LcmError::TimelineOwned { .. }
+        | LcmError::LcmDivergence { .. }
+        | LcmError::ForkRequired
         | LcmError::InactiveChild => RuntimeError::conflict("LCM expansion store state conflicted"),
         LcmError::StoreFailure => RuntimeError::internal("LCM expansion store failed"),
         LcmError::SecretSource | LcmError::CannotFit { .. } => {
@@ -4487,6 +4932,25 @@ fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
         }
     }
     .with_class(class)
+    .with_lcm_failure(evidence)
+}
+
+fn lcm_failure_evidence(error: &LcmError) -> Option<agent_runtime_core::error::LcmFailure> {
+    use agent_runtime_core::error::LcmFailure;
+    match error {
+        LcmError::EntryConflict => Some(LcmFailure::EntryConflict),
+        LcmError::RangeOverlap => Some(LcmFailure::RangeOverlap),
+        LcmError::TimelineOwned { owner, generation } => Some(LcmFailure::TimelineOwned {
+            owner: owner.clone(),
+            generation: *generation,
+        }),
+        LcmError::LcmDivergence { frontier, at } => Some(LcmFailure::LcmDivergence {
+            frontier: *frontier,
+            at: *at,
+        }),
+        LcmError::ForkRequired => Some(LcmFailure::ForkRequired),
+        _ => None,
+    }
 }
 
 fn lcm_failure_class(error: &LcmError, stage: FailureStage) -> FailureClass {
@@ -4514,6 +4978,9 @@ fn lcm_failure_class(error: &LcmError, stage: FailureStage) -> FailureClass {
         | LcmError::SequenceGap { .. }
         | LcmError::EntryConflict
         | LcmError::RangeOverlap
+        | LcmError::TimelineOwned { .. }
+        | LcmError::LcmDivergence { .. }
+        | LcmError::ForkRequired
         | LcmError::InactiveChild => FailureClass::StateConflict {
             stage,
             component: FailureComponent::Lcm,
@@ -4872,6 +5339,17 @@ mod tests {
 
     #[async_trait]
     impl agent_runtime_lcm::LcmWriter for TestStore {
+        async fn claim(
+            &self,
+            view: &LcmView,
+            owner: &agent_runtime_core::ids::SessionId,
+            generation: u64,
+        ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
+            let _ = (owner, generation);
+            agent_runtime_lcm::LcmReader::authorize_view(self, view)?;
+            Ok(agent_runtime_lcm::LcmClaimResult::Claimed)
+        }
+
         async fn append(
             &self,
             view: &LcmView,
@@ -5678,6 +6156,7 @@ mod tests {
             hard_rounds: 0,
             hard_round_limit: 0,
             fixed_overhead_tokens: 0,
+            claim_generation: 0,
         };
         let value = serde_json::to_value(state).unwrap();
         assert_eq!(value["schema_version"], LCM_STATE_SCHEMA_VERSION);

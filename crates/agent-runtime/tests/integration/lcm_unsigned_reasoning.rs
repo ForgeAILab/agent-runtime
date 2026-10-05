@@ -279,7 +279,7 @@ async fn unsigned_reasoning_does_not_wedge_the_next_turn() {
         observer.clone(),
     );
     let session = second
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("the session resumes over its protected checkpoint");
     session

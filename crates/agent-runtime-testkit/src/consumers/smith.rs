@@ -32,3 +32,13 @@ pub fn build(
         .clock(Arc::new(SystemClock))
         .build()
 }
+
+/// The terminal /new action rotates the idle durable session.
+pub fn new_session(from: SessionId, new_id: SessionId) -> ForkSession {
+    ForkSession {
+        from,
+        new_id,
+        seed: ForkSeed::Empty,
+        lcm: ForkLcm::NewTimeline,
+    }
+}

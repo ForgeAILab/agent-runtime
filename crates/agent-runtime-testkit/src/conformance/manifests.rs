@@ -264,7 +264,7 @@ pub async fn assert_file_store_manifest_migration() {
             .unwrap();
         for _ in 0..3 {
             let session = runtime
-                .start_session(StartSession::new().with_id(source.id.clone()))
+                .start_session(StartSession::resume(source.id.clone()))
                 .await
                 .unwrap();
             let snapshot = session.snapshot();
@@ -330,7 +330,7 @@ pub async fn assert_file_store_manifest_migration() {
     assert_new_checkpoints(&checkpoints, &id);
     session.shutdown().await.unwrap();
     let resumed = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     assert_eq!(resumed.snapshot().manifests, manifests);
@@ -533,7 +533,7 @@ pub async fn assert_protected_manifest_recovery() {
                 .build()
                 .unwrap();
             let recovered = runtime
-                .start_session(StartSession::new().with_id(id.clone()))
+                .start_session(StartSession::resume(id.clone()))
                 .await
                 .unwrap();
             if !ordinary_available {

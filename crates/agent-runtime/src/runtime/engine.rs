@@ -22,7 +22,9 @@ use crate::harness::{
     import_semantic_summary_v1,
 };
 use crate::ids::IdMinter;
-use crate::runtime::command::{COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession};
+use crate::runtime::command::{
+    COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession, StartSessionMode,
+};
 use crate::runtime::emitter::EventEmitter;
 use crate::runtime::inject::InjectionQueue;
 use crate::runtime::manifests::{
@@ -156,7 +158,12 @@ fn merge_terminal_checkpoint_snapshot(
                 )));
             }
         }
-        if canonical.updated <= protected.updated
+        // These runtime-owned values are immutable after creation. Ordinary
+        // storage may redact their bodies even at a newer write timestamp.
+        let immutable_fork_state = namespace == crate::runtime::fork::SUMMARY_SEED_NAMESPACE
+            || namespace == crate::runtime::fork::PENDING_FORK_NAMESPACE;
+        if immutable_fork_state
+            || canonical.updated <= protected.updated
             || !canonical.extension_state.contains_key(namespace)
         {
             canonical
@@ -284,6 +291,7 @@ async fn prepare_lcm_resume(
     shared: &RuntimeShared,
     session: &SessionId,
     snapshot: &mut SessionSnapshot,
+    policy: Option<crate::harness::LcmRecoveryPolicy>,
 ) -> Result<(Vec<HarnessEvent>, bool), RuntimeError> {
     let legacy = snapshot
         .extension_state
@@ -330,14 +338,53 @@ async fn prepare_lcm_resume(
     let Some(legacy) = legacy else {
         // Resolve the host binding even for a fresh session so an invalid or
         // cross-session grant fails during construction, not at first use.
-        coordinator.timeline_binding(session)?;
-        return Ok((Vec::new(), false));
+        let initialized = coordinator
+            .claim_session(session, &snapshot.history, policy)
+            .await?;
+        snapshot.history = initialized.history;
+        if let Some(state) = initialized.state {
+            snapshot
+                .extension_state
+                .insert(LCM_COMPONENT_ID.to_owned(), state);
+        }
+        if let Some(summary) = initialized.summary {
+            snapshot.extension_state.insert(
+                crate::runtime::fork::SUMMARY_SEED_NAMESPACE.to_owned(),
+                crate::runtime::fork::summary_state(summary),
+            );
+        }
+        return Ok((Vec::new(), policy.is_some()));
     };
     let session_store = shared.session_store.as_ref().ok_or_else(|| {
         RuntimeError::conflict(
             "legacy semantic-summary import requires durable session persistence",
         )
     })?;
+    let previous_binding = coordinator.timeline_binding(session)?;
+    let initialized = coordinator
+        .claim_session(session, &snapshot.history, policy)
+        .await?;
+    let replaced = coordinator.timeline_binding(session)?.timeline != previous_binding.timeline;
+    if initialized.state.is_some() || initialized.summary.is_some() || replaced {
+        snapshot.history = initialized.history;
+        snapshot
+            .extension_state
+            .remove(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID);
+        if let Some(state) = initialized.state {
+            snapshot
+                .extension_state
+                .insert(LCM_COMPONENT_ID.to_owned(), state);
+        }
+        if let Some(summary) = initialized.summary {
+            snapshot.extension_state.insert(
+                crate::runtime::fork::SUMMARY_SEED_NAMESPACE.to_owned(),
+                crate::runtime::fork::summary_state(summary),
+            );
+        }
+        snapshot.updated = shared.clock.now();
+        session_store.save(snapshot).await?;
+        return Ok((Vec::new(), true));
+    }
     let patch = import_semantic_summary_v1(
         coordinator,
         session,
@@ -551,7 +598,7 @@ fn protected_outcome_state_is_newer(
 }
 
 /// The shared, immutable composition behind a [`Runtime`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RuntimeShared {
     pub(crate) driver: Driver,
     /// Provider-bound cache mechanism shared by the Runtime's sessions.
@@ -578,6 +625,7 @@ pub struct RuntimeShared {
 #[derive(Debug, Default)]
 pub(crate) struct ActiveSessionRegistry {
     sessions: Mutex<BTreeSet<SessionId>>,
+    handles: Mutex<BTreeMap<SessionId, Weak<SessionInner>>>,
 }
 
 impl ActiveSessionRegistry {
@@ -599,6 +647,10 @@ impl ActiveSessionRegistry {
         self.sessions
             .lock()
             .expect("active sessions poisoned")
+            .remove(session);
+        self.handles
+            .lock()
+            .expect("active handles poisoned")
             .remove(session);
     }
 }
@@ -643,6 +695,20 @@ impl Runtime {
         Self { shared }
     }
 
+    pub(crate) async fn session_exists(&self, id: &SessionId) -> Result<bool, RuntimeError> {
+        if let Some(store) = &self.shared.session_store {
+            if store.load(id).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        if let Some(store) = &self.shared.checkpoint_store {
+            if store.load_latest(id).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The injected secret store, if any (hosts use it to resolve credentials).
     pub fn secret_store(&self) -> Option<&Arc<dyn SecretStore>> {
         self.shared.secret_store.as_ref()
@@ -654,12 +720,290 @@ impl Runtime {
         &self.shared.cache
     }
 
+    /// Forks an idle session, persists its successor and supersedes the parent.
+    /// The host resolver authorizes each LCM binding; no provider call occurs.
+    pub async fn fork_session(
+        &self,
+        request: crate::runtime::ForkSession,
+    ) -> Result<SessionHandle, RuntimeError> {
+        use crate::runtime::fork::{
+            ForkLcm, ForkReservation, ForkSeed, PENDING_FORK_NAMESPACE, SUMMARY_SEED_NAMESPACE,
+            SUPERSEDED_NAMESPACE, seed_history, summary_state,
+        };
+        if request.from == request.new_id || request.new_id.as_str().trim().is_empty() {
+            return Err(RuntimeError::conflict(
+                "fork requires a fresh nonempty successor id",
+            ));
+        }
+        if self.shared.session_store.is_none() || self.shared.checkpoint_store.is_none() {
+            return Err(RuntimeError::conflict(
+                "fork requires session and protected checkpoint stores",
+            ));
+        }
+        let durable_parent = self
+            .shared
+            .checkpoint_store
+            .as_ref()
+            .expect("checked store")
+            .load_latest(&request.from)
+            .await?;
+        if let Some(snapshot) = durable_parent
+            .as_ref()
+            .map(|checkpoint| &checkpoint.snapshot)
+        {
+            if snapshot
+                .extension_state
+                .get(SUPERSEDED_NAMESPACE)
+                .is_some_and(|state| state.value == serde_json::json!(request.new_id))
+            {
+                if snapshot
+                    .extension_state
+                    .get(PENDING_FORK_NAMESPACE)
+                    .is_none_or(|state| {
+                        state.value
+                            != serde_json::to_value(&request).expect("fork request serializes")
+                    })
+                {
+                    return Err(RuntimeError::conflict("completed fork request differs"));
+                }
+                let live_child = self
+                    .shared
+                    .active_sessions
+                    .handles
+                    .lock()
+                    .expect("active handles poisoned")
+                    .get(&request.new_id)
+                    .and_then(Weak::upgrade);
+                return match live_child {
+                    Some(inner) => Ok(SessionHandle::new(inner)),
+                    None => {
+                        self.start_session(
+                            StartSession::resume(request.new_id)
+                                .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+                        )
+                        .await
+                    }
+                };
+            }
+        }
+        let live = self
+            .shared
+            .active_sessions
+            .handles
+            .lock()
+            .expect("active handles poisoned")
+            .get(&request.from)
+            .and_then(Weak::upgrade);
+        let parent = match live {
+            Some(inner) => SessionHandle::new(inner),
+            None => {
+                self.start_session_with_parent(
+                    StartSession::resume(request.from.clone())
+                        .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+                    None,
+                    true,
+                )
+                .await?
+            }
+        };
+        if parent.inner().shared.session_store.is_none()
+            || parent.inner().shared.checkpoint_store.is_none()
+        {
+            return Err(RuntimeError::conflict(
+                "fork source requires durable session and protected stores",
+            ));
+        }
+        let serialized_request = serde_json::to_value(&request)?;
+        let pending = parent
+            .inner()
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .get(PENDING_FORK_NAMESPACE)
+            .cloned();
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.value != serialized_request)
+        {
+            return Err(RuntimeError::conflict(
+                "a different fork is pending for this parent",
+            ));
+        }
+        // Reserve the same admission boundary as turns and cache operations.
+        let _turn_gate = parent
+            .inner()
+            .turn_gate
+            .try_lock()
+            .map_err(|_| RuntimeError::conflict("fork parent is busy"))?;
+        let _cache_gate = parent
+            .inner()
+            .cache_gate
+            .try_lock()
+            .map_err(|_| RuntimeError::conflict("fork parent has active cache work"))?;
+        {
+            let _admission = parent
+                .inner()
+                .admission_gate
+                .lock()
+                .expect("admission gate poisoned");
+            let mut turns = parent.inner().turns.lock().expect("session turns poisoned");
+            if (turns.shutting_down && pending.is_none())
+                || turns.count != 0
+                || parent.inner().cache_active.load(Ordering::Acquire) != 0
+                || parent
+                    .inner()
+                    .idle_compaction_inflight
+                    .load(Ordering::Acquire)
+                || parent
+                    .inner()
+                    .delegation_coordinator_active
+                    .load(Ordering::Acquire)
+                || parent
+                    .inner()
+                    .goal_controller_active
+                    .load(Ordering::Acquire)
+            {
+                return Err(RuntimeError::conflict("fork parent is busy or superseded"));
+            }
+            turns.shutting_down = true;
+        }
+        let mut reservation = ForkReservation {
+            inner: parent.inner().clone(),
+            retain: pending.is_some(),
+        };
+        async {
+            if !parent.idle_checkpoint_is_safe().await? {
+                return Err(RuntimeError::conflict(
+                    "fork parent has unfinished protected work",
+                ));
+            }
+            if let Some(coordinator) = &self.shared.lcm {
+                let persisted = parent
+                    .inner()
+                    .execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .get(LCM_COMPONENT_ID)
+                    .cloned();
+                coordinator.validate_fork_source(parent.id(), persisted.as_ref())?;
+            }
+            let history = seed_history(&request.seed, &parent.history())?;
+            let child_exists = self.session_exists(&request.new_id).await?;
+            if pending.is_none()
+                && (child_exists
+                    || self
+                        .shared
+                        .active_sessions
+                        .sessions
+                        .lock()
+                        .expect("active sessions poisoned")
+                        .contains(&request.new_id))
+            {
+                return Err(RuntimeError::conflict("fork successor already exists"));
+            }
+            if pending.is_none() {
+                parent
+                    .inner()
+                    .execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .insert(
+                        PENDING_FORK_NAMESPACE.into(),
+                        agent_runtime_core::store::VersionedSessionState::new(
+                            agent_runtime_registry::RegistryRevision::new("session-fork-pending-1"),
+                            serialized_request.clone(),
+                        ),
+                    );
+                // An ambiguous write still leaves this live parent fenced.
+                reservation.retain = true;
+                parent.protect_session_boundary().await?;
+                parent.persist().await?;
+            }
+            let child = if child_exists {
+                let live_child = self
+                    .shared
+                    .active_sessions
+                    .handles
+                    .lock()
+                    .expect("active handles poisoned")
+                    .get(&request.new_id)
+                    .and_then(Weak::upgrade);
+                match live_child {
+                    Some(inner) => SessionHandle::new(inner),
+                    None => {
+                        self.start_session(
+                            StartSession::resume(request.new_id.clone())
+                                .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+                        )
+                        .await?
+                    }
+                }
+            } else {
+                if let Some(lcm) = &self.shared.lcm {
+                    lcm.fork_binding(&request.from, &request.new_id, request.lcm)
+                        .await?;
+                }
+                let mut start = StartSession::create(request.new_id.clone(), history);
+                if request.lcm == ForkLcm::Continue && self.shared.lcm.is_some() {
+                    start = start.with_lcm_policy(crate::harness::LcmRecoveryPolicy::Adopt);
+                }
+                self.start_session(start).await?
+            };
+            if let ForkSeed::Summary(summary) = &request.seed {
+                child
+                    .inner()
+                    .execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .insert(
+                        SUMMARY_SEED_NAMESPACE.into(),
+                        summary_state(summary.clone()),
+                    );
+            }
+            // Protect the seed before ordinary persistence can redact it.
+            child.protect_session_boundary().await?;
+            child.persist().await?;
+            let _persist = parent.inner().persist_gate.lock().await;
+            parent
+                .inner()
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned")
+                .insert(
+                    SUPERSEDED_NAMESPACE.into(),
+                    agent_runtime_core::store::VersionedSessionState::new(
+                        agent_runtime_registry::RegistryRevision::new("session-superseded-1"),
+                        serde_json::json!(request.new_id),
+                    )
+                    .redaction_safe(),
+                );
+            parent.protect_session_boundary().await?;
+            parent.persist_locked().await?;
+            Ok(child)
+        }
+        .await
+    }
+
     /// Starts (or resumes) a session.
     pub async fn start_session(
         &self,
         request: StartSession,
     ) -> Result<SessionHandle, RuntimeError> {
-        self.start_session_with_parent(request, None).await
+        if request.mode == StartSessionMode::Ephemeral {
+            let mut shared = (*self.shared).clone();
+            shared.driver = shared.driver.without_persistence();
+            shared.session_store = None;
+            shared.checkpoint_store = None;
+            return Self::from_shared(Arc::new(shared))
+                .start_session_with_parent(request, None, false)
+                .await;
+        }
+        self.start_session_with_parent(request, None, false).await
     }
 
     /// Starts a delegated child session attributed to `parent`.
@@ -673,13 +1017,15 @@ impl Runtime {
         request: StartSession,
         parent: SessionId,
     ) -> Result<SessionHandle, RuntimeError> {
-        self.start_session_with_parent(request, Some(parent)).await
+        self.start_session_with_parent(request, Some(parent), false)
+            .await
     }
 
     async fn start_session_with_parent(
         &self,
         request: StartSession,
         parent: Option<SessionId>,
+        archive_for_fork: bool,
     ) -> Result<SessionHandle, RuntimeError> {
         if request.schema_version != COMMAND_SCHEMA_VERSION {
             return Err(RuntimeError::config(format!(
@@ -688,6 +1034,16 @@ impl Runtime {
             )));
         }
         let explicit_id = request.session_id.is_some();
+        if request.mode == StartSessionMode::Resume && (!explicit_id || !request.seed.is_empty()) {
+            return Err(RuntimeError::conflict(
+                "resume requires an id and forbids seed history",
+            ));
+        }
+        if request.mode != StartSessionMode::Resume && request.resume_identity_floor.is_some() {
+            return Err(RuntimeError::conflict(
+                "identity floors apply only to resume",
+            ));
+        }
         if !explicit_id && request.resume_identity_floor.is_some() {
             return Err(RuntimeError::config(
                 "a resume identity floor requires an explicit session id",
@@ -702,9 +1058,12 @@ impl Runtime {
 
         // Resume only when the caller explicitly supplied the identity. A
         // freshly minted id must never silently load an older snapshot.
-        let mut state = SessionState::with_history(request.initial_history);
+        let mut state = SessionState::with_history(request.seed);
         let mut identity = Default::default();
-        let mut extension_state = Default::default();
+        let mut extension_state: BTreeMap<
+            String,
+            agent_runtime_core::store::VersionedSessionState,
+        > = BTreeMap::new();
         let snapshot = match (explicit_id, &self.shared.session_store) {
             (true, Some(store)) => store.load(&session_id).await?,
             _ => None,
@@ -713,6 +1072,16 @@ impl Runtime {
             (true, Some(store)) => store.load_latest(&session_id).await?,
             _ => None,
         };
+        let resumed = snapshot.is_some() || checkpoint.is_some();
+        match request.mode {
+            StartSessionMode::Create if resumed => {
+                return Err(RuntimeError::conflict("create requires a fresh session id"));
+            }
+            StartSessionMode::Resume if !resumed => {
+                return Err(RuntimeError::not_found("resume session was not found"));
+            }
+            _ => {}
+        }
         if let Some(snapshot) = &snapshot {
             crate::runtime::manifests::snapshot_planned_steps(snapshot)?;
         }
@@ -825,9 +1194,49 @@ impl Runtime {
             (Some(checkpoint), None) => Some(checkpoint.snapshot.clone()),
             (None, snapshot) => snapshot,
         };
-        let (lcm_resume_events, _) = if let Some(canonical) = snapshot.as_mut() {
+        if snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .extension_state
+                .contains_key(crate::runtime::fork::SUPERSEDED_NAMESPACE)
+        }) {
+            return Err(RuntimeError::conflict("session is superseded"));
+        }
+        let fork_pending = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .extension_state
+                .contains_key(crate::runtime::fork::PENDING_FORK_NAMESPACE)
+        });
+        if fork_pending && !archive_for_fork {
+            return Err(RuntimeError::conflict(
+                "session has a pending fork; retry the same fork request",
+            ));
+        }
+        let (lcm_resume_events, _) = if archive_for_fork {
+            let canonical = snapshot
+                .as_mut()
+                .expect("fork source resume has a snapshot");
+            if canonical
+                .extension_state
+                .contains_key(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID)
+            {
+                prepare_lcm_resume(&self.shared, &session_id, canonical, request.lcm_policy).await?
+            } else if let Some(coordinator) = &self.shared.lcm {
+                coordinator.validate_fork_source(
+                    &session_id,
+                    canonical.extension_state.get(LCM_COMPONENT_ID),
+                )?;
+                (Vec::new(), false)
+            } else if canonical.extension_state.contains_key(LCM_COMPONENT_ID) {
+                return Err(RuntimeError::conflict(
+                    "fork source requires its configured LCM coordinator",
+                ));
+            } else {
+                (Vec::new(), false)
+            }
+        } else if let Some(canonical) = snapshot.as_mut() {
             let (events, repaired) =
-                prepare_lcm_resume(&self.shared, &session_id, canonical).await?;
+                prepare_lcm_resume(&self.shared, &session_id, canonical, request.lcm_policy)
+                    .await?;
             if repaired || !events.is_empty() {
                 // Recovery must continue from the replacement namespace even
                 // when the loaded protected checkpoint still contains schema
@@ -840,9 +1249,19 @@ impl Runtime {
             }
             (events, repaired)
         } else if let Some(coordinator) = self.shared.lcm.as_ref() {
-            // Fresh ephemeral sessions still validate their host-issued
-            // binding before construction succeeds.
-            coordinator.timeline_binding(&session_id)?;
+            let initialized = coordinator
+                .claim_session(&session_id, &state.history, request.lcm_policy)
+                .await?;
+            state.history = initialized.history;
+            if let Some(lcm_state) = initialized.state {
+                extension_state.insert(LCM_COMPONENT_ID.to_owned(), lcm_state);
+            }
+            if let Some(summary) = initialized.summary {
+                extension_state.insert(
+                    crate::runtime::fork::SUMMARY_SEED_NAMESPACE.to_owned(),
+                    crate::runtime::fork::summary_state(summary),
+                );
+            }
             (Vec::new(), false)
         } else {
             (Vec::new(), false)
@@ -855,6 +1274,9 @@ impl Runtime {
             state.manifests = snapshot.manifests;
             identity = snapshot.identity;
             extension_state = snapshot.extension_state;
+        }
+        if extension_state.contains_key(crate::runtime::fork::SUPERSEDED_NAMESPACE) {
+            return Err(RuntimeError::conflict("session is superseded"));
         }
         extension_state
             .entry(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE.to_owned())
@@ -933,6 +1355,7 @@ impl Runtime {
             idle_compaction_inflight: AtomicBool::new(false),
             idle_compaction_attempted: AtomicBool::new(false),
             recovery_deferred,
+            resumed,
             interrupted_on_resume: interrupted_on_resume.clone(),
         });
 
@@ -979,7 +1402,28 @@ impl Runtime {
             }
             inner.execution.clear_turn(&checkpoint.turn);
         }
+        self.shared
+            .active_sessions
+            .handles
+            .lock()
+            .expect("active handles poisoned")
+            .insert(inner.id.clone(), Arc::downgrade(&inner));
         let session = SessionHandle::new(inner);
+        if !resumed
+            && self.shared.checkpoint_store.is_some()
+            && session
+                .inner()
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned")
+                .contains_key(crate::runtime::fork::SUMMARY_SEED_NAMESPACE)
+        {
+            // U7 policy Fork can seed a fresh session before any user turn.
+            // Protect that exact body before ordinary storage may redact it.
+            session.protect_session_boundary().await?;
+            session.persist().await?;
+        }
         let checkpoint = if request.checkpoint_recovery != CheckpointRecoveryPolicy::Defer
             && !recovery_deferred
         {

@@ -404,6 +404,17 @@ impl LcmReader for LcmFixtureStore {
 
 #[async_trait]
 impl LcmWriter for LcmFixtureStore {
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
+        let _ = (owner, generation);
+        self.authorize_view(view)?;
+        Ok(agent_runtime::lcm::LcmClaimResult::Claimed)
+    }
+
     async fn append(
         &self,
         view: &LcmView,
@@ -1153,7 +1164,7 @@ async fn valid_legacy_artifact_imports_before_first_turn_and_replaces_namespace(
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
 
     let session = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("valid legacy state resumes");
 
@@ -1270,7 +1281,7 @@ async fn missing_configured_lcm_fails_closed_before_provider_admission() {
     let runtime = runtime(provider.clone(), sessions.clone(), None);
 
     let result = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await;
     assert!(
         result.is_err(),
@@ -1298,7 +1309,7 @@ async fn missing_legacy_artifact_fails_closed_without_partial_lcm_mutation() {
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
 
     let result = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await;
     assert!(result.is_err(), "missing source artifact fails closed");
     assert!(provider.requests().is_empty());
@@ -1333,7 +1344,7 @@ async fn retry_after_append_before_node_commit_reuses_exact_entries_without_work
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
 
     let first = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await;
     assert!(
         first.is_err(),
@@ -1372,7 +1383,7 @@ async fn retry_after_append_before_node_commit_reuses_exact_entries_without_work
     );
 
     let resumed = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("retry reuses the durable append and commits the leaf");
     assert_eq!(
@@ -1419,7 +1430,7 @@ async fn retry_after_node_commit_adopts_existing_node_without_model_work() {
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
 
     let first = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await;
     assert!(
         first.is_err(),
@@ -1439,7 +1450,7 @@ async fn retry_after_node_commit_adopts_existing_node_without_model_work() {
     );
 
     let resumed = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("retry adopts the committed node");
     assert_eq!(
@@ -1520,7 +1531,7 @@ async fn pending_node_resume_repairs_and_saves_state_before_handle_creation() {
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
 
     let session = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("resume installs exact pending-node successor");
     let persisted = sessions.latest(&session_id);
@@ -1640,7 +1651,7 @@ async fn condensation_commit_before_checkpoint_is_adopted_without_model_retry() 
     let provider = Arc::new(FakeProvider::text_reply("must not run during resume"));
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
     let session = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("runtime adopts pending condensation during restart");
 
@@ -1870,7 +1881,7 @@ async fn idle_clear_save_failure_is_restart_adoptable_without_model_or_usage_rep
     drop(session);
 
     let resumed = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("restart adopts the committed idle node");
     assert_eq!(
@@ -2004,7 +2015,7 @@ async fn conflicting_old_and_new_namespaces_fail_closed_deterministically() {
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
 
     let result = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await;
     assert!(result.is_err(), "ambiguous old/new state fails closed");
     assert!(provider.requests().is_empty());

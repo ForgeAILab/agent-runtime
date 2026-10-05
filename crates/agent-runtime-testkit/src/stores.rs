@@ -143,14 +143,15 @@ impl CheckpointStore for InMemoryCheckpointStore {
         let mut checkpoints = self.checkpoints.lock().expect("store poisoned");
         match checkpoints.get(checkpoint.session.as_str()) {
             None => {
-                if checkpoint.state_revision != 0
-                    || !matches!(
-                        checkpoint.state,
-                        TurnState::Accepted { .. }
-                            | TurnState::InternalAccepted { .. }
-                            | TurnState::LocalActionAccepted { .. }
-                            | TurnState::CacheOperationPrepared { .. }
-                    )
+                if !checkpoint.is_session_boundary()
+                    && (checkpoint.state_revision != 0
+                        || !matches!(
+                            checkpoint.state,
+                            TurnState::Accepted { .. }
+                                | TurnState::InternalAccepted { .. }
+                                | TurnState::LocalActionAccepted { .. }
+                                | TurnState::CacheOperationPrepared { .. }
+                        ))
                 {
                     return Err(RuntimeError::conflict(
                         "the first checkpoint for a session must be an admission state at revision zero",

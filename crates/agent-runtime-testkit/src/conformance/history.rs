@@ -142,6 +142,16 @@ impl LcmReader for CountingStore {
 }
 #[async_trait]
 impl LcmWriter for CountingStore {
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
+        let _ = (owner, generation);
+        self.inner.claim(view, owner, generation).await
+    }
+
     async fn append(
         &self,
         view: &LcmView,
@@ -360,10 +370,7 @@ pub async fn assert_file_backed_held_views() {
         .lcm(coordinator(&id, store, sizer, true))
         .build()
         .unwrap();
-    let resumed = cold
-        .start_session(StartSession::new().with_id(id))
-        .await
-        .unwrap();
+    let resumed = cold.start_session(StartSession::resume(id)).await.unwrap();
     assert_eq!(resumed.history(), current.history);
     assert_eq!(serde_json::to_vec(&held).unwrap(), held_bytes);
     assert_eq!(serde_json::to_vec(&view.as_ref()).unwrap(), view_bytes);
@@ -431,10 +438,7 @@ pub async fn assert_authorized_accounting() {
         .lcm(coordinator(&id, store.clone(), sizer.clone(), false))
         .build()
         .unwrap();
-    let resumed = cold
-        .start_session(StartSession::new().with_id(id))
-        .await
-        .unwrap();
+    let resumed = cold.start_session(StartSession::resume(id)).await.unwrap();
     assert_eq!(resumed.history(), held.history);
     assert_eq!(resumed.snapshot().extension_state["harness.lcm"], state);
     assert!(

@@ -9,6 +9,7 @@ pub mod builder;
 pub mod command;
 pub mod emitter;
 pub mod engine;
+pub(crate) mod fork;
 pub mod goal;
 pub(crate) mod history;
 pub mod inject;
@@ -21,9 +22,12 @@ pub use agent_runtime_core::steer::{
     SteerLimits, SteerReceipt, SteerRejection, SteerRejectionReason,
 };
 pub use builder::{RuntimeBuilder, WorkingSetPolicy};
-pub use command::{COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession};
+pub use command::{
+    COMMAND_SCHEMA_VERSION, CheckpointRecoveryPolicy, StartSession, StartSessionMode,
+};
 pub use emitter::{EventEmitter, RuntimeEventStream};
 pub use engine::Runtime;
+pub use fork::{ForkLcm, ForkSeed, ForkSession};
 pub use goal::{GoalAdmissionGate, GoalController, GoalControllerConfig};
 pub use inject::InjectedContent;
 pub use manifests::MANIFEST_BOUNDARY_NAMESPACE;

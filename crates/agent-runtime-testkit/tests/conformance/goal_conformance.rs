@@ -582,7 +582,7 @@ async fn restored_active_goal_continues_only_after_a_later_controller_attaches()
         Arc::new(RecordingObserver::new()),
     );
     let second = second_runtime
-        .start_session(StartSession::new().with_id(session_id))
+        .start_session(StartSession::resume(session_id))
         .await
         .unwrap();
     assert_eq!(provider.requests().len(), 0);

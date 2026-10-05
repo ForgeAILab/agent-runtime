@@ -29,6 +29,23 @@ impl SessionHandle {
         &self.inner.id
     }
 
+    /// Whether this handle loaded an existing snapshot or protected checkpoint.
+    pub fn resumed(&self) -> bool {
+        self.inner.resumed
+    }
+
+    /// Successor identity when this session has been superseded by a fork.
+    pub fn superseded_by(&self) -> Option<SessionId> {
+        self.inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .get(crate::runtime::fork::SUPERSEDED_NAMESPACE)
+            .and_then(|state| state.value.as_str())
+            .map(SessionId::new)
+    }
+
     /// The parent session id, when this session is a delegated child.
     pub fn parent(&self) -> Option<&SessionId> {
         self.inner.parent.as_ref()
@@ -187,7 +204,7 @@ impl SessionHandle {
     /// Persists without taking `persist_gate`. Callers must already own the
     /// gate. Cache dispatch uses this to keep reservation, result reduction,
     /// and protected checkpoint publication in one serialized interval.
-    pub(super) async fn persist_locked(&self) -> Result<(), RuntimeError> {
+    pub(crate) async fn persist_locked(&self) -> Result<(), RuntimeError> {
         match &self.inner.shared.session_store {
             Some(store) => store.save(&self.snapshot()).await,
             None => Ok(()),

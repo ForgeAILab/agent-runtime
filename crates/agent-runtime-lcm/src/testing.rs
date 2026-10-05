@@ -36,6 +36,7 @@ enum OperationRecord {
 #[derive(Debug, Default)]
 struct State {
     revision: LcmRevision,
+    owner: Option<(agent_runtime_core::ids::SessionId, u64)>,
     entries: BTreeMap<LcmSequence, LcmEntry>,
     entry_ids: BTreeMap<LcmEntryId, LcmSequence>,
     nodes: BTreeMap<LcmNodeId, LcmNode>,
@@ -277,6 +278,41 @@ impl LcmReader for InMemoryLcmStore {
 
 #[async_trait]
 impl LcmWriter for InMemoryLcmStore {
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<crate::store::LcmClaimResult, LcmError> {
+        self.authorize_view(view)?;
+        validate_view(&self.timeline_id, view)?;
+        if owner.as_str().trim().is_empty() {
+            return Err(LcmError::Invalid {
+                reason: "empty owner".into(),
+            });
+        }
+        let mut state = self.lock()?;
+        let current_generation = state
+            .owner
+            .as_ref()
+            .map_or(0, |(_, generation)| *generation);
+        if state.owner.as_ref() == Some(&(owner.clone(), generation)) {
+            return Ok(crate::store::LcmClaimResult::Claimed);
+        }
+        let empty_unowned =
+            state.owner.is_none() && state.entries.is_empty() && state.nodes.is_empty();
+        if (empty_unowned && generation == 0)
+            || current_generation.checked_add(1) == Some(generation)
+        {
+            state.owner = Some((owner.clone(), generation));
+            return Ok(crate::store::LcmClaimResult::Claimed);
+        }
+        Err(LcmError::TimelineOwned {
+            owner: state.owner.as_ref().map(|(owner, _)| owner.clone()),
+            generation: current_generation,
+        })
+    }
+
     async fn append(
         &self,
         view: &LcmView,

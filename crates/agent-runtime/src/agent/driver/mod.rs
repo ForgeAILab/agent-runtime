@@ -322,6 +322,9 @@ impl RequestBuildError {
                         component: FailureComponent::Harness,
                     };
                 }
+                if error.lcm.is_some() {
+                    return error;
+                }
                 // Retain original evidence and the old display/coarse projection.
                 error.kind = ErrorKind::Config;
                 error.retryable = false;
@@ -562,6 +565,12 @@ pub struct Driver {
 }
 
 impl Driver {
+    pub(crate) fn without_persistence(mut self) -> Self {
+        self.session_store = None;
+        self.checkpoint_store = None;
+        self
+    }
+
     pub(crate) fn with_history_lcm(
         mut self,
         lcm: Option<Arc<crate::harness::LcmCoordinator>>,

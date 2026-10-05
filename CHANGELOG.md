@@ -9,6 +9,47 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Breaking
 
+- U7/U8 (explicit session and timeline lifecycle). Full consumer-break list:
+  - `COMMAND_SCHEMA_VERSION` is 2. `StartSession` now requires explicit `mode`
+    on the wire; `initial_history` becomes `seed`. Schema 1/unknown legacy
+    fields are rejected. Use `create(id, seed)`, `resume(id)` or
+    `ephemeral(history)`. `new().with_id(id)` creates; it no longer resumes.
+    Resume with any seed returns Conflict; missing resume state returns NotFound;
+    create over an ordinary snapshot or protected checkpoint returns Conflict.
+    Resume identity floors require resume mode. Checkpoint recovery policies remain.
+  - Ephemeral disables session/checkpoint loading and writes even when stores
+    were configured. `SessionHandle::resumed()` reports actual persisted loading.
+    Nyx's per-call history reconstruction maps to `ephemeral`.
+  - `LcmWriter::claim` is defaulted and authorizes before returning Fork for
+    unsupported stores. Fresh owners cannot silently bind populated timelines.
+    Implement atomic owner generations for reuse; select explicit Adopt, Fork or
+    Retire. Legacy unclaimed timelines need adoption. Default resolver replacement
+    and continuation hooks fail closed; hosts opting into rotations must implement
+    durable, idempotent, authorized bindings. NewTimeline requires an empty store.
+  - `LcmError` adds TimelineOwned, LcmDivergence and ForkRequired; update exhaustive
+    matches. `RuntimeError` adds optional typed `lcm: Option<Box<LcmFailure>>`; add it to
+    Rust literals/destructures; `lcm_failure()` borrows the evidence. RangeOverlap/EntryConflict now retain Conflict kind
+    through provider admission, with typed evidence rather than Config strings.
+    Below-frontier reconcile fails without truncation. Serialized errors remain
+    additive and legacy/future optional LCM evidence is readable.
+  - `Runtime::fork_session(ForkSession)` accepts Summary/FromIndex/Empty and
+    NewTimeline/Continue. It requires idle durable sources and supersedes parents.
+    Retry the same protected pending fork after partial writes; default resume
+    refuses pending or superseded parents. Continue retains the old projection;
+    use NewTimeline plus Summary for bounded topic rotation. Smith `/new` maps to
+    an Empty fork; Forge genesis/handoff maps to a Summary/NewTimeline fork.
+  - Protected adapters that restrict their first save to admission states must
+    additionally accept `TurnCheckpoint::is_session_boundary()` for exact idle
+    seed protection. The constructor uses existing Terminal wire data; checkpoint
+    schema/transition versions and store trait signatures are unchanged. Ordinary
+    Sensitive-state redaction and exact protected retention remain mandatory.
+    Compatible exact immutable seeds/pending intents override even newer ordinary
+    redacted values; generated U7 Fork seeds are protected before the first turn.
+    Persisted LCM state adds a defaulted claim generation; U6 tunable rebuilds remain.
+  - Forge can remove V149 timeline retirement and stale-LCM-state deletion for
+    tunable changes after adopting claims and authorized session/topic forks.
+    See `docs/migrations/session-timeline-lifecycle.md` for migration and U9/U10.
+
 - U6 (LCM working sets, one sizer, provider summaries). Consumer-break list:
   - `LCM_ALGORITHM_REVISION` is now `agent-runtime-lcm-2`; persisted LCM state
     from `-1` rebuilds its derived metadata once on resume (see below).

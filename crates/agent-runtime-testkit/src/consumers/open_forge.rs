@@ -67,3 +67,13 @@ pub fn build(
         .clock(Arc::new(SystemClock))
         .build()
 }
+
+/// Topic genesis/handoff rotates both session and timeline with a host summary.
+pub fn topic_rotation(from: SessionId, new_id: SessionId, summary: String) -> ForkSession {
+    ForkSession {
+        from,
+        new_id,
+        seed: ForkSeed::Summary(summary),
+        lcm: ForkLcm::NewTimeline,
+    }
+}

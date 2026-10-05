@@ -3488,7 +3488,7 @@ async fn terminal_save_failure_is_repaired_by_the_completed_result_fast_path() {
         .build()
         .expect("runtime rebuilds");
     let session2 = runtime2
-        .start_session(StartSession::new().with_id(session_id))
+        .start_session(StartSession::resume(session_id))
         .await
         .expect("ResultReady checkpoint resumes");
     let result = session2
@@ -3558,7 +3558,7 @@ async fn preflight_rejection_recovery_preserves_reason_and_fingerprint() {
         .build()
         .expect("runtime rebuilds");
     let session2 = runtime2
-        .start_session(StartSession::new().with_id(session_id))
+        .start_session(StartSession::resume(session_id))
         .await
         .expect("prepared rejection checkpoint resumes");
     let recovered = session2
@@ -3603,7 +3603,7 @@ async fn terminal_checkpoint_without_cache_extension_fails_closed_before_provide
         .build()
         .expect("runtime rebuilds");
     let error = runtime2
-        .start_session(StartSession::new().with_id(session_id))
+        .start_session(StartSession::resume(session_id))
         .await
         .expect_err("terminal checkpoint without extension must fail closed");
     assert!(error.message.contains("protected cache extension"));
@@ -3852,7 +3852,7 @@ async fn session_store_only_recovery_conflicts_without_replaying_a_reserved_oper
         .build()
         .expect("runtime rebuilds");
     let session2 = runtime2
-        .start_session(StartSession::new().with_id(session_id))
+        .start_session(StartSession::resume(session_id))
         .await
         .expect("SessionStore reservation restores");
     let conflict = session2

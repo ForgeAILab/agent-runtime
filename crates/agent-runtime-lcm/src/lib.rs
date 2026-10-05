@@ -59,8 +59,9 @@ pub use projection::{
     ProjectionItem, project_active_context, project_active_context_with_suffix,
 };
 pub use store::{
-    AppendResult, CommitResult, ExpansionItem, ExpansionRequest, LcmError, LcmExpansion, LcmReader,
-    LcmStore, LcmView, LcmViewAuthority, LcmWriter, TruncateResult, operation_fingerprint,
+    AppendResult, CommitResult, ExpansionItem, ExpansionRequest, LcmClaimResult, LcmError,
+    LcmExpansion, LcmReader, LcmStore, LcmView, LcmViewAuthority, LcmWriter, TruncateResult,
+    operation_fingerprint,
 };
 pub use summarize::{
     EscalationLevel, LcmEscalatingSummarizer, LcmEscalationPolicy, LcmSummaryAttempt,

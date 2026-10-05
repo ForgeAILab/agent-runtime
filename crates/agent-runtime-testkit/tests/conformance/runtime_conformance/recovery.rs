@@ -24,7 +24,7 @@ async fn session_resumes_from_store() {
 
     // A new session with the same id resumes the saved history.
     let resumed = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     assert!(!resumed.history().is_empty(), "history should be resumed");
@@ -67,7 +67,7 @@ async fn ordinary_session_store_resume_restores_the_previous_cache_plan() {
         .build()
         .unwrap();
     let resumed = second_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     resumed.run(UserInput::text("second turn")).await.unwrap();
@@ -147,7 +147,7 @@ async fn provider_switch_rebases_only_the_incompatible_previous_cache_baseline()
         .build()
         .unwrap();
     let resumed = second_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .expect("a valid cache baseline from another profile is only an optimization miss");
     assert!(
@@ -347,7 +347,7 @@ async fn accepted_recovery_keeps_the_exact_active_input_boundary() {
         .unwrap();
 
     let session = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&observer).await;
@@ -422,11 +422,7 @@ async fn model_response_ready_reuses_the_attempt_and_restores_identity_floor() {
     floor.tool_call = floor.tool_call.max(100);
     floor.event_seq = floor.event_seq.max(100);
     let recovered = recovery_runtime
-        .start_session(
-            StartSession::new()
-                .with_id(id)
-                .with_resume_identity_floor(floor.clone()),
-        )
+        .start_session(StartSession::resume(id).with_resume_identity_floor(floor.clone()))
         .await
         .unwrap();
     wait_for_terminal(&recovery_observer).await;
@@ -512,7 +508,7 @@ async fn planning_calling_and_completing_boundaries_have_explicit_recovery_polic
         .build()
         .unwrap();
     planning_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     wait_for_terminal(&planning_observer).await;
@@ -534,7 +530,7 @@ async fn planning_calling_and_completing_boundaries_have_explicit_recovery_polic
         .build()
         .unwrap();
     calling_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     wait_for_terminal(&calling_observer).await;
@@ -568,7 +564,7 @@ async fn planning_calling_and_completing_boundaries_have_explicit_recovery_polic
         .build()
         .unwrap();
     completing_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&completing_observer).await;
@@ -666,7 +662,7 @@ async fn awaiting_approval_reauthorizes_exact_preparation_without_persisting_a_g
         .build()
         .unwrap();
     runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&observer).await;
@@ -741,7 +737,7 @@ async fn executing_tools_recovery_keeps_committed_parallel_prefix_and_never_repl
         .build()
         .unwrap();
     let recovered = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&observer).await;
@@ -884,7 +880,7 @@ async fn mixed_ready_denied_and_pure_batch_recovers_in_source_order() {
         .build()
         .unwrap();
     let recovered = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&observer).await;
@@ -953,7 +949,7 @@ async fn terminal_publication_recovers_before_or_after_the_event_exactly_once() 
         .build()
         .unwrap();
     recovery_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     wait_for_terminal(&recovery_observer).await;
@@ -991,7 +987,7 @@ async fn terminal_publication_recovers_before_or_after_the_event_exactly_once() 
         .build()
         .unwrap();
     terminal_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     tokio::task::yield_now().await;
@@ -1109,7 +1105,7 @@ async fn publishing_terminal_recovery_preserves_commit_hook_state_and_usage_with
         .build()
         .unwrap();
     let recovered = recovery_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&recovery_observer).await;
@@ -1207,7 +1203,7 @@ async fn raw_tool_outcome_checkpoint_failure_never_replays_the_invocation() {
         .filter(|event| matches!(event, RuntimeEvent::TurnCompleted { .. }))
         .count();
     let recovered = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1413,7 +1409,7 @@ async fn terminal_resume_prefers_non_regressing_canonical_session_snapshot() {
     sessions.seed(canonical);
 
     let resumed = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     assert!(
@@ -1434,7 +1430,7 @@ async fn terminal_resume_prefers_non_regressing_canonical_session_snapshot() {
     regressed.identity.event_seq = terminal.snapshot.identity.event_seq.saturating_sub(1);
     sessions.seed(regressed);
     let error = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Conflict);
@@ -1491,7 +1487,7 @@ async fn resume_preserves_all_historical_manifests() {
         .build()
         .unwrap();
     let resumed = second_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     assert_eq!(resumed.snapshot().manifests.len(), 2);
@@ -1505,7 +1501,7 @@ async fn resume_preserves_all_historical_manifests() {
         .build()
         .unwrap();
     let loaded = final_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     let manifests = loaded.snapshot().manifests;
@@ -1591,7 +1587,7 @@ async fn resumed_session_continues_ids_and_event_sequences() {
         .build()
         .unwrap();
     let resumed = second_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     assert_eq!(

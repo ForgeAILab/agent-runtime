@@ -47,6 +47,20 @@ pub enum LcmError {
     /// A leaf source range overlaps an existing committed leaf.
     #[error("LCM leaf source range overlaps an existing span")]
     RangeOverlap,
+    /// A fresh owner cannot implicitly bind populated or differently owned history.
+    #[error("LCM timeline requires an explicit ownership policy")]
+    TimelineOwned {
+        /// Existing owner, absent for a legacy unclaimed timeline.
+        owner: Option<agent_runtime_core::ids::SessionId>,
+        /// Existing ownership generation.
+        generation: u64,
+    },
+    /// Reconcile would cross the active summary frontier.
+    #[error("LCM divergence at {at} below frontier {frontier}")]
+    LcmDivergence { frontier: u64, at: u64 },
+    /// Ownership-safe replacement is required.
+    #[error("LCM requires a new authorized timeline")]
+    ForkRequired,
     /// Required entry or node identity does not exist.
     #[error("LCM source identity is missing")]
     MissingSource,
@@ -375,10 +389,38 @@ pub trait LcmReader: Send + Sync + fmt::Debug {
     ) -> Result<LcmExpansion, LcmError>;
 }
 
+/// Result of a timeline ownership claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LcmClaimResult {
+    /// Ownership was acquired or the same owner/epoch was already recorded.
+    Claimed,
+    /// This store cannot establish ownership; the host must supply a replacement.
+    Fork,
+}
+
 /// Least-authority mutation contract. Mutations are expected-revision CAS and
 /// operation-fingerprint idempotent.
 #[async_trait]
 pub trait LcmWriter: LcmReader {
+    /// Claims an authorized timeline for one session and owner epoch.
+    ///
+    /// Epoch zero may claim only an empty unowned timeline. Equal owner/epoch
+    /// is idempotent. Explicit adoption uses exactly the observed epoch plus
+    /// one; stores must compare/update ownership atomically. Populated legacy
+    /// timelines and different owners return `TimelineOwned` at epoch zero.
+    /// This default validates authority and requires a fork, never adoption.
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<LcmClaimResult, LcmError> {
+        self.authorize_view(view)?;
+        let _ = (owner, generation);
+        Ok(LcmClaimResult::Fork)
+    }
+
     /// Idempotently appends immutable entries.
     async fn append(
         &self,

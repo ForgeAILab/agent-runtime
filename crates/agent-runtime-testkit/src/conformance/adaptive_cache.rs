@@ -1040,7 +1040,7 @@ mod tests {
                 .build()
                 .expect("resumed runtime builds");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("session resumes");
         let second = resumed
@@ -1112,7 +1112,7 @@ mod tests {
         )
         .build()
         .expect("checkpoint-only resumed runtime builds")
-        .start_session(StartSession::new().with_id(session_id))
+        .start_session(StartSession::resume(session_id))
         .await
         .expect("protected cache terminal resumes without SessionStore");
         let second = resumed
@@ -1204,7 +1204,7 @@ mod tests {
                 .build()
                 .expect("resumed runtime builds");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("session resumes");
         let second = resumed
@@ -1292,7 +1292,7 @@ mod tests {
                 .build()
                 .expect("resumed runtime builds");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("session resumes");
         let result = resumed
@@ -1486,7 +1486,7 @@ mod tests {
         .build()
         .expect("resumed runtime builds");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("prepared checkpoint recovers");
         let result = resumed
@@ -1590,7 +1590,7 @@ mod tests {
         .build()
         .expect("resumed runtime builds");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("started checkpoint recovers");
         let result = resumed
@@ -1748,7 +1748,7 @@ mod tests {
         .build()
         .expect("resumed runtime builds");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("result-ready checkpoint recovers");
         let result = resumed
@@ -1829,7 +1829,7 @@ mod tests {
         .build()
         .expect("resumed runtime builds");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("terminal failure recovery succeeds");
         let result = resumed
@@ -1917,7 +1917,7 @@ mod tests {
         .build()
         .expect("resumed runtime builds from protected terminal authority");
         let resumed = resumed_runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::resume(session_id))
             .await
             .expect("terminal checkpoint resumes despite stale SessionStore");
         let result = resumed
@@ -2013,7 +2013,7 @@ mod tests {
         .build()
         .unwrap();
         let resumed = runtime
-            .start_session(StartSession::new().with_id(id))
+            .start_session(StartSession::resume(id))
             .await
             .unwrap();
         assert!(resumed.recent_manifests().is_empty());

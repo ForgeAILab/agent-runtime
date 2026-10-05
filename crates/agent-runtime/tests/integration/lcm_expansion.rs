@@ -231,6 +231,17 @@ impl LcmReader for ExpansionStore {
 
 #[async_trait]
 impl LcmWriter for ExpansionStore {
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
+        let _ = (owner, generation);
+        self.authorize_view(view)?;
+        Ok(agent_runtime::lcm::LcmClaimResult::Claimed)
+    }
+
     async fn append(
         &self,
         _view: &LcmView,
@@ -387,11 +398,7 @@ async fn bounded_expansion_continuation_is_redaction_safe() {
 #[tokio::test]
 async fn unauthorized_and_unknown_expansion_do_not_leak_existence() {
     let store = ExpansionStore::new();
-    let runtime = runtime_for(
-        "expansion-unauthorized",
-        store.clone(),
-        LcmViewAuthority::new(),
-    );
+    let runtime = runtime_for("expansion-unauthorized", store.clone(), store.authority());
     let session = runtime
         .start_session(
             StartSession::new().with_id(agent_runtime::core::ids::SessionId::new(
@@ -400,6 +407,7 @@ async fn unauthorized_and_unknown_expansion_do_not_leak_existence() {
         )
         .await
         .expect("session starts");
+    store.authority().revoke();
     let mut events = session.subscribe();
     let request = ExpansionRequest::new(LcmNodeId::new("expansion-node"), 1);
     let error = session
@@ -425,6 +433,7 @@ async fn unauthorized_and_unknown_expansion_do_not_leak_existence() {
     assert!(metadata.operation_fingerprint.is_some());
     assert_eq!(store.expand_calls(), 0, "store must reject before lookup");
 
+    let store = ExpansionStore::new();
     let authorized_runtime = runtime_for("expansion-unknown", store.clone(), store.authority());
     let unknown = authorized_runtime
         .start_session(

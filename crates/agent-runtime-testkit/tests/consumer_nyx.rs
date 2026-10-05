@@ -50,7 +50,7 @@ async fn nyx_fresh_seeded_history_preflight_retains_existing_error_terminal_sequ
         Message::text(Role::Assistant, "seeded answer"),
     ];
     let session = runtime
-        .start_session(StartSession::new().with_history(seeded.clone()))
+        .start_session(consumers::nyx::start_request(seeded.clone()))
         .await
         .unwrap();
     assert_eq!(session.snapshot().history, seeded);

@@ -176,6 +176,32 @@ pub enum ErrorKind {
     Internal,
 }
 
+/// Redaction-safe LCM evidence retained across runtime boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LcmFailure {
+    /// Immutable entry content conflicts.
+    EntryConflict,
+    /// A mutation overlaps committed summary sources.
+    RangeOverlap,
+    /// Explicit ownership policy is required.
+    TimelineOwned {
+        /// Current owner, if a legacy populated timeline is unclaimed.
+        owner: Option<crate::ids::SessionId>,
+        /// Current ownership generation.
+        generation: u64,
+    },
+    /// Reconciliation would rewrite summarized history.
+    LcmDivergence {
+        /// First sequence after all active summary sources.
+        frontier: u64,
+        /// First differing or orphaned sequence.
+        at: u64,
+    },
+    /// The store or resolver requires an explicitly authorized new timeline.
+    ForkRequired,
+}
+
 /// The canonical error type of the runtime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeError {
@@ -216,6 +242,23 @@ pub struct RuntimeError {
         skip_serializing_if = "Option::is_none"
     )]
     pub credential_recovery: Option<ProviderCredentialRecovery>,
+    /// Typed LCM failures; source and summary bodies are never carried here.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_lcm_failure",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lcm: Option<Box<LcmFailure>>,
+}
+
+fn deserialize_optional_lcm_failure<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<LcmFailure>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(LcmFailure::deserialize(value).ok().map(Box::new))
 }
 
 fn deserialize_failure_class<'de, D>(deserializer: D) -> Result<FailureClass, D::Error>
@@ -256,7 +299,19 @@ impl RuntimeError {
             retry_after_ms: None,
             limit_resets_at_ms: None,
             credential_recovery: None,
+            lcm: None,
         }
+    }
+
+    /// Borrows typed LCM evidence without exposing its allocation strategy.
+    pub fn lcm_failure(&self) -> Option<&LcmFailure> {
+        self.lcm.as_deref()
+    }
+
+    /// Attaches typed LCM evidence without changing the failure class.
+    pub fn with_lcm_failure(mut self, evidence: Option<LcmFailure>) -> Self {
+        self.lcm = evidence.map(Box::new);
+        self
     }
 
     /// Attaches explicit typed evidence without changing coarse projections.

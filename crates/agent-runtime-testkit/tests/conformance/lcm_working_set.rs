@@ -268,7 +268,7 @@ async fn live_session_policy_bump_rebuilds_active_nodes_and_preserves_identity()
         false,
     );
     let resumed = second
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::resume(SessionId::new("u6.session")))
         .await
         .unwrap();
     let rebuilt = resumed.snapshot().extension_state["harness.lcm"].clone();
@@ -288,7 +288,7 @@ async fn live_session_policy_bump_rebuilds_active_nodes_and_preserves_identity()
         false,
     );
     let resumed = third
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::resume(SessionId::new("u6.session")))
         .await
         .unwrap();
     resumed.run(UserInput::text("continue")).await.unwrap();

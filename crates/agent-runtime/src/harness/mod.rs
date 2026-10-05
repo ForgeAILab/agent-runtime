@@ -40,7 +40,8 @@ pub use goals::{
 pub use lcm::{
     DefaultLcmSourceClassifier, LCM_COMPONENT_ID, LCM_IDLE_COMPACTION_PURPOSE,
     LCM_STATE_SCHEMA_VERSION, LCM_SUMMARY_PURPOSE, LcmCoordinator, LcmCoordinatorPolicy,
-    LcmSourceClassifier, LcmTimelineBinding, LcmTimelineResolver, StaticLcmTimelineResolver,
+    LcmRecoveryPolicy, LcmSourceClassifier, LcmTimelineBinding, LcmTimelineResolver,
+    StaticLcmTimelineResolver,
 };
 #[allow(unused_imports)]
 pub(crate) use lcm::{LcmExpansionObservation, import_semantic_summary_v1};

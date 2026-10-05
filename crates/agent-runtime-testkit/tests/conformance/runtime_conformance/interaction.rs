@@ -361,8 +361,7 @@ async fn pending_interaction_recovers_from_both_pre_barrier_boundaries() {
         .unwrap();
     let deferred = deferred_runtime
         .start_session(
-            StartSession::new()
-                .with_id(id.clone())
+            StartSession::resume(id.clone())
                 .with_checkpoint_recovery(CheckpointRecoveryPolicy::DeferPendingInteraction),
         )
         .await
@@ -389,7 +388,7 @@ async fn pending_interaction_recovers_from_both_pre_barrier_boundaries() {
         .build()
         .unwrap();
     let resumed_after_defer = resumed_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     wait_for_terminal(&resumed_observer).await;
@@ -429,7 +428,7 @@ async fn pending_interaction_recovers_from_both_pre_barrier_boundaries() {
             .build()
             .unwrap();
         let resumed = runtime
-            .start_session(StartSession::new().with_id(id.clone()))
+            .start_session(StartSession::resume(id.clone()))
             .await
             .unwrap();
         wait_for_terminal(&observer).await;
@@ -522,7 +521,7 @@ async fn answered_interaction_checkpoint_commits_without_representing() {
         .build()
         .unwrap();
     let resumed = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&observer).await;

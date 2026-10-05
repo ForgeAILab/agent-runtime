@@ -10,11 +10,8 @@ use agent_runtime_core::store::SessionIdentityState;
 use serde::{Deserialize, Serialize};
 
 /// The schema version of runtime command payloads.
-///
-/// Version 1 permits additive optional fields whose default preserves the
-/// original wire bytes and behavior. `checkpoint_recovery` follows that rule:
-/// `Resume` is omitted, while the explicit defer opt-in is serialized.
-pub const COMMAND_SCHEMA_VERSION: u32 = 1;
+/// Version 2 requires explicit create, resume or ephemeral intent.
+pub const COMMAND_SCHEMA_VERSION: u32 = 2;
 
 const fn command_schema_version() -> u32 {
     COMMAND_SCHEMA_VERSION
@@ -56,19 +53,37 @@ fn checkpoint_recovery_is_resume(policy: &CheckpointRecoveryPolicy) -> bool {
     *policy == CheckpointRecoveryPolicy::Resume
 }
 
+/// Explicit session persistence intent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartSessionMode {
+    /// Start fresh; an existing snapshot or checkpoint is a conflict.
+    #[default]
+    Create,
+    /// Load an existing session; supplying seed history is a conflict.
+    Resume,
+    /// Start fresh without reading or writing session/checkpoint stores.
+    Ephemeral,
+}
+
 /// A request to start (or resume) a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartSession {
     /// The command payload schema version.
     #[serde(default = "command_schema_version")]
     pub schema_version: u32,
-    /// An explicit session id (for resuming a persisted session). When absent
-    /// the runtime mints a fresh id.
+    /// Required explicit intent on the wire.
+    pub mode: StartSessionMode,
+    /// Session identity. Create may mint an id; resume requires one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
-    /// An initial history used when no persisted snapshot is found.
+    /// Seed history for create/ephemeral; any resume seed is a Conflict.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub initial_history: Vec<Message>,
+    pub seed: Vec<Message>,
+    /// Explicit recovery choice for populated LCM timelines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lcm_policy: Option<crate::harness::LcmRecoveryPolicy>,
     /// Optional monotonic floor derived from a separately durable observer
     /// journal when resuming after a crash.
     ///
@@ -87,8 +102,10 @@ impl Default for StartSession {
     fn default() -> Self {
         Self {
             schema_version: COMMAND_SCHEMA_VERSION,
+            mode: StartSessionMode::Create,
             session_id: None,
-            initial_history: Vec::new(),
+            seed: Vec::new(),
+            lcm_policy: None,
             resume_identity_floor: None,
             checkpoint_recovery: CheckpointRecoveryPolicy::Resume,
         }
@@ -101,7 +118,40 @@ impl StartSession {
         Self::default()
     }
 
-    /// Sets an explicit session id.
+    /// Creates one fresh, named session with host seed history.
+    pub fn create(id: SessionId, seed: Vec<Message>) -> Self {
+        Self {
+            session_id: Some(id),
+            seed,
+            ..Self::default()
+        }
+    }
+
+    /// Resumes an existing named session without seed history.
+    pub fn resume(id: SessionId) -> Self {
+        Self {
+            mode: StartSessionMode::Resume,
+            session_id: Some(id),
+            ..Self::default()
+        }
+    }
+
+    /// Starts history without using configured session/checkpoint persistence.
+    pub fn ephemeral(history: Vec<Message>) -> Self {
+        Self {
+            mode: StartSessionMode::Ephemeral,
+            seed: history,
+            ..Self::default()
+        }
+    }
+
+    /// Chooses explicit LCM recovery at this construction boundary.
+    pub fn with_lcm_policy(mut self, policy: crate::harness::LcmRecoveryPolicy) -> Self {
+        self.lcm_policy = Some(policy);
+        self
+    }
+
+    /// Sets an explicit session id without changing the selected intent.
     pub fn with_id(mut self, id: SessionId) -> Self {
         self.session_id = Some(id);
         self
@@ -109,12 +159,12 @@ impl StartSession {
 
     /// Seeds the initial history.
     pub fn with_history(mut self, history: Vec<Message>) -> Self {
-        self.initial_history = history;
+        self.seed = history;
         self
     }
 
     /// Sets the monotonic identity floor recovered from durable observer
-    /// state. This is valid only together with an explicit session id.
+    /// state. This is valid only for explicit resume.
     pub fn with_resume_identity_floor(mut self, floor: SessionIdentityState) -> Self {
         self.resume_identity_floor = Some(floor);
         self
