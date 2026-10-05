@@ -298,7 +298,7 @@ async fn pending_interaction_recovers_from_both_pre_barrier_boundaries() {
         .build()
         .unwrap();
     let source = source_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     let source_turn = source.send(UserInput::text("recover ask")).unwrap();
@@ -476,7 +476,7 @@ async fn answered_interaction_checkpoint_commits_without_representing() {
         .build()
         .unwrap();
     let source = source_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     source

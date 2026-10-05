@@ -146,11 +146,10 @@ pub async fn assert_durable_child_requires_parent_checkpoint_store() {
         .build()
         .expect("session-only parent runtime builds");
     let parent = runtime
-        .start_session(
-            StartSession::new().with_id(agent_runtime_core::ids::SessionId::new(
-                "session-only-parent",
-            )),
-        )
+        .start_session(StartSession::create(
+            agent_runtime_core::ids::SessionId::new("session-only-parent"),
+            Vec::new(),
+        ))
         .await
         .expect("session-only parent starts");
     let factory = Arc::new(

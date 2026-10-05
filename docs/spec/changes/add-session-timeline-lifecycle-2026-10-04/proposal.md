@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-04T00:00:00Z
-updated_at: 2026-10-05T00:19:50Z
+updated_at: 2026-10-05T01:53:30Z
 ---
 
 # Proposal: Explicit session and timeline lifecycle (U7 + U8)
@@ -11,17 +11,22 @@ may truncate committed summary sources. Implicit resume silently discards host
 history. Hosts need bounded topic rotation and explicit session intent.
 
 ## What Changes
-- Add defaulted, authorized LcmWriter::claim(view, owner, generation); unsupported
-  stores return Fork. Populated/unowned or differently owned timelines require
-  explicit Adopt, Fork or Retire policy; default fails closed with TimelineOwned.
+- Add defaulted, authorized LcmWriter::claim(view, owner, generation). The
+  default claims an empty timeline and reports Unsupported for a populated one,
+  which a fresh binding turns into a Fork. Claim-aware stores fence writes by
+  owner generation and bump their revision on ownership change. Populated or
+  differently owned timelines require explicit Adopt, Fork or Retire policy;
+  default fails closed with TimelineOwned. Adopt claims before reading.
 - Check the active-node frontier before truncation; return typed LcmDivergence.
   Preserve EntryConflict and RangeOverlap through harness, driver and RuntimeError.
 - **BREAKING:** command schema 2 and explicit create/resume/ephemeral constructors.
   Create rejects existing state; resume requires existing state and rejects seed;
-  ephemeral ignores persistence and never writes session/checkpoint stores.
-  SessionHandle reports resumed. Keep checkpoint recovery and identity floors.
+  ephemeral ignores persistence, never writes session/checkpoint stores and keeps
+  LCM on a volatile timeline. SessionHandle reports resumed. Keep checkpoint
+  recovery and identity floors. Remove with_id; add typed StartSession::from_json.
 - Add Runtime::fork_session with Summary, FromIndex or Empty seed and NewTimeline
-  or Continue LCM choice. Persist a Sensitive, Stable Summary fragment; supersede
+  or Continue LCM choice; validate before durable intent, roll the intent back on
+  failure and add Runtime::abort_fork. Persist a Sensitive, Stable Summary fragment; supersede
   the idle parent. NewTimeline requires a fresh host-authorized binding; Continue
   explicitly transfers the existing timeline claim and adopts its projection.
 - Extend the host resolver with defaulted replacement/continuation hooks; hosts

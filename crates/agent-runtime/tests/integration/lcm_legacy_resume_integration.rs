@@ -404,17 +404,6 @@ impl LcmReader for LcmFixtureStore {
 
 #[async_trait]
 impl LcmWriter for LcmFixtureStore {
-    async fn claim(
-        &self,
-        view: &LcmView,
-        owner: &agent_runtime_core::ids::SessionId,
-        generation: u64,
-    ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
-        let _ = (owner, generation);
-        self.authorize_view(view)?;
-        Ok(agent_runtime::lcm::LcmClaimResult::Claimed)
-    }
-
     async fn append(
         &self,
         view: &LcmView,
@@ -1756,11 +1745,7 @@ async fn idle_compaction_saves_pending_before_one_model_and_one_cas() {
     let runtime = runtime(provider.clone(), sessions.clone(), Some(coordinator));
     let history = idle_history();
     let session = runtime
-        .start_session(
-            StartSession::new()
-                .with_id(session_id.clone())
-                .with_history(history.clone()),
-        )
+        .start_session(StartSession::create(session_id.clone(), history.clone()))
         .await
         .expect("idle session starts");
 
@@ -1813,11 +1798,7 @@ async fn idle_save_failure_before_cas_leaves_no_node_or_pending_memory() {
     let provider = Arc::new(FakeProvider::text_reply("must not run"));
     let runtime = runtime(provider, sessions, Some(coordinator));
     let session = runtime
-        .start_session(
-            StartSession::new()
-                .with_id(session_id)
-                .with_history(idle_history()),
-        )
+        .start_session(StartSession::create(session_id, idle_history()))
         .await
         .expect("idle session starts");
 
@@ -1847,11 +1828,7 @@ async fn idle_clear_save_failure_is_restart_adoptable_without_model_or_usage_rep
         Some(coordinator.clone()),
     );
     let session = runtime
-        .start_session(
-            StartSession::new()
-                .with_id(session_id.clone())
-                .with_history(idle_history()),
-        )
+        .start_session(StartSession::create(session_id.clone(), idle_history()))
         .await
         .expect("idle session starts");
     assert!(session.try_idle_compaction().await.is_err());
@@ -1934,11 +1911,7 @@ async fn idle_lcm_requires_durable_session_store() {
         .build()
         .expect("ephemeral runtime builds");
     let session = runtime
-        .start_session(
-            StartSession::new()
-                .with_id(session_id)
-                .with_history(idle_history()),
-        )
+        .start_session(StartSession::create(session_id, idle_history()))
         .await
         .expect("ephemeral session starts");
     assert!(matches!(
@@ -1961,11 +1934,7 @@ async fn idle_lcm_refuses_a_nonterminal_checkpoint_without_model_or_store_work()
     let runtime = runtime_with_checkpoints(provider, sessions, checkpoints.clone(), coordinator);
     let history = idle_history();
     let session = runtime
-        .start_session(
-            StartSession::new()
-                .with_id(session_id.clone())
-                .with_history(history.clone()),
-        )
+        .start_session(StartSession::create(session_id.clone(), history.clone()))
         .await
         .expect("idle session starts");
     checkpoints.seed(
@@ -2075,11 +2044,7 @@ async fn audit_idle_checkpoint_failure_rolls_back_pending_memory() {
         .build()
         .expect("runtime builds");
     let session = runtime
-        .start_session(
-            StartSession::new()
-                .with_id(session_id.clone())
-                .with_history(idle_history()),
-        )
+        .start_session(StartSession::create(session_id.clone(), idle_history()))
         .await
         .expect("idle session starts");
     let saves_before = sessions.saves().len();

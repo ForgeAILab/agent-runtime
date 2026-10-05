@@ -153,6 +153,7 @@ impl LcmViewAuthority {
             timeline_id,
             authorization_revision: Some(authorization_revision.into()),
             grant: Arc::clone(&self.grant),
+            owner: None,
         }
     }
 
@@ -192,11 +193,17 @@ impl Default for LcmViewAuthority {
 /// timeline binding, gives the same authority to its store adapter, and then
 /// passes the issued view to every read/write operation. IDs supplied in
 /// model or repository text are never accepted in place of this scope.
+///
+/// A view may also carry an ownership fence (`owner`, `generation`). The fence
+/// is not authority: it tells a claim-aware store which claim the writer
+/// believes it holds, so a stale owner's mutation is rejected with
+/// [`LcmError::TimelineOwned`]. Equality compares the authorized scope only.
 #[derive(Clone)]
 pub struct LcmView {
     timeline_id: LcmTimelineId,
     authorization_revision: Option<String>,
     grant: Arc<AuthorityGrant>,
+    owner: Option<(agent_runtime_core::ids::SessionId, u64)>,
 }
 
 impl PartialEq for LcmView {
@@ -216,6 +223,7 @@ impl fmt::Debug for LcmView {
             .field("timeline_id", &self.timeline_id)
             .field("authorization_revision", &"[redacted]")
             .field("grant", &"[redacted]")
+            .field("owner", &self.owner)
             .finish()
     }
 }
@@ -229,6 +237,24 @@ impl LcmView {
     /// Optional host authorization/configuration revision.
     pub fn authorization_revision(&self) -> Option<&str> {
         self.authorization_revision.as_deref()
+    }
+
+    /// Attaches the ownership claim this writer holds. Claim-aware stores
+    /// reject mutations whose fence differs from the recorded owner.
+    pub fn with_owner(
+        mut self,
+        owner: agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Self {
+        self.owner = Some((owner, generation));
+        self
+    }
+
+    /// Ownership fence carried by this view, if any.
+    pub fn owner(&self) -> Option<(&agent_runtime_core::ids::SessionId, u64)> {
+        self.owner
+            .as_ref()
+            .map(|(owner, generation)| (owner, *generation))
     }
 }
 
@@ -395,8 +421,10 @@ pub trait LcmReader: Send + Sync + fmt::Debug {
 pub enum LcmClaimResult {
     /// Ownership was acquired or the same owner/epoch was already recorded.
     Claimed,
-    /// This store cannot establish ownership; the host must supply a replacement.
-    Fork,
+    /// This store records no ownership and the timeline is populated, so the
+    /// claim cannot be established. A fresh binding is replaced by a fork
+    /// (new timeline plus a summary); an existing owner continues unfenced.
+    Unsupported,
 }
 
 /// Least-authority mutation contract. Mutations are expected-revision CAS and
@@ -409,7 +437,13 @@ pub trait LcmWriter: LcmReader {
     /// is idempotent. Explicit adoption uses exactly the observed epoch plus
     /// one; stores must compare/update ownership atomically. Populated legacy
     /// timelines and different owners return `TimelineOwned` at epoch zero.
-    /// This default validates authority and requires a fork, never adoption.
+    ///
+    /// A claim-aware store also bumps its revision whenever ownership
+    /// changes and rejects a mutation whose view fence ([`LcmView::owner`])
+    /// is not the recorded owner and epoch, with `TimelineOwned`.
+    ///
+    /// This default records nothing. It validates authority, then returns
+    /// `Claimed` for an empty timeline and `Unsupported` for a populated one.
     async fn claim(
         &self,
         view: &LcmView,
@@ -418,7 +452,16 @@ pub trait LcmWriter: LcmReader {
     ) -> Result<LcmClaimResult, LcmError> {
         self.authorize_view(view)?;
         let _ = (owner, generation);
-        Ok(LcmClaimResult::Fork)
+        if !self.active_nodes(view).await?.is_empty() {
+            return Ok(LcmClaimResult::Unsupported);
+        }
+        let range = LcmRange::new(LcmSequence::new(0), LcmSequence::new(u64::MAX))
+            .map_err(|_| LcmError::InvalidBound)?;
+        if self.load_range(view, range, 1).await?.is_empty() {
+            Ok(LcmClaimResult::Claimed)
+        } else {
+            Ok(LcmClaimResult::Unsupported)
+        }
     }
 
     /// Idempotently appends immutable entries.

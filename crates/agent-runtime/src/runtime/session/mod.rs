@@ -111,6 +111,8 @@ pub struct SessionInner {
     pub(crate) resumed: bool,
     /// Startup interrupted this turn after re-authorizing changed abilities.
     pub(crate) interrupted_on_resume: Option<TurnId>,
+    /// Volatile LCM timeline of an ephemeral session, released on drop.
+    pub(crate) _ephemeral_lcm: Option<crate::harness::EphemeralLcmGuard>,
 }
 
 /// Protected boundary invoked by the cache mechanism immediately after its

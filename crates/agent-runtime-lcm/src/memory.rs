@@ -1,7 +1,9 @@
-//! Deterministic in-memory reference store for tests.
+//! Deterministic, volatile in-memory reference store.
 //!
-//! This module is compiled only for crate tests or with the opt-in
-//! `test-support` feature; it is not a production persistence backend.
+//! The runtime uses it for ephemeral sessions, whose LCM never reaches a
+//! durable timeline, and the conformance suite uses it as the reference
+//! adapter. It is not a persistence backend: production hosts provide their
+//! own transactional adapter and run the conformance suite against it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -104,6 +106,22 @@ impl InMemoryLcmStore {
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, LcmError> {
         self.state.lock().map_err(|_| LcmError::StoreFailure)
+    }
+
+    /// Rejects a mutation whose view fence is not the recorded owner. An
+    /// unowned timeline accepts any authorized writer.
+    fn owner_fence(state: &State, view: &LcmView) -> Result<(), LcmError> {
+        let Some((owner, generation)) = state.owner.as_ref() else {
+            return Ok(());
+        };
+        if view.owner() == Some((owner, *generation)) {
+            Ok(())
+        } else {
+            Err(LcmError::TimelineOwned {
+                owner: Some(owner.clone()),
+                generation: *generation,
+            })
+        }
     }
 
     fn revision(state: &State, expected: LcmRevision) -> Result<(), LcmError> {
@@ -304,6 +322,11 @@ impl LcmWriter for InMemoryLcmStore {
         if (empty_unowned && generation == 0)
             || current_generation.checked_add(1) == Some(generation)
         {
+            // An ownership change invalidates every CAS read taken under the
+            // previous owner, so a stale writer cannot commit on top of it.
+            state.revision = state.revision.next().ok_or_else(|| LcmError::Invalid {
+                reason: "LCM revision space is exhausted".into(),
+            })?;
             state.owner = Some((owner.clone(), generation));
             return Ok(crate::store::LcmClaimResult::Claimed);
         }
@@ -330,6 +353,7 @@ impl LcmWriter for InMemoryLcmStore {
             return Err(LcmError::IdempotencyConflict);
         }
         let mut state = self.lock()?;
+        Self::owner_fence(&state, view)?;
         if let Some(record) = Self::existing_operation(
             &state,
             request.operation_id.as_str(),
@@ -478,6 +502,7 @@ impl LcmWriter for InMemoryLcmStore {
             });
         }
         let mut state = self.lock()?;
+        Self::owner_fence(&state, view)?;
         let computed_fingerprint = request.computed_operation_fingerprint(&self.timeline_id);
         if request
             .operation_fingerprint
@@ -665,6 +690,7 @@ impl LcmWriter for InMemoryLcmStore {
             .validate()
             .map_err(|reason| LcmError::Invalid { reason })?;
         let mut state = self.lock()?;
+        Self::owner_fence(&state, view)?;
         let computed_fingerprint = request.computed_operation_fingerprint(&self.timeline_id);
         if request
             .operation_fingerprint
@@ -836,6 +862,7 @@ impl LcmWriter for InMemoryLcmStore {
         self.authorize_view(view)?;
         validate_view(&self.timeline_id, view)?;
         let mut state = self.lock()?;
+        Self::owner_fence(&state, view)?;
         if state
             .nodes
             .values()

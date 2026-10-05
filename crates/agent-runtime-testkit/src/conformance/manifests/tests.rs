@@ -334,7 +334,7 @@ async fn new_json_is_old_readable_but_old_terminal_overlay_rejects_it() {
         .unwrap();
     let id = SessionId::new("downgrade");
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     for _ in 0..5 {
@@ -461,7 +461,7 @@ async fn lagging_ordinary_snapshot_keeps_pre_crash_diagnostics() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     session.run(UserInput::text("first turn")).await.unwrap();
@@ -555,7 +555,10 @@ async fn internal_turns_share_the_configured_window() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("window-internal")))
+        .start_session(StartSession::create(
+            SessionId::new("window-internal"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     for _ in 0..2 {

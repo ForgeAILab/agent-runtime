@@ -23,9 +23,6 @@ tokio = { workspace = true, features = ["time", "macros"], optional = true }
 
 [features]
 default = []
-# Reference storage is intentionally opt-in. Production hosts should provide
-# their own transactional adapter and run the conformance suite against it.
-test-support = []
 # Real provider summarization; no adapter or product dependency is required.
 provider-summary = ["dep:tokio", "dep:futures-util"]
 

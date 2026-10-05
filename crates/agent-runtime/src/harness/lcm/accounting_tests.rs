@@ -159,7 +159,7 @@ async fn warm_unchanged_append_and_cold_resume_match_full_oracle() {
         coordinator.descriptor_value().revision()
     );
     assert!(
-        cold.validate_resume_state(&binding.session, &history, &persisted)
+        cold.validate_resume_state(&binding.session, &history, &persisted, None)
             .await
             .unwrap()
             .is_none()
@@ -366,7 +366,7 @@ async fn changed_revisions_grants_and_untrusted_history_cannot_reuse_accounting(
     let decoded = coordinator.decode_state(&binding, &persisted).unwrap();
     assert!(coordinator.tunables_changed(&persisted, &decoded));
     let rebuilt = coordinator
-        .validate_resume_state(&binding.session, &generation.history, &persisted)
+        .validate_resume_state(&binding.session, &generation.history, &persisted, None)
         .await
         .unwrap()
         .unwrap();
@@ -661,7 +661,7 @@ async fn session_generation_drop_releases_sidecar_but_preserves_held_arc_values(
 #[tokio::test]
 async fn warm_leaf_and_condensation_deltas_match_reference_store_oracle() {
     let (_, sizer, mut coordinator, _) = fixture();
-    let store = Arc::new(agent_runtime_lcm::testing::InMemoryLcmStore::new(
+    let store = Arc::new(agent_runtime_lcm::memory::InMemoryLcmStore::new(
         LcmTimelineId::new("lcm-timeline"),
     ));
     let binding = LcmTimelineBinding::new(

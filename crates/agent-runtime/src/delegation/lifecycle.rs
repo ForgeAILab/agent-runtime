@@ -1152,7 +1152,8 @@ impl DelegationCoordinator {
                 crate::runtime::command::StartSession::resume(session.clone())
                     .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer)
             } else {
-                start.with_id(session.clone())
+                crate::runtime::command::StartSession::create(session.clone(), Vec::new())
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer)
             };
         }
         let handle = runtime

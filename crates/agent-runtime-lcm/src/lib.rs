@@ -27,8 +27,7 @@ pub mod projection;
 pub mod store;
 pub mod summarize;
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod testing;
+pub mod memory;
 
 pub use agent_runtime_context::Sensitivity;
 pub use agent_runtime_core::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock};
@@ -69,8 +68,7 @@ pub use summarize::{
     LcmSummaryModelResponse, LcmSummaryOutcome, SummaryProvenance, truncate_head_tail_to_cap,
 };
 
-#[cfg(any(test, feature = "test-support"))]
-pub use testing::InMemoryLcmStore;
+pub use memory::InMemoryLcmStore;
 
 /// The package's semantic contract revision.  Hosts should include this in
 /// their run manifests and compatibility checks when they persist LCM state.

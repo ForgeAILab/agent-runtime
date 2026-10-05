@@ -138,11 +138,7 @@ pub async fn assert_storeless_recent_window() {
         .build()
         .unwrap();
     let reference = reference_runtime
-        .start_session(
-            StartSession::new()
-                .with_id(session.id().clone())
-                .with_history(seed),
-        )
+        .start_session(StartSession::create(session.id().clone(), seed))
         .await
         .unwrap();
     for i in 0..5 {
@@ -316,7 +312,7 @@ pub async fn assert_file_store_manifest_migration() {
         .unwrap();
     let id = SessionId::new("new-file-window");
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     for _ in 0..5 {
@@ -499,7 +495,7 @@ pub async fn assert_protected_manifest_recovery() {
                 .build()
                 .unwrap();
             let source = runtime
-                .start_session(StartSession::new().with_id(id.clone()))
+                .start_session(StartSession::create(id.clone(), Vec::new()))
                 .await
                 .unwrap();
             source.run(UserInput::text("write once")).await.unwrap();

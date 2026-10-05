@@ -914,7 +914,7 @@ mod tests {
     ) {
         let runtime = builder.build().expect("runtime builds");
         let session = runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::create(session_id, Vec::new()))
             .await
             .expect("session starts");
         session
@@ -1007,7 +1007,7 @@ mod tests {
                 .build()
                 .expect("runtime builds");
         let session = runtime
-            .start_session(StartSession::new().with_id(session_id.clone()))
+            .start_session(StartSession::create(session_id.clone(), Vec::new()))
             .await
             .expect("session starts");
         session.run(UserInput::text("seed")).await.unwrap();
@@ -1078,7 +1078,7 @@ mod tests {
         .build()
         .expect("checkpoint-only runtime builds");
         let session = runtime
-            .start_session(StartSession::new().with_id(session_id.clone()))
+            .start_session(StartSession::create(session_id.clone(), Vec::new()))
             .await
             .expect("checkpoint-only session starts");
         session.run(UserInput::text("seed")).await.unwrap();
@@ -1149,7 +1149,7 @@ mod tests {
                 .build()
                 .expect("runtime builds");
         let session = runtime
-            .start_session(StartSession::new().with_id(session_id.clone()))
+            .start_session(StartSession::create(session_id.clone(), Vec::new()))
             .await
             .expect("session starts");
         session.run(UserInput::text("seed")).await.unwrap();
@@ -1259,7 +1259,7 @@ mod tests {
                 .build()
                 .expect("runtime builds");
         let session = runtime
-            .start_session(StartSession::new().with_id(session_id.clone()))
+            .start_session(StartSession::create(session_id.clone(), Vec::new()))
             .await
             .expect("session starts");
         session.run(UserInput::text("seed")).await.unwrap();
@@ -1330,7 +1330,7 @@ mod tests {
                 .build()
                 .expect("runtime builds");
         let session = runtime
-            .start_session(StartSession::new().with_id(session_id.clone()))
+            .start_session(StartSession::create(session_id.clone(), Vec::new()))
             .await
             .expect("session starts");
         session.run(UserInput::text("seed")).await.unwrap();
@@ -1963,7 +1963,7 @@ mod tests {
             .build()
             .unwrap();
         let session = runtime
-            .start_session(StartSession::new().with_id(id.clone()))
+            .start_session(StartSession::create(id.clone(), Vec::new()))
             .await
             .unwrap();
         for _ in 0..5 {

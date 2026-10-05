@@ -5,6 +5,7 @@
 //! further interaction happens through the returned session handle.
 
 use agent_runtime_core::content::Message;
+use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::store::SessionIdentityState;
 use serde::{Deserialize, Serialize};
@@ -113,9 +114,36 @@ impl Default for StartSession {
 }
 
 impl StartSession {
-    /// A new, empty start request.
+    /// A fresh create request with a runtime-minted session id.
+    ///
+    /// Name the session with [`StartSession::create`], or continue an
+    /// existing one with [`StartSession::resume`]; there is no builder that
+    /// changes an unnamed create into either.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Decodes a wire payload, rejecting any other command schema version
+    /// with a typed `Config` error before field decoding.
+    pub fn from_json(value: serde_json::Value) -> Result<Self, RuntimeError> {
+        let version = value
+            .get("schema_version")
+            .map(|version| version.as_u64())
+            .unwrap_or(Some(u64::from(COMMAND_SCHEMA_VERSION)));
+        if version != Some(u64::from(COMMAND_SCHEMA_VERSION)) {
+            let found = value
+                .get("schema_version")
+                .map_or_else(String::new, ToString::to_string);
+            return Err(RuntimeError::config(format!(
+                "unsupported StartSession schema version {found}; expected {COMMAND_SCHEMA_VERSION}"
+            )));
+        }
+        serde_json::from_value(value).map_err(|error| {
+            RuntimeError::new(
+                agent_runtime_core::error::ErrorKind::Serialization,
+                format!("invalid StartSession payload: {error}"),
+            )
+        })
     }
 
     /// Creates one fresh, named session with host seed history.
@@ -148,12 +176,6 @@ impl StartSession {
     /// Chooses explicit LCM recovery at this construction boundary.
     pub fn with_lcm_policy(mut self, policy: crate::harness::LcmRecoveryPolicy) -> Self {
         self.lcm_policy = Some(policy);
-        self
-    }
-
-    /// Sets an explicit session id without changing the selected intent.
-    pub fn with_id(mut self, id: SessionId) -> Self {
-        self.session_id = Some(id);
         self
     }
 
@@ -197,6 +219,31 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<StartSession>(json).unwrap(),
             deferred
+        );
+    }
+
+    #[test]
+    fn from_json_rejects_other_schema_versions_with_a_typed_error() {
+        let current = serde_json::to_value(StartSession::resume(SessionId::new("s"))).unwrap();
+        assert_eq!(
+            StartSession::from_json(current).unwrap(),
+            StartSession::resume(SessionId::new("s"))
+        );
+        for legacy in [
+            serde_json::json!({"schema_version": 1, "session_id": "s", "initial_history": []}),
+            serde_json::json!({"schema_version": 1, "session_id": "s", "mode": "resume"}),
+            serde_json::json!({"schema_version": "1", "mode": "create"}),
+        ] {
+            let error = StartSession::from_json(legacy).unwrap_err();
+            assert_eq!(error.kind, agent_runtime_core::error::ErrorKind::Config);
+            assert!(error.message.contains("schema version"), "{error:?}");
+        }
+        let error =
+            StartSession::from_json(serde_json::json!({"schema_version": 2, "session_id": "s"}))
+                .unwrap_err();
+        assert_eq!(
+            error.kind,
+            agent_runtime_core::error::ErrorKind::Serialization
         );
     }
 }

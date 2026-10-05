@@ -316,7 +316,7 @@ pub async fn assert_file_backed_held_views() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     session
@@ -399,7 +399,7 @@ pub async fn assert_authorized_accounting() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     session.run(UserInput::text("first")).await.unwrap();

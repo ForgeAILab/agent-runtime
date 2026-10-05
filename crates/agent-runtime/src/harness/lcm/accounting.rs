@@ -311,7 +311,7 @@ mod tests {
     async fn truncated_store_tail_discards_removed_entry_totals() {
         let mut coordinator =
             test_coordinator(Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline"))));
-        let store = Arc::new(agent_runtime_lcm::testing::InMemoryLcmStore::new(
+        let store = Arc::new(agent_runtime_lcm::memory::InMemoryLcmStore::new(
             LcmTimelineId::new("lcm-timeline"),
         ));
         let binding = LcmTimelineBinding::new(

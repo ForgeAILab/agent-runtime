@@ -205,7 +205,7 @@ async fn new_turn_finalizes_interrupted_checkpoint_instead_of_wedging() {
         observer.clone(),
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
         .await
         .expect("session starts");
 
@@ -410,7 +410,7 @@ async fn saved_upgrade_turn() -> (
     ));
     let old = upgrade_runtime(provider, sessions.clone(), checkpoints.clone(), false);
     let session = old
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     let mut snapshot = session.snapshot();
