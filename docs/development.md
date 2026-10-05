@@ -110,7 +110,8 @@ The fixture shape above is illustrative; use the testkit's
 `LcmStoreFixture<S>` and supply the adapter's own setup. The suite exercises
 append idempotency/gaps, atomic leaf and condensation CAS, bounded expansion,
 and same-timeline unauthorized-view isolation. `agent-runtime-lcm` has no
-default production database; its in-memory store is test-support only.
+default production database; its volatile in-memory store backs ephemeral
+sessions and the conformance suite, and is not a persistence backend.
 
 Runtime hosts should provide a durable `SessionStore` whenever LCM is
 configured: idle compaction deliberately refuses admission without it because

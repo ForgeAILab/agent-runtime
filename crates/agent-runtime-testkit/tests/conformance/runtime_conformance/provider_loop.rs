@@ -59,7 +59,7 @@ async fn pending_approval_is_checkpointed_before_the_host_decides() {
         .unwrap();
     let id = SessionId::new("approval-checkpoint");
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
 

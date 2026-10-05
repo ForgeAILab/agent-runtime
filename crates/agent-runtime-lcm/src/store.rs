@@ -47,6 +47,20 @@ pub enum LcmError {
     /// A leaf source range overlaps an existing committed leaf.
     #[error("LCM leaf source range overlaps an existing span")]
     RangeOverlap,
+    /// A fresh owner cannot implicitly bind populated or differently owned history.
+    #[error("LCM timeline requires an explicit ownership policy")]
+    TimelineOwned {
+        /// Existing owner, absent for a legacy unclaimed timeline.
+        owner: Option<agent_runtime_core::ids::SessionId>,
+        /// Existing ownership generation.
+        generation: u64,
+    },
+    /// Reconcile would cross the active summary frontier.
+    #[error("LCM divergence at {at} below frontier {frontier}")]
+    LcmDivergence { frontier: u64, at: u64 },
+    /// Ownership-safe replacement is required.
+    #[error("LCM requires a new authorized timeline")]
+    ForkRequired,
     /// Required entry or node identity does not exist.
     #[error("LCM source identity is missing")]
     MissingSource,
@@ -139,6 +153,7 @@ impl LcmViewAuthority {
             timeline_id,
             authorization_revision: Some(authorization_revision.into()),
             grant: Arc::clone(&self.grant),
+            owner: None,
         }
     }
 
@@ -178,11 +193,17 @@ impl Default for LcmViewAuthority {
 /// timeline binding, gives the same authority to its store adapter, and then
 /// passes the issued view to every read/write operation. IDs supplied in
 /// model or repository text are never accepted in place of this scope.
+///
+/// A view may also carry an ownership fence (`owner`, `generation`). The fence
+/// is not authority: it tells a claim-aware store which claim the writer
+/// believes it holds, so a stale owner's mutation is rejected with
+/// [`LcmError::TimelineOwned`]. Equality compares the authorized scope only.
 #[derive(Clone)]
 pub struct LcmView {
     timeline_id: LcmTimelineId,
     authorization_revision: Option<String>,
     grant: Arc<AuthorityGrant>,
+    owner: Option<(agent_runtime_core::ids::SessionId, u64)>,
 }
 
 impl PartialEq for LcmView {
@@ -202,6 +223,7 @@ impl fmt::Debug for LcmView {
             .field("timeline_id", &self.timeline_id)
             .field("authorization_revision", &"[redacted]")
             .field("grant", &"[redacted]")
+            .field("owner", &self.owner)
             .finish()
     }
 }
@@ -215,6 +237,24 @@ impl LcmView {
     /// Optional host authorization/configuration revision.
     pub fn authorization_revision(&self) -> Option<&str> {
         self.authorization_revision.as_deref()
+    }
+
+    /// Attaches the ownership claim this writer holds. Claim-aware stores
+    /// reject mutations whose fence differs from the recorded owner.
+    pub fn with_owner(
+        mut self,
+        owner: agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Self {
+        self.owner = Some((owner, generation));
+        self
+    }
+
+    /// Ownership fence carried by this view, if any.
+    pub fn owner(&self) -> Option<(&agent_runtime_core::ids::SessionId, u64)> {
+        self.owner
+            .as_ref()
+            .map(|(owner, generation)| (owner, *generation))
     }
 }
 
@@ -375,10 +415,55 @@ pub trait LcmReader: Send + Sync + fmt::Debug {
     ) -> Result<LcmExpansion, LcmError>;
 }
 
+/// Result of a timeline ownership claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LcmClaimResult {
+    /// Ownership was acquired or the same owner/epoch was already recorded.
+    Claimed,
+    /// This store records no ownership and the timeline is populated, so the
+    /// claim cannot be established. A fresh binding is replaced by a fork
+    /// (new timeline plus a summary); an existing owner continues unfenced.
+    Unsupported,
+}
+
 /// Least-authority mutation contract. Mutations are expected-revision CAS and
 /// operation-fingerprint idempotent.
 #[async_trait]
 pub trait LcmWriter: LcmReader {
+    /// Claims an authorized timeline for one session and owner epoch.
+    ///
+    /// Epoch zero may claim only an empty unowned timeline. Equal owner/epoch
+    /// is idempotent. Explicit adoption uses exactly the observed epoch plus
+    /// one; stores must compare/update ownership atomically. Populated legacy
+    /// timelines and different owners return `TimelineOwned` at epoch zero.
+    ///
+    /// A claim-aware store also bumps its revision whenever ownership
+    /// changes and rejects a mutation whose view fence ([`LcmView::owner`])
+    /// is not the recorded owner and epoch, with `TimelineOwned`.
+    ///
+    /// This default records nothing. It validates authority, then returns
+    /// `Claimed` for an empty timeline and `Unsupported` for a populated one.
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<LcmClaimResult, LcmError> {
+        self.authorize_view(view)?;
+        let _ = (owner, generation);
+        if !self.active_nodes(view).await?.is_empty() {
+            return Ok(LcmClaimResult::Unsupported);
+        }
+        let range = LcmRange::new(LcmSequence::new(0), LcmSequence::new(u64::MAX))
+            .map_err(|_| LcmError::InvalidBound)?;
+        if self.load_range(view, range, 1).await?.is_empty() {
+            Ok(LcmClaimResult::Claimed)
+        } else {
+            Ok(LcmClaimResult::Unsupported)
+        }
+    }
+
     /// Idempotently appends immutable entries.
     async fn append(
         &self,

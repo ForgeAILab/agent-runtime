@@ -195,9 +195,10 @@ pub mod prelude {
     pub use crate::provider::retry::RetryPolicy;
     pub use crate::provider::transport::{ByteStream, HttpRequest, HttpTransport};
     pub use crate::runtime::{
-        CheckpointRecoveryPolicy, CurrentCacheIdentityLease, GoalAdmissionGate, GoalController,
-        GoalControllerConfig, IdleCompactionAdmission, InjectedContent, InternalTurnAdmission,
-        Runtime, RuntimeBuilder, RuntimeEventStream, SessionHandle, StartSession, TurnHandle,
+        CheckpointRecoveryPolicy, CurrentCacheIdentityLease, ForkLcm, ForkSeed, ForkSession,
+        GoalAdmissionGate, GoalController, GoalControllerConfig, IdleCompactionAdmission,
+        InjectedContent, InternalTurnAdmission, Runtime, RuntimeBuilder, RuntimeEventStream,
+        SessionHandle, StartSession, StartSessionMode, TurnHandle,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};

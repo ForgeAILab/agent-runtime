@@ -32,7 +32,7 @@ use agent_runtime::lcm::{
     AppendResult, CommitResult, CondensationCommit, ExpansionRequest, LcmAppendRequest, LcmEntry,
     LcmError, LcmExpansion, LcmNode, LcmNodeId, LcmRange, LcmRevision, LcmTimelineId, LeafCommit,
 };
-use agent_runtime_lcm::testing::InMemoryLcmStore;
+use agent_runtime_lcm::memory::InMemoryLcmStore;
 
 /// Every operation authorizes before returning even a synthetic conflict.
 #[derive(Debug)]
@@ -157,7 +157,7 @@ async fn open_forge_authorized_conflict_and_revoked_view_retain_classes_without_
             .build()
             .unwrap();
         let session = runtime
-            .start_session(StartSession::new().with_id(session_id))
+            .start_session(StartSession::create(session_id, Vec::new()))
             .await
             .unwrap();
         if revoked {

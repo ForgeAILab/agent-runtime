@@ -56,6 +56,9 @@ use super::pipeline::{
 };
 
 mod accounting;
+mod ephemeral;
+
+pub(crate) use ephemeral::EphemeralLcmGuard;
 
 /// Protected LCM state wire version.
 pub const LCM_STATE_SCHEMA_VERSION: u32 = 1;
@@ -84,6 +87,9 @@ pub struct LcmTimelineBinding {
     pub authorization_revision: RegistryRevision,
     /// Opaque host-issued authority used to construct every store view.
     view_authority: LcmViewAuthority,
+    /// Ownership epoch this runtime holds; carried by every issued view as
+    /// the store's write fence. Set only by the coordinator after a claim.
+    owner_generation: Option<u64>,
 }
 
 impl PartialEq for LcmTimelineBinding {
@@ -118,15 +124,26 @@ impl LcmTimelineBinding {
             timeline,
             authorization_revision,
             view_authority,
+            owner_generation: None,
         })
     }
 
-    /// Creates the least-authority view accepted by the LCM store.
+    /// Creates the least-authority view accepted by the LCM store. After a
+    /// claim, the view carries this session's ownership fence.
     pub fn view(&self) -> LcmView {
-        self.view_authority.issue(
+        let view = self.view_authority.issue(
             self.timeline.clone(),
             self.authorization_revision.as_str().to_owned(),
-        )
+        );
+        match self.owner_generation {
+            Some(generation) => view.with_owner(self.session.clone(), generation),
+            None => view,
+        }
+    }
+
+    fn with_owner_generation(mut self, generation: Option<u64>) -> Self {
+        self.owner_generation = generation;
+        self
     }
 
     fn validate_for(&self, session: &SessionId) -> Result<(), RuntimeError> {
@@ -142,6 +159,24 @@ impl LcmTimelineBinding {
     }
 }
 
+/// Explicit host recovery choice; absence fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LcmRecoveryPolicy {
+    /// Retain canonical source identity and project the existing summaries.
+    Adopt,
+    /// Replace the timeline and carry its projected summary.
+    Fork,
+    /// Logically retire the old binding and start an empty replacement.
+    Retire,
+}
+
+pub(crate) struct LcmSessionInitialization {
+    pub(crate) history: Vec<Message>,
+    pub(crate) state: Option<VersionedSessionState>,
+    pub(crate) summary: Option<String>,
+}
+
 /// Host-owned resolver used at construction and resume boundaries.
 ///
 /// Implementations perform the authorization decision.  The coordinator never
@@ -150,6 +185,29 @@ impl LcmTimelineBinding {
 pub trait LcmTimelineResolver: Send + Sync + fmt::Debug {
     /// Resolves the authorized timeline for one runtime session.
     fn resolve(&self, session: &SessionId) -> Result<LcmTimelineBinding, RuntimeError>;
+
+    /// Allocates and durably binds a fresh authorized timeline to `session`.
+    /// Implementations must preserve the old immutable timeline and return a
+    /// different empty timeline. No authority is inferred from its identity.
+    fn new_timeline(
+        &self,
+        session: &SessionId,
+        previous: &LcmTimelineBinding,
+    ) -> Result<LcmTimelineBinding, RuntimeError> {
+        let _ = (session, previous);
+        Err(map_lcm_error(LcmError::ForkRequired))
+    }
+
+    /// Durably binds the parent's authorized timeline to a successor session.
+    /// Default denies; hosts explicitly authorize the ownership transfer.
+    fn continue_timeline(
+        &self,
+        session: &SessionId,
+        previous: &LcmTimelineBinding,
+    ) -> Result<LcmTimelineBinding, RuntimeError> {
+        let _ = (session, previous);
+        Err(map_lcm_error(LcmError::ForkRequired))
+    }
 }
 
 /// A small resolver for hosts which have already made one binding decision.
@@ -272,7 +330,13 @@ pub struct LcmCoordinatorPolicy {
     pub sizer: Arc<dyn LcmSizer>,
     /// Default source sensitivity when no host classifier is supplied.
     pub source_sensitivity: Sensitivity,
+    /// Upper bound, in characters, of the projected summary a U7 Fork
+    /// carries to its replacement timeline. Newest tail content wins.
+    pub fork_summary_max_chars: usize,
 }
+
+/// Default bound of a U7 Fork summary seed, in characters.
+pub const DEFAULT_FORK_SUMMARY_MAX_CHARS: usize = 16_384;
 
 impl Default for LcmCoordinatorPolicy {
     fn default() -> Self {
@@ -286,6 +350,7 @@ impl Default for LcmCoordinatorPolicy {
             input_budget_tokens: 0,
             sizer: default_lcm_sizer(),
             source_sensitivity: Sensitivity::Sensitive,
+            fork_summary_max_chars: DEFAULT_FORK_SUMMARY_MAX_CHARS,
         }
     }
 }
@@ -323,6 +388,11 @@ impl LcmCoordinatorPolicy {
         if self.source_sensitivity == Sensitivity::Secret {
             return Err(RuntimeError::config(
                 "secret source content cannot enter normal LCM summary nodes",
+            ));
+        }
+        if self.fork_summary_max_chars == 0 {
+            return Err(RuntimeError::config(
+                "LCM fork summary bound must be positive",
             ));
         }
         Ok(())
@@ -471,6 +541,17 @@ struct LcmState {
     /// the next plan re-measures it; the pressure floor bounds its effect.
     #[serde(default)]
     fixed_overhead_tokens: u64,
+    #[serde(default)]
+    claim_generation: u64,
+}
+
+/// Whether a claim establishes new ownership or re-checks a held one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimMode {
+    /// A new owner or epoch; a claim-unaware store cannot establish it.
+    Fresh,
+    /// The session already holds this binding (live or resumed state).
+    Recheck,
 }
 
 /// One runtime LCM coordinator.  It is deliberately a single component that
@@ -478,6 +559,11 @@ struct LcmState {
 #[derive(Clone)]
 pub struct LcmCoordinator {
     accounting: accounting::Accounting,
+    /// Ownership epoch this runtime holds per session, with its timeline.
+    claim_generations: Arc<std::sync::Mutex<BTreeMap<SessionId, (LcmTimelineId, u64)>>>,
+    /// Volatile timelines of live ephemeral sessions; see `ephemeral`.
+    volatile_stores: ephemeral::VolatileStores,
+    volatile_bindings: ephemeral::VolatileBindings,
     overheads: Arc<std::sync::Mutex<BTreeMap<SessionId, u64>>>,
     conversation_tokens: Arc<std::sync::Mutex<BTreeMap<SessionId, u64>>>,
     working_set: Option<crate::runtime::WorkingSetPolicy>,
@@ -535,12 +621,16 @@ impl LcmCoordinator {
         let summarizer = LcmEscalatingSummarizer::with_policy(model.clone(), escalation_policy)
             .map_err(|_| RuntimeError::config("LCM summary escalation policy is invalid"))?;
         let classifier = Arc::new(DefaultLcmSourceClassifier::new(policy.source_sensitivity));
+        let volatile_stores = ephemeral::VolatileStores::default();
         Ok(Self {
             accounting: Arc::default(),
+            claim_generations: Arc::default(),
+            volatile_stores: volatile_stores.clone(),
+            volatile_bindings: Arc::default(),
             overheads: Arc::default(),
             conversation_tokens: Arc::default(),
             working_set: None,
-            store,
+            store: Arc::new(ephemeral::RoutingStore::new(store, volatile_stores)),
             model: model.clone(),
             summarizer,
             resolver,
@@ -549,6 +639,498 @@ impl LcmCoordinator {
             legacy_artifact_store: None,
             policy,
         })
+    }
+
+    /// Registers a volatile in-memory timeline for an ephemeral session. The
+    /// session never claims or writes its host-resolved durable timeline; the
+    /// returned guard releases the volatile timeline when the session ends.
+    pub(crate) fn register_ephemeral(
+        &self,
+        session: &SessionId,
+    ) -> Result<EphemeralLcmGuard, RuntimeError> {
+        ephemeral::register(
+            session,
+            &self.volatile_stores,
+            &self.volatile_bindings,
+            &self.claim_generations,
+        )
+    }
+
+    /// Claims a binding before a writable session exists. `resumed` is true
+    /// when the session's own snapshot is being loaded without LCM state.
+    pub(crate) async fn claim_session(
+        &self,
+        session: &SessionId,
+        history: &[Message],
+        policy: Option<LcmRecoveryPolicy>,
+        resumed: bool,
+    ) -> Result<LcmSessionInitialization, RuntimeError> {
+        let binding = self.timeline_binding(session)?;
+        let unchanged = || LcmSessionInitialization {
+            history: history.to_vec(),
+            state: None,
+            summary: None,
+        };
+        match self.store.claim(&binding.view(), session, 0).await {
+            Ok(agent_runtime_lcm::LcmClaimResult::Claimed) => {
+                self.record_claim(&binding, 0);
+                Ok(unchanged())
+            }
+            // A claim-unaware store cannot fence a populated timeline. The
+            // session resuming its own snapshot continues on it unfenced,
+            // unless the host explicitly chose a replacement.
+            Ok(agent_runtime_lcm::LcmClaimResult::Unsupported)
+                if resumed && matches!(policy, None | Some(LcmRecoveryPolicy::Adopt)) =>
+            {
+                self.record_claim(&binding, 0);
+                Ok(unchanged())
+            }
+            // A fresh binding forks it (new timeline plus a summary) unless
+            // the host chose Retire; an unfenced adoption is never attempted.
+            Ok(agent_runtime_lcm::LcmClaimResult::Unsupported) => {
+                let policy = match policy {
+                    None | Some(LcmRecoveryPolicy::Fork) => LcmRecoveryPolicy::Fork,
+                    Some(LcmRecoveryPolicy::Retire) => LcmRecoveryPolicy::Retire,
+                    Some(LcmRecoveryPolicy::Adopt) => {
+                        return Err(map_lcm_error(LcmError::ForkRequired));
+                    }
+                };
+                self.recover_binding(binding, history, Some(policy), LcmError::ForkRequired)
+                    .await
+            }
+            Err(error @ LcmError::TimelineOwned { .. }) => {
+                self.recover_binding(binding, history, policy, error).await
+            }
+            Err(error) => Err(map_lcm_error(error)),
+        }
+    }
+
+    async fn recover_binding(
+        &self,
+        binding: LcmTimelineBinding,
+        history: &[Message],
+        policy: Option<LcmRecoveryPolicy>,
+        error: LcmError,
+    ) -> Result<LcmSessionInitialization, RuntimeError> {
+        let Some(policy) = policy else {
+            return Err(map_lcm_error(error));
+        };
+        match policy {
+            LcmRecoveryPolicy::Adopt => {
+                let generation = match error {
+                    LcmError::TimelineOwned { generation, .. } => generation
+                        .checked_add(1)
+                        .ok_or_else(|| map_lcm_error(LcmError::ForkRequired))?,
+                    _ => return Err(map_lcm_error(error)),
+                };
+                // Claim first. From here the previous owner's mutations are
+                // fenced, so the projection read below is exactly the
+                // timeline this session now owns, including any turn the old
+                // owner committed before the claim landed.
+                self.require_claim(&binding, generation, ClaimMode::Fresh)
+                    .await?;
+                let binding = self.timeline_binding(&binding.session)?;
+                let history = self.timeline_history(&binding).await?;
+                let state = self
+                    .checkpoint_state(&binding, &history, &[], None, None, 0)
+                    .await?;
+                self.project_state(
+                    &binding,
+                    &state,
+                    &HistoryView {
+                        session: binding.session.clone(),
+                        turn: TurnId::new("lcm-adopt-validation"),
+                        history: Arc::from(history.clone()),
+                        active_history_start: history.len(),
+                        state: None,
+                    },
+                )
+                .await?;
+                Ok(LcmSessionInitialization {
+                    history,
+                    state: Some(self.state_patch(&state)?.into_state()),
+                    summary: None,
+                })
+            }
+            LcmRecoveryPolicy::Fork | LcmRecoveryPolicy::Retire => {
+                // Everything that can fail deterministically on the source
+                // runs before the host's durable rebind below.
+                let summary = if policy == LcmRecoveryPolicy::Fork {
+                    Some(self.timeline_summary(&binding).await?)
+                } else {
+                    None
+                };
+                let replacement = self.resolver.new_timeline(&binding.session, &binding)?;
+                self.validate_replacement(&binding, &replacement, &binding.session)?;
+                self.require_empty(&replacement).await?;
+                self.require_claim(&replacement, 0, ClaimMode::Fresh)
+                    .await?;
+                Ok(LcmSessionInitialization {
+                    history: history.to_vec(),
+                    state: None,
+                    summary,
+                })
+            }
+        }
+    }
+
+    fn validate_replacement(
+        &self,
+        previous: &LcmTimelineBinding,
+        replacement: &LcmTimelineBinding,
+        session: &SessionId,
+    ) -> Result<(), RuntimeError> {
+        replacement.validate_for(session)?;
+        if replacement.timeline == previous.timeline {
+            return Err(map_lcm_error(LcmError::ForkRequired));
+        }
+        let resolved = self.timeline_binding(&replacement.session)?;
+        if resolved != *replacement {
+            return Err(RuntimeError::conflict(
+                "replacement binding was not retained by host resolver",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates identity and authority for explicit archival, without admitting
+    /// the divergent source projection to a provider request.
+    pub(crate) fn validate_fork_source(
+        &self,
+        session: &SessionId,
+        persisted: Option<&VersionedSessionState>,
+    ) -> Result<(), RuntimeError> {
+        let binding = self.timeline_binding(session)?;
+        self.store
+            .authorize_view(&binding.view())
+            .map_err(map_lcm_error)?;
+        if let Some(persisted) = persisted {
+            self.decode_state(&binding, persisted)?;
+        }
+        Ok(())
+    }
+
+    async fn claim_commit_view(&self, view: &TurnCommitView) -> Result<(), RuntimeError> {
+        let binding = self.timeline_binding(&view.session)?;
+        let generation = match &view.state {
+            Some(persisted) => self.decode_state(&binding, persisted)?.claim_generation,
+            None => self.claim_generation(&binding).unwrap_or(0),
+        };
+        self.require_claim(&binding, generation, ClaimMode::Recheck)
+            .await
+    }
+
+    async fn divergence_below_frontier(
+        &self,
+        binding: &LcmTimelineBinding,
+        history: &[Message],
+    ) -> Result<Option<RuntimeError>, RuntimeError> {
+        let view = binding.view();
+        let frontier =
+            self.store
+                .active_nodes(&view)
+                .await
+                .map_err(map_lcm_error)?
+                .iter()
+                .map(|node| {
+                    node.range.end.get().checked_add(1).ok_or_else(|| {
+                        RuntimeError::conflict("LCM frontier exceeds sequence space")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+        let end = history
+            .len()
+            .min(usize::try_from(frontier).unwrap_or(usize::MAX));
+        let stored = self.load_stored_overlap(&view, 0, end).await?;
+        let at = stored
+            .iter()
+            .zip(history)
+            .position(|(entry, message)| entry.content != *message)
+            .or_else(|| (stored.len() < end).then_some(stored.len()))
+            .or_else(|| ((history.len() as u64) < frontier).then_some(history.len()));
+        Ok(at.map(|at| {
+            map_lcm_error(LcmError::LcmDivergence {
+                frontier,
+                at: at as u64,
+            })
+        }))
+    }
+
+    async fn require_empty(&self, binding: &LcmTimelineBinding) -> Result<(), RuntimeError> {
+        if !self
+            .store
+            .active_nodes(&binding.view())
+            .await
+            .map_err(map_lcm_error)?
+            .is_empty()
+            || self.store_has_entry_at(&binding.view(), 0).await?
+        {
+            return Err(map_lcm_error(LcmError::ForkRequired));
+        }
+        Ok(())
+    }
+
+    /// Ownership epoch this runtime holds for the binding's session and
+    /// timeline, if it has claimed one.
+    fn claim_generation(&self, binding: &LcmTimelineBinding) -> Option<u64> {
+        self.claim_generations
+            .lock()
+            .expect("claim generations poisoned")
+            .get(&binding.session)
+            .filter(|(timeline, _)| *timeline == binding.timeline)
+            .map(|(_, generation)| *generation)
+    }
+
+    fn record_claim(&self, binding: &LcmTimelineBinding, generation: u64) {
+        self.claim_generations
+            .lock()
+            .expect("claim generations poisoned")
+            .insert(
+                binding.session.clone(),
+                (binding.timeline.clone(), generation),
+            );
+    }
+
+    async fn require_claim(
+        &self,
+        binding: &LcmTimelineBinding,
+        generation: u64,
+        mode: ClaimMode,
+    ) -> Result<(), RuntimeError> {
+        match self
+            .store
+            .claim(&binding.view(), &binding.session, generation)
+            .await
+            .map_err(map_lcm_error)?
+        {
+            agent_runtime_lcm::LcmClaimResult::Claimed => {
+                self.record_claim(binding, generation);
+                Ok(())
+            }
+            // A claim-unaware store records no owner. The session that
+            // already holds this binding continues unfenced; a new owner
+            // cannot be established.
+            agent_runtime_lcm::LcmClaimResult::Unsupported if mode == ClaimMode::Recheck => {
+                self.record_claim(binding, generation);
+                Ok(())
+            }
+            agent_runtime_lcm::LcmClaimResult::Unsupported => {
+                Err(map_lcm_error(LcmError::ForkRequired))
+            }
+        }
+    }
+
+    async fn timeline_history(
+        &self,
+        binding: &LcmTimelineBinding,
+    ) -> Result<Vec<Message>, RuntimeError> {
+        let view = binding.view();
+        let revision = self
+            .store
+            .current_revision(&view)
+            .await
+            .map_err(map_lcm_error)?;
+        let mut entries = Vec::new();
+        loop {
+            let start = entries.len() as u64;
+            let page = self
+                .store
+                .load_range(
+                    &view,
+                    LcmRange::new(LcmSequence::new(start), LcmSequence::new(u64::MAX))
+                        .map_err(|_| RuntimeError::conflict("invalid LCM read range"))?,
+                    LCM_READ_PAGE_SIZE,
+                )
+                .await
+                .map_err(map_lcm_error)?;
+            if page.is_empty() {
+                break;
+            }
+            for entry in page {
+                if entry.sequence.get() != entries.len() as u64
+                    || entry.timeline_id != binding.timeline
+                {
+                    return Err(RuntimeError::conflict(
+                        "LCM adoption source is not contiguous",
+                    ));
+                }
+                entries.push(entry);
+            }
+        }
+        if self
+            .store
+            .current_revision(&view)
+            .await
+            .map_err(map_lcm_error)?
+            != revision
+        {
+            return Err(lcm_revision_conflict("LCM adoption source changed"));
+        }
+        Ok(entries.into_iter().map(|entry| entry.content).collect())
+    }
+
+    /// Renders the projected summary of a timeline for a U7 Fork seed.
+    ///
+    /// Active summary bodies come first, then the newest unsummarized tail
+    /// messages that fit `policy.fork_summary_max_chars`. Tail messages
+    /// classified Secret never enter the rendering, and the active content
+    /// guard (when configured) must accept the result before it can become a
+    /// Stable Summary fragment.
+    async fn timeline_summary(&self, binding: &LcmTimelineBinding) -> Result<String, RuntimeError> {
+        let history = self.timeline_history(binding).await?;
+        let state = self
+            .checkpoint_state(binding, &history, &[], None, None, 0)
+            .await?;
+        let projection = self
+            .project_state(
+                binding,
+                &state,
+                &HistoryView {
+                    session: binding.session.clone(),
+                    turn: TurnId::new("lcm-fork-projection"),
+                    history: Arc::from(history.clone()),
+                    active_history_start: history.len(),
+                    state: None,
+                },
+            )
+            .await?;
+        let budget = self.policy.fork_summary_max_chars;
+        let mut used = 0_usize;
+        let mut head = Vec::new();
+        for fragment in projection.summaries {
+            if let FragmentContent::Text(text) = fragment.content {
+                let length = text.chars().count().saturating_add(1);
+                if used.saturating_add(length) > budget {
+                    break;
+                }
+                used += length;
+                head.push(text);
+            }
+        }
+        let mut tail = Vec::new();
+        let mut classifications = Vec::new();
+        for message in history[projection.omit_prefix..].iter().rev() {
+            let classification = self.classify_source(message)?;
+            if classification.is_secret() {
+                continue;
+            }
+            // Preserve tool arguments/results and other non-text context in
+            // the projected tail. This is rendering, never an instruction.
+            let rendered = serde_json::to_string(message)?;
+            let length = rendered.chars().count().saturating_add(1);
+            if used.saturating_add(length) > budget {
+                break;
+            }
+            used += length;
+            classifications.push(classification);
+            tail.push(rendered);
+        }
+        tail.reverse();
+        head.extend(tail);
+        let summary = head.join("\n");
+        self.validate_summary_body(
+            &LcmClassification::join_all(classifications),
+            &summary,
+            None,
+        )
+        .await?;
+        Ok(summary)
+    }
+
+    /// Prepares the successor binding of a fork before any durable fork
+    /// intent exists: the resolver hook, replacement emptiness and, for
+    /// Continue, the store's ability to fence the transfer.
+    pub(crate) async fn fork_binding(
+        &self,
+        from: &SessionId,
+        new_id: &SessionId,
+        choice: crate::runtime::ForkLcm,
+        persisted: Option<&VersionedSessionState>,
+    ) -> Result<(), RuntimeError> {
+        let previous = self.timeline_binding(from)?;
+        self.store
+            .authorize_view(&previous.view())
+            .map_err(map_lcm_error)?;
+        if choice == crate::runtime::ForkLcm::Continue {
+            self.require_parent_claim(&previous, persisted, Some(new_id))
+                .await?;
+        }
+        let binding = match choice {
+            crate::runtime::ForkLcm::NewTimeline => {
+                self.resolver.new_timeline(new_id, &previous)?
+            }
+            crate::runtime::ForkLcm::Continue => {
+                self.resolver.continue_timeline(new_id, &previous)?
+            }
+        };
+        binding.validate_for(new_id)?;
+        if choice == crate::runtime::ForkLcm::NewTimeline {
+            self.validate_replacement(&previous, &binding, new_id)?;
+            self.require_empty(&binding).await?;
+        } else if binding.timeline != previous.timeline || self.timeline_binding(new_id)? != binding
+        {
+            return Err(RuntimeError::conflict(
+                "continued binding differs from parent timeline",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Side-effect-free probe that the parent still holds (or, for a legacy
+    /// unclaimed timeline, may hand over) its timeline through a store that
+    /// can fence the transfer. `successor` is accepted as the current owner
+    /// when an interrupted attempt of the same fork already claimed it.
+    async fn require_parent_claim(
+        &self,
+        parent: &LcmTimelineBinding,
+        persisted: Option<&VersionedSessionState>,
+        successor: Option<&SessionId>,
+    ) -> Result<(), RuntimeError> {
+        let generation = match persisted {
+            Some(persisted) => self.decode_state(parent, persisted)?.claim_generation,
+            None => self.claim_generation(parent).unwrap_or(0),
+        };
+        match self
+            .store
+            .claim(&parent.view(), &parent.session, generation)
+            .await
+        {
+            Ok(agent_runtime_lcm::LcmClaimResult::Claimed)
+            | Err(LcmError::TimelineOwned { owner: None, .. }) => Ok(()),
+            Err(LcmError::TimelineOwned {
+                owner: Some(owner), ..
+            }) if Some(&owner) == successor => Ok(()),
+            Ok(agent_runtime_lcm::LcmClaimResult::Unsupported) => {
+                Err(map_lcm_error(LcmError::ForkRequired))
+            }
+            Err(error) => Err(map_lcm_error(error)),
+        }
+    }
+
+    /// Whether the parent of an interrupted Continue fork still owns its
+    /// timeline, so the fork intent can be rolled back without leaving the
+    /// parent fenced out of its own history.
+    pub(crate) async fn parent_retains_timeline(
+        &self,
+        parent: &SessionId,
+        persisted: Option<&VersionedSessionState>,
+    ) -> Result<bool, RuntimeError> {
+        let binding = self.timeline_binding(parent)?;
+        match self.require_parent_claim(&binding, persisted, None).await {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.lcm_failure(),
+                    Some(agent_runtime_core::error::LcmFailure::TimelineOwned { .. })
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Configures independent source and output/reclaim targets.
@@ -728,14 +1310,29 @@ impl LcmCoordinator {
         self
     }
 
-    /// Resolves the host-authorized timeline for `session`.
+    /// Resolves the host-authorized timeline for `session`. A live ephemeral
+    /// session resolves to its volatile timeline instead of the host's.
+    /// After a claim, the binding's views carry this runtime's ownership fence.
     pub fn timeline_binding(
         &self,
         session: &SessionId,
     ) -> Result<LcmTimelineBinding, RuntimeError> {
-        let binding = self.resolver.resolve(session)?;
-        binding.validate_for(session)?;
-        Ok(binding)
+        let volatile = self
+            .volatile_bindings
+            .lock()
+            .expect("volatile LCM bindings poisoned")
+            .get(session)
+            .cloned();
+        let binding = match volatile {
+            Some(binding) => binding,
+            None => {
+                let binding = self.resolver.resolve(session)?;
+                binding.validate_for(session)?;
+                binding
+            }
+        };
+        let generation = self.claim_generation(&binding);
+        Ok(binding.with_owner_generation(generation))
     }
 
     /// Computes a framed, redaction-safe identity for an expansion request.
@@ -985,7 +1582,7 @@ impl LcmCoordinator {
         // Validate the old protected identity and DAG before rebuilding any
         // derived metadata. A tuning change never authorizes external writes.
         let repaired = self
-            .validate_resume_state(&binding.session, history, persisted)
+            .validate_resume_state(&binding.session, history, persisted, None)
             .await?;
         repaired.map_or(Ok(state), |persisted| {
             self.decode_state(binding, &persisted)
@@ -1117,9 +1714,32 @@ impl LcmCoordinator {
         session: &SessionId,
         history: &[Message],
         persisted: &VersionedSessionState,
+        policy: Option<LcmRecoveryPolicy>,
     ) -> Result<Option<VersionedSessionState>, RuntimeError> {
         let binding = self.timeline_binding(session)?;
         let state = self.decode_state(&binding, persisted)?;
+        if let Err(error) = self
+            .require_claim(&binding, state.claim_generation, ClaimMode::Recheck)
+            .await
+        {
+            return match (policy, error.lcm_failure()) {
+                (
+                    Some(LcmRecoveryPolicy::Adopt),
+                    Some(agent_runtime_core::error::LcmFailure::TimelineOwned {
+                        owner: None,
+                        generation,
+                    }),
+                ) => {
+                    let generation = generation
+                        .checked_add(1)
+                        .ok_or_else(|| map_lcm_error(LcmError::ForkRequired))?;
+                    self.adopt_unclaimed_resume(binding, history, state, generation)
+                        .await
+                        .map(Some)
+                }
+                _ => Err(error),
+            };
+        }
         let view = HistoryView {
             session: session.clone(),
             turn: TurnId::new("lcm-resume-validation"),
@@ -1166,6 +1786,51 @@ impl LcmCoordinator {
             )
             .await?;
         Ok(Some(self.state_patch(&rebuilt)?.into_state()))
+    }
+
+    /// Explicit adoption of an unclaimed (pre-U7) timeline by the session
+    /// whose validated U6 state it carries. The claim lands first and bumps
+    /// the store revision, so the state is rebuilt from the claimed timeline
+    /// and validated against canonical history before work is admitted.
+    async fn adopt_unclaimed_resume(
+        &self,
+        binding: LcmTimelineBinding,
+        history: &[Message],
+        state: LcmState,
+        generation: u64,
+    ) -> Result<VersionedSessionState, RuntimeError> {
+        if state.history_len > history.len() {
+            return Err(RuntimeError::conflict(
+                "LCM checkpoint history frontier exceeds canonical history",
+            ));
+        }
+        self.require_claim(&binding, generation, ClaimMode::Fresh)
+            .await?;
+        let binding = self.timeline_binding(&binding.session)?;
+        self.invalidate_accounting(&binding.session);
+        let rebuilt = self
+            .checkpoint_state(
+                &binding,
+                &history[..state.history_len],
+                &state.operation_watermarks,
+                state.model_purpose,
+                None,
+                0,
+            )
+            .await?;
+        self.project_state(
+            &binding,
+            &rebuilt,
+            &HistoryView {
+                session: binding.session.clone(),
+                turn: TurnId::new("lcm-adopt-resume-validation"),
+                history: Arc::from(history.to_vec().into_boxed_slice()),
+                active_history_start: history.len(),
+                state: None,
+            },
+        )
+        .await?;
+        Ok(self.state_patch(&rebuilt)?.into_state())
     }
 
     fn history_fingerprint(history: &[Message]) -> Result<Fingerprint, RuntimeError> {
@@ -1368,6 +2033,27 @@ impl LcmCoordinator {
                 RuntimeError::conflict("LCM store tail exceeds addressable history")
             })?;
             if tail < start {
+                let frontier = self
+                    .store
+                    .active_nodes(&view)
+                    .await
+                    .map_err(map_lcm_error)?
+                    .iter()
+                    .map(|node| {
+                        node.range.end.get().checked_add(1).ok_or_else(|| {
+                            RuntimeError::conflict("LCM frontier exceeds sequence space")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                if (tail as u64) < frontier {
+                    return Err(map_lcm_error(LcmError::LcmDivergence {
+                        frontier,
+                        at: tail as u64,
+                    }));
+                }
                 return match self.try_append_range(binding, history, tail).await? {
                     Ok(()) => Ok(()),
                     Err(error) => Err(map_lcm_error(error)),
@@ -1395,6 +2081,27 @@ impl LcmCoordinator {
         let truncate_at = divergence.or_else(|| beyond_canonical.then_some(history.len()));
         let resume_from = match truncate_at {
             Some(sequence) => {
+                let frontier = self
+                    .store
+                    .active_nodes(&view)
+                    .await
+                    .map_err(map_lcm_error)?
+                    .iter()
+                    .map(|node| {
+                        node.range.end.get().checked_add(1).ok_or_else(|| {
+                            RuntimeError::conflict("LCM frontier exceeds sequence space")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                if (sequence as u64) < frontier {
+                    return Err(map_lcm_error(LcmError::LcmDivergence {
+                        frontier,
+                        at: sequence as u64,
+                    }));
+                }
                 self.store
                     .truncate_from(&view, LcmSequence::new(sequence as u64))
                     .await
@@ -1671,6 +2378,7 @@ impl LcmCoordinator {
             pending_summary,
             hard_rounds,
             hard_round_limit: 0,
+            claim_generation: self.claim_generation(binding).unwrap_or(0),
             fixed_overhead_tokens: self
                 .overheads
                 .lock()
@@ -2887,6 +3595,12 @@ impl LcmCoordinator {
         let entries = self.load_entries(&store_view, state.history_len).await?;
         for (index, (entry, message)) in entries.iter().zip(view.history.iter()).enumerate() {
             if entry.sequence.get() != index as u64 || entry.content != *message {
+                if let Some(error) = self
+                    .divergence_below_frontier(binding, &view.history)
+                    .await?
+                {
+                    return Err(error);
+                }
                 return Err(RuntimeError::conflict(
                     "LCM immutable entry no longer matches canonical history",
                 ));
@@ -3539,6 +4253,12 @@ impl LcmCoordinator {
             || state.history_fingerprint
                 != self.canonical_fingerprint(binding, &view.history, state.history_len)?
         {
+            if let Some(error) = self
+                .divergence_below_frontier(binding, &view.history)
+                .await?
+            {
+                return Err(error);
+            }
             return Err(RuntimeError::conflict(
                 "LCM canonical history no longer matches its protected checkpoint",
             ));
@@ -3926,6 +4646,9 @@ impl TurnCommitHook for LcmCoordinator {
         &self,
         view: &TurnCommitView,
     ) -> Result<BeforeProviderPatch, RuntimeError> {
+        self.claim_commit_view(view)
+            .await
+            .map_err(lcm_pre_provider_error)?;
         self.compact_hard_result(view)
             .await
             .map(|mut patch| {
@@ -3945,6 +4668,7 @@ impl TurnCommitHook for LcmCoordinator {
         if view.finish != TurnFinish::Completed {
             return Ok(TurnCommitPatch::default());
         }
+        self.claim_commit_view(view).await?;
         let binding = self.timeline_binding(&view.session)?;
         let previous = match view.state.as_ref() {
             Some(persisted) => Some(
@@ -3978,6 +4702,7 @@ impl TurnCommitHook for LcmCoordinator {
         &self,
         view: &TurnCommitView,
     ) -> Result<IdleCompactionResult, RuntimeError> {
+        self.claim_commit_view(view).await?;
         let binding = self.timeline_binding(&view.session)?;
         let previous = match view.state.as_ref() {
             Some(persisted) => Some(
@@ -4436,6 +5161,7 @@ fn map_summary_error(error: LcmSummaryError) -> RuntimeError {
 
 fn map_lcm_error(error: LcmError) -> RuntimeError {
     let class = lcm_failure_class(&error, FailureStage::Unknown);
+    let evidence = lcm_failure_evidence(&error);
     match error {
         LcmError::CannotFit {
             required_tokens,
@@ -4456,6 +5182,9 @@ fn map_lcm_error(error: LcmError) -> RuntimeError {
         LcmError::RangeOverlap => {
             RuntimeError::conflict("LCM source range overlaps an active node")
         }
+        LcmError::TimelineOwned { .. } => RuntimeError::conflict("LCM timeline requires ownership policy"),
+        LcmError::LcmDivergence { .. } => RuntimeError::conflict("LCM divergence crosses summary frontier"),
+        LcmError::ForkRequired => RuntimeError::conflict("LCM requires a new authorized timeline"),
         LcmError::MissingSource => RuntimeError::conflict("LCM source identity is missing"),
         LcmError::InactiveChild => RuntimeError::conflict("LCM condensation child is inactive"),
         LcmError::CrossTimeline => RuntimeError::conflict("LCM operation crossed timelines"),
@@ -4463,11 +5192,12 @@ fn map_lcm_error(error: LcmError) -> RuntimeError {
         LcmError::InvalidBound => RuntimeError::limit("LCM read or expansion bound is invalid"),
         LcmError::SecretSource => RuntimeError::conflict("LCM secret source cannot be summarized"),
         LcmError::StoreFailure => RuntimeError::internal("LCM store backend failed"),
-    }.with_class(class)
+    }.with_class(class).with_lcm_failure(evidence)
 }
 
 fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
     let class = lcm_failure_class(&error, FailureStage::Unknown);
+    let evidence = lcm_failure_evidence(&error);
     match error {
         LcmError::Unauthorized => RuntimeError::approval("LCM timeline view is unauthorized"),
         LcmError::MissingSource => RuntimeError::not_found("LCM expansion target was not found"),
@@ -4480,6 +5210,9 @@ fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
         | LcmError::SequenceGap { .. }
         | LcmError::EntryConflict
         | LcmError::RangeOverlap
+        | LcmError::TimelineOwned { .. }
+        | LcmError::LcmDivergence { .. }
+        | LcmError::ForkRequired
         | LcmError::InactiveChild => RuntimeError::conflict("LCM expansion store state conflicted"),
         LcmError::StoreFailure => RuntimeError::internal("LCM expansion store failed"),
         LcmError::SecretSource | LcmError::CannotFit { .. } => {
@@ -4487,6 +5220,25 @@ fn map_expansion_lcm_error(error: LcmError) -> RuntimeError {
         }
     }
     .with_class(class)
+    .with_lcm_failure(evidence)
+}
+
+fn lcm_failure_evidence(error: &LcmError) -> Option<agent_runtime_core::error::LcmFailure> {
+    use agent_runtime_core::error::LcmFailure;
+    match error {
+        LcmError::EntryConflict => Some(LcmFailure::EntryConflict),
+        LcmError::RangeOverlap => Some(LcmFailure::RangeOverlap),
+        LcmError::TimelineOwned { owner, generation } => Some(LcmFailure::TimelineOwned {
+            owner: owner.clone(),
+            generation: *generation,
+        }),
+        LcmError::LcmDivergence { frontier, at } => Some(LcmFailure::LcmDivergence {
+            frontier: *frontier,
+            at: *at,
+        }),
+        LcmError::ForkRequired => Some(LcmFailure::ForkRequired),
+        _ => None,
+    }
 }
 
 fn lcm_failure_class(error: &LcmError, stage: FailureStage) -> FailureClass {
@@ -4514,6 +5266,9 @@ fn lcm_failure_class(error: &LcmError, stage: FailureStage) -> FailureClass {
         | LcmError::SequenceGap { .. }
         | LcmError::EntryConflict
         | LcmError::RangeOverlap
+        | LcmError::TimelineOwned { .. }
+        | LcmError::LcmDivergence { .. }
+        | LcmError::ForkRequired
         | LcmError::InactiveChild => FailureClass::StateConflict {
             stage,
             component: FailureComponent::Lcm,
@@ -5678,6 +6433,7 @@ mod tests {
             hard_rounds: 0,
             hard_round_limit: 0,
             fixed_overhead_tokens: 0,
+            claim_generation: 0,
         };
         let value = serde_json::to_value(state).unwrap();
         assert_eq!(value["schema_version"], LCM_STATE_SCHEMA_VERSION);
@@ -6177,11 +6933,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let session = runtime
-            .start_session(
-                StartSession::new()
-                    .with_id(SessionId::new("lcm-session"))
-                    .with_history(initial_history),
-            )
+            .start_session(StartSession::create(
+                SessionId::new("lcm-session"),
+                initial_history,
+            ))
             .await
             .expect("session starts");
         session
@@ -6268,7 +7023,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.leaf_commit_count.load(Ordering::SeqCst), 1);
         let repaired = coordinator
-            .validate_resume_state(&session, &history, &persisted)
+            .validate_resume_state(&session, &history, &persisted, None)
             .await
             .expect("exact pending node successor should validate for resume")
             .expect("resume should return the repaired successor state");
@@ -6323,7 +7078,7 @@ mod tests {
             .await
             .expect("raw suffix append succeeds");
         let repaired = coordinator
-            .validate_resume_state(&session, &next_history, &persisted)
+            .validate_resume_state(&session, &next_history, &persisted, None)
             .await
             .expect("canonical append successor should validate")
             .expect("append successor should return repaired state");
@@ -6374,7 +7129,7 @@ mod tests {
                 agent_runtime_context::CharRatioSizer::default().with_chars_per_token(2),
             )));
             let rebuilt = tuned
-                .validate_resume_state(&session, &history, &persisted)
+                .validate_resume_state(&session, &history, &persisted, None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -6428,7 +7183,7 @@ mod tests {
         *store.revision.lock().expect("test store lock") = LcmRevision::new(3);
 
         let error = coordinator
-            .validate_resume_state(&session, &history, &persisted)
+            .validate_resume_state(&session, &history, &persisted, None)
             .await
             .expect_err("unexplained two-revision progress must fail closed");
         assert!(error.to_string().contains("unexplained DAG progress"));
@@ -6462,11 +7217,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let session = runtime
-            .start_session(
-                StartSession::new()
-                    .with_id(SessionId::new("lcm-session"))
-                    .with_history(initial_history),
-            )
+            .start_session(StartSession::create(
+                SessionId::new("lcm-session"),
+                initial_history,
+            ))
             .await
             .expect("session starts");
         session

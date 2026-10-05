@@ -141,6 +141,57 @@ impl TurnCheckpoint {
         })
     }
 
+    /// Protects an idle session boundary without accepting a provider turn.
+    /// Used for a newly seeded session before any user input exists.
+    pub fn session_boundary(
+        snapshot: SessionSnapshot,
+        event_sequence: u64,
+    ) -> Result<Self, RuntimeError> {
+        let turn = TurnId::new(format!("session-boundary:{}", snapshot.id));
+        let state = TurnState::Terminal {
+            finish: TurnFinish::Completed,
+            visible_output: false,
+        };
+        let checkpoint = Self {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            transition_revision: TURN_TRANSITION_REVISION,
+            session: snapshot.id.clone(),
+            turn,
+            state_revision: 1,
+            operation_fingerprint: checkpoint_operation_fingerprint(&state, 0, None, false),
+            active_history_start: 0,
+            internal_input: None,
+            visible_output: false,
+            state,
+            updated: snapshot.updated,
+            snapshot,
+            deadline: Deadline::never(),
+            watermark: CheckpointWatermark::new(1, event_sequence),
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Whether this is an exact initial idle-session boundary, without a turn.
+    /// Stores that restrict first writes to admission states may additionally
+    /// admit this narrowly recognized boundary for session creation/forking.
+    pub fn is_session_boundary(&self) -> bool {
+        self.turn.as_str() == format!("session-boundary:{}", self.session)
+            && self.state_revision == 1
+            && self.active_history_start == 0
+            && self.internal_input.is_none()
+            && !self.visible_output
+            && matches!(
+                self.state,
+                TurnState::Terminal {
+                    finish: TurnFinish::Completed,
+                    visible_output: false
+                }
+            )
+            && self.watermark.checkpoint_sequence == 1
+            && self.validate().is_ok()
+    }
+
     /// Creates the first checkpoint for an accepted turn.
     #[allow(clippy::too_many_arguments)]
     pub fn accepted(

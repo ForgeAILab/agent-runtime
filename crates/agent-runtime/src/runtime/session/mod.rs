@@ -108,8 +108,11 @@ pub struct SessionInner {
     pub(crate) idle_compaction_attempted: AtomicBool,
     /// An unanswered interaction checkpoint was intentionally left dormant.
     pub(crate) recovery_deferred: bool,
+    pub(crate) resumed: bool,
     /// Startup interrupted this turn after re-authorizing changed abilities.
     pub(crate) interrupted_on_resume: Option<TurnId>,
+    /// Volatile LCM timeline of an ephemeral session, released on drop.
+    pub(crate) _ephemeral_lcm: Option<crate::harness::EphemeralLcmGuard>,
 }
 
 /// Protected boundary invoked by the cache mechanism immediately after its
@@ -123,8 +126,8 @@ pub(crate) trait CacheStartBarrier: Send + Sync {
 /// Active turn bookkeeping shared with shutdown.
 #[derive(Debug, Default)]
 pub(crate) struct ActiveTurns {
-    shutting_down: bool,
-    count: usize,
+    pub(crate) shutting_down: bool,
+    pub(crate) count: usize,
     aborts: Vec<AbortHandle>,
     cancellations: BTreeMap<TurnId, Cancellation>,
     internal_goals: BTreeMap<TurnId, agent_runtime_core::content::InternalGoalBinding>,

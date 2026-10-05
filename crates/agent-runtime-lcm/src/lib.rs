@@ -27,8 +27,7 @@ pub mod projection;
 pub mod store;
 pub mod summarize;
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod testing;
+pub mod memory;
 
 pub use agent_runtime_context::Sensitivity;
 pub use agent_runtime_core::content::{ContentPart, Message, Role, ToolCall, ToolResultBlock};
@@ -59,8 +58,9 @@ pub use projection::{
     ProjectionItem, project_active_context, project_active_context_with_suffix,
 };
 pub use store::{
-    AppendResult, CommitResult, ExpansionItem, ExpansionRequest, LcmError, LcmExpansion, LcmReader,
-    LcmStore, LcmView, LcmViewAuthority, LcmWriter, TruncateResult, operation_fingerprint,
+    AppendResult, CommitResult, ExpansionItem, ExpansionRequest, LcmClaimResult, LcmError,
+    LcmExpansion, LcmReader, LcmStore, LcmView, LcmViewAuthority, LcmWriter, TruncateResult,
+    operation_fingerprint,
 };
 pub use summarize::{
     EscalationLevel, LcmEscalatingSummarizer, LcmEscalationPolicy, LcmSummaryAttempt,
@@ -68,8 +68,7 @@ pub use summarize::{
     LcmSummaryModelResponse, LcmSummaryOutcome, SummaryProvenance, truncate_head_tail_to_cap,
 };
 
-#[cfg(any(test, feature = "test-support"))]
-pub use testing::InMemoryLcmStore;
+pub use memory::InMemoryLcmStore;
 
 /// The package's semantic contract revision.  Hosts should include this in
 /// their run manifests and compatibility checks when they persist LCM state.

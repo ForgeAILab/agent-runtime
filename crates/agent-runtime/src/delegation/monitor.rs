@@ -590,6 +590,7 @@ fn child_failure(cause: Option<RuntimeError>) -> RuntimeError {
         retry_after_ms,
         limit_resets_at_ms,
         credential_recovery,
+        lcm,
     } = cause;
     let mut reported = RuntimeError::new(kind, format!("child turn failed: {message}"))
         .with_metadata(metadata)
@@ -597,6 +598,7 @@ fn child_failure(cause: Option<RuntimeError>) -> RuntimeError {
     reported.retry_after_ms = retry_after_ms;
     reported.limit_resets_at_ms = limit_resets_at_ms;
     reported.credential_recovery = credential_recovery;
+    reported.lcm = lcm;
     if retryable {
         reported.retryable()
     } else {

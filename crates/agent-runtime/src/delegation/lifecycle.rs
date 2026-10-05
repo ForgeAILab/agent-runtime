@@ -1144,16 +1144,25 @@ impl DelegationCoordinator {
         let mut start = crate::runtime::command::StartSession::new()
             .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer);
         if let Some(session) = session {
-            start = start.with_id(session.clone());
+            let persisted = match self.inner.factory.durability() {
+                ChildDurability::Ephemeral => false,
+                _ => runtime.session_exists(session).await?,
+            };
+            start = if persisted {
+                crate::runtime::command::StartSession::resume(session.clone())
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer)
+            } else {
+                crate::runtime::command::StartSession::create(session.clone(), Vec::new())
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer)
+            };
         }
         let handle = runtime
             .start_child_session(start, self.inner.parent.id().clone())
             .await
             .map_err(|err| {
-                RuntimeError::new(
-                    err.kind,
-                    format!("failed to start child `{child}`: {}", err.message),
-                )
+                let mut err = err;
+                err.message = format!("failed to start child `{child}`: {}", err.message);
+                err
             })?;
         Ok((runtime, handle))
     }

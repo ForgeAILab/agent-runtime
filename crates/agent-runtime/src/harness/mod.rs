@@ -38,12 +38,13 @@ pub use goals::{
     UPDATE_GOAL_TOOL_NAME, UpdateGoalTool,
 };
 pub use lcm::{
-    DefaultLcmSourceClassifier, LCM_COMPONENT_ID, LCM_IDLE_COMPACTION_PURPOSE,
-    LCM_STATE_SCHEMA_VERSION, LCM_SUMMARY_PURPOSE, LcmCoordinator, LcmCoordinatorPolicy,
-    LcmSourceClassifier, LcmTimelineBinding, LcmTimelineResolver, StaticLcmTimelineResolver,
+    DEFAULT_FORK_SUMMARY_MAX_CHARS, DefaultLcmSourceClassifier, LCM_COMPONENT_ID,
+    LCM_IDLE_COMPACTION_PURPOSE, LCM_STATE_SCHEMA_VERSION, LCM_SUMMARY_PURPOSE, LcmCoordinator,
+    LcmCoordinatorPolicy, LcmRecoveryPolicy, LcmSourceClassifier, LcmTimelineBinding,
+    LcmTimelineResolver, StaticLcmTimelineResolver,
 };
 #[allow(unused_imports)]
-pub(crate) use lcm::{LcmExpansionObservation, import_semantic_summary_v1};
+pub(crate) use lcm::{EphemeralLcmGuard, LcmExpansionObservation, import_semantic_summary_v1};
 pub(crate) use legacy_semantic_summary::LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID;
 pub(crate) use live_abilities::{
     ACTIVATION_STATE_NAMESPACE, LiveAbilityRuntime, SessionAbilities, emit_activation_epoch,

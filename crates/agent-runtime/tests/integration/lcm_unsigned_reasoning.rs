@@ -31,7 +31,7 @@ use agent_runtime::lcm::{
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream};
 use agent_runtime::registry::RegistryRevision;
 use agent_runtime::runtime::{Runtime, RuntimeBuilder, StartSession};
-use agent_runtime_lcm::testing::InMemoryLcmStore;
+use agent_runtime_lcm::memory::InMemoryLcmStore;
 use async_trait::async_trait;
 
 const TIMELINE_ID: &str = "timeline-unsigned-reasoning";
@@ -234,7 +234,7 @@ async fn unsigned_reasoning_does_not_wedge_the_next_turn() {
         observer.clone(),
     );
     let session = first
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
         .await
         .expect("fresh session starts");
     session
@@ -279,7 +279,7 @@ async fn unsigned_reasoning_does_not_wedge_the_next_turn() {
         observer.clone(),
     );
     let session = second
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("the session resumes over its protected checkpoint");
     session

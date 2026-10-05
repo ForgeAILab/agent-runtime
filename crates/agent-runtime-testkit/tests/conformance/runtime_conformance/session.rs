@@ -408,11 +408,17 @@ async fn two_sessions_from_one_runtime_keep_requests_events_and_manifests_isolat
     let observer = RecordingObserver::shared();
     let runtime = build(provider.clone(), observer.clone());
     let session_a = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("session-a")))
+        .start_session(StartSession::create(
+            SessionId::new("session-a"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     let session_b = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("session-b")))
+        .start_session(StartSession::create(
+            SessionId::new("session-b"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
 
@@ -542,7 +548,10 @@ async fn live_initial_activation_uses_the_smallest_authorized_intent_bundle() {
         .unwrap();
 
     let read_session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("live-activation-read")))
+        .start_session(StartSession::create(
+            SessionId::new("live-activation-read"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     let read_bootstrap = read_session
@@ -560,7 +569,10 @@ async fn live_initial_activation_uses_the_smallest_authorized_intent_bundle() {
     assert_eq!(read_selected.index(), 1);
     assert!(read_selected.contains(&RegistryId::tool("activation_read")));
     let edit_session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("live-activation-edit")))
+        .start_session(StartSession::create(
+            SessionId::new("live-activation-edit"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     let edit_bootstrap = edit_session

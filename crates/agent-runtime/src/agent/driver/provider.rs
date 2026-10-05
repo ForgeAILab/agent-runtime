@@ -405,6 +405,17 @@ impl Driver {
         revisions.harness_pipeline = self.harness.fingerprint().clone();
         let mut activation = Vec::new();
         let mut contributed = Vec::new();
+        let summary_seed = execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .get(crate::runtime::fork::SUMMARY_SEED_NAMESPACE)
+            .cloned();
+        if let Some(fragment) = crate::runtime::fork::summary_fragment(summary_seed.as_ref())
+            .map_err(harness_context_error)?
+        {
+            contributed.push(fragment);
+        }
         let schemas = if let (Some(runtime), Some(abilities)) =
             (&self.live_abilities, &execution.abilities)
         {

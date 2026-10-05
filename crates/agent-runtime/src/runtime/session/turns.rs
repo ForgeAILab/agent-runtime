@@ -10,7 +10,7 @@ impl SessionHandle {
     /// ordinary persistence gate. A failed model attempt is represented by an
     /// accepted result with a fallback reason and consumes the attempt; it is
     /// never retried automatically. The canonical history remains unchanged.
-    async fn idle_checkpoint_is_safe(&self) -> Result<bool, RuntimeError> {
+    pub(crate) async fn idle_checkpoint_is_safe(&self) -> Result<bool, RuntimeError> {
         let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
             return Ok(true);
         };
@@ -22,6 +22,42 @@ impl SessionHandle {
             checkpoint.state,
             TurnState::Terminal { .. } | TurnState::CacheOperationTerminal { .. }
         ))
+    }
+
+    /// Saves exact idle extension state, retaining the preceding turn identity.
+    pub(crate) async fn protect_session_boundary(&self) -> Result<(), RuntimeError> {
+        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+            return Ok(());
+        };
+        let previous = store.load_latest(self.id()).await?;
+        let snapshot = self.checkpoint_snapshot()?;
+        let sequence = self.inner.emitter.begin_checkpoint_barrier();
+        let result = async {
+            let next = match previous {
+                Some(previous) => {
+                    if !previous.state.is_terminal() {
+                        return Err(RuntimeError::conflict(
+                            "session boundary requires an idle terminal checkpoint",
+                        ));
+                    }
+                    let mut next = previous.clone();
+                    next.state_revision =
+                        previous.state_revision.checked_add(1).ok_or_else(|| {
+                            RuntimeError::conflict("session checkpoint revision exhausted")
+                        })?;
+                    next.watermark = previous.watermark.clone().next(sequence);
+                    next.snapshot = snapshot;
+                    next.updated = self.inner.shared.clock.now();
+                    previous.validate_successor(&next)?;
+                    next
+                }
+                None => TurnCheckpoint::session_boundary(snapshot, sequence)?,
+            };
+            store.save(&next).await
+        }
+        .await;
+        self.inner.emitter.end_checkpoint_barrier();
+        result
     }
 
     /// Refreshes only post-terminal extension/usage progress. The existing

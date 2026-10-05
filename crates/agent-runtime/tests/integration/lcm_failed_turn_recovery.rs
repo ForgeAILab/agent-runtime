@@ -31,7 +31,7 @@ use agent_runtime::lcm::{
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream};
 use agent_runtime::registry::RegistryRevision;
 use agent_runtime::runtime::{Runtime, RuntimeBuilder, StartSession};
-use agent_runtime_lcm::testing::InMemoryLcmStore;
+use agent_runtime_lcm::memory::InMemoryLcmStore;
 use async_trait::async_trait;
 
 const TIMELINE_ID: &str = "timeline-failed-turn-recovery";
@@ -265,7 +265,7 @@ async fn failed_turn_appends_nothing_and_session_accepts_the_next_turn() {
         observer.clone(),
     );
     let session = first
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
         .await
         .expect("fresh session starts");
     session
@@ -314,7 +314,7 @@ async fn failed_turn_appends_nothing_and_session_accepts_the_next_turn() {
         observer.clone(),
     );
     let session = second
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::resume(session_id.clone()))
         .await
         .expect("session restarts over the failed turn's checkpoint");
     session
@@ -377,8 +377,14 @@ async fn diverged_lcm_timeline_heals_on_the_next_completed_turn() {
         })
         .collect::<Vec<_>>();
     lcm_store
+        .claim(&lcm_store.view(), &session_id, 0)
+        .await
+        .expect("same-session orphan owner");
+    // The orphan tail is the owner's own crashed write, so it carries the
+    // owner's claim fence.
+    lcm_store
         .append(
-            &lcm_store.view(),
+            &lcm_store.view().with_owner(session_id.clone(), 0),
             LcmAppendRequest::new(LcmOperationId::new("history:0:orphans"), orphan_entries),
         )
         .await
@@ -402,7 +408,7 @@ async fn diverged_lcm_timeline_heals_on_the_next_completed_turn() {
         observer.clone(),
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
         .await
         .expect("session starts over the diverged timeline");
 

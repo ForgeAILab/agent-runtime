@@ -61,7 +61,7 @@ async fn checkpoint_only_resume_uses_legacy_diagnostics_or_an_empty_new_window()
             .build()
             .unwrap();
         let session = runtime
-            .start_session(StartSession::new().with_id(checkpoint.session.clone()))
+            .start_session(StartSession::resume(checkpoint.session.clone()))
             .await
             .unwrap();
         let snapshot = session.snapshot();
@@ -123,7 +123,7 @@ async fn rollback_under_count_bootstraps_from_the_legacy_snapshot_list() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(legacy.id))
+        .start_session(StartSession::resume(legacy.id))
         .await
         .unwrap();
     assert_eq!(
@@ -162,7 +162,7 @@ async fn terminal_pairs_require_full_legacy_lists_or_equal_validated_counters() 
             .build()
             .unwrap();
         let session = runtime
-            .start_session(StartSession::new().with_id(exact.session))
+            .start_session(StartSession::resume(exact.session))
             .await
             .unwrap();
         assert_eq!(
@@ -214,7 +214,7 @@ async fn incompatible_equal_legacy_diagnostics_do_not_block_nonterminal_recovery
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(planning.session))
+        .start_session(StartSession::resume(planning.session))
         .await
         .unwrap();
     await_terminal(&checkpoints, session.id()).await;
@@ -295,7 +295,7 @@ async fn stale_or_removed_boundary_evidence_never_attests_ordinary_state() {
             .build()
             .unwrap();
         let error = runtime
-            .start_session(StartSession::new().with_id(exact.session.clone()))
+            .start_session(StartSession::resume(exact.session.clone()))
             .await
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::Conflict, "{error:?}");
@@ -315,7 +315,7 @@ async fn stale_or_removed_boundary_evidence_never_attests_ordinary_state() {
         .unwrap();
     assert_eq!(
         runtime
-            .start_session(StartSession::new().with_id(exact.session))
+            .start_session(StartSession::resume(exact.session))
             .await
             .unwrap_err()
             .kind,
@@ -334,7 +334,7 @@ async fn new_json_is_old_readable_but_old_terminal_overlay_rejects_it() {
         .unwrap();
     let id = SessionId::new("downgrade");
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     for _ in 0..5 {
@@ -355,7 +355,7 @@ async fn new_json_is_old_readable_but_old_terminal_overlay_rejects_it() {
     );
     session.shutdown().await.unwrap();
     let resumed = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     assert_eq!(resumed.recent_manifests(), snapshot.manifests);
@@ -379,7 +379,7 @@ async fn planned_step_overflow_fails_before_provider_io() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(snapshot.id))
+        .start_session(StartSession::resume(snapshot.id))
         .await
         .unwrap();
     session.run(UserInput::text("overflow")).await.unwrap();
@@ -406,7 +406,7 @@ async fn historical_equivalent_replay_requires_retained_or_host_archived_evidenc
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(source.id))
+        .start_session(StartSession::resume(source.id))
         .await
         .unwrap();
     let recent = session.recent_manifests();
@@ -461,7 +461,7 @@ async fn lagging_ordinary_snapshot_keeps_pre_crash_diagnostics() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     session.run(UserInput::text("first turn")).await.unwrap();
@@ -491,7 +491,7 @@ async fn lagging_ordinary_snapshot_keeps_pre_crash_diagnostics() {
     .build()
     .unwrap();
     let crashed = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     crashed
@@ -526,7 +526,7 @@ async fn lagging_ordinary_snapshot_keeps_pre_crash_diagnostics() {
         .build()
         .unwrap();
     let recovered = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     assert!(recovered.recent_manifests().starts_with(&pre_crash));
@@ -555,7 +555,10 @@ async fn internal_turns_share_the_configured_window() {
         .build()
         .unwrap();
     let session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("window-internal")))
+        .start_session(StartSession::create(
+            SessionId::new("window-internal"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     for _ in 0..2 {
@@ -647,7 +650,7 @@ async fn unsupported_checkpoint_revisions_and_malformed_protected_markers_fail_b
             .unwrap();
         assert_eq!(
             runtime
-                .start_session(StartSession::new().with_id(id))
+                .start_session(StartSession::resume(id))
                 .await
                 .unwrap_err()
                 .kind,
@@ -744,7 +747,7 @@ async fn legacy_planning_refresh_recovers_equivalently_across_diagnostic_windows
             .build()
             .unwrap();
         let session = runtime
-            .start_session(StartSession::new().with_id(planning.session.clone()))
+            .start_session(StartSession::resume(planning.session.clone()))
             .await
             .unwrap();
         assert_eq!(session.recent_manifests().len(), window.min(5));

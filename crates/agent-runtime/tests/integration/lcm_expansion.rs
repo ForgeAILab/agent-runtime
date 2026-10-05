@@ -231,6 +231,20 @@ impl LcmReader for ExpansionStore {
 
 #[async_trait]
 impl LcmWriter for ExpansionStore {
+    // The fixture creates its session over a timeline it pre-populated, which
+    // the default claim correctly treats as a fresh binding and forks. This
+    // stub stands in for the host's recorded ownership of that timeline.
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
+        let _ = (owner, generation);
+        self.authorize_view(view)?;
+        Ok(agent_runtime::lcm::LcmClaimResult::Claimed)
+    }
+
     async fn append(
         &self,
         _view: &LcmView,
@@ -300,11 +314,10 @@ async fn authorized_expansion_is_complete_and_emits_one_event() {
     let store = ExpansionStore::new();
     let runtime = runtime_for("expansion-authorized", store.clone(), store.authority());
     let session = runtime
-        .start_session(
-            StartSession::new().with_id(agent_runtime::core::ids::SessionId::new(
-                "expansion-authorized",
-            )),
-        )
+        .start_session(StartSession::create(
+            agent_runtime::core::ids::SessionId::new("expansion-authorized"),
+            Vec::new(),
+        ))
         .await
         .expect("session starts");
     let mut events = session.subscribe();
@@ -340,11 +353,10 @@ async fn bounded_expansion_continuation_is_redaction_safe() {
     let store = ExpansionStore::new();
     let runtime = runtime_for("expansion-bounded", store.clone(), store.authority());
     let session = runtime
-        .start_session(
-            StartSession::new().with_id(agent_runtime::core::ids::SessionId::new(
-                "expansion-bounded",
-            )),
-        )
+        .start_session(StartSession::create(
+            agent_runtime::core::ids::SessionId::new("expansion-bounded"),
+            Vec::new(),
+        ))
         .await
         .expect("session starts");
     let mut events = session.subscribe();
@@ -387,19 +399,15 @@ async fn bounded_expansion_continuation_is_redaction_safe() {
 #[tokio::test]
 async fn unauthorized_and_unknown_expansion_do_not_leak_existence() {
     let store = ExpansionStore::new();
-    let runtime = runtime_for(
-        "expansion-unauthorized",
-        store.clone(),
-        LcmViewAuthority::new(),
-    );
+    let runtime = runtime_for("expansion-unauthorized", store.clone(), store.authority());
     let session = runtime
-        .start_session(
-            StartSession::new().with_id(agent_runtime::core::ids::SessionId::new(
-                "expansion-unauthorized",
-            )),
-        )
+        .start_session(StartSession::create(
+            agent_runtime::core::ids::SessionId::new("expansion-unauthorized"),
+            Vec::new(),
+        ))
         .await
         .expect("session starts");
+    store.authority().revoke();
     let mut events = session.subscribe();
     let request = ExpansionRequest::new(LcmNodeId::new("expansion-node"), 1);
     let error = session
@@ -425,13 +433,13 @@ async fn unauthorized_and_unknown_expansion_do_not_leak_existence() {
     assert!(metadata.operation_fingerprint.is_some());
     assert_eq!(store.expand_calls(), 0, "store must reject before lookup");
 
+    let store = ExpansionStore::new();
     let authorized_runtime = runtime_for("expansion-unknown", store.clone(), store.authority());
     let unknown = authorized_runtime
-        .start_session(
-            StartSession::new().with_id(agent_runtime::core::ids::SessionId::new(
-                "expansion-unknown",
-            )),
-        )
+        .start_session(StartSession::create(
+            agent_runtime::core::ids::SessionId::new("expansion-unknown"),
+            Vec::new(),
+        ))
         .await
         .expect("session starts");
     let mut unknown_events = unknown.subscribe();

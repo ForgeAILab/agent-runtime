@@ -1,7 +1,7 @@
 //! Public LCM conformance helpers and deterministic fixtures.
 //!
 //! The suite intentionally exercises the leaf package through its public
-//! `test-support` store.  It does not reimplement persistence, CAS, cursor,
+//! in-memory reference store.  It does not reimplement persistence, CAS, cursor,
 //! projection, pressure, or summarization mechanisms in the testkit.
 
 use std::collections::{BTreeSet, VecDeque};

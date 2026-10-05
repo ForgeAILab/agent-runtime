@@ -79,7 +79,10 @@ async fn host_controls_are_serialized_persisted_and_optimistic() {
         Arc::new(RecordingObserver::new()),
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("goal-controls")))
+        .start_session(StartSession::create(
+            SessionId::new("goal-controls"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
 
@@ -158,7 +161,10 @@ async fn internal_turn_is_attributed_checkpointed_and_not_user_history() {
         observer.clone(),
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("internal-turn")))
+        .start_session(StartSession::create(
+            SessionId::new("internal-turn"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     let handle = match session
@@ -540,7 +546,7 @@ async fn restored_active_goal_continues_only_after_a_later_controller_attaches()
         Arc::new(RecordingObserver::new()),
     );
     let first = first_runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
         .await
         .unwrap();
     first
@@ -582,7 +588,7 @@ async fn restored_active_goal_continues_only_after_a_later_controller_attaches()
         Arc::new(RecordingObserver::new()),
     );
     let second = second_runtime
-        .start_session(StartSession::new().with_id(session_id))
+        .start_session(StartSession::resume(session_id))
         .await
         .unwrap();
     assert_eq!(provider.requests().len(), 0);

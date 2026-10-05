@@ -141,7 +141,7 @@ async fn local_tool_action_is_checkpointed_offloaded_and_never_spends_provider_t
         .unwrap();
     let id = SessionId::new("local-artifact-action");
     let session = runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
 
@@ -263,7 +263,7 @@ async fn local_tool_recovery_executes_prepared_once_and_never_replays_a_durable_
         .build()
         .unwrap();
     let source = source_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     source
@@ -301,7 +301,7 @@ async fn local_tool_recovery_executes_prepared_once_and_never_replays_a_durable_
         .build()
         .unwrap();
     prepared_runtime
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::resume(id.clone()))
         .await
         .unwrap();
     wait_for_terminal(&prepared_observer).await;
@@ -325,7 +325,7 @@ async fn local_tool_recovery_executes_prepared_once_and_never_replays_a_durable_
         .build()
         .unwrap();
     outcome_runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     wait_for_terminal(&outcome_observer).await;

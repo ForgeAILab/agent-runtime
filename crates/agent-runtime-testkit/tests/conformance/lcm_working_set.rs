@@ -204,7 +204,10 @@ async fn working_set_target_drives_pressure_independently_of_provider_window_and
         false,
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::create(
+            SessionId::new("u6.session"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     session
@@ -240,7 +243,10 @@ async fn live_session_policy_bump_rebuilds_active_nodes_and_preserves_identity()
         false,
     );
     let session = first
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::create(
+            SessionId::new("u6.session"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     session
@@ -268,7 +274,7 @@ async fn live_session_policy_bump_rebuilds_active_nodes_and_preserves_identity()
         false,
     );
     let resumed = second
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::resume(SessionId::new("u6.session")))
         .await
         .unwrap();
     let rebuilt = resumed.snapshot().extension_state["harness.lcm"].clone();
@@ -288,7 +294,7 @@ async fn live_session_policy_bump_rebuilds_active_nodes_and_preserves_identity()
         false,
     );
     let resumed = third
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::resume(SessionId::new("u6.session")))
         .await
         .unwrap();
     resumed.run(UserInput::text("continue")).await.unwrap();
@@ -338,7 +344,10 @@ async fn failed_idle_checkpoint_rolls_back_state_usage_and_boundary_marker() {
         false,
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::create(
+            SessionId::new("u6.session"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     session
@@ -375,7 +384,10 @@ async fn opt_in_soft_compaction_runs_after_turn_completed() {
         true,
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(SessionId::new("u6.session")))
+        .start_session(StartSession::create(
+            SessionId::new("u6.session"),
+            Vec::new(),
+        ))
         .await
         .unwrap();
     session

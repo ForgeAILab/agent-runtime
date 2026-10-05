@@ -1617,6 +1617,7 @@ impl From<ProviderError> for RuntimeError {
             retry_after_ms: err.retry_after_ms,
             limit_resets_at_ms: err.limit_resets_at_ms,
             credential_recovery: err.credential_recovery,
+            lcm: None,
         }
     }
 }

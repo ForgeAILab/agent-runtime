@@ -18,6 +18,83 @@ contain breaking changes and are coordinated with consumer proposals.
   access when the root is contained. Absolute contained paths remain valid;
   standalone registration and builds without a workspace are unaffected.
   Invocation checks remain in place for prepared, argument-dependent scopes.
+- U7/U8 (explicit session and timeline lifecycle). Full consumer-break list:
+  - `COMMAND_SCHEMA_VERSION` is 2. `StartSession` now requires explicit `mode`
+    on the wire; `initial_history` becomes `seed`. Schema 1/unknown legacy
+    fields are rejected. Use `create(id, seed)`, `resume(id)` or
+    `ephemeral(history)`. `StartSession::with_id` is removed, so a former
+    `new().with_id(id)` resume fails to compile; `new()` is an unnamed create.
+    `StartSession::from_json(value)` decodes wire payloads and rejects another
+    schema version with a typed `Config` error (plain serde decoding still
+    fails with a serde error). Resume with any seed returns Conflict; missing
+    resume state returns NotFound; create over an ordinary snapshot or protected
+    checkpoint returns Conflict. Resume identity floors require resume mode.
+    Checkpoint recovery policies remain.
+  - Ephemeral disables session/checkpoint loading and writes even when stores
+    were configured. Its LCM runs on a volatile in-memory timeline and never
+    claims or writes the host timeline bound to its id. `SessionHandle::resumed()`
+    reports actual persisted loading. Nyx's per-call history reconstruction maps
+    to `ephemeral`.
+  - `LcmWriter::claim` is defaulted. The default records nothing: it returns
+    `Claimed` for an empty timeline and `LcmClaimResult::Unsupported` for a
+    populated one. With it, LCM stays usable: sessions run normally, a session
+    resuming its own snapshot continues unfenced, and a fresh binding of a
+    populated timeline forks to the resolver's `new_timeline` with a summary
+    seed (typed `ForkRequired` without that hook). Explicit Adopt of a fresh
+    binding on such a store returns `ForkRequired`. Claim-aware stores must update ownership
+    atomically, bump their revision on every ownership change, and reject a
+    mutation whose `LcmView::owner()` fence is not the recorded owner (an
+    unfenced write to an owned timeline included) with `TimelineOwned`.
+    `LcmView` gains `with_owner`/`owner`; the runtime fences every write.
+  - Fresh owners cannot silently bind populated timelines; select explicit
+    Adopt, Fork or Retire. Adopt claims the next generation before it reads, and
+    Adopt with a non-empty seed returns Conflict. A pre-U7 session on an
+    unclaimed timeline fails resume with `TimelineOwned { owner: None, .. }`;
+    `resume(id).with_lcm_policy(Adopt)` claims generation 1 and continues.
+    Default resolver replacement and continuation hooks fail closed; hosts
+    opting into rotations must implement durable, idempotent, authorized
+    bindings. The Fork and Retire policies durably rebind through `new_timeline`
+    before validating the replacement. NewTimeline requires an empty store. An
+    unauthorized LCM view now fails at session construction, not first use.
+  - The U7 Fork summary is capped by the new public
+    `LcmCoordinatorPolicy::fork_summary_max_chars` (default
+    `DEFAULT_FORK_SUMMARY_MAX_CHARS`, 16 384), keeps the newest tail, omits
+    Secret-classified sources and passes the content guard. Exhaustive
+    `LcmCoordinatorPolicy` literals must add the field.
+  - `agent-runtime-lcm`: the `testing` module is now `memory` and always
+    compiled, and the `test-support` feature is removed; import
+    `agent_runtime_lcm::InMemoryLcmStore` or `memory::InMemoryLcmStore`. It
+    remains a volatile reference store, not a persistence backend.
+  - `LcmError` adds TimelineOwned, LcmDivergence and ForkRequired; update exhaustive
+    matches. `RuntimeError` adds optional typed `lcm: Option<Box<LcmFailure>>`; add it to
+    Rust literals/destructures; `lcm_failure()` borrows the evidence. RangeOverlap/EntryConflict now retain Conflict kind
+    through provider admission, with typed evidence rather than Config strings.
+    Below-frontier reconcile fails without truncation. Serialized errors remain
+    additive and legacy/future optional LCM evidence is readable.
+  - `Runtime::fork_session(ForkSession)` accepts Summary/FromIndex/Empty and
+    NewTimeline/Continue. It requires idle durable sources and supersedes parents.
+    The resolver hook, replacement emptiness, Continue claim support and the seed
+    are validated before any pending intent is written. A later failure rolls the
+    intent back while the successor owns nothing durable; otherwise retry the same
+    request. `Runtime::abort_fork(parent)` clears an intent a crash left behind
+    under the same rule. Default resume refuses pending or superseded parents.
+    With LCM, Continue accepts only `Empty` or `FromIndex(0)` (its adopted history);
+    a Summary or a later suffix returns Conflict. Use NewTimeline plus Summary for
+    bounded topic rotation. Smith `/new` maps to an Empty fork; Forge
+    genesis/handoff maps to a Summary/NewTimeline fork.
+  - Protected adapters that restrict their first save to admission states must
+    additionally accept `TurnCheckpoint::is_session_boundary()` for exact idle
+    seed protection. The constructor uses existing Terminal wire data; checkpoint
+    schema/transition versions and store trait signatures are unchanged. Ordinary
+    Sensitive-state redaction and exact protected retention remain mandatory.
+    Compatible exact immutable seeds/pending intents override even newer ordinary
+    redacted values; generated U7 Fork seeds are protected before the first turn,
+    on the create and the resume path.
+    Persisted LCM state adds a defaulted claim generation; U6 tunable rebuilds remain.
+  - Forge can remove V149 timeline retirement and stale-LCM-state deletion for
+    tunable changes after adopting claims and authorized session/topic forks.
+    See `docs/migrations/session-timeline-lifecycle.md` for migration and U9/U10.
+
 - U6 (LCM working sets, one sizer, provider summaries). Consumer-break list:
   - `LCM_ALGORITHM_REVISION` is now `agent-runtime-lcm-2`; persisted LCM state
     from `-1` rebuilds its derived metadata once on resume (see below).

@@ -205,7 +205,7 @@ async fn new_turn_finalizes_interrupted_checkpoint_instead_of_wedging() {
         observer.clone(),
     );
     let session = runtime
-        .start_session(StartSession::new().with_id(session_id.clone()))
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
         .await
         .expect("session starts");
 
@@ -331,8 +331,7 @@ async fn dormant_interrupted_checkpoint_is_finalized_on_new_work() {
     );
     let session = runtime
         .start_session(
-            StartSession::new()
-                .with_id(session_id.clone())
+            StartSession::resume(session_id.clone())
                 .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
         )
         .await
@@ -411,7 +410,7 @@ async fn saved_upgrade_turn() -> (
     ));
     let old = upgrade_runtime(provider, sessions.clone(), checkpoints.clone(), false);
     let session = old
-        .start_session(StartSession::new().with_id(id.clone()))
+        .start_session(StartSession::create(id.clone(), Vec::new()))
         .await
         .unwrap();
     let mut snapshot = session.snapshot();
@@ -454,8 +453,7 @@ async fn changed_activation_interrupts_without_replay_and_keeps_history() {
     );
     let resumed = runtime
         .start_session(
-            StartSession::new()
-                .with_id(id.clone())
+            StartSession::resume(id.clone())
                 .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
         )
         .await
@@ -486,7 +484,7 @@ async fn changed_activation_interrupts_without_replay_and_keeps_history() {
     // The migrated terminal record resumes normally, rather than repeatedly
     // interrupting on every start or requiring deletion of the old session.
     let resumed = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap();
     assert!(resumed.interrupted_on_resume().is_none());
@@ -504,7 +502,7 @@ async fn strict_resume_still_rejects_changed_activation_without_writes() {
     ));
     let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
     let error = runtime
-        .start_session(StartSession::new().with_id(id))
+        .start_session(StartSession::resume(id))
         .await
         .unwrap_err();
     assert!(
@@ -534,8 +532,7 @@ async fn upgrade_recovery_does_not_hide_invalid_activation_state() {
     let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
     let error = runtime
         .start_session(
-            StartSession::new()
-                .with_id(id)
+            StartSession::resume(id)
                 .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
         )
         .await
@@ -555,8 +552,7 @@ async fn upgrade_recovery_requires_durable_interruption_before_returning() {
         vec![],
     ));
     let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
-    let request = StartSession::new()
-        .with_id(id)
+    let request = StartSession::resume(id)
         .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt);
     assert!(runtime.start_session(request.clone()).await.is_err());
     assert_eq!(checkpoints.latest().unwrap(), original);
@@ -577,8 +573,7 @@ async fn compatible_upgrade_policy_still_resumes_the_exact_saved_turn() {
     let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), false);
     let resumed = runtime
         .start_session(
-            StartSession::new()
-                .with_id(id)
+            StartSession::resume(id)
                 .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
         )
         .await
@@ -638,8 +633,7 @@ async fn upgrade_recovery_preserves_a_previously_decided_finish() {
         let runtime = upgrade_runtime(provider.clone(), sessions, checkpoints.clone(), true);
         let resumed = runtime
             .start_session(
-                StartSession::new()
-                    .with_id(id)
+                StartSession::resume(id)
                     .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
             )
             .await
