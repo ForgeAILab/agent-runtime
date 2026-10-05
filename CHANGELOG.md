@@ -523,6 +523,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   event-schema, shutdown) plus neutral consumer adapter fixtures.
 
 ### Fixed
+- OpenAI-compatible JSON error envelopes now preserve authentication,
+  rate-limit/quota, and invalid-request classifications instead of always
+  becoming retryable server errors. Pre-output authentication failures
+  invalidate the exact credential revision once; errors after semantic output
+  do not trigger credential recovery. Rate-limit retry hints are retained,
+  unknown errors remain server failures, and provider bodies stay redacted.
 - LCM hard compaction no longer wedges a session behind one oversized agentic
   turn. Leaf planning only cuts at user boundaries, so a single turn whose
   tool loop outgrew `leaf_target_tokens` (many tool rounds, no user message
