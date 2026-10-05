@@ -1063,6 +1063,10 @@ struct TurnMachine<'a> {
     turn_id: TurnId,
     acceptance: Option<Arc<TurnAcceptance>>,
     checkpoint: Option<TurnCheckpoint>,
+    /// An ordinary-only hard intent whose successor still needs publication.
+    ordinary_lcm_intent_saved: bool,
+    /// This turn crossed an ordinary hard-admission durability barrier.
+    ordinary_lcm_hard_admitted: bool,
 }
 
 /// Cohesive process-local dependencies shared by every turn-machine entry

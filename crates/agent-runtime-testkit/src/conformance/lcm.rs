@@ -1833,3 +1833,150 @@ mod tests {
         super::assert_lcm_conformance().await;
     }
 }
+
+/// One-shot failure boundary for testing a durable hard-admission intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LcmCommitFault {
+    /// No failure.
+    None,
+    /// Fail before the reference store mutates its DAG.
+    Before,
+    /// Commit the exact reference-store CAS, then lose its acknowledgement.
+    After,
+}
+
+/// Reference-store adapter with one-shot leaf/condensation commit faults.
+/// All authority, owner fences, CAS and idempotency checks remain in the store.
+#[derive(Debug)]
+pub struct FaultInjectingLcmStore {
+    /// Durable reference-store state retained across runtime restarts.
+    pub inner: Arc<InMemoryLcmStore>,
+    fault: Mutex<LcmCommitFault>,
+    condensation_fault: Mutex<LcmCommitFault>,
+}
+
+impl FaultInjectingLcmStore {
+    /// Wraps a reference store without injecting a fault.
+    pub fn new(inner: Arc<InMemoryLcmStore>) -> Self {
+        Self {
+            inner,
+            fault: Mutex::new(LcmCommitFault::None),
+            condensation_fault: Mutex::new(LcmCommitFault::None),
+        }
+    }
+
+    /// Arms the next summary CAS (either leaf or condensation).
+    pub fn fail_next_commit(&self, fault: LcmCommitFault) {
+        *self.fault.lock().expect("LCM fault lock") = fault;
+    }
+
+    /// Arms the next condensation CAS, leaving leaf commits unaffected.
+    pub fn fail_next_condensation(&self, fault: LcmCommitFault) {
+        *self.condensation_fault.lock().expect("LCM fault lock") = fault;
+    }
+
+    fn take_fault(&self) -> LcmCommitFault {
+        std::mem::replace(
+            &mut *self.fault.lock().expect("LCM fault lock"),
+            LcmCommitFault::None,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl LcmReader for FaultInjectingLcmStore {
+    fn store_revision(&self) -> RegistryRevision {
+        self.inner.store_revision()
+    }
+    fn authorize_view(&self, view: &LcmView) -> Result<(), LcmError> {
+        self.inner.authorize_view(view)
+    }
+    async fn current_revision(&self, view: &LcmView) -> Result<LcmRevision, LcmError> {
+        self.inner.current_revision(view).await
+    }
+    async fn load_range(
+        &self,
+        view: &LcmView,
+        range: LcmRange,
+        limit: usize,
+    ) -> Result<Vec<LcmEntry>, LcmError> {
+        self.inner.load_range(view, range, limit).await
+    }
+    async fn active_nodes(&self, view: &LcmView) -> Result<Vec<LcmNode>, LcmError> {
+        self.inner.active_nodes(view).await
+    }
+    async fn node(&self, view: &LcmView, node: &LcmNodeId) -> Result<LcmNode, LcmError> {
+        self.inner.node(view, node).await
+    }
+    async fn expand(
+        &self,
+        view: &LcmView,
+        request: ExpansionRequest,
+    ) -> Result<agent_runtime_lcm::LcmExpansion, LcmError> {
+        self.inner.expand(view, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl LcmWriter for FaultInjectingLcmStore {
+    async fn claim(
+        &self,
+        view: &LcmView,
+        owner: &agent_runtime_core::ids::SessionId,
+        generation: u64,
+    ) -> Result<agent_runtime_lcm::LcmClaimResult, LcmError> {
+        self.inner.claim(view, owner, generation).await
+    }
+    async fn append(
+        &self,
+        view: &LcmView,
+        request: LcmAppendRequest,
+    ) -> Result<AppendResult, LcmError> {
+        self.inner.append(view, request).await
+    }
+    async fn commit_leaf(
+        &self,
+        view: &LcmView,
+        request: LeafCommit,
+    ) -> Result<CommitResult, LcmError> {
+        let fault = self.take_fault();
+        if fault == LcmCommitFault::Before {
+            return Err(LcmError::StoreFailure);
+        }
+        let result = self.inner.commit_leaf(view, request).await?;
+        if fault == LcmCommitFault::After {
+            return Err(LcmError::StoreFailure);
+        }
+        Ok(result)
+    }
+    async fn commit_condensation(
+        &self,
+        view: &LcmView,
+        request: CondensationCommit,
+    ) -> Result<CommitResult, LcmError> {
+        let condensation_fault = std::mem::replace(
+            &mut *self.condensation_fault.lock().expect("LCM fault lock"),
+            LcmCommitFault::None,
+        );
+        let fault = if condensation_fault == LcmCommitFault::None {
+            self.take_fault()
+        } else {
+            condensation_fault
+        };
+        if fault == LcmCommitFault::Before {
+            return Err(LcmError::StoreFailure);
+        }
+        let result = self.inner.commit_condensation(view, request).await?;
+        if fault == LcmCommitFault::After {
+            return Err(LcmError::StoreFailure);
+        }
+        Ok(result)
+    }
+    async fn truncate_from(
+        &self,
+        view: &LcmView,
+        from: LcmSequence,
+    ) -> Result<agent_runtime_lcm::TruncateResult, LcmError> {
+        self.inner.truncate_from(view, from).await
+    }
+}
