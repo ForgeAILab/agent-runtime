@@ -281,3 +281,23 @@ async fn follow_up_persists_ready_removal_before_send() {
 async fn stop_wins_completion_publication_race() {
     delegation::assert_stop_wins_completion_publication_race().await;
 }
+
+#[tokio::test]
+async fn a_tool_result_carrying_the_outcome_withdraws_automatic_delivery() {
+    delegation::assert_tool_result_withdraws_automatic_delivery().await;
+}
+
+#[tokio::test]
+async fn an_error_tool_result_keeps_automatic_delivery() {
+    delegation::assert_error_tool_result_keeps_automatic_delivery().await;
+}
+
+#[tokio::test]
+async fn an_uncommitted_tool_result_keeps_automatic_delivery() {
+    delegation::assert_uncommitted_tool_result_keeps_automatic_delivery().await;
+}
+
+#[tokio::test]
+async fn acknowledgement_requires_the_serving_turn() {
+    delegation::assert_acknowledgement_requires_the_serving_turn().await;
+}

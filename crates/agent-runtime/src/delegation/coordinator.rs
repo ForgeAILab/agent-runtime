@@ -575,6 +575,115 @@ impl DelegationCoordinator {
         self.task_outcome(child)
     }
 
+    /// Withdraws `outcome` from automatic delivery once the parent model has
+    /// received it as the result of tool call `call` in parent turn `turn`.
+    ///
+    /// A host delegation tool that returns a child outcome to the model calls
+    /// this from its invocation. Nothing changes until that call's result
+    /// commits to the parent's canonical history without an error; then the
+    /// outcome leaves the automatic-delivery projection, exactly as an
+    /// explicit follow-up or stop supersedes it, and the parent snapshot is
+    /// saved before the turn continues. The ledger keeps the outcome, so
+    /// [`Self::task_outcome`] still returns it. If the turn ends before the
+    /// result commits, or the process stops before the snapshot is saved,
+    /// the outcome stays ready and is delivered automatically: a crash can
+    /// repeat a delivery but cannot lose one.
+    ///
+    /// Fails when `outcome` is not a durable recorded outcome of this parent
+    /// or `turn` is not the parent's serving turn.
+    pub fn acknowledge_task_outcome_on_tool_result(
+        &self,
+        turn: &TurnId,
+        call: &ToolCallId,
+        outcome: &ChildTaskOutcome,
+    ) -> Result<(), RuntimeError> {
+        let (child, identity) = match outcome {
+            ChildTaskOutcome::Completed { child, result } => {
+                (child, TaskOutcomeKey::Completed(result.turn.clone()))
+            }
+            ChildTaskOutcome::NeedsInput { child, request } => {
+                (child, TaskOutcomeKey::NeedsInput(request.id().clone()))
+            }
+        };
+        let key = ChildOutcomeKey::new(child.clone(), identity.clone());
+        let map_key = (child.clone(), identity);
+        let recorded = self
+            .inner
+            .durable_task_outcomes
+            .lock()
+            .expect("durable child outcomes poisoned")
+            .contains(&key)
+            && self
+                .inner
+                .task_outcome_ledger
+                .lock()
+                .expect("child task outcome ledger poisoned")
+                .get(&map_key)
+                == Some(outcome);
+        if !recorded {
+            return Err(RuntimeError::conflict(format!(
+                "child `{child}` has no durable recorded outcome matching the acknowledged one"
+            )));
+        }
+        // The hook lives in the parent's execution context, which the
+        // coordinator already owns; a strong reference would keep both alive
+        // until the turn ends.
+        let coordinator = Arc::downgrade(&self.inner);
+        let outcome = outcome.clone();
+        self.inner
+            .parent
+            .inner()
+            .execution
+            .on_tool_result_committed(
+                turn.clone(),
+                call.clone(),
+                Box::new(move || {
+                    Box::pin(async move {
+                        if let Some(inner) = coordinator.upgrade() {
+                            DelegationCoordinator { inner }
+                                .withdraw_delivered_outcome(&map_key, &outcome)
+                                .await;
+                        }
+                    })
+                }),
+            )
+    }
+
+    /// Removes one exact outcome from the automatic-delivery projection and
+    /// persists the change. A no-op when admission already consumed it or a
+    /// follow-up superseded it. A failed save is recorded like any other
+    /// protected-outcome persistence failure.
+    async fn withdraw_delivered_outcome(
+        &self,
+        map_key: &(ChildId, TaskOutcomeKey),
+        outcome: &ChildTaskOutcome,
+    ) {
+        let withdrawn = {
+            let _admission = self
+                .inner
+                .outcome_admission_gate
+                .lock()
+                .expect("child outcome admission gate poisoned");
+            let mut ready = self
+                .inner
+                .ready_task_outcomes
+                .lock()
+                .expect("ready child task outcomes poisoned");
+            if ready.get(map_key) == Some(outcome) {
+                ready.remove(map_key);
+                self.inner
+                    .outcome_state_revision
+                    .fetch_add(1, Ordering::AcqRel);
+                true
+            } else {
+                false
+            }
+        };
+        if withdrawn {
+            let _ = self.persist_catalog().await;
+        }
+    }
+
     /// Returns a snapshot of every currently ready protected outcome in
     /// canonical `(child_id, outcome_id)` order.
     ///

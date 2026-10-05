@@ -620,6 +620,16 @@ impl<'a> TurnMachine<'a> {
             return Err(error);
         }
 
+        let hooks = self
+            .execution
+            .take_tool_result_commit_hooks(&self.turn_id, &block.call_id);
+        if !block.is_error {
+            // Awaited so the hook's state is in place before this turn's
+            // next checkpoint captures the session.
+            for hook in hooks {
+                hook().await;
+            }
+        }
         self.emitter.emit(
             Some(self.turn_id.clone()),
             RuntimeEvent::ToolCallCompleted {
