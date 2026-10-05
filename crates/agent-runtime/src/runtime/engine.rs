@@ -314,9 +314,15 @@ async fn prepare_lcm_resume(
     };
 
     if let Some(current) = current {
-        let validation = coordinator
-            .validate_resume_state(session, &snapshot.history, &current, policy)
-            .await?;
+        let validation = if shared.checkpoint_store.is_none() && shared.session_store.is_some() {
+            coordinator
+                .validate_ordinary_resume_state(session, &snapshot.history, &current, policy)
+                .await?
+        } else {
+            coordinator
+                .validate_resume_state(session, &snapshot.history, &current, policy)
+                .await?
+        };
         let Some(repaired) = validation else {
             return Ok((Vec::new(), false));
         };

@@ -1788,6 +1788,49 @@ impl LcmCoordinator {
         Ok(Some(self.state_patch(&rebuilt)?.into_state()))
     }
 
+    /// Ordinary snapshots cannot replay the interrupted turn. Discard a
+    /// validated response whose mutation has not landed before new history
+    /// can invalidate its CAS revision. Committed responses are adopted by
+    /// the existing exact-successor validation first.
+    pub(crate) async fn validate_ordinary_resume_state(
+        &self,
+        session: &SessionId,
+        history: &[Message],
+        persisted: &VersionedSessionState,
+        policy: Option<LcmRecoveryPolicy>,
+    ) -> Result<Option<VersionedSessionState>, RuntimeError> {
+        let repaired = self
+            .validate_resume_state(session, history, persisted, policy)
+            .await?;
+        let binding = self.timeline_binding(session)?;
+        let mut state = self.decode_state(&binding, repaired.as_ref().unwrap_or(persisted))?;
+        let Some(pending) = state.pending_summary.as_ref() else {
+            if repaired.is_some() && state.hard_rounds > 0 {
+                // Exact successor adoption ends the interrupted ordinary
+                // admission epoch; a future turn gets its own round budget.
+                state.hard_rounds = 0;
+                state.hard_round_limit = 0;
+                return Ok(Some(self.state_patch(&state)?.into_state()));
+            }
+            return Ok(repaired);
+        };
+        let purpose = state.model_purpose.as_deref().ok_or_else(|| {
+            RuntimeError::conflict("LCM pending summary has no protected purpose")
+        })?;
+        if Self::validate_pending_purpose(purpose)? != LCM_SUMMARY_PURPOSE {
+            // Idle intent recovery keeps its existing behavior. This barrier
+            // only adds durability for pre-provider hard admission.
+            return Ok(repaired);
+        }
+        self.validate_pending_body(pending).await?;
+        self.validate_pending_plan(&binding, history, pending, purpose)
+            .await?;
+        state.pending_summary = None;
+        state.hard_rounds = 0;
+        state.hard_round_limit = 0;
+        Ok(Some(self.state_patch(&state)?.into_state()))
+    }
+
     /// Explicit adoption of an unclaimed (pre-U7) timeline by the session
     /// whose validated U6 state it carries. The claim lands first and bumps
     /// the store revision, so the state is rebuilt from the claimed timeline

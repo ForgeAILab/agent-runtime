@@ -37,6 +37,8 @@ impl<'a> TurnMachine<'a> {
             turn_id,
             acceptance,
             checkpoint: None,
+            ordinary_lcm_intent_saved: false,
+            ordinary_lcm_hard_admitted: false,
         }
     }
 
@@ -69,6 +71,8 @@ impl<'a> TurnMachine<'a> {
             turn_id,
             acceptance: None,
             checkpoint: Some(checkpoint),
+            ordinary_lcm_intent_saved: false,
+            ordinary_lcm_hard_admitted: false,
         }
     }
 
@@ -434,6 +438,21 @@ impl<'a> TurnMachine<'a> {
             return;
         }
 
+        // Terminal LCM synchronization can append the provider response to
+        // the immutable store. Save its canonical source first, so a crash
+        // after that append can use the existing exact append-successor proof
+        // rather than losing a hard-admitted turn's response/history.
+        if self.ordinary_lcm_hard_admitted {
+            if let Some(store) = &self.driver.session_store {
+                let persist_gate = self.execution.persist_gate();
+                let _persist_gate = persist_gate.lock().await;
+                if let Err(error) = store.save(&self.snapshot()).await {
+                    self.emit_non_durable_failure(error, visible_output);
+                    return;
+                }
+            }
+        }
+
         if let Err(error) = self
             .run_turn_commit_hooks(&finish, visible_output, provider_error_kind)
             .await
@@ -652,6 +671,21 @@ impl<'a> TurnMachine<'a> {
         for event in hook_events {
             self.emitter
                 .emit(Some(self.turn_id.clone()), event.into_runtime_event());
+        }
+        if self.driver.checkpoint_store.is_none()
+            && (retry_admission || self.ordinary_lcm_intent_saved)
+        {
+            if let Some(store) = &self.driver.session_store {
+                // Publish each Sensitive intent before its CAS, and its
+                // finalized successor before provider admission. Until the
+                // save succeeds, the preceding saved intent remains exact
+                // crash-recovery proof for any already committed mutation.
+                let persist_gate = self.execution.persist_gate();
+                let _persist_gate = persist_gate.lock().await;
+                store.save(&self.snapshot()).await?;
+                self.ordinary_lcm_intent_saved = retry_admission;
+                self.ordinary_lcm_hard_admitted = true;
+            }
         }
         if let Some(error) = blocked {
             // A blocked admission must cross the protected Planning

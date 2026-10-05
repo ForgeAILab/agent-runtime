@@ -7,6 +7,16 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- LCM hard admission with a SessionStore and no CheckpointStore now saves its
+  Sensitive pending response and full canonical snapshot before the summary DAG
+  CAS. Resume validates and discards an uncommitted intent or adopts its exact
+  committed successor without duplicate nodes. Finalized successor state is
+  saved before provider admission, and canonical response history is saved
+  before terminal LCM append. A staging save failure refuses provider admission. Checkpointed and storeless hosts retain existing behavior;
+  no public production API, schema version or store migration changes.
+
 ### Breaking
 
 - U.1: `RuntimeBuilder::build()` now rejects static workspace write scopes

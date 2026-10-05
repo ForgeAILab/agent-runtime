@@ -14,3 +14,6 @@ mod lcm_working_set;
 
 #[path = "conformance/session_timeline.rs"]
 mod session_timeline;
+
+#[path = "conformance/lcm_durable_hard_admission.rs"]
+mod lcm_durable_hard_admission;
