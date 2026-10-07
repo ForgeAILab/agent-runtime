@@ -1569,6 +1569,21 @@ impl<'a> TurnMachine<'a> {
                         // An external effect may have occurred before a result
                         // checkpoint failed. Keep the last durable
                         // ExecutingTools state and never replay it implicitly.
+                        // Without a checkpoint store nothing will reconcile
+                        // that state later: the response that requested the
+                        // calls is canonical, so close the ones left without
+                        // a result. Otherwise a host saving this session
+                        // persists an exchange every later turn is rejected
+                        // for. A checkpointed host closes them when it
+                        // finalizes or recovers the interrupted checkpoint.
+                        if self.driver.checkpoint_store.is_none() {
+                            if let Some(checkpoint) = self.checkpoint.clone() {
+                                self.close_unanswered_tool_calls(
+                                    &checkpoint,
+                                    recovery::TURN_FAILED_BEFORE_RESULT,
+                                );
+                            }
+                        }
                         self.emit_non_durable_failure(error, visible_output);
                         return;
                     }

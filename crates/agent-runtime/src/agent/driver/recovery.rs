@@ -1,5 +1,8 @@
 use super::*;
 
+const TOOLS_CHANGED_BEFORE_RESULT: &str = "this unfinished action was not retried after the available tools changed; its outcome is unverified; inspect previous changes before retrying";
+pub(super) const TURN_FAILED_BEFORE_RESULT: &str = "the turn failed before this action's result was recorded; it was not retried and its outcome is unverified; inspect previous changes before retrying";
+
 impl<'a> TurnMachine<'a> {
     /// Finalizes one validated non-terminal checkpoint from a turn that is
     /// no longer running as an explicit `Failed` terminal.
@@ -35,7 +38,7 @@ impl<'a> TurnMachine<'a> {
             );
         }
         if activation_changed {
-            self.close_upgrade_tool_calls(&checkpoint);
+            self.close_unanswered_tool_calls(&checkpoint, TOOLS_CHANGED_BEFORE_RESULT);
             let finish = match &checkpoint.state {
                 TurnState::Completing { finish, .. }
                 | TurnState::PublishingTerminal { finish, .. } => finish.clone(),
@@ -86,6 +89,7 @@ impl<'a> TurnMachine<'a> {
             self.publish_terminal(finish, checkpoint.visible_output)
                 .await;
         } else {
+            self.close_unanswered_tool_calls(&checkpoint, TURN_FAILED_BEFORE_RESULT);
             self.emitter.emit(
                 Some(self.turn_id.clone()),
                 RuntimeEvent::Error {
@@ -99,10 +103,15 @@ impl<'a> TurnMachine<'a> {
         }
     }
 
-    /// Close only unmatched tool calls from the interrupted turn. Committed
-    /// results stay byte-for-byte intact; unknown outcomes never become a
-    /// success claim or a replay of the original invocation.
-    fn close_upgrade_tool_calls(&self, checkpoint: &TurnCheckpoint) {
+    /// Close only unmatched tool calls from a turn that will not finish its
+    /// tool step. Committed results stay byte-for-byte intact; unknown
+    /// outcomes never become a success claim or a replay of the original
+    /// invocation.
+    ///
+    /// The model response that requested the calls is already canonical, so
+    /// a turn that ends without closing them leaves an exchange the context
+    /// planner rejects as `invalid_pairing` on every later turn.
+    pub(super) fn close_unanswered_tool_calls(&self, checkpoint: &TurnCheckpoint, reason: &str) {
         let known = match &checkpoint.state {
             TurnState::AwaitingApproval { slots, .. }
             | TurnState::AwaitingInteraction { slots, .. }
@@ -131,11 +140,7 @@ impl<'a> TurnMachine<'a> {
                 continue;
             }
             let result = known.get(&call.id).cloned().unwrap_or_else(|| {
-                crate::tool::executor::error_block(
-                    &call,
-                    "this unfinished action was not retried after the available tools changed; its outcome is unverified; inspect previous changes before retrying",
-                    self.driver.config.output_limit,
-                )
+                crate::tool::executor::error_block(&call, reason, self.driver.config.output_limit)
             });
             state.history.push(Message::tool_result(result.clone()));
             self.emitter.emit(
