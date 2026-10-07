@@ -10,6 +10,8 @@ mod cache_evidence;
 mod delta_coalescing;
 #[path = "integration/external_agent.rs"]
 mod external_agent;
+#[path = "integration/failed_tool_step_pairing.rs"]
+mod failed_tool_step_pairing;
 #[path = "integration/fetch_tool_integration.rs"]
 mod fetch_tool_integration;
 #[path = "integration/interrupted_turn_admission.rs"]

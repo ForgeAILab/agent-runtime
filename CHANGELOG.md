@@ -9,6 +9,15 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
+- A turn that fails in the middle of a tool step no longer leaves its tool
+  calls unanswered in canonical history. The model response requesting them is
+  already canonical at that point, so the session was rejected as
+  `invalid_pairing` on every later turn, and a host saving the session carried
+  that across restarts. Each unanswered call is now closed with an explicit
+  error result and is never replayed: at the failure for a host with no
+  CheckpointStore, and when the interrupted checkpoint is finalized on the next
+  admission for a checkpointed host. Sessions already saved in that state are
+  not repaired.
 - LCM hard admission with a SessionStore and no CheckpointStore now saves its
   Sensitive pending response and full canonical snapshot before the summary DAG
   CAS. Resume validates and discards an uncommitted intent or adopts its exact
