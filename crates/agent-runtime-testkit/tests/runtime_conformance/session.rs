@@ -591,6 +591,7 @@ async fn live_initial_activation_uses_the_smallest_authorized_intent_bundle() {
     assert_eq!(
         names(&requests[0]),
         BTreeSet::from([
+            agent_runtime::harness::CAPABILITY_ACTIVATE_TOOL_NAME.to_owned(),
             CAPABILITY_SEARCH_TOOL_NAME.to_owned(),
             "activation_read".to_owned(),
         ]),
@@ -599,6 +600,7 @@ async fn live_initial_activation_uses_the_smallest_authorized_intent_bundle() {
     assert_eq!(
         names(&requests[2]),
         BTreeSet::from([
+            agent_runtime::harness::CAPABILITY_ACTIVATE_TOOL_NAME.to_owned(),
             CAPABILITY_SEARCH_TOOL_NAME.to_owned(),
             "activation_read".to_owned(),
             "checkpoint_write".to_owned(),

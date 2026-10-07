@@ -172,7 +172,7 @@ pub fn registry_search(
     embedding: Option<&dyn EmbeddingIndex>,
     max_results: usize,
 ) -> DiscoveryResult {
-    let retrieval = retrieve(view, query, embedding);
+    let retrieval = crate::capability::retrieval::retrieve_descriptive(view, query, embedding);
     DiscoveryResult {
         query_fingerprint: retrieval.query_fingerprint,
         cards: retrieval

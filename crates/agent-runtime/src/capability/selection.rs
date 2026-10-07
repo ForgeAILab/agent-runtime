@@ -378,9 +378,16 @@ fn try_admit(
             }
             let alt_cost = costs.get(alt).copied().unwrap_or_default();
             let tentative_context = delta_context + alt_descriptor.context_cost().total_tokens();
+            let tentative_instruction = instruction_tokens(candidate)
+                + extra_bindings
+                    .iter()
+                    .map(|binding| instruction_tokens(&binding.descriptor))
+                    .sum::<u32>()
+                + instruction_tokens(&alt_descriptor);
             let tentative_latency = delta_latency + alt_cost.latency_ms;
             let tentative_monetary = delta_monetary + alt_cost.monetary_cost_cents;
             if used_context + tentative_context > budgets.max_context_tokens
+                || used_instruction + tentative_instruction > budgets.max_instruction_tokens
                 || used_latency + tentative_latency > budgets.max_latency_ms
                 || used_monetary + tentative_monetary > budgets.max_monetary_cost_cents
                 || chosen.len() + extra_bindings.len() + 2 > budgets.max_candidates
@@ -455,6 +462,51 @@ fn try_admit(
         delta_instruction,
         delta_latency,
         delta_monetary,
+    })
+}
+
+/// Resolve one explicitly requested id using the existing dependency and
+/// conflict rules, without greedy affordance pruning or candidate cardinality.
+pub(crate) fn select_explicit(
+    view: &RegistryView<AbilityDescriptor>,
+    descriptor: &AbilityDescriptor,
+    already_active: &[RegistryId],
+) -> Result<ActivationPlan, RejectionReason> {
+    select_explicit_with_budgets(
+        view,
+        descriptor,
+        already_active,
+        &SelectionBudgets::unbounded(),
+    )
+}
+
+pub(crate) fn select_explicit_with_budgets(
+    view: &RegistryView<AbilityDescriptor>,
+    descriptor: &AbilityDescriptor,
+    already_active: &[RegistryId],
+    budgets: &SelectionBudgets,
+) -> Result<ActivationPlan, RejectionReason> {
+    let admission = try_admit(
+        descriptor.id(),
+        descriptor,
+        view,
+        &[],
+        already_active,
+        budgets,
+        &BTreeMap::new(),
+        0,
+        0,
+        0,
+        0,
+    )?;
+    let mut bindings = vec![admission.candidate_binding];
+    bindings.extend(admission.extra_bindings);
+    Ok(ActivationPlan {
+        bindings,
+        rejected: Vec::new(),
+        used_context_tokens: admission.delta_context,
+        used_latency_ms: admission.delta_latency,
+        used_monetary_cost_cents: admission.delta_monetary,
     })
 }
 

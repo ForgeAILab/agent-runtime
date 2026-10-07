@@ -291,3 +291,48 @@ mod tests {
         assert_bundle_is_dependency_complete_and_conflict_free(&plan, &[]);
     }
 }
+
+#[cfg(test)]
+mod descriptive_conformance {
+    use super::*;
+    use agent_runtime::ability::descriptor::ContextCost;
+    use agent_runtime::capability::ActivationBudget;
+
+    #[test]
+    fn explicit_text_discovery_respects_scope_and_prefers_tools_without_noisy_preactivation() {
+        let tool = conformance_descriptor(AbilityKind::Tool, "terminal", "Inspect eigenvectors")
+            .with_affordances(["inspect"])
+            .with_context_cost(ContextCost::new(10, 0));
+        let skill = conformance_descriptor(AbilityKind::Skill, "reference", "Inspect eigenvectors")
+            .with_affordances(["reference"])
+            .with_context_cost(ContextCost::new(0, 10));
+        let denied =
+            conformance_descriptor(AbilityKind::Tool, "restricted", "Inspect eigenvectors");
+        let view = conformance_view(
+            vec![tool, skill, denied],
+            ViewFilter::new().deny_id(RegistryId::tool("restricted")),
+        );
+        let resolver = CapabilityResolver::new();
+        let query = RoutingQuery::derive("eigenvectors", Vec::<String>::new());
+        // With ample instruction budget, metadata-only pre-activation still
+        // binds nothing: safety does not depend on budget accidentally starving it.
+        let initial = resolver.pre_activate(&view, &query, ActivationBudget::new(10_000, 8));
+        assert!(initial.result().plan.is_empty());
+        assert!(initial.result().retrieval.candidates.is_empty());
+        let explicit = resolver.retrieve_descriptive(&view, &query);
+        assert_eq!(explicit, resolver.retrieve_descriptive(&view, &query));
+        assert_eq!(explicit.candidates.len(), 2);
+        assert_eq!(
+            explicit.candidates[0].descriptor.id(),
+            &RegistryId::tool("terminal")
+        );
+        assert_eq!(
+            explicit.candidates[1].descriptor.id(),
+            &RegistryId::skill("reference")
+        );
+        assert_eq!(
+            resolver.registry_search(&view, &query, 1).cards[0].id,
+            RegistryId::tool("terminal")
+        );
+    }
+}

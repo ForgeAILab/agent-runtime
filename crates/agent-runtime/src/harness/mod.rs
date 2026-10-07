@@ -17,7 +17,8 @@ pub use artifacts::{
     DEFAULT_ARTIFACT_READ_BYTES,
 };
 pub use capability_search::{
-    CAPABILITY_SEARCH_TOOL_NAME, CapabilitySearchTool, MAX_CAPABILITY_SEARCH_RESULTS,
+    CAPABILITY_ACTIVATE_TOOL_NAME, CAPABILITY_SEARCH_TOOL_NAME, CapabilityActivateTool,
+    CapabilitySearchTool, MAX_CAPABILITY_SEARCH_RESULTS,
 };
 pub use fetch::{
     DEFAULT_MAX_FETCH_BYTES, DEFAULT_MAX_OUTPUT_CHARS, FETCH_TOOL_NAME, FetchFormat, FetchRequest,

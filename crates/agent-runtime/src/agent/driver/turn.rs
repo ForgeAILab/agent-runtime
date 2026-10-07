@@ -653,10 +653,14 @@ impl<'a> TurnMachine<'a> {
         call: &ToolCall,
         mut outcome: ToolOutcome,
     ) -> Result<(), RuntimeError> {
-        let mut search_stage = if call.name == CAPABILITY_SEARCH_TOOL_NAME {
+        let mut search_stage = if matches!(
+            call.name.as_str(),
+            CAPABILITY_SEARCH_TOOL_NAME | CAPABILITY_ACTIVATE_TOOL_NAME
+        ) {
             self.execution
                 .abilities
                 .as_ref()
+                .filter(|abilities| abilities.has_staged_call(&call.id))
                 .map(|abilities| abilities.search_stage_guard(&call.id))
                 .transpose()?
         } else {

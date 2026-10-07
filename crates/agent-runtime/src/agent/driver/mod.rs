@@ -63,10 +63,10 @@ use crate::agent::config::LoopConfig;
 use crate::agent::planning::{PreviousCacheRestore, RunPlanner};
 use crate::cache::CacheMechanism;
 use crate::harness::{
-    CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView, HarnessPipeline,
-    HistoryProjection, HistoryView, LiveAbilityRuntime, ModelView, QUESTIONNAIRE_TOOL_NAME,
-    SEMANTIC_SUMMARY_COMPONENT_ID, SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, ToolOutputView,
-    TurnCommitPatch, TurnCommitView,
+    CAPABILITY_ACTIVATE_TOOL_NAME, CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView,
+    HarnessPipeline, HistoryProjection, HistoryView, LiveAbilityRuntime, ModelView,
+    QUESTIONNAIRE_TOOL_NAME, SEMANTIC_SUMMARY_COMPONENT_ID,
+    SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, ToolOutputView, TurnCommitPatch, TurnCommitView,
 };
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;

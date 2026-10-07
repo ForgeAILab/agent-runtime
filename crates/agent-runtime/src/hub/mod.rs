@@ -29,5 +29,6 @@ mod store;
 pub use diagnostics::{DomainDiagnostics, ExclusionReason, ExclusionReasons, ScopeDiagnostics};
 pub use domain::{AbilityHandle, ContextPolicyHandle, ProviderHandle, TokenizerHandle};
 pub use index::HubEntry;
-pub use scope::{AgentView, ScopeIdentity, ScopeInputs, ScopedRegistry};
+pub(crate) use scope::is_bootstrap;
+pub use scope::{AgentView, CapabilityPattern, ScopeIdentity, ScopeInputs, ScopedRegistry};
 pub use store::{RegistryHub, RegistryHubBuilder, RegistryHubError};
