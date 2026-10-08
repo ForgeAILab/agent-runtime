@@ -72,7 +72,7 @@ pub use memory::InMemoryLcmStore;
 
 /// The package's semantic contract revision.  Hosts should include this in
 /// their run manifests and compatibility checks when they persist LCM state.
-pub const LCM_ALGORITHM_REVISION: &str = "agent-runtime-lcm-2";
+pub const LCM_ALGORITHM_REVISION: &str = "agent-runtime-lcm-3";
 
 /// Stable purpose for separately attributed semantic summary model work.
 pub const LCM_SUMMARY_PURPOSE: &str = "context.semantic_summary";

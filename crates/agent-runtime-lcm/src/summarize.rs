@@ -17,6 +17,10 @@ use crate::node::LcmNode;
 use crate::planning::{LcmSizer, source_fingerprint_entries, source_fingerprint_nodes};
 
 const ELISION_MARKER: &str = "\n[lcm deterministic elision]\n";
+/// First line of every deterministic fallback, when it fits. The fallback is
+/// kept as assistant text in later requests; the label tells the model it is
+/// reading old transcript, not a summary and not a form for its next reply.
+const FALLBACK_LABEL: &str = "[excerpt of earlier conversation, not a summary]\n";
 
 /// Escalation stage used for provenance and replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,7 +384,7 @@ impl Default for LcmEscalationPolicy {
             min_reclaim_ratio: 0.5,
             deterministic_token_cap: 512,
             algorithm_revision: RegistryRevision::from_content(
-                "lcm-deterministic-head-tail-tools-2",
+                "lcm-deterministic-head-tail-tools-3",
             ),
         }
     }
@@ -648,12 +652,21 @@ impl LcmEscalatingSummarizer {
         source_tokens: u64,
         sizer: &dyn LcmSizer,
     ) -> Result<(String, u64), u64> {
-        let serialized = render_summary_source(messages, Some(256));
+        let serialized = render_fallback_source(messages, 256);
         let target = self
             .policy
             .deterministic_token_cap
             .min(source_tokens.saturating_sub(1));
-        let text = truncate_head_tail_to_cap(&serialized, target, sizer);
+        // The label is part of the target. A source too small to carry it
+        // gets the bare cut, so the label never makes a source unsummarizable.
+        let labelled = target
+            .checked_sub(sizer.summary_tokens(FALLBACK_LABEL))
+            .map(|body| truncate_head_tail_to_cap(&serialized, body, sizer))
+            .filter(|body| !body.trim().is_empty())
+            .map(|body| format!("{FALLBACK_LABEL}{body}"))
+            .filter(|text| sizer.summary_tokens(text) <= target);
+        let text =
+            labelled.unwrap_or_else(|| truncate_head_tail_to_cap(&serialized, target, sizer));
         let token_count = sizer.summary_tokens(&text);
         if text.trim().is_empty() || token_count >= source_tokens {
             return Err(target);
@@ -887,6 +900,70 @@ pub fn render_summary_source(messages: &[Message], part_chars: Option<usize>) ->
             crate::Role::Tool => "tool: ",
         });
         render(&message.content, part_chars, &mut out);
+    }
+    out
+}
+
+/// Renders source bodies for the deterministic fallback, whose text is stored
+/// as a summary and shown to the model as its own earlier message.
+///
+/// Tool names, capped arguments and capped results are kept as evidence, but
+/// as bracketed notes on their own lines: a model that reads
+/// `assistant: call name(args)` in its context writes that back as a reply
+/// instead of calling the tool. Reasoning is left out; it is not part of what
+/// was said or done.
+fn render_fallback_source(messages: &[Message], part_chars: usize) -> String {
+    fn excerpt(text: &str, cap: usize) -> String {
+        if text.chars().count() <= cap {
+            return text.to_owned();
+        }
+        let mut result: String = text.chars().take(cap / 2).collect();
+        result.push_str(" … ");
+        let tail: String = text.chars().rev().take(cap / 2).collect();
+        result.extend(tail.chars().rev());
+        result
+    }
+    fn render(parts: &[ContentPart], role: &str, cap: usize, out: &mut String) {
+        for part in parts {
+            match part {
+                ContentPart::Text { text } => {
+                    out.push_str(role);
+                    out.push_str(&excerpt(text, cap));
+                }
+                ContentPart::Reasoning { .. } => continue,
+                ContentPart::ToolCall(call) => {
+                    out.push_str(&format!(
+                        "[earlier tool call: {} {}]",
+                        call.name,
+                        excerpt(&call.arguments.to_string(), cap)
+                    ));
+                }
+                ContentPart::ToolResult(result) => {
+                    out.push_str(&format!(
+                        "[earlier tool result: {}{}]\n",
+                        result.name,
+                        if result.is_error { ", error" } else { "" }
+                    ));
+                    render(&result.content, "", cap, out);
+                    continue;
+                }
+                ContentPart::Image { .. } => {
+                    out.push_str(role);
+                    out.push_str("[image]");
+                }
+            }
+            out.push('\n');
+        }
+    }
+    let mut out = String::new();
+    for message in messages {
+        let role = match message.role {
+            crate::Role::System => "system: ",
+            crate::Role::User => "user: ",
+            crate::Role::Assistant => "assistant: ",
+            crate::Role::Tool => "",
+        };
+        render(&message.content, role, part_chars, &mut out);
     }
     out
 }
@@ -1231,6 +1308,104 @@ mod tests {
         ));
         assert!(outcome.token_count < source_tokens);
         assert!(outcome.text.contains("elision"));
+        assert!(outcome.text.starts_with(FALLBACK_LABEL));
+    }
+
+    fn tool_turn() -> Vec<LcmEntry> {
+        use agent_runtime_core::content::{ToolCall, ToolResultBlock};
+        use agent_runtime_core::ids::ToolCallId;
+        let messages = [
+            crate::Message::user(format!("Check the games page. {}", "detail ".repeat(40))),
+            crate::Message::assistant(vec![
+                ContentPart::Reasoning {
+                    text: "private deliberation".into(),
+                    redacted: false,
+                    signature: None,
+                },
+                ContentPart::ToolCall(ToolCall {
+                    id: ToolCallId::new("call-1"),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "python3 watch.py"}),
+                }),
+            ]),
+            crate::Message {
+                role: crate::Role::Tool,
+                content: vec![ContentPart::ToolResult(ToolResultBlock {
+                    call_id: ToolCallId::new("call-1"),
+                    name: "shell".into(),
+                    content: vec![ContentPart::text("nothing new")],
+                    is_error: false,
+                })],
+            },
+        ];
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| {
+                LcmEntry::new(
+                    LcmTimelineId::new("t"),
+                    LcmEntryId::new(format!("e{index}")),
+                    LcmSequence::new(index as u64 + 1),
+                    message,
+                    LcmSourceMetadata::new(LcmClassification::new(
+                        Sensitivity::Internal,
+                        TrustClass::UserContent,
+                    )),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fallback_keeps_tool_evidence_without_call_syntax_or_reasoning() {
+        let model = Arc::new(FakeModel {
+            responses: Mutex::new(VecDeque::new()),
+            revision: RegistryRevision::from_content("model"),
+        });
+        let outcome = LcmEscalatingSummarizer::new(model)
+            .summarize(
+                &tool_turn(),
+                LcmOperationFingerprint::from_fields(["op"]),
+                &CharRatioSizer::new(),
+                "test.summary",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.provenance,
+            SummaryProvenance::Deterministic {
+                revision: LcmEscalationPolicy::default().algorithm_revision,
+            }
+        );
+        assert!(outcome.text.starts_with(FALLBACK_LABEL));
+        // The evidence stays: which tool ran, with what, and what came back.
+        assert!(
+            outcome
+                .text
+                .contains(r#"[earlier tool call: shell {"command":"python3 watch.py"}]"#)
+        );
+        assert!(
+            outcome
+                .text
+                .contains("[earlier tool result: shell]\nnothing new")
+        );
+        // Nothing a model could copy as its next action, and no reasoning.
+        assert!(!outcome.text.contains("call shell("));
+        assert!(!outcome.text.contains("assistant: ["));
+        assert!(!outcome.text.contains("private deliberation"));
+    }
+
+    #[test]
+    fn a_source_too_small_for_the_label_still_gets_a_fallback() {
+        let summarizer = LcmEscalatingSummarizer::new(Arc::new(FakeModel {
+            responses: Mutex::new(VecDeque::new()),
+            revision: RegistryRevision::from_content("model"),
+        }));
+        let sizer = CharRatioSizer::new();
+        let label_tokens = sizer.summary_tokens(FALLBACK_LABEL);
+        let source = entries(&"word ".repeat(8));
+        assert!(sizer.entry_tokens(&source[0]) <= label_tokens);
+        assert!(summarizer.can_always_summarize(&source, &sizer));
     }
 
     #[derive(Debug)]
