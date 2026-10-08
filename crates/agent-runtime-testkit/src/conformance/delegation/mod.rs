@@ -11,8 +11,10 @@ mod authorization;
 mod durable_recovery;
 mod lifecycle;
 mod returned_input;
+mod tool_delivery;
 
 pub use authorization::*;
 pub use durable_recovery::*;
 pub use lifecycle::*;
 pub use returned_input::*;
+pub use tool_delivery::*;

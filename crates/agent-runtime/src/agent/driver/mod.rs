@@ -66,8 +66,8 @@ use crate::agent::config::LoopConfig;
 use crate::agent::planning::{PreviousCacheRestore, RunPlanner};
 use crate::cache::CacheMechanism;
 use crate::harness::{
-    CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView, HarnessPipeline,
-    HistoryProjection, HistoryView, IdleCompactionResult, LCM_COMPONENT_ID,
+    CAPABILITY_ACTIVATE_TOOL_NAME, CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView,
+    HarnessPipeline, HistoryProjection, HistoryView, IdleCompactionResult, LCM_COMPONENT_ID,
     LCM_IDLE_COMPACTION_PURPOSE, LCM_SUMMARY_PURPOSE, LiveAbilityRuntime, ModelView,
     QUESTIONNAIRE_TOOL_NAME, ToolOutputView, TurnCommitView,
 };
@@ -491,6 +491,7 @@ impl ReasoningAccumulator {
                 text: part.text,
                 redacted: part.redacted,
                 signature: part.signature,
+                producer: None,
             })
             .collect()
     }

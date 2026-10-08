@@ -34,7 +34,7 @@ use agent_runtime_context::plan::{ContextPlan, PlanInputs};
 use agent_runtime_context::planner::ContextPlanner;
 use agent_runtime_context::sizing::RequestSizer;
 use agent_runtime_core::catalog::ResolvedModelProfile;
-use agent_runtime_core::content::{ContentPart, Message, Role};
+use agent_runtime_core::content::{ContentPart, Message, ReasoningProducer, Role};
 use agent_runtime_core::ids::ToolCallId;
 use agent_runtime_core::manifest::{
     ActivatedCapability, CapabilityResolution, ContextSegmentRecord, LosslessSummaryClassification,
@@ -110,6 +110,7 @@ impl RunRevisions {
 pub struct RunPlanner {
     profile: ResolvedModelProfile,
     provider_name: String,
+    requires_nonempty_assistant_content: bool,
     sizer: std::sync::Arc<dyn RequestSizer>,
     policy: ContextPolicy,
     compactor: Option<StructuralCompactor>,
@@ -151,6 +152,7 @@ impl RunPlanner {
         Self {
             profile,
             provider_name: provider_name.into(),
+            requires_nonempty_assistant_content: false,
             sizer,
             policy,
             compactor,
@@ -173,6 +175,18 @@ impl RunPlanner {
     /// The frozen model profile this session plans against.
     pub fn profile(&self) -> &ResolvedModelProfile {
         &self.profile
+    }
+
+    pub(crate) fn reasoning_producer(&self) -> ReasoningProducer {
+        ReasoningProducer {
+            provider: self.provider_name.clone(),
+            model: self.profile.model.clone(),
+        }
+    }
+
+    pub(crate) fn with_nonempty_assistant_content(mut self, required: bool) -> Self {
+        self.requires_nonempty_assistant_content = required;
+        self
     }
 
     /// The run-scoped revisions folded into every plan fingerprint.
@@ -201,7 +215,8 @@ impl RunPlanner {
             self.compactor.clone(),
             self.cache_capability.clone(),
             self.revisions.clone(),
-        );
+        )
+        .with_nonempty_assistant_content(self.requires_nonempty_assistant_content);
         if let Some(endpoint) = &self.cache_endpoint_identity {
             planner = planner.with_cache_endpoint_identity(endpoint.clone());
         }
@@ -543,8 +558,14 @@ impl RunPlanner {
         fragments.extend(contributed.iter().cloned());
 
         let mut group_start: Option<usize> = None;
+        let producer = self.reasoning_producer();
         for (index, message) in history.iter().enumerate() {
             let absolute_index = history_index_offset.saturating_add(index);
+            let Some(message) =
+                message.for_reasoning_producer(&producer, self.requires_nonempty_assistant_content)
+            else {
+                continue;
+            };
             // Before the active turn, user messages begin historical groups.
             // From the accepted input onward, later user-role injections
             // remain part of the same active group.
@@ -567,7 +588,7 @@ impl RunPlanner {
                 kind,
                 FragmentSource::History,
                 revision,
-                FragmentContent::Message(message.clone()),
+                FragmentContent::Message(message),
             )
             .with_priority(absolute_index as i32)
             .with_position(ContextPosition::new(
@@ -921,6 +942,114 @@ mod tests {
             .iter()
             .map(|text| UserInput::text(*text).into_message())
             .collect()
+    }
+
+    #[test]
+    fn same_producer_reasoning_keeps_context_and_cache_fingerprints() {
+        let planner = planner(8_000);
+        let own = vec![
+            Message::user("first"),
+            Message::assistant(vec![
+                ContentPart::Reasoning {
+                    text: "signed thought".into(),
+                    redacted: false,
+                    signature: Some("sig-1".into()),
+                    producer: Some(planner.reasoning_producer()),
+                },
+                ContentPart::text("answer"),
+            ]),
+            Message::user("continue"),
+        ];
+        let mut legacy = own.clone();
+        if let ContentPart::Reasoning { producer, .. } = &mut legacy[1].content[0] {
+            *producer = None;
+        }
+        let own_plan = planner.plan_turn(None, &own, &[]).unwrap().plan;
+        let legacy_plan = planner.plan_turn(None, &legacy, &[]).unwrap().plan;
+        assert_eq!(own_plan.messages(), own);
+        assert_eq!(legacy_plan.messages(), legacy);
+        assert_eq!(own_plan.input_tokens(), legacy_plan.input_tokens());
+        assert_eq!(own_plan.fingerprint(), legacy_plan.fingerprint());
+        assert_eq!(
+            own_plan.cache_plan().map(CachePlan::fingerprint),
+            legacy_plan.cache_plan().map(CachePlan::fingerprint)
+        );
+    }
+
+    #[test]
+    fn foreign_reasoning_is_projected_before_context_and_cache_planning() {
+        let planner = planner(8_000);
+        let foreign = ReasoningProducer {
+            provider: "foreign".into(),
+            ..planner.reasoning_producer()
+        };
+        let canonical = vec![
+            Message::user("first"),
+            Message::assistant(vec![
+                ContentPart::Reasoning {
+                    text: "foreign thought that must not be counted".into(),
+                    redacted: true,
+                    signature: Some("foreign-signature".into()),
+                    producer: Some(foreign),
+                },
+                ContentPart::text("answer"),
+            ]),
+            Message::user("continue"),
+        ];
+        let mut expected = canonical.clone();
+        expected[1].content.remove(0);
+        let projected = planner.plan_turn(None, &canonical, &[]).unwrap();
+        let baseline = planner.plan_turn(None, &expected, &[]).unwrap();
+        assert_eq!(projected.plan.messages(), expected);
+        assert_eq!(projected.plan.input_tokens(), baseline.plan.input_tokens());
+        assert_eq!(
+            projected.manifest.context_fingerprint,
+            baseline.manifest.context_fingerprint
+        );
+        assert_eq!(
+            projected.manifest.cache_plan_fingerprint,
+            baseline.manifest.cache_plan_fingerprint
+        );
+        assert_eq!(canonical[1].content.len(), 2);
+    }
+
+    #[test]
+    fn omitting_foreign_only_assistants_preserves_history_indices_and_active_start() {
+        let planner = planner(8_000).with_nonempty_assistant_content(true);
+        let canonical = vec![
+            Message::user("first"),
+            Message::assistant(vec![ContentPart::Reasoning {
+                text: "foreign thought".into(),
+                redacted: true,
+                signature: Some("foreign-signature".into()),
+                producer: Some(ReasoningProducer {
+                    provider: "foreign".into(),
+                    ..planner.reasoning_producer()
+                }),
+            }]),
+            Message::user("continue"),
+        ];
+        let planned = planner
+            .plan_activated_turn_from(None, &canonical, &[], &[], 2, planner.revisions(), &[])
+            .unwrap();
+        assert_eq!(
+            planned.plan.messages(),
+            &[canonical[0].clone(), canonical[2].clone()]
+        );
+        let segments = planned.plan.segments();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].fragment.as_str(), "history:0");
+        assert_eq!(segments[1].fragment.as_str(), "history:2");
+        assert_eq!(segments[1].kind, FragmentKind::UserInput);
+        assert_eq!(segments[1].cache_class, CacheClass::Ephemeral);
+        let fork = planner.fork_session(&agent_runtime_core::ids::SessionId::new("fork"));
+        assert_eq!(
+            fork.plan_turn(None, &canonical, &[])
+                .unwrap()
+                .plan
+                .messages(),
+            planned.plan.messages()
+        );
     }
 
     #[test]

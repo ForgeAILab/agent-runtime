@@ -46,6 +46,9 @@ pub mod sse;
 mod tool_names;
 pub mod transport;
 
+#[cfg(test)]
+mod reasoning_history_tests;
+
 pub use agent_runtime_core as core;
 pub use agent_runtime_core::provider_credential::{
     CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,

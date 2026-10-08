@@ -167,11 +167,14 @@ pub mod prelude {
         LcmViewAuthority, LcmWriter, QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool,
         StaticLcmTimelineResolver,
     };
-    pub use crate::hub::{RegistryHub, RegistryHubBuilder, ScopeInputs, ScopedRegistry};
+    pub use crate::hub::{
+        CapabilityPattern, RegistryHub, RegistryHubBuilder, ScopeInputs, ScopedRegistry,
+    };
 
     // -- capability retrieval, selection, and pre-activation -----------------
     pub use crate::capability::{
-        ActivationBudget, ActivationEpoch, CapabilityResolver, RoutingQuery,
+        ActivationBudget, ActivationEpoch, CapabilityCatalogEntry, CapabilityResolver,
+        CapabilityState, RoutingQuery,
     };
 
     // -- provider adapters and the embeddable runtime facade -----------------

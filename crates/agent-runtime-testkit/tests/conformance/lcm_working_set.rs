@@ -47,6 +47,7 @@ fn tool_messages() -> Vec<Message> {
                 text: "reasoning evidence ".repeat(20),
                 signature: None,
                 redacted: false,
+                producer: None,
             },
             ContentPart::ToolCall(ToolCall {
                 id: ToolCallId::new("call-1"),

@@ -169,6 +169,7 @@ mod tests {
             text: "sealed thought".into(),
             redacted: true,
             signature: Some("exact signature".into()),
+            producer: None,
         }])];
         let held = cache.capture(&history);
         let owned = held.history.to_vec();
@@ -201,11 +202,13 @@ mod tests {
                     text: "reasoning".into(),
                     redacted: false,
                     signature: None,
+                    producer: None,
                 },
                 ContentPart::Reasoning {
                     text: "sealed".into(),
                     redacted: true,
                     signature: Some("s\"\\".into()),
+                    producer: None,
                 },
                 ContentPart::Image {
                     url: "data:image/png;base64,AA==".into(),

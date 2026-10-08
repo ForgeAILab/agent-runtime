@@ -12,15 +12,18 @@ impl LiveAbilityRuntime {
         scope_inputs: ScopeInputs,
         budget: ActivationBudget,
     ) -> Result<SealedLiveAbilities, RuntimeError> {
-        if tools
-            .iter()
-            .any(|tool| tool.spec().name == CAPABILITY_SEARCH_TOOL_NAME)
-        {
-            return Err(RuntimeError::conflict(format!(
-                "`{CAPABILITY_SEARCH_TOOL_NAME}` is a protected runtime ability name"
-            )));
+        if tools.iter().any(|tool| {
+            matches!(
+                tool.spec().name.as_str(),
+                CAPABILITY_SEARCH_TOOL_NAME | CAPABILITY_ACTIVATE_TOOL_NAME
+            )
+        }) {
+            return Err(RuntimeError::conflict(
+                "registry.search and registry.activate are protected runtime ability names",
+            ));
         }
         tools.push(Arc::new(CapabilitySearchTool));
+        tools.push(Arc::new(CapabilityActivateTool));
 
         let mut overrides = BTreeMap::new();
         for descriptor in descriptor_overrides {
@@ -40,8 +43,10 @@ impl LiveAbilityRuntime {
             }
         }
 
-        let search_descriptor = search_descriptor(&tools)?;
-        overrides.insert(search_descriptor.id().clone(), search_descriptor);
+        for name in [CAPABILITY_SEARCH_TOOL_NAME, CAPABILITY_ACTIVATE_TOOL_NAME] {
+            let descriptor = search_descriptor(&tools, name)?;
+            overrides.insert(descriptor.id().clone(), descriptor);
+        }
 
         let mut hub_builder = RegistryHubBuilder::new();
         for tool in &tools {
@@ -83,9 +88,14 @@ impl LiveAbilityRuntime {
                 activation_context,
                 scope_inputs,
                 budget,
+                pinned: BTreeSet::new(),
             }),
             tools,
         })
+    }
+
+    pub(crate) fn set_pinned(&mut self, ids: impl IntoIterator<Item = RegistryId>) {
+        self.pinned = ids.into_iter().collect();
     }
 
     pub(crate) fn snapshot_fingerprint(&self) -> Fingerprint {
@@ -141,50 +151,21 @@ impl LiveAbilityRuntime {
         let visible = agent_view.abilities();
         let mut filter = ViewFilter::new();
         for entry in self.descriptors.iter() {
-            if visible.get(entry.id()).is_none()
-                && entry.id() != &RegistryId::tool(CAPABILITY_SEARCH_TOOL_NAME)
-            {
+            if visible.get(entry.id()).is_none() && !crate::hub::is_bootstrap(entry.id()) {
                 filter = filter.deny_id(entry.id().clone());
             }
         }
         let descriptor_view = self.descriptors.view(&filter);
 
-        let search_id = RegistryId::tool(CAPABILITY_SEARCH_TOOL_NAME);
-        let search_descriptor = self
-            .descriptors
-            .get(&search_id)
-            .ok_or_else(|| RuntimeError::internal("protected registry.search descriptor missing"))?
-            .payload()
-            .clone();
-        let search_ability = self
-            .hub
-            .abilities()
-            .get(&search_id)
-            .ok_or_else(|| RuntimeError::internal("protected registry.search ability missing"))?
-            .payload()
-            .clone();
-        let mut context = self.activation_context.clone();
-        context.expected_revision = Some(search_descriptor.content_revision().clone());
-        self.policy
-            .authorize(&search_descriptor, &context)
-            .map_err(|error| RuntimeError::config(error.to_string()))?;
-        let search_payload = search_ability
-            .materialize()
-            .map_err(|error| RuntimeError::config(error.to_string()))?;
-
-        let mut epochs = ActivationEpochs::new();
-        epochs.advance([(
-            search_id.clone(),
-            search_descriptor.content_revision().clone(),
-        )]);
-        let mut materialized = BTreeMap::new();
-        materialized.insert(search_id, search_payload);
+        let epochs = ActivationEpochs::new();
+        let materialized = BTreeMap::new();
         let mut session = SessionAbilities {
             rebased: false,
             snapshot: self.snapshot_fingerprint(),
             scoped,
             descriptor_view,
             routing_hints,
+            descriptors: self.descriptors.clone(),
             state: Arc::new(Mutex::new(SessionActivationState {
                 epochs,
                 materialized,
@@ -200,6 +181,8 @@ impl LiveAbilityRuntime {
             } else {
                 self.restore_session_state(&session, persisted)?;
             }
+        } else {
+            self.initialize_required(&session)?;
         }
         Ok(session)
     }
@@ -220,7 +203,7 @@ impl LiveAbilityRuntime {
     /// on its own but pushed the activated set past the total — which the
     /// context planner then rejected as an unrecoverable turn failure rather
     /// than the "not enough budget" answer the model could have acted on.
-    fn active_context_tokens(
+    pub(super) fn active_context_tokens(
         &self,
         view: &RegistryView<AbilityDescriptor>,
         already_active: &[RegistryId],
@@ -233,7 +216,7 @@ impl LiveAbilityRuntime {
     }
 
     /// The share of the skill sub-budget the active skills already hold.
-    fn active_instruction_tokens(
+    pub(super) fn active_instruction_tokens(
         &self,
         view: &RegistryView<AbilityDescriptor>,
         already_active: &[RegistryId],
@@ -257,11 +240,24 @@ impl LiveAbilityRuntime {
         crate::capability::ActivationPlan,
     ) {
         let retrieval = self.resolver.retrieve(view, query);
+        let plan = self.select_retrieved(view, &retrieval, already_active, max_candidates);
+        (retrieval, plan)
+    }
+
+    pub(super) fn select_retrieved(
+        &self,
+        view: &RegistryView<AbilityDescriptor>,
+        retrieval: &crate::capability::RetrievalResult,
+        already_active: &[RegistryId],
+        max_candidates: usize,
+    ) -> crate::capability::ActivationPlan {
         let candidates = retrieval
             .candidates
             .iter()
+            .filter(|candidate| !crate::hub::is_bootstrap(candidate.descriptor.id()))
             .filter(|candidate| {
-                candidate.descriptor.id() != &RegistryId::tool(CAPABILITY_SEARCH_TOOL_NAME)
+                !(self.pinned.contains(candidate.descriptor.id())
+                    && already_active.contains(candidate.descriptor.id()))
             })
             .take(max_candidates)
             .cloned()
@@ -276,7 +272,17 @@ impl LiveAbilityRuntime {
         let remaining_candidates = self
             .budget
             .max_candidates
-            .saturating_sub(already_active.len())
+            .saturating_sub(
+                already_active
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|id| {
+                        !self.pinned.contains(*id)
+                            && *id != &RegistryId::tool(CAPABILITY_ACTIVATE_TOOL_NAME)
+                    })
+                    .count(),
+            )
             .min(max_candidates);
         // The skill sub-budget is charged the same way: what the active
         // skills already hold is spent, and activation is monotonic, so a
@@ -285,7 +291,7 @@ impl LiveAbilityRuntime {
             .budget
             .max_instruction_tokens
             .saturating_sub(self.active_instruction_tokens(view, already_active));
-        let plan = self.resolver.select(
+        self.resolver.select(
             view,
             &candidates,
             &SelectionBudgets::new(
@@ -297,8 +303,71 @@ impl LiveAbilityRuntime {
             )
             .with_instruction_budget(remaining_instruction_tokens),
             already_active,
+        )
+    }
+
+    /// Explicit requests use the same dependency admission with only token
+    /// budgets. Resolve unconstrained only to explain why a bounded admission
+    /// failed; it never materializes or stages the diagnostic plan.
+    pub(super) fn explicit_plan(
+        &self,
+        session: &SessionAbilities,
+        descriptor: &AbilityDescriptor,
+        held: &[RegistryId],
+    ) -> Result<crate::capability::ActivationPlan, RuntimeError> {
+        let used = self.active_context_tokens(&session.descriptor_view, held);
+        let instructions = self.active_instruction_tokens(&session.descriptor_view, held);
+        let budgets = SelectionBudgets::new(
+            self.budget.max_schema_tokens.saturating_sub(used),
+            u32::MAX,
+            u32::MAX,
+            RiskLevel::High,
+            usize::MAX,
+        )
+        .with_instruction_budget(
+            self.budget
+                .max_instruction_tokens
+                .saturating_sub(instructions),
         );
-        (retrieval, plan)
+        match crate::capability::selection::select_explicit_with_budgets(
+            &session.descriptor_view,
+            descriptor,
+            held,
+            &budgets,
+        ) {
+            Ok(plan) => Ok(plan),
+            Err(reason) => {
+                if let Ok(plan) = crate::capability::selection::select_explicit(
+                    &session.descriptor_view,
+                    descriptor,
+                    held,
+                ) {
+                    let required = used.saturating_add(plan.used_context_tokens);
+                    if required > self.budget.max_schema_tokens {
+                        return Err(RuntimeError::config(format!(
+                            "max_schema_tokens budget {} requires {required} tokens",
+                            self.budget.max_schema_tokens
+                        )));
+                    }
+                    let required = plan
+                        .bindings
+                        .iter()
+                        .filter(|b| b.descriptor.kind() == &AbilityKind::Skill)
+                        .map(|b| b.descriptor.context_cost().total_tokens())
+                        .fold(instructions, u32::saturating_add);
+                    if required > self.budget.max_instruction_tokens {
+                        return Err(RuntimeError::config(format!(
+                            "max_instruction_tokens budget {} requires {required} tokens",
+                            self.budget.max_instruction_tokens
+                        )));
+                    }
+                }
+                Err(RuntimeError::config(format!(
+                    "cannot activate `{}`: {reason:?}",
+                    descriptor.id()
+                )))
+            }
+        }
     }
 
     pub(super) fn authorize_and_materialize(

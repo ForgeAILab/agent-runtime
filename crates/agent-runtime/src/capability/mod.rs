@@ -61,6 +61,30 @@ pub use selection::{
     RejectionReason, SelectionBudgets,
 };
 
+/// Host-visible state in a session's sealed ability catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityState {
+    /// Materialized in the current activation epoch.
+    Active,
+    /// Authorized and eligible for discovery and activation.
+    Available,
+    /// Sealed in the registry but excluded from this session's scope.
+    Denied,
+}
+
+/// One read-only catalog row for a host to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityCatalogEntry {
+    /// Qualified registry identity.
+    pub id: RegistryId,
+    /// Bounded descriptive summary.
+    pub summary: String,
+    /// Ability kind.
+    pub kind: agent_runtime_ability::AbilityKind,
+    /// Current session visibility and activation state.
+    pub state: CapabilityState,
+}
+
 /// The single resolver behind both pre-activation and the on-demand discovery
 /// fallback: it holds the one optional embedding index and the per-capability
 /// latency/monetary cost hints a host wants every retrieval and selection
@@ -100,6 +124,15 @@ impl CapabilityResolver {
         query: &RoutingQuery,
     ) -> RetrievalResult {
         retrieval::retrieve(view, query, self.embedding.as_deref())
+    }
+
+    /// Retrieves with descriptive whole-word scoring for explicit discovery.
+    pub fn retrieve_descriptive(
+        &self,
+        view: &RegistryView<AbilityDescriptor>,
+        query: &RoutingQuery,
+    ) -> RetrievalResult {
+        retrieval::retrieve_descriptive(view, query, self.embedding.as_deref())
     }
 
     /// Selects a dependency-complete, conflict-free bundle from `candidates`

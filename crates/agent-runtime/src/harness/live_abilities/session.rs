@@ -30,6 +30,7 @@ pub(crate) struct SessionAbilities {
     pub(super) snapshot: Fingerprint,
     pub(super) scoped: ScopedRegistry,
     pub(super) descriptor_view: RegistryView<AbilityDescriptor>,
+    pub(super) descriptors: RegistrySnapshot<AbilityDescriptor>,
     pub(super) routing_hints: Vec<String>,
     pub(super) state: Arc<Mutex<SessionActivationState>>,
 }
@@ -56,6 +57,43 @@ pub(super) struct SessionActivationState {
 }
 
 impl SessionAbilities {
+    pub(super) fn active_ids(&self) -> Vec<RegistryId> {
+        self.state
+            .lock()
+            .expect("activation state poisoned")
+            .epochs
+            .current()
+            .map(|epoch| epoch.activated().iter().map(|(id, _)| id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn capability_catalog(&self) -> Vec<crate::capability::CapabilityCatalogEntry> {
+        let active = self.active_ids();
+        self.descriptors
+            .iter()
+            .map(|entry| crate::capability::CapabilityCatalogEntry {
+                id: entry.id().clone(),
+                summary: entry.card().summary.clone(),
+                kind: entry.payload().kind().clone(),
+                state: if self.descriptor_view.get(entry.id()).is_none() {
+                    crate::capability::CapabilityState::Denied
+                } else if active.contains(entry.id()) {
+                    crate::capability::CapabilityState::Active
+                } else {
+                    crate::capability::CapabilityState::Available
+                },
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_staged_call(&self, call: &ToolCallId) -> bool {
+        self.state
+            .lock()
+            .expect("activation state poisoned")
+            .staged
+            .contains_key(call)
+    }
+
     /// An interrupted turn cannot promote its unfinished activation work.
     /// Already active capabilities remain subject to the normal scoped rebase.
     pub(crate) fn discard_uncommitted_activation(&self) {

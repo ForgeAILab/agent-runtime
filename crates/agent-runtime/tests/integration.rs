@@ -6,6 +6,8 @@ mod active_turn_steering;
 mod cache_admission;
 #[path = "integration/cache_evidence.rs"]
 mod cache_evidence;
+#[path = "integration/context_window_resume.rs"]
+mod context_window_resume;
 #[path = "integration/delta_coalescing.rs"]
 mod delta_coalescing;
 #[path = "integration/external_agent.rs"]
