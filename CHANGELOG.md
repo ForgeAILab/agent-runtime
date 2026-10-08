@@ -9,6 +9,21 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
+- The deterministic LCM fallback no longer stores text a model can copy as a
+  reply. When both summary attempts were rejected, the fallback kept a cut of
+  the source that rendered tool calls as `assistant: call name(args)`. That
+  text is later shown to the model as its own earlier message, and a session
+  holding many fallback nodes started answering with the literal text
+  `call shell({...})` instead of calling the tool. The fallback now renders a
+  tool call as `[earlier tool call: name args]` and a result as
+  `[earlier tool result: name]`, each on its own line, leaves reasoning out,
+  and begins with `[excerpt of earlier conversation, not a summary]` when that
+  fits its target. Tool names, capped arguments and capped results are kept.
+  `LCM_ALGORITHM_REVISION` is now `agent-runtime-lcm-3` and the default
+  deterministic algorithm revision is `lcm-deterministic-head-tail-tools-3`,
+  so persisted LCM state rebuilds its derived metadata once on resume.
+  Fallback nodes already stored keep their old text. `render_summary_source`
+  is unchanged.
 - A turn that fails in the middle of a tool step no longer leaves its tool
   calls unanswered in canonical history. The model response requesting them is
   already canonical at that point, so the session was rejected as
