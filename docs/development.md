@@ -9,10 +9,10 @@ manifest MUST NOT require a sibling relative path to this repository.
 ```toml
 # In a consumer Cargo.toml — pin an exact release.
 [dependencies]
-agent-runtime = "=0.1.0"
+agent-runtime = "=0.2.0"
 
 # Or, before a registry release exists, pin an exact revision:
-# agent-runtime = { git = "https://example.invalid/agent-runtime", tag = "v0.1.0" }
+# agent-runtime = { git = "https://example.invalid/agent-runtime", tag = "v0.2.0" }
 ```
 
 ## Local cross-repository development (uncommitted override)
@@ -77,10 +77,10 @@ up an opaque identity; a timeline or node ID is never an authority grant.
 
 ```toml
 [dependencies]
-agent-runtime-lcm = "0.1"
+agent-runtime-lcm = "0.2"
 
 [dev-dependencies]
-agent-runtime-testkit = "0.1"
+agent-runtime-testkit = "0.2"
 ```
 
 Run the shared testkit against the real adapter before calling it production
