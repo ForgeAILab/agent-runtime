@@ -7,6 +7,11 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-08
+
+The first tagged release since `v0.1.0`. That tag was cut without a changelog
+section of its own, so this section also lists what `v0.1.0` contained.
+
 ### Fixed
 
 - The deterministic LCM fallback no longer stores text a model can copy as a
