@@ -7,6 +7,21 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- An LCM session whose turn was killed between provider steps can be resumed
+  again. Each provider step appends to the LCM timeline, but a host with a
+  SessionStore and no CheckpointStore saves the session when the turn ends, so
+  a process that died mid-turn left the store several appends ahead of the
+  saved session. Resume accepted only the exact checkpoint, a pending summary
+  successor or one canonical append, and refused such a session on every later
+  turn with `LCM DAG revision no longer matches its protected checkpoint`.
+  Resume now drops that tail when the checkpoint has no pending summary, the
+  summary DAG is exactly the one it recorded and every entry below its
+  frontier still matches canonical history. Summary nodes are not changed, and
+  any other disagreement is still a conflict. A store without `truncate_from`
+  keeps the old behavior.
+
 ## [0.2.0] - 2026-10-08
 
 The first tagged release since `v0.1.0`. That tag was cut without a changelog
