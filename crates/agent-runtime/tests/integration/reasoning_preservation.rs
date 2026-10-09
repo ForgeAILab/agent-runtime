@@ -2,8 +2,9 @@
 //!
 //! OpenAI-compatible thinking models (Z.AI GLM among them) require reasoning
 //! during the same turn's tool-call continuation. Signed providers additionally
-//! require opaque continuation after later turns. The driver therefore sheds
-//! prior unsigned reasoning while preserving signed blocks exactly.
+//! require opaque continuation after later turns. The request projection
+//! therefore sheds prior unsigned reasoning while preserving signed blocks
+//! exactly.
 
 use std::sync::Arc;
 

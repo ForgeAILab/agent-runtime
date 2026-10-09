@@ -767,10 +767,9 @@ fn to_openai_messages(msg: &Message) -> Vec<Value> {
         Role::System => vec![json!({"role": "system", "content": msg.joined_text()})],
         Role::User => vec![json!({"role": "user", "content": user_content(msg)})],
         Role::Assistant => {
-            // An assistant message whose only content was unsigned reasoning
-            // shed before the request is left empty rather than removed from
-            // canonical history, and an empty assistant message has nothing
-            // to say on this wire.
+            // An assistant message whose only content was reasoning the
+            // request projection omitted arrives empty rather than removed,
+            // and an empty assistant message has nothing to say on this wire.
             if msg.content.is_empty() {
                 return Vec::new();
             }
@@ -3041,7 +3040,7 @@ mod tests {
 
     #[test]
     fn an_empty_assistant_message_never_reaches_the_wire() {
-        // The driver sheds a prior turn's unsigned reasoning from the request
+        // The request projection omits reasoning that cannot be replayed
         // without removing the message, so a reasoning-only assistant turn
         // arrives here empty and must not be sent as a blank assistant line.
         let msg = Message::assistant(Vec::new());

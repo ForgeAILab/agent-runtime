@@ -45,7 +45,11 @@ pub(crate) fn request(
     let messages: Vec<_> = history
         .iter()
         .filter_map(|message| {
-            message.for_reasoning_producer(current, provider.requires_nonempty_assistant_content())
+            message.for_reasoning_replay(
+                current,
+                false,
+                provider.requires_nonempty_assistant_content(),
+            )
         })
         .collect();
     let stable_messages = messages.len().saturating_sub(1) as u32;

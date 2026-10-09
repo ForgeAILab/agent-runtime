@@ -508,16 +508,30 @@ established; Runtime MUST NOT retry, prewarm, or rebuild the old identity.
 - **THEN** identity B starts with its own cache state
 - **AND** Runtime does not prewarm identity A or transfer its lease
 
-### Requirement: Reasoning history is replayed only to its producer
+### Requirement: Reasoning history is replayed only where it is valid
 
 The runtime SHALL record on each reasoning part it commits to canonical
-history the provider and model that produced it, and SHALL omit from a
-provider request every reasoning part whose recorded producer differs from
-that request's provider or model. Canonical history MUST keep omitted parts.
-A reasoning part with no recorded producer SHALL be sent as it was before
-this requirement. A request whose reasoning parts were all produced by its
-own provider and model MUST be byte-identical to the request built without
-this requirement.
+history the provider and model that produced it. When it builds a provider
+request it SHALL decide in one projection step, before context and cache
+planning, which stored reasoning parts the request carries, and SHALL omit a
+reasoning part when either of these holds:
+
+- its recorded producer differs from the request's provider or model,
+  wherever the part sits in history; or
+- it carries no signature and belongs to a turn earlier than the active one.
+
+Every other reasoning part SHALL be sent. A reasoning part with no recorded
+producer MUST NOT be treated as foreign: when signed it is sent, and when
+unsigned it follows the earlier-turn rule. The rule applies equally to
+reasoning nested in a tool result. The projection MUST NOT change canonical
+history, and an omitted part or message MUST NOT change the index by which
+later history is addressed. A request from which nothing is omitted MUST be
+byte-identical to the request built from canonical history directly.
+
+An assistant message left with no content by the projection MUST NOT reach
+the provider as an empty assistant message: it is omitted from the request
+when the provider's wire requires assistant content, and otherwise dropped by
+the adapter when it renders the wire.
 
 #### Scenario: Continuing on another provider
 
@@ -529,22 +543,46 @@ this requirement.
 
 #### Scenario: Same provider and model
 
-- **GIVEN** a session whose reasoning was all produced by the current
-  provider and model
+- **GIVEN** a session whose reasoning was all signed and produced by the
+  current provider and model
 - **WHEN** the next request is built
-- **THEN** it is byte-identical to the request built before this requirement
+- **THEN** it is byte-identical to the request built from canonical history
 
 #### Scenario: Switching back
 
-- **GIVEN** reasoning from provider A was omitted while the session ran on B
+- **GIVEN** signed reasoning from provider A was omitted while the session
+  ran on B
 - **WHEN** the session returns to A with the same model
 - **THEN** A's reasoning is sent again with its signatures
 
-#### Scenario: Reasoning recorded before provenance existed
+#### Scenario: Unsigned reasoning from an earlier turn
 
-- **GIVEN** a reasoning part with no recorded producer
+- **GIVEN** an earlier turn holds unsigned reasoning, with or without a
+  recorded producer
+- **WHEN** a later turn's request is built
+- **THEN** the request carries none of that reasoning
+- **AND** canonical history still holds it
+
+#### Scenario: Unsigned reasoning inside the active turn
+
+- **GIVEN** the active turn produced unsigned reasoning and a tool call on
+  the current provider and model
+- **WHEN** the tool-call continuation request is built
+- **THEN** the request carries that reasoning
+
+#### Scenario: Signed reasoning recorded before provenance existed
+
+- **GIVEN** a signed reasoning part with no recorded producer
 - **WHEN** any request is built
-- **THEN** the part is sent exactly as before
+- **THEN** the part is sent
+
+#### Scenario: A message holding only omitted reasoning
+
+- **GIVEN** an assistant message whose only content is reasoning the
+  projection omits
+- **WHEN** the request is rendered for any provider
+- **THEN** the wire carries no empty assistant message
+- **AND** later history keeps its indices
 
 #### Scenario: Continuing on Gemini after another provider's tool calls
 
