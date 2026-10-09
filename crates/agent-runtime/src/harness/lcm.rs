@@ -3896,6 +3896,11 @@ impl LcmCoordinator {
     /// disowned and removed, as `reconcile_diverged_store` does for the same
     /// residue at an append. Canonical history past the frontier is appended
     /// again by the next synchronization. Anything else stays a conflict.
+    ///
+    /// A store with nothing past the frontier is accepted too. That is this
+    /// same recovery interrupted after its truncation and before the repaired
+    /// checkpoint was saved: the DAG and every entry are the checkpoint's, and
+    /// only the revision moved.
     async fn disown_uncheckpointed_tail(
         &self,
         binding: &LcmTimelineBinding,
@@ -3940,14 +3945,6 @@ impl LcmCoordinator {
         {
             return Err(RuntimeError::conflict(
                 "LCM tail recovery found a changed protected DAG",
-            ));
-        }
-        if !self
-            .store_has_entry_at(&store_view, state.history_len)
-            .await?
-        {
-            return Err(RuntimeError::conflict(
-                "LCM tail recovery found no entry past the checkpointed frontier",
             ));
         }
         let entries = self.load_entries(&store_view, state.history_len).await?;

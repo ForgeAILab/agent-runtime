@@ -27,9 +27,10 @@ an append, but resume refused the session before any append could run.
   tries one more recovery. If the checkpoint has no pending summary, its
   history prefix is canonical, the store's active DAG is exactly the one the
   checkpoint recorded, every entry below the checkpointed frontier matches
-  canonical history and the store holds an entry at the frontier, the store
-  is truncated from the frontier and the checkpoint is re-anchored to the
-  resulting revision.
+  canonical history, the store is truncated from the frontier and the
+  checkpoint is re-anchored to the resulting revision. A store with nothing
+  past the frontier is accepted as well, so a recovery that died after its
+  truncation can run again.
 - Any other disagreement stays the original conflict.
 
 ## Impact

@@ -17,6 +17,10 @@ disagreement MUST remain a conflict.
 - **AND** the timeline MUST hold no entry of the killed turn
 - **AND** the next turn MUST complete.
 
+#### Scenario: Recovery interrupted after its truncation
+- **WHEN** a recovery truncated the tail and the process died before the repaired checkpoint was saved
+- **THEN** the next resume of the unchanged saved session MUST succeed.
+
 #### Scenario: Store without truncation
 - **WHEN** the store does not support truncating its tail
 - **THEN** resume MUST fail with the original conflict and the store MUST be unchanged.

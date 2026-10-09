@@ -524,6 +524,37 @@ async fn session_killed_mid_turn_resumes_without_its_uncheckpointed_tail() {
     }
     assert_eq!(lcm_store.entry_count(), saved_len + 2);
 
+    // A first recovery that dies before anything is saved again: the tail is
+    // gone, the saved session is unchanged, and the store revision has moved.
+    // The next resume must still succeed.
+    let saved_before = sessions
+        .load(&session_id)
+        .await
+        .expect("session store reads")
+        .expect("saved session");
+    drop(
+        ordinary_runtime(
+            Arc::new(FakeProvider::new(
+                "fake",
+                Capabilities::basic_streaming(),
+                Vec::new(),
+            )),
+            Arc::new(RecordingObserver::default()),
+        )
+        .start_session(StartSession::resume(session_id.clone()))
+        .await
+        .expect("the session resumes over the killed turn's residue"),
+    );
+    assert_eq!(
+        lcm_store.entry_count(),
+        saved_len,
+        "resume removes exactly the uncheckpointed tail"
+    );
+    sessions
+        .save(&saved_before)
+        .await
+        .expect("session restores");
+
     let provider = Arc::new(FakeProvider::new(
         "fake",
         Capabilities::basic_streaming(),
@@ -533,12 +564,8 @@ async fn session_killed_mid_turn_resumes_without_its_uncheckpointed_tail() {
     let resumed = ordinary_runtime(provider.clone(), observer.clone())
         .start_session(StartSession::resume(session_id.clone()))
         .await
-        .expect("the session resumes over the killed turn's residue");
-    assert_eq!(
-        lcm_store.entry_count(),
-        saved_len,
-        "resume removes exactly the uncheckpointed tail"
-    );
+        .expect("the session resumes again after an interrupted recovery");
+    assert_eq!(lcm_store.entry_count(), saved_len);
 
     resumed
         .run(UserInput::text("second question"))
