@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::{JournalGcReport, JournalGcRequest, JournalRetirement, JournalRevision};
-use crate::checkpoint::{CHECKPOINT_SCHEMA_VERSION, CheckpointStore, TurnCheckpoint};
+use crate::checkpoint::{CheckpointStore, TurnCheckpoint};
 use crate::error::{RuntimeError, UnsupportedCapability};
 use crate::ids::SessionId;
 use crate::store::{SessionSnapshot, SessionStore};
@@ -57,9 +57,8 @@ impl SnapshotJournal {
         Ok(snapshot)
     }
 
-    /// Materializes a valid v3/v4 exact checkpoint without writes or replanning.
-    /// The returned schema tag is preserved for same-revision legacy idempotency;
-    /// the next changed transition emits version 4.
+    /// Loads and validates the exact schema-3 checkpoint, as the legacy path
+    /// does, without writes or replanning. The checkpoint is returned as stored.
     pub async fn load_checkpoint(
         &self,
         session: &SessionId,
@@ -80,13 +79,11 @@ impl SnapshotJournal {
         self.ordinary.save(snapshot).await
     }
 
-    /// Performs an exact full-checkpoint write. New writes must be schema 4;
-    /// loading schema 3 never silently rewrites a revision in place.
+    /// Performs the legacy exact full-checkpoint write. The checkpoint is
+    /// validated first, so an invalid or unsupported one is rejected before
+    /// the store is called; a valid one is saved unchanged.
     pub async fn save_checkpoint(&self, checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
         checkpoint.validate()?;
-        if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION {
-            return Err(super::conflict());
-        }
         self.protected.save(checkpoint).await
     }
 

@@ -4,6 +4,12 @@
 
 The first released U9 version SHALL read valid v3 checkpoints and v3-era unversioned snapshots for its entire release lifetime, including unfinished turns. Native version-4 import SHALL preserve exact execution/recovery semantics and keep source-compatible existing store methods. A coordinated pre-1.0 persisted-contract release MUST pass Smith, Nyx and Open Forge gates against an immutable landed tag or exact revision; readable JSON alone MUST NOT imply old-binary execution compatibility.
 
+#### Scenario: Host adopts no native journal
+
+- **WHEN** a host upgrades to the release containing only the journal contracts and readers
+- **THEN** every checkpoint and snapshot it writes is byte-identical to what the previous release wrote, with checkpoint schema 3
+- **AND** the previous release can read them, so the host can roll back without an export
+
 #### Scenario: Stored v3 session is mid-turn
 
 - **WHEN** the new runtime imports a supported v3 CallingModel, pending approval or committed outcome boundary

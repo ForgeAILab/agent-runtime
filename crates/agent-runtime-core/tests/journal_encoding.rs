@@ -12,6 +12,55 @@ fn frozen(name: &str) -> (Vec<u8>, Value) {
     )
 }
 
+/// Object IDs pinned in the test source as well as in the fixture files. An
+/// ID covers every byte of its object, so regenerating a fixture and its
+/// digest file together still fails here. Do not update these to make a test
+/// pass: a changed byte needs a new encoding revision.
+const PINNED_OBJECT_IDS: [(&str, &str); 7] = [
+    (
+        "signed-message",
+        "2656ce2807efc408099ae5dbb1328dc23b7389a89c24ef23a2cc030f093fa751",
+    ),
+    (
+        "numbers-extension",
+        "cbdc26950ff09c7de7edfd3e3b4d0008d64ae381aeb9185547a4bb9a9eb342fc",
+    ),
+    (
+        "raw-message",
+        "070059973a84e7b1244bf456335039193ae2fbeb63041173b10e6b520fdd4120",
+    ),
+    (
+        "projected-message",
+        "bd57baa3dcae9917373bb61e8d6adb6fa967c8535176690498219baa71859ba6",
+    ),
+    (
+        "sequence-leaf",
+        "2b987ef9eddad924f952e4f4f052e4fee6fbad4076ff0263290688789068129d",
+    ),
+    (
+        "map-leaf",
+        "dc26c3a526a864c9810a75c7900be7550e85e0e3ae17e1b4ba13f7caad2479eb",
+    ),
+    (
+        "ordered-extension",
+        "d595352f865a37043ac7b540c80dcb555b246dd275c09791c534f6226eb36bf2",
+    ),
+];
+const PINNED_EMPTY_HISTORY_CHAIN: &str =
+    "0e392412cfd7c27c672b332e9c1a8c3d28276c47b4097c1f629cb6456faf0cc5";
+const PINNED_SIGNED_HISTORY_CHAIN: &str =
+    "fce04b911bf7525a6fd6f2a91157fac8f295c6d60c7b9a6b11171f714f6a990f";
+const PINNED_COMMIT_INPUT_DIGEST: &str =
+    "4adf0c2b8d6da7a5c019785a2b0648cf3ebe7a709dc09eb94b0c3e4238c57acd";
+
+fn pinned_object_id(name: &str) -> &'static str {
+    PINNED_OBJECT_IDS
+        .iter()
+        .find(|(pinned, _)| *pinned == name)
+        .map(|(_, id)| *id)
+        .unwrap()
+}
+
 #[test]
 fn journal_json_1_bytes_and_domain_type_version_digests_are_frozen() {
     assert_eq!(JOURNAL_ENCODING, "journal-json-1");
@@ -29,6 +78,11 @@ fn journal_json_1_bytes_and_domain_type_version_digests_are_frozen() {
         ("map-leaf", JournalObjectKind::Map),
     ] {
         let (bytes, digests) = frozen(name);
+        assert_eq!(
+            digests["schema_4"].as_str().unwrap(),
+            pinned_object_id(name),
+            "{name}: fixture files were regenerated"
+        );
         let envelope: Value = serde_json::from_slice(&bytes).unwrap();
         let object = JournalObject::encode(kind, &envelope["value"]).unwrap();
         assert_eq!(object.bytes, bytes, "{name} canonical bytes changed");
@@ -122,6 +176,8 @@ fn history_chain_is_frozen_and_order_sensitive() {
         journal_history_chain([]).as_str(),
         digests["empty"].as_str().unwrap()
     );
+    assert_eq!(digests["empty"], PINNED_EMPTY_HISTORY_CHAIN);
+    assert_eq!(digests["signed_message"], PINNED_SIGNED_HISTORY_CHAIN);
     let (_, signed) = frozen("signed-message");
     let signed = JournalObjectId::parse(signed["schema_4"].as_str().unwrap()).unwrap();
     assert_eq!(
@@ -142,6 +198,7 @@ fn private_commit_input_digest_is_frozen_and_binds_drafts_delta_fence_and_operat
     let mut commit: JournalCommit =
         serde_json::from_str(include_str!("fixtures/journal/commit-input.json")).unwrap();
     let expected = include_str!("fixtures/journal/commit-input.sha256").trim();
+    assert_eq!(expected, PINNED_COMMIT_INPUT_DIGEST);
     assert_eq!(commit.input_digest().unwrap().as_str(), expected);
     commit.digest = commit.input_digest().unwrap();
     assert_eq!(
@@ -189,6 +246,10 @@ fn private_commit_input_digest_is_frozen_and_binds_drafts_delta_fence_and_operat
 #[test]
 fn execution_relevant_json_object_order_is_frozen_without_changing_canonical_key_order() {
     let (bytes, digests) = frozen("ordered-extension");
+    assert_eq!(
+        digests["schema_4"].as_str().unwrap(),
+        pinned_object_id("ordered-extension")
+    );
     assert_eq!(
         journal_object_id(JournalObjectKind::Extension, 4, &bytes).as_str(),
         digests["schema_4"].as_str().unwrap()

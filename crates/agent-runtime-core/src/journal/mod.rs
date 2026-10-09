@@ -1,9 +1,12 @@
-//! Opt-in session journal contracts and readers (persisted schema 4).
+//! Opt-in session journal contracts and readers (journal schema 4).
 //!
 //! This module does not install a native writer or change runtime mode selection.
-//! Existing stores keep their materialized load/save path. The first U9 release
-//! reads schema-3 checkpoints and unversioned snapshots for its entire lifetime;
-//! old binaries must not execute migrated schema-4 records. Retention is host-owned.
+//! Existing stores keep their materialized load/save path, and the runtime still
+//! writes schema-3 checkpoints and unversioned snapshots byte for byte as before:
+//! a host that adopts nothing here can roll back to the previous release.
+//! [`JOURNAL_SCHEMA_VERSION`] tags journal heads, objects and reference
+//! checkpoints only; nothing in the runtime writes them yet. Once a host does
+//! publish a journal head, older binaries cannot read it. Retention is host-owned.
 //!
 //! Object hashes attest integrity, not authority or confidentiality. Backend
 //! implementations must enforce protection-domain isolation, fenced publication,
@@ -40,6 +43,9 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
     /// Reads only this live lease's pinned closure or validated staging set.
     /// Verify framing/checksums before returning bytes; unpublished torn tails
     /// may be repaired only under a writer fence. Published corruption conflicts.
+    /// The backend owns the size of the one buffer it returns: bound a single
+    /// object by its own frame length before allocating. [`JournalReader`] can
+    /// only count the bytes after they are returned.
     async fn read(
         &self,
         lease: &JournalLease,

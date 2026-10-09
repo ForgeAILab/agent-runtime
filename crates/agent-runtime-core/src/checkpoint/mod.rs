@@ -30,13 +30,13 @@ use crate::tool::{PreparedToolCall, ToolOutcome};
 
 /// The protected-checkpoint wire schema.
 ///
-/// Version 4 adds journal/reference readers. Legacy materialized writes also
-/// use version 4; this constant does not activate native journal persistence.
-/// Version 3 remains readable throughout the first released U9 version.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
-
-/// Backward-readable protected schema retained for the first U9 release.
-pub const LEGACY_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+/// Version 3 adds protected provider-cache operation phases and bounded
+/// result metadata to the same unreleased protected contract.
+///
+/// Materialized checkpoints stay at version 3: adding the session-journal
+/// contracts changed no persisted checkpoint byte. Journal heads, objects and
+/// reference checkpoints carry [`crate::journal::JOURNAL_SCHEMA_VERSION`].
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 /// The direct turn-machine transition-table revision.
 ///

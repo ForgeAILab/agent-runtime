@@ -13,7 +13,7 @@ all applicable gates, not merely contract merge.
 
 - [x] 1.1 Approve design decisions and record pre-1.0 break/migration contract; define every DTO and exact/default trait method listed in design.md without removing old methods.
 - [x] 1.2 Freeze journal-json-1/SHA-256 domain/type/version fixtures, signed reasoning and negative-zero round trips; add bounded persistent sequence/map reference encoding.
-- [x] 1.3 Add schema-4 head/reference checkpoint readers, retain v3/unversioned snapshot readers for the stated release window, and validate transition revision 4 equivalence rather than assume it.
+- [x] 1.3 Add schema-4 head/reference checkpoint readers, retain v3/unversioned snapshot readers for the stated release window, and validate transition revision 4 equivalence rather than assume it. Materialized writes stay at schema 3 with unchanged bytes (review fix, 2026-10-08).
 - [x] 1.4 Preserve materialized public SessionSnapshot/TurnCheckpoint/TurnState, all exactness/redaction checks, and explicit unsupported capability errors; add unchanged legacy store implementation compile fixtures.
 - [x] 1.5 Add SnapshotJournal materialization adapter over separate policy stores; make its O(history) cost, single-writer requirement and lack of native CAS/GC explicit.
 
@@ -26,6 +26,7 @@ all applicable gates, not merely contract merge.
 - [ ] 2.5 Implement idempotent one-time v3 import and mixed native/legacy detection; cut crashes at each import write, including pending approval, CallingModel, model/tool results, cache phases and pending summary.
 - [ ] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
 - [ ] 2.7 Count serialized submission/new-object bytes at N=100/1000/10000 and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.
+- [ ] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)
 

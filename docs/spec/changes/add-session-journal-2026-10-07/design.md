@@ -233,11 +233,23 @@ extension/outcome/settings leaves retain their replacement-byte cost. Typed
 schema-4 object reconstruction rejects dropped fields/default substitutions.
 Materialization validates the existing operation/transition/boundary checks.
 
-Changed materialized transitions from schema 3 emit schema 4, while exact
-same-state reapplication preserves the original revision/tag for idempotency.
-The standalone JSON reader normalizes a validated materialized v3 checkpoint
-to schema 4 without saving it. SnapshotJournal loads preserve the source tag
-and never write back a legacy revision in place. Revision 4 equivalence is
+Group A leaves materialized persistence byte for byte as v0.2.1 wrote it:
+`CHECKPOINT_SCHEMA_VERSION` stays 3, `TurnCheckpoint::validate` accepts exactly
+3, transitions keep their predecessor's tag and SessionSnapshot stays
+unversioned. Schema 4 (`JOURNAL_SCHEMA_VERSION`) tags journal heads, objects
+and ReferencedTurnCheckpoint envelopes only, and nothing in the runtime writes
+those yet. A reference checkpoint materializes to a TurnCheckpoint tagged 3,
+equal to the materialized checkpoint it was built from, so it chains with a
+predecessor from a legacy store. The reason is rollback: a 3-to-4 tag on an
+otherwise identical inline checkpoint would make a host's in-flight turns
+unreadable by its previous binary and buy nothing before the native writer
+exists. A host that adopts nothing can move between v0.2.1 and this release
+in both directions. Whether materialized writes ever need a new tag is decided
+with the native writer in group B (task 2.8); if they do, this release's
+readers must be extended first, one release ahead of the writer.
+The standalone JSON reader returns a validated v3 checkpoint as stored.
+SnapshotJournal loads and saves the same records as the stores it wraps and
+never writes back on load. Revision 4 equivalence is
 checked against a frozen v3 enum, transition table and helper implementation
 from base `6ec58fa`, including every persisted state tag and splice cases.
 This addition of `require_journal` and these concrete encoding/DTO choices
@@ -361,11 +373,12 @@ Do not invent a legacy snapshot tag as a precondition for reading it.
    binding, namespace and operation checks remain. Invalid/missing evidence is
    not a migration opportunity. No raw v3 record is pruned before U3 boundary
    bootstrapping. Keep a recovery backup/pin until native publication completes.
-2. Without native capabilities, load the old pair and write materialized current
-   schema-4 checkpoints through existing methods. Source implementations keep
-   compiling, but custom schema guards need coordinated updates. No delta
-   performance claim applies. Existing legacy records stay readable for the
-   entire first U9 release; no automatic v3 write-back/downgrade promise.
+2. Without native capabilities, load the old pair and keep writing materialized
+   schema-3 checkpoints through existing methods, exactly as before. Source
+   implementations keep compiling and custom schema guards need no change. No
+   delta performance claim applies. Such a host can roll back to the previous
+   release. The v3 reader window is counted from the first release that
+   activates a native writer (group B), not from the group A contracts.
 3. With native capabilities, acquire import writer fence, load/validate the
    legacy pair once, and import exact protected and separately redacted ordinary
    objects under stable import IDs. Commit the exact head first. Crash before

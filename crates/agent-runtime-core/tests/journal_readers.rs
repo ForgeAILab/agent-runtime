@@ -32,7 +32,15 @@ async fn frozen_v3_checkpoint_keeps_legacy_diagnostic_window_and_sensitive_bound
     assert_eq!(legacy.schema_version, 3);
     assert!(!legacy.snapshot.manifests.is_empty());
     let materialized = read_checkpoint_json(raw).unwrap();
-    assert_eq!(materialized.snapshot, legacy.snapshot);
+    assert_eq!(
+        materialized, legacy,
+        "the v3 reader returns the record as stored"
+    );
+    assert_eq!(
+        serde_json::to_value(&materialized).unwrap(),
+        serde_json::from_slice::<Value>(raw).unwrap(),
+        "a v0.2.1 checkpoint re-serializes to the same JSON value"
+    );
     let fixture = ReadFixture::checkpoint(&materialized);
     let lease = fixture.lease();
     let restored = JournalReader::new(&fixture, &lease, LIMITS)
@@ -51,18 +59,24 @@ async fn frozen_v3_checkpoint_keeps_legacy_diagnostic_window_and_sensitive_bound
 
 #[tokio::test]
 async fn schema4_reference_schema3_inline_and_unversioned_snapshot_are_equivalent_at_every_state() {
-    assert_eq!(CHECKPOINT_SCHEMA_VERSION, 4);
+    // Materialized checkpoints stay at the v0.2.1 schema; only journal heads,
+    // objects and reference checkpoints carry schema 4.
+    assert_eq!(CHECKPOINT_SCHEMA_VERSION, 3);
+    assert_eq!(JOURNAL_SCHEMA_VERSION, 4);
     assert_eq!(TURN_TRANSITION_REVISION, 4);
     let mut tags = std::collections::BTreeSet::new();
     for state in states() {
         let checkpoint = checkpoint_for_state(&state);
         checkpoint.validate().unwrap();
-        let mut legacy = checkpoint.clone();
-        legacy.schema_version = 3;
-        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert_eq!(checkpoint.schema_version, 3, "new writes keep schema 3");
+        let legacy_bytes = serde_json::to_vec(&checkpoint).unwrap();
         assert_eq!(read_checkpoint_json(&legacy_bytes).unwrap(), checkpoint);
-        let inline4 = serde_json::to_vec(&checkpoint).unwrap();
-        assert_eq!(read_checkpoint_json(&inline4).unwrap(), checkpoint);
+        // No materialized schema-4 checkpoint exists: schema 4 is a reference
+        // envelope, never an inline checkpoint with a different tag.
+        let mut inline4 = checkpoint.clone();
+        inline4.schema_version = 4;
+        assert!(inline4.validate().is_err());
+        assert!(read_checkpoint_json(&serde_json::to_vec(&inline4).unwrap()).is_err());
         let unversioned = serde_json::to_vec(&checkpoint.snapshot).unwrap();
         assert_eq!(
             read_snapshot_json(&unversioned).unwrap(),
@@ -205,10 +219,10 @@ fn transition_revision4_matches_the_frozen_v3_transition_table_and_operation_fin
 }
 
 #[tokio::test]
-async fn legacy_changed_transitions_write4_and_equivalent_reference_successors_validate() {
+async fn materialized_transitions_keep_schema3_and_reference_successors_validate() {
     let current = accepted();
-    let mut legacy = current.clone();
-    legacy.schema_version = 3;
+    let legacy = current.clone();
+    assert_eq!(legacy.schema_version, 3);
     legacy.validate().unwrap();
     assert_eq!(
         legacy
@@ -224,17 +238,16 @@ async fn legacy_changed_transitions_write4_and_equivalent_reference_successors_v
     );
     let next = TurnState::Planning { step: 0 };
     let from3 = legacy
-        .transition(next.clone(), legacy.snapshot.clone(), 10, Timestamp(101))
+        .transition(next, legacy.snapshot.clone(), 10, Timestamp(101))
         .unwrap();
-    let from4 = current
-        .transition(next, current.snapshot.clone(), 10, Timestamp(101))
-        .unwrap();
-    assert_eq!(from3, from4);
-    assert_eq!(from3.schema_version, 4);
+    assert_eq!(
+        from3.schema_version, 3,
+        "a v0.2.1 binary must be able to read every successor this one writes"
+    );
     legacy.validate_successor(&from3).unwrap();
     let a = ReadFixture::checkpoint(&current);
     let a_lease = a.lease();
-    let b = ReadFixture::checkpoint(&from4);
+    let b = ReadFixture::checkpoint(&from3);
     let b_lease = b.lease();
     let restored_a = JournalReader::new(&a, &a_lease, LIMITS)
         .unwrap()
@@ -249,9 +262,14 @@ async fn legacy_changed_transitions_write4_and_equivalent_reference_successors_v
         .unwrap()
         .unwrap();
     restored_a.validate_successor(&restored_b).unwrap();
-    let mut downgrade = from4;
-    downgrade.schema_version = 3;
-    assert!(current.validate_successor(&downgrade).is_err());
+    // A reference checkpoint materializes to the same value, tag included,
+    // so it chains with a materialized predecessor from a legacy store.
+    assert_eq!(restored_a, current);
+    assert_eq!(restored_b, from3);
+    legacy.validate_successor(&restored_b).unwrap();
+    let mut other_schema = from3;
+    other_schema.schema_version = 4;
+    assert!(current.validate_successor(&other_schema).is_err());
     let mut unsupported = legacy;
     unsupported.transition_revision = 5;
     assert!(read_checkpoint_json(&serde_json::to_vec(&unsupported).unwrap()).is_err());
@@ -579,4 +597,79 @@ async fn oversize_or_misordered_reference_nodes_are_rejected() {
                 .unwrap_err(),
         );
     }
+}
+
+#[tokio::test]
+async fn host_limits_height_and_json_depth_reject_hostile_input_without_reading_it() {
+    use std::sync::atomic::Ordering;
+    let mut snapshot = snapshot();
+    snapshot.history = (0..200)
+        .map(|i| Message::user(format!("message-{i}")))
+        .collect();
+
+    // The object limit is checked before the backend is asked for anything.
+    let fixture = ReadFixture::snapshot(&snapshot);
+    let lease = fixture.lease();
+    let none = JournalReadLimits {
+        objects: 0,
+        ..LIMITS
+    };
+    let mut reader = JournalReader::new(&fixture, &lease, none).unwrap();
+    assert_conflict(reader.snapshot().await.unwrap_err());
+    assert_eq!(fixture.reads.load(Ordering::Relaxed), 0);
+
+    // The entry limit is checked against the declared count before the tree
+    // is walked: only the batch object has been read when it is rejected.
+    let short = JournalReadLimits {
+        entries: 199,
+        ..LIMITS
+    };
+    let mut reader = JournalReader::new(&fixture, &lease, short).unwrap();
+    assert_conflict(reader.snapshot().await.unwrap_err());
+    assert_eq!(fixture.reads.load(Ordering::Relaxed), 1);
+    let exact = JournalReadLimits {
+        entries: 200,
+        ..LIMITS
+    };
+    let mut reader = JournalReader::new(&fixture, &lease, exact).unwrap();
+    assert_eq!(reader.snapshot().await.unwrap(), Some(snapshot.clone()));
+
+    // A descriptor claiming an absurd count cannot make the reader reserve or
+    // walk anything.
+    let mut huge = ReadFixture::snapshot(&snapshot);
+    huge.head.snapshot.history.len = u64::MAX;
+    huge.repair_batch_refs();
+    let lease = huge.lease();
+    let mut reader = JournalReader::new(&huge, &lease, LIMITS).unwrap();
+    assert_conflict(reader.snapshot().await.unwrap_err());
+    assert_eq!(huge.reads.load(Ordering::Relaxed), 1);
+
+    // Over-height descriptors are rejected when the head is validated.
+    let mut tall = ReadFixture::snapshot(&snapshot);
+    tall.head.snapshot.history.height = JOURNAL_MAX_TREE_HEIGHT + 1;
+    tall.repair_batch_refs();
+    assert_conflict(JournalHead::from_json(&serde_json::to_vec(&tall.head).unwrap()).unwrap_err());
+    let lease = tall.lease();
+    assert_conflict(JournalReader::new(&tall, &lease, LIMITS).unwrap_err());
+    assert_eq!(tall.reads.load(Ordering::Relaxed), 0);
+
+    // Deeply nested JSON is a typed conflict, not a stack overflow.
+    let prefix =
+        br#"{"encoding":"journal-json-1","kind":"state_value","schema_version":4,"value":"#;
+    for nested in [vec![b'['; 200_000], b"{\"a\":".repeat(200_000)] {
+        for bytes in [nested.clone(), [prefix.to_vec(), nested].concat()] {
+            let object = JournalObject {
+                id: journal_object_id(JournalObjectKind::StateValue, 4, &bytes),
+                bytes,
+            };
+            assert_conflict(
+                object
+                    .decode::<Value>(JournalObjectKind::StateValue)
+                    .unwrap_err(),
+            );
+        }
+    }
+    assert_conflict(JournalHead::from_json(&vec![b'['; 200_000]).unwrap_err());
+    assert_conflict(read_snapshot_json(&vec![b'['; 200_000]).unwrap_err());
+    assert_conflict(read_checkpoint_json(&vec![b'['; 200_000]).unwrap_err());
 }

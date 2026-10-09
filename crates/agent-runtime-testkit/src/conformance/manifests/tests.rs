@@ -626,7 +626,7 @@ async fn unsupported_checkpoint_revisions_and_malformed_protected_markers_fail_b
     let legacy = legacy_checkpoint(true);
     let mut bad = Vec::new();
     let mut schema = legacy.clone();
-    schema.schema_version = agent_runtime_core::checkpoint::CHECKPOINT_SCHEMA_VERSION + 1;
+    schema.schema_version += 1;
     bad.push(schema);
     let mut transition = legacy.clone();
     transition.transition_revision += 1;

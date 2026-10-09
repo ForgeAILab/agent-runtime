@@ -59,10 +59,7 @@ fn assert_new_checkpoints(checkpoints: &InMemoryCheckpointStore, id: &SessionId)
     assert!(!history.is_empty());
     for checkpoint in history {
         checkpoint.validate().unwrap();
-        assert_eq!(
-            checkpoint.schema_version,
-            agent_runtime_core::checkpoint::CHECKPOINT_SCHEMA_VERSION
-        );
+        assert_eq!(checkpoint.schema_version, 3);
         assert_eq!(checkpoint.transition_revision, 4);
         assert!(checkpoint.snapshot.manifests.is_empty());
         let wire = serde_json::to_value(&checkpoint).unwrap();

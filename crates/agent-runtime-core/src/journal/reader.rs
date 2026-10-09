@@ -4,7 +4,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use super::*;
-use crate::checkpoint::{TURN_TRANSITION_REVISION, TurnCheckpoint, TurnState};
+use crate::checkpoint::{
+    CHECKPOINT_SCHEMA_VERSION, TURN_TRANSITION_REVISION, TurnCheckpoint, TurnState,
+};
 use crate::content::{InternalTurnInput, Message};
 use crate::error::RuntimeError;
 use crate::provider::{ProviderRequest, ToolSchema};
@@ -13,6 +15,15 @@ use crate::usage::{UsageLedger, UsageRecord};
 
 /// Explicit host resource limits for one materialization. Counts include
 /// repeated reads; no background policy/expiry or execution authority is added.
+///
+/// `objects` is checked before each backend read, and `entries` before a
+/// sequence or map is walked, against the count its descriptor declares. A
+/// node is rejected when it holds more than [`JOURNAL_FANOUT`] entries or its
+/// tree is higher than [`JOURNAL_MAX_TREE_HEIGHT`]. `encoded_bytes` is checked
+/// after each read returns and before the object is decoded, so it bounds the
+/// total decoded, not the one buffer a backend allocates for a single object;
+/// see [`SessionJournal::read`]. Materialized output is bounded by these
+/// limits together, not by a separate memory budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalReadLimits {
     /// Maximum object reads for this reader instance.
@@ -23,13 +34,13 @@ pub struct JournalReadLimits {
     pub entries: u64,
 }
 
-/// Reads schema-3 or materialized schema-4 JSON, validating exact operation and
-/// transition evidence before normalizing its schema tag to 4. This is a
-/// representation conversion only; no execution or store write occurs.
+/// Reads a materialized schema-3 checkpoint from JSON and validates its exact
+/// operation and transition evidence. The checkpoint is returned as stored;
+/// no execution or store write occurs. Reference checkpoints are read through
+/// [`JournalReader`], never through this function.
 pub fn read_checkpoint_json(bytes: &[u8]) -> Result<TurnCheckpoint, RuntimeError> {
-    let mut checkpoint: TurnCheckpoint = serde_json::from_slice(bytes).map_err(|_| conflict())?;
+    let checkpoint: TurnCheckpoint = serde_json::from_slice(bytes).map_err(|_| conflict())?;
     checkpoint.validate()?;
-    checkpoint.schema_version = JOURNAL_SCHEMA_VERSION;
     Ok(checkpoint)
 }
 
@@ -491,6 +502,8 @@ impl<'a> JournalReader<'a> {
 
     /// Materializes exact protected execution and validates the unchanged
     /// operation/transition table. Ordinary heads cannot supply execution roots.
+    /// The result carries [`CHECKPOINT_SCHEMA_VERSION`], like any other
+    /// materialized checkpoint.
     pub async fn checkpoint(&mut self) -> Result<Option<TurnCheckpoint>, RuntimeError> {
         let Some(head) = self.lease.head().cloned() else {
             return Ok(None);
@@ -532,8 +545,10 @@ impl<'a> JournalReader<'a> {
             Some(id) => Some(self.object(id, JournalObjectKind::InternalInput).await?),
             None => None,
         };
+        // The materialized form keeps the materialized schema tag: schema 4
+        // names the reference envelope just validated, not this value.
         let checkpoint = TurnCheckpoint {
-            schema_version: refs.schema_version,
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
             transition_revision: refs.transition_revision,
             session: refs.session,
             turn: refs.turn,

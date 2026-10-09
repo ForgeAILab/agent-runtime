@@ -26,8 +26,11 @@ Nyx needs the same neutral capability if it later chooses durable sessions.
 - Store exact checkpoint execution state by references to protected journal
   objects. Freeze request contents once, with ordered persistent references to
   every final planned message and tool schema. Recovery never replans a request.
-- **BREAKING persisted contract:** introduce version-4 journal heads and referenced
-  checkpoint envelopes, and move CHECKPOINT_SCHEMA_VERSION from 3 to 4. Read
+- **BREAKING persisted contract (native adoption only):** introduce version-4
+  journal heads and referenced checkpoint envelopes under a separate
+  JOURNAL_SCHEMA_VERSION. CHECKPOINT_SCHEMA_VERSION stays 3 and materialized
+  checkpoint/snapshot bytes do not change in group A; any later move of the
+  materialized tag is a group B decision (task 2.8). Read
   valid v3 checkpoints and v3-era unversioned SessionSnapshot JSON for at least
   the entire first released version containing U9. Preserve transition revision
   4 unless equivalent-execution tests demonstrate that a new revision is required.
@@ -90,5 +93,9 @@ compatibility, v3/unversioned readers for the entire first U9 release,
 `journal-json-1` with domain/type/version-separated SHA-256, and fanout 64.
 Group A adds contracts/readers and a full-snapshot compatibility adapter; it
 does not activate native writing, import or retention. Existing stores keep
-compiling; custom persisted-schema guards must accept schema 4 before upgrading.
+compiling. The group A review (2026-10-08) narrowed the break: materialized
+checkpoints keep schema 3 and no persisted byte changes for a host that adopts
+nothing, so custom persisted-schema guards need no change and rollback to
+v0.2.1 works. Schema 4 applies to journal heads and reference checkpoints,
+which only a native backend (group B) writes.
 Groups B/C/D, U10 and release eligibility are not approved by this decision.

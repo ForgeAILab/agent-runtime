@@ -49,6 +49,7 @@ pub enum FailureComponent {
 
 /// A persistence capability that a host explicitly requested but does not supply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum UnsupportedCapability {
     /// Native, fenced session-journal access.

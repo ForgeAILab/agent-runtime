@@ -237,7 +237,7 @@ impl fmt::Debug for JournalObject {
     }
 }
 impl JournalObject {
-    /// Encodes a schema-4 typed object, including opaque Value map order where
+    /// Encodes a journal-schema-4 typed object, including opaque Value map order where
     /// execution fingerprints require it. Prepares bytes only; writes no store.
     pub fn encode<T: Serialize>(kind: JournalObjectKind, value: &T) -> Result<Self, RuntimeError> {
         let value = serde_json::to_value(value).map_err(|_| conflict())?;

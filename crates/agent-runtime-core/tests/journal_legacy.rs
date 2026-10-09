@@ -155,18 +155,17 @@ async fn snapshot_adapter_equals_legacy_materialization_and_preserves_store_barr
 }
 
 #[tokio::test]
-async fn schema3_adapter_load_does_not_write_back_same_revision_then_successor_is4() {
+async fn schema3_adapter_load_does_not_write_back_and_successor_stays_schema3() {
     let sessions = Arc::new(legacy::InMemorySessionStore::new());
     let checkpoints = Arc::new(legacy::InMemoryCheckpointStore::new());
-    let mut v3 = checkpoint();
-    v3.schema_version = 3;
+    let v3 = checkpoint();
+    assert_eq!(v3.schema_version, 3);
     checkpoints.seed(v3.clone()).unwrap();
     sessions.seed(v3.snapshot.clone());
     let adapter = SnapshotJournal::new(sessions, checkpoints.clone());
     let loaded = adapter.load_checkpoint(&v3.session).await.unwrap().unwrap();
     assert_eq!(loaded, v3);
     assert_eq!(checkpoints.history(&v3.session), vec![v3.clone()]);
-    assert!(adapter.save_checkpoint(&loaded).await.is_err());
     let next = loaded
         .transition(
             TurnState::Planning { step: 0 },
@@ -175,8 +174,13 @@ async fn schema3_adapter_load_does_not_write_back_same_revision_then_successor_i
             Timestamp(101),
         )
         .unwrap();
-    assert_eq!(next.schema_version, 4);
+    assert_eq!(next.schema_version, 3);
     adapter.save_checkpoint(&next).await.unwrap();
+    assert_eq!(checkpoints.history(&v3.session), vec![v3.clone(), next]);
+    // The adapter never writes a tag the previous release cannot read.
+    let mut other_schema = loaded;
+    other_schema.schema_version = 4;
+    assert!(adapter.save_checkpoint(&other_schema).await.is_err());
     assert_eq!(checkpoints.history(&v3.session).len(), 2);
 }
 
