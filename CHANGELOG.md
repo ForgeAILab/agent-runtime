@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-08
+
 ### Fixed
 
 - An LCM session whose turn was killed between provider steps can be resumed
