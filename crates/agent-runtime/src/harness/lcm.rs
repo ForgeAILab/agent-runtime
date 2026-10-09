@@ -1764,7 +1764,13 @@ impl LcmCoordinator {
                 .await
             {
                 Ok(repaired) => Ok(Some(repaired)),
-                Err(_append_error) => Err(strict_error),
+                Err(_append_error) => match self
+                    .disown_uncheckpointed_tail(&binding, &state, &view)
+                    .await
+                {
+                    Ok(repaired) => Ok(Some(repaired)),
+                    Err(_tail_error) => Err(strict_error),
+                },
             },
         }?;
         if !self.tunables_changed(persisted, &state) {
@@ -3873,6 +3879,109 @@ impl LcmCoordinator {
             .iter()
             .map(active_node_state_from_node)
             .collect::<Result<Vec<_>, RuntimeError>>()?;
+        self.project_state(binding, &reconciled, view).await?;
+        self.state_patch(&reconciled)
+            .map(SessionStatePatch::into_state)
+    }
+
+    /// Recovers a checkpoint whose store ran ahead of it by more than one
+    /// canonical append: the residue of a turn that was killed between
+    /// provider steps. Each step appends its history to the store, but a host
+    /// with only a session store saves the checkpoint when the turn ends, so
+    /// a process that dies mid-turn leaves entries no saved history holds.
+    ///
+    /// The checkpoint is the authority. When the summary DAG is exactly the
+    /// one it recorded and every entry below its frontier still matches
+    /// canonical history, whatever the store holds from the frontier on is
+    /// disowned and removed, as `reconcile_diverged_store` does for the same
+    /// residue at an append. Canonical history past the frontier is appended
+    /// again by the next synchronization. Anything else stays a conflict.
+    async fn disown_uncheckpointed_tail(
+        &self,
+        binding: &LcmTimelineBinding,
+        state: &LcmState,
+        view: &HistoryView,
+    ) -> Result<VersionedSessionState, RuntimeError> {
+        if state.pending_summary.is_some() {
+            return Err(RuntimeError::conflict(
+                "LCM tail recovery cannot carry a pending summary",
+            ));
+        }
+        if state.history_len > view.history.len()
+            || state.history_fingerprint
+                != self.canonical_fingerprint(binding, &view.history, state.history_len)?
+        {
+            return Err(RuntimeError::conflict(
+                "LCM tail recovery requires the checkpointed history prefix",
+            ));
+        }
+        // The caller resolved its binding before rechecking the claim, so
+        // that binding carries no owner epoch and the store would refuse the
+        // write. Resolve again now that the claim is recorded.
+        let binding = &self.timeline_binding(&binding.session)?;
+        let store_view = binding.view();
+        let current_revision = self
+            .store
+            .current_revision(&store_view)
+            .await
+            .map_err(map_lcm_error)?;
+        let mut active_nodes = self
+            .store
+            .active_nodes(&store_view)
+            .await
+            .map_err(map_lcm_error)?;
+        active_nodes.sort_by_key(|node| (node.range.start, node.range.end, node.id.clone()));
+        if state.active_nodes.len() != active_nodes.len()
+            || state
+                .active_nodes
+                .iter()
+                .zip(active_nodes.iter())
+                .any(|(persisted, node)| !active_node_state_matches_node(persisted, node))
+        {
+            return Err(RuntimeError::conflict(
+                "LCM tail recovery found a changed protected DAG",
+            ));
+        }
+        if !self
+            .store_has_entry_at(&store_view, state.history_len)
+            .await?
+        {
+            return Err(RuntimeError::conflict(
+                "LCM tail recovery found no entry past the checkpointed frontier",
+            ));
+        }
+        let entries = self.load_entries(&store_view, state.history_len).await?;
+        if entries.len() != state.history_len
+            || entries.iter().zip(view.history.iter()).enumerate().any(
+                |(index, (entry, message))| {
+                    entry.sequence.get() != index as u64 || entry.content != *message
+                },
+            )
+        {
+            return Err(RuntimeError::conflict(
+                "LCM tail recovery found a changed immutable entry",
+            ));
+        }
+        if self
+            .store
+            .current_revision(&store_view)
+            .await
+            .map_err(map_lcm_error)?
+            != current_revision
+        {
+            return Err(lcm_revision_conflict(
+                "LCM store changed while validating its uncheckpointed tail",
+            ));
+        }
+        let truncated = self
+            .store
+            .truncate_from(&store_view, LcmSequence::new(state.history_len as u64))
+            .await
+            .map_err(map_lcm_error)?;
+        // Counts taken over the removed tail must not carry into a later append.
+        self.invalidate_accounting(&binding.session);
+        let mut reconciled = state.clone();
+        reconciled.dag_revision = truncated.revision;
         self.project_state(binding, &reconciled, view).await?;
         self.state_patch(&reconciled)
             .map(SessionStatePatch::into_state)
@@ -7089,6 +7198,48 @@ mod tests {
         assert!(!resumed.retry_admission);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.leaf_commit_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn uncheckpointed_tail_stays_a_conflict_when_the_store_cannot_truncate() {
+        // `TestStore` keeps the default `truncate_from`, which refuses.
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let coordinator = test_coordinator(store.clone());
+        let session = SessionId::new("lcm-session");
+        let history = vec![
+            Message::user("first request"),
+            Message::assistant(vec![ContentPart::text("first answer")]),
+        ];
+        let first = coordinator
+            .after_commit(&commit_view(&session, "first-turn", &history, None))
+            .await
+            .expect("initial LCM checkpoint");
+        let persisted = first.state.expect("initial LCM state").into_state();
+        let binding = coordinator.timeline_binding(&session).unwrap();
+        let mut state = coordinator.decode_state(&binding, &persisted).unwrap();
+
+        // A killed turn: two provider steps, appended one at a time.
+        let mut killed = history.clone();
+        for text in ["killed turn input", "killed turn step"] {
+            killed.push(Message::user(text));
+            coordinator
+                .append_history(&binding, Some(&state), &killed)
+                .await
+                .expect("killed turn step appends");
+            state.history_len = killed.len();
+            state.history_fingerprint = LcmCoordinator::history_fingerprint(&killed).unwrap();
+        }
+        assert_eq!(store.entry_count(), 4);
+
+        let error = coordinator
+            .validate_resume_state(&session, &history, &persisted, None)
+            .await
+            .expect_err("a store that cannot truncate cannot drop the tail");
+        assert_eq!(
+            error.message,
+            "LCM DAG revision no longer matches its protected checkpoint"
+        );
+        assert_eq!(store.entry_count(), 4);
     }
 
     #[tokio::test]

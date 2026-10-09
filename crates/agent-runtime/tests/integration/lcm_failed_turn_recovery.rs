@@ -452,3 +452,110 @@ async fn diverged_lcm_timeline_heals_on_the_next_completed_turn() {
     assert_eq!(provider.requests().len(), 2);
     assert_eq!(lcm_store.entry_count(), session.history().len());
 }
+
+/// A host with only a session store saves its checkpoint when a turn ends,
+/// while every provider step of the turn appends to the LCM timeline. A
+/// process killed mid-turn therefore leaves the store several appends ahead
+/// of the saved session, holding entries no saved history contains. Resuming
+/// that session must drop the residue instead of refusing every later turn.
+#[tokio::test]
+async fn session_killed_mid_turn_resumes_without_its_uncheckpointed_tail() {
+    let session_id = SessionId::new("killed-mid-turn-resumes");
+    let sessions = Arc::new(MemorySessionStore::default());
+    let lcm_store = Arc::new(InMemoryLcmStore::new(LcmTimelineId::new(TIMELINE_ID)));
+    let ordinary_runtime = |provider: Arc<FakeProvider>, observer: Arc<RecordingObserver>| {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider)
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .session_store(sessions.clone())
+            .lcm(coordinator(&session_id, lcm_store.clone()))
+            .observer(observer)
+            .build()
+            .expect("runtime builds")
+    };
+
+    let first = ordinary_runtime(
+        Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![text_reply_script("first reply")],
+        )),
+        Arc::new(RecordingObserver::default()),
+    );
+    let session = first
+        .start_session(StartSession::create(session_id.clone(), Vec::new()))
+        .await
+        .expect("session starts");
+    session
+        .run(UserInput::text("first question"))
+        .await
+        .expect("first turn completes");
+    let saved_len = session.history().len();
+    session.shutdown().await.expect("session saves");
+    assert_eq!(lcm_store.entry_count(), saved_len);
+
+    // The killed turn: two provider steps, each appended on its own, none of
+    // them in the saved session.
+    for (step, text) in ["killed turn input", "killed turn tool step"]
+        .into_iter()
+        .enumerate()
+    {
+        let sequence = (saved_len + step) as u64;
+        lcm_store
+            .append(
+                &lcm_store.view().with_owner(session_id.clone(), 0),
+                LcmAppendRequest::new(
+                    LcmOperationId::new(format!("history:{sequence}:killed")),
+                    vec![LcmEntry::new(
+                        LcmTimelineId::new(TIMELINE_ID),
+                        LcmEntryId::new(format!("killed-{sequence}")),
+                        LcmSequence::new(sequence),
+                        Message::user(text),
+                        LcmSourceMetadata::new(LcmClassification::default()),
+                    )],
+                ),
+            )
+            .await
+            .expect("killed turn residue seeds");
+    }
+    assert_eq!(lcm_store.entry_count(), saved_len + 2);
+
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![text_reply_script("second reply")],
+    ));
+    let observer = Arc::new(RecordingObserver::default());
+    let resumed = ordinary_runtime(provider.clone(), observer.clone())
+        .start_session(StartSession::resume(session_id.clone()))
+        .await
+        .expect("the session resumes over the killed turn's residue");
+    assert_eq!(
+        lcm_store.entry_count(),
+        saved_len,
+        "resume removes exactly the uncheckpointed tail"
+    );
+
+    resumed
+        .run(UserInput::text("second question"))
+        .await
+        .expect("the resumed session accepts a turn");
+    assert_eq!(
+        observer.last_finish(),
+        Some(TurnFinish::Completed),
+        "runtime errors: {:?}",
+        observer.errors()
+    );
+    let history = resumed.history();
+    assert_eq!(lcm_store.entry_count(), history.len());
+    let texts = stored_texts(&lcm_store, history.len()).await;
+    assert!(
+        texts.iter().all(|text| !text.contains("killed turn")),
+        "no residue of the killed turn survives: {texts:?}"
+    );
+    assert!(texts.iter().any(|text| text.contains("second question")));
+}
