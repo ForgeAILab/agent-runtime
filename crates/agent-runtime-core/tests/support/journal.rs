@@ -505,6 +505,7 @@ pub(super) fn model_request() -> ProviderRequest {
                     text: "thought\né\u{2028}".to_owned(),
                     redacted: false,
                     signature: Some("sig+/=\0\né".to_owned()),
+                    producer: None,
                 }],
             },
             Message::user("final transformed prompt"),

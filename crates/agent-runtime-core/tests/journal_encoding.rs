@@ -113,6 +113,7 @@ fn signed_reasoning_and_numeric_bits_round_trip_without_normalization() {
         text,
         signature,
         redacted,
+        ..
     } = &message.content[0]
     else {
         panic!("not reasoning");
