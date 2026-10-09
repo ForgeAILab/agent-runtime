@@ -2,6 +2,8 @@
 
 include!("runtime_conformance/support.rs");
 
+#[path = "runtime_conformance/capability_discovery.rs"]
+mod capability_discovery;
 #[path = "runtime_conformance/interaction.rs"]
 mod interaction;
 #[path = "runtime_conformance/local_action.rs"]

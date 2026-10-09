@@ -255,6 +255,7 @@ pub async fn assert_storeless_held_history() {
                 text: "sealed".into(),
                 redacted: true,
                 signature: Some("opaque signature".into()),
+                producer: None,
             },
             ContentPart::text("seed answer"),
         ]),

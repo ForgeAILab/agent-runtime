@@ -31,7 +31,8 @@ use crate::hub::{RegistryHub, RegistryHubBuilder, ScopeInputs, ScopedRegistry};
 use crate::runtime::emitter::EventEmitter;
 
 use super::capability_search::{
-    CAPABILITY_SEARCH_TOOL_NAME, CapabilitySearchTool, search_arguments,
+    CAPABILITY_ACTIVATE_TOOL_NAME, CAPABILITY_SEARCH_TOOL_NAME, CapabilityActivateTool,
+    CapabilitySearchTool, search_arguments,
 };
 use super::{HarnessPipeline, ToolViewContext};
 
@@ -47,6 +48,7 @@ pub(crate) struct LiveAbilityRuntime {
     activation_context: ActivationContext,
     scope_inputs: ScopeInputs,
     budget: ActivationBudget,
+    pinned: BTreeSet<RegistryId>,
 }
 
 impl fmt::Debug for LiveAbilityRuntime {
@@ -69,6 +71,7 @@ pub(crate) struct SealedLiveAbilities {
 
 mod activation;
 mod rebase;
+mod required;
 mod search;
 mod session;
 

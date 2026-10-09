@@ -120,6 +120,9 @@ pub(crate) fn classify_reason(
     domain_authorized: bool,
     extra_risk_or_quota: bool,
 ) -> Option<ExclusionReason> {
+    if crate::hub::is_bootstrap(id) {
+        return None;
+    }
     let policy_denied = extra_policy_denied
         || inputs.denies_id(id)
         || inputs.denies_domain(&id.domain)

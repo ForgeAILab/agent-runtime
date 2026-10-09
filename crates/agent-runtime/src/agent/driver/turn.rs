@@ -857,6 +857,16 @@ impl<'a> TurnMachine<'a> {
             return Err(error);
         }
 
+        let hooks = self
+            .execution
+            .take_tool_result_commit_hooks(&self.turn_id, &block.call_id);
+        if !block.is_error {
+            // Awaited so the hook's state is in place before this turn's
+            // next checkpoint captures the session.
+            for hook in hooks {
+                hook().await;
+            }
+        }
         self.emitter.emit(
             Some(self.turn_id.clone()),
             RuntimeEvent::ToolCallCompleted {
@@ -880,10 +890,14 @@ impl<'a> TurnMachine<'a> {
         call: &ToolCall,
         mut outcome: ToolOutcome,
     ) -> Result<(), RuntimeError> {
-        let mut search_stage = if call.name == CAPABILITY_SEARCH_TOOL_NAME {
+        let mut search_stage = if matches!(
+            call.name.as_str(),
+            CAPABILITY_SEARCH_TOOL_NAME | CAPABILITY_ACTIVATE_TOOL_NAME
+        ) {
             self.execution
                 .abilities
                 .as_ref()
+                .filter(|abilities| abilities.has_staged_call(&call.id))
                 .map(|abilities| abilities.search_stage_guard(&call.id))
                 .transpose()?
         } else {
@@ -1391,7 +1405,7 @@ impl<'a> TurnMachine<'a> {
                     max_attempts,
                     attempt_visible_output,
                     text,
-                    reasoning,
+                    mut reasoning,
                     mut tool_calls,
                     finish,
                 } => {
@@ -1404,6 +1418,15 @@ impl<'a> TurnMachine<'a> {
                     // reaches dispatch or history, so the call and the result
                     // the host returns for it agree on one unique id.
                     reassign_colliding_tool_call_ids(&self.state, &mut tool_calls);
+                    let producer = execution.planner.reasoning_producer();
+                    for part in &mut reasoning {
+                        if let ContentPart::Reasoning {
+                            producer: recorded, ..
+                        } = part
+                        {
+                            *recorded = Some(producer.clone());
+                        }
+                    }
                     if let Err(error) = self
                         .transition(TurnState::ModelResponseReady {
                             request_id: request_id.clone(),

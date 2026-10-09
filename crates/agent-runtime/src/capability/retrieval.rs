@@ -28,7 +28,7 @@ use crate::capability::query::RoutingQuery;
 /// retriever produced a candidate, even when no embedding index is
 /// configured. Bump this if scoring changes in a way that could reorder
 /// results for the same inputs.
-pub const DETERMINISTIC_RETRIEVER_REVISION: &str = "capability-retrieval.deterministic.v1";
+pub const DETERMINISTIC_RETRIEVER_REVISION: &str = "capability-retrieval.deterministic.v2";
 
 const NAME_WEIGHT: u32 = 10;
 const AFFORDANCE_WEIGHT: u32 = 6;
@@ -58,7 +58,8 @@ pub struct MatchReasons {
     pub name: bool,
     /// Tags the query matched.
     pub tags: Vec<String>,
-    /// Keywords the query matched.
+    /// Keywords the query matched. Explicit descriptive matches are recorded
+    /// as `text:<whole-word>` and carry a lower score than curated keywords.
     pub keywords: Vec<String>,
     /// Declared affordances the query matched.
     pub affordances: Vec<Affordance>,
@@ -87,7 +88,17 @@ impl MatchReasons {
             score += NAME_WEIGHT;
         }
         score += TAG_WEIGHT * self.tags.len() as u32;
-        score += KEYWORD_WEIGHT * self.keywords.len() as u32;
+        score += self
+            .keywords
+            .iter()
+            .map(|term| {
+                if term.starts_with("text:") {
+                    1
+                } else {
+                    KEYWORD_WEIGHT
+                }
+            })
+            .sum::<u32>();
         score += AFFORDANCE_WEIGHT * self.affordances.len() as u32;
         score += MODALITY_WEIGHT * self.modalities.len() as u32;
         score += DEPENDENCY_WEIGHT * self.dependencies.len() as u32;
@@ -237,10 +248,67 @@ pub fn retrieve(
     query: &RoutingQuery,
     embedding: Option<&dyn EmbeddingIndex>,
 ) -> RetrievalResult {
+    retrieve_mode(view, query, embedding, false)
+}
+
+/// Explicit discovery includes low-weight whole-word descriptive matches.
+pub fn retrieve_descriptive(
+    view: &RegistryView<AbilityDescriptor>,
+    query: &RoutingQuery,
+    embedding: Option<&dyn EmbeddingIndex>,
+) -> RetrievalResult {
+    retrieve_mode(view, query, embedding, true)
+}
+
+fn retrieve_mode(
+    view: &RegistryView<AbilityDescriptor>,
+    query: &RoutingQuery,
+    embedding: Option<&dyn EmbeddingIndex>,
+    descriptive: bool,
+) -> RetrievalResult {
     let mut candidates: Vec<RetrievedCandidate> = view
         .iter()
         .filter_map(|entry| {
-            let matched = match_reasons(entry.payload(), query);
+            let mut matched = match_reasons(entry.payload(), query);
+            if descriptive {
+                let card = entry.payload().card();
+                let words: BTreeSet<String> = [&card.title, &card.summary]
+                    .into_iter()
+                    .flat_map(|text| text.split(|c: char| !c.is_alphanumeric()))
+                    .map(str::to_lowercase)
+                    .collect();
+                let terms: BTreeSet<String> = query
+                    .terms()
+                    .iter()
+                    .flat_map(|term| term.split(|c: char| !c.is_alphanumeric()))
+                    .filter(|term| {
+                        term.chars().count() >= 3
+                            && !matches!(
+                                *term,
+                                "the"
+                                    | "and"
+                                    | "for"
+                                    | "with"
+                                    | "this"
+                                    | "that"
+                                    | "from"
+                                    | "into"
+                                    | "are"
+                                    | "you"
+                                    | "your"
+                                    | "can"
+                                    | "use"
+                                    | "how"
+                            )
+                    })
+                    .map(str::to_owned)
+                    .collect();
+                matched.keywords.extend(
+                    terms
+                        .intersection(&words)
+                        .map(|term| format!("text:{term}")),
+                );
+            }
             if matched.is_empty() {
                 return None;
             }
@@ -285,6 +353,10 @@ pub fn retrieve(
     candidates.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
+            .then_with(|| {
+                (a.descriptor.kind() != &agent_runtime_ability::AbilityKind::Tool)
+                    .cmp(&(b.descriptor.kind() != &agent_runtime_ability::AbilityKind::Tool))
+            })
             .then_with(|| a.descriptor.id().cmp(b.descriptor.id()))
     });
 
@@ -392,6 +464,97 @@ mod tests {
                 .candidates
                 .iter()
                 .all(|c| c.descriptor.id() != &fixtures::denied_tool_id())
+        );
+    }
+}
+
+#[cfg(test)]
+mod descriptive_tests {
+    use super::*;
+    use agent_runtime_ability::AbilityKind;
+    use agent_runtime_registry::{
+        EntryProvenance, RegistryBuilder, RegistryEntry, RegistryRevision, RegistrySource,
+        ViewFilter,
+    };
+
+    fn descriptor(kind: AbilityKind, name: &str, summary: &str) -> AbilityDescriptor {
+        AbilityDescriptor::new(
+            kind,
+            name,
+            EntryProvenance::new(RegistrySource::Host, RegistryRevision::new("1")),
+            "Card",
+            summary,
+            RegistryRevision::new("1"),
+        )
+    }
+
+    #[test]
+    fn descriptive_matches_are_explicit_whole_words_below_keywords_and_explainable() {
+        let description = descriptor(
+            AbilityKind::Tool,
+            "terminal",
+            "Inspect an eigenvector on a remote server",
+        );
+        let keyword =
+            descriptor(AbilityKind::Tool, "curated", "Other").with_keywords(["eigenvector"]);
+        let mut builder = RegistryBuilder::new();
+        for d in [description, keyword] {
+            builder.declare(RegistryEntry::new(d.card().clone(), d));
+        }
+        let view = builder.seal().unwrap().view(&ViewFilter::new());
+        let query = RoutingQuery::derive("EIGENVECTOR", Vec::<String>::new());
+        assert_eq!(retrieve(&view, &query, None).candidates.len(), 1);
+        let result = retrieve_descriptive(&view, &query, None);
+        assert_eq!(result.candidates.len(), 2);
+        assert_eq!(
+            result.candidates[0].descriptor.id(),
+            &RegistryId::tool("curated")
+        );
+        assert_eq!(result.candidates[1].matched.keywords, ["text:eigenvector"]);
+        assert!(
+            retrieve_descriptive(
+                &view,
+                &RoutingQuery::derive("eigen", Vec::<String>::new()),
+                None
+            )
+            .candidates
+            .is_empty()
+        );
+        assert!(
+            retrieve_descriptive(
+                &view,
+                &RoutingQuery::derive("an the on", Vec::<String>::new()),
+                None
+            )
+            .candidates
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn tools_rank_before_skills_on_equal_score_then_by_id() {
+        let mut builder = RegistryBuilder::new();
+        for (kind, name) in [
+            (AbilityKind::Skill, "skill"),
+            (AbilityKind::Tool, "z-tool"),
+            (AbilityKind::Tool, "a-tool"),
+        ] {
+            let d = descriptor(kind, name, "Inspect eigenvectors");
+            builder.declare(RegistryEntry::new(d.card().clone(), d));
+        }
+        let view = builder.seal().unwrap().view(&ViewFilter::new());
+        let result = retrieve_descriptive(
+            &view,
+            &RoutingQuery::derive("eigenvectors", Vec::<String>::new()),
+            None,
+        );
+        assert_eq!(
+            result
+                .candidates
+                .iter()
+                .map(|c| c.descriptor.id().qualified())
+                .collect::<Vec<_>>(),
+            ["tool:a-tool", "tool:z-tool", "skill:skill"]
         );
     }
 }

@@ -1,0 +1,14 @@
+{
+  "change_id": "update-tool-delivered-child-outcomes",
+  "change_ref": "update-tool-delivered-child-outcomes-2026-10-05",
+  "created_at": "2026-10-05T00:00:00Z",
+  "updated_at": "2026-10-05T00:00:00Z",
+  "completed_at": null,
+  "status": "implementing",
+  "approved_at": "2026-10-05T00:00:00Z",
+  "implementation_started_at": "2026-10-05T00:00:00Z",
+  "depends_on": [
+    "add-adaptive-cache-parking-2026-08-08"
+  ],
+  "external_dependencies": []
+}

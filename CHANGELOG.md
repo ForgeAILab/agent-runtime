@@ -7,6 +7,41 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- Pinned abilities and capability browse. `RuntimeBuilder::pinned_abilities`
+  places named abilities in every authorized session's first activation
+  epoch, independent of retrieval. `registry.search` without a query lists
+  the authorized catalog with per-domain counts, and explicit searches also
+  score a card's title and summary. A protected `registry.activate` tool
+  stages named ids through the same transaction as search. Scope inputs
+  accept allow and deny patterns (`CapabilityPattern`), and sessions expose a
+  read-only capability catalog to hosts.
+
+### Fixed
+
+- A child outcome the model already read through a host delegation tool is no
+  longer delivered again by the automatic child-completion turn. The tool
+  acknowledges the outcome against its tool call; once that call's non-error
+  result commits to the parent's history the outcome leaves the
+  automatic-delivery projection and the parent snapshot is saved. An error
+  result, or a turn that ends before the result commits, leaves delivery in
+  place. The ledger keeps the outcome for inspection.
+- Reasoning is now omitted from a request by one rule, applied in one place
+  as the request is planned. Reasoning committed to canonical history records
+  the provider and model that produced it, and a request omits a reasoning
+  part when that producer is another provider or model, or when the part is
+  unsigned and belongs to an earlier turn. Reasoning with no recorded
+  producer is never treated as foreign: signed it is sent as before, unsigned
+  it is dropped once its turn has ended. This replaces the separate step
+  that dropped earlier unsigned reasoning before planning. Canonical history
+  keeps every part, so LCM entries and checkpoint fingerprints are untouched,
+  and an assistant message left empty is never sent as an empty message.
+  Gemini accepts unsigned tool calls from earlier turns and still requires a
+  signed thought in the active continuation.
+- Image parts in a tool result are bounded by their estimated token cost
+  rather than the length of their URL, so a large inline image that fits the
+  output limit is no longer dropped.
 ## [0.2.1] - 2026-10-08
 
 ### Fixed

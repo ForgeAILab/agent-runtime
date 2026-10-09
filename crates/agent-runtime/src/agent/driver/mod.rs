@@ -8,7 +8,6 @@
 //! recording, an explicit turn deadline, fail-closed approval via the executor,
 //! and structured terminal events.
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::{Future, pending};
 use std::sync::{Arc, Mutex};
@@ -66,8 +65,8 @@ use crate::agent::config::LoopConfig;
 use crate::agent::planning::{PreviousCacheRestore, RunPlanner};
 use crate::cache::CacheMechanism;
 use crate::harness::{
-    CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView, HarnessPipeline,
-    HistoryProjection, HistoryView, IdleCompactionResult, LCM_COMPONENT_ID,
+    CAPABILITY_ACTIVATE_TOOL_NAME, CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView,
+    HarnessPipeline, HistoryProjection, HistoryView, IdleCompactionResult, LCM_COMPONENT_ID,
     LCM_IDLE_COMPACTION_PURPOSE, LCM_SUMMARY_PURPOSE, LiveAbilityRuntime, ModelView,
     QUESTIONNAIRE_TOOL_NAME, ToolOutputView, TurnCommitView,
 };
@@ -491,48 +490,10 @@ impl ReasoningAccumulator {
                 text: part.text,
                 redacted: part.redacted,
                 signature: part.signature,
+                producer: None,
             })
             .collect()
     }
-}
-
-/// Sheds unsigned reasoning retained from earlier turns, for the model-facing
-/// projection of `history` only. Signed reasoning is provider-required
-/// continuation content and rides every later request; unsigned reasoning is
-/// dead weight once the producing turn ends, and the turn still in flight --
-/// everything from `active_start` on -- keeps its own reasoning so
-/// thinking endpoints can echo it back on a tool-call continuation.
-///
-/// Canonical history is never rewritten here. It is the LCM's immutable
-/// record: entries are durable and the protected checkpoint fingerprints
-/// them, so mutating history between turns makes the next turn's projection
-/// fail against its own checkpoint. Messages are preserved one for one for
-/// the same reason -- fragment ids and compaction provenance address history
-/// by index -- so an assistant message that carried nothing but shed
-/// reasoning is left empty, and each provider decides whether an empty
-/// assistant message reaches its wire.
-fn history_without_stale_reasoning(history: &[Message], active_start: usize) -> Cow<'_, [Message]> {
-    let is_stale = |part: &ContentPart| {
-        matches!(
-            part,
-            ContentPart::Reasoning {
-                signature: None,
-                ..
-            }
-        )
-    };
-    let stale_through = history.len().min(active_start);
-    if !history[..stale_through]
-        .iter()
-        .any(|message| message.content.iter().any(is_stale))
-    {
-        return Cow::Borrowed(history);
-    }
-    let mut shed = history.to_vec();
-    for message in shed.iter_mut().take(stale_through) {
-        message.content.retain(|part| !is_stale(part));
-    }
-    Cow::Owned(shed)
 }
 
 /// Drives turns for a session using injected services.

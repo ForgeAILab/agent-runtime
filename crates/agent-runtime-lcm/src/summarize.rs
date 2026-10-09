@@ -1321,6 +1321,7 @@ mod tests {
                     text: "private deliberation".into(),
                     redacted: false,
                     signature: None,
+                    producer: None,
                 },
                 ContentPart::ToolCall(ToolCall {
                     id: ToolCallId::new("call-1"),
