@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT"
@@ -48,18 +48,18 @@ uuid = { version = "1.19", features = ["v4"] }
 sha2 = { version = "0.10", default-features = false }
 
 # Internal workspace crates (path + version so a future tagged release resolves).
-agent-runtime-registry = { path = "crates/agent-runtime-registry", version = "0.1.0" }
-agent-runtime-core = { path = "crates/agent-runtime-core", version = "0.1.0" }
-agent-runtime-ability = { path = "crates/agent-runtime-ability", version = "0.1.0" }
-agent-runtime-provider = { path = "crates/agent-runtime-provider", version = "0.1.0" }
-agent-runtime-context = { path = "crates/agent-runtime-context", version = "0.1.0" }
-agent-runtime-lcm = { path = "crates/agent-runtime-lcm", version = "0.1.0" }
-agent-runtime-obs = { path = "crates/agent-runtime-obs", version = "0.1.0" }
-agent-runtime = { path = "crates/agent-runtime", version = "0.1.0" }
-agent-runtime-mcp = { path = "crates/agent-runtime-mcp", version = "0.1.0" }
-agent-runtime-agent-cli = { path = "crates/agent-runtime-agent-cli", version = "0.1.0" }
-agent-runtime-cli = { path = "crates/agent-runtime-cli", version = "0.1.0" }
-agent-runtime-testkit = { path = "crates/agent-runtime-testkit", version = "0.1.0" }
+agent-runtime-registry = { path = "crates/agent-runtime-registry", version = "0.2.0" }
+agent-runtime-core = { path = "crates/agent-runtime-core", version = "0.2.0" }
+agent-runtime-ability = { path = "crates/agent-runtime-ability", version = "0.2.0" }
+agent-runtime-provider = { path = "crates/agent-runtime-provider", version = "0.2.0" }
+agent-runtime-context = { path = "crates/agent-runtime-context", version = "0.2.0" }
+agent-runtime-lcm = { path = "crates/agent-runtime-lcm", version = "0.2.0" }
+agent-runtime-obs = { path = "crates/agent-runtime-obs", version = "0.2.0" }
+agent-runtime = { path = "crates/agent-runtime", version = "0.2.0" }
+agent-runtime-mcp = { path = "crates/agent-runtime-mcp", version = "0.2.0" }
+agent-runtime-agent-cli = { path = "crates/agent-runtime-agent-cli", version = "0.2.0" }
+agent-runtime-cli = { path = "crates/agent-runtime-cli", version = "0.2.0" }
+agent-runtime-testkit = { path = "crates/agent-runtime-testkit", version = "0.2.0" }
 
 # Clippy-as-error at the workspace level. CI additionally runs
 # `cargo clippy --all-targets -- -D warnings` for the full set.

@@ -7,6 +7,17 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- Pinned abilities and capability browse. `RuntimeBuilder::pinned_abilities`
+  places named abilities in every authorized session's first activation
+  epoch, independent of retrieval. `registry.search` without a query lists
+  the authorized catalog with per-domain counts, and explicit searches also
+  score a card's title and summary. A protected `registry.activate` tool
+  stages named ids through the same transaction as search. Scope inputs
+  accept allow and deny patterns (`CapabilityPattern`), and sessions expose a
+  read-only capability catalog to hosts.
+
 ### Fixed
 
 - A child outcome the model already read through a host delegation tool is no
@@ -16,15 +27,29 @@ contain breaking changes and are coordinated with consumer proposals.
   automatic-delivery projection and the parent snapshot is saved. An error
   result, or a turn that ends before the result commits, leaves delivery in
   place. The ledger keeps the outcome for inspection.
-- Reasoning committed to canonical history now records the provider and model
-  that produced it, and a request omits reasoning recorded for a different
-  provider or model. Canonical history keeps the omitted parts, so LCM entries
-  and checkpoint fingerprints are untouched, and reasoning with no recorded
-  producer is sent as before. Gemini accepts unsigned tool calls from earlier
-  turns and still requires a signed thought in the active continuation.
+- Reasoning is now omitted from a request by one rule, applied in one place
+  as the request is planned. Reasoning committed to canonical history records
+  the provider and model that produced it, and a request omits a reasoning
+  part when that producer is another provider or model, or when the part is
+  unsigned and belongs to an earlier turn. Reasoning with no recorded
+  producer is never treated as foreign: signed it is sent as before, unsigned
+  it is dropped once its turn has ended. This replaces the separate step
+  that dropped earlier unsigned reasoning before planning. Canonical history
+  keeps every part, so LCM entries and checkpoint fingerprints are untouched,
+  and an assistant message left empty is never sent as an empty message.
+  Gemini accepts unsigned tool calls from earlier turns and still requires a
+  signed thought in the active continuation.
 - Image parts in a tool result are bounded by their estimated token cost
   rather than the length of their URL, so a large inline image that fits the
   output limit is no longer dropped.
+
+## [0.2.0] - 2026-10-08
+
+The first tagged release since `v0.1.0`. That tag was cut without a changelog
+section of its own, so this section also lists what `v0.1.0` contained.
+
+### Fixed
+
 - The deterministic LCM fallback no longer stores text a model can copy as a
   reply. When both summary attempts were rejected, the fallback kept a cut of
   the source that rendered tool calls as `assistant: call name(args)`. That
@@ -442,14 +467,6 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
 
 ### Added
 
-- Pinned abilities and capability browse. `RuntimeBuilder::pinned_abilities`
-  places named abilities in every authorized session's first activation
-  epoch, independent of retrieval. `registry.search` without a query lists
-  the authorized catalog with per-domain counts, and explicit searches also
-  score a card's title and summary. A protected `registry.activate` tool
-  stages named ids through the same transaction as search. Scope inputs
-  accept allow and deny patterns (`CapabilityPattern`), and sessions expose a
-  read-only capability catalog to hosts.
 - Cache diagnostics: `first_changed_fragment` names the first plan segment
   (in plan-segment order) that differs from the committed predecessor,
   including a removed segment, without changing fingerprints, cache
