@@ -70,6 +70,7 @@ pub mod guard;
 pub mod ids;
 pub mod interaction;
 pub mod isolation;
+pub mod journal;
 pub mod manifest;
 pub mod metadata;
 pub mod observer;
@@ -130,6 +131,7 @@ pub mod prelude {
     };
     pub use crate::error::{
         ErrorKind, FailureClass, FailureComponent, FailureStage, LcmFailure, Result, RuntimeError,
+        UnsupportedCapability,
     };
     pub use crate::event::{
         BudgetCategory, CacheOperationOutcome, CacheOperationReason, CacheState, CacheStateKind,

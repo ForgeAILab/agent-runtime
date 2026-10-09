@@ -18,6 +18,40 @@ contain breaking changes and are coordinated with consumer proposals.
   accept allow and deny patterns (`CapabilityPattern`), and sessions expose a
   read-only capability catalog to hosts.
 
+- SessionJournal contracts and readers (U9 merge group A), in
+  `agent_runtime_core::journal`. This is the contract a host store implements
+  to persist a session as immutable content-addressed objects plus a head, so
+  that a transition writes only what changed. It contains the `SessionJournal`
+  trait and its request, lease, head, batch and commit types; the frozen
+  `journal-json-1` encoding with domain, type and version separated SHA-256
+  object IDs; `JournalReader`, which materializes a `SessionSnapshot` or
+  `TurnCheckpoint` from a journal head under host-supplied limits; and
+  `SnapshotJournal`, an adapter over an existing `SessionStore` and
+  `CheckpointStore` pair that keeps writing full snapshots.
+- The runtime does not write a journal yet. Nothing here activates a native
+  writer, an import or a collector; those are later merge groups.
+- Persisted data is unchanged. `CHECKPOINT_SCHEMA_VERSION` stays 3, session
+  snapshots stay unversioned, and every checkpoint and snapshot this release
+  writes is byte for byte what v0.2.1 wrote. A host can upgrade without
+  changing a store or a schema guard, and can roll back to v0.2.1.
+  `JOURNAL_SCHEMA_VERSION` (4) tags journal heads, objects and reference
+  checkpoints only. A host that publishes those through its own
+  `SessionJournal` cannot read them with an older release.
+- `SessionStore` and `CheckpointStore` gain two defaulted methods, `journal()`
+  returning `None` and `require_journal()` returning the new typed error.
+  Existing implementations compile unchanged.
+- `FailureClass::UnsupportedCapability { stage, capability }` and
+  `UnsupportedCapability`, built by `RuntimeError::unsupported_capability`. The
+  error kind is `Config` and it is not retryable. `FailureClass` was already
+  `#[non_exhaustive]`; `UnsupportedCapability` is too.
+
+### Changed
+
+- `agent-runtime-core` now enables `serde_json/float_roundtrip`. Cargo unifies
+  features, so a host's own `serde_json` parsing becomes exact for every float
+  and somewhat slower on float-heavy input. The journal encoding needs it to
+  read back the float it wrote.
+
 ### Fixed
 
 - A child outcome the model already read through a host delegation tool is no

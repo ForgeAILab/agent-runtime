@@ -32,6 +32,10 @@ use crate::tool::{PreparedToolCall, ToolOutcome};
 ///
 /// Version 3 adds protected provider-cache operation phases and bounded
 /// result metadata to the same unreleased protected contract.
+///
+/// Materialized checkpoints stay at version 3: adding the session-journal
+/// contracts changed no persisted checkpoint byte. Journal heads, objects and
+/// reference checkpoints carry [`crate::journal::JOURNAL_SCHEMA_VERSION`].
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 /// The direct turn-machine transition-table revision.

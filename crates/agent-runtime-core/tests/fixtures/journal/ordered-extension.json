@@ -1,0 +1,1 @@
+{"encoding":"journal-json-1","kind":"extension","ordered_objects":[{"keys":["z","a"],"path":["value"]}],"schema_version":4,"value":{"revision":"fixture-v1","sensitivity":"sensitive","value":{"a":-0.0,"z":1.5}}}

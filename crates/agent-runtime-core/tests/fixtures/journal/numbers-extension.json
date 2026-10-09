@@ -1,0 +1,1 @@
+{"encoding":"journal-json-1","kind":"extension","schema_version":4,"value":{"revision":"fixture-v1","sensitivity":"sensitive","value":{"min":-9223372036854775808,"negative_zero":-0.0,"nested":{"a":18446744073709551615,"z":1.5},"positive_zero":0.0}}}
