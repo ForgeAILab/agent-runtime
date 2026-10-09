@@ -42,6 +42,10 @@ contain breaking changes and are coordinated with consumer proposals.
 - Image parts in a tool result are bounded by their estimated token cost
   rather than the length of their URL, so a large inline image that fits the
   output limit is no longer dropped.
+## [0.2.1] - 2026-10-08
+
+### Fixed
+
 - An LCM session whose turn was killed between provider steps can be resumed
   again. Each provider step appends to the LCM timeline, but a host with a
   SessionStore and no CheckpointStore saves the session when the turn ends, so
