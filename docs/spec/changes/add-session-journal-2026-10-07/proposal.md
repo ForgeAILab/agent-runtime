@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-07T00:00:00Z
+updated_at: 2026-10-09T00:00:00Z
 ---
 
 # Proposal: SessionJournal with referenced checkpoints (U9)
@@ -84,8 +84,11 @@ overrides remain uncommitted development aids, not release dependencies.
 
 ## Approval Decisions
 
-Recommend approving native opt-in plus legacy source compatibility for this
-release, one full release of v3 readers, a SHA-256 versioned encoding, and
-host-triggered retention/collection with no automatic expiry default. Approve
-these choices before implementation; the exact decisions and risks are listed
-in design.md. This document authorizes no implementation or release.
+The owner approved group A only on 2026-10-08 (local date): the coordinated
+pre-1.0 persisted-schema 3-to-4 break, native opt-in with legacy source
+compatibility, v3/unversioned readers for the entire first U9 release,
+`journal-json-1` with domain/type/version-separated SHA-256, and fanout 64.
+Group A adds contracts/readers and a full-snapshot compatibility adapter; it
+does not activate native writing, import or retention. Existing stores keep
+compiling; custom persisted-schema guards must accept schema 4 before upgrading.
+Groups B/C/D, U10 and release eligibility are not approved by this decision.

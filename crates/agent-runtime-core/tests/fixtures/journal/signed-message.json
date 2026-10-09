@@ -1,0 +1,1 @@
+{"encoding":"journal-json-1","kind":"message","schema_version":4,"value":{"content":[{"redacted":false,"signature":"sig+/=\u0000\né","text":"thought\né ","type":"reasoning"},{"text":"answer","type":"text"}],"role":"assistant"}}

@@ -241,6 +241,24 @@ pub struct SessionSnapshot {
 /// A host-injected session store.
 #[async_trait]
 pub trait SessionStore: Send + Sync + fmt::Debug {
+    /// Discovers opt-in native persistence. Legacy implementations return `None`.
+    /// Group A does not activate this capability in the runtime.
+    fn journal(&self) -> Option<std::sync::Arc<dyn crate::journal::SessionJournal>> {
+        None
+    }
+
+    /// Requests native persistence explicitly; legacy stores fail with typed
+    /// unsupported-capability evidence instead of inventing CAS from `save`.
+    fn require_journal(
+        &self,
+    ) -> Result<std::sync::Arc<dyn crate::journal::SessionJournal>, RuntimeError> {
+        self.journal().ok_or_else(|| {
+            RuntimeError::unsupported_capability(
+                crate::error::UnsupportedCapability::SessionJournal,
+            )
+        })
+    }
+
     /// Loads a session snapshot, if one exists.
     async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError>;
 

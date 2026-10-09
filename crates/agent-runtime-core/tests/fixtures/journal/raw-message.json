@@ -1,0 +1,1 @@
+{"encoding":"journal-json-1","kind":"message","schema_version":4,"value":{"content":[{"text":"credentials: secret-token","type":"text"}],"role":"user"}}

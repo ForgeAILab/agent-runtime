@@ -455,7 +455,7 @@ impl TurnCheckpoint {
             )));
         }
         let checkpoint = Self {
-            schema_version: self.schema_version,
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
             transition_revision: self.transition_revision,
             session: self.session.clone(),
             turn: self.turn.clone(),
@@ -481,7 +481,10 @@ impl TurnCheckpoint {
 
     /// Validates schema compatibility, identity, and operation fingerprints.
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        if self.schema_version != CHECKPOINT_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            LEGACY_CHECKPOINT_SCHEMA_VERSION | CHECKPOINT_SCHEMA_VERSION
+        ) {
             return Err(RuntimeError::conflict(format!(
                 "unsupported checkpoint schema {}; expected {}",
                 self.schema_version, CHECKPOINT_SCHEMA_VERSION
@@ -866,9 +869,10 @@ impl TurnCheckpoint {
                 "checkpoint successor belongs to another session or turn",
             ));
         }
-        if self.schema_version != next.schema_version
-            || self.transition_revision != next.transition_revision
-        {
+        let schema_compatible = self.schema_version == next.schema_version
+            || (self.schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION
+                && next.schema_version == CHECKPOINT_SCHEMA_VERSION);
+        if !schema_compatible || self.transition_revision != next.transition_revision {
             return Err(RuntimeError::conflict(
                 "checkpoint successor changed schema or transition revision",
             ));

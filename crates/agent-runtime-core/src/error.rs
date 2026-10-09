@@ -47,6 +47,20 @@ pub enum FailureComponent {
     Unknown,
 }
 
+/// A persistence capability that a host explicitly requested but does not supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedCapability {
+    /// Native, fenced session-journal access.
+    SessionJournal,
+    /// Atomic writer fencing across processes.
+    JournalFencing,
+    /// Expected-revision retirement under host retention authorization.
+    JournalRetirement,
+    /// Collection serialized with all roots and pins.
+    JournalCollection,
+}
+
 /// Host-visible details of a static tool write scope rejected during build.
 /// Declared tool/scope/root strings are configuration evidence, not telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +81,11 @@ pub struct ToolWriteScopeViolation {
 #[non_exhaustive]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum FailureClass {
+    /// The configured store cannot supply an explicitly requested capability.
+    UnsupportedCapability {
+        stage: FailureStage,
+        capability: UnsupportedCapability,
+    },
     /// A static workspace write scope was rejected during runtime build.
     /// Host-visible configuration evidence; declared paths are not telemetry.
     InvalidToolWriteScope(Box<ToolWriteScopeViolation>),
@@ -122,6 +141,7 @@ impl FailureClass {
             Self::InvalidToolWriteScope(_) => FailureStage::PreProvider,
             Self::Unclassified => FailureStage::Unknown,
             Self::RequestRejected { stage }
+            | Self::UnsupportedCapability { stage, .. }
             | Self::PolicyDenied { stage }
             | Self::ContextOverflow { stage, .. }
             | Self::Transient { stage }
@@ -147,6 +167,7 @@ impl FailureClass {
         match &mut self {
             Self::Unclassified | Self::InvalidToolWriteScope(_) => {}
             Self::RequestRejected { stage }
+            | Self::UnsupportedCapability { stage, .. }
             | Self::PolicyDenied { stage }
             | Self::ContextOverflow { stage, .. }
             | Self::Transient { stage }
@@ -361,6 +382,16 @@ impl RuntimeError {
     }
 
     // Convenience constructors for the common kinds.
+
+    /// An explicit, nonretryable missing persistence capability.
+    pub fn unsupported_capability(capability: UnsupportedCapability) -> Self {
+        Self::new(ErrorKind::Config, "unsupported persistence capability").with_class(
+            FailureClass::UnsupportedCapability {
+                stage: FailureStage::PreProvider,
+                capability,
+            },
+        )
+    }
 
     /// A [`ErrorKind::Config`] error.
     pub fn config(message: impl Into<String>) -> Self {

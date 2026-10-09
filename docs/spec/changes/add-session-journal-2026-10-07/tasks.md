@@ -1,20 +1,21 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-07T00:00:00Z
+updated_at: 2026-10-09T00:00:00Z
 ---
 
 # Tasks: SessionJournal and referenced checkpoints
 
-All boxes are future work. Documents only are authorized now. Groups can merge
-independently; release requires all applicable gates, not merely contract merge.
+The owner approved merge group A only on 2026-10-08 (local date). Groups B, C,
+D and U10 remain unapproved. Groups can merge independently; release requires
+all applicable gates, not merely contract merge.
 
 ## 1. Merge group A — Contracts and dual readers (no native writer activation)
 
-- [ ] 1.1 Approve design decisions and record pre-1.0 break/migration contract; define every DTO and exact/default trait method listed in design.md without removing old methods.
-- [ ] 1.2 Freeze journal-json-1/SHA-256 domain/type/version fixtures, signed reasoning and negative-zero round trips; add bounded persistent sequence/map reference encoding.
-- [ ] 1.3 Add schema-4 head/reference checkpoint readers, retain v3/unversioned snapshot readers for the stated release window, and validate transition revision 4 equivalence rather than assume it.
-- [ ] 1.4 Preserve materialized public SessionSnapshot/TurnCheckpoint/TurnState, all exactness/redaction checks, and explicit unsupported capability errors; add unchanged legacy store implementation compile fixtures.
-- [ ] 1.5 Add SnapshotJournal materialization adapter over separate policy stores; make its O(history) cost, single-writer requirement and lack of native CAS/GC explicit.
+- [x] 1.1 Approve design decisions and record pre-1.0 break/migration contract; define every DTO and exact/default trait method listed in design.md without removing old methods.
+- [x] 1.2 Freeze journal-json-1/SHA-256 domain/type/version fixtures, signed reasoning and negative-zero round trips; add bounded persistent sequence/map reference encoding.
+- [x] 1.3 Add schema-4 head/reference checkpoint readers, retain v3/unversioned snapshot readers for the stated release window, and validate transition revision 4 equivalence rather than assume it.
+- [x] 1.4 Preserve materialized public SessionSnapshot/TurnCheckpoint/TurnState, all exactness/redaction checks, and explicit unsupported capability errors; add unchanged legacy store implementation compile fixtures.
+- [x] 1.5 Add SnapshotJournal materialization adapter over separate policy stores; make its O(history) cost, single-writer requirement and lack of native CAS/GC explicit.
 
 ## 2. Merge group B — Native writer and migration (independent of U10)
 

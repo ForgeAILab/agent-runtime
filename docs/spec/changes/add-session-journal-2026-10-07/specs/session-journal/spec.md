@@ -2,12 +2,13 @@
 
 ### Requirement: Native journal capability is explicit
 
-SessionStore and CheckpointStore SHALL add defaulted journal() discovery returning None, without changing or removing existing methods. A native SessionJournal SHALL provide storage_id, open, read, commit, renew, close, retire and collect with the signatures and fenced semantics in design.md. Existing implementations MUST continue compiling; a legacy SnapshotJournal adapter MUST NOT claim native CAS, GC safety or delta-write performance.
+SessionStore and CheckpointStore SHALL add defaulted journal() discovery returning None, without changing or removing existing methods. An additive defaulted require_journal() SHALL return the discovered capability or explicit typed UnsupportedCapability::SessionJournal evidence. A native SessionJournal SHALL provide storage_id, open, read, commit, renew, close, retire and collect with the signatures and fenced semantics in design.md. Existing implementations MUST continue compiling; a legacy SnapshotJournal adapter MUST NOT claim native CAS, GC safety or delta-write performance.
 
 #### Scenario: Existing store implements only current methods
 
 - **WHEN** an unchanged SessionStore/CheckpointStore pair is composed
 - **THEN** it compiles and selects materialized legacy persistence
+- **AND** explicit native capability requests fail with typed unsupported evidence
 - **AND** schema guards requiring migration are reported by the coordinated consumer gate
 
 #### Scenario: Native data loses its adapter
@@ -41,6 +42,12 @@ Referenced checkpoints SHALL retain the exact final request, prepared invocation
 - **WHEN** CallingModel is restored from references
 - **THEN** the final ordered messages, schemas, reasoning signatures, settings and cache boundaries equal the frozen request
 - **AND** current planner or summary-model policy is not run to reconstruct it
+
+#### Scenario: Host preserves opaque JSON map insertion order
+
+- **WHEN** existing operation or preparation fingerprints depend on opaque JSON map order
+- **THEN** journal-json-1 binds and restores that order as explicit metadata while payload object keys stay canonical
+- **AND** a reader unable to represent the recorded order fails closed before execution instead of changing fingerprints
 
 #### Scenario: Redacted terminal history differs in bytes
 

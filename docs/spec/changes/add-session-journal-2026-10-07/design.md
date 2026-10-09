@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-07T00:00:00Z
+updated_at: 2026-10-09T00:00:00Z
 ---
 
 # Design: Delta persistence without changing storage authority
@@ -101,6 +101,12 @@ Bytes are a neutral owned byte vector, not a backend SDK type.
 ```rust
 // Add to each existing trait; load/save and load_latest/save are unchanged.
 fn journal(&self) -> Option<Arc<dyn SessionJournal>> { None }
+// Additive convenience for an explicit capability request; default discovery
+// remains exactly Option/None as specified, rather than changing its signature.
+fn require_journal(&self) -> Result<Arc<dyn SessionJournal>, RuntimeError> {
+    self.journal().ok_or_else(|| RuntimeError::unsupported_capability(
+        UnsupportedCapability::SessionJournal))
+}
 
 #[async_trait]
 pub trait SessionJournal: Send + Sync + Debug {
@@ -180,6 +186,62 @@ neither cross-process CAS nor GC. No new event, start command, resolver method
 or LcmReader/LcmWriter method is introduced by U9.
 
 ## Objects, Heads and Reference Checkpoints
+
+### Group A encoding and reader refinements
+
+Approved group A defines the DTOs in `agent-runtime-core::journal`. Object
+envelopes contain encoding, kind, schema_version and value. Keys sort by UTF-8
+bytes; arrays preserve order; finite JSON numbers preserve their serde type
+and representation including `-0.0`. `serde_json/float_roundtrip` preserves
+binary float values on reads. Signature strings are never normalized.
+Frozen JSON/digest fixtures live in `agent-runtime-core/tests/fixtures/journal`.
+
+Existing operation/preparation fingerprints also depend on the insertion order
+of opaque JSON Value maps when a host unifies `serde_json/preserve_order`.
+Canonical envelopes therefore optionally bind `ordered_objects` path/key-list
+metadata for execution-relevant Value fields (state values, message arguments,
+extension values, schema values and vendor settings). Payload keys still sort
+lexically; readers restore that explicit ordering before validating existing
+fingerprints. A host unable to represent a recorded order fails closed rather
+than changing operation identity. No existing fingerprint algorithm or
+dependency feature is changed to force preserve_order on legacy consumers.
+Default-feature and preserve_order reader equivalence are both tested; the
+ordered-extension bytes/domain/type/version fixture freezes this refinement.
+
+The object SHA-256 preimage is `agent-runtime/session-journal/object\0`, then
+u64-big-endian encoding-length/encoding, u64-big-endian kind-length/kind,
+u32-big-endian schema, u64-big-endian envelope-length/envelope bytes. History
+seed/step and private commit-input digests have distinct domains, documented
+in rustdoc. Object IDs and ordering digests are separate redacted-debug types.
+Storage-domain isolation remains backend authorization, not part of a public
+global deduplication namespace or permission conferred by a digest.
+
+Sequence/map descriptors bind root, total count and height. Leaves and branches
+have at most 64 entries; child height decreases by one. Map child separators
+bind exact first keys and exclusive upper bounds. Readers reject bad counts,
+ordering, heights, object types, versions and noncanonical bytes. They read
+only the lease's selected head, with explicit host object/byte/entry limits.
+Backend open/read still own durable frame-length/checksum and pin/fence checks;
+readers validate current batch/sequence/predecessor metadata, not dereference
+collected predecessor batches or scan orphan frames.
+
+Referenced states preserve the existing TurnState tag and reference every field;
+top-level field lists use bounded sequences. CallingModel's request field must
+use a Request object: persistent final message/tool sequences plus an exact
+ProviderRequest settings object with empty message/tool lists. Large opaque
+extension/outcome/settings leaves retain their replacement-byte cost. Typed
+schema-4 object reconstruction rejects dropped fields/default substitutions.
+Materialization validates the existing operation/transition/boundary checks.
+
+Changed materialized transitions from schema 3 emit schema 4, while exact
+same-state reapplication preserves the original revision/tag for idempotency.
+The standalone JSON reader normalizes a validated materialized v3 checkpoint
+to schema 4 without saving it. SnapshotJournal loads preserve the source tag
+and never write back a legacy revision in place. Revision 4 equivalence is
+checked against a frozen v3 enum, transition table and helper implementation
+from base `6ec58fa`, including every persisted state tag and splice cases.
+This addition of `require_journal` and these concrete encoding/DTO choices
+refine the illustrative contract; no existing public signature is replaced.
 
 Versioned, domain-separated SHA-256 hashes bind canonical encoded object bytes
 and type/schema. Define encoding `journal-json-1`: compact UTF-8 JSON with
