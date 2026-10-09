@@ -1382,6 +1382,7 @@ mod tests {
             text: text.to_owned(),
             redacted: false,
             signature: None,
+            producer: None,
         }
     }
 
@@ -1390,6 +1391,7 @@ mod tests {
             text: text.to_owned(),
             redacted: true,
             signature: Some(signature.to_owned()),
+            producer: None,
         }
     }
 

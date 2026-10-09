@@ -91,6 +91,7 @@ pub async fn assert_storeless_recent_window() {
                 text: "signed seed".into(),
                 redacted: false,
                 signature: Some("seed-signature".into()),
+                producer: None,
             },
             ContentPart::text("seed answer"),
         ]),

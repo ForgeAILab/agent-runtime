@@ -123,8 +123,8 @@ pub mod prelude {
     pub use crate::compat::LegacyApprovalAuthority;
     pub use crate::content::{
         ContentPart, InternalGoalBinding, InternalTurnInput, InternalTurnSensitivity,
-        InternalTurnSource, MAX_INTERNAL_SOURCE_CHARS, MAX_INTERNAL_TURN_CHARS, Message, Role,
-        ToolCall, ToolResultBlock, UserInput,
+        InternalTurnSource, MAX_INTERNAL_SOURCE_CHARS, MAX_INTERNAL_TURN_CHARS, Message,
+        ReasoningProducer, Role, ToolCall, ToolResultBlock, UserInput,
     };
     pub use crate::delegation::{
         ChildLimits, ChildModelSelection, ChildSpec, ToolViewScope, WorkspacePolicy,

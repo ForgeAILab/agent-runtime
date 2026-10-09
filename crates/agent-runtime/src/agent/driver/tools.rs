@@ -643,11 +643,15 @@ impl<'a> TurnMachine<'a> {
                 let Some(ready) = prepared_batch.ready[index].take() else {
                     continue;
                 };
-                if ready.call.name == CAPABILITY_SEARCH_TOOL_NAME {
+                if matches!(
+                    ready.call.name.as_str(),
+                    CAPABILITY_SEARCH_TOOL_NAME | CAPABILITY_ACTIVATE_TOOL_NAME
+                ) {
                     let raw = match (&self.driver.live_abilities, &self.execution.abilities) {
                         (Some(runtime), Some(abilities)) => RawToolResult {
                             call: ready.call.clone(),
-                            outcome: runtime.search_and_stage(
+                            outcome: runtime.discover_and_stage(
+                                &ready.call.name,
                                 abilities,
                                 &ready.call.id,
                                 ready.prepared.arguments(),

@@ -51,6 +51,17 @@ impl SessionHandle {
         self.inner.parent.as_ref()
     }
 
+    /// Read-only host catalog; denied metadata is never returned to the agent.
+    /// Returns an empty catalog when live capability routing is disabled.
+    pub fn capability_catalog(&self) -> Vec<crate::capability::CapabilityCatalogEntry> {
+        self.inner
+            .execution
+            .abilities
+            .as_ref()
+            .map(|abilities| abilities.capability_catalog())
+            .unwrap_or_default()
+    }
+
     /// Returns the session's current frozen activation epoch when live
     /// capability routing is enabled.
     ///

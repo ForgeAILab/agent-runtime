@@ -11,7 +11,7 @@ use agent_runtime_core::clock::Timestamp;
 use agent_runtime_core::content::{InternalTurnInput, Message};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::TurnFinish;
-use agent_runtime_core::ids::{InteractionRequestId, SessionId, TurnId};
+use agent_runtime_core::ids::{InteractionRequestId, SessionId, ToolCallId, TurnId};
 use agent_runtime_core::interaction::{InteractionDisposition, InteractionRequest};
 use agent_runtime_core::store::{TurnManifest, VersionedSessionState};
 use agent_runtime_core::usage::UsageLedger;
@@ -35,6 +35,23 @@ const RETURNED_INTERACTION_STATE_REVISION: &str = "returned-interaction-1";
 /// outcome ledger has crossed its own persistence barrier.
 pub(crate) const ARTIFACT_REFERENCES_STATE_NAMESPACE: &str = "agent-runtime.artifact-references";
 const ARTIFACT_REFERENCES_STATE_REVISION: &str = "artifact-references-1";
+
+/// Runs once, and is awaited by the turn, after one tool call's non-error
+/// result has entered canonical history and its turn checkpoint committed.
+/// Dropped without running when the result is an error or the turn ends
+/// first.
+pub(crate) type ToolResultCommitHook =
+    Box<dyn FnOnce() -> futures_util::future::BoxFuture<'static, ()> + Send>;
+
+/// Hooks waiting on tool results of the serving turn, keyed by call.
+#[derive(Default)]
+struct ToolResultCommitHooks(BTreeMap<(TurnId, ToolCallId), Vec<ToolResultCommitHook>>);
+
+impl std::fmt::Debug for ToolResultCommitHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedArtifactReferences {
@@ -79,6 +96,10 @@ pub struct SessionExecutionContext {
     pub(crate) persist_gate: Arc<AsyncMutex<()>>,
     /// The currently serving turn, if any.
     pub(crate) current_turn: Mutex<Option<ActiveTurn>>,
+    /// Hooks waiting for one tool result of the serving turn to commit.
+    /// Always locked after `current_turn` so a hook cannot be registered for
+    /// a turn whose `clear_turn` has already drained them.
+    tool_result_commit_hooks: Mutex<ToolResultCommitHooks>,
     /// Durable terminal outcomes awaiting their in-process turn handles.
     completed_turns: Mutex<BTreeMap<TurnId, TurnFinish>>,
     /// Exact handling for this session's task-information requests.
@@ -111,6 +132,7 @@ impl SessionExecutionContext {
             staged_extension_state: Mutex::new(BTreeMap::new()),
             persist_gate: Arc::new(AsyncMutex::new(())),
             current_turn: Mutex::new(None),
+            tool_result_commit_hooks: Mutex::new(ToolResultCommitHooks::default()),
             completed_turns: Mutex::new(BTreeMap::new()),
             interaction_disposition,
             returned_interaction: Mutex::new(returned_interaction),
@@ -169,6 +191,62 @@ impl SessionExecutionContext {
         if current.as_ref().is_some_and(|active| &active.id == id) {
             *current = None;
         }
+        // Hooks of a turn that ended are abandoned: their results never
+        // committed. Drop them outside both locks.
+        let abandoned = {
+            let mut hooks = self
+                .tool_result_commit_hooks
+                .lock()
+                .expect("tool result commit hooks poisoned");
+            let kept = std::mem::take(&mut hooks.0)
+                .into_iter()
+                .filter(|((turn, _), _)| turn != id)
+                .collect();
+            std::mem::replace(&mut hooks.0, kept)
+        };
+        drop(current);
+        drop(abandoned);
+    }
+
+    /// Registers `hook` to run once when `call`'s non-error result in the
+    /// serving turn `turn` commits to canonical history. Fails when `turn` is
+    /// not the serving turn, because no later commit could run the hook.
+    pub(crate) fn on_tool_result_committed(
+        &self,
+        turn: TurnId,
+        call: ToolCallId,
+        hook: ToolResultCommitHook,
+    ) -> Result<(), RuntimeError> {
+        let current = self.current_turn.lock().expect("current turn poisoned");
+        if !current.as_ref().is_some_and(|active| active.id == turn) {
+            return Err(RuntimeError::conflict(format!(
+                "turn `{turn}` is not serving; its tool results can no longer commit"
+            )));
+        }
+        self.tool_result_commit_hooks
+            .lock()
+            .expect("tool result commit hooks poisoned")
+            .0
+            .entry((turn, call))
+            .or_default()
+            .push(hook);
+        drop(current);
+        Ok(())
+    }
+
+    /// Removes every hook waiting on `call` in `turn`, once its result block
+    /// committed.
+    pub(crate) fn take_tool_result_commit_hooks(
+        &self,
+        turn: &TurnId,
+        call: &ToolCallId,
+    ) -> Vec<ToolResultCommitHook> {
+        self.tool_result_commit_hooks
+            .lock()
+            .expect("tool result commit hooks poisoned")
+            .0
+            .remove(&(turn.clone(), call.clone()))
+            .unwrap_or_default()
     }
 
     pub(crate) fn active_history_start(&self, id: &TurnId) -> Option<usize> {

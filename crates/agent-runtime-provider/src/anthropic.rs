@@ -600,6 +600,7 @@ fn to_anthropic_message(msg: &Message) -> Option<Value> {
                         text,
                         redacted: false,
                         signature: Some(signature),
+                        ..
                     } => {
                         blocks.push(json!({
                             "type": "thinking",
@@ -1145,6 +1146,10 @@ fn event_to_events(
 
 #[async_trait]
 impl<T: HttpTransport> Provider for AnthropicProvider<T> {
+    fn requires_nonempty_assistant_content(&self) -> bool {
+        true
+    }
+
     fn describe(&self) -> Vec<ModelDescriptor> {
         vec![ModelDescriptor {
             id: self.config.model.clone(),
@@ -1383,6 +1388,48 @@ mod tests {
     };
     use agent_runtime_registry::Fingerprint;
     use std::sync::Mutex;
+
+    #[test]
+    fn same_producer_reasoning_keeps_anthropic_request_bytes() {
+        use crate::reasoning_history_tests::{history, producer, request};
+
+        let provider = AnthropicProvider::new(
+            ReplayTransport::new(vec![]),
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let current = producer("anthropic", "claude-test");
+        let canonical = history(Some(current.clone()), true);
+        let own = request(&canonical, &current, &provider);
+        assert_eq!(own.messages, canonical);
+        let legacy = request(&history(None, true), &current, &provider);
+        assert_eq!(
+            serde_json::to_vec(&provider.build_payload(&own).unwrap()).unwrap(),
+            serde_json::to_vec(&provider.build_payload(&legacy).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn foreign_reasoning_is_omitted_before_anthropic_validation() {
+        use crate::reasoning_history_tests::{
+            assert_no_foreign_reasoning, history, producer, request,
+        };
+
+        let provider = AnthropicProvider::new(
+            ReplayTransport::new(vec![]),
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let current = producer("anthropic", "claude-test");
+        let canonical = history(Some(producer("foreign-provider", "foreign-model")), true);
+        let projected = request(&canonical, &current, &provider);
+        assert_eq!(projected.messages.len(), canonical.len() - 1);
+        let body = provider.build_payload(&projected).unwrap();
+        assert_no_foreign_reasoning(&body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{"type": "text", "text": "visible answer", "cache_control": {"type": "ephemeral"}}])
+        );
+    }
 
     /// A transport that replays fixed SSE byte chunks and records the request.
     #[derive(Debug)]
@@ -1909,6 +1956,7 @@ mod tests {
                 text: "cannot replay".into(),
                 redacted: false,
                 signature: None,
+                producer: None,
             }])],
         )
         .with_cache_boundary(ProviderCacheBoundary::new(0, 0, 1));
@@ -1987,6 +2035,7 @@ mod tests {
                     text: "not a tool-result wire block".into(),
                     redacted: false,
                     signature: None,
+                    producer: None,
                 }],
                 is_error: false,
             })],
@@ -2124,11 +2173,13 @@ mod tests {
                         text: "unsigned and therefore unreplayable".into(),
                         redacted: false,
                         signature: None,
+                        producer: None,
                     },
                     ContentPart::Reasoning {
                         text: "signed thought".into(),
                         redacted: false,
                         signature: Some("sig-1".into()),
+                        producer: None,
                     },
                     ContentPart::text("taking it"),
                     ContentPart::ToolCall(ToolCall {

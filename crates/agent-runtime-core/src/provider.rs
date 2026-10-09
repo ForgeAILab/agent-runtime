@@ -1956,6 +1956,12 @@ pub trait Provider: Send + Sync + fmt::Debug {
     /// The capabilities of `model`, if this provider serves it.
     fn capabilities(&self, model: &ModelId) -> Option<Capabilities>;
 
+    /// Whether request projection must omit assistant messages emptied by
+    /// removing foreign reasoning, because the wire requires content.
+    fn requires_nonempty_assistant_content(&self) -> bool {
+        false
+    }
+
     /// Begins a streaming attempt. Implementations must observe
     /// `ctx.cancel` and stop promptly when cancelled.
     async fn stream(

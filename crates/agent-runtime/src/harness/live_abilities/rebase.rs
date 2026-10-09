@@ -138,6 +138,7 @@ impl LiveAbilityRuntime {
             pending,
             staged,
         };
+        self.reconcile_required(session)?;
         Ok(())
     }
 
@@ -349,6 +350,7 @@ impl LiveAbilityRuntime {
             pending,
             staged,
         };
+        self.reconcile_required(session)?;
         Ok(())
     }
 
@@ -384,7 +386,7 @@ impl LiveAbilityRuntime {
         self.policy
             .authorize(descriptor, &context)
             .map_err(|error| RuntimeError::conflict(error.to_string()))?;
-        let ability = if id == &RegistryId::tool(CAPABILITY_SEARCH_TOOL_NAME) {
+        let ability = if crate::hub::is_bootstrap(id) {
             self.hub.abilities().get(id).map(|entry| entry.payload())
         } else {
             session.scoped.resolve_ability(id)

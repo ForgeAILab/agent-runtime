@@ -32,6 +32,78 @@ use crate::hub::domain::{AbilityHandle, ContextPolicyHandle, ProviderHandle, Tok
 use crate::hub::index::HubEntry;
 use crate::hub::store::RegistryHub;
 
+/// Validated domain-qualified wildcard limit for a capability scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CapabilityPattern {
+    domain: String,
+    name: String,
+}
+
+impl CapabilityPattern {
+    /// Parses a known registry domain (or `*`) and a nonempty name glob.
+    pub fn parse(pattern: &str) -> Result<Self, String> {
+        let (domain, name) = pattern
+            .split_once(':')
+            .ok_or("capability pattern requires ':'")?;
+        if !matches!(
+            domain,
+            "*" | "tool"
+                | "skill"
+                | "mcp"
+                | "agent"
+                | "provider"
+                | "model"
+                | "tokenizer"
+                | "context_policy"
+        ) {
+            return Err(format!("unknown registry domain `{domain}`"));
+        }
+        if name.is_empty() || name.contains(':') {
+            return Err("capability pattern requires a nonempty local name without ':'".into());
+        }
+        Ok(Self {
+            domain: domain.into(),
+            name: name.into(),
+        })
+    }
+
+    /// Whether `id` falls under this pattern.
+    pub fn matches(&self, id: &RegistryId) -> bool {
+        if self.domain != "*" && self.domain != id.domain.as_str() {
+            return false;
+        }
+        // Greedy wildcard matching with backtracking only to the latest '*'.
+        let pattern = self.name.as_bytes();
+        let text = id.name.as_bytes();
+        let (mut p, mut t, mut star, mut retry) = (0, 0, None, 0);
+        while t < text.len() {
+            if p < pattern.len() && pattern[p] == b'*' {
+                star = Some(p);
+                p += 1;
+                retry = t;
+            } else if p < pattern.len() && pattern[p] == text[t] {
+                p += 1;
+                t += 1;
+            } else if let Some(s) = star {
+                retry += 1;
+                t = retry;
+                p = s + 1;
+            } else {
+                return false;
+            }
+        }
+        while p < pattern.len() && pattern[p] == b'*' {
+            p += 1;
+        }
+        p == pattern.len()
+    }
+}
+
+pub(crate) fn is_bootstrap(id: &RegistryId) -> bool {
+    id.domain == RegistryDomain::Tool
+        && matches!(id.name.as_str(), "registry.search" | "registry.activate")
+}
+
 /// Tenant/user/workspace/agent identity for one scope.
 ///
 /// Carried through to [`ScopedRegistry::fingerprint`] so two scopes with
@@ -95,6 +167,8 @@ impl ScopeIdentity {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeInputs {
     identity: ScopeIdentity,
+    denied_patterns: BTreeSet<CapabilityPattern>,
+    allowed_patterns: BTreeSet<CapabilityPattern>,
     denied_ids: BTreeSet<RegistryId>,
     denied_domains: BTreeSet<RegistryDomain>,
     denied_sources: BTreeSet<RegistrySource>,
@@ -127,6 +201,20 @@ impl ScopeInputs {
     pub fn deny_id(mut self, id: RegistryId) -> Self {
         self.denied_ids.insert(id);
         self
+    }
+
+    /// Adds a validated deny pattern; denial wins over allowances.
+    pub fn deny_pattern(mut self, pattern: impl Into<String>) -> Result<Self, String> {
+        self.denied_patterns
+            .insert(CapabilityPattern::parse(&pattern.into())?);
+        Ok(self)
+    }
+
+    /// Adds a validated allow pattern, unioned with allowed ids.
+    pub fn allow_pattern(mut self, pattern: impl Into<String>) -> Result<Self, String> {
+        self.allowed_patterns
+            .insert(CapabilityPattern::parse(&pattern.into())?);
+        Ok(self)
     }
 
     /// Hides every entry in `domain` regardless of any allow-list.
@@ -208,7 +296,7 @@ impl ScopeInputs {
     }
 
     pub(crate) fn denies_id(&self, id: &RegistryId) -> bool {
-        self.denied_ids.contains(id)
+        self.denied_ids.contains(id) || self.denied_patterns.iter().any(|p| p.matches(id))
     }
 
     pub(crate) fn denies_domain(&self, domain: &RegistryDomain) -> bool {
@@ -220,7 +308,9 @@ impl ScopeInputs {
     }
 
     pub(crate) fn violates_allowed_ids(&self, id: &RegistryId) -> bool {
-        !self.allowed_ids.is_empty() && !self.allowed_ids.contains(id)
+        (!self.allowed_ids.is_empty() || !self.allowed_patterns.is_empty())
+            && !self.allowed_ids.contains(id)
+            && !self.allowed_patterns.iter().any(|p| p.matches(id))
     }
 
     pub(crate) fn violates_allowed_domains(&self, domain: &RegistryDomain) -> bool {
@@ -242,31 +332,36 @@ impl ScopeInputs {
     /// The shared [`ViewFilter`] every domain starts from, before any
     /// domain-specific risk, quota, compatibility, or agent-facing
     /// restriction is layered on.
-    fn base_filter(&self) -> ViewFilter {
+    fn base_filter(&self, hub: &RegistryHub) -> ViewFilter {
         let mut filter = ViewFilter::new();
-        for id in &self.denied_ids {
-            filter = filter.deny_id(id.clone());
-        }
-        for domain in &self.denied_domains {
-            filter = filter.deny_domain(domain.clone());
-        }
-        for source in &self.denied_sources {
-            filter = filter.deny_source(*source);
-        }
-        for id in &self.allowed_ids {
-            filter = filter.allow_id(id.clone());
-        }
-        for domain in &self.allowed_domains {
-            filter = filter.allow_domain(domain.clone());
-        }
-        for source in &self.allowed_sources {
-            filter = filter.allow_source(*source);
-        }
-        for id in &self.ready_ids {
-            filter = filter.ready(id.clone());
-        }
-        if self.require_readiness {
-            filter = filter.require_readiness();
+        for id in hub
+            .abilities()
+            .iter()
+            .map(|e| e.id())
+            .chain(hub.providers().iter().map(|e| e.id()))
+            .chain(hub.models().iter().map(|e| e.id()))
+            .chain(hub.tokenizers().iter().map(|e| e.id()))
+            .chain(hub.context_policies().iter().map(|e| e.id()))
+        {
+            if is_bootstrap(id) {
+                continue;
+            }
+            let source = hub
+                .entry(id)
+                .expect("hub index contains all entries")
+                .card()
+                .provenance
+                .source;
+            if self.denies_id(id)
+                || self.denies_domain(&id.domain)
+                || self.denies_source(source)
+                || self.violates_allowed_ids(id)
+                || self.violates_allowed_domains(&id.domain)
+                || self.violates_allowed_sources(source)
+                || (self.require_readiness && !self.is_ready(id))
+            {
+                filter = filter.deny_id(id.clone());
+            }
         }
         filter
     }
@@ -275,6 +370,18 @@ impl ScopeInputs {
         let mut hasher = FingerprintHasher::new();
         hasher.pair("kind", "scope_inputs");
         self.identity.fingerprint_into(&mut hasher);
+        for pattern in &self.denied_patterns {
+            hasher.pair(
+                "deny_pattern",
+                format!("{}:{}", pattern.domain, pattern.name),
+            );
+        }
+        for pattern in &self.allowed_patterns {
+            hasher.pair(
+                "allow_pattern",
+                format!("{}:{}", pattern.domain, pattern.name),
+            );
+        }
         for id in &self.denied_ids {
             hasher.pair("deny_id", id.qualified());
         }
@@ -367,12 +474,12 @@ impl ScopedRegistry {
     /// Translates `inputs` into per-domain filters and derives every view
     /// this scope will ever expose. The only place hard filtering happens.
     pub(crate) fn derive(hub: RegistryHub, inputs: ScopeInputs) -> Self {
-        let base = inputs.base_filter();
+        let base = inputs.base_filter(&hub);
 
         let mut ability_risk_denied = BTreeSet::new();
         if let Some(max_risk) = inputs.max_ability_risk {
             for entry in hub.abilities().iter() {
-                if entry.payload().descriptor().risk() > max_risk {
+                if !is_bootstrap(entry.id()) && entry.payload().descriptor().risk() > max_risk {
                     ability_risk_denied.insert(entry.id().clone());
                 }
             }
@@ -385,7 +492,11 @@ impl ScopedRegistry {
         let mut ability_quota_denied = BTreeSet::new();
         if let Some(max_active) = inputs.max_active_abilities {
             let provisional = hub.abilities().view(&ability_filter);
-            for id in provisional.iter().skip(max_active) {
+            for id in provisional
+                .iter()
+                .filter(|e| !is_bootstrap(e.id()))
+                .skip(max_active)
+            {
                 ability_quota_denied.insert(id.id().clone());
             }
         }
@@ -1042,5 +1153,86 @@ mod tests {
         let a = hub.scoped(&ScopeInputs::new().deny_id(RegistryId::mcp("browser")));
         let b = hub.scoped(&ScopeInputs::new().deny_id(RegistryId::mcp("browser")));
         assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+    use crate::harness::{CapabilityActivateTool, CapabilitySearchTool};
+    use crate::hub::RegistryHubBuilder;
+    use agent_runtime_ability::{Skill, tool_ability};
+    use std::sync::Arc;
+
+    #[test]
+    fn patterns_validate_domains_names_and_wildcards() {
+        for bad in ["shell", "unknown:*", ":*", "tool:", "tool:a:b"] {
+            assert!(CapabilityPattern::parse(bad).is_err(), "{bad}");
+        }
+        for (pattern, name, matches) in [
+            ("tool:*", "shell", true),
+            ("tool:s*ll", "shell", true),
+            ("tool:s**l*", "shell", true),
+            ("tool:sh*", "s", false),
+            ("tool:*sh", "shell", false),
+            ("tool:s*el*", "shell", true),
+            ("tool:shell", "shells", false),
+        ] {
+            assert_eq!(
+                CapabilityPattern::parse(pattern)
+                    .unwrap()
+                    .matches(&RegistryId::tool(name)),
+                matches
+            );
+        }
+        assert!(
+            CapabilityPattern::parse("*:abc*")
+                .unwrap()
+                .matches(&RegistryId::skill("abcd"))
+        );
+        assert!(
+            !CapabilityPattern::parse("tool:*")
+                .unwrap()
+                .matches(&RegistryId::skill("abcd"))
+        );
+    }
+
+    #[test]
+    fn allow_ids_union_patterns_deny_wins_and_bootstraps_survive_all_limits() {
+        let mut builder = RegistryHubBuilder::new();
+        for name in ["alpha", "beta", "gamma"] {
+            builder.ability(Arc::new(Skill::inline(name, "d", "body")));
+        }
+        builder.ability(tool_ability(Arc::new(CapabilitySearchTool)));
+        builder.ability(tool_ability(Arc::new(CapabilityActivateTool)));
+        let hub = builder.seal().unwrap();
+        let scope = hub.scoped(
+            &ScopeInputs::new()
+                .allow_pattern("skill:a*")
+                .unwrap()
+                .allow_id(RegistryId::skill("beta"))
+                .deny_pattern("*:a*")
+                .unwrap(),
+        );
+        assert!(scope.resolve_ability(&RegistryId::skill("alpha")).is_none());
+        assert!(scope.resolve_ability(&RegistryId::skill("beta")).is_some());
+        assert!(scope.resolve_ability(&RegistryId::skill("gamma")).is_none());
+        let restrictive = hub.scoped(
+            &ScopeInputs::new()
+                .deny_pattern("*:*")
+                .unwrap()
+                .deny_domain(RegistryDomain::Tool)
+                .require_readiness()
+                .with_max_active_abilities(0),
+        );
+        for name in ["registry.search", "registry.activate"] {
+            assert!(
+                restrictive
+                    .resolve_ability(&RegistryId::tool(name))
+                    .is_some()
+            );
+        }
+        assert_eq!(restrictive.agent_view().ability_count(), 2);
+        assert_eq!(restrictive.diagnostics().abilities.excluded, 3);
     }
 }

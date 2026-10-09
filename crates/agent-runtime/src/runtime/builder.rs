@@ -6,6 +6,9 @@
 //! workspace → [`DenyAllWorkspace`]; no observers → none.
 
 use std::num::NonZeroUsize;
+
+use agent_runtime_registry::RegistryId;
+
 use std::sync::Arc;
 
 use agent_runtime_ability::activation::{ActivationContext, ActivationPolicy, FailClosedPolicy};
@@ -120,6 +123,7 @@ pub struct RuntimeBuilder {
     activation_policy: Arc<dyn ActivationPolicy>,
     activation_context: ActivationContext,
     activation_budget: Option<ActivationBudget>,
+    pinned_abilities: Vec<RegistryId>,
     /// When set, every turn is executed by this backend instead of the
     /// provider/tool loop.
     #[cfg(feature = "external-agent")]
@@ -186,6 +190,7 @@ impl RuntimeBuilder {
             activation_policy: Arc::new(FailClosedPolicy),
             activation_context: ActivationContext::new(),
             activation_budget: None,
+            pinned_abilities: Vec::new(),
             harness: HarnessPipelineBuilder::new(),
             lcm: None,
             working_set: None,
@@ -311,6 +316,16 @@ impl RuntimeBuilder {
     pub fn scope_inputs(mut self, inputs: ScopeInputs) -> Self {
         self.live_ability_routing = true;
         self.scope_inputs = inputs;
+        self
+    }
+
+    /// Pins core abilities in every authorized session's first activation epoch.
+    /// Unknown or scope-denied ids are skipped. Pins spend tokens, not candidate slots.
+    pub fn pinned_abilities(mut self, ids: impl IntoIterator<Item = RegistryId>) -> Self {
+        self.pinned_abilities.extend(ids);
+        if !self.pinned_abilities.is_empty() {
+            self.live_ability_routing = true;
+        }
         self
     }
 
@@ -825,7 +840,7 @@ impl RuntimeBuilder {
                     ability.descriptor().id()
                 )));
             }
-            let sealed = LiveAbilityRuntime::seal(
+            let mut sealed = LiveAbilityRuntime::seal(
                 std::mem::take(&mut self.tools),
                 self.tool_descriptor_overrides,
                 self.abilities,
@@ -835,6 +850,9 @@ impl RuntimeBuilder {
                 self.scope_inputs,
                 activation_budget,
             )?;
+            Arc::get_mut(&mut sealed.runtime)
+                .expect("newly sealed runtime is exclusively owned")
+                .set_pinned(self.pinned_abilities);
             self.tools = sealed.tools;
             Some(sealed.runtime)
         } else {
@@ -978,7 +996,8 @@ impl RuntimeBuilder {
             self.compactor,
             cache_capability,
             self.revisions,
-        );
+        )
+        .with_nonempty_assistant_content(provider.requires_nonempty_assistant_content());
         if let Some(policy) = self.working_set {
             planner = planner.with_input_cap(policy.hard_tokens);
         }

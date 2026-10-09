@@ -482,11 +482,7 @@ impl Driver {
             semantic_provenance = projection.provenance;
             contributed.extend(projection.summaries);
         }
-        let shed_history = super::history_without_stale_reasoning(
-            &history[history_offset..],
-            projected_active_start,
-        );
-        let projected_history = shed_history.as_ref();
+        let projected_history = &history[history_offset..];
 
         if let Some(input) = &internal_input {
             let rendered = serde_json::to_string(input).map_err(|error| {
