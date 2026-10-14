@@ -32,6 +32,9 @@ use crate::tool::{PreparedToolCall, ToolOutcome};
 ///
 /// Version 3 adds protected provider-cache operation phases and bounded
 /// result metadata to the same unreleased protected contract.
+/// An additive state rejected by name by older builds leaves the schema and
+/// transition revision unchanged; changing an existing state's encoding requires
+/// a schema bump and changing its execution or encoding requires a revision bump.
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 /// The direct turn-machine transition-table revision.
@@ -40,6 +43,11 @@ pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 /// execute equivalently. Silent best-effort recovery could repeat a provider
 /// call or tool side effect. Revision 4 adds cache operation admission,
 /// result-ready, and terminal transitions.
+/// An additive state such as `ExternalToolCall` that older builds reject by name
+/// does not raise this revision, preserving validation of existing checkpoints.
+/// Unlike the state addition in commit 0080f61, which changed existing states'
+/// behavior, this addition preserves their execution and encoding; a change to
+/// either requires a revision bump.
 pub const TURN_TRANSITION_REVISION: u32 = 4;
 
 const MAX_CACHE_CHECKPOINT_OPERATION_BYTES: usize = 256;
@@ -392,6 +400,16 @@ pub enum TurnState {
         /// Exact assembled response.
         response: AssembledModelResponse,
         /// Zero-based tool-loop step.
+        step: u32,
+    },
+    /// A runtime-owned call from an external backend has entered canonical history.
+    #[cfg(feature = "external-agent")]
+    ExternalToolCall {
+        /// Logical request identity, with no provider attempt.
+        request_id: RequestId,
+        /// Exact runtime-minted call.
+        call: ToolCall,
+        /// Zero-based bridged tool round.
         step: u32,
     },
     /// Immutable prepared calls are waiting for security approval.

@@ -438,6 +438,8 @@ pub struct Driver {
     /// which is what keeps canonical history single-owner.
     #[cfg(feature = "external-agent")]
     external: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
+    #[cfg(feature = "external-agent")]
+    external_excluded_tools: Vec<String>,
 }
 
 impl Driver {
@@ -451,8 +453,10 @@ impl Driver {
     pub(crate) fn with_external_agent(
         mut self,
         backend: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
+        excluded_tools: Vec<String>,
     ) -> Self {
         self.external = backend;
+        self.external_excluded_tools = excluded_tools;
         self
     }
 
@@ -503,6 +507,8 @@ impl Driver {
             live_abilities,
             #[cfg(feature = "external-agent")]
             external: None,
+            #[cfg(feature = "external-agent")]
+            external_excluded_tools: Vec::new(),
         }
     }
 
@@ -775,22 +781,27 @@ impl Driver {
         input: InternalTurnInput,
         acceptance: Arc<TurnAcceptance>,
     ) {
-        TurnMachine::new(
-            self,
-            TurnMachineContext {
-                state,
-                execution,
-                emitter,
-                minter,
-                cancel: turn_cancel,
-                inbox,
-                steer_mailbox: Some(steer_mailbox),
-                turn_id,
-                acceptance: Some(acceptance),
-            },
-        )
-        .run_internal(input)
-        .await;
+        let context = TurnMachineContext {
+            state,
+            execution,
+            emitter,
+            minter,
+            cancel: turn_cancel,
+            inbox,
+            steer_mailbox: Some(steer_mailbox),
+            turn_id,
+            acceptance: Some(acceptance),
+        };
+
+        #[cfg(feature = "external-agent")]
+        if let Some(backend) = self.external.clone() {
+            external_turn::ExternalTurnMachine::new(self, context, backend)
+                .run_internal(input)
+                .await;
+            return;
+        }
+
+        TurnMachine::new(self, context).run_internal(input).await;
     }
 
     /// Runs one explicit host tool action through the checkpointed turn
@@ -865,6 +876,34 @@ impl Driver {
         .await;
     }
 
+    /// External conversations cannot be re-entered mid-turn. Local actions and
+    /// cache operations retain their own recovery contracts, as do determinate
+    /// terminal publication barriers.
+    pub(crate) fn interrupts_external_checkpoint(&self, checkpoint: &TurnCheckpoint) -> bool {
+        #[cfg(feature = "external-agent")]
+        {
+            self.external.is_some()
+                && matches!(
+                    checkpoint.state,
+                    TurnState::Accepted { .. }
+                        | TurnState::InternalAccepted { .. }
+                        | TurnState::Planning { .. }
+                        | TurnState::CallingModel { .. }
+                        | TurnState::ModelResponseReady { .. }
+                        | TurnState::ExternalToolCall { .. }
+                        | TurnState::AwaitingApproval { .. }
+                        | TurnState::AwaitingInteraction { .. }
+                        | TurnState::ExecutingTools { .. }
+                        | TurnState::ToolOutcomeReady { .. }
+                )
+        }
+        #[cfg(not(feature = "external-agent"))]
+        {
+            let _ = checkpoint;
+            false
+        }
+    }
+
     /// Finalizes one validated non-terminal checkpoint from a turn that is
     /// no longer running as an explicit `Failed` terminal without minting a
     /// new turn or replaying its indeterminate provider/tool work.
@@ -918,6 +957,8 @@ struct TurnMachine<'a> {
     turn_id: TurnId,
     acceptance: Option<Arc<TurnAcceptance>>,
     checkpoint: Option<TurnCheckpoint>,
+    #[cfg(feature = "external-agent")]
+    external_call: Option<external_turn::BridgedRound>,
 }
 
 /// Cohesive process-local dependencies shared by every turn-machine entry
@@ -939,5 +980,6 @@ struct TurnMachineContext {
 mod external_turn;
 mod provider;
 mod recovery;
+mod tool_output;
 mod tools;
 mod turn;

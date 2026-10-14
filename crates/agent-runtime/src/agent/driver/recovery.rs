@@ -34,8 +34,14 @@ impl<'a> TurnMachine<'a> {
                 self.driver.clock.now(),
             );
         }
-        if activation_changed {
-            self.close_upgrade_tool_calls(&checkpoint);
+        let external_interrupted = self.driver.interrupts_external_checkpoint(&checkpoint);
+        if activation_changed || external_interrupted {
+            if external_interrupted {
+                if let Some(abilities) = &self.execution.abilities {
+                    abilities.discard_uncommitted_activation();
+                }
+            }
+            self.close_interrupted_tool_calls(&checkpoint, external_interrupted);
             let finish = match &checkpoint.state {
                 TurnState::Completing { finish, .. }
                 | TurnState::PublishingTerminal { finish, .. } => finish.clone(),
@@ -44,9 +50,11 @@ impl<'a> TurnMachine<'a> {
             self.emitter.emit(
                 Some(self.turn_id.clone()),
                 RuntimeEvent::Error {
-                    error: RuntimeError::conflict(
-                        "available tools changed since this turn was saved; conversation restored without retrying the unfinished action; check previous changes before retrying",
-                    ),
+                    error: RuntimeError::conflict(if external_interrupted {
+                        "external turn interrupted by restart; finalized as failed without re-entering the backend or replaying host tools"
+                    } else {
+                        "available tools changed since this turn was saved; conversation restored without retrying the unfinished action; check previous changes before retrying"
+                    }),
                 },
             );
             // The fallback is local recovery, not another turn. In particular
@@ -102,7 +110,7 @@ impl<'a> TurnMachine<'a> {
     /// Close only unmatched tool calls from the interrupted turn. Committed
     /// results stay byte-for-byte intact; unknown outcomes never become a
     /// success claim or a replay of the original invocation.
-    fn close_upgrade_tool_calls(&self, checkpoint: &TurnCheckpoint) {
+    fn close_interrupted_tool_calls(&self, checkpoint: &TurnCheckpoint, external: bool) {
         let known = match &checkpoint.state {
             TurnState::AwaitingApproval { slots, .. }
             | TurnState::AwaitingInteraction { slots, .. }
@@ -133,7 +141,11 @@ impl<'a> TurnMachine<'a> {
             let result = known.get(&call.id).cloned().unwrap_or_else(|| {
                 crate::tool::executor::error_block(
                     &call,
-                    "this unfinished action was not retried after the available tools changed; its outcome is unverified; inspect previous changes before retrying",
+                    if external {
+                        "indeterminate tool outcome after restart; the runtime did not replay this invocation"
+                    } else {
+                        "this unfinished action was not retried after the available tools changed; its outcome is unverified; inspect previous changes before retrying"
+                    },
                     self.driver.config.output_limit,
                 )
             });
@@ -174,7 +186,18 @@ impl<'a> TurnMachine<'a> {
             );
         }
 
+        // Use the same interrupt branch as ResumeOrInterrupt: no backend,
+        // prepared tool, approval, interaction, or commit hook is replayed.
+        if self.driver.interrupts_external_checkpoint(&checkpoint) {
+            self.abandon(false).await;
+            return;
+        }
+
         match checkpoint.state {
+            #[cfg(feature = "external-agent")]
+            TurnState::ExternalToolCall { .. } => {
+                self.abandon(false).await;
+            }
             TurnState::Accepted { .. } => {
                 // The exact input is already present at active_history_start;
                 // never append it again on recovery.
@@ -187,7 +210,7 @@ impl<'a> TurnMachine<'a> {
                 .await;
             }
             TurnState::LocalActionAccepted { request_id, call } => {
-                self.emit_local_tool_requested(&call);
+                self.emit_tool_requested(&call, false);
                 if let Err(error) = self
                     .prepare_and_run_local(request_id, call, checkpoint.deadline)
                     .await
@@ -600,6 +623,22 @@ impl<'a> TurnMachine<'a> {
                 );
             }
             TurnState::Terminal { .. } => {}
+            // A dependency can enable core's checkpoint feature independently
+            // through Cargo feature unification. This driver cannot replay it.
+            #[cfg(not(feature = "external-agent"))]
+            #[allow(unreachable_patterns)]
+            _ => {
+                self.emitter.emit(
+                    Some(self.turn_id.clone()),
+                    RuntimeEvent::Error {
+                        error: RuntimeError::conflict(
+                            "external tool checkpoint requires the external-agent runtime feature",
+                        ),
+                    },
+                );
+                self.complete(TurnFinish::Failed, checkpoint.visible_output)
+                    .await;
+            }
         }
     }
 

@@ -105,6 +105,8 @@ pub struct RuntimeBuilder {
     /// provider/tool loop.
     #[cfg(feature = "external-agent")]
     external_agent: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
+    #[cfg(feature = "external-agent")]
+    external_excluded_tools: Vec<String>,
     harness: HarnessPipelineBuilder,
 }
 
@@ -114,6 +116,8 @@ impl RuntimeBuilder {
         Self {
             #[cfg(feature = "external-agent")]
             external_agent: None,
+            #[cfg(feature = "external-agent")]
+            external_excluded_tools: Vec::new(),
             provider: None,
             tools: Vec::new(),
             approval: None,
@@ -316,7 +320,6 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Caps initial and on-demand activation schema cost and cardinality.
     /// Routes every turn to an installed external agent instead of the
     /// provider/tool loop.
     ///
@@ -332,6 +335,17 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Omits these tool names from external turns. Provider turns are unaffected.
+    #[cfg(feature = "external-agent")]
+    pub fn external_excluded_tools(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.external_excluded_tools = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Caps initial and on-demand activation schema cost and cardinality.
     pub fn activation_budget(mut self, budget: ActivationBudget) -> Self {
         self.live_ability_routing = true;
         self.activation_budget = Some(budget);
@@ -871,7 +885,7 @@ impl RuntimeBuilder {
             live_abilities,
         );
         #[cfg(feature = "external-agent")]
-        let driver = driver.with_external_agent(self.external_agent);
+        let driver = driver.with_external_agent(self.external_agent, self.external_excluded_tools);
 
         let shared = RuntimeShared {
             driver,

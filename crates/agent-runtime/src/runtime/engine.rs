@@ -500,21 +500,29 @@ impl Runtime {
                 ));
             }
         }
-        let recovery_deferred = matches!(
-            (&checkpoint_recovery, &checkpoint),
-            (
-                CheckpointRecoveryPolicy::DeferPendingInteraction,
-                Some(TurnCheckpoint {
-                    state: TurnState::AwaitingInteraction { response: None, .. },
-                    ..
-                })
-            )
-        );
-        // Only this explicit policy may rebuild an unfinished ordinary
-        // turn's abilities. Its old execution will be finalized, not resumed.
+        let external_interrupted = request.checkpoint_recovery != CheckpointRecoveryPolicy::Defer
+            && checkpoint.as_ref().is_some_and(|checkpoint| {
+                self.shared
+                    .driver
+                    .interrupts_external_checkpoint(checkpoint)
+            });
+        let recovery_deferred = !external_interrupted
+            && matches!(
+                (&checkpoint_recovery, &checkpoint),
+                (
+                    CheckpointRecoveryPolicy::DeferPendingInteraction,
+                    Some(TurnCheckpoint {
+                        state: TurnState::AwaitingInteraction { response: None, .. },
+                        ..
+                    })
+                )
+            );
+        // ResumeOrInterrupt and unreenterable external turns may rebuild an
+        // unfinished turn's abilities: execution is finalized, never resumed.
         // Cache-operation checkpoints keep their separate idempotency rules.
-        let allow_interrupted_rebase = checkpoint_recovery
+        let allow_interrupted_rebase = (checkpoint_recovery
             == CheckpointRecoveryPolicy::ResumeOrInterrupt
+            || external_interrupted)
             && checkpoint.as_ref().is_some_and(|checkpoint| {
                 !checkpoint.state.is_terminal()
                     && !matches!(
@@ -614,11 +622,12 @@ impl Runtime {
                 .await?,
         );
         let interrupted_on_resume = checkpoint.as_ref().and_then(|checkpoint| {
-            (allow_interrupted_rebase
-                && execution
-                    .abilities
-                    .as_ref()
-                    .is_some_and(|abilities| abilities.rebased))
+            (external_interrupted
+                || (allow_interrupted_rebase
+                    && execution
+                        .abilities
+                        .as_ref()
+                        .is_some_and(|abilities| abilities.rebased)))
             .then(|| checkpoint.turn.clone())
         });
         if interrupted_on_resume.is_some() {
@@ -678,7 +687,11 @@ impl Runtime {
                     inner.cancel.child(),
                     inner.inbox.clone(),
                     checkpoint.clone(),
-                    true,
+                    inner
+                        .execution
+                        .abilities
+                        .as_ref()
+                        .is_some_and(|abilities| abilities.rebased),
                 )
                 .await;
             // Never return a writable session until the interruption has a
@@ -694,9 +707,11 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|saved| saved.turn == checkpoint.turn && saved.state.is_terminal())
             {
-                return Err(RuntimeError::conflict(
-                    "could not save the interrupted turn after tools changed; retry resume before submitting new work",
-                ));
+                return Err(RuntimeError::conflict(if external_interrupted {
+                    "could not save the interrupted external turn; retry resume before submitting new work"
+                } else {
+                    "could not save the interrupted turn after tools changed; retry resume before submitting new work"
+                }));
             }
             inner.execution.clear_turn(&checkpoint.turn);
         }

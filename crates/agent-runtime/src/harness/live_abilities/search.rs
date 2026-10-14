@@ -233,6 +233,117 @@ impl LiveAbilityRuntime {
         }
     }
 
+    /// External turns have no next provider request or activation budget to
+    /// charge. Reuse scoped selection, authorization, and content verification,
+    /// but return materialized instructions without changing activation state.
+    #[cfg(feature = "external-agent")]
+    pub(crate) fn discover_external(
+        &self,
+        name: &str,
+        session: &SessionAbilities,
+        call: &ToolCallId,
+        arguments: &serde_json::Value,
+        emitter: &EventEmitter,
+        turn: &Option<TurnId>,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        if name != CAPABILITY_ACTIVATE_TOOL_NAME {
+            let args = search_arguments(arguments)?;
+            if args.query.is_empty() {
+                // The existing listing branch performs neither materialization
+                // nor staging; preserve its pagination and authorized view.
+                return self.search_and_stage(session, call, arguments, emitter, turn);
+            }
+            // Reuse descriptive retrieval, but do not select a provider-context
+            // bundle or materialize it merely to return discovery cards.
+            let query = RoutingQuery::derive(args.query, session.routing_hints.clone());
+            let mut retrieval = self
+                .resolver
+                .retrieve_descriptive(&session.descriptor_view, &query);
+            retrieval.candidates.retain(|candidate| {
+                !crate::hub::is_bootstrap(candidate.descriptor.id())
+                    && args
+                        .domain
+                        .is_none_or(|domain| candidate.descriptor.id().domain.as_str() == domain)
+            });
+            emit_retrieval(emitter, turn, &retrieval);
+            let cards = retrieval
+                .candidates
+                .iter()
+                .take(args.max_results)
+                .map(|candidate| candidate.descriptor.card().clone())
+                .collect::<Vec<_>>();
+            let already_available = retrieval
+                .candidates
+                .iter()
+                .take(args.max_results)
+                .filter(|candidate| candidate.descriptor.kind() == &AbilityKind::Tool)
+                .map(|candidate| candidate.descriptor.id().qualified())
+                .collect::<Vec<_>>();
+            return Ok(ToolOutcome::json(serde_json::json!({
+                "by_domain":session.by_domain(),"cards":cards,"staged":[],
+                "already_available":already_available,"available_on":"registry.activate"
+            })));
+        }
+        let ids = arguments
+            .get("ids")
+            .and_then(serde_json::Value::as_array)
+            .filter(|ids| !ids.is_empty() && ids.len() <= 8)
+            .ok_or_else(|| RuntimeError::tool("registry.activate requires 1..=8 qualified ids"))?;
+        // Every authorized tool is already available through the bridge. Skills
+        // must still be reverified, even if a previous provider epoch held them.
+        let mut held = session
+            .descriptor_view
+            .iter()
+            .filter(|entry| entry.payload().kind() == &AbilityKind::Tool)
+            .map(|entry| entry.id().clone())
+            .collect::<Vec<_>>();
+        let mut activated = Vec::new();
+        let mut already_available = Vec::new();
+        let mut rejected = Vec::new();
+        for raw in ids {
+            let text = raw.as_str().unwrap_or("");
+            let Some(entry) = session
+                .descriptor_view
+                .iter()
+                .find(|entry| entry.id().qualified() == text)
+            else {
+                rejected.push(serde_json::json!({"id":raw,"reason":"unknown or not authorized"}));
+                continue;
+            };
+            if held.contains(entry.id()) {
+                already_available.push(text.to_owned());
+                continue;
+            }
+            let attempt = (|| {
+                let plan = crate::capability::selection::select_explicit(
+                    &session.descriptor_view,
+                    entry.payload(),
+                    &held,
+                )
+                .map_err(|reason| {
+                    RuntimeError::config(format!("cannot activate `{}`: {reason:?}", entry.id()))
+                })?;
+                let payloads = self.authorize_and_materialize(session, &plan, &held)?;
+                Ok::<_, RuntimeError>(payloads)
+            })();
+            match attempt {
+                Ok(payloads) => {
+                    for (id, payload) in payloads {
+                        if let Activated::SkillInstructions(instructions) = payload {
+                            activated.push(serde_json::json!({"id":id.qualified(),"instructions":instructions}));
+                        }
+                        held.push(id);
+                    }
+                }
+                Err(error) => rejected.push(serde_json::json!({"id":text,"reason":error.message})),
+            }
+        }
+        Ok(ToolOutcome::json(serde_json::json!({
+            "activated":activated,"already_available":already_available,"rejected":rejected,
+            "available_on":"this_result"
+        })))
+    }
+
     pub(crate) fn activate_and_stage(
         &self,
         session: &SessionAbilities,

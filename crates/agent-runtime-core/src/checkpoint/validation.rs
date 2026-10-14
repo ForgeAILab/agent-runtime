@@ -546,6 +546,19 @@ impl TurnCheckpoint {
             }
         }
         match &self.state {
+            #[cfg(feature = "external-agent")]
+            TurnState::ExternalToolCall { call, .. } => {
+                if !self
+                    .snapshot
+                    .history
+                    .iter()
+                    .any(|message| message.tool_calls().any(|recorded| recorded == call))
+                {
+                    return Err(RuntimeError::conflict(
+                        "external tool checkpoint has no canonical call",
+                    ));
+                }
+            }
             TurnState::LocalActionPrepared { call, prepared, .. }
             | TurnState::LocalActionExecuting { call, prepared, .. } => {
                 if !prepared_matches_call(prepared, call) {
@@ -883,6 +896,8 @@ pub(super) fn state_name(state: &TurnState) -> &'static str {
         TurnState::Planning { .. } => "planning",
         TurnState::CallingModel { .. } => "calling_model",
         TurnState::ModelResponseReady { .. } => "model_response_ready",
+        #[cfg(feature = "external-agent")]
+        TurnState::ExternalToolCall { .. } => "external_tool_call",
         TurnState::AwaitingApproval { .. } => "awaiting_approval",
         TurnState::AwaitingInteraction { .. } => "awaiting_interaction",
         TurnState::ToolOutcomeReady { .. } => "tool_outcome_ready",

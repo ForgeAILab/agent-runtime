@@ -1,4 +1,4 @@
-use super::turn::{await_harness_phase, wait_for_interaction_deadline};
+use super::turn::wait_for_interaction_deadline;
 use super::*;
 
 impl<'a> TurnMachine<'a> {
@@ -45,7 +45,7 @@ impl<'a> TurnMachine<'a> {
                 results[index] = Some(block);
                 continue;
             }
-            match self
+            let authorization = self
                 .driver
                 .executor
                 .prepare_and_authorize_once(
@@ -59,8 +59,10 @@ impl<'a> TurnMachine<'a> {
                         deadline,
                     ),
                 )
-                .await
-            {
+                .await;
+            #[cfg(feature = "external-agent")]
+            self.accept_bridged_round(call, request_id, step).await?;
+            match authorization {
                 PreparedAuthorization::Ready(prepared) => {
                     let returns_input_to_parent = self.execution.interaction_disposition
                         == InteractionDisposition::ReturnToParent
@@ -145,6 +147,16 @@ impl<'a> TurnMachine<'a> {
                         break;
                     }
                     PendingApprovalResolution::Rejected(block) => {
+                        #[cfg(feature = "external-agent")]
+                        let block = if self.bridged_call_abandoned() {
+                            crate::tool::executor::error_block(
+                                &calls[index],
+                                "external call abandoned",
+                                self.driver.config.output_limit,
+                            )
+                        } else {
+                            block
+                        };
                         results[index] = Some(block);
                         break;
                     }
@@ -231,22 +243,7 @@ impl<'a> TurnMachine<'a> {
         deadline: Deadline,
     ) -> Result<(), RuntimeError> {
         for call in tool_calls {
-            self.emitter.emit(
-                Some(self.turn_id.clone()),
-                RuntimeEvent::ToolCallRequested {
-                    call: call.id.clone(),
-                    name: call.name.clone(),
-                    argument_keys: argument_keys(&call.arguments),
-                    argument_fingerprint: Fingerprint::of(
-                        serde_json::to_vec(&call.arguments).unwrap_or_default(),
-                    ),
-                    arguments: self
-                        .driver
-                        .config
-                        .emit_raw_tool_arguments
-                        .then(|| call.arguments.clone()),
-                },
-            );
+            self.emit_tool_requested(call, self.driver.config.emit_raw_tool_arguments);
         }
 
         let prepared_batch = self
@@ -480,6 +477,12 @@ impl<'a> TurnMachine<'a> {
                 Ok(outcome) => outcome,
                 Err(error) => ToolOutcome::error(error.message),
             };
+            #[cfg(feature = "external-agent")]
+            let outcome = if self.bridged_call_abandoned() {
+                ToolOutcome::error("external call abandoned")
+            } else {
+                outcome
+            };
             self.process_and_commit_tool_outcome(
                 request_id,
                 &prepared_batch.calls,
@@ -643,22 +646,58 @@ impl<'a> TurnMachine<'a> {
                 let Some(ready) = prepared_batch.ready[index].take() else {
                     continue;
                 };
+                #[cfg(feature = "external-agent")]
+                if self.bridged_call_abandoned() {
+                    prepared_batch.results[index] = Some(crate::tool::executor::error_block(
+                        &ready.call,
+                        "external call abandoned",
+                        self.driver.config.output_limit,
+                    ));
+                    continue;
+                }
                 if matches!(
                     ready.call.name.as_str(),
                     CAPABILITY_SEARCH_TOOL_NAME | CAPABILITY_ACTIVATE_TOOL_NAME
                 ) {
                     let raw = match (&self.driver.live_abilities, &self.execution.abilities) {
-                        (Some(runtime), Some(abilities)) => RawToolResult {
-                            call: ready.call.clone(),
-                            outcome: runtime.discover_and_stage(
-                                &ready.call.name,
-                                abilities,
-                                &ready.call.id,
-                                ready.prepared.arguments(),
-                                &self.emitter,
-                                &Some(self.turn_id.clone()),
-                            )?,
-                        },
+                        (Some(runtime), Some(abilities)) => {
+                            #[cfg(feature = "external-agent")]
+                            let external = self.external_call.is_some();
+                            #[cfg(not(feature = "external-agent"))]
+                            let external = false;
+                            let outcome = if external {
+                                #[cfg(feature = "external-agent")]
+                                {
+                                    runtime
+                                        .discover_external(
+                                            &ready.call.name,
+                                            abilities,
+                                            &ready.call.id,
+                                            ready.prepared.arguments(),
+                                            &self.emitter,
+                                            &Some(self.turn_id.clone()),
+                                        )
+                                        .unwrap_or_else(|error| ToolOutcome::error(error.message))
+                                }
+                                #[cfg(not(feature = "external-agent"))]
+                                {
+                                    unreachable!("external dispatch requires external-agent")
+                                }
+                            } else {
+                                runtime.discover_and_stage(
+                                    &ready.call.name,
+                                    abilities,
+                                    &ready.call.id,
+                                    ready.prepared.arguments(),
+                                    &self.emitter,
+                                    &Some(self.turn_id.clone()),
+                                )?
+                            };
+                            RawToolResult {
+                                call: ready.call.clone(),
+                                outcome,
+                            }
+                        }
                         _ => RawToolResult {
                             call: ready.call,
                             outcome: ToolOutcome::error(
@@ -677,7 +716,8 @@ impl<'a> TurnMachine<'a> {
             // Results still commit strictly in request order below, keeping
             // canonical history and durable checkpoints deterministic.
             let executor = &self.driver.executor;
-            let cancel = &self.cancel;
+            let invocation_cancel = self.tool_invocation_cancel();
+            let cancel = &invocation_cancel;
             outcomes.extend(
                 futures_util::future::join_all(invocations.into_iter().map(
                     |(index, ready)| async move {
@@ -1080,6 +1120,24 @@ impl<'a> TurnMachine<'a> {
         })
     }
 
+    pub(super) fn tool_invocation_cancel(&self) -> Cancellation {
+        #[cfg(feature = "external-agent")]
+        if let Some(round) = &self.external_call {
+            // Invocation (and output processing) observes the turn, never
+            // caller abandonment. The executor derives the tool's child token
+            // from this same cancellation source as in a provider turn.
+            return round.turn_cancel.clone();
+        }
+        self.cancel.clone()
+    }
+
+    #[cfg(feature = "external-agent")]
+    fn bridged_call_abandoned(&self) -> bool {
+        self.external_call
+            .as_ref()
+            .is_some_and(|round| self.cancel.is_cancelled() && !round.turn_cancel.is_cancelled())
+    }
+
     pub(super) async fn run_local_action(
         &mut self,
         call: ToolCall,
@@ -1098,11 +1156,11 @@ impl<'a> TurnMachine<'a> {
             .emit(Some(self.turn_id.clone()), RuntimeEvent::TurnStarted);
         self.checkpoint_local_action(request_id.clone(), call.clone(), deadline)
             .await?;
-        self.emit_local_tool_requested(&call);
+        self.emit_tool_requested(&call, false);
         self.prepare_and_run_local(request_id, call, deadline).await
     }
 
-    pub(super) fn emit_local_tool_requested(&self, call: &ToolCall) {
+    pub(super) fn emit_tool_requested(&self, call: &ToolCall, emit_raw_arguments: bool) {
         self.emitter.emit(
             Some(self.turn_id.clone()),
             RuntimeEvent::ToolCallRequested {
@@ -1112,7 +1170,7 @@ impl<'a> TurnMachine<'a> {
                 argument_fingerprint: Fingerprint::of(
                     serde_json::to_vec(&call.arguments).unwrap_or_default(),
                 ),
-                arguments: None,
+                arguments: emit_raw_arguments.then(|| call.arguments.clone()),
             },
         );
     }
@@ -1283,63 +1341,16 @@ impl<'a> TurnMachine<'a> {
         &mut self,
         request_id: RequestId,
         call: ToolCall,
-        mut outcome: ToolOutcome,
+        outcome: ToolOutcome,
         deadline: Deadline,
     ) -> Result<ToolResultBlock, RuntimeError> {
-        let mut updates = Vec::<(String, VersionedSessionState)>::new();
-        let mut component_events = Vec::new();
-        for processor in self.driver.harness.tool_output() {
-            let descriptor = processor.descriptor();
-            let current_state = self
-                .execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned")
-                .get(descriptor.id().as_str())
-                .cloned();
-            let usage = Arc::from(
-                self.state
-                    .lock()
-                    .expect("session state poisoned")
-                    .usage
-                    .records()
-                    .to_vec()
-                    .into_boxed_slice(),
-            );
-            let now = self.driver.clock.now();
-            let patch = await_harness_phase(
-                processor.process(
-                    &ToolOutputView {
-                        session: self.emitter.session().clone(),
-                        turn: self.turn_id.clone(),
-                        request: request_id.clone(),
-                        call: call.clone(),
-                        state: current_state,
-                        usage,
-                        now,
-                    },
-                    outcome,
-                ),
-                &self.cancel,
-                deadline,
-                self.driver.clock.clone(),
-                "running local tool-output processor",
-            )
+        let super::tool_output::ProcessedToolOutput {
+            outcome,
+            updates,
+            events: component_events,
+        } = self
+            .process_tool_output(&request_id, &call, outcome, deadline)
             .await?;
-            outcome = patch.outcome;
-            component_events.extend(patch.events);
-            if let Some(state) = patch.state {
-                if state.revision != *descriptor.revision() {
-                    return Err(RuntimeError::conflict(format!(
-                        "tool-output component `{}` returned state revision `{}` but declares `{}`",
-                        descriptor.id(),
-                        state.revision,
-                        descriptor.revision()
-                    )));
-                }
-                updates.push((descriptor.id().as_str().to_owned(), state.into_state()));
-            }
-        }
 
         let artifact = outcome.content.artifact_reference().cloned();
         let result = outcome.into_result_block(

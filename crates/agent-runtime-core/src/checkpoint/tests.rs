@@ -134,6 +134,281 @@ fn checkpoint_round_trips_and_verifies() {
 }
 
 #[test]
+fn pre_existing_checkpoint_states_validate_with_head_versions() {
+    use crate::content::{InternalTurnSensitivity, InternalTurnSource};
+    use crate::ids::{InteractionRequestId, QuestionId};
+    use crate::interaction::{InteractionOrigin, InteractionSensitivity, Question, Questionnaire};
+
+    fn verify(checkpoint: &TurnCheckpoint) {
+        let wire = serde_json::to_value(checkpoint).unwrap();
+        // Pinned to HEAD before ExternalToolCall was added, rather than to
+        // the current constants, so another blanket bump fails this test.
+        assert_eq!(wire["schema_version"], 3);
+        assert_eq!(wire["transition_revision"], 4);
+        let restored: TurnCheckpoint = serde_json::from_value(wire).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(&restored, checkpoint);
+    }
+
+    fn advance(checkpoint: &TurnCheckpoint, state: TurnState) -> TurnCheckpoint {
+        let next = checkpoint
+            .transition(
+                state,
+                checkpoint.snapshot.clone(),
+                checkpoint.watermark.event_sequence + 1,
+                Timestamp(checkpoint.updated.0 + 1),
+            )
+            .unwrap();
+        verify(&next);
+        next
+    }
+
+    let accepted = accepted();
+    verify(&accepted);
+    let planning = planning(&accepted);
+    verify(&planning);
+    let calling = calling(&planning, "request-1");
+    verify(&calling);
+    let call = source_call("call-1", "read");
+    let request_id = RequestId::new("request-1");
+    let source_calls = vec![call.clone()];
+    let slots = vec![ToolSlotCheckpoint::Prepared(prepared(&call))];
+    let mut checkpoint = calling;
+    for state in [
+        TurnState::ModelResponseReady {
+            request_id: request_id.clone(),
+            response: assembled("", source_calls.clone()),
+            step: 0,
+        },
+        TurnState::AwaitingApproval {
+            request_id: request_id.clone(),
+            source_calls: source_calls.clone(),
+            slots: slots.clone(),
+            step: 0,
+        },
+        TurnState::ExecutingTools {
+            request_id: request_id.clone(),
+            source_calls: source_calls.clone(),
+            slots: slots.clone(),
+            completed: Vec::new(),
+            step: 0,
+        },
+    ] {
+        checkpoint = advance(&checkpoint, state);
+    }
+    advance(
+        &checkpoint,
+        TurnState::ToolOutcomeReady {
+            request_id: request_id.clone(),
+            source_calls: source_calls.clone(),
+            slots: slots.clone(),
+            completed: Vec::new(),
+            outcome_index: 0,
+            outcome: ToolOutcome::text("done"),
+            step: 0,
+        },
+    );
+    let request = InteractionRequest::questionnaire(
+        InteractionRequestId::new("interaction-1"),
+        InteractionOrigin::new(
+            accepted.session.clone(),
+            accepted.turn.clone(),
+            call.id.clone(),
+        ),
+        Questionnaire::new(vec![
+            Question::new(QuestionId::new("detail"), "Detail", "Any detail?").allow_free_form(true),
+        ])
+        .unwrap(),
+        Deadline::never(),
+        InteractionSensitivity::Sensitive,
+    )
+    .unwrap();
+    advance(
+        &checkpoint,
+        TurnState::AwaitingInteraction {
+            request_id,
+            source_calls,
+            slots,
+            completed: Vec::new(),
+            interaction_index: 0,
+            request,
+            response: None,
+            step: 0,
+        },
+    );
+
+    // Include the completed checkpoint that hosts load on session resume.
+    let mut checkpoint = accepted;
+    for state in [
+        TurnState::Completing {
+            finish: TurnFinish::Completed,
+            visible_output: false,
+            provider_error_kind: None,
+        },
+        TurnState::PublishingTerminal {
+            finish: TurnFinish::Completed,
+            visible_output: false,
+        },
+        TurnState::Terminal {
+            finish: TurnFinish::Completed,
+            visible_output: false,
+        },
+    ] {
+        checkpoint = advance(&checkpoint, state);
+    }
+
+    let internal = TurnCheckpoint::internal_accepted(
+        TurnId::new("internal-turn"),
+        InternalTurnInput::new(
+            "Continue the current goal.",
+            InternalTurnSource {
+                kind: "goal".into(),
+                id: "harness.goal.state".into(),
+                revision: agent_runtime_registry::RegistryRevision::new("goal-controller-v1"),
+                sensitivity: InternalTurnSensitivity::Public,
+                goal: None,
+            },
+        )
+        .unwrap(),
+        snapshot(),
+        snapshot().history.len(),
+        Deadline::never(),
+        1,
+        3,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    verify(&internal);
+
+    let request_id = RequestId::new("local-request");
+    let mut checkpoint = TurnCheckpoint::local_action(
+        TurnId::new("local-turn"),
+        request_id.clone(),
+        call.clone(),
+        snapshot(),
+        Deadline::never(),
+        1,
+        3,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    verify(&checkpoint);
+    for state in [
+        TurnState::LocalActionPrepared {
+            request_id: request_id.clone(),
+            call: call.clone(),
+            prepared: prepared(&call),
+        },
+        TurnState::LocalActionExecuting {
+            request_id: request_id.clone(),
+            call: call.clone(),
+            prepared: prepared(&call),
+        },
+        TurnState::LocalActionOutcomeReady {
+            request_id: request_id.clone(),
+            call: call.clone(),
+            outcome: ToolOutcome::text("done"),
+        },
+        TurnState::LocalActionResultReady {
+            request_id,
+            call: call.clone(),
+            result: result(&call),
+        },
+    ] {
+        checkpoint = advance(&checkpoint, state);
+    }
+
+    let mut checkpoint = TurnCheckpoint::cache_operation(
+        TurnId::new("cache-turn"),
+        cache_operation(Some("cache-request"), None),
+        snapshot(),
+        Deadline::never(),
+        1,
+        3,
+        Timestamp::ZERO,
+    )
+    .unwrap();
+    verify(&checkpoint);
+    let operation = cache_operation(Some("cache-request"), Some("cache-attempt"));
+    let result = CacheOperationResultCheckpoint {
+        outcome: CacheOperationOutcome::Completed,
+        state: CacheState::WarmObserved,
+        evidence: None,
+        metrics: BTreeMap::new(),
+        rejection_reason: None,
+        terminal_reason: None,
+    };
+    for state in [
+        TurnState::CacheOperationStarted {
+            operation: operation.clone(),
+        },
+        TurnState::CacheOperationResultReady {
+            operation: operation.clone(),
+            result: result.clone(),
+        },
+        TurnState::CacheOperationTerminal { operation, result },
+    ] {
+        checkpoint = advance(&checkpoint, state);
+    }
+}
+
+fn external_tool_call_wire() -> serde_json::Value {
+    serde_json::json!({
+        "state": "external_tool_call",
+        "request_id": "external-request-1",
+        "call": {
+            "id": "external-call-1",
+            "name": "echo",
+            "arguments": {"id": "external-call-1"}
+        },
+        "step": 0
+    })
+}
+
+#[cfg(feature = "external-agent")]
+#[test]
+fn external_tool_checkpoint_round_trips_and_verifies() {
+    let call = source_call("external-call-1", "echo");
+    let mut state = snapshot();
+    state.history.push(crate::content::Message::assistant(vec![
+        ContentPart::ToolCall(call.clone()),
+    ]));
+    let checkpoint = accepted()
+        .transition(
+            TurnState::ExternalToolCall {
+                request_id: RequestId::new("external-request-1"),
+                call,
+                step: 0,
+            },
+            state,
+            4,
+            Timestamp(1),
+        )
+        .unwrap();
+    let wire = serde_json::to_value(&checkpoint).unwrap();
+    assert_eq!(wire["state"], external_tool_call_wire());
+    assert_eq!(wire["schema_version"], 3);
+    assert_eq!(wire["transition_revision"], 4);
+    let restored: TurnCheckpoint = serde_json::from_value(wire).unwrap();
+    restored.validate().unwrap();
+    assert_eq!(restored, checkpoint);
+}
+
+#[cfg(not(feature = "external-agent"))]
+#[test]
+fn external_tool_checkpoint_without_feature_fails_closed() {
+    let mut wire = serde_json::to_value(accepted()).unwrap();
+    wire["state"] = external_tool_call_wire();
+    let error = serde_json::from_value::<TurnCheckpoint>(wire).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown variant `external_tool_call`"),
+        "unsupported state must be an explicit decode error: {error}"
+    );
+}
+
+#[test]
 fn cache_checkpoint_phases_require_protected_result_before_terminal() {
     let prepared = TurnCheckpoint::cache_operation(
         TurnId::new("cache-turn-1"),

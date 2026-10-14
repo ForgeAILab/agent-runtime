@@ -47,6 +47,12 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   migration adapter, but cannot claim invocation-specific authority.
 
 ### Changed
+- External agent turns dispatch host tools through the runtime bridge, including
+  skill discovery and verified instruction delivery without provider staging.
+  Tools can read a bounded, volatile log of the backend's own tool observations
+  through the session view. Backend diagnostics surface without failing a turn.
+  Interrupted external turns are finalized without replaying backend or host
+  work; committed tool rounds and child-outcome consumption are preserved.
 - `ProviderAttemptFinished` now carries optional zero-based attempt position,
   configured attempt total, and the effective delay before an actually
   admitted retry. Legacy journals deserialize the fields as absent, while
