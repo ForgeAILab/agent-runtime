@@ -27,10 +27,10 @@ use agent_runtime_core::clock::{Clock, Deadline, SystemClock};
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::provider::{
-    AuthKind, Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
-    ProviderCacheBehavior, ProviderCacheContract, ProviderCallContext, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent, ReasoningSupport,
-    ToolChoice,
+    AuthKind, Capabilities, FinishReason, HostedSearchAction, ModelDescriptor, ModelId,
+    PromptCacheControl, Provider, ProviderCacheBehavior, ProviderCacheContract,
+    ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
+    ProviderStreamEvent, ReasoningSupport, ToolChoice,
 };
 use agent_runtime_core::provider_credential::{
     CredentialInvalidation, ProviderAuthRejection, ProviderCredentialError,
@@ -1442,18 +1442,57 @@ fn hosted_search(
         return;
     }
     let action = &item["action"];
-    let query = action
-        .get("query")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let sources = action
-        .get("sources")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|source| super::hosted::source(source, "url"))
-        .collect();
-    out.push(ProviderStreamEvent::HostedSearch { query, sources });
+    let url = || action.get("url").and_then(Value::as_str).map(str::to_owned);
+    let (action, query, sources) = match action.get("type").and_then(Value::as_str) {
+        Some("open_page") => (
+            Some(HostedSearchAction::OpenPage { url: url() }),
+            None,
+            Vec::new(),
+        ),
+        Some("find_in_page" | "find") => (
+            Some(HostedSearchAction::FindInPage {
+                url: url(),
+                pattern: action
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }),
+            None,
+            Vec::new(),
+        ),
+        _ => {
+            let query = action
+                .get("query")
+                .and_then(Value::as_str)
+                .filter(|query| !query.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let queries = action
+                        .get("queries")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|query| !query.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    (!queries.is_empty()).then_some(queries)
+                });
+            let sources = action
+                .get("sources")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|source| super::hosted::source(source, "url"))
+                .collect();
+            (None, query, sources)
+        }
+    };
+    out.push(ProviderStreamEvent::HostedSearch {
+        action,
+        query,
+        sources,
+    });
     state.saw_semantic_event = true;
 }
 
@@ -2892,6 +2931,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_search_stream_normalizes_page_actions_and_query_lists() {
+        let url = "https://blog.rust-lang.org/releases/";
+        for (action, expected_action, expected_query) in [
+            (
+                json!({"type":"open_page","url":url}),
+                Some(HostedSearchAction::OpenPage {
+                    url: Some(url.into()),
+                }),
+                None,
+            ),
+            (
+                json!({"type":"open_page","url":null}),
+                Some(HostedSearchAction::OpenPage { url: None }),
+                None,
+            ),
+            (
+                json!({"type":"find_in_page","url":url,"pattern":"Rust"}),
+                Some(HostedSearchAction::FindInPage {
+                    url: Some(url.into()),
+                    pattern: Some("Rust".into()),
+                }),
+                None,
+            ),
+            (
+                json!({"type":"find","url":url,"pattern":"Rust"}),
+                Some(HostedSearchAction::FindInPage {
+                    url: Some(url.into()),
+                    pattern: Some("Rust".into()),
+                }),
+                None,
+            ),
+            (
+                json!({"type":"search","queries":["a","b"]}),
+                None,
+                Some("a; b"),
+            ),
+            (
+                json!({"type":"search","query":"","queries":["", "a", "", "b"]}),
+                None,
+                Some("a; b"),
+            ),
+            (
+                json!({"type":"search","query":"single","queries":["a","b"]}),
+                None,
+                Some("single"),
+            ),
+            (json!({"queries":["a","b"]}), None, Some("a; b")),
+            (
+                json!({"type":"unknown","queries":["a","b"]}),
+                None,
+                Some("a; b"),
+            ),
+            (json!({"type":"search","queries":[""]}), None, None),
+        ] {
+            let search = json!({"type":"web_search_call","id":"hosted-call","action":action});
+            let frames = [
+                json!({"type":"response.output_item.added","output_index":0,"item":search}),
+                json!({"type":"response.output_item.done","output_index":0,"item":search}),
+                json!({"type":"response.completed","response":{"output":[search],"usage":{"input_tokens":2,"output_tokens":3}}}),
+            ];
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>()
+                + "data: [DONE]\n\n";
+            let request =
+                ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("search")]);
+            let events = collect_events(&body, request).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::Error { .. })),
+                "{events:?}"
+            );
+            let searches: Vec<_> = events
+                .iter()
+                .filter(|event| matches!(event, ProviderStreamEvent::HostedSearch { .. }))
+                .collect();
+            assert_eq!(
+                searches,
+                vec![&ProviderStreamEvent::HostedSearch {
+                    action: expected_action,
+                    query: expected_query.map(str::to_owned),
+                    sources: Vec::new(),
+                }]
+            );
+            let mut usage = UsageDelta::new();
+            for event in &events {
+                if let ProviderStreamEvent::Usage { delta } = event {
+                    usage.merge(delta);
+                }
+            }
+            assert_eq!(usage.get(CounterKind::WebSearchRequests), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn hosted_search_stream_keeps_public_sources_citations_and_usage_only() {
         use agent_runtime_core::provider::HostedTool;
         for reported in [None, Some(7), Some(0)] {
@@ -2932,7 +3068,11 @@ mod tests {
             let searches: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
-                    ProviderStreamEvent::HostedSearch { query, sources } => Some((query, sources)),
+                    ProviderStreamEvent::HostedSearch {
+                        action: None,
+                        query,
+                        sources,
+                    } => Some((query, sources)),
                     _ => None,
                 })
                 .collect();

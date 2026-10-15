@@ -973,14 +973,22 @@ impl Driver {
                                 emit_coalesced(coalescer.drain());
                                 assembler.push(index, id, name, &arguments_fragment);
                             }
-                            ProviderStreamEvent::HostedSearch { query, sources } => {
+                            ProviderStreamEvent::HostedSearch {
+                                action,
+                                query,
+                                sources,
+                            } => {
                                 accepted_semantic_event = true;
                                 response_progress = true;
                                 hosted_searches = hosted_searches.saturating_add(1);
                                 emit_coalesced(coalescer.drain());
                                 emitter.emit(
                                     turn.clone(),
-                                    RuntimeEvent::HostedSearch { query, sources },
+                                    RuntimeEvent::HostedSearch {
+                                        action,
+                                        query,
+                                        sources,
+                                    },
                                 );
                             }
                             ProviderStreamEvent::Usage { delta } => {

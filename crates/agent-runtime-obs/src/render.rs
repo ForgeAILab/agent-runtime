@@ -6,6 +6,7 @@
 //! or format the [`crate::ObsRow`] projection instead.
 
 use agent_runtime_core::event::{EventEnvelope, RuntimeEvent};
+use agent_runtime_core::provider::HostedSearchAction;
 use serde_json::Value;
 use std::fmt::Display;
 
@@ -313,7 +314,26 @@ fn summary(payload: &RuntimeEvent) -> String {
         RuntimeEvent::Downgrade { capability, detail } => {
             format!("downgrade {capability}: {detail}")
         }
-        RuntimeEvent::HostedSearch { query, sources } => format!(
+        RuntimeEvent::HostedSearch {
+            action: Some(HostedSearchAction::OpenPage { url }),
+            ..
+        } => format!(
+            "hosted_search action=open_page url={}",
+            compact(&serde_json::to_value(url).unwrap_or(Value::Null))
+        ),
+        RuntimeEvent::HostedSearch {
+            action: Some(HostedSearchAction::FindInPage { url, pattern }),
+            ..
+        } => format!(
+            "hosted_search action=find_in_page url={} pattern={}",
+            compact(&serde_json::to_value(url).unwrap_or(Value::Null)),
+            compact(&serde_json::to_value(pattern).unwrap_or(Value::Null))
+        ),
+        RuntimeEvent::HostedSearch {
+            action: None,
+            query,
+            sources,
+        } => format!(
             "hosted_search query={} sources={}",
             compact(&serde_json::to_value(query).unwrap_or(Value::Null)),
             compact(&serde_json::to_value(sources).unwrap_or(Value::Null))
@@ -749,8 +769,36 @@ mod tests {
         assert!(line.contains("missed=105000"));
     }
     #[test]
+    fn hosted_search_renders_page_actions() {
+        for (action, expected) in [
+            (
+                HostedSearchAction::OpenPage {
+                    url: Some("https://rust.test".into()),
+                },
+                "hosted_search action=open_page url=\"https://rust.test\"",
+            ),
+            (
+                HostedSearchAction::FindInPage {
+                    url: Some("https://rust.test".into()),
+                    pattern: Some("Rust".into()),
+                },
+                "hosted_search action=find_in_page url=\"https://rust.test\" pattern=\"Rust\"",
+            ),
+        ] {
+            let event = RuntimeEvent::HostedSearch {
+                action: Some(action),
+                query: None,
+                sources: Vec::new(),
+            };
+            let line = log_line(&envelope(Some("turn"), event));
+            assert!(line.contains(expected), "{line}");
+        }
+    }
+
+    #[test]
     fn hosted_search_renders_public_query_and_sources() {
         let event = RuntimeEvent::HostedSearch {
+            action: None,
             query: Some("rust docs".into()),
             sources: vec![agent_runtime_core::provider::HostedSource {
                 title: Some("Rust".into()),
@@ -766,6 +814,7 @@ mod tests {
         assert_eq!(
             empty,
             RuntimeEvent::HostedSearch {
+                action: None,
                 query: None,
                 sources: Vec::new()
             }

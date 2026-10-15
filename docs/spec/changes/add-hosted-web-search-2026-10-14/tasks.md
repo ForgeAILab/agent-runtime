@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-15T01:06:46Z
-updated_at: 2026-10-15T01:06:46Z
-completed_at:
+updated_at: 2026-10-15T08:52:23Z
+completed_at: 2026-10-15T08:52:23Z
 ---
 
 ## 1. Hosted web search
@@ -21,3 +21,12 @@ completed_at:
       canonical history; cross-provider continuation after hosted search.
 - [x] 1.7 Gate: fmt, clippy `-D warnings` with all features, workspace tests.
 - [x] 1.8 Host-set hosted tools on agent requests.
+
+## 2. Live-run follow-ups (2026-10-15)
+
+- [x] 2.1 Hosted-search events carry the step's action (search, open page,
+      find in page) with its URL and pattern, as optional fields; the
+      Responses query falls back to `queries`.
+- [x] 2.2 Citation rendering skips a source the cited span already links
+      (Responses, Anthropic, Gemini).
+- [x] 2.3 Gate: fmt, clippy `-D warnings` with all features, workspace tests.
