@@ -37,8 +37,21 @@ impl<'a> TurnMachine<'a> {
                 self.driver.clock.now(),
             );
         }
-        if activation_changed {
-            self.close_unanswered_tool_calls(&checkpoint, TOOLS_CHANGED_BEFORE_RESULT);
+        let external_interrupted = self.driver.interrupts_external_checkpoint(&checkpoint);
+        if activation_changed || external_interrupted {
+            if external_interrupted {
+                if let Some(abilities) = &self.execution.abilities {
+                    abilities.discard_uncommitted_activation();
+                }
+            }
+            self.close_unanswered_tool_calls(
+                &checkpoint,
+                if external_interrupted {
+                    "indeterminate tool outcome after restart; the runtime did not replay this invocation"
+                } else {
+                    TOOLS_CHANGED_BEFORE_RESULT
+                },
+            );
             let finish = match &checkpoint.state {
                 TurnState::Completing { finish, .. }
                 | TurnState::PublishingTerminal { finish, .. } => finish.clone(),
@@ -47,9 +60,11 @@ impl<'a> TurnMachine<'a> {
             self.emitter.emit(
                 Some(self.turn_id.clone()),
                 RuntimeEvent::Error {
-                    error: RuntimeError::conflict(
-                        "available tools changed since this turn was saved; conversation restored without retrying the unfinished action; check previous changes before retrying",
-                    ),
+                    error: RuntimeError::conflict(if external_interrupted {
+                        "external turn interrupted by restart; finalized as failed without re-entering the backend or replaying host tools"
+                    } else {
+                        "available tools changed since this turn was saved; conversation restored without retrying the unfinished action; check previous changes before retrying"
+                    }),
                 },
             );
             // The fallback is local recovery, not another turn. In particular
@@ -179,7 +194,20 @@ impl<'a> TurnMachine<'a> {
             );
         }
 
+        // Use the same interrupt branch as ResumeOrInterrupt: no backend,
+        // prepared tool, approval, interaction, or commit hook is replayed.
+        if self.driver.interrupts_external_checkpoint(&checkpoint) {
+            // Boxed: external interruption must not inline another large recovery future.
+            Box::pin(self.abandon(false)).await;
+            return;
+        }
+
         match checkpoint.state {
+            #[cfg(feature = "external-agent")]
+            TurnState::ExternalToolCall { .. } => {
+                // Boxed: external interruption must not inline another large recovery future.
+                Box::pin(self.abandon(false)).await;
+            }
             TurnState::Accepted { .. } => {
                 // The exact input is already present at active_history_start;
                 // never append it again on recovery.
@@ -192,7 +220,7 @@ impl<'a> TurnMachine<'a> {
                 .await;
             }
             TurnState::LocalActionAccepted { request_id, call } => {
-                self.emit_local_tool_requested(&call);
+                self.emit_tool_requested(&call, false);
                 if let Err(error) = self
                     .prepare_and_run_local(request_id, call, checkpoint.deadline)
                     .await
@@ -605,6 +633,22 @@ impl<'a> TurnMachine<'a> {
                 );
             }
             TurnState::Terminal { .. } => {}
+            // A dependency can enable core's checkpoint feature independently
+            // through Cargo feature unification. This driver cannot replay it.
+            #[cfg(not(feature = "external-agent"))]
+            #[allow(unreachable_patterns)]
+            _ => {
+                self.emitter.emit(
+                    Some(self.turn_id.clone()),
+                    RuntimeEvent::Error {
+                        error: RuntimeError::conflict(
+                            "external tool checkpoint requires the external-agent runtime feature",
+                        ),
+                    },
+                );
+                self.complete(TurnFinish::Failed, checkpoint.visible_output)
+                    .await;
+            }
         }
     }
 

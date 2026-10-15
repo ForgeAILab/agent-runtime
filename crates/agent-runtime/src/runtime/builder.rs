@@ -130,6 +130,8 @@ pub struct RuntimeBuilder {
     external_agent: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
     #[cfg(feature = "external-agent")]
     external_capabilities: crate::agent::external::ExternalCapabilities,
+    #[cfg(feature = "external-agent")]
+    external_excluded_tools: Vec<String>,
     harness: HarnessPipelineBuilder,
     lcm: Option<Arc<LcmCoordinator>>,
     working_set: Option<WorkingSetPolicy>,
@@ -145,6 +147,8 @@ impl RuntimeBuilder {
             external_agent: None,
             #[cfg(feature = "external-agent")]
             external_capabilities: Default::default(),
+            #[cfg(feature = "external-agent")]
+            external_excluded_tools: Vec::new(),
             provider: None,
             tools: Vec::new(),
             approval: None,
@@ -384,6 +388,16 @@ impl RuntimeBuilder {
         capabilities: crate::agent::external::ExternalCapabilities,
     ) -> Self {
         self.external_capabilities = capabilities;
+        self
+    }
+
+    /// Omits these tool names from external turns. Provider turns are unaffected.
+    #[cfg(feature = "external-agent")]
+    pub fn external_excluded_tools(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.external_excluded_tools = names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -1038,7 +1052,11 @@ impl RuntimeBuilder {
         )
         .with_history_lcm(self.lcm.clone());
         #[cfg(feature = "external-agent")]
-        let driver = driver.with_external_agent(self.external_agent, self.external_capabilities);
+        let driver = driver.with_external_agent(
+            self.external_agent,
+            self.external_capabilities,
+            self.external_excluded_tools,
+        );
 
         let shared = RuntimeShared {
             driver,

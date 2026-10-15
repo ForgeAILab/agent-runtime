@@ -7,7 +7,7 @@ pub(super) enum BeforeProviderOutcome {
 }
 
 impl<'a> TurnMachine<'a> {
-    fn resolve_acceptance(&self, result: Result<(), RuntimeError>) {
+    pub(super) fn resolve_acceptance(&self, result: Result<(), RuntimeError>) {
         if let Some(acceptance) = &self.acceptance {
             acceptance.resolve(result);
         }
@@ -39,6 +39,8 @@ impl<'a> TurnMachine<'a> {
             checkpoint: None,
             ordinary_lcm_intent_saved: false,
             ordinary_lcm_hard_admitted: false,
+            #[cfg(feature = "external-agent")]
+            external_call: None,
         }
     }
 
@@ -73,6 +75,8 @@ impl<'a> TurnMachine<'a> {
             checkpoint: Some(checkpoint),
             ordinary_lcm_intent_saved: false,
             ordinary_lcm_hard_admitted: false,
+            #[cfg(feature = "external-agent")]
+            external_call: None,
         }
     }
 
@@ -888,7 +892,7 @@ impl<'a> TurnMachine<'a> {
         outcome_index: usize,
         step: u32,
         call: &ToolCall,
-        mut outcome: ToolOutcome,
+        outcome: ToolOutcome,
     ) -> Result<(), RuntimeError> {
         let mut search_stage = if matches!(
             call.name.as_str(),
@@ -919,60 +923,12 @@ impl<'a> TurnMachine<'a> {
             .as_ref()
             .map(|checkpoint| checkpoint.deadline)
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
-        let mut updates = Vec::<(String, VersionedSessionState)>::new();
-        let mut component_events = Vec::new();
-        for processor in self.driver.harness.tool_output() {
-            let descriptor = processor.descriptor();
-            let current_state = self
-                .execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned")
-                .get(descriptor.id().as_str())
-                .cloned();
-            let usage = Arc::from(
-                self.state
-                    .lock()
-                    .expect("session state poisoned")
-                    .usage
-                    .records()
-                    .to_vec()
-                    .into_boxed_slice(),
-            );
-            let now = self.driver.clock.now();
-            let patch = await_harness_phase(
-                processor.process(
-                    &ToolOutputView {
-                        session: self.emitter.session().clone(),
-                        turn: self.turn_id.clone(),
-                        request: request_id.clone(),
-                        call: call.clone(),
-                        state: current_state,
-                        usage,
-                        now,
-                    },
-                    outcome,
-                ),
-                &self.cancel,
-                deadline,
-                self.driver.clock.clone(),
-                "running tool-output processor",
-            )
-            .await?;
-            outcome = patch.outcome;
-            component_events.extend(patch.events);
-            if let Some(state) = patch.state {
-                if state.revision != *descriptor.revision() {
-                    return Err(RuntimeError::conflict(format!(
-                        "tool-output component `{}` returned state revision `{}` but declares `{}`",
-                        descriptor.id(),
-                        state.revision,
-                        descriptor.revision()
-                    )));
-                }
-                updates.push((descriptor.id().as_str().to_owned(), state.into_state()));
-            }
-        }
+        // Boxed: the shared output-processing future otherwise inflates provider-turn recovery.
+        let super::tool_output::ProcessedToolOutput {
+            outcome,
+            updates,
+            events: component_events,
+        } = Box::pin(self.process_tool_output(request_id, call, outcome, deadline)).await?;
 
         if let Some(reference) = outcome.content.artifact_reference().cloned() {
             self.execution

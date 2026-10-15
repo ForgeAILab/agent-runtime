@@ -10,6 +10,9 @@ description = "Host-neutral contracts, events, errors, cancellation, usage, and 
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+external-agent = []
+
 [dependencies]
 # The registry kernel is std-only and sits below core: it owns the identity and
 # fingerprint primitives that catalog profiles, snapshots, and plans all share.

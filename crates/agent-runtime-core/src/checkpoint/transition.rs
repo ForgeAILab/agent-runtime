@@ -11,6 +11,60 @@ impl TurnState {
             return true;
         }
         match (self, next) {
+            #[cfg(feature = "external-agent")]
+            (
+                Self::Accepted { .. } | Self::InternalAccepted { .. },
+                Self::ExternalToolCall { step, .. },
+            ) => *step == 0,
+            #[cfg(feature = "external-agent")]
+            (
+                Self::Planning { step },
+                Self::ExternalToolCall {
+                    step: next_step, ..
+                },
+            ) => step == next_step,
+            #[cfg(feature = "external-agent")]
+            (
+                Self::ExternalToolCall {
+                    request_id,
+                    call,
+                    step,
+                },
+                Self::AwaitingApproval {
+                    request_id: next_request,
+                    source_calls,
+                    slots,
+                    step: next_step,
+                },
+            ) => {
+                request_id == next_request
+                    && step == next_step
+                    && source_calls.as_slice() == std::slice::from_ref(call)
+                    && slots_correspond(source_calls, slots)
+            }
+            #[cfg(feature = "external-agent")]
+            (
+                Self::ExternalToolCall {
+                    request_id,
+                    call,
+                    step,
+                },
+                Self::ExecutingTools {
+                    request_id: next_request,
+                    source_calls,
+                    slots,
+                    completed,
+                    step: next_step,
+                },
+            ) => {
+                request_id == next_request
+                    && step == next_step
+                    && source_calls.as_slice() == std::slice::from_ref(call)
+                    && completed.is_empty()
+                    && slots_correspond(source_calls, slots)
+            }
+            #[cfg(feature = "external-agent")]
+            (Self::ExternalToolCall { .. }, Self::Completing { .. }) => true,
             (Self::Accepted { .. }, Self::Planning { step }) => *step == 0,
             (Self::Accepted { .. }, Self::Completing { .. }) => true,
             (Self::InternalAccepted { .. }, Self::Planning { step }) => *step == 0,

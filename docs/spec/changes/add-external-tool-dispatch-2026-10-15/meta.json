@@ -2,7 +2,8 @@
   "change_id": "add-external-tool-dispatch",
   "change_ref": "add-external-tool-dispatch-2026-10-15",
   "created_at": "2026-10-15T20:40:12Z",
-  "updated_at": "2026-10-15T20:43:18Z",
-  "status": "proposed",
-  "completed_at": null
+  "updated_at": "2026-10-15T21:06:27Z",
+  "status": "implementing",
+  "completed_at": null,
+  "implementation_started_at": "2026-10-15T20:46:17Z"
 }

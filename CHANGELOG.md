@@ -463,6 +463,13 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   targets `consumer_open_forge`, `consumer_smith` and `consumer_nyx` keep their
   names. Run a moved case with `--test integration <module>::` or
   `--test conformance <module>::`.
+- External agent turns dispatch host tools through `ExternalToolDispatch`, including
+  skill discovery and verified instruction delivery without provider staging.
+  Tools can read a bounded, volatile log of the backend's own tool observations
+  through the session view. Backend diagnostics surface without failing a turn.
+  Interrupted external turns are finalized without replaying backend or host
+  work; committed tool rounds and child-outcome consumption are preserved.
+  The existing MCP bridge is unchanged.
 - `ProviderAttemptFinished` now carries optional zero-based attempt position,
   configured attempt total, and the effective delay before an actually
   admitted retry. Legacy journals deserialize the fields as absent, while

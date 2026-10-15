@@ -523,6 +523,8 @@ pub struct Driver {
     /// Injected into every external turn; empty unless the host set it.
     #[cfg(feature = "external-agent")]
     external_capabilities: Arc<crate::agent::external::ExternalCapabilities>,
+    #[cfg(feature = "external-agent")]
+    external_excluded_tools: Vec<String>,
 }
 
 impl Driver {
@@ -551,9 +553,11 @@ impl Driver {
         mut self,
         backend: Option<Arc<dyn crate::agent::external::ExternalAgentBackend>>,
         capabilities: crate::agent::external::ExternalCapabilities,
+        excluded_tools: Vec<String>,
     ) -> Self {
         self.external = backend;
         self.external_capabilities = Arc::new(capabilities);
+        self.external_excluded_tools = excluded_tools;
         self
     }
 
@@ -601,6 +605,8 @@ impl Driver {
             external: None,
             #[cfg(feature = "external-agent")]
             external_capabilities: Arc::default(),
+            #[cfg(feature = "external-agent")]
+            external_excluded_tools: Vec::new(),
         }
     }
 
@@ -819,8 +825,8 @@ impl Driver {
 
         #[cfg(feature = "external-agent")]
         if let Some(backend) = self.external.clone() {
-            external_turn::ExternalTurnMachine::new(self, context, backend)
-                .run(input)
+            // Boxed: external tool dispatch makes this future large; keep it off the caller's stack.
+            Box::pin(external_turn::ExternalTurnMachine::new(self, context, backend).run(input))
                 .await;
             return;
         }
@@ -856,8 +862,8 @@ impl Driver {
 
         #[cfg(feature = "external-agent")]
         if let Some(backend) = self.external.clone() {
-            external_turn::ExternalTurnMachine::new(self, context, backend)
-                .run(input)
+            // Boxed: external tool dispatch makes this future large; keep it off the caller's stack.
+            Box::pin(external_turn::ExternalTurnMachine::new(self, context, backend).run(input))
                 .await;
             return;
         }
@@ -881,22 +887,29 @@ impl Driver {
         input: InternalTurnInput,
         acceptance: Arc<TurnAcceptance>,
     ) {
-        TurnMachine::new(
-            self,
-            TurnMachineContext {
-                state,
-                execution,
-                emitter,
-                minter,
-                cancel: turn_cancel,
-                inbox,
-                steer_mailbox: Some(steer_mailbox),
-                turn_id,
-                acceptance: Some(acceptance),
-            },
-        )
-        .run_internal(input)
-        .await;
+        let context = TurnMachineContext {
+            state,
+            execution,
+            emitter,
+            minter,
+            cancel: turn_cancel,
+            inbox,
+            steer_mailbox: Some(steer_mailbox),
+            turn_id,
+            acceptance: Some(acceptance),
+        };
+
+        #[cfg(feature = "external-agent")]
+        if let Some(backend) = self.external.clone() {
+            // Boxed: the external internal-turn future is large; keep it off the caller's stack.
+            Box::pin(
+                external_turn::ExternalTurnMachine::new(self, context, backend).run_internal(input),
+            )
+            .await;
+            return;
+        }
+
+        TurnMachine::new(self, context).run_internal(input).await;
     }
 
     /// Runs one explicit host tool action through the checkpointed turn
@@ -971,6 +984,34 @@ impl Driver {
         .await;
     }
 
+    /// External conversations cannot be re-entered mid-turn. Local actions and
+    /// cache operations retain their own recovery contracts, as do determinate
+    /// terminal publication barriers.
+    pub(crate) fn interrupts_external_checkpoint(&self, checkpoint: &TurnCheckpoint) -> bool {
+        #[cfg(feature = "external-agent")]
+        {
+            self.external.is_some()
+                && matches!(
+                    checkpoint.state,
+                    TurnState::Accepted { .. }
+                        | TurnState::InternalAccepted { .. }
+                        | TurnState::Planning { .. }
+                        | TurnState::CallingModel { .. }
+                        | TurnState::ModelResponseReady { .. }
+                        | TurnState::ExternalToolCall { .. }
+                        | TurnState::AwaitingApproval { .. }
+                        | TurnState::AwaitingInteraction { .. }
+                        | TurnState::ExecutingTools { .. }
+                        | TurnState::ToolOutcomeReady { .. }
+                )
+        }
+        #[cfg(not(feature = "external-agent"))]
+        {
+            let _ = checkpoint;
+            false
+        }
+    }
+
     /// Finalizes one validated non-terminal checkpoint from a turn that is
     /// no longer running as an explicit `Failed` terminal without minting a
     /// new turn or replaying its indeterminate provider/tool work.
@@ -1028,6 +1069,8 @@ struct TurnMachine<'a> {
     ordinary_lcm_intent_saved: bool,
     /// This turn crossed an ordinary hard-admission durability barrier.
     ordinary_lcm_hard_admitted: bool,
+    #[cfg(feature = "external-agent")]
+    external_call: Option<external_turn::DispatchedRound>,
 }
 
 /// Cohesive process-local dependencies shared by every turn-machine entry
@@ -1051,6 +1094,7 @@ mod external_bridge;
 mod external_turn;
 mod provider;
 mod recovery;
+mod tool_output;
 mod tools;
 mod turn;
 

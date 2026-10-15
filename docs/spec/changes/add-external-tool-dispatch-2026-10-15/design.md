@@ -64,11 +64,13 @@ On main, three earlier changes touch the same ground:
 - **Checkpoints.** `ExternalToolCall` is an additive `TurnState`. Main's
   constants are still schema 3 and revision 4, and they MUST NOT change. The
   doc comments `db8dff2` added beside the constants are ported.
-- **Tests.** Main keeps its external-agent conformance tests in
-  `tests/external_agent.rs` and `tests/integration/external_agent.rs`. The
-  ported modules go under `tests/external_agent/` as in `db8dff2`, loaded
-  from `tests/external_agent.rs`, with request construction updated to set
-  both `bridge` and `tools`.
+- **Tests.** Main moved the external-agent conformance tests from
+  `tests/external_agent.rs` to `tests/integration/external_agent.rs`, which
+  `tests/integration.rs` loads with `#[path]`. `db8dff2`'s additions to the
+  old file merge into `tests/integration/external_agent.rs`. Its
+  `tests/external_agent/*.rs` modules move under `tests/integration/` as
+  submodules of that file. The top-level `tests/external_agent.rs` stays
+  deleted. Request construction sets both `bridge` and `tools`.
 
 ## Risks / Trade-offs
 

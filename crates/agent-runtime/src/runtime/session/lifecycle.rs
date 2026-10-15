@@ -105,6 +105,18 @@ impl SessionHandle {
             .clone()
     }
 
+    /// Owned snapshot of tools the BACKEND ran, not runtime tool-call history.
+    /// Empty outside an external turn; never persisted in session state.
+    #[cfg(feature = "external-agent")]
+    pub fn backend_tool_observations(&self) -> crate::agent::external::BackendToolObservations {
+        self.inner
+            .execution
+            .backend_tool_observations
+            .lock()
+            .expect("backend observations poisoned")
+            .snapshot()
+    }
+
     /// Runs `f` over the current conversation history without cloning it.
     ///
     /// The session state lock is held while `f` runs, so `f` must stay a
@@ -149,7 +161,8 @@ impl SessionHandle {
         observation.result
     }
 
-    /// The turn stopped without replay because its activation scope changed.
+    /// The turn stopped without replay because its activation scope changed
+    /// or its external backend conversation could not be re-entered.
     ///
     /// Presentations should tell the user that history was retained and the
     /// previous action was not retried. A normal or exact resume returns None.

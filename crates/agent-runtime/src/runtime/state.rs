@@ -80,6 +80,9 @@ pub struct ActiveTurn {
 #[derive(Debug)]
 pub struct SessionExecutionContext {
     history_generations: Mutex<super::history::HistoryGenerations>,
+    /// Volatile backend observations, deliberately outside all snapshot state.
+    #[cfg(feature = "external-agent")]
+    pub(crate) backend_tool_observations: Mutex<crate::agent::external::BackendToolObservationLog>,
     /// Cache-aware planner with session-local prior-plan state.
     pub(crate) planner: RunPlanner,
     /// Session-scoped registry view and activation history when live routing
@@ -125,6 +128,8 @@ impl SessionExecutionContext {
         let returned_interaction = take_returned_interaction_state(&mut extension_state)?;
         let artifacts = restore_artifact_references(&extension_state, session)?;
         Ok(Self {
+            #[cfg(feature = "external-agent")]
+            backend_tool_observations: Mutex::new(Default::default()),
             planner,
             history_generations: Mutex::new(super::history::HistoryGenerations::default()),
             abilities,

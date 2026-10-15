@@ -102,6 +102,9 @@ pub mod tool;
 
 pub use agent_runtime_core as core;
 
+#[cfg(feature = "external-agent")]
+pub use agent::external::ExternalToolDispatch;
+
 /// The dependency-light registry kernel: namespaced identity, revisions,
 /// provenance, cards, layered sealing, snapshots, and scoped views.
 ///
@@ -146,6 +149,8 @@ pub use agent_runtime_obs as obs;
 /// capability, and runtime surfaces — the coherent "one import" entry point
 /// for a host composing the facade.
 pub mod prelude {
+    #[cfg(feature = "external-agent")]
+    pub use crate::ExternalToolDispatch;
     // -- registry kernel: identity, revisions, and scoped views --------------
     pub use crate::registry::{RegistryDomain, RegistryId, RegistryRevision, RegistryView};
 
