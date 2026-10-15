@@ -22,7 +22,7 @@ futures-util.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
