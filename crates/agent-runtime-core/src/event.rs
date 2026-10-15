@@ -45,6 +45,11 @@ fn default_true() -> bool {
 fn is_true(value: &bool) -> bool {
     *value
 }
+
+/// Serde skip predicate for counts that are absent unless nonzero.
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
 use crate::provider::{
     CacheAvailabilityEvidence, CacheIdentity, FinishReason, ModelId, ProviderAttemptPurpose,
     RateLimitSnapshot,
@@ -457,6 +462,12 @@ pub enum RuntimeEvent {
         /// Absent on journals written before the field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capability_overflow_tokens: Option<u32>,
+        /// Image parts replaced because the model does not accept image input.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        images_text_only: u32,
+        /// Image parts replaced because they fell outside the image window.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        images_windowed: u32,
     },
     /// Compaction changed the context plan.
     ContextCompacted {
@@ -1178,6 +1189,65 @@ mod tests {
         assert_eq!(event, back);
     }
 
+    #[test]
+    fn context_planned_image_counts_roundtrip_and_skip_zeros() {
+        for (images_text_only, images_windowed) in [(0, 0), (1, 0), (0, 2), (1, 2)] {
+            let event = RuntimeEvent::ContextPlanned {
+                context: Fingerprint::of("context"),
+                cache_plan: Fingerprint::of("cache"),
+                segment_count: 1,
+                totals: BTreeMap::from([(SegmentKind::new("history"), 42)]),
+                input_tokens: 42,
+                input_budget_tokens: 8000,
+                reserved_tokens: 512,
+                confidence: EstimationConfidence::Estimated,
+                capability_overflow_tokens: None,
+                images_text_only,
+                images_windowed,
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            for (field, count) in [
+                ("images_text_only", images_text_only),
+                ("images_windowed", images_windowed),
+            ] {
+                if count == 0 {
+                    assert!(json.get(field).is_none(), "{json}");
+                } else {
+                    assert_eq!(json[field], count);
+                }
+            }
+            assert_eq!(serde_json::from_value::<RuntimeEvent>(json).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn legacy_context_planned_without_image_counts_defaults_to_zero() {
+        let event: RuntimeEvent = serde_json::from_value(serde_json::json!({
+            "event": "context_planned",
+            "context": Fingerprint::of("context"),
+            "cache_plan": Fingerprint::of("cache"),
+            "segment_count": 1,
+            "totals": {},
+            "input_tokens": 42,
+            "input_budget_tokens": 8000,
+            "reserved_tokens": 512,
+            "confidence": "estimated"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            RuntimeEvent::ContextPlanned {
+                images_text_only: 0,
+                images_windowed: 0,
+                ..
+            }
+        ));
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("images_text_only").is_none());
+        assert!(json.get("images_windowed").is_none());
+        assert_eq!(serde_json::from_value::<RuntimeEvent>(json).unwrap(), event);
+    }
+
     /// "Automatic routing activates browser research": intent routing selects
     /// authorized research capabilities, and once the initial context plan is
     /// completed, consumers must have received the snapshot, resolution,
@@ -1222,6 +1292,8 @@ mod tests {
                 reserved_tokens: 512,
                 confidence: EstimationConfidence::Estimated,
                 capability_overflow_tokens: None,
+                images_text_only: 0,
+                images_windowed: 0,
             },
         ];
 
