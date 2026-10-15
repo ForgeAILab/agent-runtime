@@ -2076,6 +2076,28 @@ mod tests {
     }
 
     #[test]
+    fn cache_identity_without_hosted_tools_preserves_legacy_digest_and_wire() {
+        let identity = identity_fixture();
+        // Freeze the digest from before hosted tools entered the identity contract.
+        assert_eq!(
+            identity.digest().as_str(),
+            "5216e1c785375d35001d6eb09784fab7"
+        );
+
+        let mut wire = serde_json::to_value(&identity).unwrap();
+        assert!(wire.get("hosted_tools").is_none());
+        let restored = serde_json::from_value::<CacheIdentity>(wire.clone()).unwrap();
+        assert_eq!(restored, identity);
+        assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+
+        wire["hosted_tools"] = Value::Null;
+        assert_eq!(
+            serde_json::from_value::<CacheIdentity>(wire).unwrap(),
+            identity
+        );
+    }
+
+    #[test]
     fn cache_identity_deserialization_rejects_digest_tampering() {
         let identity = identity_fixture();
         let mut json = serde_json::to_value(&identity).unwrap();

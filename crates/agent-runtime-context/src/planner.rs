@@ -294,6 +294,7 @@ impl<'a> ContextPlanner<'a> {
         let mut scoped_view = None;
         let mut activation = None;
         let mut harness = None;
+        let mut hosted_tools = None;
         // Keep a bounded, ordered projection of the committed history that
         // actually belongs to the stable leading prefix. The active
         // Ephemeral tail is intentionally excluded even when it has a
@@ -314,6 +315,7 @@ impl<'a> ContextPlanner<'a> {
                 "scoped_view" => scoped_view = Some(fingerprint),
                 "activation" => activation = Some(fingerprint),
                 "harness_pipeline" => harness = Some(fingerprint),
+                "hosted_tools" => hosted_tools = Some(fingerprint),
                 _ if name.starts_with("history:") => {}
                 _ => {}
             }
@@ -387,6 +389,9 @@ impl<'a> ContextPlanner<'a> {
             .registry_revisions(registry_snapshot, scoped_view, activation)
             .runtime_revisions(harness, cache_policy_revision)
             .stable_history(history);
+        if let Some(hosted_tools) = hosted_tools {
+            builder = builder.hosted_tools(hosted_tools);
+        }
         builder.build()
     }
 

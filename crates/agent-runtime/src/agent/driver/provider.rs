@@ -658,6 +658,7 @@ impl Driver {
             .push(turn_manifest);
 
         let mut request = plan.to_provider_request(self.config.model.clone());
+        request.hosted_tools = self.config.hosted_tools.clone();
         request.sampling = self.config.sampling.clone();
         request.reasoning = self.config.reasoning.clone();
         request.structured_output = self.config.structured_output.clone();
@@ -1475,6 +1476,102 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hosted_tools_reaches_every_main_agent_request() {
+        use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
+        use agent_runtime_core::provider::{Capabilities, HostedTool, ModelId};
+
+        use crate::provider::fake::{FakeProvider, ScriptedStream};
+        use crate::runtime::{RuntimeBuilder, StartSession};
+
+        let tools = vec![HostedTool::WebSearch { max_uses: Some(5) }];
+        let reply = ScriptedStream::new(vec![
+            ProviderStreamEvent::TextDelta {
+                text: "done".into(),
+            },
+            ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ]);
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities {
+                hosted_web_search: true,
+                ..Capabilities::basic_streaming()
+            },
+            vec![reply.clone(), reply],
+        ));
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider.clone())
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .hosted_tools(tools.clone())
+            .build()
+            .unwrap();
+        let session = runtime.start_session(StartSession::new()).await.unwrap();
+        session.run(UserInput::text("search")).await.unwrap();
+        session.run(UserInput::text("search again")).await.unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.hosted_tools == tools));
+    }
+
+    #[tokio::test]
+    async fn hosted_tools_unsupported_fails_before_io_even_with_permissive_downgrades() {
+        use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
+        use agent_runtime_core::provider::{HostedTool, ModelId};
+
+        use crate::agent::config::DowngradePolicy;
+        use crate::provider::fake::FakeProvider;
+        use crate::runtime::{RuntimeBuilder, StartSession};
+
+        let provider = Arc::new(FakeProvider::text_reply("must not run"));
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider.clone())
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .hosted_tools(vec![HostedTool::WebSearch { max_uses: None }])
+            .downgrade_policy(DowngradePolicy::permissive())
+            .build()
+            .unwrap();
+        let session = runtime.start_session(StartSession::new()).await.unwrap();
+        let mut events = session.subscribe();
+        session.run(UserInput::text("search")).await.unwrap();
+
+        let mut errors = Vec::new();
+        let mut finish = None;
+        while let Some(envelope) = events.next().await {
+            match envelope.payload {
+                RuntimeEvent::Error { error } => errors.push(error),
+                RuntimeEvent::Downgrade { .. } | RuntimeEvent::ProviderAttemptStarted { .. } => {
+                    panic!("hosted search must fail before downgrade or provider I/O");
+                }
+                RuntimeEvent::TurnCompleted {
+                    finish: completed, ..
+                } => {
+                    finish = Some(completed);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(finish, Some(TurnFinish::Failed));
+        assert_eq!(
+            errors,
+            vec![RuntimeError::from(ProviderError::unsupported(&[
+                UnsupportedFeature::HostedWebSearch,
+            ]))]
+        );
+        assert!(provider.requests().is_empty());
+    }
 
     #[tokio::test]
     async fn text_only_history_image_emits_context_planned_projection_count() {

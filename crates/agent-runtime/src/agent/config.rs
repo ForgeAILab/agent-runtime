@@ -4,7 +4,9 @@
 //! wording, workflow rules) is expressed only through the host-supplied
 //! `system_prompt` text and injected adapters — the loop hard-codes none of it.
 
-use agent_runtime_core::provider::{ModelId, ReasoningConfig, Sampling, StructuredOutputConfig};
+use agent_runtime_core::provider::{
+    HostedTool, ModelId, ReasoningConfig, Sampling, StructuredOutputConfig,
+};
 use agent_runtime_core::steer::SteerLimits;
 
 use crate::provider::retry::RetryPolicy;
@@ -65,6 +67,9 @@ pub struct LoopConfig {
     /// satisfy it either fails before network I/O or is downgraded per
     /// [`LoopConfig::downgrade`].
     pub structured_output: Option<StructuredOutputConfig>,
+    /// Provider-hosted tools enabled for the agent's own model turns.
+    /// Synthetic maintenance and dedicated summary requests do not inherit them.
+    pub hosted_tools: Vec<HostedTool>,
     /// Maximum output tokens per attempt.
     pub max_output_tokens: Option<u32>,
     /// Sampling parameters.
@@ -110,6 +115,7 @@ impl LoopConfig {
             output_limit: 100_000,
             reasoning: None,
             structured_output: None,
+            hosted_tools: Vec::new(),
             max_output_tokens: None,
             sampling: Sampling::default(),
             conflict_policy: ConflictPolicy::ScopeOverlap,
