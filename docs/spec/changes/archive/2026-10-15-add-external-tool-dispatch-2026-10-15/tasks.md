@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-15T20:40:12Z
-updated_at: 2026-10-15T21:06:27Z
-completed_at:
+updated_at: 2026-10-15T21:08:40Z
+completed_at: 2026-10-15T21:08:40Z
 ---
 
 Port of `db8dff2` (`add-external-tool-dispatch-2026-10-13`) onto main.
@@ -92,5 +92,6 @@ intent. Do not take the compat line's version of a file wholesale.
   two testkit crash-boundary tests first overflowed their stacks. Eight
   port-added await sites are now boxed in `driver/{mod,recovery,tools,turn}.rs`.)
 
-- [ ] 6.3 PR to main, CI green, merge. Archive this change.
+- [x] 6.3 PR to main, CI green, merge. Archive this change.
   `add-external-tool-dispatch-2026-10-13` stays on the compat line.
+  (PR #28. Archived on the PR branch before merge, as PR #27 did.)
