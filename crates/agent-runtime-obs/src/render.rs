@@ -7,6 +7,7 @@
 
 use agent_runtime_core::event::Fingerprint;
 use agent_runtime_core::event::{EventEnvelope, RuntimeEvent};
+use agent_runtime_core::provider::HostedSearchAction;
 use serde_json::Value;
 use std::fmt::Display;
 
@@ -36,6 +37,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::CachePlanChanged { .. } => "cache_plan_changed",
         RuntimeEvent::BudgetFailure { .. } => "budget_failure",
         RuntimeEvent::ProviderAttemptStarted { .. } => "provider_attempt_started",
+        RuntimeEvent::HostedSearch { .. } => "hosted_search",
         RuntimeEvent::TextDelta { .. } => "text_delta",
         RuntimeEvent::ReasoningDelta { .. } => "reasoning_delta",
         RuntimeEvent::ProviderAttemptOutputCommitted { .. } => "provider_attempt_output_committed",
@@ -153,6 +155,8 @@ fn summary(payload: &RuntimeEvent) -> String {
             reserved_tokens,
             confidence,
             capability_overflow_tokens,
+            images_text_only,
+            images_windowed,
         } => {
             let totals_str = totals
                 .iter()
@@ -162,8 +166,18 @@ fn summary(payload: &RuntimeEvent) -> String {
             let overflow = capability_overflow_tokens
                 .map(|tokens| format!(" capability_overflow={tokens}"))
                 .unwrap_or_default();
+            let text_only = if *images_text_only == 0 {
+                String::new()
+            } else {
+                format!(" images_text_only={images_text_only}")
+            };
+            let windowed = if *images_windowed == 0 {
+                String::new()
+            } else {
+                format!(" images_windowed={images_windowed}")
+            };
             format!(
-                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_tokens={input_tokens} input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}{overflow}",
+                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_tokens={input_tokens} input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}{overflow}{text_only}{windowed}",
                 totals_str
             )
         }
@@ -344,6 +358,30 @@ fn summary(payload: &RuntimeEvent) -> String {
         RuntimeEvent::Downgrade { capability, detail } => {
             format!("downgrade {capability}: {detail}")
         }
+        RuntimeEvent::HostedSearch {
+            action: Some(HostedSearchAction::OpenPage { url }),
+            ..
+        } => format!(
+            "hosted_search action=open_page url={}",
+            compact(&serde_json::to_value(url).unwrap_or(Value::Null))
+        ),
+        RuntimeEvent::HostedSearch {
+            action: Some(HostedSearchAction::FindInPage { url, pattern }),
+            ..
+        } => format!(
+            "hosted_search action=find_in_page url={} pattern={}",
+            compact(&serde_json::to_value(url).unwrap_or(Value::Null)),
+            compact(&serde_json::to_value(pattern).unwrap_or(Value::Null))
+        ),
+        RuntimeEvent::HostedSearch {
+            action: None,
+            query,
+            sources,
+        } => format!(
+            "hosted_search query={} sources={}",
+            compact(&serde_json::to_value(query).unwrap_or(Value::Null)),
+            compact(&serde_json::to_value(sources).unwrap_or(Value::Null))
+        ),
         RuntimeEvent::Usage { record } => format!(
             "usage source={:?} {}",
             record.source,
@@ -706,29 +744,49 @@ mod tests {
         use agent_runtime_core::manifest::SegmentKind;
         use agent_runtime_registry::Fingerprint;
 
-        let env = envelope(
-            None,
-            RuntimeEvent::ContextPlanned {
-                context: Fingerprint::of("context"),
-                cache_plan: Fingerprint::of("cache"),
-                segment_count: 3,
-                totals: BTreeMap::from([(SegmentKind::new("history"), 42)]),
-                input_tokens: 420,
-                input_budget_tokens: 8000,
-                reserved_tokens: 512,
-                confidence: EstimationConfidence::Estimated,
-                capability_overflow_tokens: Some(101),
-            },
-        );
-        let line = log_line(&env);
-        assert_eq!(event_type(&env.payload), "context_planned");
-        assert!(line.contains("segments=3"));
-        assert!(line.contains("history=42"));
-        assert!(line.contains("input_tokens=420"));
-        assert!(line.contains("input_budget=8000"));
-        assert!(line.contains("reserved=512"));
-        // Rendered only when there is one, so an ordinary plan stays quiet.
-        assert!(line.contains("capability_overflow=101"), "{line}");
+        for (images_text_only, images_windowed) in [(0, 0), (2, 0), (0, 3), (2, 3)] {
+            let env = envelope(
+                None,
+                RuntimeEvent::ContextPlanned {
+                    context: Fingerprint::of("context"),
+                    cache_plan: Fingerprint::of("cache"),
+                    segment_count: 3,
+                    totals: BTreeMap::from([(SegmentKind::new("history"), 42)]),
+                    input_tokens: 420,
+                    input_budget_tokens: 8000,
+                    reserved_tokens: 512,
+                    confidence: EstimationConfidence::Estimated,
+                    capability_overflow_tokens: Some(101),
+                    images_text_only,
+                    images_windowed,
+                },
+            );
+            let line = log_line(&env);
+            assert_eq!(event_type(&env.payload), "context_planned");
+            assert!(line.contains("segments=3"));
+            assert!(line.contains("history=42"));
+            assert!(line.contains("input_tokens=420"));
+            assert!(line.contains("input_budget=8000"));
+            assert!(line.contains("reserved=512"));
+            // Rendered only when there is one, so an ordinary plan stays quiet.
+            assert!(line.contains("capability_overflow=101"), "{line}");
+            assert_eq!(
+                line.contains("images_text_only="),
+                images_text_only != 0,
+                "{line}"
+            );
+            assert_eq!(
+                line.contains("images_windowed="),
+                images_windowed != 0,
+                "{line}"
+            );
+            if images_text_only != 0 {
+                assert!(line.contains("images_text_only=2"), "{line}");
+            }
+            if images_windowed != 0 {
+                assert!(line.contains("images_windowed=3"), "{line}");
+            }
+        }
     }
 
     #[test]
@@ -814,5 +872,57 @@ mod tests {
         assert!(line.contains("observed_read=0"));
         assert!(line.contains("observed_write=none"));
         assert!(line.contains("missed=105000"));
+    }
+    #[test]
+    fn hosted_search_renders_page_actions() {
+        for (action, expected) in [
+            (
+                HostedSearchAction::OpenPage {
+                    url: Some("https://rust.test".into()),
+                },
+                "hosted_search action=open_page url=\"https://rust.test\"",
+            ),
+            (
+                HostedSearchAction::FindInPage {
+                    url: Some("https://rust.test".into()),
+                    pattern: Some("Rust".into()),
+                },
+                "hosted_search action=find_in_page url=\"https://rust.test\" pattern=\"Rust\"",
+            ),
+        ] {
+            let event = RuntimeEvent::HostedSearch {
+                action: Some(action),
+                query: None,
+                sources: Vec::new(),
+            };
+            let line = log_line(&envelope(Some("turn"), event));
+            assert!(line.contains(expected), "{line}");
+        }
+    }
+
+    #[test]
+    fn hosted_search_renders_public_query_and_sources() {
+        let event = RuntimeEvent::HostedSearch {
+            action: None,
+            query: Some("rust docs".into()),
+            sources: vec![agent_runtime_core::provider::HostedSource {
+                title: Some("Rust".into()),
+                url: "https://rust.test".into(),
+            }],
+        };
+        assert_eq!(event_type(&event), "hosted_search");
+        let line = log_line(&envelope(Some("turn"), event));
+        assert!(line.contains("rust docs"));
+        assert!(line.contains("https://rust.test"));
+        let empty: RuntimeEvent =
+            serde_json::from_value(serde_json::json!({"event":"hosted_search"})).unwrap();
+        assert_eq!(
+            empty,
+            RuntimeEvent::HostedSearch {
+                action: None,
+                query: None,
+                sources: Vec::new()
+            }
+        );
     }
 }

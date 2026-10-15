@@ -349,8 +349,21 @@ impl<T: HttpTransport> OpenAiProvider<T> {
         let wire_request = tool_names.project(request);
         let request = wire_request.as_ref();
         let mut messages = Vec::new();
+        let mut tool_images = Vec::new();
         for msg in &request.messages {
+            if msg.role != Role::Tool && !tool_images.is_empty() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": std::mem::take(&mut tool_images),
+                }));
+            }
             messages.extend(to_openai_messages(msg));
+            if msg.role == Role::Tool {
+                tool_images.extend(tool_result_images(msg));
+            }
+        }
+        if !tool_images.is_empty() {
+            messages.push(json!({"role": "user", "content": tool_images}));
         }
         let mut payload = json!({
             "model": self.config.model.as_str(),
@@ -510,6 +523,7 @@ impl<T: HttpTransport> OpenAiProvider<T> {
 /// Runtime cannot plan explicit-breakpoint or synthetic behavior against a
 /// wire shape this adapter does not support.
 fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
+    capabilities.hosted_web_search = false;
     // This generic adapter emits only an implicit routing key.  Normalize all
     // declarations through that one wire shape so an explicit/resource
     // contract cannot smuggle unsupported retention, key, maintenance, or
@@ -695,20 +709,52 @@ fn user_content(msg: &Message) -> Value {
         .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } => Some(json!({"type": "text", "text": text})),
-            ContentPart::Image { url, detail } => {
-                let mut image_url = json!({"url": url});
-                if let Some(detail) = detail {
-                    image_url
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("detail".into(), Value::String(detail.clone()));
-                }
-                Some(json!({"type": "image_url", "image_url": image_url}))
-            }
+            ContentPart::Image { url, detail } => Some(image_content(url, detail.as_deref())),
             _ => None,
         })
         .collect();
     Value::Array(parts)
+}
+
+/// Renders an image with the Chat Completions `image_url` content shape.
+fn image_content(url: &str, detail: Option<&str>) -> Value {
+    let mut image_url = json!({"url": url});
+    if let Some(detail) = detail {
+        image_url
+            .as_object_mut()
+            .unwrap()
+            .insert("detail".into(), Value::String(detail.to_owned()));
+    }
+    json!({"type": "image_url", "image_url": image_url})
+}
+
+/// Renders each image-bearing tool result's call id label and ordered images.
+///
+/// The request builder collects these parts across consecutive tool messages
+/// and emits them in one user message after the run's tool replies.
+fn tool_result_images(msg: &Message) -> Vec<Value> {
+    let mut out = Vec::new();
+    for part in &msg.content {
+        let ContentPart::ToolResult(result) = part else {
+            continue;
+        };
+        let images: Vec<Value> = result
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Image { url, detail } => Some(image_content(url, detail.as_deref())),
+                _ => None,
+            })
+            .collect();
+        if !images.is_empty() {
+            out.push(json!({
+                "type": "text",
+                "text": format!("Images from tool call {}:", result.call_id.as_str()),
+            }));
+            out.extend(images);
+        }
+    }
+    out
 }
 
 /// Validates that every canonical content part has an OpenAI Chat
@@ -747,7 +793,8 @@ fn validate_openai_messages(request: &ProviderRequest) -> Result<(), ProviderErr
                             if result
                                 .content
                                 .iter()
-                                .all(|nested| matches!(nested, ContentPart::Text { .. })))
+                                .all(|nested| matches!(nested,
+                                    ContentPart::Text { .. } | ContentPart::Image { .. })))
                     })
             }
         };
@@ -807,12 +854,20 @@ fn to_openai_messages(msg: &Message) -> Vec<Value> {
             let mut out = Vec::new();
             for part in &msg.content {
                 if let ContentPart::ToolResult(block) = part {
-                    let text = block
+                    let mut text = block
                         .content
                         .iter()
                         .filter_map(|p| p.as_text())
                         .collect::<Vec<_>>()
                         .join("\n");
+                    if text.is_empty()
+                        && block
+                            .content
+                            .iter()
+                            .any(|part| matches!(part, ContentPart::Image { .. }))
+                    {
+                        text.push_str("[image result]");
+                    }
                     out.push(json!({
                         "role": "tool",
                         "tool_call_id": block.call_id.as_str(),
@@ -1270,6 +1325,12 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        if !request.hosted_tools.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                "hosted web search is unsupported by Chat Completions",
+            ));
+        }
         let tool_names = super::tool_names::ToolNames::new(&request);
         if request.model != self.config.model {
             return Err(ProviderError::new(
@@ -3009,7 +3070,223 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stable_tool_result_image_is_rejected_before_transport() {
+    async fn stable_tool_result_image_reaches_transport_as_a_following_user_message() {
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![MINIMAL_SSE]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let request = ProviderRequest::new(
+            ModelId::new("gpt-x"),
+            vec![Message::tool_result(ToolResultBlock {
+                call_id: ToolCallId::new("call-1"),
+                name: "vision".into(),
+                content: vec![
+                    ContentPart::text("screenshot captured"),
+                    ContentPart::Image {
+                        url: "data:image/png;base64,AAAA".into(),
+                        detail: Some("high".into()),
+                    },
+                    ContentPart::text("ready"),
+                ],
+                is_error: false,
+            })],
+        )
+        .with_cache_boundary(agent_runtime_core::provider::ProviderCacheBoundary::new(
+            0, 0, 1,
+        ));
+        collect(provider.stream(request, ctx()).await.unwrap()).await;
+        let requests = provider.transport().requests();
+        assert_eq!(requests.len(), 1);
+        let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            payload["messages"],
+            json!([
+                {"role": "tool", "tool_call_id": "call-1", "content": "screenshot captured\nready"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Images from tool call call-1:"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,AAAA", "detail": "high",
+                    }},
+                ]},
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_images_are_grouped_per_run_in_result_order() {
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let result = |id: &str, content| {
+            ContentPart::ToolResult(ToolResultBlock {
+                call_id: ToolCallId::new(id),
+                name: "vision".into(),
+                content,
+                is_error: false,
+            })
+        };
+        let image = |url: &str, detail: Option<&str>| ContentPart::Image {
+            url: url.into(),
+            detail: detail.map(str::to_owned),
+        };
+        let request = ProviderRequest::new(
+            ModelId::new("gpt-x"),
+            vec![
+                Message {
+                    role: Role::Tool,
+                    content: vec![
+                        result("c1", vec![image("https://example.test/1.png", None)]),
+                        result("c2", vec![ContentPart::text("text only")]),
+                    ],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![result("c3", vec![ContentPart::text("between images")])],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![result(
+                        "c4",
+                        vec![
+                            image("data:image/png;base64,AAAA", Some("high")),
+                            ContentPart::text("first"),
+                            ContentPart::text(""),
+                            image("data:image/jpeg;base64,BBBB", None),
+                            ContentPart::text("last"),
+                        ],
+                    )],
+                },
+                Message::assistant(vec![ContentPart::text("next run")]),
+                Message {
+                    role: Role::Tool,
+                    content: vec![result(
+                        "c5",
+                        vec![
+                            ContentPart::text(""),
+                            image("https://example.test/5.png", Some("low")),
+                        ],
+                    )],
+                },
+            ],
+        );
+        let canonical = request.messages.clone();
+        validate_openai_messages(&request).unwrap();
+        let session = SessionId::new("s");
+        let payload = provider.build_payload(&request, &session);
+        assert_eq!(
+            payload["messages"],
+            json!([
+                {"role": "tool", "tool_call_id": "c1", "content": "[image result]"},
+                {"role": "tool", "tool_call_id": "c2", "content": "text only"},
+                {"role": "tool", "tool_call_id": "c3", "content": "between images"},
+                {"role": "tool", "tool_call_id": "c4", "content": "first\n\nlast"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Images from tool call c1:"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/1.png"}},
+                    {"type": "text", "text": "Images from tool call c4:"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,AAAA", "detail": "high",
+                    }},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB"}},
+                ]},
+                {"role": "assistant", "content": "next run"},
+                {"role": "tool", "tool_call_id": "c5", "content": "[image result]"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Images from tool call c5:"},
+                    {"type": "image_url", "image_url": {
+                        "url": "https://example.test/5.png", "detail": "low",
+                    }},
+                ]},
+            ])
+        );
+        assert_eq!(request.messages, canonical);
+        assert_eq!(
+            serde_json::to_vec(&payload).unwrap(),
+            serde_json::to_vec(&provider.build_payload(&request, &session)).unwrap()
+        );
+    }
+
+    #[test]
+    fn text_only_tool_results_keep_legacy_request_bytes() {
+        use agent_runtime_core::content::ToolCall;
+
+        let provider = OpenAiProvider::new(
+            ReplayTransport::new(vec![]),
+            OpenAiConfig::new("http://x/v1", "gpt-x"),
+        );
+        let call = |id: &str| {
+            ContentPart::ToolCall(ToolCall {
+                id: ToolCallId::new(id),
+                name: "lookup".into(),
+                arguments: json!({}),
+            })
+        };
+        let result = |id: &str, content| {
+            ContentPart::ToolResult(ToolResultBlock {
+                call_id: ToolCallId::new(id),
+                name: "lookup".into(),
+                content,
+                is_error: false,
+            })
+        };
+        let request = ProviderRequest::new(
+            ModelId::new("gpt-x"),
+            vec![
+                Message::system("system"),
+                Message::user("look up three things"),
+                Message::assistant(vec![
+                    ContentPart::text("checking"),
+                    call("c1"),
+                    call("c2"),
+                    call("c3"),
+                ]),
+                Message {
+                    role: Role::Tool,
+                    content: vec![result("c1", vec![ContentPart::text("one")])],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![
+                        result(
+                            "c2",
+                            vec![
+                                ContentPart::text(""),
+                                ContentPart::text("two"),
+                                ContentPart::text(""),
+                                ContentPart::text("three"),
+                            ],
+                        ),
+                        result("c3", vec![]),
+                    ],
+                },
+                Message::assistant(vec![ContentPart::text("done")]),
+            ],
+        );
+        validate_openai_messages(&request).unwrap();
+        // Complete payload bytes from the text-only serializer, including its
+        // newline joining and empty-result behavior.
+        let legacy = concat!(
+            r#"{"messages":[{"content":"system","role":"system"},"#,
+            r#"{"content":"look up three things","role":"user"},"#,
+            r#"{"content":"checking","role":"assistant","tool_calls":["#,
+            r#"{"function":{"arguments":"{}","name":"lookup"},"id":"c1","type":"function"},"#,
+            r#"{"function":{"arguments":"{}","name":"lookup"},"id":"c2","type":"function"},"#,
+            r#"{"function":{"arguments":"{}","name":"lookup"},"id":"c3","type":"function"}]},"#,
+            r#"{"content":"one","role":"tool","tool_call_id":"c1"},"#,
+            r#"{"content":"\ntwo\n\nthree","role":"tool","tool_call_id":"c2"},"#,
+            r#"{"content":"","role":"tool","tool_call_id":"c3"},"#,
+            r#"{"content":"done","role":"assistant"}],"#,
+            r#""model":"gpt-x","prompt_cache_key":"s","stream":true,"stream_options":{"include_usage":true}}"#,
+        );
+        assert_eq!(
+            serde_json::to_vec(&provider.build_payload(&request, &SessionId::new("s"))).unwrap(),
+            legacy.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_reasoning_is_rejected_before_transport() {
         let provider = OpenAiProvider::new(
             ReplayTransport::new(vec![]),
             OpenAiConfig::new("http://x/v1", "gpt-x"),
@@ -3019,21 +3296,20 @@ mod tests {
             vec![Message::tool_result(ToolResultBlock {
                 call_id: ToolCallId::new("call-1"),
                 name: "vision".into(),
-                content: vec![ContentPart::Image {
-                    url: "https://example.test/result.png".into(),
-                    detail: None,
+                content: vec![ContentPart::Reasoning {
+                    text: "unsupported".into(),
+                    redacted: false,
+                    signature: None,
+                    producer: None,
                 }],
                 is_error: false,
             })],
-        )
-        .with_cache_boundary(agent_runtime_core::provider::ProviderCacheBoundary::new(
-            0, 0, 1,
-        ));
+        );
         let error = provider
             .stream(request, ctx())
             .await
             .err()
-            .expect("unsupported stable tool-result content must fail closed");
+            .expect("unsupported tool-result content must fail closed");
         assert_eq!(error.kind, ProviderErrorKind::BadRequest);
         assert!(provider.transport().requests().is_empty());
     }
@@ -3340,5 +3616,35 @@ mod tests {
             azure.base_url,
             "https://my-resource.openai.azure.com/openai/v1"
         );
+    }
+    #[tokio::test]
+    async fn hosted_search_is_rejected_before_chat_completions_transport() {
+        use agent_runtime_core::provider::HostedTool;
+        let mut config = OpenAiConfig::new("https://example.test/v1", "glm");
+        config.capabilities.hosted_web_search = true;
+        let provider = OpenAiProvider::new(ReplayTransport::new(vec![]), config);
+        assert!(
+            !provider
+                .capabilities(&ModelId::new("glm"))
+                .unwrap()
+                .hosted_web_search
+        );
+        let request = ProviderRequest::new(ModelId::new("glm"), vec![Message::user("search")]);
+        assert!(
+            provider
+                .build_payload(&request, &SessionId::new("s"))
+                .get("tools")
+                .is_none()
+        );
+        let error = provider
+            .stream(
+                request.with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]),
+                ctx(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+        assert!(provider.transport().requests().is_empty());
     }
 }

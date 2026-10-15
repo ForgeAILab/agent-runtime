@@ -12,11 +12,13 @@ categories.workspace = true
 
 [dependencies]
 # Deterministic and network-free by construction: core contracts plus the
-# registry kernel's identity primitives, and nothing else.
+# registry kernel's identity primitives, plus image header decoding and hashing.
 agent-runtime-core.workspace = true
 agent-runtime-registry = { workspace = true, features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use agent_runtime_core::catalog::ResolvedModelProfile;
+use agent_runtime_core::catalog::{Modality, ResolvedModelProfile};
 use agent_runtime_core::content::{Message, Role};
 use agent_runtime_core::ids::ToolCallId;
 use agent_runtime_core::provider::{
@@ -40,6 +40,7 @@ use crate::budget::{BudgetReport, ContextBudget, ContextError, ContextPolicy};
 use crate::cache::{CachePlan, ProviderCacheCapability};
 use crate::compaction::{CompactionError, CompactionResult, validate_compacted};
 use crate::fragment::{ContextFragment, FragmentContent, FragmentKind};
+use crate::image_projection::{ImageProjectionReport, project_fragments};
 use crate::plan::{ContextPlan, PlanInputs, PlanSegment};
 use crate::sizing::{EstimationConfidence, RequestSizer};
 
@@ -178,7 +179,9 @@ impl<'a> ContextPlanner<'a> {
             cache_endpoint_identity: self.cache_endpoint_identity.clone(),
             cache_session_partition: self.cache_session_partition.clone(),
         };
-        let plan = planner.plan(fragments)?.with_extra_revisions(revisions);
+        let plan = planner
+            .plan(fragments)?
+            .with_extra_revisions(self.image_window_inputs(revisions));
         let endpoint_missing = capability.contract.behavior.supports_stable_prefix()
             && self.cache_endpoint_identity.is_none();
         let cache_identity = self.cache_identity(&plan, &capability);
@@ -298,6 +301,7 @@ impl<'a> ContextPlanner<'a> {
         let mut scoped_view = None;
         let mut activation = None;
         let mut harness = None;
+        let mut hosted_tools = None;
         // Keep a bounded, ordered projection of the committed history that
         // actually belongs to the stable leading prefix. The active
         // Ephemeral tail is intentionally excluded even when it has a
@@ -318,6 +322,7 @@ impl<'a> ContextPlanner<'a> {
                 "scoped_view" => scoped_view = Some(fingerprint),
                 "activation" => activation = Some(fingerprint),
                 "harness_pipeline" => harness = Some(fingerprint),
+                "hosted_tools" => hosted_tools = Some(fingerprint),
                 _ if name.starts_with("history:") => {}
                 _ => {}
             }
@@ -391,6 +396,9 @@ impl<'a> ContextPlanner<'a> {
             .registry_revisions(registry_snapshot, scoped_view, activation)
             .runtime_revisions(harness, cache_policy_revision)
             .stable_history(history);
+        if let Some(hosted_tools) = hosted_tools {
+            builder = builder.hosted_tools(hosted_tools);
+        }
         builder.build()
     }
 
@@ -400,9 +408,9 @@ impl<'a> ContextPlanner<'a> {
     ///    deterministic regardless of contribution order.
     /// 2. Validates tool-call/result pairing; an unmatched pair fails with
     ///    [`ContextError::invalid_pairing`].
-    /// 3. Merges instruction-kind text into one leading system message,
-    ///    passes message fragments through unchanged, wraps other text
-    ///    fragments in their own message, and collects tool schemas.
+    /// 3. Projects images for the profile and policy, then merges instruction
+    ///    text into leading system messages, wraps other text fragments in
+    ///    their own message, and collects tool schemas.
     /// 4. Sizes everything and builds the [`BudgetReport`].
     /// 5. Enforces the capability sub-budget and the overall input budget
     ///    before returning, invoking the attached [`Compactor`] at most once
@@ -410,17 +418,38 @@ impl<'a> ContextPlanner<'a> {
     /// 6. Rejects an [`EstimationConfidence::Estimated`] plan that lands
     ///    within the policy's configured margin of the limit.
     pub fn plan(&self, fragments: Vec<ContextFragment>) -> Result<ContextPlan, ContextError> {
-        self.plan_inner(fragments, false)
+        self.plan_inner(fragments, false, ImageProjectionReport::default())
+    }
+
+    fn image_window_inputs(&self, inputs: PlanInputs) -> PlanInputs {
+        match self.policy.image_window {
+            Some(window) => inputs.with("image_window", window.inline.max(1).to_string()),
+            None => inputs,
+        }
     }
 
     fn plan_inner(
         &self,
         mut fragments: Vec<ContextFragment>,
         compaction_attempted: bool,
+        mut image_projection: ImageProjectionReport,
     ) -> Result<ContextPlan, ContextError> {
         validate_unique_fragment_ids(&fragments)?;
         fragments.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         validate_pairing(&fragments)?;
+
+        // Compaction may introduce new summary content. Project every
+        // candidate before sizing; already-created placeholders are text and
+        // therefore neither counted again nor assigned a different id.
+        let projected = project_fragments(
+            &mut fragments,
+            self.profile.input_modalities.contains(&Modality::Image),
+            self.policy.image_window,
+        );
+        image_projection.text_only = image_projection
+            .text_only
+            .saturating_add(projected.text_only);
+        image_projection.window = image_projection.window.saturating_add(projected.window);
 
         let report = BudgetReport::compute(&fragments, self.sizer, &self.budget);
 
@@ -454,11 +483,13 @@ impl<'a> ContextPlanner<'a> {
                             .map_err(|error| ContextError::compaction(error.to_string()))?;
                         let mut outcome = result.outcome;
                         let original_tokens = report.total_input_tokens;
-                        return self.plan_inner(result.fragments, true).map(|plan| {
-                            outcome.reclaimed_tokens =
-                                original_tokens.saturating_sub(plan.input_tokens());
-                            plan.with_compaction_outcome(outcome)
-                        });
+                        return self
+                            .plan_inner(result.fragments, true, image_projection)
+                            .map(|plan| {
+                                outcome.reclaimed_tokens =
+                                    original_tokens.saturating_sub(plan.input_tokens());
+                                plan.with_compaction_outcome(outcome)
+                            });
                     }
                 }
             }
@@ -528,7 +559,9 @@ impl<'a> ContextPlanner<'a> {
             report,
             self.profile.fingerprint(),
         )
-        .with_cache_boundary(cache_boundary);
+        .with_cache_boundary(cache_boundary)
+        .with_image_projection_report(image_projection)
+        .with_extra_revisions(self.image_window_inputs(PlanInputs::new()));
         Ok(plan)
     }
 }
@@ -788,6 +821,296 @@ mod tests {
             RegistryRevision::from_content(body),
             FragmentContent::Text(body.to_owned()),
         )
+    }
+
+    fn image_part(index: usize) -> ContentPart {
+        ContentPart::Image {
+            url: format!("https://example.com/image-{index}.png"),
+            detail: Some("high".into()),
+        }
+    }
+
+    fn image_history(count: usize) -> Vec<ContextFragment> {
+        (0..count)
+            .map(|index| {
+                ContextFragment::new(
+                    format!("history:{index}"),
+                    FragmentKind::History,
+                    FragmentSource::History,
+                    RegistryRevision::new("image-1"),
+                    FragmentContent::Message(Message::assistant(vec![image_part(index)])),
+                )
+                .with_position(ContextPosition::new(
+                    ContextLane::Conversation,
+                    index as u64,
+                ))
+            })
+            .collect()
+    }
+
+    fn inline_image_count(plan: &ContextPlan) -> usize {
+        fn count(parts: &[ContentPart]) -> usize {
+            parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Image { .. } => 1,
+                    ContentPart::ToolResult(result) => count(&result.content),
+                    _ => 0,
+                })
+                .sum()
+        }
+        plan.messages()
+            .iter()
+            .map(|message| count(&message.content))
+            .sum()
+    }
+
+    #[test]
+    fn text_only_tool_image_is_projected_before_sizing_and_cache_identity() {
+        let p = profile(300, 300, 50);
+        let sizer = CharRatioSizer::default().with_image_tokens(10_000);
+        let endpoint =
+            CacheEndpointIdentity::from_opaque(b"test-endpoint", RegistryRevision::new("1"));
+        let planner =
+            ContextPlanner::new(&p, &sizer, policy(50, 0)).with_cache_endpoint_identity(endpoint);
+        let call_id = ToolCallId::new("screenshot-call");
+        let call = ContextFragment::new(
+            "call",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("1"),
+            FragmentContent::Message(Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                id: call_id.clone(),
+                name: "screenshot".into(),
+                arguments: serde_json::json!({}),
+            })])),
+        )
+        .paired_with(call_id.clone())
+        .with_position(ContextPosition::new(ContextLane::Conversation, 0));
+        let result = ContextFragment::new(
+            "result",
+            FragmentKind::ToolResult,
+            FragmentSource::Tool,
+            RegistryRevision::new("1"),
+            FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                call_id: call_id.clone(),
+                name: "screenshot".into(),
+                content: vec![image_part(0)],
+                is_error: false,
+            })),
+        )
+        .paired_with(call_id)
+        .with_position(ContextPosition::new(ContextLane::Conversation, 1))
+        .with_token_hint(10_000);
+        let canonical = vec![call, result];
+        let original = canonical.clone();
+        let capability = ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test");
+        let plan = planner
+            .plan_with_cache(canonical.clone(), None, &capability, None)
+            .unwrap();
+        assert_eq!(inline_image_count(&plan), 0);
+        assert_eq!(
+            plan.image_projection_report(),
+            &ImageProjectionReport {
+                text_only: 1,
+                window: 0
+            }
+        );
+        assert!(plan.input_tokens() < 250);
+        assert_eq!(canonical, original);
+        assert_eq!(plan.cache_boundary().unwrap().stable_message_count, 2);
+        assert_ne!(plan.segments()[1].content_hash, canonical[1].content_hash());
+        let mut projected = canonical;
+        project_fragments(&mut projected, false, None);
+        let expected = planner
+            .plan_with_cache(projected, None, &capability, None)
+            .unwrap();
+        assert_eq!(plan.segments(), expected.segments());
+        assert_eq!(
+            plan.cache_plan().unwrap().cache_identity(),
+            expected.cache_plan().unwrap().cache_identity()
+        );
+    }
+
+    #[test]
+    fn image_window_keeps_the_prefix_stable_between_advances() {
+        let mut p = profile(100_000, 100_000, 100);
+        p.input_modalities.push(Modality::Image);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(
+            &p,
+            &sizer,
+            policy(100, 0).with_image_window(crate::ImageWindow { inline: 10 }),
+        );
+        let first = planner.plan(image_history(14)).unwrap();
+        let second = planner.plan(image_history(15)).unwrap();
+        assert_eq!(inline_image_count(&first), 14);
+        assert_eq!(inline_image_count(&second), 15);
+        assert_eq!(first.messages(), &second.messages()[..14]);
+        assert_eq!(first.segments(), &second.segments()[..14]);
+        assert_eq!(
+            second.image_projection_report(),
+            &ImageProjectionReport::default()
+        );
+    }
+
+    #[test]
+    fn image_window_advances_by_a_whole_step() {
+        let mut p = profile(100_000, 100_000, 100);
+        p.input_modalities.push(Modality::Image);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(
+            &p,
+            &sizer,
+            policy(100, 0).with_image_window(crate::ImageWindow { inline: 10 }),
+        );
+        let canonical = image_history(20);
+        let plan = planner.plan(canonical.clone()).unwrap();
+        assert_eq!(inline_image_count(&plan), 10);
+        assert_eq!(
+            plan.image_projection_report(),
+            &ImageProjectionReport {
+                text_only: 0,
+                window: 10
+            }
+        );
+        for (index, message) in plan.messages().iter().enumerate() {
+            assert_eq!(
+                matches!(message.content[0], ContentPart::Image { .. }),
+                index >= 10
+            );
+            if index < 10 {
+                assert!(
+                    message.content[0]
+                        .as_text()
+                        .unwrap()
+                        .contains("not included in this request")
+                );
+            }
+        }
+        assert_eq!(plan, planner.plan(canonical).unwrap());
+    }
+
+    #[test]
+    fn newest_user_images_are_exempt_and_not_counted() {
+        let mut p = profile(100_000, 100_000, 100);
+        p.input_modalities.push(Modality::Image);
+        let sizer = CharRatioSizer::default();
+        let planner = ContextPlanner::new(
+            &p,
+            &sizer,
+            policy(100, 0).with_image_window(crate::ImageWindow { inline: 3 }),
+        );
+        let mut fragments = image_history(5);
+        fragments.push(
+            ContextFragment::new(
+                "user",
+                FragmentKind::UserInput,
+                FragmentSource::Host,
+                RegistryRevision::new("1"),
+                FragmentContent::Message(Message {
+                    role: Role::User,
+                    content: (0..6).map(image_part).collect(),
+                }),
+            )
+            .with_position(ContextPosition::new(ContextLane::Conversation, 5)),
+        );
+        let plan = planner.plan(fragments).unwrap();
+        assert_eq!(inline_image_count(&plan), 11);
+        assert_eq!(plan.messages()[5].content.len(), 6);
+        assert_eq!(
+            plan.image_projection_report(),
+            &ImageProjectionReport::default()
+        );
+    }
+
+    #[test]
+    fn text_user_input_ends_the_previous_user_image_exemption_and_zero_means_one() {
+        let mut p = profile(100_000, 100_000, 100);
+        p.input_modalities.push(Modality::Image);
+        let sizer = CharRatioSizer::default();
+        let mut fragments = image_history(2);
+        let FragmentContent::Message(message) = &mut fragments[0].content else {
+            panic!("expected message")
+        };
+        message.role = Role::User;
+        fragments.push(
+            text_fragment("current", FragmentKind::UserInput, "next question")
+                .with_position(ContextPosition::new(ContextLane::Conversation, 2)),
+        );
+        let zero = ContextPlanner::new(
+            &p,
+            &sizer,
+            policy(100, 0).with_image_window(crate::ImageWindow { inline: 0 }),
+        )
+        .plan(fragments.clone())
+        .unwrap();
+        let one = ContextPlanner::new(
+            &p,
+            &sizer,
+            policy(100, 0).with_image_window(crate::ImageWindow { inline: 1 }),
+        )
+        .plan(fragments)
+        .unwrap();
+        assert_eq!(zero, one);
+        assert_eq!(zero.image_projection_report().window, 1);
+        assert!(zero.messages()[0].content[0].as_text().is_some());
+    }
+
+    #[test]
+    fn unset_image_window_preserves_messages_and_legacy_fingerprint() {
+        let mut p = profile(100_000, 100_000, 100);
+        p.input_modalities.push(Modality::Image);
+        let sizer = CharRatioSizer::default();
+        let fragments = image_history(2);
+        let planner = ContextPlanner::new(&p, &sizer, policy(100, 0));
+        let plan = planner.plan(fragments.clone()).unwrap();
+        let (messages, _) = merge_into_messages(&fragments);
+        let legacy = ContextPlan::new(
+            messages.clone(),
+            Vec::new(),
+            plan.segments().to_vec(),
+            BudgetReport::compute(&fragments, &sizer, planner.budget()),
+            p.fingerprint(),
+        );
+        assert_eq!(plan.messages(), messages);
+        assert_eq!(plan.fingerprint(), legacy.fingerprint());
+        assert_eq!(inline_image_count(&plan), 2);
+        let configured = ContextPlanner::new(
+            &p,
+            &sizer,
+            policy(100, 0).with_image_window(crate::ImageWindow { inline: 10 }),
+        )
+        .plan(fragments.clone())
+        .unwrap();
+        assert_eq!(plan.messages(), configured.messages());
+        assert_ne!(plan.fingerprint(), configured.fingerprint());
+        let capability = ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "test");
+        let cached = ContextPlanner::new(
+            &p,
+            &sizer,
+            policy(100, 0).with_image_window(crate::ImageWindow { inline: 10 }),
+        )
+        .plan_with_cache_and_revisions(
+            fragments,
+            None,
+            &capability,
+            None,
+            PlanInputs::new().with("host", "1"),
+        )
+        .unwrap();
+        assert!(
+            cached
+                .plan_inputs()
+                .revisions()
+                .any(|(name, value)| name == "image_window" && value == "10")
+        );
+        assert!(
+            cached
+                .plan_inputs()
+                .revisions()
+                .any(|(name, value)| name == "host" && value == "1")
+        );
     }
 
     #[test]
@@ -1525,6 +1848,48 @@ mod tests {
                 }))
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct AssertImageProjectionCompactor;
+
+    impl Compactor for AssertImageProjectionCompactor {
+        fn compact(
+            &self,
+            fragments: &[ContextFragment],
+            report: &BudgetReport,
+            budget: &ContextBudget,
+        ) -> Result<Option<CompactionResult>, CompactionError> {
+            for fragment in fragments {
+                if let FragmentContent::Message(message) = &fragment.content {
+                    assert!(
+                        message
+                            .content
+                            .iter()
+                            .all(|part| !matches!(part, ContentPart::Image { .. }))
+                    );
+                    assert!(fragment.token_hint.is_none());
+                }
+            }
+            DropOptionalCompactor.compact(fragments, report, budget)
+        }
+    }
+
+    #[test]
+    fn compaction_sees_projected_content_and_preserves_the_projection_report() {
+        let p = profile(300, 300, 50);
+        let sizer = CharRatioSizer::default().with_image_tokens(10_000);
+        let planner = ContextPlanner::new(&p, &sizer, policy(50, 0))
+            .with_compactor(&AssertImageProjectionCompactor);
+        let mut fragments = image_history(2);
+        fragments[0] = fragments[0].clone().with_token_hint(10_000);
+        fragments[1] = fragments[1].clone().optional();
+        fragments
+            .push(text_fragment("padding", FragmentKind::Memory, &"x".repeat(2_000)).optional());
+        let plan = planner.plan(fragments).unwrap();
+        assert_eq!(plan.segments().len(), 1);
+        assert_eq!(inline_image_count(&plan), 0);
+        assert_eq!(plan.image_projection_report().text_only, 2);
     }
 
     #[derive(Debug)]

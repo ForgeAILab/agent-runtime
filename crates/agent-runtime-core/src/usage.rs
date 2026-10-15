@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AttemptId, RequestId, ToolCallId};
 use crate::provider::{CacheIdentity, ProviderAttemptPurpose};
 
-/// A disjoint token category. Categories never overlap, so the total token
-/// count for a delta is the sum across all categories.
+/// A usage category. Token categories never overlap; search requests are
+/// counted separately and excluded from token totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CounterKind {
@@ -27,11 +27,13 @@ pub enum CounterKind {
     CacheWrite,
     /// Visible output tokens.
     Output,
+    /// Provider-hosted web search requests (not tokens).
+    WebSearchRequests,
     /// Reasoning / thinking tokens (billed separately from output).
     Reasoning,
 }
 
-/// A set of disjoint counter values produced by one unit of work.
+/// Disjoint token counts and hosted-search requests from one unit of work.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UsageDelta {
@@ -46,7 +48,7 @@ impl UsageDelta {
 
     /// Sets a counter value (builder style).
     pub fn with(mut self, kind: CounterKind, value: u64) -> Self {
-        if value != 0 {
+        if value != 0 || kind == CounterKind::WebSearchRequests {
             self.counters.insert(kind, value);
         }
         self
@@ -54,11 +56,10 @@ impl UsageDelta {
 
     /// Adds `value` to a counter.
     pub fn add(&mut self, kind: CounterKind, value: u64) {
-        // Keep the sparse representation invariant even for callers that
-        // accumulate provider counters incrementally.  Cache evidence uses
-        // `Option<u64>` precisely so an explicit zero is not forced through
-        // this billing-oriented structure.
-        if value == 0 {
+        // Token counters stay sparse. A reported zero search count remains
+        // present so callers can distinguish it from missing provider usage
+        // before falling back to a count of hosted-search events.
+        if value == 0 && kind != CounterKind::WebSearchRequests {
             return;
         }
         let slot = self.counters.entry(kind).or_insert(0);
@@ -70,9 +71,12 @@ impl UsageDelta {
         self.counters.get(&kind).copied().unwrap_or(0)
     }
 
-    /// The total across all disjoint categories.
+    /// The total tokens across disjoint categories, excluding search requests.
     pub fn total(&self) -> u64 {
-        self.counters.values().copied().fold(0, u64::saturating_add)
+        self.iter()
+            .filter(|(kind, _)| *kind != CounterKind::WebSearchRequests)
+            .map(|(_, value)| value)
+            .fold(0, u64::saturating_add)
     }
 
     /// Every token that occupied the context window on this request.
@@ -93,7 +97,7 @@ impl UsageDelta {
             .saturating_add(self.get(CounterKind::CacheWrite))
     }
 
-    /// Whether every counter is zero.
+    /// Whether no counters were reported.
     pub fn is_empty(&self) -> bool {
         self.counters.is_empty()
     }
@@ -105,7 +109,8 @@ impl UsageDelta {
         }
     }
 
-    /// Iterates the non-zero counters in category order.
+    /// Iterates reported counters in category order. Token counters are
+    /// non-zero; search counts also preserve an explicitly reported zero.
     pub fn iter(&self) -> impl Iterator<Item = (CounterKind, u64)> + '_ {
         self.counters.iter().map(|(k, v)| (*k, *v))
     }
@@ -165,7 +170,7 @@ pub struct UsageRecord {
     pub source: UsageSource,
     /// Where the usage came from.
     pub provenance: Provenance,
-    /// The disjoint token counters.
+    /// Disjoint token counters and hosted-search request counts.
     pub delta: UsageDelta,
 }
 
@@ -267,5 +272,21 @@ mod tests {
 
         let built = UsageDelta::new().with(CounterKind::CacheWrite, 0);
         assert!(built.is_empty());
+    }
+    #[test]
+    fn hosted_search_counts_are_not_tokens_and_preserve_reported_zero() {
+        let mut delta = UsageDelta::new().with(CounterKind::WebSearchRequests, 0);
+        assert_eq!(
+            delta.iter().collect::<Vec<_>>(),
+            vec![(CounterKind::WebSearchRequests, 0)]
+        );
+        delta.add(CounterKind::WebSearchRequests, 3);
+        delta.add(CounterKind::Output, 5);
+        assert_eq!(delta.get(CounterKind::WebSearchRequests), 3);
+        assert_eq!(delta.total(), 5);
+        assert_eq!(delta.input_tokens(), 0);
+        let restored: UsageDelta =
+            serde_json::from_str(&serde_json::to_string(&delta).unwrap()).unwrap();
+        assert_eq!(restored, delta);
     }
 }

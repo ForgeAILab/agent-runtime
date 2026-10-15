@@ -29,8 +29,8 @@ use agent_runtime_core::ids::TenantId;
 use agent_runtime_core::interaction::{InteractionBroker, UnavailableInteractionBroker};
 use agent_runtime_core::observer::EventObserver;
 use agent_runtime_core::provider::{
-    CacheEndpointIdentity, Capabilities, ModelId, Provider, ProviderCacheBehavior, ReasoningConfig,
-    StructuredOutputConfig,
+    CacheEndpointIdentity, Capabilities, HostedTool, ModelId, Provider, ProviderCacheBehavior,
+    ReasoningConfig, StructuredOutputConfig,
 };
 use agent_runtime_core::security::{PermissionSet, SecuritySubject};
 use agent_runtime_core::store::{SecretStore, SessionStore};
@@ -233,9 +233,18 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the context policy (reserves and the capability sub-budget).
+    /// Sets the context policy (reserves, the capability sub-budget, and the
+    /// optional image window). Use [`ContextPolicy::with_image_window`] to
+    /// configure request image projection.
     pub fn context_policy(mut self, policy: ContextPolicy) -> Self {
         self.context_policy = Some(policy);
+        self
+    }
+
+    /// Sets provider-hosted tools for the agent's own model turns. Synthetic
+    /// maintenance and dedicated summary requests do not inherit them.
+    pub fn hosted_tools(mut self, tools: Vec<HostedTool>) -> Self {
+        self.config.hosted_tools = tools;
         self
     }
 
@@ -997,7 +1006,8 @@ impl RuntimeBuilder {
             cache_capability,
             self.revisions,
         )
-        .with_nonempty_assistant_content(provider.requires_nonempty_assistant_content());
+        .with_nonempty_assistant_content(provider.requires_nonempty_assistant_content())
+        .with_hosted_tools(&config.hosted_tools);
         if let Some(policy) = self.working_set {
             planner = planner.with_input_cap(policy.hard_tokens);
         }
@@ -1155,6 +1165,33 @@ mod tests {
     use agent_runtime_registry::Permission;
     use async_trait::async_trait;
     use serde_json::{Value, json};
+
+    #[test]
+    fn hosted_tools_carries_the_host_declaration() {
+        let builder = RuntimeBuilder::new(ModelId::new("fake"));
+        assert!(builder.config.hosted_tools.is_empty());
+        let tools = vec![HostedTool::WebSearch { max_uses: Some(5) }];
+        let builder = builder.hosted_tools(tools.clone());
+        assert_eq!(builder.config.hosted_tools, tools);
+        assert!(
+            builder
+                .hosted_tools(Vec::new())
+                .config
+                .hosted_tools
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn context_policy_carries_the_host_image_window() {
+        let policy = ContextPolicy::new(RegistryRevision::new("image-policy-1"), 64, 0)
+            .with_image_window(agent_runtime_context::ImageWindow { inline: 10 });
+        let builder = RuntimeBuilder::new(ModelId::new("fake")).context_policy(policy);
+        assert_eq!(
+            builder.context_policy.unwrap().image_window,
+            Some(agent_runtime_context::ImageWindow { inline: 10 })
+        );
+    }
 
     fn profile() -> ResolvedModelProfile {
         ResolvedModelProfile::explicit(

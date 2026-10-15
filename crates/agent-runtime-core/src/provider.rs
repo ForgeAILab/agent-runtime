@@ -1055,6 +1055,9 @@ pub struct Capabilities {
     pub streaming: bool,
     /// Whether tool/function calling is supported.
     pub tools: bool,
+    /// Whether provider-hosted web search is supported.
+    #[serde(default)]
+    pub hosted_web_search: bool,
     /// Reasoning support.
     pub reasoning: ReasoningSupport,
     /// Whether structured (schema-constrained) output is supported.
@@ -1088,6 +1091,7 @@ impl Capabilities {
         Self {
             streaming: true,
             tools: true,
+            hosted_web_search: false,
             reasoning: ReasoningSupport::Unsupported,
             structured_output: false,
             usage: true,
@@ -1110,6 +1114,9 @@ impl Capabilities {
         }
         if !self.tools && !request.tools.is_empty() {
             out.push(UnsupportedFeature::Tools);
+        }
+        if !self.hosted_web_search && !request.hosted_tools.is_empty() {
+            out.push(UnsupportedFeature::HostedWebSearch);
         }
         if let Some(reasoning) = &request.reasoning {
             match self.reasoning {
@@ -1198,6 +1205,8 @@ pub enum UnsupportedFeature {
     Streaming,
     /// Tool calling is not supported.
     Tools,
+    /// Provider-hosted web search is not supported.
+    HostedWebSearch,
     /// Reasoning is not supported at all.
     Reasoning,
     /// Reasoning is supported but its controls are not.
@@ -1212,6 +1221,7 @@ impl UnsupportedFeature {
         match self {
             UnsupportedFeature::Streaming => "streaming",
             UnsupportedFeature::Tools => "tools",
+            UnsupportedFeature::HostedWebSearch => "hosted_web_search",
             UnsupportedFeature::Reasoning => "reasoning",
             UnsupportedFeature::ReasoningControls => "reasoning_controls",
             UnsupportedFeature::StructuredOutput => "structured_output",
@@ -1347,6 +1357,51 @@ impl ProviderCacheBoundary {
     }
 }
 
+/// A tool executed by the provider rather than by the runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HostedTool {
+    /// Search the web during this response.
+    WebSearch {
+        /// Optional per-response search limit, where the provider supports it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u32>,
+    },
+}
+
+/// A public source found by provider-hosted web search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedSource {
+    /// The source title, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The source URL.
+    #[serde(default)]
+    pub url: String,
+}
+
+/// What a provider-hosted search step did when it was not a search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostedSearchAction {
+    /// Open a web page.
+    OpenPage {
+        /// The page URL, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// Find text in a web page.
+    FindInPage {
+        /// The page URL, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// The search pattern, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
+}
+
 /// A normalized, vendor-neutral provider request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderRequest {
@@ -1367,6 +1422,9 @@ pub struct ProviderRequest {
     /// Advertised tools (empty = none).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSchema>,
+    /// Tools executed by the provider (empty = none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_tools: Vec<HostedTool>,
     /// Tool-choice policy.
     #[serde(default)]
     pub tool_choice: ToolChoice,
@@ -1399,6 +1457,7 @@ impl ProviderRequest {
             cache_boundary: None,
             messages,
             tools: Vec::new(),
+            hosted_tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             sampling: Sampling::default(),
             reasoning: None,
@@ -1407,6 +1466,12 @@ impl ProviderRequest {
             stop: Vec::new(),
             vendor_extensions: Value::Null,
         }
+    }
+
+    /// Sets the tools executed by the provider during this response.
+    pub fn with_hosted_tools(mut self, hosted_tools: Vec<HostedTool>) -> Self {
+        self.hosted_tools = hosted_tools;
+        self
     }
 
     /// Attaches an exact opaque cache identity to the request.
@@ -1438,7 +1503,9 @@ impl ProviderRequest {
 
     /// Whether this request carries no provider tools.
     pub fn has_no_tools(&self) -> bool {
-        self.tools.is_empty() && matches!(self.tool_choice, ToolChoice::None | ToolChoice::Auto)
+        self.tools.is_empty()
+            && self.hosted_tools.is_empty()
+            && matches!(self.tool_choice, ToolChoice::None | ToolChoice::Auto)
     }
 }
 
@@ -1776,6 +1843,18 @@ impl RateLimitSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
+    /// A provider-hosted web search and its public sources.
+    HostedSearch {
+        /// The page action, or `None` for a plain search.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<HostedSearchAction>,
+        /// The query, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        /// Sources found by the search.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<HostedSource>,
+    },
     /// A fragment of visible output text.
     TextDelta {
         /// The text fragment.
@@ -2038,6 +2117,28 @@ mod tests {
         let refreshed =
             evidence.with_contract_refresh(&contract, Timestamp::ZERO, CacheRefreshCause::Write);
         assert_eq!(refreshed.guaranteed_until, Some(Timestamp(10_000)));
+    }
+
+    #[test]
+    fn cache_identity_without_hosted_tools_preserves_legacy_digest_and_wire() {
+        let identity = identity_fixture();
+        // Freeze the digest from before hosted tools entered the identity contract.
+        assert_eq!(
+            identity.digest().as_str(),
+            "5216e1c785375d35001d6eb09784fab7"
+        );
+
+        let mut wire = serde_json::to_value(&identity).unwrap();
+        assert!(wire.get("hosted_tools").is_none());
+        let restored = serde_json::from_value::<CacheIdentity>(wire.clone()).unwrap();
+        assert_eq!(restored, identity);
+        assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+
+        wire["hosted_tools"] = Value::Null;
+        assert_eq!(
+            serde_json::from_value::<CacheIdentity>(wire).unwrap(),
+            identity
+        );
     }
 
     #[test]
@@ -2581,6 +2682,82 @@ mod tests {
             ProviderStreamEvent::CacheObservation {
                 read_tokens: Some(4),
                 write_tokens: Some(1),
+            }
+        );
+    }
+    #[test]
+    fn hosted_search_page_actions_roundtrip_with_optional_fields() {
+        for action in [
+            HostedSearchAction::OpenPage {
+                url: Some("https://rust.test".into()),
+            },
+            HostedSearchAction::OpenPage { url: None },
+            HostedSearchAction::FindInPage {
+                url: None,
+                pattern: None,
+            },
+        ] {
+            let event = ProviderStreamEvent::HostedSearch {
+                action: Some(action),
+                query: None,
+                sources: Vec::new(),
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            assert!(json.get("query").is_none());
+            assert!(json.get("sources").is_none());
+            assert_eq!(
+                serde_json::from_value::<ProviderStreamEvent>(json).unwrap(),
+                event
+            );
+        }
+        for kind in ["open_page", "find_in_page"] {
+            let action: HostedSearchAction =
+                serde_json::from_value(serde_json::json!({"type":kind})).unwrap();
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::json!({"type":kind})
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_search_defaults_and_capability_validation_are_additive() {
+        let request = ProviderRequest::new(ModelId::new("model"), Vec::new());
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert!(serialized.get("hosted_tools").is_none());
+        let legacy: ProviderRequest = serde_json::from_value(serialized).unwrap();
+        assert!(legacy.hosted_tools.is_empty());
+        let request = legacy.with_hosted_tools(vec![HostedTool::WebSearch { max_uses: Some(5) }]);
+        assert!(!request.has_no_tools());
+        let mut capabilities = Capabilities::basic_streaming();
+        assert_eq!(
+            capabilities.unsupported_for(&request),
+            vec![UnsupportedFeature::HostedWebSearch]
+        );
+        capabilities.hosted_web_search = true;
+        assert!(capabilities.unsupported_for(&request).is_empty());
+        let mut serialized = serde_json::to_value(&capabilities).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("hosted_web_search");
+        assert!(
+            !serde_json::from_value::<Capabilities>(serialized)
+                .unwrap()
+                .hosted_web_search
+        );
+        let event: ProviderStreamEvent =
+            serde_json::from_value(serde_json::json!({"type":"hosted_search"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({"type":"hosted_search"})
+        );
+        assert_eq!(
+            event,
+            ProviderStreamEvent::HostedSearch {
+                action: None,
+                query: None,
+                sources: Vec::new()
             }
         );
     }

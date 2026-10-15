@@ -25,6 +25,7 @@ use crate::budget::BudgetReport;
 use crate::cache::CachePlan;
 use crate::compaction::CompactionOutcome;
 use crate::fragment::{CacheClass, FragmentId, FragmentKind, Sensitivity};
+use crate::image_projection::ImageProjectionReport;
 use crate::sizing::EstimationConfidence;
 
 /// One ordered, accounted slice of a [`ContextPlan`]: everything about a
@@ -49,7 +50,7 @@ pub struct PlanSegment {
 /// Extra named revisions folded into a plan's fingerprint by a later stage —
 /// registry snapshot and activation-set revisions from the runtime,
 /// compaction and cache-policy revisions from the compaction author. Empty by
-/// default: [`crate::planner::ContextPlanner`] never populates it itself.
+/// default; the context planner adds the image-window policy only when set.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanInputs {
     revisions: BTreeMap<String, String>,
@@ -104,6 +105,8 @@ pub struct ContextPlan {
     /// text or fragment identifiers; `None` is retained for legacy plans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_boundary: Option<ProviderCacheBoundary>,
+    #[serde(default, skip_serializing_if = "ImageProjectionReport::is_empty")]
+    image_projection: ImageProjectionReport,
 }
 
 impl ContextPlan {
@@ -129,6 +132,7 @@ impl ContextPlan {
             compaction: CompactionOutcome::default(),
             cache_plan: None,
             cache_boundary: None,
+            image_projection: ImageProjectionReport::default(),
         }
     }
 
@@ -151,6 +155,16 @@ impl ContextPlan {
     /// The complete preflight budget report.
     pub fn budget_report(&self) -> &BudgetReport {
         &self.budget
+    }
+
+    /// Images replaced before sizing, including images later removed by compaction.
+    pub fn image_projection_report(&self) -> &ImageProjectionReport {
+        &self.image_projection
+    }
+
+    pub(crate) fn with_image_projection_report(mut self, report: ImageProjectionReport) -> Self {
+        self.image_projection = report;
+        self
     }
 
     /// The complete accounted input token count.
@@ -303,6 +317,39 @@ mod tests {
             confidence: EstimationConfidence::Estimated,
             capability_overflow_tokens: None,
         }
+    }
+
+    #[test]
+    fn image_projection_report_defaults_for_legacy_plans_and_skips_zero_counts() {
+        let plan = ContextPlan::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            sample_budget(),
+            Fingerprint::of("profile"),
+        );
+        let legacy = serde_json::to_value(&plan).unwrap();
+        assert!(legacy.get("image_projection").is_none());
+        let restored: ContextPlan = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            restored.image_projection_report(),
+            &ImageProjectionReport::default()
+        );
+        assert_eq!(restored.fingerprint(), plan.fingerprint());
+        let reported = plan
+            .clone()
+            .with_image_projection_report(ImageProjectionReport {
+                text_only: 2,
+                window: 0,
+            });
+        let value = serde_json::to_value(&reported).unwrap();
+        assert_eq!(value["image_projection"]["text_only"], 2);
+        assert!(value["image_projection"].get("window").is_none());
+        assert_eq!(
+            serde_json::from_value::<ContextPlan>(value).unwrap(),
+            reported
+        );
+        assert_eq!(reported.fingerprint(), plan.fingerprint());
     }
 
     fn sample_segment(id: &str, hash_seed: &str) -> PlanSegment {

@@ -21,6 +21,7 @@ use agent_runtime_core::ids::ToolCallId;
 use agent_runtime_registry::RegistryRevision;
 
 use crate::fragment::{ContextFragment, FragmentKind};
+use crate::image_projection::ImageWindow;
 use crate::sizing::{EstimationConfidence, RequestSizer};
 
 /// Tokens attributed to one [`FragmentKind`] in a [`BudgetReport`].
@@ -200,7 +201,7 @@ impl ContextBudget {
 
 /// Host-supplied planning policy for one execution phase: reserves, the
 /// capability sub-budget, and a revision folded into downstream fingerprints.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPolicy {
     /// This policy's own revision. A changed reserve or sub-budget is a
     /// changed revision, which changes every downstream plan fingerprint.
@@ -216,6 +217,10 @@ pub struct ContextPolicy {
     /// this many tokens of the input budget. `None` never rejects on
     /// confidence alone.
     pub max_estimated_slack: Option<u32>,
+    /// The stepped window for historical images. `None` leaves images inline
+    /// for image-capable models; text-only models always receive placeholders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_window: Option<ImageWindow>,
 }
 
 impl ContextPolicy {
@@ -228,6 +233,7 @@ impl ContextPolicy {
             reasoning_reserve,
             capability_budget: None,
             max_estimated_slack: None,
+            image_window: None,
         }
     }
 
@@ -240,6 +246,12 @@ impl ContextPolicy {
     /// Sets the estimated-confidence rejection margin.
     pub fn with_max_estimated_slack(mut self, tokens: u32) -> Self {
         self.max_estimated_slack = Some(tokens);
+        self
+    }
+
+    /// Sets the stepped image window. An inline count of zero is treated as one.
+    pub fn with_image_window(mut self, window: ImageWindow) -> Self {
+        self.image_window = Some(window);
         self
     }
 }
@@ -380,6 +392,23 @@ mod tests {
     use agent_runtime_core::catalog::{Modality, ResolvedModelProfile};
     use agent_runtime_core::provider::{Capabilities, ModelId, ToolSchema};
 
+    #[test]
+    fn image_window_defaults_for_legacy_policy_and_round_trips_when_set() {
+        let policy = ContextPolicy::new(RegistryRevision::new("1"), 100, 0);
+        let legacy = serde_json::to_value(&policy).unwrap();
+        assert!(legacy.get("image_window").is_none());
+        assert_eq!(
+            serde_json::from_value::<ContextPolicy>(legacy).unwrap(),
+            policy
+        );
+        let configured = policy.with_image_window(ImageWindow { inline: 3 });
+        let value = serde_json::to_value(&configured).unwrap();
+        assert_eq!(value["image_window"]["inline"], 3);
+        assert_eq!(
+            serde_json::from_value::<ContextPolicy>(value).unwrap(),
+            configured
+        );
+    }
     fn test_profile(
         context_tokens: u32,
         max_input_tokens: u32,

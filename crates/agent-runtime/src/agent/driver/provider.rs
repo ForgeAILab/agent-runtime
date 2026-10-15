@@ -625,6 +625,8 @@ impl Driver {
                     .saturating_add(plan.reasoning_reserve()),
                 confidence: map_confidence(plan.confidence()),
                 capability_overflow_tokens: plan.budget_report().capability_overflow_tokens,
+                images_text_only: plan.image_projection_report().text_only,
+                images_windowed: plan.image_projection_report().window,
             },
         );
 
@@ -708,6 +710,7 @@ impl Driver {
         }
 
         let mut request = plan.to_provider_request(self.config.model.clone());
+        request.hosted_tools = self.config.hosted_tools.clone();
         request.sampling = self.config.sampling.clone();
         request.reasoning = self.config.reasoning.clone();
         request.structured_output = self.config.structured_output.clone();
@@ -793,7 +796,7 @@ impl Driver {
                 }
                 UnsupportedFeature::Tools => self.config.downgrade.tools,
                 UnsupportedFeature::StructuredOutput => self.config.downgrade.structured_output,
-                UnsupportedFeature::Streaming => false,
+                UnsupportedFeature::Streaming | UnsupportedFeature::HostedWebSearch => false,
             };
             if !allowed {
                 return Err(ProviderError::unsupported(&[feature]));
@@ -814,7 +817,7 @@ impl Driver {
                     request.tool_choice = ToolChoice::None;
                 }
                 UnsupportedFeature::StructuredOutput => request.structured_output = None,
-                UnsupportedFeature::Streaming => {}
+                UnsupportedFeature::Streaming | UnsupportedFeature::HostedWebSearch => {}
             }
         }
         Ok(())
@@ -897,6 +900,7 @@ impl Driver {
             let mut response_progress = false;
             let mut reasoning = ReasoningAccumulator::default();
             let mut usage = UsageDelta::new();
+            let mut hosted_searches = 0u64;
             let mut cache_observation: Option<(Option<u64>, Option<u64>)> = None;
             let mut reached_cache_evidence_boundary = false;
             let mut assembler = ToolCallAssembler::default();
@@ -1021,6 +1025,24 @@ impl Driver {
                                 emit_coalesced(coalescer.drain());
                                 assembler.push(index, id, name, &arguments_fragment);
                             }
+                            ProviderStreamEvent::HostedSearch {
+                                action,
+                                query,
+                                sources,
+                            } => {
+                                accepted_semantic_event = true;
+                                response_progress = true;
+                                hosted_searches = hosted_searches.saturating_add(1);
+                                emit_coalesced(coalescer.drain());
+                                emitter.emit(
+                                    turn.clone(),
+                                    RuntimeEvent::HostedSearch {
+                                        action,
+                                        query,
+                                        sources,
+                                    },
+                                );
+                            }
                             ProviderStreamEvent::Usage { delta } => {
                                 accepted_semantic_event = true;
                                 response_progress = true;
@@ -1113,6 +1135,16 @@ impl Driver {
             // silently dropped on any exit.
             emit_coalesced(coalescer.drain());
 
+            if hosted_searches > 0
+                && !usage.iter().any(|(kind, _)| {
+                    kind == agent_runtime_core::usage::CounterKind::WebSearchRequests
+                })
+            {
+                usage.add(
+                    agent_runtime_core::usage::CounterKind::WebSearchRequests,
+                    hosted_searches,
+                );
+            }
             let mut tool_calls = Vec::new();
             if error.is_none() {
                 match assembler.finish(minter) {
@@ -1541,6 +1573,167 @@ mod tests {
         );
     }
     use super::*;
+
+    #[tokio::test]
+    async fn hosted_tools_reaches_every_main_agent_request() {
+        use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
+        use agent_runtime_core::provider::{Capabilities, HostedTool, ModelId};
+
+        use crate::provider::fake::{FakeProvider, ScriptedStream};
+        use crate::runtime::{RuntimeBuilder, StartSession};
+
+        let tools = vec![HostedTool::WebSearch { max_uses: Some(5) }];
+        let reply = ScriptedStream::new(vec![
+            ProviderStreamEvent::TextDelta {
+                text: "done".into(),
+            },
+            ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ]);
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities {
+                hosted_web_search: true,
+                ..Capabilities::basic_streaming()
+            },
+            vec![reply.clone(), reply],
+        ));
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider.clone())
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .hosted_tools(tools.clone())
+            .build()
+            .unwrap();
+        let session = runtime.start_session(StartSession::new()).await.unwrap();
+        session.run(UserInput::text("search")).await.unwrap();
+        session.run(UserInput::text("search again")).await.unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.hosted_tools == tools));
+    }
+
+    #[tokio::test]
+    async fn hosted_tools_unsupported_fails_before_io_even_with_permissive_downgrades() {
+        use agent_runtime_core::catalog::{ModelLimits, ResolvedModelProfile};
+        use agent_runtime_core::provider::{HostedTool, ModelId};
+
+        use crate::agent::config::DowngradePolicy;
+        use crate::provider::fake::FakeProvider;
+        use crate::runtime::{RuntimeBuilder, StartSession};
+
+        let provider = Arc::new(FakeProvider::text_reply("must not run"));
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider.clone())
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .hosted_tools(vec![HostedTool::WebSearch { max_uses: None }])
+            .downgrade_policy(DowngradePolicy::permissive())
+            .build()
+            .unwrap();
+        let session = runtime.start_session(StartSession::new()).await.unwrap();
+        let mut events = session.subscribe();
+        session.run(UserInput::text("search")).await.unwrap();
+
+        let mut errors = Vec::new();
+        let mut finish = None;
+        while let Some(envelope) = events.next().await {
+            match envelope.payload {
+                RuntimeEvent::Error { error } => errors.push(error),
+                RuntimeEvent::Downgrade { .. } | RuntimeEvent::ProviderAttemptStarted { .. } => {
+                    panic!("hosted search must fail before downgrade or provider I/O");
+                }
+                RuntimeEvent::TurnCompleted {
+                    finish: completed, ..
+                } => {
+                    finish = Some(completed);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(finish, Some(TurnFinish::Failed));
+        assert_eq!(
+            errors,
+            vec![
+                RuntimeError::from(ProviderError::unsupported(&[
+                    UnsupportedFeature::HostedWebSearch,
+                ]))
+                .with_failure_stage(agent_runtime_core::error::FailureStage::PreProvider)
+            ]
+        );
+        assert!(provider.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_only_history_image_emits_context_planned_projection_count() {
+        use agent_runtime_core::catalog::{Modality, ModelLimits, ResolvedModelProfile};
+        use agent_runtime_core::provider::ModelId;
+
+        use crate::provider::fake::FakeProvider;
+        use crate::runtime::{RuntimeBuilder, StartSession};
+
+        let provider = Arc::new(FakeProvider::text_reply("done"));
+        let mut profile = ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(128_000, 128_000, 4_096),
+        );
+        profile.input_modalities = vec![Modality::Text];
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider.clone())
+            .model_profile(profile)
+            .build()
+            .expect("runtime builds");
+        let session = runtime
+            .start_session(StartSession::new().with_history(vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Image {
+                        url: "data:image/png;base64,aW1hZ2U=".into(),
+                        detail: None,
+                    }],
+                },
+                Message::text(Role::Assistant, "image received"),
+            ]))
+            .await
+            .expect("session starts");
+        let mut events = session.subscribe();
+        session
+            .run(UserInput::text("continue"))
+            .await
+            .expect("turn completes");
+
+        let mut counts = Vec::new();
+        while let Some(envelope) = events.next().await {
+            match envelope.payload {
+                RuntimeEvent::ContextPlanned {
+                    images_text_only,
+                    images_windowed,
+                    ..
+                } => counts.push((images_text_only, images_windowed)),
+                RuntimeEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(counts, [(1, 0)]);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].messages.iter().all(|message| {
+            message
+                .content
+                .iter()
+                .all(|part| !matches!(part, ContentPart::Image { .. }))
+        }));
+    }
 
     fn projection(expected_read_tokens: Option<u64>) -> ProviderCacheProjection {
         ProviderCacheProjection {
