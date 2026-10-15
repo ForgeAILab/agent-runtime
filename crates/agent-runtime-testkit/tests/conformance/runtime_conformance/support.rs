@@ -13,8 +13,9 @@ use agent_runtime::context::{CompactionPolicy, StructuralCompactor};
 use agent_runtime::harness::{
     ARTIFACT_READ_PERMISSION, ArtifactOffloader, ArtifactReadTool, CAPABILITY_SEARCH_TOOL_NAME,
     ComponentDescriptor, ContextContributor, ContextPatch, ContextView, ModelInterceptor,
-    ModelRequestPatch, ModelView, SessionStatePatch, ToolOutputPatch, ToolOutputProcessor,
-    ToolOutputView, TurnCommitHook, TurnCommitPatch, TurnCommitView,
+    ModelRequestPatch, ModelView, SemanticSummaryCoordinator, SemanticSummaryPolicy,
+    SessionStatePatch, SummaryModel, SummaryModelRequest, SummaryModelResponse, ToolOutputPatch,
+    ToolOutputProcessor, ToolOutputView, TurnCommitHook, TurnCommitPatch, TurnCommitView,
 };
 use agent_runtime::prelude::*;
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, tool_call_fragments};
@@ -942,4 +943,51 @@ async fn run_consumer_forge() -> Vec<RuntimeEvent> {
     let session = runtime.start_session(StartSession::new()).await.unwrap();
     session.run(UserInput::text("hi")).await.unwrap();
     observer.payloads()
+}
+
+#[derive(Debug, Default)]
+struct CountingSummaryModel {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl SummaryModel for CountingSummaryModel {
+    fn id(&self) -> &str {
+        "counting-summary"
+    }
+
+    fn revision(&self) -> RegistryRevision {
+        RegistryRevision::new("counting-summary-v1")
+    }
+
+    async fn summarize(
+        &self,
+        _request: &SummaryModelRequest,
+    ) -> Result<SummaryModelResponse, RuntimeError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Ok(SummaryModelResponse {
+            text: "Earlier work established the durable recovery constraints.".into(),
+            usage: UsageDelta::new()
+                .with(CounterKind::InputUncached, 11)
+                .with(CounterKind::Output, 5),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CountingSemanticSummaryHook {
+    inner: Arc<SemanticSummaryCoordinator>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl TurnCommitHook for CountingSemanticSummaryHook {
+    fn descriptor(&self) -> ComponentDescriptor {
+        TurnCommitHook::descriptor(self.inner.as_ref())
+    }
+
+    async fn after_commit(&self, view: &TurnCommitView) -> Result<TurnCommitPatch, RuntimeError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.inner.after_commit(view).await
+    }
 }

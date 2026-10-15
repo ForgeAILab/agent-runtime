@@ -50,6 +50,7 @@ pub(crate) const IDLE_BOUNDARY_NAMESPACE: &str = "runtime.lcm.idle_boundary";
 fn merge_terminal_checkpoint_snapshot(
     canonical: &mut SessionSnapshot,
     protected: &SessionSnapshot,
+    flat_summary: bool,
 ) -> Result<(), RuntimeError> {
     if canonical.id != protected.id {
         return Err(RuntimeError::conflict(
@@ -116,7 +117,8 @@ fn merge_terminal_checkpoint_snapshot(
         // checkpoint that carried the old flat-summary namespace. Once the
         // canonical snapshot contains only the replacement, do not resurrect
         // the legacy component during protected-state overlay.
-        if namespace == LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID
+        if !flat_summary
+            && namespace == LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID
             && canonical.extension_state.contains_key(LCM_COMPONENT_ID)
             && !canonical
                 .extension_state
@@ -191,6 +193,7 @@ fn merge_terminal_checkpoint_snapshot(
 fn merge_newer_nonterminal_delegation_state(
     protected: &mut SessionSnapshot,
     ordinary: &SessionSnapshot,
+    flat_summary: bool,
 ) -> Result<(), RuntimeError> {
     if protected.id != ordinary.id {
         return Err(RuntimeError::conflict(
@@ -229,7 +232,7 @@ fn merge_newer_nonterminal_delegation_state(
                 .insert(namespace.to_owned(), state.clone());
         }
     }
-    merge_durable_lcm_import(protected, ordinary)?;
+    merge_durable_lcm_import(protected, ordinary, flat_summary)?;
     Ok(())
 }
 
@@ -240,6 +243,7 @@ fn merge_newer_nonterminal_delegation_state(
 fn merge_durable_lcm_import(
     protected: &mut SessionSnapshot,
     ordinary: &SessionSnapshot,
+    flat_summary: bool,
 ) -> Result<(), RuntimeError> {
     let ordinary_lcm = ordinary.extension_state.get(LCM_COMPONENT_ID);
     let ordinary_legacy = ordinary
@@ -258,6 +262,14 @@ fn merge_durable_lcm_import(
         return Err(RuntimeError::conflict(
             "protected checkpoint contains both legacy semantic-summary and LCM state",
         ));
+    }
+    if flat_summary {
+        if ordinary_lcm.is_some() || protected_lcm.is_some() {
+            return Err(RuntimeError::conflict(
+                "persisted LCM state requires its configured LCM coordinator",
+            ));
+        }
+        return Ok(());
     }
     match (
         ordinary_lcm,
@@ -304,6 +316,15 @@ async fn prepare_lcm_resume(
         ));
     }
 
+    if shared.driver.semantic_summary_revision().is_some() {
+        if current.is_some() {
+            return Err(RuntimeError::conflict(
+                "persisted LCM state requires its configured LCM coordinator",
+            ));
+        }
+        // Flat state is live component state; normal projection validates it.
+        return Ok((Vec::new(), false));
+    }
     let Some(coordinator) = shared.lcm.as_ref() else {
         if legacy.is_some() || current.is_some() {
             return Err(RuntimeError::conflict(
@@ -1393,7 +1414,11 @@ impl Runtime {
             (Some(checkpoint), Some(mut snapshot))
                 if matches!(checkpoint.state, TurnState::Terminal { .. }) =>
             {
-                merge_terminal_checkpoint_snapshot(&mut snapshot, &checkpoint.snapshot)?;
+                merge_terminal_checkpoint_snapshot(
+                    &mut snapshot,
+                    &checkpoint.snapshot,
+                    self.shared.driver.semantic_summary_revision().is_some(),
+                )?;
                 Some(snapshot)
             }
             (Some(checkpoint), Some(snapshot))
@@ -1405,7 +1430,11 @@ impl Runtime {
                 // lifecycle barrier; retain only newer delegation namespaces
                 // and never require stale usage/history equality here.
                 let mut protected = checkpoint.snapshot.clone();
-                merge_newer_nonterminal_delegation_state(&mut protected, &snapshot)?;
+                merge_newer_nonterminal_delegation_state(
+                    &mut protected,
+                    &snapshot,
+                    self.shared.driver.semantic_summary_revision().is_some(),
+                )?;
                 carry_compatible_diagnostics(
                     &mut protected,
                     &snapshot,
@@ -1421,7 +1450,11 @@ impl Runtime {
             }
             (Some(checkpoint), Some(snapshot)) => {
                 let mut protected = checkpoint.snapshot.clone();
-                merge_newer_nonterminal_delegation_state(&mut protected, &snapshot)?;
+                merge_newer_nonterminal_delegation_state(
+                    &mut protected,
+                    &snapshot,
+                    self.shared.driver.semantic_summary_revision().is_some(),
+                )?;
                 carry_compatible_diagnostics(
                     &mut protected,
                     &snapshot,
@@ -1830,7 +1863,7 @@ mod tests {
             ),
         );
 
-        merge_newer_nonterminal_delegation_state(&mut checkpoint, &ordinary).unwrap();
+        merge_newer_nonterminal_delegation_state(&mut checkpoint, &ordinary, false).unwrap();
         assert_eq!(checkpoint.history[0].joined_text(), "checkpoint history");
         assert_eq!(
             checkpoint.extension_state[CHILD_OUTCOME_CURSOR_NAMESPACE].value["revision"],

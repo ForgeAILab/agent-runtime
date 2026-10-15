@@ -16,7 +16,7 @@ use agent_runtime_core::checkpoint::{
 };
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::{
-    InternalTurnInput, Message, ToolCall, ToolResultBlock, UserInput,
+    InternalTurnInput, Message, Role, ToolCall, ToolResultBlock, UserInput,
 };
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::event::{LcmLifecycleKind, LcmLifecycleReason, RuntimeEvent, TurnFinish};
@@ -26,6 +26,7 @@ use agent_runtime_core::interaction::InteractionRequest;
 use agent_runtime_core::steer::{SteerReceipt, SteerRejection, SteerRejectionReason};
 use agent_runtime_core::store::{SessionSnapshot, VersionedSessionState};
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageLedger, UsageRecord, UsageSource};
+use agent_runtime_registry::Fingerprint;
 use serde_json::Value;
 
 use crate::cache::{
@@ -34,7 +35,9 @@ use crate::cache::{
 use crate::capability::ActivationEpoch;
 use crate::harness::{
     ComponentDescriptor, ExpansionRequest, GoalComponent, HarnessEvent, IdleCompactionResult,
-    LCM_COMPONENT_ID, LcmCoordinator, LcmExpansion, LcmExpansionObservation, TurnCommitView,
+    LCM_COMPONENT_ID, LcmCoordinator, LcmExpansion, LcmExpansionObservation,
+    ProtectedSemanticSummary, SEMANTIC_SUMMARY_COMPONENT_ID, TurnCommitView,
+    protected_semantic_summary_from_state,
 };
 use crate::ids::IdMinter;
 use crate::runtime::emitter::{CacheEventBatch, EventEmitter, RuntimeEventStream};
@@ -226,6 +229,33 @@ pub enum IdleCompactionAdmission {
         /// Typed redaction-safe fallback/failure reason, when one was
         /// reported by LCM lifecycle events.
         fallback_reason: Option<LcmLifecycleReason>,
+        /// Disjoint usage committed by this idle attempt.
+        usage: UsageDelta,
+    },
+    /// User/admission/active work already owns the boundary, or this idle
+    /// interval has consumed its one attempt.
+    Busy,
+    /// Shutdown or cancellation won the protected boundary.
+    Shutdown,
+}
+
+/// Outcome of one explicit idle semantic-compaction boundary.
+///
+/// The accepted branch intentionally carries the protected result by value so
+/// callers can consume its metadata/body without an extra allocation; the
+/// larger enum branch is an API tradeoff for this infrequent boundary result.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, PartialEq, Eq)]
+pub enum SemanticIdleCompactionAdmission {
+    /// The idle boundary was claimed. A summary is present when the
+    /// configured coordinator committed one; a fallback reason means the
+    /// bounded attempt completed without changing summary state.
+    Accepted {
+        /// Protected summary metadata and body, when committed.
+        summary: Option<ProtectedSemanticSummary>,
+        /// Redaction-safe fallback category, when the attempt made no state
+        /// change.
+        fallback_reason: Option<String>,
         /// Disjoint usage committed by this idle attempt.
         usage: UsageDelta,
     },

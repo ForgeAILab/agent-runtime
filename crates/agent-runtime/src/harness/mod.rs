@@ -65,6 +65,7 @@ pub use pipeline::{
     TurnCommitPatch, TurnCommitView,
 };
 pub use questionnaire::{QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
+pub(crate) use semantic_summary::protected_summary_from_patch;
 pub use semantic_summary::{
     DEFAULT_MAX_SUMMARY_CHARS, DEFAULT_SUMMARY_MIN_TURNS, DEFAULT_SUMMARY_RETAIN_TURNS,
     DEFAULT_SUMMARY_TRIGGER_PERCENT, ProtectedSemanticSummary, ProtectedSummaryBody,

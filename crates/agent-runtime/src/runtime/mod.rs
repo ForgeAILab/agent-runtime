@@ -32,7 +32,7 @@ pub use goal::{GoalAdmissionGate, GoalController, GoalControllerConfig};
 pub use inject::InjectedContent;
 pub use manifests::MANIFEST_BOUNDARY_NAMESPACE;
 pub use session::{
-    CurrentCacheIdentityLease, IdleCompactionAdmission, InternalTurnAdmission, SessionHandle,
-    TurnHandle,
+    CurrentCacheIdentityLease, IdleCompactionAdmission, InternalTurnAdmission,
+    SemanticIdleCompactionAdmission, SessionHandle, TurnHandle,
 };
 pub use state::{SessionExecutionContext, SessionState};

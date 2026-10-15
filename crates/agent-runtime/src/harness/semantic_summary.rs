@@ -673,8 +673,6 @@ impl SemanticSummaryCoordinator {
 /// The hook has already performed policy/model identity validation. This
 /// narrow helper is kept crate-visible so the SessionHandle can return the
 /// protected live result without exposing the internal wire state type.
-// Used by the session facade in the follow-up session integration batch.
-#[allow(dead_code)]
 pub(crate) fn protected_summary_from_patch(
     patch: &TurnCommitPatch,
 ) -> Result<Option<ProtectedSemanticSummary>, RuntimeError> {
@@ -1512,8 +1510,8 @@ mod tests {
             .unwrap();
         let turn = session.send(UserInput::text("user wins")).unwrap();
         assert!(matches!(
-            session.try_idle_compaction().await.unwrap(),
-            crate::runtime::IdleCompactionAdmission::Busy
+            session.try_idle_semantic_compaction().await.unwrap(),
+            crate::runtime::SemanticIdleCompactionAdmission::Busy
         ));
         turn.completed().await;
         session.shutdown().await.unwrap();
@@ -1529,14 +1527,11 @@ mod tests {
             .unwrap();
         session.shutdown().await.unwrap();
         assert!(matches!(
-            session.try_idle_compaction().await.unwrap(),
-            crate::runtime::IdleCompactionAdmission::Shutdown
+            session.try_idle_semantic_compaction().await.unwrap(),
+            crate::runtime::SemanticIdleCompactionAdmission::Shutdown
         ));
     }
-    // These pin-line session tests require the idle/restore facade scheduled
-    // for the next implementation batch. Keep their bodies for that port.
-    #[cfg(any())]
-    mod deferred_session_tests {
+    mod session_tests {
         use super::*;
         use agent_runtime_core::store::{SessionSnapshot, SessionStore};
         use tokio::sync::Notify;
@@ -1616,9 +1611,9 @@ mod tests {
                 .await
                 .unwrap();
             let before = session.history();
-            let result = session.try_idle_compaction().await.unwrap();
+            let result = session.try_idle_semantic_compaction().await.unwrap();
             let summary = match result {
-                crate::runtime::IdleCompactionAdmission::Accepted {
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted {
                     summary: Some(summary),
                     fallback_reason: None,
                     usage,
@@ -1642,13 +1637,21 @@ mod tests {
             );
             assert!(summary.body.as_str().contains("Earlier turns"));
             assert_eq!(session.history(), before);
+            let snapshot = session.snapshot();
+            let records = snapshot.usage.records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].source, UsageSource::SemanticSummary);
+            assert_eq!(
+                records[0].provenance.purpose.as_deref(),
+                Some(SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE)
+            );
             assert_eq!(
                 session.snapshot().extension_state[SEMANTIC_SUMMARY_COMPONENT_ID].value["purpose"],
                 SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE
             );
             assert!(matches!(
-                session.try_idle_compaction().await.unwrap(),
-                crate::runtime::IdleCompactionAdmission::Busy
+                session.try_idle_semantic_compaction().await.unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Busy
             ));
             session.shutdown().await.unwrap();
         }
@@ -1660,17 +1663,16 @@ mod tests {
             let session_id = SessionId::new("protected-summary-restore");
             let canonical_history = history(6);
             let source = runtime
-                .start_session(
-                    StartSession::new()
-                        .with_id(session_id.clone())
-                        .with_history(canonical_history.clone()),
-                )
+                .start_session(StartSession::create(
+                    session_id.clone(),
+                    canonical_history.clone(),
+                ))
                 .await
                 .unwrap();
-            let result = source.try_idle_compaction().await.unwrap();
+            let result = source.try_idle_semantic_compaction().await.unwrap();
             assert!(matches!(
                 result,
-                crate::runtime::IdleCompactionAdmission::Accepted {
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted {
                     summary: Some(_),
                     ..
                 }
@@ -1680,11 +1682,7 @@ mod tests {
             source.shutdown().await.unwrap();
 
             let resumed = runtime
-                .start_session(
-                    StartSession::new()
-                        .with_id(session_id)
-                        .with_history(canonical_history),
-                )
+                .start_session(StartSession::create(session_id, canonical_history))
                 .await
                 .unwrap();
             assert!(
@@ -1701,6 +1699,95 @@ mod tests {
                     .restore_semantic_summary_if_absent(wrong_revision)
                     .is_err()
             );
+            for (field, value, expected_error) in [
+                ("omit_prefix", serde_json::json!(1000), "split or exceed"),
+                ("omit_prefix", serde_json::json!(1), "split or exceed"),
+                (
+                    "summary",
+                    serde_json::json!("tampered summary"),
+                    "revision failed",
+                ),
+                (
+                    "summary_revision",
+                    serde_json::json!("wrong-body-revision"),
+                    "revision failed",
+                ),
+            ] {
+                let mut invalid = persisted.clone();
+                invalid.value[field] = value;
+                let error = resumed
+                    .restore_semantic_summary_if_absent(invalid)
+                    .unwrap_err();
+                assert!(error.to_string().contains(expected_error), "{error}");
+                assert!(
+                    resumed
+                        .extension_state(SEMANTIC_SUMMARY_COMPONENT_ID)
+                        .is_none()
+                );
+            }
+            let mut wrong_session = persisted.clone();
+            wrong_session.value["source_artifact"]["provenance"]["session"] =
+                serde_json::json!("another-session");
+            assert!(
+                resumed
+                    .restore_semantic_summary_if_absent(wrong_session)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another session")
+            );
+
+            let mut wrong_source = persisted.clone();
+            wrong_source.value["source_fingerprint"] =
+                serde_json::json!(Fingerprint::of(b"different source"));
+            let decoded: SemanticSummaryState =
+                serde_json::from_value(wrong_source.value.clone()).unwrap();
+            wrong_source.value["summary_revision"] =
+                serde_json::json!(RegistryRevision::from_content(
+                    [
+                        decoded.source_fingerprint.as_str(),
+                        decoded.model_revision.as_str(),
+                        decoded.purpose.as_str(),
+                        decoded.summary.as_str(),
+                    ]
+                    .join("\n")
+                ));
+            assert!(
+                resumed
+                    .restore_semantic_summary_if_absent(wrong_source)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no longer matches")
+            );
+
+            for busy in 0..3 {
+                match busy {
+                    0 => resumed.inner().turns.lock().unwrap().count = 1,
+                    1 => resumed
+                        .inner()
+                        .user_submission_pending
+                        .store(1, std::sync::atomic::Ordering::Release),
+                    _ => resumed
+                        .inner()
+                        .cache_active
+                        .store(1, std::sync::atomic::Ordering::Release),
+                }
+                assert!(
+                    resumed
+                        .restore_semantic_summary_if_absent(persisted.clone())
+                        .unwrap_err()
+                        .to_string()
+                        .contains("idle live session")
+                );
+                resumed.inner().turns.lock().unwrap().count = 0;
+                resumed
+                    .inner()
+                    .user_submission_pending
+                    .store(0, std::sync::atomic::Ordering::Release);
+                resumed
+                    .inner()
+                    .cache_active
+                    .store(0, std::sync::atomic::Ordering::Release);
+            }
             assert!(
                 resumed
                     .restore_semantic_summary_if_absent(persisted.clone())
@@ -1715,7 +1802,36 @@ mod tests {
                     .restore_semantic_summary_if_absent(persisted)
                     .unwrap()
             );
+            let mut outdated = resumed
+                .extension_state(SEMANTIC_SUMMARY_COMPONENT_ID)
+                .unwrap();
+            outdated.revision = RegistryRevision::new("outdated");
+            outdated.value = serde_json::Value::Null;
+            assert!(
+                !resumed
+                    .restore_semantic_summary_if_absent(outdated)
+                    .unwrap()
+            );
+            resumed.cancel_session(agent_runtime_core::cancel::CancelReason::UserRequested);
+            assert!(
+                resumed
+                    .restore_semantic_summary_if_absent(
+                        resumed
+                            .extension_state(SEMANTIC_SUMMARY_COMPONENT_ID)
+                            .unwrap()
+                    )
+                    .is_err()
+            );
             resumed.shutdown().await.unwrap();
+            assert!(
+                resumed
+                    .restore_semantic_summary_if_absent(
+                        resumed
+                            .extension_state(SEMANTIC_SUMMARY_COMPONENT_ID)
+                            .unwrap()
+                    )
+                    .is_err()
+            );
         }
 
         #[tokio::test]
@@ -1759,7 +1875,7 @@ mod tests {
             user.completed().await;
 
             let summary = match result {
-                crate::runtime::IdleCompactionAdmission::Accepted {
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted {
                     summary: Some(summary),
                     fallback_reason: None,
                     ..
@@ -1799,7 +1915,7 @@ mod tests {
             let result = session.try_idle_semantic_compaction().await.unwrap();
             assert!(matches!(
                 result,
-                crate::runtime::IdleCompactionAdmission::Accepted {
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted {
                     summary: None,
                     fallback_reason: Some(reason),
                     ..
@@ -1814,7 +1930,7 @@ mod tests {
             );
             assert!(matches!(
                 session.try_idle_semantic_compaction().await.unwrap(),
-                crate::runtime::IdleCompactionAdmission::Busy
+                crate::runtime::SemanticIdleCompactionAdmission::Busy
             ));
             session.shutdown().await.unwrap();
         }
@@ -1840,7 +1956,7 @@ mod tests {
             assert_eq!(after.extension_state, before.extension_state);
             assert!(matches!(
                 session.try_idle_semantic_compaction().await.unwrap(),
-                crate::runtime::IdleCompactionAdmission::Busy
+                crate::runtime::SemanticIdleCompactionAdmission::Busy
             ));
             let _ = session.shutdown().await;
         }

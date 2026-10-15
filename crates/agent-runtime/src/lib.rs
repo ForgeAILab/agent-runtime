@@ -206,7 +206,7 @@ pub mod prelude {
         CheckpointRecoveryPolicy, CurrentCacheIdentityLease, ForkLcm, ForkSeed, ForkSession,
         GoalAdmissionGate, GoalController, GoalControllerConfig, IdleCompactionAdmission,
         InjectedContent, InternalTurnAdmission, Runtime, RuntimeBuilder, RuntimeEventStream,
-        SessionHandle, StartSession, StartSessionMode, TurnHandle,
+        SemanticIdleCompactionAdmission, SessionHandle, StartSession, StartSessionMode, TurnHandle,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};
