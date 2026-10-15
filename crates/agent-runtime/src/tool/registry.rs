@@ -4,7 +4,7 @@
 //! [`agent_runtime_ability::Registry`] (a re-export of
 //! `agent-runtime-registry`'s generic mechanism); this module layers the
 //! tool-specific concerns on top: JSON-schema validation at registration and
-//! per-call argument validation before a call is surfaced or invoked.
+//! per-call argument validation before a call is prepared or invoked.
 //! Registration stays fail-closed on name conflicts and insertion order is
 //! preserved so advertisement and result ordering are deterministic. Tools are
 //! held via [`ToolEntry`], a [`Named`](agent_runtime_ability::Named) wrapper —
@@ -159,13 +159,14 @@ impl SealedToolRegistry {
         })?;
         validator.validate(arguments).map_err(|error| {
             RuntimeError::tool(format!(
-                "tool call `{name}` arguments do not match its input schema: {error}"
+                "tool call `{name}` arguments do not match its input schema: {error}. Correct the arguments and call the tool again."
             ))
         })
     }
 
-    /// Validates one assembled model call against the registered tool's input
-    /// schema before the call is exposed to observers or invoked.
+    /// Explicitly validates one assembled model call against the registered
+    /// tool's input schema. The turn driver leaves schema validation to the
+    /// executor's `validate_arguments` so violations become tool-error results.
     pub fn validate_call(&self, call: &ToolCall) -> Result<(), ProviderError> {
         let Some(spec) = self.spec(&call.name) else {
             // Unknown tools deliberately become canonical tool-error results;

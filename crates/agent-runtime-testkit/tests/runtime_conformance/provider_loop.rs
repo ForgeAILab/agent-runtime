@@ -963,10 +963,24 @@ async fn malformed_assembled_call_marks_attempt_usage_failed() {
         Capabilities::basic_streaming(),
         vec![ScriptedStream::new(events)],
     ));
-    let runtime = build(provider, observer);
+    let runtime = build(provider, observer.clone());
     let session = runtime.start_session(StartSession::new()).await.unwrap();
     session.run(UserInput::text("hi")).await.unwrap();
 
+    let payloads = observer.payloads();
+    assert!(payloads.iter().any(|event| matches!(
+        event,
+        RuntimeEvent::ProviderAttemptFinished { error: Some(error), .. }
+            if error.kind == agent_runtime_core::provider::ProviderErrorKind::MalformedStream
+                && error.message.contains("has malformed arguments")
+    )));
+    assert!(matches!(
+        payloads.last(),
+        Some(RuntimeEvent::TurnCompleted {
+            finish: TurnFinish::Failed,
+            ..
+        })
+    ));
     let snapshot = session.snapshot();
     assert_eq!(snapshot.usage.records().len(), 1);
     assert!(snapshot.usage.records()[0].provenance.failed);
@@ -1283,38 +1297,94 @@ async fn unknown_tool_becomes_error_result_and_loop_continues() {
 }
 
 #[tokio::test]
-async fn registered_tool_arguments_are_schema_validated_before_exposure() {
+async fn schema_invalid_tool_call_is_reported_as_error_and_turn_continues() {
     let mut events = tool_call_fragments(0, "call-invalid", "echo", "\"not an object\"");
     events.push(agent_runtime::provider::fake::usage_event(3, 1));
     events.push(ProviderStreamEvent::Finish {
         reason: FinishReason::ToolCalls,
     });
     let observer = RecordingObserver::shared();
-    let runtime = build(
-        Arc::new(FakeProvider::new(
-            "fake",
-            Capabilities::basic_streaming(),
-            vec![ScriptedStream::new(events)],
-        )),
-        observer.clone(),
-    );
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let approval = Arc::new(OriginRecordingApproval::default());
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![
+            ScriptedStream::new(events),
+            ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }]),
+        ],
+    ));
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(provider.clone())
+        .workspace(Arc::new(agent_runtime_testkit::MemoryWorkspace::new("/ws")))
+        .tool(Arc::new(CountingPureTool {
+            name: "echo",
+            invocations: invocations.clone(),
+        }))
+        .legacy_approval_authority()
+        .approval(approval.clone())
+        .observer(observer.clone())
+        .build()
+        .unwrap();
     let session = runtime.start_session(StartSession::new()).await.unwrap();
     session.run(UserInput::text("hi")).await.unwrap();
 
     let payloads = observer.payloads();
-    assert!(
-        payloads
-            .iter()
-            .all(|event| !matches!(event, RuntimeEvent::ToolCallRequested { .. }))
+    let requested = payloads
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeEvent::ToolCallRequested { call, name, .. }
+                    if call.as_str() == "call-invalid" && name == "echo"
+            )
+        })
+        .expect("schema-invalid call is reported as requested");
+    let completed = payloads
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RuntimeEvent::ToolCallCompleted { call, name, is_error: true }
+                    if call.as_str() == "call-invalid" && name == "echo"
+            )
+        })
+        .expect("schema-invalid call is completed with an error");
+    assert!(requested < completed);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let result = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|part| match part {
+            ContentPart::ToolResult(result) if result.call_id.as_str() == "call-invalid" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("continuation includes the schema error result");
+    assert_eq!(result.name, "echo");
+    assert!(result.is_error);
+    assert_eq!(
+        result.content,
+        vec![ContentPart::text(
+            r#"tool call `echo` arguments do not match its input schema: "not an object" is not of type "object". Correct the arguments and call the tool again."#
+        )]
     );
+    assert_eq!(invocations.load(Ordering::Acquire), 0);
+    assert!(approval.origins.lock().unwrap().is_empty());
     assert!(matches!(
         payloads.last(),
         Some(RuntimeEvent::TurnCompleted {
-            visible_output: _,
-            finish: TurnFinish::Failed
+            finish: TurnFinish::Completed,
+            ..
         })
     ));
-    assert!(session.snapshot().usage.records()[0].provenance.failed);
+    assert!(!session.snapshot().usage.records()[0].provenance.failed);
 }
 
 // source-ownership / runtime-api: sessions resume from a persisted snapshot.

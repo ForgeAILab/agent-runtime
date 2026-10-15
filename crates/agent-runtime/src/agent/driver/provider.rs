@@ -1066,16 +1066,10 @@ impl Driver {
             let mut tool_calls = Vec::new();
             if error.is_none() {
                 match assembler.finish(minter) {
-                    Ok(calls) => {
-                        if let Some(validation_error) = calls
-                            .iter()
-                            .find_map(|call| self.registry.validate_call(call).err())
-                        {
-                            error = Some(validation_error);
-                        } else {
-                            tool_calls = calls;
-                        }
-                    }
+                    // Schema violations, like unknown tools, are correctable
+                    // tool errors. The executor validates before preparation
+                    // and commits the error result for the model's next step.
+                    Ok(calls) => tool_calls = calls,
                     Err(assembly_error) => error = Some(assembly_error),
                 }
             }
