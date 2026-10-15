@@ -1214,6 +1214,7 @@ fn finish_hosted_output(
     let count = queries.len() as u64;
     for query in queries {
         out.push(ProviderStreamEvent::HostedSearch {
+            action: None,
             query,
             sources: state.search_sources.clone(),
         });
@@ -3152,7 +3153,7 @@ mod tests {
                     .any(|event| matches!(event, ProviderStreamEvent::Error { .. })),
                 "{events:?}"
             );
-            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { query: Some(query), sources } if query == "rust docs" && sources[0].url == "https://rust.test")));
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { action: None, query: Some(query), sources } if query == "rust docs" && sources[0].url == "https://rust.test")));
             assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "é Rust [Rust](https://rust.test) works.")));
             let mut usage = UsageDelta::new();
             for event in &events {
@@ -3203,7 +3204,7 @@ mod tests {
                 .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]);
         let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
         assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "Rust [Rust](https://rust.test) works.")));
-        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { query: Some(query), sources } if query == "rust docs" && sources[0].title.as_deref() == Some("Rust"))));
+        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { action: None, query: Some(query), sources } if query == "rust docs" && sources[0].title.as_deref() == Some("Rust"))));
         assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::Usage { delta } if delta.get(CounterKind::WebSearchRequests) == 1)));
     }
 }

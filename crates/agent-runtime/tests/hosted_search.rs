@@ -96,7 +96,12 @@ async fn anthropic_search_history_serializes_for_responses_and_chat_completions(
     let mut searches = 0;
     while let Some(envelope) = events.next().await {
         match envelope.payload {
-            RuntimeEvent::HostedSearch { query, sources } => {
+            RuntimeEvent::HostedSearch {
+                action,
+                query,
+                sources,
+            } => {
+                assert!(action.is_none());
                 searches += 1;
                 assert_eq!(query.as_deref(), Some("rust docs"));
                 assert_eq!(sources[0].url, "https://rust.test");
@@ -173,6 +178,7 @@ async fn anthropic_search_history_serializes_for_responses_and_chat_completions(
 async fn driver_counts_search_events_only_when_no_search_counter_was_reported() {
     for reported in [None, Some(0), Some(4)] {
         let mut script = vec![ProviderStreamEvent::HostedSearch {
+            action: None,
             query: None,
             sources: Vec::new(),
         }];

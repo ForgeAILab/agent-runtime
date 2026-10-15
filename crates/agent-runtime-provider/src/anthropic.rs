@@ -1227,6 +1227,7 @@ fn event_to_events(
                     })
                 {
                     out.push(ProviderStreamEvent::HostedSearch {
+                        action: None,
                         query,
                         sources: Vec::new(),
                     });
@@ -1241,7 +1242,11 @@ fn event_to_events(
                     })
                     .filter_map(|result| super::hosted::source(result, "url"))
                     .collect();
-                out.push(ProviderStreamEvent::HostedSearch { query, sources });
+                out.push(ProviderStreamEvent::HostedSearch {
+                    action: None,
+                    query,
+                    sources,
+                });
             }
             WireContentBlock::Thinking { thinking } => {
                 if !thinking.is_empty() {
@@ -1374,6 +1379,7 @@ fn event_to_events(
             flush_initial_inputs(state, out);
             for (_, query) in std::mem::take(&mut state.searches) {
                 out.push(ProviderStreamEvent::HostedSearch {
+                    action: None,
                     query,
                     sources: Vec::new(),
                 });
@@ -3126,7 +3132,7 @@ mod tests {
                     .any(|event| matches!(event, ProviderStreamEvent::Error { .. })),
                 "{events:?}"
             );
-            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { query: Some(query), sources } if query == "rust docs" && sources[0].url == "https://rust.test")));
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { action: None, query: Some(query), sources } if query == "rust docs" && sources[0].url == "https://rust.test")));
             assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "Rust [Rust](https://rust.test) works.")));
             let mut usage = UsageDelta::new();
             for event in &events {

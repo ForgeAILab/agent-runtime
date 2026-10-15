@@ -54,6 +54,14 @@ pub(crate) fn render(text: &str, mut citations: Vec<(usize, HostedSource)>) -> S
         if end > text.len() || !text.is_char_boundary(end) || !seen.insert(source.url.clone()) {
             continue;
         }
+        let url = source
+            .url
+            .replace(' ', "%20")
+            .replace('(', "%28")
+            .replace(')', "%29");
+        if text.contains(&source.url) || text.contains(&url) {
+            continue;
+        }
         rendered.push_str(&text[cursor..end]);
         cursor = end;
         let host = source
@@ -72,11 +80,6 @@ pub(crate) fn render(text: &str, mut citations: Vec<(usize, HostedSource)>) -> S
             .replace('\\', "\\\\")
             .replace('[', "\\[")
             .replace(']', "\\]");
-        let url = source
-            .url
-            .replace(' ', "%20")
-            .replace('(', "%28")
-            .replace(')', "%29");
         rendered.push_str(&format!(" [{title}]({url})"));
     }
     rendered.push_str(&text[cursor..]);
@@ -86,6 +89,68 @@ pub(crate) fn render(text: &str, mut citations: Vec<(usize, HostedSource)>) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_citation_preserves_an_existing_source_link() {
+        let text = "([blog.rust-lang.org](https://blog.rust-lang.org/releases/))";
+        let source = HostedSource {
+            title: Some("The Rust Release Announcements".into()),
+            url: "https://blog.rust-lang.org/releases/".into(),
+        };
+        let rendered = render(
+            text,
+            vec![(text.len(), source.clone()), (text.len(), source)],
+        );
+        assert_eq!(rendered, text);
+        assert_eq!(
+            rendered
+                .matches("https://blog.rust-lang.org/releases/")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn hosted_citation_still_appends_a_different_source() {
+        let text = "([blog.rust-lang.org](https://blog.rust-lang.org/releases/))";
+        let rendered = render(
+            text,
+            vec![
+                (
+                    text.len(),
+                    HostedSource {
+                        title: Some("The Rust Release Announcements".into()),
+                        url: "https://blog.rust-lang.org/releases/".into(),
+                    },
+                ),
+                (
+                    text.len(),
+                    HostedSource {
+                        title: Some("Rust".into()),
+                        url: "https://www.rust-lang.org/".into(),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            rendered,
+            format!("{text} [Rust](https://www.rust-lang.org/)")
+        );
+    }
+
+    #[test]
+    fn hosted_citation_recognizes_raw_and_escaped_urls() {
+        let source = HostedSource {
+            title: Some("A [source]".into()),
+            url: "https://example.com/a (b)".into(),
+        };
+        for text in [
+            "See https://example.com/a (b).",
+            "See [source](https://example.com/a%20%28b%29).",
+        ] {
+            assert_eq!(render(text, vec![(3, source.clone())]), text);
+        }
+    }
 
     #[test]
     fn citations_are_stable_deduplicated_and_unicode_safe() {

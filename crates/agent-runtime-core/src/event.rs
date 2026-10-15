@@ -901,6 +901,9 @@ pub enum ChildRecoveryState {
 pub enum RuntimeEvent {
     /// A provider-hosted web search and its public sources.
     HostedSearch {
+        /// The page action, or `None` for a plain search.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<crate::provider::HostedSearchAction>,
         /// The query, when reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query: Option<String>,
@@ -1658,6 +1661,35 @@ pub fn canonical_payloads(events: &[EventEnvelope]) -> Vec<RuntimeEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_search_action_is_optional_and_roundtrips() {
+        let legacy = serde_json::json!({"event":"hosted_search"});
+        let event: RuntimeEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            event,
+            RuntimeEvent::HostedSearch {
+                action: None,
+                query: None,
+                sources: Vec::new(),
+            }
+        );
+        assert_eq!(serde_json::to_value(&event).unwrap(), legacy);
+
+        let event = RuntimeEvent::HostedSearch {
+            action: Some(crate::provider::HostedSearchAction::OpenPage {
+                url: Some("https://rust.test".into()),
+            }),
+            query: None,
+            sources: Vec::new(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["action"],
+            serde_json::json!({"type":"open_page","url":"https://rust.test"})
+        );
+        assert_eq!(serde_json::from_value::<RuntimeEvent>(json).unwrap(), event);
+    }
 
     #[test]
     fn envelope_carries_schema_version() {

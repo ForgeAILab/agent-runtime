@@ -1381,6 +1381,27 @@ pub struct HostedSource {
     pub url: String,
 }
 
+/// What a provider-hosted search step did when it was not a search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostedSearchAction {
+    /// Open a web page.
+    OpenPage {
+        /// The page URL, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// Find text in a web page.
+    FindInPage {
+        /// The page URL, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// The search pattern, when reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
+}
+
 /// A normalized, vendor-neutral provider request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderRequest {
@@ -1824,6 +1845,9 @@ impl RateLimitSnapshot {
 pub enum ProviderStreamEvent {
     /// A provider-hosted web search and its public sources.
     HostedSearch {
+        /// The page action, or `None` for a plain search.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<HostedSearchAction>,
         /// The query, when reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query: Option<String>,
@@ -2662,6 +2686,41 @@ mod tests {
         );
     }
     #[test]
+    fn hosted_search_page_actions_roundtrip_with_optional_fields() {
+        for action in [
+            HostedSearchAction::OpenPage {
+                url: Some("https://rust.test".into()),
+            },
+            HostedSearchAction::OpenPage { url: None },
+            HostedSearchAction::FindInPage {
+                url: None,
+                pattern: None,
+            },
+        ] {
+            let event = ProviderStreamEvent::HostedSearch {
+                action: Some(action),
+                query: None,
+                sources: Vec::new(),
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            assert!(json.get("query").is_none());
+            assert!(json.get("sources").is_none());
+            assert_eq!(
+                serde_json::from_value::<ProviderStreamEvent>(json).unwrap(),
+                event
+            );
+        }
+        for kind in ["open_page", "find_in_page"] {
+            let action: HostedSearchAction =
+                serde_json::from_value(serde_json::json!({"type":kind})).unwrap();
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::json!({"type":kind})
+            );
+        }
+    }
+
+    #[test]
     fn hosted_search_defaults_and_capability_validation_are_additive() {
         let request = ProviderRequest::new(ModelId::new("model"), Vec::new());
         let serialized = serde_json::to_value(&request).unwrap();
@@ -2690,8 +2749,13 @@ mod tests {
         let event: ProviderStreamEvent =
             serde_json::from_value(serde_json::json!({"type":"hosted_search"})).unwrap();
         assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({"type":"hosted_search"})
+        );
+        assert_eq!(
             event,
             ProviderStreamEvent::HostedSearch {
+                action: None,
                 query: None,
                 sources: Vec::new()
             }
