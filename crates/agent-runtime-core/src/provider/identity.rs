@@ -84,6 +84,8 @@ pub struct CacheIdentity {
     stable_prefix: Vec<CacheIdentityFragment>,
     #[serde(default)]
     tools: Vec<CacheIdentityTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hosted_tools: Option<Fingerprint>,
     #[serde(default)]
     registry_snapshot: Option<Fingerprint>,
     #[serde(default)]
@@ -122,6 +124,8 @@ struct CacheIdentityWire {
     #[serde(default)]
     tools: Vec<CacheIdentityTool>,
     #[serde(default)]
+    hosted_tools: Option<Fingerprint>,
+    #[serde(default)]
     registry_snapshot: Option<Fingerprint>,
     #[serde(default)]
     scoped_view: Option<Fingerprint>,
@@ -156,6 +160,7 @@ impl<'de> Deserialize<'de> for CacheIdentity {
             resource: wire.resource,
             stable_prefix: wire.stable_prefix,
             tools: wire.tools,
+            hosted_tools: wire.hosted_tools,
             registry_snapshot: wire.registry_snapshot,
             scoped_view: wire.scoped_view,
             activation_revision: wire.activation_revision,
@@ -238,6 +243,7 @@ pub struct CacheIdentityBuilder {
     resource: Option<CacheResourceIdentity>,
     stable_prefix: Vec<CacheIdentityFragment>,
     tools: Vec<CacheIdentityTool>,
+    hosted_tools: Option<Fingerprint>,
     registry_snapshot: Option<Fingerprint>,
     scoped_view: Option<Fingerprint>,
     activation_revision: Option<Fingerprint>,
@@ -269,6 +275,7 @@ impl CacheIdentity {
             resource: None,
             stable_prefix: Vec::new(),
             tools: Vec::new(),
+            hosted_tools: None,
             registry_snapshot: None,
             scoped_view: None,
             activation_revision: None,
@@ -440,6 +447,7 @@ impl CacheIdentity {
             }
         }
         for (name, fingerprint) in [
+            ("hosted tools", self.hosted_tools.as_ref()),
             ("registry snapshot", self.registry_snapshot.as_ref()),
             ("scoped view", self.scoped_view.as_ref()),
             ("activation", self.activation_revision.as_ref()),
@@ -489,6 +497,9 @@ impl CacheIdentity {
                 self.cache_policy_revision.clone(),
             )
             .stable_history(self.stable_history.clone());
+        if let Some(hosted_tools) = &self.hosted_tools {
+            builder = builder.hosted_tools(hosted_tools.clone());
+        }
         let expected = builder.build().digest;
         if expected == self.digest {
             Ok(())
@@ -507,6 +518,7 @@ impl CacheIdentity {
     pub fn comparable_with(&self, previous: &Self) -> bool {
         self.same_non_fragment_partition(previous)
             && self.tools == previous.tools
+            && self.hosted_tools == previous.hosted_tools
             && self.stable_prefix.len() >= previous.stable_prefix.len()
             && previous
                 .stable_prefix
@@ -698,6 +710,12 @@ impl CacheIdentityBuilder {
         self
     }
 
+    /// Sets the digest of the ordered provider-hosted tool declarations.
+    pub fn hosted_tools(mut self, fingerprint: Fingerprint) -> Self {
+        self.hosted_tools = Some(fingerprint);
+        self
+    }
+
     /// Sets registry snapshot/view/activation revisions.
     pub fn registry_revisions(
         mut self,
@@ -772,6 +790,7 @@ impl CacheIdentityBuilder {
             hasher.pair("tool_ordinal", tool.ordinal.to_string());
         }
         for (label, revision) in [
+            ("hosted_tools", self.hosted_tools.as_ref()),
             ("registry_snapshot", self.registry_snapshot.as_ref()),
             ("scoped_view", self.scoped_view.as_ref()),
             ("activation_revision", self.activation_revision.as_ref()),
@@ -803,6 +822,7 @@ impl CacheIdentityBuilder {
             resource: self.resource,
             stable_prefix: self.stable_prefix,
             tools: self.tools,
+            hosted_tools: self.hosted_tools,
             registry_snapshot: self.registry_snapshot,
             scoped_view: self.scoped_view,
             activation_revision: self.activation_revision,

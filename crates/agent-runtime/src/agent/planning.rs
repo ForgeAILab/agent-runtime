@@ -41,7 +41,7 @@ use agent_runtime_core::manifest::{
     LosslessSummaryProducer, LosslessSummaryRecord, ModelResolution, PolicyRevisions, RunManifest,
     SegmentId, SegmentSensitivity, SummaryCoverage,
 };
-use agent_runtime_core::provider::{CacheEndpointIdentity, ToolSchema};
+use agent_runtime_core::provider::{CacheEndpointIdentity, HostedTool, ToolSchema};
 use agent_runtime_core::store::VersionedSessionState;
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
@@ -118,6 +118,7 @@ pub struct RunPlanner {
     revisions: RunRevisions,
     cache_endpoint_identity: Option<CacheEndpointIdentity>,
     cache_session_partition: Option<Fingerprint>,
+    hosted_tools: Option<Fingerprint>,
     /// The previous turn's cache plan, so a stable prefix can be compared
     /// across turns. Behind a lock because turns run serially but share the
     /// planner.
@@ -160,6 +161,7 @@ impl RunPlanner {
             revisions,
             cache_endpoint_identity: None,
             cache_session_partition: None,
+            hosted_tools: None,
             previous_cache: Mutex::new(None),
             input_cap: None,
             last_plan: Mutex::new(None),
@@ -186,6 +188,14 @@ impl RunPlanner {
 
     pub(crate) fn with_nonempty_assistant_content(mut self, required: bool) -> Self {
         self.requires_nonempty_assistant_content = required;
+        self
+    }
+
+    pub(crate) fn with_hosted_tools(mut self, tools: &[HostedTool]) -> Self {
+        // Preserve existing identities when no hosted tools are enabled.
+        self.hosted_tools = (!tools.is_empty()).then(|| {
+            Fingerprint::of(serde_json::to_vec(tools).expect("hosted tools are JSON serializable"))
+        });
         self
     }
 
@@ -217,6 +227,7 @@ impl RunPlanner {
             self.revisions.clone(),
         )
         .with_nonempty_assistant_content(self.requires_nonempty_assistant_content);
+        planner.hosted_tools = self.hosted_tools.clone();
         if let Some(endpoint) = &self.cache_endpoint_identity {
             planner = planner.with_cache_endpoint_identity(endpoint.clone());
         }
@@ -513,6 +524,9 @@ impl RunPlanner {
             .with(CACHE_POLICY_KEY, self.cache_capability.revision.as_str());
         if let Some(compactor) = &self.compactor {
             inputs = inputs.with(COMPACTION_POLICY_KEY, compactor.policy().revision.as_str());
+        }
+        if let Some(hosted_tools) = &self.hosted_tools {
+            inputs = inputs.with("hosted_tools", hosted_tools.as_str());
         }
         inputs
     }
@@ -950,6 +964,135 @@ mod tests {
             .iter()
             .map(|text| UserInput::text(*text).into_message())
             .collect()
+    }
+
+    fn hosted_tools_planner(tools: &[HostedTool]) -> RunPlanner {
+        RunPlanner::new(
+            profile(8_000),
+            "fake",
+            Arc::new(CharRatioSizer::default()),
+            ContextPolicy::new(RegistryRevision::new("ctx-1"), 64, 0),
+            None,
+            ProviderCacheCapability::full(RegistryRevision::new("cache-1"), "fake"),
+            RunRevisions::empty(),
+        )
+        .with_hosted_tools(tools)
+        .with_cache_endpoint_identity(CacheEndpointIdentity::from_opaque(
+            "test-endpoint",
+            RegistryRevision::new("endpoint-1"),
+        ))
+        .fork_session(&agent_runtime_core::ids::SessionId::new("same-session"))
+    }
+
+    #[test]
+    fn hosted_tools_changes_plan_and_cache_identity_deterministically() {
+        use agent_runtime_core::provider::CacheIdentity;
+
+        let declarations = [
+            vec![],
+            vec![HostedTool::WebSearch { max_uses: None }],
+            vec![HostedTool::WebSearch { max_uses: Some(5) }],
+            vec![HostedTool::WebSearch { max_uses: Some(6) }],
+            vec![
+                HostedTool::WebSearch { max_uses: None },
+                HostedTool::WebSearch { max_uses: Some(5) },
+            ],
+            vec![
+                HostedTool::WebSearch { max_uses: Some(5) },
+                HostedTool::WebSearch { max_uses: None },
+            ],
+        ];
+        let mut plans: Vec<ContextPlan> = Vec::new();
+        for tools in &declarations {
+            let plan = hosted_tools_planner(tools)
+                .plan_turn(Some("stable"), &history(&["hello"]), &[])
+                .unwrap()
+                .plan;
+            let repeated = hosted_tools_planner(tools)
+                .plan_turn(Some("stable"), &history(&["hello"]), &[])
+                .unwrap()
+                .plan;
+            assert_eq!(plan.fingerprint(), repeated.fingerprint());
+            let cache = plan.cache_plan().unwrap();
+            let identity = cache.cache_identity().unwrap();
+            assert_eq!(
+                cache.fingerprint(),
+                repeated.cache_plan().unwrap().fingerprint()
+            );
+            assert_eq!(
+                Some(identity),
+                repeated.cache_plan().unwrap().cache_identity()
+            );
+            let mut wire = serde_json::to_value(identity).unwrap();
+            if tools.is_empty() {
+                // Legacy identities have no hosted declaration and retain
+                // their original digest when the new field is absent.
+                wire.as_object_mut().unwrap().remove("hosted_tools");
+            }
+            let decoded: CacheIdentity = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(&decoded, identity);
+            wire["hosted_tools"] = serde_json::to_value(Fingerprint::of("tampered")).unwrap();
+            assert!(serde_json::from_value::<CacheIdentity>(wire).is_err());
+            for previous in &plans {
+                let previous_cache = previous.cache_plan().unwrap();
+                let previous_identity = previous_cache.cache_identity().unwrap();
+                assert_ne!(plan.fingerprint(), previous.fingerprint());
+                assert_ne!(cache.fingerprint(), previous_cache.fingerprint());
+                assert_ne!(identity, previous_identity);
+                assert!(!identity.comparable_with(previous_identity));
+                // Local tool changes do not partition the provider's routing
+                // key either: exact prompt content is hashed by the provider.
+                assert_eq!(
+                    identity.wire_cache_key(),
+                    previous_identity.wire_cache_key()
+                );
+            }
+            plans.push(plan);
+        }
+    }
+
+    #[test]
+    fn hosted_tools_stays_out_of_synthetic_maintenance_and_compaction_requests() {
+        use agent_runtime_core::cancel::Cancellation;
+        use agent_runtime_core::clock::{Deadline, Timestamp};
+        use agent_runtime_core::ids::CacheOperationId;
+        use agent_runtime_core::provider::{
+            CacheAuthority, CacheOperationBudget, ProviderAttemptPurpose, ToolChoice,
+        };
+
+        use crate::cache::CacheOperationRequest;
+
+        let planner = hosted_tools_planner(&[HostedTool::WebSearch { max_uses: Some(5) }]);
+        let plan = planner
+            .plan_turn(Some("stable"), &history(&["hello"]), &[])
+            .unwrap()
+            .plan;
+        assert!(
+            plan.plan_inputs()
+                .revisions()
+                .any(|(key, _)| key == "hosted_tools")
+        );
+        for purpose in [
+            ProviderAttemptPurpose::CacheKeepalive,
+            ProviderAttemptPurpose::CacheHandoffCheckpoint,
+            ProviderAttemptPurpose::IdleCompaction,
+        ] {
+            let operation = CacheOperationRequest::from_plan(
+                CacheOperationId::new("hosted-tools-maintenance"),
+                &plan,
+                purpose,
+                CacheAuthority::new("host authority"),
+                CacheOperationBudget::default(),
+                Cancellation::new(),
+                Deadline::at(Timestamp(60_000)),
+            )
+            .unwrap();
+            assert!(operation.synthetic().request().hosted_tools.is_empty());
+            assert_eq!(
+                operation.synthetic().request().tool_choice,
+                ToolChoice::None
+            );
+        }
     }
 
     #[test]

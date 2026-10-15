@@ -20,3 +20,4 @@ completed_at:
 - [x] 1.6 Tests: per-adapter serialization and parsing; no opaque block in
       canonical history; cross-provider continuation after hosted search.
 - [x] 1.7 Gate: fmt, clippy `-D warnings` with all features, workspace tests.
+- [x] 1.8 Host-set hosted tools on agent requests.
