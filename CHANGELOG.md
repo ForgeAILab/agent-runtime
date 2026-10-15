@@ -44,6 +44,22 @@ contain breaking changes and are coordinated with consumer proposals.
   `UnsupportedCapability`, built by `RuntimeError::unsupported_capability`. The
   error kind is `Config` and it is not retryable. `FailureClass` was already
   `#[non_exhaustive]`; `UnsupportedCapability` is too.
+- External tool dispatch, behind `external-agent`. `ExternalTurnRequest::tools`
+  carries an `ExternalToolDispatch` handle, which lists the session's authorized
+  tools, less the names given to `RuntimeBuilder::external_excluded_tools`, and
+  runs one call at a time through the runtime's tool path. Dispatched calls and
+  their results commit to canonical history in order around the backend's text.
+  It sits beside the MCP bridge, which is unchanged: `ExternalToolBridge`,
+  `runtime_tools` and `external-agent-bridge` keep their meaning, and MCP-bridged
+  calls still stay out of history. Also:
+  - Internal turns on an external session run on the backend.
+  - Tools can read a bounded, volatile log of the backend's own tool
+    observations through the session view.
+  - `registry.activate` through the handle returns skill instructions.
+  - Backends can report non-terminal `Diagnostic` events.
+  - An interrupted external turn is finalized without replay.
+  - Checkpoints gain the additive `ExternalToolCall` state;
+    `CHECKPOINT_SCHEMA_VERSION` and `TURN_TRANSITION_REVISION` are unchanged.
 
 ### Changed
 
@@ -51,9 +67,15 @@ contain breaking changes and are coordinated with consumer proposals.
   features, so a host's own `serde_json` parsing becomes exact for every float
   and somewhat slower on float-heavy input. The journal encoding needs it to
   read back the float it wrote.
+- `ExternalTurnRequest` gains a `tools` field. A backend test that builds the
+  request by hand sets `tools: ExternalToolDispatch::disabled()`.
 
 ### Fixed
 
+- A tool call cancelled, or past its deadline, while a tool-output processor
+  ran no longer loses its result. The real result, or the cancellation result,
+  commits once and `ToolCallCompleted` precedes the terminal event. A
+  cancellation result skips the remaining processors.
 - A child outcome the model already read through a host delegation tool is no
   longer delivered again by the automatic child-completion turn. The tool
   acknowledges the outcome against its tool call; once that call's non-error

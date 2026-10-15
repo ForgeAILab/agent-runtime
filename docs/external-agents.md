@@ -42,6 +42,25 @@ let runtime = RuntimeBuilder::new(model)
     .build()?;
 ```
 
+## Two paths to runtime tools
+
+Use the MCP bridge when the CLI should call runtime tools itself. With
+`runtime_tools` and feature `external-agent-bridge`, `request.bridge` gives
+the backend the loopback endpoint to inject into the CLI. Use the in-process
+`request.tools` handle (`ExternalToolDispatch`, feature `external-agent`)
+when the host brokers calls and wants them in canonical history. Both paths
+can be used in one turn; the handle does not require `runtime_tools`.
+
+| | MCP bridge | Dispatch handle |
+|---|---|---|
+| Listing | The whole runtime tool registry; authorization is checked on each call | The session's authorized tools, less host exclusions from `external_excluded_tools` |
+| Concurrency | Up to eight calls at once | One call at a time, in arrival order |
+| History | Calls and results stay out of canonical history | Calls and results commit in order around the backend's text |
+
+Both paths run the ordinary prepare → authorize → approve → invoke pipeline
+and emit tool events attributed to the turn. The handle lists with `specs()`
+and calls with `call(name, arguments).await`.
+
 ## Authority
 
 - **Bridge tools are runtime-dispatched.** When `runtime_tools` is on, the
@@ -51,7 +70,7 @@ let runtime = RuntimeBuilder::new(model)
   emits `ToolCallRequested`/`ToolCallCompleted`. Its exchange is not added to
   canonical history: for an external turn the CLI owns the conversation. The
   token is refused after the turn's terminal event.
-- **Everything else is the CLI's.** Built-in CLI tools and tools from injected
+- **CLI-owned tools stay CLI-owned.** Built-in CLI tools and tools from injected
   MCP servers run under the CLI's own policy. The runtime only observes them
   (`ExternalToolInvoked`/`ExternalToolCompleted`) and cannot approve them.
 - **Nothing prompts.** Backends run the CLI non-interactively. A tool outside

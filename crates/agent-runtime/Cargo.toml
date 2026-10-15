@@ -45,7 +45,7 @@ command-provider = ["agent-runtime-provider/command-provider"]
 # The external agent boundary: a turn executed by an installed coding agent
 # instead of by the provider/tool loop. Off by default; it adds no dependency,
 # only a seam.
-external-agent = []
+external-agent = ["agent-runtime-core/external-agent"]
 # Runtime-owned tools can optionally be exposed to an external agent through a
 # tiny streamable-HTTP MCP listener. Keep Tokio's socket APIs out of the
 # default graph: hosts that do not opt into the bridge pay no networking cost.

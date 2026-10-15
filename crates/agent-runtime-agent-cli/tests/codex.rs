@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use agent_runtime::agent::external::{
     AllowedTool, ExternalAgentBackend, ExternalAgentEvent, ExternalCapabilities, ExternalMcpServer,
-    ExternalMcpTransport, ExternalSessionId, ExternalToolBridge, ExternalToolPolicy,
-    ExternalTurnRequest, SkillBundle,
+    ExternalMcpTransport, ExternalSessionId, ExternalToolBridge, ExternalToolDispatch,
+    ExternalToolPolicy, ExternalTurnRequest, SkillBundle,
 };
 use agent_runtime_agent_cli::codex::{
     CODEX_API_KEY_ENV, CodexApiKey, CodexBackend, CodexConfig, CodexDecoder, toml_inline_table,
@@ -192,6 +192,7 @@ mod process_tests {
             resume,
             turn: TurnId::new("turn-1"),
             cancel: Cancellation::new(),
+            tools: ExternalToolDispatch::disabled(),
             capabilities: Arc::new(capabilities),
             bridge,
         }
@@ -422,6 +423,7 @@ async fn live_codex_lab_injection() {
             resume: None,
             turn: TurnId::new("live-codex-turn"),
             cancel: Cancellation::new(),
+            tools: ExternalToolDispatch::disabled(),
             capabilities: Arc::new(capabilities),
             bridge: None,
         })

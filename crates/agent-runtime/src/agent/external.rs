@@ -1,7 +1,7 @@
 //! The external agent boundary.
 //!
 //! An [`ExternalAgentBackend`] executes one whole turn outside the runtime's
-//! provider/tool loop. It exists for installed coding agents — a CLI that owns
+//! provider loop. It exists for installed coding agents — a CLI that owns
 //! its own conversation, runs its own tools under its own policy, and streams
 //! its own events. Such an agent is not a model, and presenting it as one
 //! would create two owners for history, tools, retries, and authority.
@@ -11,23 +11,34 @@
 //! The backend owns only what happens between a turn starting and its terminal
 //! event.
 //!
-//! What an external turn deliberately does not do: plan context, call a
-//! provider, maintain a prompt cache, dispatch tools, or retry. Those belong to
-//! the loop it replaced, and emitting their events for a turn that never made a
-//! provider call would make attempt, cache, and usage accounting lie.
+//! The backend's own tools remain observations. Host tools requested through
+//! [`ExternalToolDispatch`] are dispatched by the runtime with its ordinary
+//! authorization, approval, output bounds, history, and checkpoints. Handle
+//! calls run one at a time and commit in order around the backend's text.
+//! The optional MCP [`ExternalToolBridge`] lets the CLI call runtime tools
+//! itself, with up to eight concurrent calls and no canonical history writes.
+//! Both paths can be used in one turn. Internal turns also run on the backend.
+//! Recovery interrupts unfinished external turns without re-entering the
+//! backend or replaying a dispatched call.
+//!
+//! External turns do not plan context, call providers, maintain prompt caches,
+//! or retry. Backend observations are available in a bounded, volatile log
+//! through the session view; they never become canonical runtime tool calls.
 
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use agent_runtime_core::cancel::Cancellation;
-use agent_runtime_core::content::UserInput;
+use agent_runtime_core::content::{ToolResultBlock, UserInput};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::ids::TurnId;
+use agent_runtime_core::tool::ToolSpec;
 use agent_runtime_core::usage::UsageDelta;
 use async_trait::async_trait;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 
 pub use crate::agent::external_capabilities::{
     AllowedTool, ExternalCapabilities, ExternalMcpServer, ExternalMcpTransport, ExternalToolBridge,
@@ -88,6 +99,204 @@ impl fmt::Display for ExternalSessionId {
     }
 }
 
+/// A turn-scoped channel into the runtime's ordinary tool path.
+#[derive(Clone, Debug)]
+pub struct ExternalToolDispatch {
+    specs: Arc<Vec<ToolSpec>>,
+    sender: Option<mpsc::UnboundedSender<ExternalToolCall>>,
+    closed: Cancellation,
+}
+
+impl ExternalToolDispatch {
+    /// A handle that lists nothing and refuses every call.
+    pub fn disabled() -> Self {
+        let closed = Cancellation::new();
+        closed.cancel(agent_runtime_core::cancel::CancelReason::UserRequested);
+        Self {
+            specs: Arc::new(Vec::new()),
+            sender: None,
+            closed,
+        }
+    }
+
+    /// The tool specifications offered for this turn.
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.specs.as_ref().clone()
+    }
+
+    /// Runs one call through the runtime's tool path. Dropping the
+    /// returned future abandons the call.
+    pub async fn call(
+        &self,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Result<ToolResultBlock, RuntimeError> {
+        let name = name.into();
+        if self.closed.is_cancelled() {
+            return Err(RuntimeError::tool("external tool dispatch is closed"));
+        }
+        if !self.specs.iter().any(|spec| spec.name == name) {
+            return Err(RuntimeError::tool(format!(
+                "tool `{name}` is not offered by this handle"
+            )));
+        }
+        let (reply, receive) = oneshot::channel();
+        let cancel = Cancellation::new();
+        let _abandon = AbandonCall(cancel.clone());
+        self.sender
+            .as_ref()
+            .ok_or_else(|| RuntimeError::tool("external tool dispatch is closed"))?
+            .send(ExternalToolCall {
+                name,
+                arguments,
+                reply,
+                cancel,
+            })
+            .map_err(|_| RuntimeError::tool("external tool turn has ended"))?;
+        tokio::select! {
+            biased;
+            _ = self.closed.cancelled() => Err(RuntimeError::tool("external tool turn has ended")),
+            result = receive => result.unwrap_or_else(|_| Err(RuntimeError::tool("external tool turn has ended"))),
+        }
+    }
+
+    pub(crate) fn channel(
+        specs: Vec<ToolSpec>,
+    ) -> (Self, mpsc::UnboundedReceiver<ExternalToolCall>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                specs: Arc::new(specs),
+                sender: Some(sender),
+                closed: Cancellation::new(),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed
+            .cancel(agent_runtime_core::cancel::CancelReason::UserRequested);
+    }
+}
+
+struct AbandonCall(Cancellation);
+
+impl Drop for AbandonCall {
+    fn drop(&mut self) {
+        self.0
+            .cancel(agent_runtime_core::cancel::CancelReason::Host(
+                "call abandoned".to_owned(),
+            ));
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExternalToolCall {
+    pub(crate) name: String,
+    pub(crate) arguments: serde_json::Value,
+    pub(crate) reply: oneshot::Sender<Result<ToolResultBlock, RuntimeError>>,
+    pub(crate) cancel: Cancellation,
+}
+
+/// An entry in the volatile log of tools the BACKEND ran, not runtime tool calls.
+/// `DispatchedCall` is only a position marker for a runtime call in canonical history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendToolObservation {
+    /// Backend call id, or the canonical runtime call id for a dispatch marker.
+    pub id: String,
+    /// Backend tool name; empty for an outcome whose invocation was dropped.
+    pub name: String,
+    /// Backend detail, bounded to 8 KiB of JSON with an explicit truncation marker.
+    pub detail: serde_json::Value,
+    /// Invocation, outcome, or canonical-history dispatch position.
+    pub kind: BackendToolObservationKind,
+}
+
+/// Distinguishes tools the BACKEND ran from markers for runtime-dispatched calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendToolObservationKind {
+    /// The backend invoked its own tool.
+    Invocation,
+    /// The backend reported its own tool's outcome.
+    Outcome {
+        /// Whether the backend considered the tool successful.
+        ok: bool,
+    },
+    /// A runtime dispatched call at this position; its round lives in canonical history.
+    DispatchedCall,
+}
+
+/// Owned snapshot of tools the BACKEND ran, not runtime tool-call history.
+/// Volatile and turn-scoped: never persisted, and empty outside an external turn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BackendToolObservations {
+    /// Most recent entries in observation order, including dispatch position markers.
+    pub entries: Vec<BackendToolObservation>,
+    /// Number of oldest entries discarded by the entry or serialized-detail bounds.
+    pub dropped: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BackendToolObservationLog {
+    entries: std::collections::VecDeque<BackendToolObservation>,
+    bytes: usize,
+    dropped: usize,
+}
+
+impl BackendToolObservationLog {
+    pub(crate) fn snapshot(&self) -> BackendToolObservations {
+        BackendToolObservations {
+            entries: self.entries.iter().cloned().collect(),
+            dropped: self.dropped,
+        }
+    }
+
+    pub(crate) fn name(&self, id: &str) -> String {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.id == id && entry.kind != BackendToolObservationKind::DispatchedCall
+            })
+            .map(|entry| entry.name.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn push(&mut self, mut entry: BackendToolObservation) {
+        const DETAIL_BYTES: usize = 8 * 1024;
+        let encoded = serde_json::to_string(&entry.detail).expect("JSON detail serializes");
+        if encoded.len() > DETAIL_BYTES {
+            let mut end = DETAIL_BYTES;
+            loop {
+                while !encoded.is_char_boundary(end) {
+                    end -= 1;
+                }
+                entry.detail =
+                    serde_json::Value::String(format!("{}…[truncated]", &encoded[..end]));
+                let size = serde_json::to_vec(&entry.detail)
+                    .expect("JSON detail serializes")
+                    .len();
+                if size <= DETAIL_BYTES {
+                    break;
+                }
+                end = end.saturating_sub(size - DETAIL_BYTES);
+            }
+        }
+        self.bytes += serde_json::to_vec(&entry.detail)
+            .expect("JSON detail serializes")
+            .len();
+        self.entries.push_back(entry);
+        while self.entries.len() > 200 || self.bytes > 256 * 1024 {
+            let oldest = self.entries.pop_front().expect("nonempty bounded log");
+            self.bytes -= serde_json::to_vec(&oldest.detail)
+                .expect("JSON detail serializes")
+                .len();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+}
+
 /// One turn handed to a backend.
 #[derive(Debug)]
 pub struct ExternalTurnRequest {
@@ -105,9 +314,12 @@ pub struct ExternalTurnRequest {
     /// What the session injects into this turn. Already validated; a backend
     /// that supports injection re-applies all of it on every turn.
     pub capabilities: Arc<ExternalCapabilities>,
-    /// The runtime tool bridge for this turn, when the session exposes its
-    /// tools. Valid until this turn's terminal event.
+    /// The runtime MCP endpoint when `runtime_tools` and the
+    /// `external-agent-bridge` feature are enabled. Calls emit tool events
+    /// without entering canonical history. Valid until this turn's terminal event.
     pub bridge: Option<ExternalToolBridge>,
+    /// Runtime-owned host tools offered for this turn.
+    pub tools: ExternalToolDispatch,
 }
 
 /// Normalized events a backend streams while its turn runs.
@@ -156,6 +368,11 @@ pub enum ExternalAgentEvent {
         /// Disjoint counters, following the ordinary usage contract.
         usage: UsageDelta,
     },
+    /// Non-terminal information the host should surface without failing the turn.
+    Diagnostic {
+        /// Message, projected to at most 1,000 characters by the runtime.
+        message: String,
+    },
     /// Terminal: the turn finished, and accumulated text is its answer.
     Completed,
     /// Terminal: the turn failed.
@@ -175,7 +392,7 @@ impl ExternalAgentEvent {
 /// The stream a backend returns for one turn.
 pub type ExternalTurnStream = Pin<Box<dyn Stream<Item = ExternalAgentEvent> + Send>>;
 
-/// Executes one whole turn outside the runtime's provider/tool loop.
+/// Executes one whole turn outside the runtime's provider loop.
 #[async_trait]
 pub trait ExternalAgentBackend: Send + Sync + fmt::Debug {
     /// Runs one turn, streaming normalized events until a terminal one.
