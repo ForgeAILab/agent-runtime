@@ -34,6 +34,47 @@ use crate::client::McpConnection;
 use crate::descriptor::RemoteToolBinding;
 use crate::error::McpError;
 
+/// Host-chosen bounds and presentation for images returned by a remote tool.
+///
+/// Defaults to 5 MiB decoded bytes per image, eight images per result, and no
+/// detail hint. These are host policy, not settings supplied by the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpImageOptions {
+    max_image_bytes: usize,
+    max_images: usize,
+    default_detail: Option<String>,
+}
+
+impl Default for McpImageOptions {
+    fn default() -> Self {
+        Self {
+            max_image_bytes: 5 * 1024 * 1024,
+            max_images: 8,
+            default_detail: None,
+        }
+    }
+}
+
+impl McpImageOptions {
+    /// Bounds decoded bytes per image; zero omits every nonempty image.
+    pub fn with_max_image_bytes(mut self, max_image_bytes: usize) -> Self {
+        self.max_image_bytes = max_image_bytes;
+        self
+    }
+
+    /// Bounds images kept per result; zero omits every image.
+    pub fn with_max_images(mut self, max_images: usize) -> Self {
+        self.max_images = max_images;
+        self
+    }
+
+    /// Supplies the provider-specific detail hint, such as `"high"`.
+    pub fn with_default_detail(mut self, default_detail: impl Into<String>) -> Self {
+        self.default_detail = Some(default_detail.into());
+        self
+    }
+}
+
 /// One tool on one connected server.
 #[derive(Debug)]
 pub struct McpTool {
@@ -41,6 +82,7 @@ pub struct McpTool {
     binding: RemoteToolBinding,
     fallback_timeout: Duration,
     max_output_bytes: usize,
+    image_options: McpImageOptions,
 }
 
 impl McpTool {
@@ -56,7 +98,14 @@ impl McpTool {
             binding,
             fallback_timeout,
             max_output_bytes,
+            image_options: McpImageOptions::default(),
         }
+    }
+
+    /// Sets image bounds and detail for results from this tool.
+    pub fn with_image_options(mut self, image_options: McpImageOptions) -> Self {
+        self.image_options = image_options;
+        self
     }
 
     /// The server this tool lives on.
@@ -141,7 +190,7 @@ impl McpTool {
     /// Turns a protocol result into the canonical outcome, bounded.
     fn translate(&self, response: CallToolResult, limit: usize) -> ToolOutcome {
         let is_error = response.is_error.unwrap_or(false);
-        let rendered = render_blocks(&response.content, limit);
+        let (rendered, parts) = render_blocks(&response.content, limit, &self.image_options);
 
         // Structured content is the server's machine-readable answer; prefer
         // it as the outcome value so a consumer is not forced to re-parse
@@ -154,60 +203,117 @@ impl McpTool {
         if is_error {
             return ToolOutcome {
                 value: json!({ "error": rendered }),
-                content: ToolContent::inline(vec![ContentPart::text(rendered)]),
+                content: ToolContent::inline(parts),
                 is_error: true,
             };
         }
 
         ToolOutcome {
             value,
-            content: ToolContent::inline(vec![ContentPart::text(rendered)]),
+            content: ToolContent::inline(parts),
             is_error: false,
         }
     }
 }
 
-/// Renders content blocks into bounded text.
+/// Renders bounded text runs around images, keeping their original order.
 ///
-/// Binary payloads are described, not inlined. A base64 image in the
-/// transcript is a context-budget hazard and buys the model nothing it can act
-/// on here; the artifact store is the right home for the bytes, and that is a
-/// follow-on.
-fn render_blocks(blocks: &[ContentBlock], limit: usize) -> String {
+/// Text stops at the first overflowing block, as before. Images after that
+/// block still get their own bounds check and never spend the text budget.
+fn render_blocks(
+    blocks: &[ContentBlock],
+    limit: usize,
+    options: &McpImageOptions,
+) -> (String, Vec<ContentPart>) {
     let mut rendered = String::new();
+    let mut parts = Vec::new();
+    let mut image_count = 0;
+    let mut last_text_run = None;
 
     for block in blocks {
-        if !rendered.is_empty() {
-            rendered.push('\n');
-        }
-        match block {
-            ContentBlock::Text(text) => rendered.push_str(&text.text),
-            ContentBlock::Image(image) => rendered.push_str(&format!(
-                "[image omitted: {}, {} base64 bytes]",
-                image.mime_type,
-                image.data.len()
-            )),
-            ContentBlock::Audio(audio) => rendered.push_str(&format!(
+        let line = match block {
+            ContentBlock::Image(image) => {
+                let bytes = decoded_base64_len(&image.data);
+                let reason = if !matches!(
+                    image.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) {
+                    Some("unsupported image type")
+                } else if bytes > options.max_image_bytes {
+                    Some("exceeds per-image limit")
+                } else if image_count >= options.max_images {
+                    Some("exceeds per-result image count")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    format!(
+                        "[image omitted: {}, {bytes} bytes, {reason}]",
+                        image.mime_type
+                    )
+                } else {
+                    parts.push(ContentPart::Image {
+                        url: format!("data:{};base64,{}", image.mime_type, image.data),
+                        detail: options.default_detail.clone(),
+                    });
+                    image_count += 1;
+                    continue;
+                }
+            }
+            _ if rendered.len() > limit => continue,
+            ContentBlock::Text(text) => text.text.clone(),
+            ContentBlock::Audio(audio) => format!(
                 "[audio omitted: {}, {} base64 bytes]",
                 audio.mime_type,
                 audio.data.len()
-            )),
-            ContentBlock::Resource(_) => rendered.push_str("[embedded resource omitted]"),
-            ContentBlock::ResourceLink(link) => {
-                rendered.push_str(&format!("[resource link: {}]", link.uri));
-            }
-            // `ContentBlock` is `#[non_exhaustive]`: a protocol revision may
-            // add a block kind this build has never seen. Naming it is more
-            // useful than dropping it silently.
-            _ => rendered.push_str("[unsupported content omitted]"),
-        }
+            ),
+            ContentBlock::Resource(_) => "[embedded resource omitted]".to_owned(),
+            ContentBlock::ResourceLink(link) => format!("[resource link: {}]", link.uri),
+            // `ContentBlock` is `#[non_exhaustive]`: name a future block
+            // rather than dropping it silently.
+            _ => "[unsupported content omitted]".to_owned(),
+        };
 
         if rendered.len() > limit {
-            break;
+            continue;
+        }
+        let append_start = rendered.len();
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        let line_start = rendered.len();
+        rendered.push_str(&line);
+        if let Some(ContentPart::Text { text }) = parts.last_mut() {
+            text.push_str(&rendered[append_start..]);
+        } else {
+            last_text_run = Some((parts.len(), line_start));
+            parts.push(ContentPart::text(line));
         }
     }
 
-    truncate_on_char_boundary(rendered, limit)
+    if rendered.len() > limit {
+        rendered = truncate_on_char_boundary(rendered, limit);
+        if let Some((index, start)) = last_text_run {
+            // Earlier runs fit. If the limit falls on this run's separator,
+            // the marker's leading newline supplies that separator instead.
+            parts[index] = ContentPart::text(&rendered[start..]);
+        }
+    }
+    if parts.is_empty() {
+        parts.push(ContentPart::text(""));
+    }
+    (rendered, parts)
+}
+
+/// Counts decoded bytes without allocating a second copy of the payload.
+fn decoded_base64_len(data: &str) -> usize {
+    let padding = data
+        .bytes()
+        .rev()
+        .take(2)
+        .take_while(|b| *b == b'=')
+        .count();
+    (data.len() / 4 * 3 + data.len() % 4 * 3 / 4).saturating_sub(padding)
 }
 
 /// Truncates to `limit` bytes, saying so, without splitting a character.
@@ -230,38 +336,379 @@ fn truncate_on_char_boundary(text: String, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{McpClient, McpServerConfig, RemoteTool, bind_remote_tool};
     use rmcp::model::{ImageContent, TextContent};
 
     fn text_block(text: &str) -> ContentBlock {
         ContentBlock::Text(TextContent::new(text))
     }
 
-    fn image_block(bytes: usize) -> ContentBlock {
-        ContentBlock::Image(ImageContent::new("A".repeat(bytes), "image/png"))
+    fn image_block(data: &str, mime: &str) -> ContentBlock {
+        ContentBlock::Image(ImageContent::new(data, mime))
+    }
+
+    async fn remote_tool() -> McpTool {
+        #[derive(Debug)]
+        struct Server;
+        impl rmcp::ServerHandler for Server {}
+
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        tokio::spawn(async move {
+            let running = rmcp::serve_server(Server, server).await.unwrap();
+            let _ = running.waiting().await;
+        });
+        let connection = McpClient::new()
+            .connect_over("fake", client, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let binding = bind_remote_tool(
+            &McpServerConfig::stdio("fake", "unused"),
+            &RemoteTool::new("screenshot"),
+        )
+        .unwrap();
+        McpTool::new(Arc::new(connection), binding, Duration::from_secs(5), 1024)
+    }
+
+    #[test]
+    fn image_options_have_bounded_defaults() {
+        let options = McpImageOptions::default();
+        assert_eq!(options.max_image_bytes, 5 * 1024 * 1024);
+        assert_eq!(options.max_images, 8);
+        assert_eq!(options.default_detail, None);
     }
 
     #[test]
     fn text_blocks_concatenate_in_order() {
-        let rendered = render_blocks(&[text_block("first"), text_block("second")], 1024);
+        let (rendered, parts) = render_blocks(
+            &[text_block("first"), text_block("second")],
+            1024,
+            &McpImageOptions::default(),
+        );
         assert_eq!(rendered, "first\nsecond");
+        assert_eq!(parts, vec![ContentPart::text(rendered)]);
     }
 
-    #[test]
-    fn an_image_records_metadata_not_bytes() {
-        let rendered = render_blocks(&[image_block(4096)], 1024);
-        assert!(rendered.contains("image/png"));
-        assert!(rendered.contains("4096"));
-        assert!(
-            !rendered.contains(&"A".repeat(64)),
-            "payload bytes must not reach the transcript"
+    #[tokio::test]
+    async fn an_image_within_bounds_follows_the_text() {
+        let data = "A".repeat(900_000 / 3 * 4);
+        let tool = remote_tool().await.with_image_options(
+            McpImageOptions::default()
+                .with_max_image_bytes(900_000)
+                .with_max_images(1)
+                .with_default_detail("high"),
+        );
+        let outcome = tool.translate(
+            CallToolResult::success(vec![
+                text_block("screenshot"),
+                image_block(&data, "image/png"),
+            ]),
+            1024,
+        );
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.value, json!("screenshot"));
+        assert_eq!(
+            outcome.content.as_inline().unwrap(),
+            &[
+                ContentPart::text("screenshot"),
+                ContentPart::Image {
+                    url: format!("data:image/png;base64,{data}"),
+                    detail: Some("high".to_owned()),
+                },
+            ]
         );
     }
 
     #[test]
+    fn an_image_over_the_byte_bound_names_the_size_and_reason() {
+        let data = "A".repeat(12 * 1024 * 1024 / 3 * 4);
+        let (rendered, parts) = render_blocks(
+            &[image_block(&data, "image/png")],
+            1024,
+            &McpImageOptions::default(),
+        );
+        assert_eq!(
+            rendered,
+            "[image omitted: image/png, 12582912 bytes, exceeds per-image limit]"
+        );
+        assert_eq!(parts, vec![ContentPart::text(rendered)]);
+    }
+
+    #[test]
+    fn decoded_sizes_account_for_standard_base64_padding() {
+        for (data, bytes) in [
+            ("", 0),
+            ("AA==", 1),
+            ("AAA=", 2),
+            ("AAAA", 3),
+            ("AAAAAA==", 4),
+            ("AAAAAAA=", 5),
+            ("AAAAAAAA", 6),
+        ] {
+            assert_eq!(decoded_base64_len(data), bytes, "{data}");
+        }
+        let (_, parts) = render_blocks(
+            &[
+                image_block("AA==", "image/png"),
+                image_block("AAA=", "image/png"),
+            ],
+            1024,
+            &McpImageOptions::default().with_max_image_bytes(1),
+        );
+        assert!(matches!(parts[0], ContentPart::Image { .. }));
+        assert_eq!(
+            parts[1],
+            ContentPart::text("[image omitted: image/png, 2 bytes, exceeds per-image limit]")
+        );
+    }
+
+    #[test]
+    fn only_supported_image_types_pass_through() {
+        for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+            let (rendered, parts) =
+                render_blocks(&[image_block("AA==", mime)], 0, &McpImageOptions::default());
+            assert!(rendered.is_empty());
+            assert_eq!(
+                parts,
+                vec![ContentPart::Image {
+                    url: format!("data:{mime};base64,AA=="),
+                    detail: None,
+                }]
+            );
+        }
+        for mime in ["image/svg+xml", "image/bmp", "application/octet-stream"] {
+            let (rendered, parts) = render_blocks(
+                &[image_block("AA==", mime)],
+                1024,
+                &McpImageOptions::default(),
+            );
+            assert_eq!(
+                rendered,
+                format!("[image omitted: {mime}, 1 bytes, unsupported image type]")
+            );
+            assert_eq!(parts, vec![ContentPart::text(rendered)]);
+        }
+    }
+
+    #[test]
+    fn image_count_is_bounded_per_result() {
+        let options = McpImageOptions::default();
+        let blocks = vec![image_block("AA==", "image/png"); 9];
+        // Re-rendering starts a new result's count.
+        for _ in 0..2 {
+            let (rendered, parts) = render_blocks(&blocks, 1024, &options);
+            assert_eq!(
+                rendered,
+                "[image omitted: image/png, 1 bytes, exceeds per-result image count]"
+            );
+            assert_eq!(parts.len(), 9);
+            assert!(
+                parts[..8]
+                    .iter()
+                    .all(|p| matches!(p, ContentPart::Image { .. }))
+            );
+            assert_eq!(parts[8], ContentPart::text(rendered));
+        }
+    }
+
+    #[test]
+    fn omitted_images_do_not_spend_the_image_count() {
+        let (_, parts) = render_blocks(
+            &[
+                image_block("AA==", "image/svg+xml"),
+                image_block("AAA=", "image/png"),
+                image_block("AA==", "image/png"),
+            ],
+            1024,
+            &McpImageOptions::default()
+                .with_max_image_bytes(1)
+                .with_max_images(1),
+        );
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            ContentPart::text(concat!(
+                "[image omitted: image/svg+xml, 1 bytes, unsupported image type]\n",
+                "[image omitted: image/png, 2 bytes, exceeds per-image limit]"
+            ))
+        );
+        assert!(matches!(parts[1], ContentPart::Image { .. }));
+    }
+
+    #[test]
+    fn zero_image_bounds_are_honored() {
+        for (options, reason) in [
+            (
+                McpImageOptions::default().with_max_image_bytes(0),
+                "exceeds per-image limit",
+            ),
+            (
+                McpImageOptions::default().with_max_images(0),
+                "exceeds per-result image count",
+            ),
+        ] {
+            let (rendered, parts) =
+                render_blocks(&[image_block("AA==", "image/png")], 1024, &options);
+            assert_eq!(
+                rendered,
+                format!("[image omitted: image/png, 1 bytes, {reason}]")
+            );
+            assert_eq!(parts, vec![ContentPart::text(rendered)]);
+        }
+    }
+
+    #[test]
+    fn images_separate_text_runs_without_spending_the_text_limit() {
+        let (rendered, parts) = render_blocks(
+            &[
+                text_block("first"),
+                text_block("second"),
+                image_block("AAAA", "image/png"),
+                text_block("third"),
+                text_block("fourth"),
+            ],
+            "first\nsecond\nthird\nfourth".len(),
+            &McpImageOptions::default(),
+        );
+        assert_eq!(rendered, "first\nsecond\nthird\nfourth");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], ContentPart::text("first\nsecond"));
+        assert!(matches!(parts[1], ContentPart::Image { .. }));
+        assert_eq!(parts[2], ContentPart::text("third\nfourth"));
+    }
+
+    #[test]
+    fn text_budget_is_shared_across_runs_and_later_images_survive_truncation() {
+        let (rendered, parts) = render_blocks(
+            &[
+                text_block("first"),
+                image_block("AA==", "image/png"),
+                text_block("€€"),
+                text_block("not rendered"),
+                image_block("AAA=", "image/jpeg"),
+            ],
+            8,
+            &McpImageOptions::default(),
+        );
+        assert_eq!(rendered, "first\n\n[truncated: 6 of 12 bytes shown]");
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], ContentPart::text("first"));
+        assert!(matches!(parts[1], ContentPart::Image { .. }));
+        assert_eq!(
+            parts[2],
+            ContentPart::text("\n[truncated: 6 of 12 bytes shown]")
+        );
+        assert!(matches!(parts[3], ContentPart::Image { .. }));
+    }
+
+    #[test]
+    fn text_only_truncation_stops_at_the_first_overflowing_block() {
+        let (rendered, parts) = render_blocks(
+            &[text_block("abc"), text_block("def"), text_block("ignored")],
+            3,
+            &McpImageOptions::default(),
+        );
+        assert_eq!(rendered, "abc\n[truncated: 3 of 7 bytes shown]");
+        assert_eq!(parts, vec![ContentPart::text(rendered)]);
+    }
+
+    #[test]
+    fn truncating_at_a_text_run_boundary_preserves_the_joined_text() {
+        let (rendered, parts) = render_blocks(
+            &[
+                text_block("first"),
+                image_block("AA==", "image/png"),
+                text_block("second"),
+            ],
+            5,
+            &McpImageOptions::default(),
+        );
+        assert_eq!(rendered, "first\n[truncated: 5 of 12 bytes shown]");
+        assert_eq!(parts[0], ContentPart::text("first"));
+        assert_eq!(
+            parts[2],
+            ContentPart::text("[truncated: 5 of 12 bytes shown]")
+        );
+    }
+
+    #[test]
+    fn non_image_blocks_keep_their_text_rendering() {
+        let blocks = serde_json::from_value::<Vec<ContentBlock>>(json!([
+            { "type": "audio", "mimeType": "audio/wav", "data": "AA==" },
+            { "type": "resource", "resource": { "uri": "file:///a", "text": "a" } },
+            { "type": "resource_link", "uri": "file:///b", "name": "b" }
+        ]))
+        .unwrap();
+        let (rendered, parts) = render_blocks(&blocks, 1024, &McpImageOptions::default());
+        assert_eq!(
+            rendered,
+            concat!(
+                "[audio omitted: audio/wav, 4 base64 bytes]\n",
+                "[embedded resource omitted]\n",
+                "[resource link: file:///b]"
+            )
+        );
+        assert_eq!(parts, vec![ContentPart::text(rendered)]);
+    }
+
+    #[tokio::test]
+    async fn structured_content_wins_and_errors_keep_images() {
+        let tool = remote_tool().await;
+        let mut response = CallToolResult::success(vec![
+            text_block("before"),
+            image_block("AA==", "image/png"),
+            text_block("after"),
+        ]);
+        response.structured_content = Some(json!({ "answer": 42 }));
+        let success = tool.translate(response.clone(), 1024);
+        assert_eq!(success.value, json!({ "answer": 42 }));
+        assert!(!success.is_error);
+
+        response.structured_content = None;
+        let unstructured = tool.translate(response.clone(), 1024);
+        assert_eq!(unstructured.value, json!("before\nafter"));
+        assert_eq!(unstructured.content, success.content);
+
+        response.structured_content = Some(json!({ "ignored": true }));
+        response.is_error = Some(true);
+        let error = tool.translate(response, 1024);
+        assert!(error.is_error);
+        assert_eq!(error.value, json!({ "error": "before\nafter" }));
+        assert_eq!(error.content, success.content);
+        assert!(matches!(
+            error.content.as_inline().unwrap()[1],
+            ContentPart::Image { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_and_image_only_results_have_text_only_values() {
+        let tool = remote_tool().await;
+        let empty = tool.translate(CallToolResult::success(vec![]), 1024);
+        assert_eq!(empty.value, json!(""));
+        assert_eq!(empty.content.as_inline().unwrap(), &[ContentPart::text("")]);
+
+        let image = tool.translate(
+            CallToolResult::success(vec![image_block("AA==", "image/png")]),
+            0,
+        );
+        assert_eq!(image.value, json!(""));
+        assert_eq!(image.content.len(), 1);
+        assert!(matches!(
+            image.content.as_inline().unwrap()[0],
+            ContentPart::Image { .. }
+        ));
+    }
+
+    #[test]
     fn an_oversized_result_is_truncated_with_a_marker() {
-        let rendered = render_blocks(&[text_block(&"x".repeat(10_000))], 512);
+        let (rendered, parts) = render_blocks(
+            &[text_block(&"x".repeat(10_000))],
+            512,
+            &McpImageOptions::default(),
+        );
         assert!(rendered.contains("[truncated:"));
         assert!(rendered.len() < 700);
+        assert_eq!(parts, vec![ContentPart::text(rendered)]);
     }
 
     #[test]
