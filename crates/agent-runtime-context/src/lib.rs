@@ -25,6 +25,7 @@ pub mod budget;
 pub mod cache;
 pub mod compaction;
 pub mod fragment;
+pub mod image_projection;
 pub mod plan;
 pub mod planner;
 pub mod prompt;
@@ -47,6 +48,7 @@ pub use fragment::{
     FragmentContent, FragmentId, FragmentKind, FragmentSource, Requirement, Sensitivity,
     ToolExchange,
 };
+pub use image_projection::{ImageProjectionReport, ImageWindow};
 pub use plan::{ContextPlan, PlanInputs, PlanSegment};
 pub use planner::{Compactor, ContextPlanner};
 pub use prompt::{

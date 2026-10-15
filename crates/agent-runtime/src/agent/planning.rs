@@ -502,7 +502,7 @@ impl RunPlanner {
     }
 
     /// The extra revisions this runtime folds into every plan fingerprint.
-    /// The context crate never populates these itself — the registry,
+    /// The context crate adds the optional image window — the registry,
     /// activation, compaction, and cache identities are the runtime's to know.
     fn plan_inputs(&self, revisions: &RunRevisions) -> PlanInputs {
         let mut inputs = PlanInputs::new()

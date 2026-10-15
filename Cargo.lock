@@ -81,8 +81,10 @@ version = "0.2.1"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
+ "base64 0.22.1",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
