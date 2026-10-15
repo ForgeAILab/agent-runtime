@@ -625,6 +625,8 @@ impl Driver {
                     .saturating_add(plan.reasoning_reserve()),
                 confidence: map_confidence(plan.confidence()),
                 capability_overflow_tokens: plan.budget_report().capability_overflow_tokens,
+                images_text_only: plan.image_projection_report().text_only,
+                images_windowed: plan.image_projection_report().window,
             },
         );
 
@@ -1541,6 +1543,68 @@ mod tests {
         );
     }
     use super::*;
+
+    #[tokio::test]
+    async fn text_only_history_image_emits_context_planned_projection_count() {
+        use agent_runtime_core::catalog::{Modality, ModelLimits, ResolvedModelProfile};
+        use agent_runtime_core::provider::ModelId;
+
+        use crate::provider::fake::FakeProvider;
+        use crate::runtime::{RuntimeBuilder, StartSession};
+
+        let provider = Arc::new(FakeProvider::text_reply("done"));
+        let mut profile = ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(128_000, 128_000, 4_096),
+        );
+        profile.input_modalities = vec![Modality::Text];
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider.clone())
+            .model_profile(profile)
+            .build()
+            .expect("runtime builds");
+        let session = runtime
+            .start_session(StartSession::new().with_history(vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Image {
+                        url: "data:image/png;base64,aW1hZ2U=".into(),
+                        detail: None,
+                    }],
+                },
+                Message::text(Role::Assistant, "image received"),
+            ]))
+            .await
+            .expect("session starts");
+        let mut events = session.subscribe();
+        session
+            .run(UserInput::text("continue"))
+            .await
+            .expect("turn completes");
+
+        let mut counts = Vec::new();
+        while let Some(envelope) = events.next().await {
+            match envelope.payload {
+                RuntimeEvent::ContextPlanned {
+                    images_text_only,
+                    images_windowed,
+                    ..
+                } => counts.push((images_text_only, images_windowed)),
+                RuntimeEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(counts, [(1, 0)]);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].messages.iter().all(|message| {
+            message
+                .content
+                .iter()
+                .all(|part| !matches!(part, ContentPart::Image { .. }))
+        }));
+    }
 
     fn projection(expected_read_tokens: Option<u64>) -> ProviderCacheProjection {
         ProviderCacheProjection {

@@ -153,6 +153,8 @@ fn summary(payload: &RuntimeEvent) -> String {
             reserved_tokens,
             confidence,
             capability_overflow_tokens,
+            images_text_only,
+            images_windowed,
         } => {
             let totals_str = totals
                 .iter()
@@ -162,8 +164,18 @@ fn summary(payload: &RuntimeEvent) -> String {
             let overflow = capability_overflow_tokens
                 .map(|tokens| format!(" capability_overflow={tokens}"))
                 .unwrap_or_default();
+            let text_only = if *images_text_only == 0 {
+                String::new()
+            } else {
+                format!(" images_text_only={images_text_only}")
+            };
+            let windowed = if *images_windowed == 0 {
+                String::new()
+            } else {
+                format!(" images_windowed={images_windowed}")
+            };
             format!(
-                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_tokens={input_tokens} input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}{overflow}",
+                "context_planned context={context} cache_plan={cache_plan} segments={segment_count} totals=[{}] input_tokens={input_tokens} input_budget={input_budget_tokens} reserved={reserved_tokens} confidence={confidence:?}{overflow}{text_only}{windowed}",
                 totals_str
             )
         }
@@ -706,29 +718,49 @@ mod tests {
         use agent_runtime_core::manifest::SegmentKind;
         use agent_runtime_registry::Fingerprint;
 
-        let env = envelope(
-            None,
-            RuntimeEvent::ContextPlanned {
-                context: Fingerprint::of("context"),
-                cache_plan: Fingerprint::of("cache"),
-                segment_count: 3,
-                totals: BTreeMap::from([(SegmentKind::new("history"), 42)]),
-                input_tokens: 420,
-                input_budget_tokens: 8000,
-                reserved_tokens: 512,
-                confidence: EstimationConfidence::Estimated,
-                capability_overflow_tokens: Some(101),
-            },
-        );
-        let line = log_line(&env);
-        assert_eq!(event_type(&env.payload), "context_planned");
-        assert!(line.contains("segments=3"));
-        assert!(line.contains("history=42"));
-        assert!(line.contains("input_tokens=420"));
-        assert!(line.contains("input_budget=8000"));
-        assert!(line.contains("reserved=512"));
-        // Rendered only when there is one, so an ordinary plan stays quiet.
-        assert!(line.contains("capability_overflow=101"), "{line}");
+        for (images_text_only, images_windowed) in [(0, 0), (2, 0), (0, 3), (2, 3)] {
+            let env = envelope(
+                None,
+                RuntimeEvent::ContextPlanned {
+                    context: Fingerprint::of("context"),
+                    cache_plan: Fingerprint::of("cache"),
+                    segment_count: 3,
+                    totals: BTreeMap::from([(SegmentKind::new("history"), 42)]),
+                    input_tokens: 420,
+                    input_budget_tokens: 8000,
+                    reserved_tokens: 512,
+                    confidence: EstimationConfidence::Estimated,
+                    capability_overflow_tokens: Some(101),
+                    images_text_only,
+                    images_windowed,
+                },
+            );
+            let line = log_line(&env);
+            assert_eq!(event_type(&env.payload), "context_planned");
+            assert!(line.contains("segments=3"));
+            assert!(line.contains("history=42"));
+            assert!(line.contains("input_tokens=420"));
+            assert!(line.contains("input_budget=8000"));
+            assert!(line.contains("reserved=512"));
+            // Rendered only when there is one, so an ordinary plan stays quiet.
+            assert!(line.contains("capability_overflow=101"), "{line}");
+            assert_eq!(
+                line.contains("images_text_only="),
+                images_text_only != 0,
+                "{line}"
+            );
+            assert_eq!(
+                line.contains("images_windowed="),
+                images_windowed != 0,
+                "{line}"
+            );
+            if images_text_only != 0 {
+                assert!(line.contains("images_text_only=2"), "{line}");
+            }
+            if images_windowed != 0 {
+                assert!(line.contains("images_windowed=3"), "{line}");
+            }
+        }
     }
 
     #[test]
