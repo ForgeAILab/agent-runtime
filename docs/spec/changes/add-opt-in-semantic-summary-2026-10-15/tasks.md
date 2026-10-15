@@ -40,7 +40,7 @@ completed_at:
 - [x] 4.5 Restore the coordinator-backed recovery conformance case.
 
 ## 5. Docs and release
-- [ ] 5.1 `CHANGELOG.md` Unreleased; scope the "no summary body crosses the
+- [x] 5.1 `CHANGELOG.md` Unreleased; scope the "no summary body crosses the
       facade" rule to LCM in `CHANGELOG.md` and `docs/migration-0.1.md`.
 - [ ] 5.2 Gate: fmt, clippy `-D warnings`, `cargo test --workspace
       --all-features`, the feature combinations, Rust 1.86, consumer-compat.
