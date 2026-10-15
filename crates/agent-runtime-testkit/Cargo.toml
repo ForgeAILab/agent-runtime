@@ -27,7 +27,7 @@ default = []
 provider-summary = ["agent-runtime/provider-summary", "agent-runtime-lcm/provider-summary"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
