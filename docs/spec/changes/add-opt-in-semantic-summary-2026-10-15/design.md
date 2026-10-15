@@ -53,7 +53,7 @@ Research on `main` at `a1bb927` found:
   - Alternative considered: allow both and arbitrate. The pipeline already
     refuses two projectors, purposes collide in usage attribution, and LCM's
     spec forbids two active histories. Rejected.
-- **D2 Additive idle API (owner to confirm).**
+- **D2 Additive idle API.**
   `SessionHandle::try_idle_semantic_compaction()` returns a
   `SemanticIdleCompactionAdmission` shaped like the pin line's result, with
   the protected summary, the fallback reason and the usage. The driver's idle
@@ -67,7 +67,7 @@ Research on `main` at `a1bb927` found:
   matches the pin line's behavior for the namespace, which the
   implementation task verifies first. With LCM configured, the existing
   import path is unchanged.
-- **D4 Neither strategy configured (owner to confirm).** Resume keeps
+- **D4 Neither strategy configured.** Resume keeps
   `main`'s fail-closed error. The pin line ignored the state, which is
   lossless because the flat summary never rewrites canonical history. Keeping
   `main`'s behavior means LCM hosts and unconfigured hosts see no change.
@@ -115,6 +115,5 @@ Research on `main` at `a1bb927` found:
 
 ## Open Questions
 
-- D2: is the additive idle API acceptable, rather than extending `Accepted`?
-- D4: keep fail-closed when neither strategy is configured, or ignore the
-  state as the pin line did?
+None. The owner approved the proposal on 2026-10-15 with D2 (additive idle
+API) and D4 (fail closed when neither strategy is configured) as proposed.

@@ -14,20 +14,17 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use serde::Deserialize;
-
 use agent_runtime_context::Sensitivity;
-use agent_runtime_core::artifact::{
-    ArtifactDigest, ArtifactId, ArtifactLineage, ArtifactProvenance, ArtifactRef,
-    ArtifactRetention, ArtifactSensitivity,
-};
+use agent_runtime_core::artifact::{ArtifactRef, ArtifactSensitivity};
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::error::RuntimeError;
-use agent_runtime_core::ids::{SessionId, ToolCallId, TurnId};
+use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::store::{SessionStateSensitivity, VersionedSessionState};
 use agent_runtime_core::usage::UsageDelta;
 use agent_runtime_lcm::{LcmOperationId, LcmRange, LcmSequence, LcmTimelineId, MAX_LCM_ID_CHARS};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
+
+use super::semantic_summary_state::SemanticSummaryState;
 
 /// The only legacy protected-state schema accepted by this decoder.
 const LEGACY_SCHEMA_VERSION: u32 = 1;
@@ -205,110 +202,6 @@ impl LegacySemanticSummary {
     }
 }
 
-/// Strict wire mirror for the old state.  The historical public decoder used
-/// permissive serde defaults; migration must reject both unknown top-level
-/// fields and unknown nested artifact metadata before mutation.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacySemanticSummaryWire {
-    schema_version: u32,
-    policy_revision: RegistryRevision,
-    omit_prefix: usize,
-    source_fingerprint: Fingerprint,
-    source_artifact: ArtifactRefWire,
-    summary: String,
-    summary_revision: RegistryRevision,
-    model_id: String,
-    model_revision: RegistryRevision,
-    purpose: String,
-    sensitivity: Sensitivity,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactRefWire {
-    id: ArtifactId,
-    digest: ArtifactDigestWire,
-    media_type: String,
-    byte_length: u64,
-    sensitivity: ArtifactSensitivity,
-    retention: ArtifactRetention,
-    provenance: ArtifactProvenanceWire,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactDigestWire {
-    algorithm: String,
-    hex: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactProvenanceWire {
-    session: SessionId,
-    #[serde(default)]
-    turn: Option<TurnId>,
-    #[serde(default)]
-    call: Option<ToolCallId>,
-    purpose: String,
-    #[serde(default)]
-    derived_from: Option<ArtifactLineageWire>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactLineageWire {
-    session: SessionId,
-    id: ArtifactId,
-    digest: ArtifactDigestWire,
-}
-
-impl From<ArtifactDigestWire> for ArtifactDigest {
-    fn from(value: ArtifactDigestWire) -> Self {
-        Self {
-            algorithm: value.algorithm,
-            hex: value.hex,
-        }
-    }
-}
-
-impl From<ArtifactLineageWire> for ArtifactLineage {
-    fn from(value: ArtifactLineageWire) -> Self {
-        Self {
-            session: value.session,
-            id: value.id,
-            digest: value.digest.into(),
-        }
-    }
-}
-
-impl From<ArtifactProvenanceWire> for ArtifactProvenance {
-    fn from(value: ArtifactProvenanceWire) -> Self {
-        Self {
-            session: value.session,
-            turn: value.turn,
-            call: value.call,
-            purpose: value.purpose,
-            derived_from: value.derived_from.map(Into::into),
-        }
-    }
-}
-
-impl From<ArtifactRefWire> for ArtifactRef {
-    fn from(value: ArtifactRefWire) -> Self {
-        Self {
-            id: value.id,
-            digest: value.digest.into(),
-            media_type: value.media_type,
-            byte_length: value.byte_length,
-            sensitivity: value.sensitivity,
-            retention: value.retention,
-            provenance: value.provenance.into(),
-        }
-    }
-}
-
 /// Decodes and validates one protected semantic-summary schema-v1 value.
 ///
 /// The function is pure: all failure paths happen before a caller can mutate
@@ -323,7 +216,7 @@ pub(crate) fn decode_legacy_semantic_summary(
     {
         return Err(import_conflict("protected state envelope is incompatible"));
     }
-    let wire: LegacySemanticSummaryWire = serde_json::from_value(persisted.value.clone())
+    let wire: SemanticSummaryState = serde_json::from_value(persisted.value.clone())
         .map_err(|_| import_conflict("protected state is malformed"))?;
     if wire.schema_version != LEGACY_SCHEMA_VERSION
         || !valid_revision(&wire.policy_revision)
@@ -340,7 +233,7 @@ pub(crate) fn decode_legacy_semantic_summary(
         return Err(import_conflict("protected state failed validation"));
     }
 
-    let source_artifact: ArtifactRef = wire.source_artifact.into();
+    let source_artifact = wire.source_artifact;
     if source_artifact.validate().is_err()
         || source_artifact.byte_length == 0
         || source_artifact.provenance.purpose != wire.purpose
@@ -458,8 +351,11 @@ fn import_conflict(reason: &'static str) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use agent_runtime_core::artifact::{ArtifactDigest, ArtifactProvenance};
+    use agent_runtime_core::artifact::{
+        ArtifactDigest, ArtifactId, ArtifactProvenance, ArtifactRetention,
+    };
     use agent_runtime_core::content::{ContentPart, ToolCall};
+    use agent_runtime_core::ids::ToolCallId;
     use agent_runtime_core::store::SessionStateSensitivity;
 
     use super::*;

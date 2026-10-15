@@ -45,8 +45,9 @@ use crate::agent::config::{DowngradePolicy, LoopConfig};
 use crate::agent::driver::Driver;
 use crate::capability::{ActivationBudget, CapabilityResolver};
 use crate::harness::{
-    ContextContributor, HarnessPipelineBuilder, HistoryProjector, LcmCoordinator,
-    LiveAbilityRuntime, ModelInterceptor, ToolOutputProcessor, ToolViewResolver, TurnCommitHook,
+    ContextContributor, HarnessPipelineBuilder, HistoryProjector, LCM_COMPONENT_ID, LcmCoordinator,
+    LiveAbilityRuntime, ModelInterceptor, SEMANTIC_SUMMARY_COMPONENT_ID,
+    SemanticSummaryCoordinator, ToolOutputProcessor, ToolViewResolver, TurnCommitHook,
 };
 use crate::hub::ScopeInputs;
 use crate::provider::retry::RetryPolicy;
@@ -443,6 +444,16 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Registers the flat semantic-summary coordinator as the protected
+    /// history projector and turn-commit hook.
+    ///
+    /// Building rejects composition with LCM or `soft_on_turn_boundary(true)`.
+    pub fn semantic_summary(mut self, coordinator: Arc<SemanticSummaryCoordinator>) -> Self {
+        self.harness.history_projector(coordinator.clone());
+        self.harness.turn_commit_hook(coordinator);
+        self
+    }
+
     /// Sets an optional pressure target and hard provider-input ceiling.
     pub fn working_set_policy(mut self, policy: WorkingSetPolicy) -> Self {
         self.working_set = Some(policy);
@@ -759,6 +770,21 @@ impl RuntimeBuilder {
     /// same reasoning that already makes a missing model profile a build
     /// failure above, not a guessed context window.
     pub fn build(mut self) -> Result<Runtime, RuntimeError> {
+        if self
+            .harness
+            .contains_component_id(SEMANTIC_SUMMARY_COMPONENT_ID)
+        {
+            if self.lcm.is_some() || self.harness.contains_component_id(LCM_COMPONENT_ID) {
+                return Err(RuntimeError::config(
+                    "LCM and flat semantic summary (harness.semantic_summary) cannot be configured together",
+                ));
+            }
+            if self.soft_on_turn_boundary {
+                return Err(RuntimeError::config(
+                    "flat semantic summary (harness.semantic_summary) conflicts with soft_on_turn_boundary(true)",
+                ));
+            }
+        }
         self.config.steer_limits.validate()?;
         #[cfg(feature = "external-agent")]
         {
@@ -1711,5 +1737,214 @@ mod tests {
 
         assert!(reconciled.contract.resource_operations.is_empty());
         assert!(!reconciled.contract.evidence.resource_operations);
+    }
+}
+
+#[cfg(test)]
+mod semantic_summary_tests {
+    use super::*;
+    use crate::harness::{
+        ComponentDescriptor, LcmCoordinatorPolicy, LcmTimelineBinding, SemanticSummaryPolicy,
+        StaticLcmTimelineResolver, SummaryModel, SummaryModelRequest, SummaryModelResponse,
+        TurnCommitPatch, TurnCommitView,
+    };
+    use agent_runtime_core::artifact::{
+        ArtifactChunk, ArtifactError, ArtifactRead, ArtifactRef, ArtifactStore, ArtifactWrite,
+    };
+    use agent_runtime_core::catalog::ModelLimits;
+    use agent_runtime_core::error::ErrorKind;
+    use agent_runtime_core::ids::SessionId;
+    use agent_runtime_lcm::memory::InMemoryLcmStore;
+    use agent_runtime_lcm::{
+        LcmSummaryError, LcmSummaryModel, LcmSummaryModelRequest, LcmSummaryModelResponse,
+        LcmTimelineId,
+    };
+    use agent_runtime_provider::fake::FakeProvider;
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct UnusedArtifacts;
+
+    #[async_trait]
+    impl ArtifactStore for UnusedArtifacts {
+        async fn put(&self, _write: ArtifactWrite) -> Result<ArtifactRef, ArtifactError> {
+            panic!("build must not write artifacts")
+        }
+
+        async fn read(&self, _read: ArtifactRead) -> Result<ArtifactChunk, ArtifactError> {
+            panic!("build must not read artifacts")
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnusedSummaryModel {
+        revision: RegistryRevision,
+    }
+
+    #[async_trait]
+    impl SummaryModel for UnusedSummaryModel {
+        fn id(&self) -> &str {
+            "summary-model"
+        }
+        fn revision(&self) -> RegistryRevision {
+            self.revision.clone()
+        }
+        async fn summarize(
+            &self,
+            _request: &SummaryModelRequest,
+        ) -> Result<SummaryModelResponse, RuntimeError> {
+            panic!("build must not summarize")
+        }
+    }
+
+    #[async_trait]
+    impl LcmSummaryModel for UnusedSummaryModel {
+        fn id(&self) -> &str {
+            "summary-model"
+        }
+        fn revision(&self) -> &RegistryRevision {
+            &self.revision
+        }
+        async fn summarize(
+            &self,
+            _request: &LcmSummaryModelRequest,
+        ) -> Result<LcmSummaryModelResponse, LcmSummaryError> {
+            panic!("build must not summarize")
+        }
+    }
+
+    fn summary() -> Arc<SemanticSummaryCoordinator> {
+        Arc::new(
+            SemanticSummaryCoordinator::new(
+                Arc::new(UnusedArtifacts),
+                Arc::new(UnusedSummaryModel {
+                    revision: RegistryRevision::new("model-v1"),
+                }),
+                SemanticSummaryPolicy {
+                    input_budget_tokens: 100_000,
+                    ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    fn lcm() -> Arc<LcmCoordinator> {
+        let timeline = LcmTimelineId::new("composition-test");
+        let store = Arc::new(InMemoryLcmStore::new(timeline.clone()));
+        let binding = LcmTimelineBinding::new(
+            SessionId::new("composition-test"),
+            timeline,
+            RegistryRevision::new("binding-v1"),
+            store.authority(),
+        )
+        .unwrap();
+        Arc::new(
+            LcmCoordinator::new(
+                store,
+                Arc::new(UnusedSummaryModel {
+                    revision: RegistryRevision::new("model-v1"),
+                }),
+                Arc::new(StaticLcmTimelineResolver::new(binding)),
+                LcmCoordinatorPolicy {
+                    input_budget_tokens: 100_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    fn builder() -> RuntimeBuilder {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .provider(Arc::new(FakeProvider::text_reply("ok")))
+    }
+
+    fn assert_lcm_conflict(builder: RuntimeBuilder) {
+        let error = builder.build().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(error.message.contains("LCM"), "{error}");
+        assert!(
+            error.message.contains("harness.semantic_summary"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn semantic_summary_method_conflicts_with_lcm_in_either_order() {
+        assert_lcm_conflict(builder().lcm(lcm()).semantic_summary(summary()));
+        assert_lcm_conflict(builder().semantic_summary(summary()).lcm(lcm()));
+    }
+
+    #[test]
+    fn semantic_summary_generic_projector_conflicts_with_lcm() {
+        assert_lcm_conflict(builder().lcm(lcm()).history_projector(summary()));
+    }
+
+    #[derive(Debug)]
+    struct ComponentWithSummaryId;
+
+    #[async_trait]
+    impl TurnCommitHook for ComponentWithSummaryId {
+        fn descriptor(&self) -> ComponentDescriptor {
+            ComponentDescriptor::new(SEMANTIC_SUMMARY_COMPONENT_ID, RegistryRevision::new("v1"))
+        }
+        async fn after_commit(
+            &self,
+            _view: &TurnCommitView,
+        ) -> Result<TurnCommitPatch, RuntimeError> {
+            panic!("build must not commit turns")
+        }
+    }
+
+    #[test]
+    fn semantic_summary_generic_hook_identity_conflicts_with_lcm() {
+        assert_lcm_conflict(
+            builder()
+                .lcm(lcm())
+                .turn_commit_hook(Arc::new(ComponentWithSummaryId)),
+        );
+    }
+
+    #[test]
+    fn semantic_summary_conflicts_with_soft_turn_boundary() {
+        let error = builder()
+            .semantic_summary(summary())
+            .soft_on_turn_boundary(true)
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(
+            error.message.contains("harness.semantic_summary"),
+            "{error}"
+        );
+        assert!(
+            error.message.contains("soft_on_turn_boundary(true)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn semantic_summary_generic_hook_conflicts_with_soft_turn_boundary() {
+        let error = builder()
+            .turn_commit_hook(Arc::new(ComponentWithSummaryId))
+            .soft_on_turn_boundary(true)
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Config);
+        assert!(
+            error.message.contains("soft_on_turn_boundary(true)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn semantic_summary_alone_builds() {
+        builder().semantic_summary(summary()).build().unwrap();
     }
 }
