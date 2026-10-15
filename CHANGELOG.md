@@ -7,7 +7,40 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
 ### Added
+
+- Hosted web search. A `ProviderRequest` can declare the provider's own web
+  search, with an optional per-response cap, and a capability flag tells a
+  host beforehand whether an adapter supports it. Responses (including xAI)
+  maps it to `web_search`, Anthropic to `web_search_20250305` and Gemini to
+  `google_search`; Chat Completions reports it unsupported.
+  `RuntimeBuilder::hosted_tools` declares it on main-agent requests.
+  - `RuntimeEvent::HostedSearch` carries the query, the sources found and,
+    for a page step, the action (open page or find in page) with its URL
+    and pattern.
+  - Citations are rendered into assistant text as Markdown links, without
+    repeating a link the cited text already contains. Usage records the
+    search count.
+  - Provider-opaque blocks never enter canonical history, so a session can
+    continue on another provider.
+  - An Anthropic organization without web search gets a classified error a
+    host can fall back on.
+
+- Image content in tool results and requests.
+  - MCP `image` blocks become `ContentPart::Image`, bounded by host-set
+    `max_image_bytes` and `max_images` and limited to png, jpeg, gif and
+    webp. An image over a bound becomes a text line naming its type, size
+    and the reason.
+  - Chat Completions sends each run of tool-result images in one following
+    `user` message, labelled with its `tool_call_id`. Text-only results
+    serialize byte for byte as before.
+  - The context planner projects images before sizing and cache identity.
+    A text-only profile gets no image parts. `ContextPolicy`'s optional
+    `ImageWindow { inline: K }` keeps the newest images inline and replaces
+    older ones with a placeholder. `ContextPlanned` reports how many images
+    were replaced and why.
 
 - Pinned abilities and capability browse. `RuntimeBuilder::pinned_abilities`
   places named abilities in every authorized session's first activation
@@ -98,6 +131,8 @@ contain breaking changes and are coordinated with consumer proposals.
 - Image parts in a tool result are bounded by their estimated token cost
   rather than the length of their URL, so a large inline image that fits the
   output limit is no longer dropped.
+- The release lock resolves `rustls` 0.23.46, clearing RUSTSEC-2026-0346,
+  -0347, -0348 and -0349.
 ## [0.2.1] - 2026-10-08
 
 ### Fixed
