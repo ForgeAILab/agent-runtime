@@ -294,14 +294,18 @@ async fn inline_run_participates_in_shutdown_drain() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The provider ignores cancellation, so every turn holds shutdown until the
+// deadline. Paused time makes the measured interval the deadlines that fired,
+// not runner speed: one deadline is 30ms, one per turn would be 90ms.
+#[tokio::test(start_paused = true)]
 async fn one_shutdown_deadline_bounds_all_active_turns() {
+    const DEADLINE: Duration = Duration::from_millis(30);
     let observer = RecordingObserver::shared();
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
         .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
         .provider(Arc::new(UnresponsiveProvider))
         .observer(observer.clone())
-        .shutdown_timeout_ms(30)
+        .shutdown_timeout_ms(DEADLINE.as_millis() as u64)
         .build()
         .unwrap();
     let session = runtime.start_session(StartSession::new()).await.unwrap();
@@ -315,11 +319,12 @@ async fn one_shutdown_deadline_bounds_all_active_turns() {
         }
     }
 
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     session.shutdown().await.unwrap();
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_millis(150),
-        "shutdown applied its timeout once, not once per turn"
+        elapsed >= DEADLINE && elapsed < DEADLINE * 2,
+        "shutdown must apply its timeout once, not once per turn: {elapsed:?}"
     );
     assert!(matches!(
         observer.payloads().last(),
