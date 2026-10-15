@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T20:40:12Z
-updated_at: 2026-10-15T20:40:12Z
+updated_at: 2026-10-15T20:43:18Z
 ---
 
 ## Why
@@ -23,9 +23,12 @@ history. The dispatch handle has no transport. It lists only the session's
 authorized tools less host exclusions, runs calls one at a time, commits them
 to history in order with the backend's text, settles abandoned calls by
 phase, and never replays an interrupted turn. It also brings fixes that main
-lacks: internal turns on an external session reach the provider today, a skill
-activated from an external turn returns no instructions, and a tool
-cancelled with its turn under an output processor loses its result.
+lacks: internal turns on an external session reach the provider today, and a
+skill activated from an external turn returns no instructions (both checked
+on main `5fb0507`). It also guarantees that a tool cancelled with its turn
+under an output processor still commits its result. Main's `c20e928` covers
+the related failed-step case. Whether main also loses the cancelled result
+is settled by porting the tests first.
 
 ## What Changes
 
@@ -34,7 +37,8 @@ cancelled with its turn under an output processor loses its result.
   `ExternalToolBridge`. Main's `bridge: Option<ExternalToolBridge>` MCP
   endpoint keeps its name, feature, and behavior. **BREAKING** for code that
   builds `ExternalTurnRequest` by hand: it must set `tools`, and
-  `ExternalToolDispatch::disabled()` exists for that.
+  `ExternalToolDispatch::disabled()` exists for that. On main, the only such
+  code is the runtime itself and `agent-runtime-agent-cli/tests/{claude,codex}.rs`.
 - **Host exclusions** on the builder, for the handle's listing.
 - **Dispatched calls are runtime tool calls** committed to canonical history
   in order. Abandonment is settled by phase. Calls the CLI makes through the
@@ -60,8 +64,9 @@ cancelled with its turn under an output processor loses its result.
   only), `agent::driver::{external_turn, external_bridge, tools, tool_output,
   turn, recovery, mod}`, `runtime::{builder, engine, state,
   session::lifecycle}`, `harness::live_abilities::search`,
-  `agent-runtime-core::checkpoint`, `lib.rs` facade, and tests under
-  `crates/agent-runtime/tests/`.
+  `agent-runtime-core::checkpoint`, `lib.rs` facade, tests under
+  `crates/agent-runtime/tests/`, and request construction in
+  `crates/agent-runtime-agent-cli/tests/{claude,codex}.rs`.
 - Checkpoint compatibility: adds the additive `ExternalToolCall` state.
   `CHECKPOINT_SCHEMA_VERSION` stays 3 and `TURN_TRANSITION_REVISION` stays 4
   on main, as on the compat line. A build without `external-agent` rejects a

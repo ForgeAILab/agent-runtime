@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T20:40:12Z
-updated_at: 2026-10-15T20:40:12Z
+updated_at: 2026-10-15T20:43:18Z
 completed_at:
 ---
 
@@ -67,7 +67,8 @@ intent. Do not take the compat line's version of a file wholesale.
 - [ ] 5.1 Test: one turn with both the MCP bridge (`runtime_tools`, feature
   `external-agent-bridge`) and the handle. The MCP call leaves no history,
   and the handle call commits.
-- [ ] 5.2 All of main's existing external-agent tests pass unchanged except
+- [ ] 5.2 All of main's existing external-agent tests (including
+  `agent-runtime-agent-cli/tests/{claude,codex}.rs`) pass unchanged except
   for adding `tools: ExternalToolDispatch::disabled()` where a request is
   built by hand.
 
