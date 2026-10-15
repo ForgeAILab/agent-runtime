@@ -117,6 +117,7 @@ impl CommandAdapter for FixtureAdapter {
 
 fn capabilities(tools: bool) -> Capabilities {
     Capabilities {
+        hosted_web_search: false,
         streaming: true,
         tools,
         reasoning: ReasoningSupport::Controllable,
@@ -637,4 +638,31 @@ async fn wait_until_dead(pid: u32) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("descendant process {pid} survived bounded cleanup")
+}
+
+#[tokio::test]
+async fn hosted_search_is_unsupported_even_if_the_command_adapter_claims_it() {
+    use agent_runtime_core::provider::HostedTool;
+    let mut capabilities = capabilities(true);
+    capabilities.hosted_web_search = true;
+    let adapter = Arc::new(FixtureAdapter::new(capabilities));
+    let prepares = adapter.prepares.clone();
+    let provider = command_provider("exit 99".to_owned(), adapter, CommandLimits::default());
+    assert!(
+        !provider
+            .capabilities(&ModelId::new(MODEL))
+            .unwrap()
+            .hosted_web_search
+    );
+    assert!(!provider.describe()[0].capabilities.hosted_web_search);
+    let error = provider
+        .stream(
+            request().with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]),
+            context(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+    assert_eq!(prepares.load(Ordering::SeqCst), 0);
 }

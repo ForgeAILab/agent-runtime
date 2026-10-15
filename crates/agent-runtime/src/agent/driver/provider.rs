@@ -743,7 +743,7 @@ impl Driver {
                 }
                 UnsupportedFeature::Tools => self.config.downgrade.tools,
                 UnsupportedFeature::StructuredOutput => self.config.downgrade.structured_output,
-                UnsupportedFeature::Streaming => false,
+                UnsupportedFeature::Streaming | UnsupportedFeature::HostedWebSearch => false,
             };
             if !allowed {
                 return Err(ProviderError::unsupported(&[feature]));
@@ -764,7 +764,7 @@ impl Driver {
                     request.tool_choice = ToolChoice::None;
                 }
                 UnsupportedFeature::StructuredOutput => request.structured_output = None,
-                UnsupportedFeature::Streaming => {}
+                UnsupportedFeature::Streaming | UnsupportedFeature::HostedWebSearch => {}
             }
         }
         Ok(())
@@ -847,6 +847,7 @@ impl Driver {
             let mut response_progress = false;
             let mut reasoning = ReasoningAccumulator::default();
             let mut usage = UsageDelta::new();
+            let mut hosted_searches = 0u64;
             let mut cache_observation: Option<(Option<u64>, Option<u64>)> = None;
             let mut reached_cache_evidence_boundary = false;
             let mut assembler = ToolCallAssembler::default();
@@ -971,6 +972,16 @@ impl Driver {
                                 emit_coalesced(coalescer.drain());
                                 assembler.push(index, id, name, &arguments_fragment);
                             }
+                            ProviderStreamEvent::HostedSearch { query, sources } => {
+                                accepted_semantic_event = true;
+                                response_progress = true;
+                                hosted_searches = hosted_searches.saturating_add(1);
+                                emit_coalesced(coalescer.drain());
+                                emitter.emit(
+                                    turn.clone(),
+                                    RuntimeEvent::HostedSearch { query, sources },
+                                );
+                            }
                             ProviderStreamEvent::Usage { delta } => {
                                 accepted_semantic_event = true;
                                 response_progress = true;
@@ -1063,6 +1074,16 @@ impl Driver {
             // silently dropped on any exit.
             emit_coalesced(coalescer.drain());
 
+            if hosted_searches > 0
+                && !usage.iter().any(|(kind, _)| {
+                    kind == agent_runtime_core::usage::CounterKind::WebSearchRequests
+                })
+            {
+                usage.add(
+                    agent_runtime_core::usage::CounterKind::WebSearchRequests,
+                    hosted_searches,
+                );
+            }
             let mut tool_calls = Vec::new();
             if error.is_none() {
                 match assembler.finish(minter) {

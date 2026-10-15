@@ -37,6 +37,7 @@ pub mod catalog;
 pub mod command;
 pub mod fake;
 pub mod gemini;
+mod hosted;
 pub mod openai;
 pub mod ratelimit;
 pub mod responses;

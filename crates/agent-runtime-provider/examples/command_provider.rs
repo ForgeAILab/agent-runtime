@@ -45,6 +45,7 @@ mod enabled {
                 display_name: "Consumer model CLI".to_owned(),
                 vendor: "consumer".to_owned(),
                 capabilities: Capabilities {
+                    hosted_web_search: false,
                     streaming: true,
                     tools: false,
                     reasoning: ReasoningSupport::Unsupported,

@@ -176,10 +176,11 @@ pub mod prelude {
     pub use crate::metadata::{MetaValue, Metadata, VendorLimits};
     pub use crate::observer::EventObserver;
     pub use crate::provider::{
-        CacheResourceProvider, Capabilities, FinishReason, ModelDescriptor, ModelId,
-        PromptCacheControl, Provider, ProviderAttempt, ProviderCallContext, ProviderError,
-        ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent, ReasoningConfig,
-        ReasoningSupport, Sampling, ToolChoice, ToolSchema, UnsupportedFeature,
+        CacheResourceProvider, Capabilities, FinishReason, HostedSource, HostedTool,
+        ModelDescriptor, ModelId, PromptCacheControl, Provider, ProviderAttempt,
+        ProviderCallContext, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream,
+        ProviderStreamEvent, ReasoningConfig, ReasoningSupport, Sampling, ToolChoice, ToolSchema,
+        UnsupportedFeature,
     };
     pub use crate::provider_credential::{
         CredentialInvalidation, MAX_PROVIDER_CREDENTIAL_REVISION_CHARS,

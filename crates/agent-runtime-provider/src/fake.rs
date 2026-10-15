@@ -602,6 +602,12 @@ impl Provider for FakeProvider {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        if !request.hosted_tools.is_empty() && !self.descriptor.capabilities.hosted_web_search {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                "hosted web search is unsupported by this fake model",
+            ));
+        }
         request
             .validate_cache_identity()
             .map_err(|error| ProviderError::new(ProviderErrorKind::BadRequest, error))?;
@@ -974,5 +980,15 @@ mod tests {
         assert_eq!(provider.protocol_violation_count(), 1);
         provider.assert_all_requests_have_no_tools();
         provider.assert_tool_protocol_violations(1);
+    }
+    #[tokio::test]
+    async fn hosted_search_requires_the_configured_fake_capability() {
+        use agent_runtime_core::provider::HostedTool;
+        let provider = FakeProvider::text_reply("hi");
+        let request = ProviderRequest::new(ModelId::new("fake"), vec![])
+            .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]);
+        let error = provider.stream(request, ctx()).await.err().unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+        assert!(provider.requests().is_empty());
     }
 }
