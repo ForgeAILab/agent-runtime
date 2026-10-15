@@ -202,7 +202,9 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Sets the context policy (reserves and the capability sub-budget).
+    /// Sets the context policy (reserves, the capability sub-budget, and the
+    /// optional image window). Use [`ContextPolicy::with_image_window`] to
+    /// configure request image projection.
     pub fn context_policy(mut self, policy: ContextPolicy) -> Self {
         self.context_policy = Some(policy);
         self
@@ -1009,6 +1011,17 @@ mod tests {
     use agent_runtime_registry::Permission;
     use async_trait::async_trait;
     use serde_json::{Value, json};
+
+    #[test]
+    fn context_policy_carries_the_host_image_window() {
+        let policy = ContextPolicy::new(RegistryRevision::new("image-policy-1"), 64, 0)
+            .with_image_window(agent_runtime_context::ImageWindow { inline: 10 });
+        let builder = RuntimeBuilder::new(ModelId::new("fake")).context_policy(policy);
+        assert_eq!(
+            builder.context_policy.unwrap().image_window,
+            Some(agent_runtime_context::ImageWindow { inline: 10 })
+        );
+    }
 
     fn profile() -> ResolvedModelProfile {
         ResolvedModelProfile::explicit(

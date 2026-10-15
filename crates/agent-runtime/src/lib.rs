@@ -153,7 +153,7 @@ pub mod prelude {
     // -- context engine: fragments, planning, and the folded-in prompt builder
     pub use crate::context::{
         CharRatioSizer, ContextFragment, ContextPlan, ContextPlanner, ContextPolicy, FragmentKind,
-        SystemPromptBuilder,
+        ImageProjectionReport, ImageWindow, SystemPromptBuilder,
     };
 
     // -- registry hub: the administrative facade over every typed domain -----
