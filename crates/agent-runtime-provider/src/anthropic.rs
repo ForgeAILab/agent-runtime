@@ -38,7 +38,7 @@ use serde_json::{Map, Value, json};
 use agent_runtime_core::clock::{Deadline, SystemClock};
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::provider::{
-    Capabilities, FinishReason, ModelDescriptor, ModelId, PromptCacheControl, Provider,
+    Capabilities, FinishReason, HostedTool, ModelDescriptor, ModelId, PromptCacheControl, Provider,
     ProviderCacheBehavior, ProviderCacheContract, ProviderCallContext, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent, ReasoningConfig,
     ToolChoice,
@@ -97,6 +97,7 @@ impl AnthropicConfig {
             base_url: base_url.into(),
             model: ModelId::new(model),
             capabilities: Capabilities {
+                hosted_web_search: true,
                 // Anthropic caches only what the request explicitly marks, and
                 // allows four breakpoints per request.
                 cache: true,
@@ -313,6 +314,12 @@ impl<T: HttpTransport> AnthropicProvider<T> {
         request
             .validate_cache_identity()
             .map_err(|error| ProviderError::new(ProviderErrorKind::BadRequest, error))?;
+        if !request.hosted_tools.is_empty() && !self.config.capabilities.hosted_web_search {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                "hosted web search is unsupported by this model",
+            ));
+        }
         validate_cacheable_messages(request)?;
         validate_images(&request.messages)?;
         let mut system_parts: Vec<String> = Vec::new();
@@ -364,6 +371,23 @@ impl<T: HttpTransport> AnthropicProvider<T> {
                 })
             })
             .collect();
+        for tool in &request.hosted_tools {
+            match tool {
+                HostedTool::WebSearch { max_uses } => {
+                    let mut tool = json!({"type": "web_search_20250305", "name": "web_search"});
+                    if let Some(max_uses) = max_uses {
+                        tool["max_uses"] = json!(max_uses);
+                    }
+                    tools.push(tool);
+                }
+                _ => {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::Unsupported,
+                        "unsupported hosted tool",
+                    ));
+                }
+            }
+        }
         // Only the stable prefix needs a complete wire projection for its
         // marker. A changing tail may intentionally contain content this
         // adapter omits; that omission must not move the marker off the
@@ -816,6 +840,18 @@ enum WireContentBlock {
     Text {
         #[serde(default)]
         text: String,
+        #[serde(default)]
+        citations: Vec<Value>,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Value,
     },
     Thinking {
         #[serde(default)]
@@ -842,6 +878,9 @@ enum WireBlockDelta {
         #[serde(default)]
         text: String,
     },
+    CitationsDelta {
+        citation: Value,
+    },
     ThinkingDelta {
         #[serde(default)]
         thinking: String,
@@ -867,6 +906,8 @@ struct WireMessageDelta {
 #[derive(Debug, Default, Deserialize)]
 struct WireUsage {
     #[serde(default)]
+    server_tool_use: Option<WireServerToolUsage>,
+    #[serde(default)]
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
@@ -876,10 +917,45 @@ struct WireUsage {
     cache_read_input_tokens: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct WireServerToolUsage {
+    #[serde(default)]
+    web_search_requests: Option<u64>,
+}
+
+fn search_disabled(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    (message.contains("web_search") || message.contains("web search"))
+        && [
+            "not enabled",
+            "disabled",
+            "unavailable",
+            "not available",
+            "not allowed",
+            "not supported",
+            "permission",
+            "not permitted",
+            "not authorized",
+        ]
+        .iter()
+        .any(|phrase| message.contains(phrase))
+}
+
+fn search_disabled_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Unsupported,
+        "hosted web search is not enabled for this account",
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct WireError {
     #[serde(default, rename = "type")]
     kind: Option<String>,
+    /// Read only to recognize an organization that has not enabled hosted
+    /// search; never copied into the mapped error.
+    #[serde(default)]
+    message: Option<String>,
     #[serde(default)]
     retry_after_ms: Option<u64>,
 }
@@ -896,6 +972,11 @@ fn map_stop_reason(raw: &str) -> FinishReason {
 }
 
 fn map_error(error: WireError) -> ProviderError {
+    // Only the organization-disabled check reads the provider's text; the
+    // mapped error below still carries a fixed message.
+    if error.message.as_deref().is_some_and(search_disabled) {
+        return search_disabled_error();
+    }
     let (kind, message, safe_type) = match error.kind.as_deref() {
         Some("overloaded_error") => (
             ProviderErrorKind::Server,
@@ -962,9 +1043,42 @@ fn decode_event(data: &str) -> Result<WireEvent, ProviderError> {
     })
 }
 
+#[derive(Debug, Default)]
+struct SearchTextBlock {
+    text: String,
+    citations: Vec<(usize, agent_runtime_core::provider::HostedSource)>,
+}
+
+fn text_citation(
+    text: &str,
+    citation: &Value,
+) -> Option<(usize, agent_runtime_core::provider::HostedSource)> {
+    if citation.get("type").and_then(Value::as_str) != Some("web_search_result_location") {
+        return None;
+    }
+    let source = super::hosted::source(citation, "url")?;
+    // cited_text may quote the retrieved document rather than the generated
+    // answer. In that case the citation delta closes the current text span.
+    let end = citation
+        .get("cited_text")
+        .and_then(Value::as_str)
+        .and_then(|cited| {
+            text.rfind(cited)
+                .map(|start| start.saturating_add(cited.len()))
+        })
+        .unwrap_or(text.len());
+    Some((end, source))
+}
+
 /// Per-stream state for mapping block-indexed events onto neutral events.
 #[derive(Default)]
 struct StreamState {
+    buffer_text: bool,
+    text: BTreeMap<u32, SearchTextBlock>,
+    search_inputs: BTreeMap<u32, (String, String)>,
+    searches: BTreeMap<String, Option<String>>,
+    search_count: u64,
+    reported_searches: Option<u64>,
     /// Cumulative output tokens already reported as usage.
     reported_output: u64,
     /// The Messages stream has one input-usage boundary. A repeated boundary
@@ -992,6 +1106,26 @@ fn flush_initial_inputs(state: &mut StreamState, out: &mut Vec<ProviderStreamEve
     }
 }
 
+fn finish_text(state: &mut StreamState, index: u32, out: &mut Vec<ProviderStreamEvent>) {
+    if let Some(SearchTextBlock { text, citations }) = state.text.remove(&index) {
+        if !text.is_empty() {
+            out.push(ProviderStreamEvent::TextDelta {
+                text: super::hosted::render(&text, citations),
+            });
+        }
+    }
+}
+
+fn observe_search_usage(state: &mut StreamState, usage: &WireUsage) {
+    if let Some(count) = usage
+        .server_tool_use
+        .as_ref()
+        .and_then(|usage| usage.web_search_requests)
+    {
+        state.reported_searches = Some(state.reported_searches.unwrap_or(0).max(count));
+    }
+}
+
 /// Maps one decoded event to zero or more neutral events.
 ///
 /// Returns `true` when the stream reached its `message_stop` terminal.
@@ -1003,6 +1137,7 @@ fn event_to_events(
     match event {
         WireEvent::MessageStart { message } => {
             if let Some(usage) = message.usage {
+                observe_search_usage(state, &usage);
                 if state.usage_reported {
                     return Err(ProviderError::new(
                         ProviderErrorKind::MalformedStream,
@@ -1038,10 +1173,75 @@ fn event_to_events(
             index,
             content_block,
         } => match content_block {
-            WireContentBlock::Text { text } => {
-                if !text.is_empty() {
+            WireContentBlock::Text { text, citations } => {
+                if state.buffer_text || !citations.is_empty() {
+                    let citations = citations
+                        .iter()
+                        .filter_map(|citation| text_citation(&text, citation))
+                        .collect();
+                    state
+                        .text
+                        .insert(index, SearchTextBlock { text, citations });
+                } else if !text.is_empty() {
                     out.push(ProviderStreamEvent::TextDelta { text });
                 }
+            }
+            WireContentBlock::ServerToolUse { id, name, input } => {
+                state.buffer_text = true;
+                if name != "web_search" {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::Unsupported,
+                        "unsupported Anthropic server tool",
+                    ));
+                }
+                let query = input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                state.search_count = state.search_count.saturating_add(1);
+                state.searches.insert(id.clone(), query);
+                state.search_inputs.insert(index, (id, String::new()));
+            }
+            WireContentBlock::WebSearchToolResult {
+                tool_use_id,
+                content,
+            } => {
+                let query = state.searches.remove(&tool_use_id).ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorKind::MalformedStream,
+                        "Anthropic search result has no server tool use",
+                    )
+                })?;
+                if content
+                    .get("error_code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|code| {
+                        [
+                            "unavailable",
+                            "not_enabled",
+                            "web_search_not_enabled",
+                            "tool_not_enabled",
+                            "permission_denied",
+                        ]
+                        .contains(&code)
+                    })
+                {
+                    out.push(ProviderStreamEvent::HostedSearch {
+                        query,
+                        sources: Vec::new(),
+                    });
+                    return Err(search_disabled_error());
+                }
+                let sources = content
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|result| {
+                        result.get("type").and_then(Value::as_str) == Some("web_search_result")
+                    })
+                    .filter_map(|result| super::hosted::source(result, "url"))
+                    .collect();
+                out.push(ProviderStreamEvent::HostedSearch { query, sources });
             }
             WireContentBlock::Thinking { thinking } => {
                 if !thinking.is_empty() {
@@ -1076,8 +1276,16 @@ fn event_to_events(
         },
         WireEvent::ContentBlockDelta { index, delta } => match delta {
             WireBlockDelta::TextDelta { text } => {
-                if !text.is_empty() {
+                if state.buffer_text || state.text.contains_key(&index) {
+                    state.text.entry(index).or_default().text.push_str(&text);
+                } else if !text.is_empty() {
                     out.push(ProviderStreamEvent::TextDelta { text });
+                }
+            }
+            WireBlockDelta::CitationsDelta { citation } => {
+                let block = state.text.entry(index).or_default();
+                if let Some(citation) = text_citation(&block.text, &citation) {
+                    block.citations.push(citation);
                 }
             }
             WireBlockDelta::ThinkingDelta { thinking } => {
@@ -1103,7 +1311,9 @@ fn event_to_events(
             }
             WireBlockDelta::InputJsonDelta { partial_json } => {
                 state.initial_inputs.remove(&index);
-                if !partial_json.is_empty() {
+                if let Some((_, input)) = state.search_inputs.get_mut(&index) {
+                    input.push_str(&partial_json);
+                } else if !partial_json.is_empty() {
                     out.push(ProviderStreamEvent::ToolCallDelta {
                         index,
                         id: None,
@@ -1115,6 +1325,9 @@ fn event_to_events(
             WireBlockDelta::Unknown => {}
         },
         WireEvent::MessageDelta { delta, usage } => {
+            if let Some(usage) = &usage {
+                observe_search_usage(state, usage);
+            }
             if let Some(total) = usage.and_then(|usage| usage.output_tokens) {
                 // `output_tokens` is cumulative; report only the growth.
                 let grown = total.saturating_sub(state.reported_output);
@@ -1129,16 +1342,53 @@ fn event_to_events(
                 state.pending_finish = Some(map_stop_reason(reason));
             }
         }
-        WireEvent::MessageStop => {
-            flush_initial_inputs(state, out);
-            return Ok(true);
-        }
-        WireEvent::Error { error } => return Err(map_error(error)),
         WireEvent::ContentBlockStop { index } => {
+            finish_text(state, index, out);
             if let Some(input) = state.initial_inputs.remove(&index) {
                 emit_initial_input(index, input, out);
             }
+            if let Some((id, input)) = state
+                .search_inputs
+                .remove(&index)
+                .filter(|(_, input)| !input.is_empty())
+            {
+                let input: Value = serde_json::from_str(&input).map_err(|_| {
+                    ProviderError::new(
+                        ProviderErrorKind::MalformedStream,
+                        "invalid Anthropic hosted search input",
+                    )
+                })?;
+                state.searches.insert(
+                    id,
+                    input
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
         }
+        WireEvent::MessageStop => {
+            for index in state.text.keys().copied().collect::<Vec<_>>() {
+                finish_text(state, index, out);
+            }
+            flush_initial_inputs(state, out);
+            for (_, query) in std::mem::take(&mut state.searches) {
+                out.push(ProviderStreamEvent::HostedSearch {
+                    query,
+                    sources: Vec::new(),
+                });
+            }
+            if let Some(count) = state
+                .reported_searches
+                .or((state.search_count > 0).then_some(state.search_count))
+            {
+                out.push(ProviderStreamEvent::Usage {
+                    delta: UsageDelta::new().with(CounterKind::WebSearchRequests, count),
+                });
+            }
+            return Ok(true);
+        }
+        WireEvent::Error { error } => return Err(map_error(error)),
         WireEvent::Ping | WireEvent::Unknown => {}
     }
     Ok(false)
@@ -1206,8 +1456,53 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
                     "provider deadline elapsed",
                 ));
             }
-            result = &mut post => result.map_err(super::error_redaction::sanitize)?,
+            result = &mut post => result.map_err(|error| {
+                if search_disabled(&error.message) {
+                    search_disabled_error()
+                } else {
+                    super::error_redaction::sanitize(error)
+                }
+            })?,
         };
+        if !(200..300).contains(&response.status) {
+            let status = response.status;
+            let mut body = response.body;
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => return Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled")),
+                    _ = wait_for_deadline(ctx.deadline) => return Err(ProviderError::new(ProviderErrorKind::Timeout, "provider deadline elapsed")),
+                    chunk = body.next() => chunk,
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let chunk = chunk?;
+                if bytes.len().saturating_add(chunk.len()) > 1_048_576 {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::BadRequest,
+                        "Anthropic error response exceeded its bound",
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if let Some(error) = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("error").cloned())
+                .and_then(|error| serde_json::from_value::<WireError>(error).ok())
+            {
+                return Err(map_error(error));
+            }
+            return Err(ProviderError::new(
+                if status >= 500 {
+                    ProviderErrorKind::Server
+                } else {
+                    ProviderErrorKind::BadRequest
+                },
+                "Anthropic request was rejected",
+            ));
+        }
         // Read before the body moves: these headers describe the credential
         // that served this attempt, and nothing downstream can recover them
         // once the stream is running.
@@ -1216,6 +1511,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
         let cancel = ctx.cancel.clone();
         let deadline = ctx.deadline;
 
+        let buffer_text = !request.hosted_tools.is_empty();
         let out = stream! {
             // Emitted first so a consumer sees the limit state that governed
             // this attempt before any of its output.
@@ -1224,7 +1520,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
             }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
-            let mut state = StreamState::default();
+            let mut state = StreamState { buffer_text, ..StreamState::default() };
             let mut saw_event = false;
             let mut emitted_finish = false;
 
@@ -2758,5 +3054,182 @@ mod tests {
             "anthropic-beta".to_string(),
             "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".to_string()
         )));
+    }
+    #[tokio::test]
+    async fn hosted_search_tool_serialization_is_optional_and_preserves_the_cap() {
+        let request =
+            ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("search")]);
+        assert!(sent_payload(request.clone()).await.get("tools").is_none());
+        for max_uses in [None, Some(5)] {
+            let request = request
+                .clone()
+                .with_hosted_tools(vec![HostedTool::WebSearch { max_uses }]);
+            let payload = sent_payload(request).await;
+            let mut expected = json!({"type":"web_search_20250305","name":"web_search"});
+            if let Some(cap) = max_uses {
+                expected["max_uses"] = json!(cap);
+            }
+            // A legacy request may mark its last tool as the cache breakpoint.
+            let mut tool = payload["tools"][0].clone();
+            tool.as_object_mut().unwrap().remove("cache_control");
+            assert_eq!(tool, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_search_stream_renders_citations_and_prefers_reported_counts() {
+        for reported in [None, Some(4), Some(0)] {
+            let mut usage = json!({"output_tokens":3});
+            if let Some(count) = reported {
+                usage["server_tool_use"] = json!({"web_search_requests":count});
+            }
+            let frames = [
+                json!({"type":"message_start","message":{"usage":{"input_tokens":2}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"opaque-search-id","name":"web_search","input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust docs\"}"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"opaque-search-id","content":[{"type":"web_search_result","title":"Rust","url":"https://rust.test","encrypted_content":"encrypted-canary"}]}}),
+                json!({"type":"content_block_stop","index":1}),
+                json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Rust works."}}),
+                json!({"type":"content_block_delta","index":2,"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location","url":"https://rust.test","title":"Rust","cited_text":"Rust"}}}),
+                json!({"type":"content_block_delta","index":2,"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location","url":"https://rust.test","title":"Rust","cited_text":"works"}}}),
+                json!({"type":"content_block_stop","index":2}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":usage}),
+                json!({"type":"message_stop"}),
+            ];
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            let provider = AnthropicProvider::new(
+                ReplayTransport::new(vec![&body]),
+                AnthropicConfig::new("http://x/v1", "claude-test"),
+            );
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(
+                            ModelId::new("claude-test"),
+                            vec![Message::user("search")],
+                        )
+                        .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: Some(5) }]),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::Error { .. })),
+                "{events:?}"
+            );
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { query: Some(query), sources } if query == "rust docs" && sources[0].url == "https://rust.test")));
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "Rust [Rust](https://rust.test) works.")));
+            let mut usage = UsageDelta::new();
+            for event in &events {
+                if let ProviderStreamEvent::Usage { delta } = event {
+                    usage.merge(delta);
+                }
+            }
+            assert_eq!(
+                usage.get(CounterKind::WebSearchRequests),
+                reported.unwrap_or(1)
+            );
+            assert_eq!(usage.total(), 5);
+            let serialized = serde_json::to_string(&events).unwrap();
+            for opaque in [
+                "opaque-search-id",
+                "encrypted-canary",
+                "server_tool_use",
+                "web_search_tool_result",
+            ] {
+                assert!(!serialized.contains(opaque));
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::ToolCallDelta { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_search_disabled_errors_have_one_stable_classification() {
+        for message in [
+            "Web search is not enabled for your organization",
+            "web_search_20250305 is not available for this account",
+            "web_search is disabled",
+        ] {
+            let error = map_error(WireError {
+                kind: Some("invalid_request_error".into()),
+                message: Some(message.into()),
+                retry_after_ms: None,
+            });
+            assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+            assert_eq!(
+                error.message,
+                "hosted web search is not enabled for this account"
+            );
+        }
+        let mut state = StreamState::default();
+        let mut events = Vec::new();
+        event_to_events(decode_event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search","id":"s","input":{"query":"q"}}}"#).unwrap(), &mut state, &mut events).unwrap();
+        let error = event_to_events(decode_event(r#"{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"s","content":{"type":"web_search_tool_result_error","error_code":"unavailable"}}}"#).unwrap(), &mut state, &mut events).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+        assert_eq!(
+            error.message,
+            "hosted web search is not enabled for this account"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_search_disabled_http_json_is_classified_before_sse_parsing() {
+        #[derive(Debug)]
+        struct RejectedTransport;
+        #[async_trait]
+        impl HttpTransport for RejectedTransport {
+            async fn post_stream(
+                &self,
+                _: HttpRequest,
+            ) -> Result<crate::transport::ByteStream, ProviderError> {
+                unreachable!()
+            }
+            async fn post_response(
+                &self,
+                _: HttpRequest,
+            ) -> Result<crate::transport::HttpResponse, ProviderError> {
+                Ok(crate::transport::HttpResponse { status: 400, headers: Vec::new(), body: Box::pin(futures_util::stream::iter([Ok(br#"{"error":{"type":"invalid_request_error","message":"Web search is not enabled for your organization"}}"#.to_vec())])) })
+            }
+        }
+        let provider = AnthropicProvider::new(
+            RejectedTransport,
+            AnthropicConfig::new("http://x/v1", "claude-test"),
+        );
+        let error = provider
+            .stream(
+                ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("search")])
+                    .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]),
+                ctx(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+        assert_eq!(
+            error.message,
+            "hosted web search is not enabled for this account"
+        );
+    }
+    #[test]
+    fn hosted_search_citation_quotes_need_not_match_generated_text() {
+        let citation = json!({"type":"web_search_result_location", "url":"https://rust.test", "cited_text":"a passage from the source document"});
+        let (end, source) = text_citation("An answer.", &citation).unwrap();
+        assert_eq!(
+            super::super::hosted::render("An answer.", vec![(end, source)]),
+            "An answer. [rust.test](https://rust.test)"
+        );
     }
 }

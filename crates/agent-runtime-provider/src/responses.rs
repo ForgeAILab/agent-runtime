@@ -128,6 +128,7 @@ impl ResponsesConfig {
             base_url: base_url.into(),
             model: ModelId::new(model),
             capabilities: Capabilities {
+                hosted_web_search: true,
                 streaming: true,
                 tools: true,
                 reasoning: ReasoningSupport::Controllable,
@@ -373,6 +374,20 @@ impl<T: HttpTransport> ResponsesProvider<T> {
                 ),
             );
         }
+        if !request.hosted_tools.is_empty() {
+            object.insert(
+                "include".into(),
+                json!([
+                    "reasoning.encrypted_content",
+                    "web_search_call.action.sources"
+                ]),
+            );
+            let tools = object.entry("tools").or_insert_with(|| json!([]));
+            tools
+                .as_array_mut()
+                .expect("tools is an array")
+                .push(json!({"type": "web_search"}));
+        }
         if !request.tools.is_empty() || request.tool_choice != ToolChoice::Auto {
             object.insert(
                 "tool_choice".into(),
@@ -554,6 +569,7 @@ fn validate_request(
     config: &ResponsesConfig,
     request: &ProviderRequest,
 ) -> Result<(), ProviderError> {
+    super::hosted::validate_tools(request)?;
     request
         .validate_cache_identity()
         .map_err(|error| bad_request(&error))?;
@@ -1092,12 +1108,16 @@ enum PendingTerminal {
 #[derive(Debug, Default)]
 struct StreamState {
     terminal_output: TerminalOutputPolicy,
+    buffer_text: bool,
     tools: BTreeMap<u32, ToolSlot>,
     tool_by_item_id: BTreeMap<String, u32>,
     tool_by_call_id: BTreeMap<String, u32>,
     next_tool_index: u32,
     reasoning: BTreeMap<u32, ReasoningSlot>,
-    text: BTreeMap<u32, String>,
+    text: BTreeMap<(u32, u32), String>,
+    emitted_text: std::collections::BTreeSet<u32>,
+    searches: std::collections::BTreeSet<u32>,
+    reported_searches: Option<u64>,
     pending_terminal: Option<PendingTerminal>,
     event_count: usize,
     usage_reported: bool,
@@ -1268,7 +1288,7 @@ fn item_id(item: &Value) -> &str {
 
 fn append_text_delta(
     state: &mut StreamState,
-    output_index: u32,
+    text_index: (u32, u32),
     text: String,
     out: &mut Vec<ProviderStreamEvent>,
 ) -> Result<(), ProviderError> {
@@ -1276,24 +1296,26 @@ fn append_text_delta(
     if text.is_empty() {
         return Ok(());
     }
-    let existing = state.text.entry(output_index).or_default();
+    let existing = state.text.entry(text_index).or_default();
     if existing.len().saturating_add(text.len()) > MAX_TEXT_CHARS {
         return Err(malformed("Responses output text exceeded its bound"));
     }
     existing.push_str(&text);
-    out.push(ProviderStreamEvent::TextDelta { text });
+    if !state.buffer_text {
+        out.push(ProviderStreamEvent::TextDelta { text });
+    }
     state.saw_semantic_event = true;
     Ok(())
 }
 
 fn append_text_done(
     state: &mut StreamState,
-    output_index: u32,
+    text_index: (u32, u32),
     full_text: String,
     out: &mut Vec<ProviderStreamEvent>,
 ) -> Result<(), ProviderError> {
     validate_text(&full_text, "Responses output text")?;
-    let existing = state.text.entry(output_index).or_default();
+    let existing = state.text.entry(text_index).or_default();
     let suffix = if full_text == *existing {
         String::new()
     } else if full_text.starts_with(existing.as_str()) {
@@ -1306,7 +1328,9 @@ fn append_text_done(
     }
     if !suffix.is_empty() {
         existing.push_str(&suffix);
-        out.push(ProviderStreamEvent::TextDelta { text: suffix });
+        if !state.buffer_text {
+            out.push(ProviderStreamEvent::TextDelta { text: suffix });
+        }
         state.saw_semantic_event = true;
     }
     Ok(())
@@ -1427,21 +1451,83 @@ fn flush_reasoning_signatures(state: &mut StreamState, out: &mut Vec<ProviderStr
     }
 }
 
-fn output_item_content_text(item: &Value) -> Result<String, ProviderError> {
-    let Some(content) = item.get("content") else {
-        return Ok(String::new());
-    };
-    let Some(content) = content.as_array() else {
-        return Err(malformed("Responses message content was invalid"));
-    };
-    let mut text = String::new();
-    for part in content {
-        if part.get("type").and_then(Value::as_str) == Some("output_text") {
-            text.push_str(&required_string(part, "text")?);
+fn rendered_output_text(item: &Value) -> Result<String, ProviderError> {
+    let mut rendered = String::new();
+    for part in item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if part.get("type").and_then(Value::as_str) != Some("output_text") {
+            continue;
+        }
+        let text = required_string(part, "text")?;
+        let citations = part
+            .get("annotations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|annotation| {
+                if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                    return None;
+                }
+                let start = usize::try_from(annotation.get("start_index")?.as_u64()?).ok()?;
+                let end = usize::try_from(annotation.get("end_index")?.as_u64()?).ok()?;
+                if start > end || end > text.chars().count() {
+                    return None;
+                }
+                Some((
+                    super::hosted::char_offset(&text, end),
+                    super::hosted::source(annotation, "url")?,
+                ))
+            })
+            .collect();
+        rendered.push_str(&super::hosted::render(&text, citations));
+    }
+    Ok(rendered)
+}
+
+fn hosted_search(
+    state: &mut StreamState,
+    index: u32,
+    item: &Value,
+    out: &mut Vec<ProviderStreamEvent>,
+) {
+    state.buffer_text = true;
+    if !state.searches.insert(index) {
+        return;
+    }
+    let action = &item["action"];
+    let query = action
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let sources = action
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|source| super::hosted::source(source, "url"))
+        .collect();
+    out.push(ProviderStreamEvent::HostedSearch { query, sources });
+    state.saw_semantic_event = true;
+}
+
+fn flush_hosted_output(state: &mut StreamState, out: &mut Vec<ProviderStreamEvent>) {
+    for ((index, _), text) in &state.text {
+        if state.buffer_text && !state.emitted_text.contains(index) && !text.is_empty() {
+            out.push(ProviderStreamEvent::TextDelta { text: text.clone() });
         }
     }
-    validate_text(&text, "Responses output text")?;
-    Ok(text)
+    if let Some(count) = state
+        .reported_searches
+        .or((!state.searches.is_empty()).then_some(state.searches.len() as u64))
+    {
+        out.push(ProviderStreamEvent::Usage {
+            delta: UsageDelta::new().with(CounterKind::WebSearchRequests, count),
+        });
+    }
 }
 
 fn handle_output_item_added(
@@ -1469,8 +1555,11 @@ fn handle_output_item_added(
             Ok(())
         }
         "function_call" => state.add_tool_item(output_index, item, out),
-        "web_search_call"
-        | "x_search_call"
+        "web_search_call" => {
+            state.buffer_text = true;
+            Ok(())
+        }
+        "x_search_call"
         | "code_interpreter_call"
         | "file_search_call"
         | "mcp_call"
@@ -1490,7 +1579,34 @@ fn handle_output_item_done(
         .and_then(Value::as_str)
         .ok_or_else(|| malformed("Responses output item type was missing"))?;
     match item_type {
-        "message" => append_text_done(state, output_index, output_item_content_text(item)?, out),
+        "message" => {
+            let content = match item.get("content") {
+                None => &[][..],
+                Some(content) => content
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| malformed("Responses message content was invalid"))?,
+            };
+            for (content_index, part) in content.iter().enumerate() {
+                if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                    let content_index = u32::try_from(content_index)
+                        .map_err(|_| malformed("Responses message content was invalid"))?;
+                    append_text_done(
+                        state,
+                        (output_index, content_index),
+                        required_string(part, "text")?,
+                        out,
+                    )?;
+                }
+            }
+            if state.buffer_text && state.emitted_text.insert(output_index) {
+                let text = rendered_output_text(item)?;
+                if !text.is_empty() {
+                    out.push(ProviderStreamEvent::TextDelta { text });
+                }
+            }
+            Ok(())
+        }
         "reasoning" => finish_reasoning_item(state, output_index, item, out),
         "function_call" => {
             if !state.tools.contains_key(&output_index) {
@@ -1529,8 +1645,11 @@ fn handle_output_item_done(
             }
             Ok(())
         }
-        "web_search_call"
-        | "x_search_call"
+        "web_search_call" => {
+            hosted_search(state, output_index, item, out);
+            Ok(())
+        }
+        "x_search_call"
         | "code_interpreter_call"
         | "file_search_call"
         | "mcp_call"
@@ -1547,6 +1666,14 @@ fn response_usage(
     if state.usage_reported {
         return Ok(());
     }
+    state.reported_searches = [
+        "/usage/web_search_requests",
+        "/usage/server_tool_use/web_search_requests",
+        "/usage/server_side_tool_usage_details/web_search_calls",
+        "/tool_usage/web_search/num_requests",
+    ]
+    .iter()
+    .find_map(|path| response.pointer(path).and_then(Value::as_u64));
     let Some(usage) = response.get("usage") else {
         return Ok(());
     };
@@ -1680,14 +1807,13 @@ fn hydrate_response_output(
             .map_err(|_| malformed("Responses terminal output was too large"))?;
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         match item_type {
-            "message" | "reasoning" => {
+            "message" | "reasoning" | "web_search_call" => {
                 handle_output_item_done(state, output_index, item, out)?;
             }
             "function_call" => {
                 handle_output_item_done(state, output_index, item, out)?;
             }
-            "web_search_call"
-            | "x_search_call"
+            "x_search_call"
             | "code_interpreter_call"
             | "file_search_call"
             | "mcp_call"
@@ -1726,11 +1852,27 @@ fn event_to_events(
         "response.created" | "response.in_progress" | "response.queued" => {}
         "response.output_text.delta" | "response.text.delta" => {
             let output_index = optional_u32(&event, "output_index")?.unwrap_or(0);
-            append_text_delta(state, output_index, required_string(&event, "delta")?, out)?;
+            append_text_delta(
+                state,
+                (
+                    output_index,
+                    optional_u32(&event, "content_index")?.unwrap_or(0),
+                ),
+                required_string(&event, "delta")?,
+                out,
+            )?;
         }
         "response.output_text.done" | "response.text.done" => {
             let output_index = optional_u32(&event, "output_index")?.unwrap_or(0);
-            append_text_done(state, output_index, required_string(&event, "text")?, out)?;
+            append_text_done(
+                state,
+                (
+                    output_index,
+                    optional_u32(&event, "content_index")?.unwrap_or(0),
+                ),
+                required_string(&event, "text")?,
+                out,
+            )?;
         }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             let output_index = optional_u32(&event, "output_index")?.unwrap_or(0);
@@ -1780,6 +1922,7 @@ fn event_to_events(
             }
             flush_reasoning_signatures(state, out);
             response_usage(state, response, out)?;
+            flush_hosted_output(state, out);
             state.validate_tools()?;
             let reason = if state.saw_function_call {
                 FinishReason::ToolCalls
@@ -1797,6 +1940,7 @@ fn event_to_events(
             }
             flush_reasoning_signatures(state, out);
             response_usage(state, response, out)?;
+            flush_hosted_output(state, out);
             state.validate_tools()?;
             state.pending_terminal =
                 Some(PendingTerminal::Finish(incomplete_finish_reason(response)));
@@ -1951,6 +2095,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
         let terminal_output = self.config.terminal_output;
+        let buffer_text = !request.hosted_tools.is_empty();
         let out = stream! {
             // Emitted first so a consumer sees the limit state that governed
             // this attempt before any of its output.
@@ -1961,6 +2106,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
             let mut pending_bytes = Vec::new();
             let mut state = StreamState {
                 terminal_output,
+                buffer_text,
                 ..StreamState::default()
             };
             let mut done = false;
@@ -2980,5 +3126,115 @@ mod tests {
             cfg.extra_headers
                 .contains(&("X-Custom".to_string(), "value".to_string()))
         );
+    }
+    #[test]
+    fn hosted_search_declaration_is_optional_and_has_no_cap_on_the_wire() {
+        use agent_runtime_core::provider::HostedTool;
+        let provider = provider("");
+        let request = ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("search")]);
+        let plain = provider
+            .build_payload(&request, &SessionId::new("s"))
+            .unwrap();
+        assert!(plain.get("tools").is_none());
+        let request = request.with_hosted_tools(vec![HostedTool::WebSearch { max_uses: Some(5) }]);
+        let payload = provider
+            .build_payload(&request, &SessionId::new("s"))
+            .unwrap();
+        assert_eq!(payload["tools"], json!([{"type":"web_search"}]));
+        assert!(
+            payload["include"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("web_search_call.action.sources"))
+        );
+        assert!(
+            provider
+                .capabilities(&request.model)
+                .unwrap()
+                .hosted_web_search
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_search_stream_keeps_public_sources_citations_and_usage_only() {
+        use agent_runtime_core::provider::HostedTool;
+        for reported in [None, Some(7), Some(0)] {
+            let search = json!({"type":"web_search_call","id":"opaque-call-canary","encrypted_content":"opaque-canary","action":{"query":"rust docs","sources":[{"url":"https://rust.test","title":"Rust"}]}});
+            let message = json!({"type":"message","content":[
+                {"type":"output_text","text":"Rust works.","annotations":[{"type":"url_citation","start_index":0,"end_index":4,"title":"Rust","url":"https://rust.test"},{"type":"url_citation","start_index":5,"end_index":10,"title":"Rust","url":"https://rust.test"}]},
+                {"type":"output_text","text":"More.","annotations":[{"type":"url_citation","start_index":0,"end_index":4,"url":"https://rust.test"}]}
+            ]});
+            let mut usage = json!({"input_tokens":2,"output_tokens":3});
+            if let Some(count) = reported {
+                usage["server_side_tool_usage_details"] = json!({"web_search_calls":count});
+            }
+            let frames = [
+                json!({"type":"response.output_item.added","output_index":0,"item":search}),
+                json!({"type":"response.output_item.done","output_index":0,"item":search}),
+                json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Rust works."}),
+                json!({"type":"response.output_text.done","output_index":1,"content_index":0,"text":"Rust works."}),
+                json!({"type":"response.output_text.delta","output_index":1,"content_index":1,"delta":"More."}),
+                json!({"type":"response.output_text.done","output_index":1,"content_index":1,"text":"More."}),
+                json!({"type":"response.output_item.done","output_index":1,"item":message}),
+                json!({"type":"response.completed","response":{"output":[search,message],"usage":usage}}),
+            ];
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>()
+                + "data: [DONE]\n\n";
+            let request =
+                ProviderRequest::new(ModelId::new("grok-4.5"), vec![Message::user("search")])
+                    .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]);
+            let events = collect_events(&body, request).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::Error { .. })),
+                "{events:?}"
+            );
+            let searches: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::HostedSearch { query, sources } => Some((query, sources)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(searches.len(), 1);
+            assert_eq!(searches[0].0.as_deref(), Some("rust docs"));
+            assert_eq!(searches[0].1[0].url, "https://rust.test");
+            let text: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                text,
+                "Rust [Rust](https://rust.test) works.More [rust.test](https://rust.test)."
+            );
+            let mut usage = UsageDelta::new();
+            for event in &events {
+                if let ProviderStreamEvent::Usage { delta } = event {
+                    usage.merge(delta);
+                }
+            }
+            assert_eq!(
+                usage.get(CounterKind::WebSearchRequests),
+                reported.unwrap_or(1)
+            );
+            assert_eq!(usage.total(), 5);
+            assert!(
+                !serde_json::to_string(&events)
+                    .unwrap()
+                    .contains("opaque-canary")
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::ToolCallDelta { .. }))
+            );
+        }
     }
 }

@@ -563,14 +563,25 @@ impl fmt::Debug for CommandProvider {
 #[async_trait]
 impl Provider for CommandProvider {
     fn describe(&self) -> Vec<ModelDescriptor> {
-        self.models.clone()
+        self.models
+            .iter()
+            .cloned()
+            .map(|mut model| {
+                model.capabilities.hosted_web_search = false;
+                model
+            })
+            .collect()
     }
 
     fn capabilities(&self, model: &ModelId) -> Option<Capabilities> {
         self.models
             .iter()
             .find(|descriptor| &descriptor.id == model)
-            .map(|descriptor| descriptor.capabilities.clone())
+            .map(|descriptor| {
+                let mut capabilities = descriptor.capabilities.clone();
+                capabilities.hosted_web_search = false;
+                capabilities
+            })
     }
 
     async fn stream(

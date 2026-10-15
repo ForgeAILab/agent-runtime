@@ -36,6 +36,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::CachePlanChanged { .. } => "cache_plan_changed",
         RuntimeEvent::BudgetFailure { .. } => "budget_failure",
         RuntimeEvent::ProviderAttemptStarted { .. } => "provider_attempt_started",
+        RuntimeEvent::HostedSearch { .. } => "hosted_search",
         RuntimeEvent::TextDelta { .. } => "text_delta",
         RuntimeEvent::ReasoningDelta { .. } => "reasoning_delta",
         RuntimeEvent::ProviderAttemptOutputCommitted { .. } => "provider_attempt_output_committed",
@@ -356,6 +357,11 @@ fn summary(payload: &RuntimeEvent) -> String {
         RuntimeEvent::Downgrade { capability, detail } => {
             format!("downgrade {capability}: {detail}")
         }
+        RuntimeEvent::HostedSearch { query, sources } => format!(
+            "hosted_search query={} sources={}",
+            compact(&serde_json::to_value(query).unwrap_or(Value::Null)),
+            compact(&serde_json::to_value(sources).unwrap_or(Value::Null))
+        ),
         RuntimeEvent::Usage { record } => format!(
             "usage source={:?} {}",
             record.source,
@@ -846,5 +852,28 @@ mod tests {
         assert!(line.contains("observed_read=0"));
         assert!(line.contains("observed_write=none"));
         assert!(line.contains("missed=105000"));
+    }
+    #[test]
+    fn hosted_search_renders_public_query_and_sources() {
+        let event = RuntimeEvent::HostedSearch {
+            query: Some("rust docs".into()),
+            sources: vec![agent_runtime_core::provider::HostedSource {
+                title: Some("Rust".into()),
+                url: "https://rust.test".into(),
+            }],
+        };
+        assert_eq!(event_type(&event), "hosted_search");
+        let line = log_line(&envelope(Some("turn"), event));
+        assert!(line.contains("rust docs"));
+        assert!(line.contains("https://rust.test"));
+        let empty: RuntimeEvent =
+            serde_json::from_value(serde_json::json!({"event":"hosted_search"})).unwrap();
+        assert_eq!(
+            empty,
+            RuntimeEvent::HostedSearch {
+                query: None,
+                sources: Vec::new()
+            }
+        );
     }
 }

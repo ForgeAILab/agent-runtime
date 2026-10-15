@@ -263,6 +263,7 @@ fn parse_model(document: &Value, provider: &str, model: &str) -> Option<ModelRec
     }
 
     record.capabilities = Some(Capabilities {
+        hosted_web_search: false,
         streaming: true,
         tools: raw.tool_call.unwrap_or(false),
         reasoning: match raw.reasoning {

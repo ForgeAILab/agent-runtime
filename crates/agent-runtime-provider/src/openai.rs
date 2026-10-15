@@ -523,6 +523,7 @@ impl<T: HttpTransport> OpenAiProvider<T> {
 /// Runtime cannot plan explicit-breakpoint or synthetic behavior against a
 /// wire shape this adapter does not support.
 fn normalize_cache_capabilities(capabilities: &mut Capabilities) {
+    capabilities.hosted_web_search = false;
     // This generic adapter emits only an implicit routing key.  Normalize all
     // declarations through that one wire shape so an explicit/resource
     // contract cannot smuggle unsupported retention, key, maintenance, or
@@ -1324,6 +1325,12 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        if !request.hosted_tools.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                "hosted web search is unsupported by Chat Completions",
+            ));
+        }
         let tool_names = super::tool_names::ToolNames::new(&request);
         if request.model != self.config.model {
             return Err(ProviderError::new(
@@ -3609,5 +3616,35 @@ mod tests {
             azure.base_url,
             "https://my-resource.openai.azure.com/openai/v1"
         );
+    }
+    #[tokio::test]
+    async fn hosted_search_is_rejected_before_chat_completions_transport() {
+        use agent_runtime_core::provider::HostedTool;
+        let mut config = OpenAiConfig::new("https://example.test/v1", "glm");
+        config.capabilities.hosted_web_search = true;
+        let provider = OpenAiProvider::new(ReplayTransport::new(vec![]), config);
+        assert!(
+            !provider
+                .capabilities(&ModelId::new("glm"))
+                .unwrap()
+                .hosted_web_search
+        );
+        let request = ProviderRequest::new(ModelId::new("glm"), vec![Message::user("search")]);
+        assert!(
+            provider
+                .build_payload(&request, &SessionId::new("s"))
+                .get("tools")
+                .is_none()
+        );
+        let error = provider
+            .stream(
+                request.with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]),
+                ctx(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Unsupported);
+        assert!(provider.transport().requests().is_empty());
     }
 }

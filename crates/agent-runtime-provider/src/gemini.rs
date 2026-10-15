@@ -88,6 +88,7 @@ impl GeminiInteractionsConfig {
             base_url: base_url.into(),
             model: ModelId::new(model),
             capabilities: Capabilities {
+                hosted_web_search: true,
                 // Gemini serves a matching prefix from its own implicit cache;
                 // the adapter places no markers of its own.
                 cache: true,
@@ -256,6 +257,13 @@ impl<T: HttpTransport> GeminiInteractionsProvider<T> {
                         .collect(),
                 ),
             );
+        }
+        if !request.hosted_tools.is_empty() {
+            let tools = object.entry("tools").or_insert_with(|| json!([]));
+            tools
+                .as_array_mut()
+                .expect("tools is an array")
+                .push(json!({"type": "google_search"}));
         }
         if let Some(structured) = &request.structured_output {
             object.insert(
@@ -427,6 +435,7 @@ fn validate_request(
     config: &GeminiInteractionsConfig,
     request: &ProviderRequest,
 ) -> Result<(), ProviderError> {
+    super::hosted::validate_tools(request)?;
     request
         .validate_cache_identity()
         .map_err(|error| bad_request(&error))?;
@@ -896,6 +905,16 @@ enum WireStep {
     ModelOutput {
         #[serde(default)]
         content: Vec<WireContent>,
+        #[serde(default, rename = "groundingMetadata", alias = "grounding_metadata")]
+        grounding: Value,
+    },
+    GoogleSearchCall {
+        #[serde(default)]
+        arguments: SearchArguments,
+    },
+    GoogleSearchResult {
+        #[serde(default)]
+        result: Vec<Value>,
     },
     Thought {
         #[serde(default)]
@@ -918,6 +937,8 @@ enum WireStep {
 enum WireContent {
     Text {
         text: String,
+        #[serde(default)]
+        annotations: Vec<Value>,
     },
     #[serde(other)]
     Unknown,
@@ -926,6 +947,18 @@ enum WireContent {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireDelta {
+    GoogleSearchCall {
+        #[serde(default)]
+        arguments: SearchArguments,
+    },
+    GoogleSearchResult {
+        #[serde(default)]
+        result: Vec<Value>,
+    },
+    TextAnnotationDelta {
+        #[serde(default)]
+        annotations: Vec<Value>,
+    },
     Text {
         text: String,
     },
@@ -945,6 +978,10 @@ enum WireDelta {
 
 #[derive(Debug, Default, Deserialize)]
 struct WireInteraction {
+    #[serde(default, rename = "groundingMetadata", alias = "grounding_metadata")]
+    grounding: Value,
+    #[serde(default)]
+    candidates: Vec<Value>,
     #[serde(default)]
     status: String,
     #[serde(default)]
@@ -953,6 +990,8 @@ struct WireInteraction {
 
 #[derive(Debug, Default, Deserialize)]
 struct WireUsage {
+    #[serde(default)]
+    grounding_tool_count: Vec<GroundingToolCount>,
     #[serde(default)]
     /// Optional so an omitted cached-token field is not mistaken for an
     /// explicit zero. Gemini currently reports reads only; writes remain
@@ -967,6 +1006,20 @@ struct WireUsage {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct SearchArguments {
+    #[serde(default)]
+    queries: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GroundingToolCount {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    count: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct WireError {
     #[serde(default)]
     code: Value,
@@ -974,6 +1027,8 @@ struct WireError {
 
 #[derive(Debug)]
 enum ActiveStep {
+    HostedSearch { queries: Vec<String> },
+    HostedResult,
     ModelOutput { bytes: usize },
     Thought { bytes: usize, signed: bool },
     FunctionCall { arguments: String },
@@ -986,7 +1041,18 @@ enum PendingTerminal {
 }
 
 #[derive(Debug, Default)]
+struct SearchTextBlock {
+    text: String,
+    annotations: Vec<Value>,
+}
+
+#[derive(Debug, Default)]
 struct StreamState {
+    buffer_text: bool,
+    text: BTreeMap<u32, Vec<SearchTextBlock>>,
+    grounding: BTreeMap<u32, Value>,
+    search_queries: Vec<Option<String>>,
+    search_sources: Vec<agent_runtime_core::provider::HostedSource>,
     active: BTreeMap<u32, ActiveStep>,
     seen_indices: BTreeSet<u32>,
     pending_terminal: Option<PendingTerminal>,
@@ -1005,7 +1071,7 @@ fn decode_event(data: &str) -> Result<WireEvent, ProviderError> {
 
 fn wire_content_text(content: WireContent) -> Result<String, ProviderError> {
     match content {
-        WireContent::Text { text } => Ok(text),
+        WireContent::Text { text, .. } => Ok(text),
         WireContent::Unknown => Err(malformed("unsupported Gemini stream content")),
     }
 }
@@ -1018,6 +1084,158 @@ fn add_stream_bytes(current: &mut usize, added: usize) -> Result<(), ProviderErr
         return Err(malformed("Gemini stream step exceeded its bound"));
     }
     Ok(())
+}
+
+fn annotation_citations(
+    annotations: &[Value],
+) -> Vec<(usize, agent_runtime_core::provider::HostedSource)> {
+    annotations
+        .iter()
+        .filter_map(|annotation| {
+            if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                return None;
+            }
+            let start = annotation
+                .get("start_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let end = annotation.get("end_index")?.as_u64()?;
+            if start > end {
+                return None;
+            }
+            Some((
+                usize::try_from(end).ok()?,
+                super::hosted::source(annotation, "url")?,
+            ))
+        })
+        .collect()
+}
+
+fn grounding_citations(
+    grounding: &Value,
+    block_index: usize,
+) -> Vec<(usize, agent_runtime_core::provider::HostedSource)> {
+    let chunks = grounding.get("groundingChunks").and_then(Value::as_array);
+    grounding
+        .get("groundingSupports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|support| {
+            support
+                .pointer("/segment/partIndex")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == block_index as u64
+        })
+        .flat_map(|support| {
+            let end = support
+                .pointer("/segment/endIndex")
+                .and_then(Value::as_u64)
+                .and_then(|end| usize::try_from(end).ok());
+            support
+                .get("groundingChunkIndices")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |index| {
+                    let index = usize::try_from(index.as_u64()?).ok()?;
+                    Some((
+                        end?,
+                        super::hosted::source(chunks?.get(index)?.get("web")?, "uri")?,
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn finish_hosted_output(
+    state: &mut StreamState,
+    interaction: &WireInteraction,
+    out: &mut Vec<ProviderStreamEvent>,
+) {
+    let metadata = if !interaction.grounding.is_null() {
+        &interaction.grounding
+    } else {
+        interaction
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.get("groundingMetadata"))
+            .unwrap_or(&Value::Null)
+    };
+    for (_, grounding) in state
+        .grounding
+        .iter()
+        .chain(std::iter::once((&0, metadata)))
+    {
+        if state.search_queries.is_empty() {
+            state.search_queries.extend(
+                grounding
+                    .get("webSearchQueries")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|query| Some(query.to_owned())),
+            );
+        }
+        state.search_sources.extend(
+            grounding
+                .get("groundingChunks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|chunk| super::hosted::source(&chunk["web"], "uri")),
+        );
+    }
+    for (index, blocks) in std::mem::take(&mut state.text) {
+        let grounding = state.grounding.get(&index).unwrap_or(metadata);
+        for (block_index, SearchTextBlock { text, annotations }) in blocks.into_iter().enumerate() {
+            let mut citations = annotation_citations(&annotations);
+            citations.extend(grounding_citations(grounding, block_index));
+            state
+                .search_sources
+                .extend(citations.iter().map(|(_, source)| source.clone()));
+            if !text.is_empty() {
+                out.push(ProviderStreamEvent::TextDelta {
+                    text: super::hosted::render(&text, citations),
+                });
+            }
+        }
+    }
+    let mut urls = BTreeSet::new();
+    state
+        .search_sources
+        .retain(|source| urls.insert(source.url.clone()));
+    let mut queries = std::mem::take(&mut state.search_queries);
+    if queries.is_empty() && !state.search_sources.is_empty() {
+        queries.push(None);
+    }
+    let count = queries.len() as u64;
+    for query in queries {
+        out.push(ProviderStreamEvent::HostedSearch {
+            query,
+            sources: state.search_sources.clone(),
+        });
+    }
+    let reported = interaction.usage.as_ref().and_then(|usage| {
+        let counts: Vec<_> = usage
+            .grounding_tool_count
+            .iter()
+            .filter(|count| count.kind == "google_search")
+            .filter_map(|count| count.count)
+            .collect();
+        (!counts.is_empty()).then(|| {
+            counts
+                .iter()
+                .fold(0u64, |total, count| total.saturating_add(*count))
+        })
+    });
+    if let Some(count) = reported.or((count > 0).then_some(count)) {
+        out.push(ProviderStreamEvent::Usage {
+            delta: UsageDelta::new().with(CounterKind::WebSearchRequests, count),
+        });
+    }
 }
 
 fn event_to_events(
@@ -1043,15 +1261,46 @@ fn event_to_events(
                 return Err(malformed("Gemini stream repeated a step index"));
             }
             match step {
-                WireStep::ModelOutput { content } => {
+                WireStep::GoogleSearchCall { arguments } => {
+                    state.buffer_text = true;
+                    state.active.insert(
+                        index,
+                        ActiveStep::HostedSearch {
+                            queries: arguments.queries,
+                        },
+                    );
+                    state.saw_semantic_event = true;
+                }
+                WireStep::GoogleSearchResult { result } => {
+                    state.search_sources.extend(
+                        result
+                            .iter()
+                            .filter_map(|result| super::hosted::source(result, "url")),
+                    );
+                    state.active.insert(index, ActiveStep::HostedResult);
+                }
+                WireStep::ModelOutput { content, grounding } => {
                     let mut bytes = 0;
+                    if !grounding.is_null() {
+                        state.buffer_text = true;
+                        state.grounding.insert(index, grounding);
+                    }
                     for content in content {
-                        let text = wire_content_text(content)?;
+                        let WireContent::Text { text, annotations } = content else {
+                            return Err(malformed("unsupported Gemini stream content"));
+                        };
                         add_stream_bytes(&mut bytes, text.len())?;
-                        if !text.is_empty() {
+                        if state.buffer_text || !annotations.is_empty() {
+                            state.buffer_text = true;
+                            state
+                                .text
+                                .entry(index)
+                                .or_default()
+                                .push(SearchTextBlock { text, annotations });
+                        } else if !text.is_empty() {
                             out.push(ProviderStreamEvent::TextDelta { text });
-                            state.saw_semantic_event = true;
                         }
+                        state.saw_semantic_event = true;
                     }
                     state
                         .active
@@ -1127,12 +1376,49 @@ fn event_to_events(
                 .get_mut(&index)
                 .ok_or_else(|| malformed("Gemini stream delta has no active step"))?;
             match (active, delta) {
+                (
+                    ActiveStep::HostedSearch { queries },
+                    WireDelta::GoogleSearchCall { arguments },
+                ) => {
+                    queries.extend(arguments.queries);
+                }
+                (ActiveStep::HostedResult, WireDelta::GoogleSearchResult { result }) => {
+                    state.search_sources.extend(
+                        result
+                            .iter()
+                            .filter_map(|result| super::hosted::source(result, "url")),
+                    );
+                }
+                (
+                    ActiveStep::ModelOutput { .. },
+                    WireDelta::TextAnnotationDelta { annotations },
+                ) => {
+                    let blocks = state.text.entry(index).or_default();
+                    if blocks.is_empty() {
+                        blocks.push(SearchTextBlock::default());
+                    }
+                    blocks
+                        .last_mut()
+                        .expect("text block exists")
+                        .annotations
+                        .extend(annotations);
+                }
                 (ActiveStep::ModelOutput { bytes }, WireDelta::Text { text }) => {
                     add_stream_bytes(bytes, text.len())?;
-                    if !text.is_empty() {
+                    if state.buffer_text {
+                        let blocks = state.text.entry(index).or_default();
+                        if blocks.is_empty() {
+                            blocks.push(SearchTextBlock::default());
+                        }
+                        blocks
+                            .last_mut()
+                            .expect("text block exists")
+                            .text
+                            .push_str(&text);
+                    } else if !text.is_empty() {
                         out.push(ProviderStreamEvent::TextDelta { text });
-                        state.saw_semantic_event = true;
                     }
+                    state.saw_semantic_event = true;
                 }
                 (ActiveStep::Thought { bytes, .. }, WireDelta::ThoughtSummary { content }) => {
                     let text = wire_content_text(content)?;
@@ -1190,6 +1476,13 @@ fn event_to_events(
                 .remove(&index)
                 .ok_or_else(|| malformed("Gemini stream stopped an inactive step"))?;
             match active {
+                ActiveStep::HostedSearch { queries } => {
+                    if queries.is_empty() {
+                        state.search_queries.push(None);
+                    } else {
+                        state.search_queries.extend(queries.into_iter().map(Some));
+                    }
+                }
                 ActiveStep::Thought { signed: false, .. } => {
                     return Err(malformed("Gemini thought ended without a signature"));
                 }
@@ -1207,6 +1500,7 @@ fn event_to_events(
             if !state.active.is_empty() {
                 return Err(malformed("Gemini interaction ended with active steps"));
             }
+            finish_hosted_output(state, &interaction, out);
             if let Some(usage) = interaction.usage {
                 if state.usage_reported {
                     return Err(malformed(
@@ -1447,6 +1741,7 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
         let credential_source = self.credential_source.clone();
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.revision().clone();
+        let buffer_text = !request.hosted_tools.is_empty();
         let out = stream! {
             // Emitted first so a consumer sees the limit state that governed
             // this attempt before any of its output.
@@ -1455,7 +1750,7 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
             }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
-            let mut state = StreamState::default();
+            let mut state = StreamState { buffer_text, ..StreamState::default() };
             let mut done = false;
 
             'outer: loop {
@@ -1805,6 +2100,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
+            hosted_web_search: true,
             streaming: true,
             tools: true,
             reasoning: ReasoningSupport::Controllable,
@@ -2479,7 +2775,7 @@ mod tests {
     async fn unknown_steps_and_conflicting_terminals_are_malformed() {
         let hosted = concat!(
             "event: step.start\n",
-            "data: {\"event_type\":\"step.start\",\"index\":0,\"step\":{\"type\":\"google_search_call\"}}\n\n",
+            "data: {\"event_type\":\"step.start\",\"index\":0,\"step\":{\"type\":\"google_maps_call\"}}\n\n",
         );
         let provider =
             GeminiInteractionsProvider::new(ReplayTransport::new([hosted]), config()).unwrap();
@@ -2654,6 +2950,7 @@ mod tests {
                 interaction: WireInteraction {
                     status: "completed".to_owned(),
                     usage: None,
+                    ..WireInteraction::default()
                 },
             },
             &mut state,
@@ -2675,6 +2972,7 @@ mod tests {
                 interaction: WireInteraction {
                     status: "surprising".to_owned(),
                     usage: None,
+                    ..WireInteraction::default()
                 },
             },
             &mut state,
@@ -2790,5 +3088,122 @@ mod tests {
         assert_eq!(cfg.model.as_str(), "gemini-2.5-flash");
         assert_eq!(cfg.api_key.as_ref().map(|s| s.expose()), Some("test-key"));
         assert_eq!(cfg.supported_thinking_levels, vec!["low", "high"]);
+    }
+    #[test]
+    fn hosted_search_declaration_uses_the_interactions_tool_shape() {
+        use agent_runtime_core::provider::HostedTool;
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([""]), config()).unwrap();
+        let request =
+            ProviderRequest::new(ModelId::new("gemini-test"), vec![Message::user("search")]);
+        assert!(
+            provider
+                .build_payload(&request)
+                .unwrap()
+                .get("tools")
+                .is_none()
+        );
+        let request = request.with_hosted_tools(vec![HostedTool::WebSearch { max_uses: Some(5) }]);
+        assert_eq!(
+            provider.build_payload(&request).unwrap()["tools"],
+            json!([{"type":"google_search"}])
+        );
+        assert!(
+            provider
+                .capabilities(&request.model)
+                .unwrap()
+                .hosted_web_search
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_search_interactions_steps_and_annotation_deltas_are_portable() {
+        use agent_runtime_core::provider::HostedTool;
+        for reported in [None, Some(6), Some(0)] {
+            let mut usage = json!({"total_input_tokens":2,"total_output_tokens":3});
+            if let Some(count) = reported {
+                usage["grounding_tool_count"] = json!([{"type":"google_search","count":count}]);
+            }
+            let frames = [
+                json!({"event_type":"step.start","index":0,"step":{"type":"google_search_call","id":"opaque-call","arguments":{"queries":["rust docs"]},"signature":"opaque-signature"}}),
+                json!({"event_type":"step.stop","index":0}),
+                json!({"event_type":"step.start","index":1,"step":{"type":"google_search_result","call_id":"opaque-call","result":[{"search_suggestions":"raw-grounding-canary"}]}}),
+                json!({"event_type":"step.stop","index":1}),
+                json!({"event_type":"step.start","index":2,"step":{"type":"model_output","content":[{"type":"text","text":"é "}]}}),
+                json!({"event_type":"step.delta","index":2,"delta":{"type":"text","text":"Rust works."}}),
+                json!({"event_type":"step.delta","index":2,"delta":{"type":"text_annotation_delta","annotations":[{"type":"url_citation","start_index":3,"end_index":7,"url":"https://rust.test","title":"Rust"},{"type":"url_citation","start_index":8,"end_index":13,"url":"https://rust.test","title":"Rust"}]}}),
+                json!({"event_type":"step.stop","index":2}),
+                json!({"event_type":"interaction.completed","interaction":{"status":"completed","usage":usage}}),
+            ];
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>()
+                + "data: [DONE]\n\n";
+            let provider =
+                GeminiInteractionsProvider::new(ReplayTransport::new([body]), config()).unwrap();
+            let request =
+                ProviderRequest::new(ModelId::new("gemini-test"), vec![Message::user("search")])
+                    .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]);
+            let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::Error { .. })),
+                "{events:?}"
+            );
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { query: Some(query), sources } if query == "rust docs" && sources[0].url == "https://rust.test")));
+            assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "é Rust [Rust](https://rust.test) works.")));
+            let mut usage = UsageDelta::new();
+            for event in &events {
+                if let ProviderStreamEvent::Usage { delta } = event {
+                    usage.merge(delta);
+                }
+            }
+            assert_eq!(
+                usage.get(CounterKind::WebSearchRequests),
+                reported.unwrap_or(1)
+            );
+            assert_eq!(usage.total(), 5);
+            let serialized = serde_json::to_string(&events).unwrap();
+            for opaque in [
+                "opaque-call",
+                "opaque-signature",
+                "raw-grounding-canary",
+                "google_search_result",
+            ] {
+                assert!(!serialized.contains(opaque));
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderStreamEvent::ToolCallDelta { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_search_candidate_grounding_metadata_renders_supported_segments() {
+        use agent_runtime_core::provider::HostedTool;
+        let grounding = json!({"webSearchQueries":["rust docs"],"groundingChunks":[{"web":{"uri":"https://rust.test","title":"Rust"}}],"groundingSupports":[{"segment":{"startIndex":0,"endIndex":4},"groundingChunkIndices":[0]}]});
+        let frames = [
+            json!({"event_type":"step.start","index":0,"step":{"type":"model_output","content":[{"type":"text","text":"Rust works."}]}}),
+            json!({"event_type":"step.stop","index":0}),
+            json!({"event_type":"interaction.completed","interaction":{"status":"completed","candidates":[{"groundingMetadata":grounding}]}}),
+        ];
+        let body = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([body]), config()).unwrap();
+        let request =
+            ProviderRequest::new(ModelId::new("gemini-test"), vec![Message::user("search")])
+                .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]);
+        let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "Rust [Rust](https://rust.test) works.")));
+        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { query: Some(query), sources } if query == "rust docs" && sources[0].title.as_deref() == Some("Rust"))));
+        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::Usage { delta } if delta.get(CounterKind::WebSearchRequests) == 1)));
     }
 }
