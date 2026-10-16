@@ -437,3 +437,377 @@ and window reasons.
 - **GIVEN** `K = 3` and a newest user message with 6 images
 - **WHEN** a plan is built
 - **THEN** all 6 are inline
+
+### Requirement: First changed cache-prefix fragment is observable
+
+Cache plans and CachePlanChanged SHALL expose optional first_changed_fragment
+evidence from their committed predecessor comparison. The diagnostic MUST name
+the earliest changed ID, content hash, or cache class within an established
+stable prefix in plan-segment order (Instructions before Capabilities), not
+provider wire byte order. When IDs differ and the predecessor ID is absent
+from the current leading Stable segments, it MUST name that removed
+predecessor ID, including when a neighbour or tail occupies its old position.
+It SHALL otherwise use the current ID, or the predecessor ID when no current
+item exists. It MUST NOT change cache identity, fingerprints, provider
+wire output, or canonical cache metrics.
+
+#### Scenario: A stable instruction changes
+
+- **GIVEN** two eligible requests share the same non-fragment identity partition
+- **WHEN** the second changes one stable instruction's content
+- **THEN** first_changed_fragment names that instruction at the first differing position
+- **AND** downstream unchanged fragments are not reported as the cause
+
+#### Scenario: Prefix segment is removed or changes class
+
+- **WHEN** a comparable request removes the final stable-prefix segment or makes it ephemeral
+- **THEN** the diagnostic names the removed predecessor ID or the changed current ID respectively
+- **AND** no sensitive fragment content is emitted
+
+#### Scenario: Prefix deletion leaves a neighbour or ephemeral tail
+
+- **GIVEN** a comparable predecessor has stable segments a, b, c followed by an Ephemeral user tail
+- **WHEN** the current plan removes the final, middle, or first stable segment
+- **THEN** the diagnostic names c, b, or a respectively, even if a neighbour or user tail occupies the removed segment's old position
+- **AND** changing or retaining the tail does not change the deletion attribution
+
+#### Scenario: New tail does not invalidate an established prefix
+
+- **WHEN** the prior stable prefix remains identical and only an appended or newly promoted tail is added
+- **THEN** first_changed_fragment is absent
+- **AND** existing prefix metrics keep their current semantics
+
+#### Scenario: No fragment cause is attributable
+
+- **WHEN** a request has no usable predecessor, a suppressed/unsupported boundary, or a changed non-fragment identity partition
+- **THEN** first_changed_fragment is absent even if aggregate invalidation is nonzero
+- **AND** the runtime does not fabricate a fragment cause
+
+#### Scenario: Fragment ID is unsafe for telemetry
+
+- **WHEN** a changed ID violates the new diagnostic field's bounded safe-ID rules
+- **THEN** the event omits first_changed_fragment
+- **AND** the planner's fragment identity and all cache behavior remain unchanged
+
+### Requirement: Authorized timeline ownership
+LcmWriter SHALL expose defaulted claim(view, owner, generation). The default
+records nothing: after authority validation it SHALL return Claimed for an empty
+timeline and Unsupported for a populated one. A fresh session MUST reject
+populated or owned timelines of a claim-aware store with typed TimelineOwned
+unless the host selects Adopt, Fork or Retire. Replacement and continuation
+bindings MUST pass unchanged LcmViewAuthority checks.
+
+#### Scenario: Populated timeline policies
+- **WHEN** a new owner resolves a timeline with committed nodes
+- **THEN** default construction fails with TimelineOwned
+- **AND** Adopt claims the next generation first and then seeds canonical history from the claimed timeline projection
+- **AND** Fork claims a fresh timeline with a summary seed
+- **AND** Retire claims an empty replacement while preserving old immutable data
+
+#### Scenario: Adopt never discards a seed
+- **WHEN** a host requests Adopt with non-empty seed history
+- **THEN** construction returns typed Conflict and no timeline is claimed
+
+#### Scenario: Restart after leaf commit
+- **WHEN** a new session identity encounters a committed leaf
+- **THEN** it requires explicit policy and never starts appending at sequence zero
+
+#### Scenario: Claim-unaware store
+- **WHEN** a store uses the default claim method
+- **THEN** a session creates and runs normally on an empty timeline
+- **AND** the session that holds the binding continues on its populated timeline, live and after resume
+- **AND** a fresh binding of a populated timeline forks to a resolver-supplied replacement with a summary seed
+- **AND** explicit Adopt returns typed ForkRequired, so no timeline is adopted without fencing
+
+#### Scenario: Pre-existing unclaimed timeline
+- **WHEN** a session whose validated state predates ownership resumes with Adopt
+- **THEN** it claims generation one, rebuilds its state against the claimed timeline and continues
+- **AND** without a policy the resume fails with TimelineOwned and no owner
+
+#### Scenario: Stale ownership epoch
+- **WHEN** another owner acquires a newer claim generation
+- **THEN** the claim bumps the store revision
+- **AND** the old owner receives TimelineOwned before provider admission or a timeline commit
+- **AND** a claim-aware store rejects any mutation whose view fence is not the current owner with TimelineOwned
+
+#### Scenario: Ephemeral LCM
+- **WHEN** an ephemeral session runs with LCM configured
+- **THEN** its LCM uses a volatile in-memory timeline
+- **AND** the host's durable timeline is neither claimed nor written
+
+#### Scenario: Bounded fork summary
+- **WHEN** a Fork policy renders the projected summary of a timeline
+- **THEN** the rendering is capped by a configurable bound and keeps the newest tail
+- **AND** sources classified Secret never enter it
+
+### Requirement: Frontier-safe reconcile
+Reconciliation MUST never truncate below max(active_node.range.end)+1. Divergence
+below that frontier SHALL return typed LcmDivergence { frontier, at }, with the
+same Adopt, Fork or Retire policy options at a host recovery boundary.
+
+#### Scenario: Divergent summarized source
+- **WHEN** canonical history differs below the active summary frontier
+- **THEN** no truncation occurs and LcmDivergence identifies frontier and at
+- **AND** committed entries and nodes remain unchanged
+
+#### Scenario: Concurrent leaf commit
+- **WHEN** a leaf advances the frontier after the runtime check
+- **THEN** the store atomically rejects truncation with typed RangeOverlap
+
+### Requirement: Shared LCM Request Sizing
+By default LCM SHALL measure immutable messages and projected summary messages
+with the planner RequestSizer, including reasoning, tool arguments/results and
+framing. A host-supplied LcmSizer MUST be kept as given; builder composition
+MUST NOT replace it.
+
+#### Scenario: Tool and reasoning parity
+- **WHEN** the planner and LCM measure the same message using the shared sizer
+- **THEN** the measured counts MUST match, including structured tool content.
+
+#### Scenario: Host sizer kept
+- **WHEN** a host configures its own LcmSizer and composes LCM through the builder
+- **THEN** LCM MUST size entries with the host sizer, and only the default sizer is replaced by the planner RequestSizer.
+
+### Requirement: Working Set Budget and Pressure
+An optional host WorkingSetPolicy SHALL cap planner input at the lesser of the
+resolved input window and hard_tokens. LCM SHALL evaluate pressure against
+target_tokens minus measured fixed overhead from the last successful plan, but
+never against less than 25% of target_tokens. When the floor applies LCM MUST
+emit a typed OverheadExceedsTarget diagnostic; overhead MUST be re-measured at
+the next plan.
+
+#### Scenario: Independent target
+- **WHEN** a large provider window is configured with a smaller working set
+- **THEN** LCM MUST compact according to the working-set target and the planner MUST enforce the hard cap.
+
+#### Scenario: Overhead at or above target
+- **WHEN** measured fixed overhead leaves less than the floor, including a stale persisted overhead
+- **THEN** LCM MUST use the floor, MUST NOT refuse the turn for pressure alone, and MUST emit the typed diagnostic.
+
+#### Scenario: Absent policy
+- **WHEN** no working set is configured
+- **THEN** existing provider-budget selection MUST remain available.
+
+### Requirement: Bounded Reclaiming Summaries
+LCM SHALL separate leaf source targets from summary output caps, default the
+summary maximum ratio to 0.25, and escalate when measured reclaim is below
+min_reclaim_ratio. Every accepted model summary MUST meet both ratios and strict
+shrink. The deterministic fallback MUST strictly shrink within
+min(deterministic_token_cap, source - 1) and is not ratio-capped. Leaf selection
+MUST permit a full turn pair and MUST widen a leaf the fallback cannot shrink
+through the next turn. A summary that still cannot fit under hard pressure MUST
+end the round as a structured cannot_fit. Hard pressure SHALL derive rounds with
+one shared formula from overage and expected reclaim, fixed once per admission
+epoch and never above MAX_DERIVED_HARD_ROUNDS (64).
+
+#### Scenario: Weak reclaim escalates
+- **WHEN** a model response is smaller than its source but violates a ratio
+- **THEN** LCM MUST escalate rather than commit it.
+
+#### Scenario: Tiny oldest turn
+- **WHEN** the oldest turn is smaller than the deterministic fallback's framing and later turns exceed the leaf target
+- **THEN** hard compaction MUST widen that leaf and commit progress rather than fail on it at every admission.
+
+#### Scenario: Derived bound is fixed
+- **WHEN** hard pressure derives its round bound and later rounds run in the same admission epoch
+- **THEN** the bound MUST NOT grow, and the structured cannot_fit MUST report it as max_rounds.
+
+#### Scenario: Boundary compaction
+- **WHEN** a host opts into soft_on_turn_boundary and a turn completes
+- **THEN** runtime SHALL attempt soft compaction after TurnCompleted through existing idle admission and persistence.
+
+### Requirement: Neutral Provider Summary Mechanism
+A feature-gated provider summary adapter SHALL use host-supplied instructions,
+compact tool-aware rendering, the authoritative planner for every request,
+LCM purpose usage accounting, cancellation and deadlines. Oversized leaves
+SHALL use bounded map-reduce without exceeding the summarizer input budget.
+Every provider call MUST have its own deadline (default 60 s) within an
+operation budget scaled by the planned calls and capped (default 10 min); both
+MUST be configurable. Cancellation MUST be scoped to one summary operation.
+The attempt purpose MUST be idle compaction only for idle-boundary summaries.
+
+#### Scenario: Oversized tool leaf
+- **WHEN** a source leaf exceeds the summarizer window
+- **THEN** multiple measured map calls and bounded reduction MUST preserve tool evidence and aggregate usage.
+
+#### Scenario: Per-operation cancellation
+- **WHEN** a host cancels the scope of one summary operation
+- **THEN** that operation MUST fail without provider I/O, and the next operation MUST run normally.
+
+#### Scenario: Deterministic tool evidence
+- **WHEN** model escalation reaches fallback
+- **THEN** bounded rendering MUST include tool names, truncated arguments and results.
+
+### Requirement: Durable ordinary-store hard admission
+The runtime SHALL persist each pending hard-compaction response in the Sensitive
+LCM extension of a full canonical SessionSnapshot before committing its DAG
+mutation when SessionStore is configured and CheckpointStore is absent. It MUST
+retain existing authorization, identity, body, source-plan and revision checks.
+
+#### Scenario: Crash before the staged mutation lands
+- **WHEN** the ordinary intent snapshot is saved but its DAG CAS has not landed
+- **THEN** resume validates and discards the uncommitted intent before new work
+- **AND** retains complete canonical history and already charged summary usage.
+
+#### Scenario: Crash after the staged mutation lands
+- **WHEN** its DAG CAS lands before terminal ordinary persistence
+- **THEN** resume adopts exactly the proven successor without duplicate nodes
+- **AND** persists repaired state before exposing a live session handle.
+
+#### Scenario: Fully saved turn
+- **WHEN** terminal persistence succeeds
+- **THEN** normal resume retains history and the committed DAG without replay.
+
+#### Scenario: Failed staging save
+- **WHEN** SessionStore fails to save the hard intent
+- **THEN** admission surfaces an error and does not commit that DAG mutation
+- **AND** provider I/O does not proceed.
+
+#### Scenario: Other host compositions
+- **WHEN** CheckpointStore is configured or neither store is configured
+- **THEN** hard admission and recovery retain their existing behavior.
+
+### Requirement: Deterministic Fallback Rendering
+The deterministic fallback SHALL render its source so that the stored text
+cannot be read as a reply form. It MUST keep tool names, truncated arguments
+and truncated results as evidence, MUST render each tool call and tool result
+as a bracketed note that is not attributed to the assistant role, MUST NOT
+render a tool call as `call name(args)`, and MUST omit reasoning parts. It MUST
+begin with a fixed label saying the text is an excerpt and not a summary
+whenever the label fits inside the fallback target, and MUST fall back to the
+unlabelled cut when it does not. The rendering used to build a summary prompt
+is not changed by this requirement.
+
+#### Scenario: Deterministic tool evidence
+- **WHEN** model escalation reaches fallback for a source holding a tool call and its result
+- **THEN** the stored text MUST include the tool name, its truncated arguments and its truncated result
+- **AND** it MUST NOT contain `call name(args)` or an assistant-attributed tool call line.
+
+#### Scenario: Reasoning is left out
+- **WHEN** the fallback source holds a reasoning part
+- **THEN** the stored text MUST NOT contain that reasoning.
+
+#### Scenario: Label on a tiny source
+- **WHEN** the fallback target is smaller than the label
+- **THEN** the fallback MUST still strictly shrink the source, without the label.
+
+### Requirement: Resume Disowns an Uncheckpointed Tail
+LCM resume validation SHALL recover a checkpoint whose store holds entries
+past the checkpointed frontier that were appended by a turn which never
+reached a terminal checkpoint. The recovery MUST apply only when the
+checkpoint carries no pending summary, the checkpointed history prefix matches
+canonical history, the store's active DAG equals the DAG the checkpoint
+recorded, and every entry below the frontier matches canonical history. It
+MUST then truncate the store from the frontier and re-anchor the checkpoint to
+the resulting revision. It MUST NOT change any summary node, and any other
+disagreement MUST remain a conflict.
+
+#### Scenario: Process killed between provider steps
+- **WHEN** a host with only a session store is killed after a turn appended several provider steps and before the session was saved
+- **THEN** resuming the saved session MUST succeed
+- **AND** the timeline MUST hold no entry of the killed turn
+- **AND** the next turn MUST complete.
+
+#### Scenario: Recovery interrupted after its truncation
+- **WHEN** a recovery truncated the tail and the process died before the repaired checkpoint was saved
+- **THEN** the next resume of the unchanged saved session MUST succeed.
+
+#### Scenario: Store without truncation
+- **WHEN** the store does not support truncating its tail
+- **THEN** resume MUST fail with the original conflict and the store MUST be unchanged.
+
+### Requirement: Flat semantic summary is an opt-in alternative to LCM
+
+A host SHALL be able to compose the flat semantic-summary coordinator instead
+of LCM through `RuntimeBuilder::semantic_summary`. A runtime MUST have at most
+one semantic compaction strategy. Building MUST fail when LCM and a flat
+summary are both configured, whether the summary was added through the
+dedicated method or as a component with id `harness.semantic_summary`.
+Building MUST also fail when the flat summary is combined with
+`soft_on_turn_boundary(true)`.
+
+#### Scenario: Host composes the flat summary
+- **GIVEN** a runtime built with `RuntimeBuilder::semantic_summary` and no LCM
+- **WHEN** a turn commits under context pressure
+- **THEN** the coordinator stores the summarized originals, records the
+  summary under `harness.semantic_summary`, and projects it into later
+  requests
+- **AND** no LCM component is present
+
+#### Scenario: Both strategies are configured
+- **GIVEN** a builder with `RuntimeBuilder::lcm` and a flat summary, by method
+  or by component id
+- **WHEN** the runtime is built
+- **THEN** building fails with a configuration error naming both strategies
+
+#### Scenario: Soft turn-boundary compaction with the flat summary
+- **GIVEN** a builder with the flat summary and `soft_on_turn_boundary(true)`
+- **WHEN** the runtime is built
+- **THEN** building fails with a configuration error
+
+### Requirement: Idle semantic compaction returns the protected summary
+
+`SessionHandle::try_idle_semantic_compaction` SHALL run, with the flat summary
+configured, the coordinator's idle compaction under the
+`cache_idle_compaction` purpose. It SHALL return the protected summary, any
+fallback reason, and the usage, and SHALL record that usage with source
+`SemanticSummary`. LCM's `try_idle_compaction` result MUST be unchanged.
+
+#### Scenario: Idle compaction under the flat summary
+- **GIVEN** an idle session with the flat summary configured and eligible old
+  turns
+- **WHEN** the host calls `try_idle_semantic_compaction`
+- **THEN** the result carries the new protected summary and its usage
+- **AND** the usage ledger attributes that usage to the semantic summary
+
+#### Scenario: LCM idle compaction is unchanged
+- **GIVEN** a runtime configured with LCM
+- **WHEN** the host calls `try_idle_compaction`
+- **THEN** the result carries no summary body
+
+### Requirement: Persisted flat summary state resumes under the flat summary
+
+Persisted `harness.semantic_summary` schema-v1 state SHALL resume as live
+state when the flat summary is configured, and MUST NOT be imported into LCM
+or rejected. A host whose ordinary session store omits the state SHALL be
+able to restore it through `restore_semantic_summary_if_absent`. That restore
+MUST fail closed unless the session is idle and the component revision,
+source session, canonical history prefix and summary revision all match. It
+MUST never overwrite state the runtime already restored. State written by the
+flat coordinator MUST remain importable by the LCM legacy decoder.
+
+#### Scenario: Resume keeps the summary
+- **GIVEN** a session persisted with flat summary state
+- **WHEN** it resumes under a runtime configured with the flat summary
+- **THEN** the next request projects the persisted summary
+- **AND** the namespace is still present and no LCM state is created
+
+#### Scenario: Host restores omitted state
+- **GIVEN** a resumed idle session without the namespace and a matching
+  protected copy held by the host
+- **WHEN** the host calls `restore_semantic_summary_if_absent`
+- **THEN** it returns true and the summary is projected on the next request
+
+#### Scenario: Restore does not overwrite
+- **GIVEN** a session that already holds the namespace
+- **WHEN** the host calls `restore_semantic_summary_if_absent`
+- **THEN** it returns false and the state is unchanged
+
+#### Scenario: LCM imports flat summary state
+- **GIVEN** a session whose flat summary state was written by the restored
+  coordinator
+- **WHEN** it resumes under a runtime configured with LCM
+- **THEN** the legacy import succeeds as it does for pin-line state
+
+### Requirement: Flat summary fallback is reported as a downgrade
+
+The runtime SHALL emit `HarnessEvent::SemanticSummaryFallback` when the flat
+coordinator cannot produce a summary and falls back to unsummarized history.
+The event is observable as `RuntimeEvent::Downgrade` with capability
+`semantic_summary`, and the turn SHALL continue.
+
+#### Scenario: Summary model fails
+- **GIVEN** a session under pressure whose summary model returns an error
+- **WHEN** the turn commits
+- **THEN** a `Downgrade` event with capability `semantic_summary` is emitted
+- **AND** the turn's result is committed without a new summary

@@ -693,3 +693,379 @@ used hosted search MUST continue on another provider without errors.
 - **THEN** Smith reports once that hosted search is unavailable for this
   organization
 - **AND** the session falls back to backend routing
+
+### Requirement: Well-known provider presets and fluent config builders
+
+`agent-runtime-provider` SHALL provide well-known provider presets and fluent config builders on provider configuration structs (`OpenAiConfig`, `AnthropicConfig`, `ResponsesConfig`, and `GeminiInteractionsConfig`).
+
+The configuration structs MUST support fluent chaining via:
+- `with_api_key`
+- `with_extra_header`
+- `with_capabilities`
+- `with_prompt_cache`
+
+`OpenAiConfig` SHALL offer presets for OpenAI, OpenRouter, Groq, DeepSeek, DeepInfra, Together AI, Fireworks AI, Cerebras, Perplexity, Mistral, Baseten, Nvidia NIM, Kilo AI, ZenMux, LLM Gateway, Cloudflare AI Gateway, Cloudflare Workers AI, and Azure OpenAI, correctly setting base URLs and required default headers.
+
+`AnthropicConfig`, `ResponsesConfig`, and `GeminiInteractionsConfig` SHALL offer presets for Anthropic, xAI, and Google AI Studio respectively.
+
+#### Scenario: OpenRouter preset configures custom headers and base URL
+
+- **GIVEN** a host creates an `OpenAiConfig::openrouter("anthropic/claude-3.7-sonnet")`
+- **WHEN** the config is inspected
+- **THEN** the base URL is `"https://openrouter.ai/api/v1"`
+- **AND** the headers include `"HTTP-Referer"` and `"X-Title"`
+
+#### Scenario: Fluent config builders chain parameters
+
+- **GIVEN** a host builds a provider config using fluent methods `.with_api_key(...)` and `.with_extra_header(...)`
+- **WHEN** the config is evaluated
+- **THEN** the secret key and extra headers are set on the configuration struct
+
+### Requirement: Adapters declare how they drive a prompt cache
+
+Every provider adapter SHALL declare, per model, how it drives a provider-side
+prompt cache: not at all, implicitly by keeping a stable keyed prefix, or
+explicitly by marking segments. The declaration MUST map onto the neutral cache
+classes so a context plan reports what the serving adapter can honor rather than
+assuming it can honor nothing.
+
+#### Scenario: A plan reports the serving adapter's real capability
+- **GIVEN** an adapter that drives a prompt cache implicitly
+- **WHEN** a context plan containing cache-stable segments is built for it
+- **THEN** the plan does not report the stable class as unsupported
+
+#### Scenario: An adapter without a prompt cache is honest about it
+- **GIVEN** an adapter that cannot cache
+- **WHEN** a plan containing cache-stable segments is built for it
+- **THEN** the plan reports the stable class as unsupported
+
+### Requirement: A prompt cache is keyed by session, not by request
+
+An adapter driving an implicit prompt cache SHALL key it to the session rather
+than to the request or attempt. A request id changes every turn, so keying by it
+would place each turn in a different cache partition and defeat the reuse the
+stable prefix exists to enable.
+
+#### Scenario: Two turns of one session share a cache key
+- **GIVEN** a session that issues two provider requests
+- **WHEN** each request is serialized
+- **THEN** both carry the same prompt cache key
+
+#### Scenario: Separate sessions do not share a cache key
+- **GIVEN** two sessions on the same model
+- **WHEN** each issues a request
+- **THEN** their prompt cache keys differ
+
+### Requirement: Explicit adapters mark the stable request prefix
+
+An adapter that marks cache segments explicitly SHALL mark the tool
+declarations and the trailing system instructions, which the planner classifies
+cache-stable and which every turn of a session repeats verbatim. It MUST NOT
+exceed the number of breakpoints it declared.
+
+#### Scenario: Tools and system instructions are marked
+- **GIVEN** a request carrying tool declarations and system instructions
+- **WHEN** an explicit adapter serializes it
+- **THEN** the serialized request marks both for caching
+
+#### Scenario: A request with neither is unmarked
+- **GIVEN** a request with no tools and no system instructions
+- **WHEN** an explicit adapter serializes it
+- **THEN** no cache breakpoint is emitted
+
+### Requirement: Native Responses adapter
+
+Agent Runtime SHALL provide a native OpenAI Responses adapter over the shared
+provider, transport, credential, cancellation, deadline, capability, error,
+and event contracts, with a configurable base URL whose first supported
+deployment is xAI serving Grok models. The adapter MUST operate statelessly
+with streaming enabled (`store=false`, no `previous_response_id`) and MUST
+NOT depend on provider-side conversation state, hosted tools, or background
+execution.
+
+#### Scenario: Stream a native tool-assisted attempt
+
+- **GIVEN** a valid Responses request contains canonical history and function
+  tool declarations
+- **WHEN** the provider streams reasoning, output-text, function-call, and
+  usage events
+- **THEN** the adapter emits the corresponding shared events in source order
+- **AND** starts no hidden tool loop, provider retry, or background task
+
+#### Scenario: Attempt requests provider state or hosted tools
+
+- **GIVEN** vendor extension data attempts to enable response storage,
+  `previous_response_id`, background execution, or hosted tools such as web
+  search, X search, or code execution
+- **WHEN** the adapter validates the request
+- **THEN** it rejects the unsupported behavior before credential or network
+  I/O
+- **AND** does not silently drop or apply the extension
+
+### Requirement: Encrypted Responses reasoning continuation
+
+The adapter SHALL request `include: ["reasoning.encrypted_content"]` on every
+request and SHALL preserve encrypted reasoning items as signature-bearing
+canonical reasoning content. Continuation requests MUST replay preserved
+reasoning items verbatim in their original order relative to function calls,
+MUST NOT invent or reorder encrypted content, and MUST drop a signature
+whenever the text it signed is altered. Encrypted content MUST remain
+non-rendered and non-diagnostic.
+
+#### Scenario: Continue a function call with encrypted reasoning
+
+- **GIVEN** a Responses stream emitted a reasoning item with encrypted
+  content followed by a function call
+- **WHEN** a later request includes the correlated function result
+- **THEN** the adapter replays the reasoning item with its encrypted content
+  and the function call in their original order before the result
+- **AND** sends no `previous_response_id`
+
+#### Scenario: Reasoning item carries only encrypted content
+
+- **GIVEN** a reasoning output item has encrypted content and no summary or
+  text
+- **WHEN** the adapter normalizes the item
+- **THEN** it emits one signature-bearing redacted reasoning block
+- **AND** the runtime retains it for replay without rendering it as visible
+  reasoning
+
+### Requirement: Responses stream normalization
+
+The adapter SHALL normalize Responses output-text deltas, reasoning deltas,
+fragmented function-call arguments, usage including cached and reasoning
+token detail, and exactly one `completed`, `incomplete`, or `failed` terminal
+into the existing provider event vocabulary. An `incomplete` terminal MUST
+surface its truncation reason as a finish state rather than silent success. A
+stream that ends without a terminal, or emits conflicting terminals, MUST
+produce a structured malformed-stream error without committing provider data
+after the first terminal boundary.
+
+#### Scenario: Function arguments arrive in deltas
+
+- **GIVEN** one function call announces its identity and streams several
+  argument fragments
+- **WHEN** the stream reaches its terminal
+- **THEN** the adapter emits indexed fragments that assemble into one
+  validated canonical tool call
+- **AND** preserves the provider call ID for the function result
+
+#### Scenario: Response ends incomplete
+
+- **GIVEN** a stream terminates with an `incomplete` terminal caused by the
+  output token limit
+- **WHEN** the adapter normalizes the terminal
+- **THEN** it commits the streamed output with a truncation finish state
+- **AND** does not report a natural completion
+
+#### Scenario: Stream ends without a terminal
+
+- **GIVEN** a Responses stream closes after semantic events but before any
+  terminal event
+- **WHEN** the adapter observes the end of the stream
+- **THEN** it ends the attempt with a structured malformed-stream provider
+  error
+- **AND** does not commit the partial output as a successful attempt
+
+### Requirement: Observable response metadata
+
+The HTTP transport contract SHALL offer a way for an adapter to observe the
+response status and headers alongside the body, without requiring existing
+transports to supply them. A transport that does not surface headers MUST
+degrade to reporting none, and an adapter MUST treat absent headers as absent
+rather than as empty limit state.
+
+#### Scenario: A transport surfaces response headers
+
+- **GIVEN** a transport that reports response status and headers
+- **WHEN** an adapter begins an attempt
+- **THEN** the adapter observes those headers before mapping the body
+- **AND** header values never reach a debug rendering, log field, or error
+  message
+
+#### Scenario: A transport that reports no headers still works
+
+- **GIVEN** a replay transport implementing only the byte-stream method
+- **WHEN** an adapter begins an attempt
+- **THEN** the attempt proceeds unchanged
+- **AND** no rate-limit snapshot is produced for it
+
+### Requirement: Normalized provider rate-limit snapshots
+
+Direct provider adapters SHALL parse provider-reported rate-limit and usage
+headers into one normalized, redaction-safe snapshot observation carrying, per
+reported window: used percentage, window duration, reset time, and the
+provider's limit identifier, each only when the provider reported it. An
+adapter MUST NOT estimate or fabricate usage, and absent data MUST surface as
+absent rather than zero. A snapshot SHALL flow through the versioned stream
+event and runtime event contracts without exposing credential material.
+
+#### Scenario: Response carries rate-limit headers
+
+- **GIVEN** a provider response reports a primary window at 82% used with a
+  reset timestamp
+- **WHEN** the adapter completes the attempt
+- **THEN** a normalized snapshot observation records 82%, the window, and the
+  reset time
+- **AND** the snapshot contains no authorization or header secret material
+
+#### Scenario: Provider reports no usage headers
+
+- **GIVEN** a provider response carries no recognized rate-limit headers
+- **WHEN** the adapter completes the attempt
+- **THEN** no snapshot is emitted
+- **AND** any consumer surface continues to show limit state as unknown
+
+#### Scenario: A relative reset is not converted to an absolute one
+
+- **GIVEN** a provider reports a window resetting in 3600 seconds and no
+  absolute reset timestamp
+- **WHEN** the adapter records the snapshot
+- **THEN** the window carries the relative reset
+- **AND** the absolute reset stays absent until a consumer with a clock
+  resolves it
+
+### Requirement: Typed limit-exhaustion classification
+
+The shared transport/adapter error classification SHALL distinguish a
+usage-limit exhaustion rejection from other rate or authentication failures as
+a distinct typed error carrying the server-reported reset time when present. A
+transient throttle that the existing retry discipline may safely retry MUST NOT
+be classified as exhaustion, and an exhaustion error MUST NOT be retryable by
+kind.
+
+#### Scenario: Usage limit rejection carries reset time
+
+- **GIVEN** the provider rejects an attempt because the account's usage window
+  is exhausted and reports when it resets
+- **WHEN** the shared classifier inspects the rejection
+- **THEN** the attempt fails with the typed limit-exhaustion error including
+  that reset time
+- **AND** the classification is redaction-safe in events and journals
+
+#### Scenario: Transient throttle is not exhaustion
+
+- **GIVEN** the provider returns a momentary throttle with a short retry hint
+- **WHEN** the shared classifier inspects the rejection
+- **THEN** the failure keeps its existing retryable rate-limited
+  classification
+- **AND** no limit-exhaustion handling is triggered
+
+#### Scenario: Exhaustion is not retried against the same credential
+
+- **GIVEN** an attempt failed with the typed limit-exhaustion error
+- **WHEN** the retry policy classifies it
+- **THEN** it is not retryable by kind
+- **AND** no further attempt is spent on the exhausted window
+
+### Requirement: Model-advertised Responses reasoning effort
+
+The Responses adapter SHALL accept a bounded, non-empty named reasoning
+effort supplied from a host-resolved model catalog and SHALL serialize that
+value unchanged. The adapter MUST reject an empty or oversized effort before
+credential or network I/O and MUST NOT impose one provider-wide enumeration
+on model-specific effort vocabularies.
+
+#### Scenario: Forward an extended Codex reasoning effort
+
+- **GIVEN** the host resolved `xhigh`, `max`, or `ultra` as a supported effort
+  for the selected model
+- **WHEN** the runtime builds the Responses request
+- **THEN** the adapter serializes the selected effort unchanged
+- **AND** does not reject it through a legacy three-value allowlist
+
+#### Scenario: Reject an invalid effort label
+
+- **GIVEN** a Responses request contains an empty or oversized reasoning
+  effort label
+- **WHEN** the adapter validates the request
+- **THEN** it returns a structured bad-request error before credential or
+  network I/O
+
+### Requirement: Explicit reqwest destination policy
+
+The optional ReqwestTransport SHALL require an explicit PublicHttps, Loopback or
+ConfiguredOrigin policy, enforce it on every request, and optionally pin scheme/host/effective
+port. Feature unification and configuration MUST NOT bypass a check.
+
+#### Scenario: Public HTTPS endpoint
+
+- **WHEN** PublicHttps receives HTTP, userinfo, fragments, a restricted host,
+  or a private/loopback/link-local/restricted IP
+- **THEN** it rejects the destination before HTTP I/O with the CLI classification.
+
+#### Scenario: Local model server
+
+- **WHEN** Loopback receives HTTP or HTTPS to 127/8, ::1, or localhost
+- **THEN** it permits only nonempty all-loopback address sets
+- **AND** rejects private/public IPs, other DNS names and non-loopback localhost answers.
+
+#### Scenario: User-configured self-hosted endpoint
+
+- **WHEN** ConfiguredOrigin pins an HTTP or HTTPS origin on a private address
+- **THEN** it permits requests to exactly that scheme, host and effective port
+- **AND** rejects any other origin, and every request when no origin is pinned.
+
+#### Scenario: DNS rebinding or origin change
+
+- **WHEN** any DNS answer violates policy or a request changes a pinned origin
+- **THEN** the entire request is rejected
+- **AND** allowed answers are pinned into the client without a second DNS lookup.
+
+### Requirement: Bounded redaction-safe streaming transport
+
+Both policies SHALL disable proxies and redirects, bound error bodies to 8 KiB,
+return at most 128 headers of at most 8 KiB each, and stream successful bodies
+through ByteStream. Errors and Debug MUST omit secrets. Connect timeout SHALL
+be configurable, defaulting to ten seconds; cancellation SHALL work by dropping
+pending requests or response streams, without detached I/O or hidden retries.
+
+#### Scenario: Redirect or credential echo
+
+- **WHEN** a response redirects or echoes credentials in an error body
+- **THEN** no redirect is followed and no raw credential enters diagnostics.
+
+#### Scenario: Stream local response and cancel
+
+- **WHEN** a Loopback server emits chunks before closing its response
+- **THEN** the caller can consume them incrementally
+- **AND** dropping a pending request or ByteStream releases its I/O.
+
+### Requirement: Canonical tool names at provider boundaries
+
+Anthropic Messages, OpenAI-compatible Chat Completions and Responses adapters SHALL use one shared deterministic bidirectional tool-name mapping with an ASCII
+letter/digit/underscore/hyphen wire alphabet and a 1–64 character bound. They
+MUST translate definitions, named choices and historical calls/results to the
+same wire names and translate model call names back before emitting events.
+Runtime requests, history, events and manifests MUST retain canonical identities.
+
+#### Scenario: Dotted and over-long names round-trip
+
+- **WHEN** a request registers a dotted or over-long canonical tool name
+- **THEN** its definition and named choice use a bounded provider-safe name
+- **AND** a model call using that name emits the canonical name
+- **AND** replay of its call/result uses the same wire identity
+
+#### Scenario: Valid names are unchanged
+
+- **WHEN** a tool name already meets the wire policy
+- **THEN** its wire name is identical to the canonical name
+
+#### Scenario: Collision disambiguation is deterministic
+
+- **WHEN** distinct canonical names sanitize or truncate to the same prefix
+- **THEN** deterministic suffixes distinguish them, including collisions with
+  already valid registered names or generated suffixes
+- **AND** reordering the same tool set produces the same mapping
+- **AND** growing history does not change registered tool wire names
+
+#### Scenario: Unknown model tool remains unknown
+
+- **WHEN** a model emits a wire name absent from the mapping
+- **THEN** the adapter passes it through unchanged for runtime unknown-tool handling
+
+#### Scenario: Fragmented OpenAI tool name
+
+- **WHEN** an OpenAI-compatible model streams a wire name in several fragments
+- **THEN** the adapter emits its complete canonical name before the tool finish
+- **AND** no wire-name fragments escape as runtime tool names

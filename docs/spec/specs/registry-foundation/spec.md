@@ -91,3 +91,10 @@ remote catalog updates MUST NOT silently change that run-plane view.
 - **THEN** the active request continues with its original snapshot
 - **AND** the new capability is eligible only for a later explicitly resolved
   view
+
+### Requirement: Capability scope patterns
+Scopes SHALL accept validated domain:name wildcard patterns. Deny MUST win; allow ids and patterns form a union. Protected bootstrap tools MUST remain visible.
+
+#### Scenario: Allow and deny overlap
+- **WHEN** allow and deny overlap
+- **THEN** The matching entry is absent from all agent discovery and activation surfaces.
