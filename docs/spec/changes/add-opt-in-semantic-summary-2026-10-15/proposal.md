@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T22:46:05Z
-updated_at: 2026-10-15T22:46:05Z
+updated_at: 2026-10-16T00:11:07Z
 ---
 
 # Proposal: Opt-in flat semantic summary beside LCM

@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-15T22:46:05Z
-updated_at: 2026-10-15T22:46:05Z
-completed_at:
+updated_at: 2026-10-16T00:11:07Z
+completed_at: 2026-10-16T00:11:07Z
 ---
 
 # Tasks: Opt-in flat semantic summary beside LCM
@@ -42,10 +42,17 @@ completed_at:
 ## 5. Docs and release
 - [x] 5.1 `CHANGELOG.md` Unreleased; scope the "no summary body crosses the
       facade" rule to LCM in `CHANGELOG.md` and `docs/migration-0.1.md`.
-- [ ] 5.2 Gate: fmt, clippy `-D warnings`, `cargo test --workspace
+- [x] 5.2 Gate: fmt, clippy `-D warnings`, `cargo test --workspace
       --all-features`, the feature combinations, Rust 1.86, consumer-compat.
       (Local 2026-10-15 after batch B: fmt, clippy, 1,835 tests, doc tests and
-      the three consumer suites pass; MSRV and feature legs run in CI.)
-- [ ] 5.3 Before tagging, build Smith against this branch through a local
+      the three consumer suites pass. PR #31 CI passed all 8 jobs.)
+- [x] 5.3 Before tagging, build Smith against this branch through a local
       override and run its semantic-summary and cache-controller suites.
-- [ ] 5.4 Release v0.4.0.
+      (2026-10-15: Smith's full gate passed against this branch, 2,890 tests,
+      after test-only fixes for main's build-time write-scope check and
+      manifest schema 2. Live on the owner's config: a tool turn, `/model`,
+      `/quit`, and resuming a 0.5.0 session. A session the new build writes
+      cannot be resumed by Smith 0.5.0.)
+- [x] 5.4 Release v0.4.0. (Archive waits for
+      `add-lossless-context-memory-2026-08-11`, whose requirement this change
+      modifies.)
