@@ -7,6 +7,17 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `agent-runtime-provider/reqwest-transport`: a shared streaming
+  `ReqwestTransport` with a required, non-exhaustive destination policy
+  (`DestinationPolicy::{PublicHttps, Loopback, ConfiguredOrigin}`), optional
+  exact-origin pinning (required for `ConfiguredOrigin`), a configurable
+  connect timeout, checked and pinned DNS answers, no proxies or redirects,
+  bounded error bodies and response headers, and redaction-safe diagnostics.
+  The CLI now builds on the shared `PublicHttps` mechanism with its existing
+  exact-origin policy.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added
@@ -606,15 +617,6 @@ See [`docs/migration-0.1.md`](docs/migration-0.1.md) for the full migration.
   dropped in favor of `agent-runtime-context`'s `RequestSizer`/`CharRatioSizer`.
 
 ### Added
-
-- Opt-in `agent-runtime-provider/reqwest-transport`: shared streaming
-  `ReqwestTransport` with required, non-exhaustive
-  `DestinationPolicy::{PublicHttps, Loopback, ConfiguredOrigin}`, optional
-  exact-origin pinning (required for `ConfiguredOrigin`), configurable connect timeout, checked/pinned
-  DNS answers, no proxies or redirects, bounded error bodies/response headers,
-  and redaction-safe diagnostics. The CLI uses the shared PublicHttps mechanism
-  with its existing exact-origin policy. Both default and optional provider
-  builds pass Rust 1.86 with the workspace lockfile.
 
 - Cache diagnostics: `first_changed_fragment` names the first plan segment
   (in plan-segment order) that differs from the committed predecessor,
