@@ -16,11 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 agent-runtime.workspace = true
+agent-runtime-provider = { workspace = true, features = ["reqwest-transport"] }
 agent-runtime-mcp.workspace = true
 async-trait.workspace = true
 clap = { version = "4", features = ["derive"] }
 futures-util.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -7,6 +7,17 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `agent-runtime-provider/reqwest-transport`: a shared streaming
+  `ReqwestTransport` with a required, non-exhaustive destination policy
+  (`DestinationPolicy::{PublicHttps, Loopback, ConfiguredOrigin}`), optional
+  exact-origin pinning (required for `ConfiguredOrigin`), a configurable
+  connect timeout, checked and pinned DNS answers, no proxies or redirects,
+  bounded error bodies and response headers, and redaction-safe diagnostics.
+  The CLI now builds on the shared `PublicHttps` mechanism with its existing
+  exact-origin policy.
+
 ## [0.4.0] - 2026-10-15
 
 ### Added
