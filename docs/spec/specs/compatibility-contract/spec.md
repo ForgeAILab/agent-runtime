@@ -116,3 +116,46 @@ An exhaustive consumer failure MUST block the compatible landed revision.
 - **WHEN** landed-revision eligibility is evaluated
 - **THEN** the immutable revision is not accepted as compatible
 - **AND** the consumer migration is coordinated before pinning
+
+### Requirement: Rate-limit observation additivity
+
+Adding rate-limit observation SHALL NOT break an existing transport, adapter,
+or serialized record. The byte-stream transport method remains required and
+unchanged; the header-observing method is defaulted. New stream and runtime
+event variants and the new provider error kind SHALL serialize as additive
+tagged variants, and no existing field SHALL be removed or repurposed.
+
+#### Scenario: An existing transport keeps compiling
+
+- **GIVEN** a transport implementing only the byte-stream method
+- **WHEN** the crate is rebuilt against this change
+- **THEN** it compiles unchanged
+- **AND** attempts it serves produce no snapshot rather than failing
+
+#### Scenario: An older record still deserializes
+
+- **GIVEN** a serialized provider error written before this change
+- **WHEN** it is deserialized after it
+- **THEN** it deserializes successfully
+- **AND** its reset time reads as absent
+
+### Requirement: Cache diagnostics and normalization remain opt-in compatible
+
+New cache diagnostic fields SHALL default to absent when reading legacy
+plans/events and SHALL be omitted when unavailable. Existing tools MUST retain
+identity normalization without migration. All supported consumer gates MUST
+verify the existing event variant set, prepared authority, and legacy serde
+behavior, coordinating any field-exact Rust construction updates before a
+compatible release.
+
+#### Scenario: Old cache event and plan are read
+
+- **WHEN** a current reader loads a cache event or plan without first_changed_fragment
+- **THEN** all existing fields retain their values and the diagnostic is absent
+- **AND** no changed fragment is inferred from invalidated token counts alone
+
+#### Scenario: Consumer does not adopt normalization
+
+- **WHEN** an unchanged consumer runs its legacy tool fixture against the candidate
+- **THEN** its advertised schema, validation outcome, and authority checks remain unchanged
+- **AND** a failing consumer suite blocks publication even if the new optional JSON is readable
