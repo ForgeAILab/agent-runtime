@@ -9,6 +9,14 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Added
 
+- `agent::one_shot` calls on a provider or external agent, with bounded text,
+  typed finishes and errors, caller-owned usage, deadlines, and cancellation
+  of child work when the call's future is dropped.
+- Per-turn `ExternalTurnRequest::instructions`, appended after configured
+  backend instructions. Claude Code uses `--append-system-prompt`; Codex
+  prefixes instructions to its input. Both CLI configs now accept optional
+  standing `instructions`.
+
 - Opt-in `agent-runtime-provider/reqwest-transport`: a shared streaming
   `ReqwestTransport` with a required, non-exhaustive destination policy
   (`DestinationPolicy::{PublicHttps, Loopback, ConfiguredOrigin}`), optional
@@ -17,6 +25,12 @@ contain breaking changes and are coordinated with consumer proposals.
   bounded error bodies and response headers, and redaction-safe diagnostics.
   The CLI now builds on the shared `PublicHttps` mechanism with its existing
   exact-origin policy.
+
+### Changed
+
+- **Breaking:** `ExternalTurnRequest` is non-exhaustive. Consumers should use
+  `ExternalTurnRequest::new(input, turn, cancel)` and assign optional fields
+  instead of constructing it with a struct literal.
 
 ## [0.4.0] - 2026-10-15
 

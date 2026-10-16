@@ -275,6 +275,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .collect();
         let (dispatch, mut calls) = ExternalToolDispatch::channel(specs);
         let request = ExternalTurnRequest {
+            instructions: None,
             input,
             resume: self.stored_session(),
             turn: turn_id.clone(),

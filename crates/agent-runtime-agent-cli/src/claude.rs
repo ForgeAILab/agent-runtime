@@ -75,6 +75,8 @@ pub struct ClaudeCodeConfig {
     pub program: PathBuf,
     /// Optional Claude model alias or id.
     pub model: Option<String>,
+    /// Standing instructions, followed by any per-turn request instructions.
+    pub instructions: Option<String>,
     /// Working directory for Claude.
     pub cwd: PathBuf,
     /// Runtime-owned root for per-turn generated configuration.
@@ -90,6 +92,7 @@ impl Default for ClaudeCodeConfig {
         Self {
             program: PathBuf::from("claude"),
             model: None,
+            instructions: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             turn_dir_root: session_dir::default_root(),
             extra_args: Vec::new(),
@@ -104,6 +107,7 @@ impl fmt::Debug for ClaudeCodeConfig {
             .debug_struct("ClaudeCodeConfig")
             .field("program", &self.program)
             .field("model", &self.model)
+            .field("instructions", &self.instructions)
             .field("cwd", &self.cwd)
             .field("turn_dir_root", &self.turn_dir_root)
             .field("extra_args", &self.extra_args)
@@ -247,6 +251,17 @@ impl ClaudeCodeBackend {
         }
 
         args.extend(self.config.extra_args.iter().cloned());
+        let instructions = [
+            self.config.instructions.as_deref(),
+            request.instructions.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+        if !instructions.is_empty() {
+            args.extend(["--append-system-prompt".to_owned(), instructions]);
+        }
         args.push(prompt);
 
         Launch {
@@ -568,4 +583,45 @@ fn parse_version(text: &str) -> Option<Version> {
         );
         (components.next().is_none()).then_some(version)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_runtime_core::cancel::Cancellation;
+    use agent_runtime_core::content::UserInput;
+    use agent_runtime_core::ids::TurnId;
+
+    #[test]
+    fn one_shot_instructions_follow_configured_instructions_in_append_flag() {
+        for (configured, per_turn, expected) in [
+            (None, None, None),
+            (Some("configured"), None, Some("configured")),
+            (None, Some("request"), Some("request")),
+            (
+                Some("configured"),
+                Some("request"),
+                Some("configured\n\nrequest"),
+            ),
+        ] {
+            let backend = ClaudeCodeBackend::new(ClaudeCodeConfig {
+                instructions: configured.map(str::to_owned),
+                ..Default::default()
+            });
+            let mut request = ExternalTurnRequest::new(
+                UserInput::text("input"),
+                TurnId::new("turn"),
+                Cancellation::new(),
+            );
+            request.instructions = per_turn.map(str::to_owned);
+            let launch = backend.launch(&request, Path::new("mcp.json"), None, "input".into());
+            let append = launch
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "--append-system-prompt")
+                .map(|pair| pair[1].as_str());
+            assert_eq!(append, expected);
+            assert_eq!(launch.args.last().unwrap(), "input");
+        }
+    }
 }

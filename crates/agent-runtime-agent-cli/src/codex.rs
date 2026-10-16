@@ -69,6 +69,8 @@ pub struct CodexConfig {
     pub program: PathBuf,
     /// Optional --model value.
     pub model: Option<String>,
+    /// Standing instructions, followed by any per-turn request instructions.
+    pub instructions: Option<String>,
     /// Optional model_reasoning_effort value.
     pub reasoning_effort: Option<String>,
     /// Working directory passed with -C.
@@ -94,6 +96,7 @@ impl Default for CodexConfig {
         Self {
             program: PathBuf::from("codex"),
             model: None,
+            instructions: None,
             reasoning_effort: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             sandbox: "read-only".to_owned(),
@@ -111,6 +114,7 @@ impl fmt::Debug for CodexConfig {
         f.debug_struct("CodexConfig")
             .field("program", &self.program)
             .field("model", &self.model)
+            .field("instructions", &self.instructions)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("cwd", &self.cwd)
             .field("sandbox", &self.sandbox)
@@ -282,7 +286,16 @@ impl CodexBackend {
         if let Some(resume) = &request.resume {
             args.push(resume.as_str().to_owned());
         }
-        args.push(prompt.to_owned());
+        let prompt = [
+            self.config.instructions.as_deref(),
+            request.instructions.as_deref(),
+            Some(prompt),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+        args.push(prompt);
 
         Ok(Materialized {
             launch: Launch {
@@ -1038,5 +1051,38 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{config:?}").contains("secret"));
+    }
+
+    #[test]
+    fn one_shot_instructions_follow_configured_instructions_in_input() {
+        use agent_runtime_core::cancel::Cancellation;
+        use agent_runtime_core::ids::TurnId;
+
+        let root = std::env::temp_dir().join(format!("one-shot-codex-{}", uuid::Uuid::new_v4()));
+        for (configured, per_turn, expected) in [
+            (None, None, "input"),
+            (Some("configured"), None, "configured\n\ninput"),
+            (None, Some("request"), "request\n\ninput"),
+            (
+                Some("configured"),
+                Some("request"),
+                "configured\n\nrequest\n\ninput",
+            ),
+        ] {
+            let backend = CodexBackend::new(CodexConfig {
+                instructions: configured.map(str::to_owned),
+                turn_dir_root: root.clone(),
+                ..Default::default()
+            });
+            let mut request = ExternalTurnRequest::new(
+                UserInput::text("input"),
+                TurnId::new("turn"),
+                Cancellation::new(),
+            );
+            request.instructions = per_turn.map(str::to_owned);
+            let materialized = backend.materialize(&request, "input").unwrap();
+            assert_eq!(materialized.launch.args.last().unwrap(), expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
