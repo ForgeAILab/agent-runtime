@@ -10,7 +10,7 @@
 //!
 //! # Quick start
 //!
-//! Every request is planned against the model's declared limits, so a host
+//! Every session turn is planned against the model's declared limits, so a host
 //! supplies a model profile (or a [`core::catalog::ModelCatalog`] to resolve
 //! one). There is no default window: the runtime refuses to build rather than
 //! guess how much context it may send.
@@ -116,7 +116,8 @@ pub use agent_runtime_registry as registry;
 /// accounting, compaction, and cache planning.
 ///
 /// Re-exported from [`agent_runtime_context`]. Every provider request the
-/// runtime sends is derived from one of its plans.
+/// session loop sends is derived from one of its plans. One-shot calls let
+/// hosts size their own input outside that loop.
 pub use agent_runtime_context as context;
 
 /// Lossless Context Memory: immutable timelines, hierarchical summary DAGs,
@@ -184,6 +185,9 @@ pub mod prelude {
 
     // -- provider adapters and the embeddable runtime facade -----------------
     pub use crate::agent::config::{DowngradePolicy, LoopConfig};
+    pub use crate::agent::one_shot::{
+        OneShotAnswer, OneShotError, OneShotExecutor, OneShotFinish, OneShotRequest, run_one_shot,
+    };
     pub use crate::cache::{
         CacheCapturedOutput, CacheHandoffSuffix, CacheMechanism, CacheOperationRequest,
         CacheOperationResult, CacheResourceDispatchRequest, CacheStateRecord,

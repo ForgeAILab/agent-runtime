@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use agent_runtime::agent::external::{
     AllowedTool, ExternalAgentBackend, ExternalAgentEvent, ExternalCapabilities, ExternalMcpServer,
-    ExternalMcpTransport, ExternalSessionId, ExternalToolBridge, ExternalToolDispatch,
-    ExternalToolPolicy, ExternalTurnRequest, RUNTIME_BRIDGE_SERVER_NAME, SkillBundle,
+    ExternalMcpTransport, ExternalSessionId, ExternalToolBridge, ExternalToolPolicy,
+    ExternalTurnRequest, RUNTIME_BRIDGE_SERVER_NAME, SkillBundle,
 };
 use agent_runtime_agent_cli::claude::{ClaudeCodeBackend, ClaudeCodeConfig, ClaudeDecoder};
 use agent_runtime_agent_cli::process::LineDecoder;
@@ -45,15 +45,14 @@ fn request(
     bridge: Option<ExternalToolBridge>,
     input: &str,
 ) -> ExternalTurnRequest {
-    ExternalTurnRequest {
-        input: UserInput::text(input),
-        resume: None,
-        turn: TurnId::new("claude-test-turn"),
-        cancel: Cancellation::new(),
-        tools: ExternalToolDispatch::disabled(),
-        capabilities: Arc::new(capabilities),
-        bridge,
-    }
+    let mut request = ExternalTurnRequest::new(
+        UserInput::text(input),
+        TurnId::new("claude-test-turn"),
+        Cancellation::new(),
+    );
+    request.capabilities = Arc::new(capabilities);
+    request.bridge = bridge;
+    request
 }
 
 fn fixture_events(fixture: &str) -> Vec<ExternalAgentEvent> {
@@ -228,6 +227,7 @@ printf '%s\n' '{"type":"result","session_id":"snapshot","usage":{},"terminal_rea
     let config = ClaudeCodeConfig {
         program: script,
         model: Some("sonnet".to_owned()),
+        instructions: None,
         cwd: root.clone(),
         turn_dir_root: root.join("turns"),
         extra_args: vec!["--extra-test".to_owned(), "value".to_owned()],

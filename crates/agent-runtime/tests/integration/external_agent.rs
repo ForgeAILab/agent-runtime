@@ -33,6 +33,16 @@ struct ScriptedBackend {
     dispatches: Mutex<Vec<agent_runtime::prelude::ExternalToolDispatch>>,
     offered: Mutex<Vec<Option<String>>>,
     inputs: Mutex<Vec<UserInput>>,
+    requests: Mutex<Vec<ObservedExternalRequest>>,
+}
+
+#[derive(Debug)]
+struct ObservedExternalRequest {
+    instructions: Option<String>,
+    turn: agent_runtime_core::ids::TurnId,
+    cancel: agent_runtime_core::cancel::Cancellation,
+    capabilities: Arc<agent_runtime::agent::external::ExternalCapabilities>,
+    has_bridge: bool,
 }
 
 impl ScriptedBackend {
@@ -49,6 +59,7 @@ impl ScriptedBackend {
             dispatches: Mutex::new(Vec::new()),
             offered: Mutex::new(Vec::new()),
             inputs: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
         })
     }
 
@@ -63,6 +74,13 @@ impl ExternalAgentBackend for ScriptedBackend {
         &self,
         request: ExternalTurnRequest,
     ) -> Result<ExternalTurnStream, RuntimeError> {
+        self.requests.lock().unwrap().push(ObservedExternalRequest {
+            instructions: request.instructions.clone(),
+            turn: request.turn.clone(),
+            cancel: request.cancel.clone(),
+            capabilities: request.capabilities.clone(),
+            has_bridge: request.bridge.is_some(),
+        });
         self.inputs.lock().unwrap().push(request.input.clone());
         self.offered
             .lock()
@@ -1996,3 +2014,6 @@ mod bridge_tests {
         )));
     }
 }
+
+#[path = "external_agent/one_shot.rs"]
+mod one_shot;

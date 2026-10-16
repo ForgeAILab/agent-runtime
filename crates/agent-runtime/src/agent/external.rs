@@ -298,8 +298,11 @@ impl BackendToolObservationLog {
 }
 
 /// One turn handed to a backend.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct ExternalTurnRequest {
+    /// Instructions added after the backend's configured instructions for this turn.
+    pub instructions: Option<String>,
     /// The user input for this turn, already resolved by the host.
     pub input: UserInput,
     /// An identity the backend reported earlier, offered for continuation.
@@ -320,6 +323,23 @@ pub struct ExternalTurnRequest {
     pub bridge: Option<ExternalToolBridge>,
     /// Runtime-owned host tools offered for this turn.
     pub tools: ExternalToolDispatch,
+}
+
+impl ExternalTurnRequest {
+    /// Creates a fresh turn without continuation, injected capabilities, or host tools.
+    /// Optional fields remain assignable so hosts can opt into only what they need.
+    pub fn new(input: UserInput, turn: TurnId, cancel: Cancellation) -> Self {
+        Self {
+            input,
+            turn,
+            cancel,
+            instructions: None,
+            resume: None,
+            capabilities: Arc::default(),
+            bridge: None,
+            tools: ExternalToolDispatch::disabled(),
+        }
+    }
 }
 
 /// Normalized events a backend streams while its turn runs.
