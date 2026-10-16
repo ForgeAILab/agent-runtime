@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-16
+
 ### Added
 
 - `agent::one_shot` calls on a provider or external agent, with bounded text,
@@ -16,7 +18,6 @@ contain breaking changes and are coordinated with consumer proposals.
   backend instructions. Claude Code uses `--append-system-prompt`; Codex
   prefixes instructions to its input. Both CLI configs now accept optional
   standing `instructions`.
-
 - Opt-in `agent-runtime-provider/reqwest-transport`: a shared streaming
   `ReqwestTransport` with a required, non-exhaustive destination policy
   (`DestinationPolicy::{PublicHttps, Loopback, ConfiguredOrigin}`), optional
