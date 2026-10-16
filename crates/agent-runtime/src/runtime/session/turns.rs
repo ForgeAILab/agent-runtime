@@ -1,4 +1,5 @@
 use super::*;
+use crate::harness::protected_summary_from_patch;
 use crate::runtime::engine::IDLE_BOUNDARY_NAMESPACE;
 
 impl SessionHandle {
@@ -218,7 +219,62 @@ impl SessionHandle {
         }
     }
 
+    /// Attempts one LCM compaction at the current idle turn boundary.
+    /// Returns lifecycle metadata and usage without exposing a summary body.
     pub async fn try_idle_compaction(&self) -> Result<IdleCompactionAdmission, RuntimeError> {
+        Ok(match Box::pin(self.run_idle_compaction()).await? {
+            IdleBoundaryAdmission::Accepted {
+                changed,
+                fallback_reason,
+                usage,
+                ..
+            } => IdleCompactionAdmission::Accepted {
+                changed,
+                fallback_reason,
+                usage,
+            },
+            IdleBoundaryAdmission::Busy => IdleCompactionAdmission::Busy,
+            IdleBoundaryAdmission::Shutdown => IdleCompactionAdmission::Shutdown,
+        })
+    }
+
+    /// Attempts one flat semantic compaction at the current idle turn boundary.
+    ///
+    /// Requires the flat summary component. The accepted result includes its
+    /// protected summary and usage under `cache_idle_compaction`. The same
+    /// admission, exact checkpoint, persistence and rollback rules as LCM apply;
+    /// each idle interval permits one attempt, including a model fallback.
+    pub async fn try_idle_semantic_compaction(
+        &self,
+    ) -> Result<SemanticIdleCompactionAdmission, RuntimeError> {
+        if self
+            .inner
+            .shared
+            .driver
+            .semantic_summary_revision()
+            .is_none()
+        {
+            return Err(RuntimeError::config(
+                "idle semantic compaction requires a configured flat summary component",
+            ));
+        }
+        Ok(match Box::pin(self.run_idle_compaction()).await? {
+            IdleBoundaryAdmission::Accepted {
+                summary,
+                semantic_fallback_reason,
+                usage,
+                ..
+            } => SemanticIdleCompactionAdmission::Accepted {
+                summary,
+                fallback_reason: semantic_fallback_reason,
+                usage,
+            },
+            IdleBoundaryAdmission::Busy => SemanticIdleCompactionAdmission::Busy,
+            IdleBoundaryAdmission::Shutdown => SemanticIdleCompactionAdmission::Shutdown,
+        })
+    }
+
+    async fn run_idle_compaction(&self) -> Result<IdleBoundaryAdmission, RuntimeError> {
         // Claim both admission layers before publishing the idle attempt.  In
         // particular, do not release `admission_gate` and then await
         // `turn_gate`: a user can otherwise win admission in that gap and the
@@ -230,21 +286,21 @@ impl SessionHandle {
                 .lock()
                 .expect("session admission gate poisoned");
             if self.inner.recovery_deferred {
-                return Ok(IdleCompactionAdmission::Busy);
+                return Ok(IdleBoundaryAdmission::Busy);
             }
             let turns = self.inner.turns.lock().expect("session turns poisoned");
             if turns.shutting_down || self.inner.cancel.is_cancelled() {
-                return Ok(IdleCompactionAdmission::Shutdown);
+                return Ok(IdleBoundaryAdmission::Shutdown);
             }
             if self.inner.user_submission_pending.load(Ordering::Acquire) != 0
                 || turns.count != 0
                 || self.inner.idle_compaction_attempted.load(Ordering::Acquire)
             {
-                return Ok(IdleCompactionAdmission::Busy);
+                return Ok(IdleBoundaryAdmission::Busy);
             }
             let turn_gate = match self.inner.turn_gate.try_lock() {
                 Ok(turn_gate) => turn_gate,
-                Err(_) => return Ok(IdleCompactionAdmission::Busy),
+                Err(_) => return Ok(IdleBoundaryAdmission::Busy),
             };
             if self
                 .inner
@@ -252,7 +308,7 @@ impl SessionHandle {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                return Ok(IdleCompactionAdmission::Busy);
+                return Ok(IdleBoundaryAdmission::Busy);
             }
             turn_gate
         };
@@ -267,7 +323,7 @@ impl SessionHandle {
                 self.inner
                     .idle_compaction_inflight
                     .store(false, Ordering::Release);
-                return Ok(IdleCompactionAdmission::Shutdown);
+                return Ok(IdleBoundaryAdmission::Shutdown);
             }
         };
         let _idle = IdleCompactionGuard {
@@ -275,13 +331,13 @@ impl SessionHandle {
             _cache_activity: cache_activity,
         };
         if self.inner.cancel.is_cancelled() {
-            return Ok(IdleCompactionAdmission::Shutdown);
+            return Ok(IdleBoundaryAdmission::Shutdown);
         }
         if self.inner.shared.lcm.is_some() && self.inner.shared.session_store.is_none() {
-            return Ok(IdleCompactionAdmission::Busy);
+            return Ok(IdleBoundaryAdmission::Busy);
         }
         if !self.idle_checkpoint_is_safe().await? {
-            return Ok(IdleCompactionAdmission::Busy);
+            return Ok(IdleBoundaryAdmission::Busy);
         }
         self.inner
             .idle_compaction_attempted
@@ -333,23 +389,25 @@ impl SessionHandle {
         {
             Ok(results) => results,
             Err(_error) if self.inner.cancel.is_cancelled() => {
-                return Ok(IdleCompactionAdmission::Shutdown);
+                return Ok(IdleBoundaryAdmission::Shutdown);
             }
             Err(error) => return Err(error),
         };
-        let first_batch = IdleCompactionBatch::from_results(results, &extension_state);
+        let first_batch = IdleCompactionBatch::from_results(results, &extension_state)?;
         let _persist_gate = self.inner.persist_gate.lock().await;
         if self.inner.cancel.is_cancelled() {
-            return Ok(IdleCompactionAdmission::Shutdown);
+            return Ok(IdleBoundaryAdmission::Shutdown);
         }
         self.persist_idle_batch(&first_batch).await?;
         self.emit_idle_batch(&boundary_turn, &first_batch);
 
         if !first_batch.retry_after_checkpoint {
-            return Ok(IdleCompactionAdmission::Accepted {
+            return Ok(IdleBoundaryAdmission::Accepted {
                 changed: first_batch.changed,
                 fallback_reason: first_batch.fallback_reason,
                 usage: first_batch.usage,
+                summary: first_batch.summary,
+                semantic_fallback_reason: first_batch.semantic_fallback_reason,
             });
         }
 
@@ -357,7 +415,7 @@ impl SessionHandle {
         // the durable handoff; only LCM is rerun, so unrelated hooks cannot
         // repeat work or publish a second idle operation.
         if self.inner.cancel.is_cancelled() {
-            return Ok(IdleCompactionAdmission::Shutdown);
+            return Ok(IdleBoundaryAdmission::Shutdown);
         }
         let second_extension_state = self
             .inner
@@ -400,12 +458,12 @@ impl SessionHandle {
         {
             Ok(results) => results,
             Err(_error) if self.inner.cancel.is_cancelled() => {
-                return Ok(IdleCompactionAdmission::Shutdown);
+                return Ok(IdleBoundaryAdmission::Shutdown);
             }
             Err(error) => return Err(error),
         };
         let second_batch =
-            IdleCompactionBatch::from_results(second_results, &second_extension_state);
+            IdleCompactionBatch::from_results(second_results, &second_extension_state)?;
         if second_batch.retry_after_checkpoint {
             return Err(RuntimeError::conflict(
                 "idle LCM compaction exceeded its two-pass retry bound",
@@ -416,10 +474,14 @@ impl SessionHandle {
 
         let mut usage = first_batch.usage.clone();
         usage.merge(&second_batch.usage);
-        Ok(IdleCompactionAdmission::Accepted {
+        Ok(IdleBoundaryAdmission::Accepted {
             changed: first_batch.changed || second_batch.changed,
             fallback_reason: first_batch.fallback_reason.or(second_batch.fallback_reason),
             usage,
+            summary: second_batch.summary.or(first_batch.summary),
+            semantic_fallback_reason: first_batch
+                .semantic_fallback_reason
+                .or(second_batch.semantic_fallback_reason),
         })
     }
 
@@ -1352,6 +1414,25 @@ impl std::fmt::Debug for IdleCompactionAdmission {
     }
 }
 
+impl std::fmt::Debug for SemanticIdleCompactionAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Accepted {
+                summary,
+                fallback_reason,
+                usage,
+            } => formatter
+                .debug_struct("SemanticIdleCompactionAdmission::Accepted")
+                .field("has_summary", &summary.is_some())
+                .field("fallback_reason", fallback_reason)
+                .field("usage", usage)
+                .finish(),
+            Self::Busy => formatter.write_str("SemanticIdleCompactionAdmission::Busy"),
+            Self::Shutdown => formatter.write_str("SemanticIdleCompactionAdmission::Shutdown"),
+        }
+    }
+}
+
 impl TurnHandle {
     /// The accepted turn id.
     pub fn id(&self) -> &TurnId {
@@ -1387,6 +1468,19 @@ impl Drop for IdleCompactionGuard {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+enum IdleBoundaryAdmission {
+    Accepted {
+        changed: bool,
+        fallback_reason: Option<LcmLifecycleReason>,
+        usage: UsageDelta,
+        summary: Option<ProtectedSemanticSummary>,
+        semantic_fallback_reason: Option<String>,
+    },
+    Busy,
+    Shutdown,
+}
+
 #[derive(Debug)]
 struct IdleCompactionBatch {
     updates: Vec<(String, VersionedSessionState)>,
@@ -1396,13 +1490,15 @@ struct IdleCompactionBatch {
     fallback_reason: Option<LcmLifecycleReason>,
     usage: UsageDelta,
     retry_after_checkpoint: bool,
+    summary: Option<ProtectedSemanticSummary>,
+    semantic_fallback_reason: Option<String>,
 }
 
 impl IdleCompactionBatch {
     fn from_results(
         results: Vec<(ComponentDescriptor, IdleCompactionResult)>,
         previous_extensions: &BTreeMap<String, VersionedSessionState>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         let mut updates = Vec::new();
         let mut usage_records = Vec::new();
         let mut events = Vec::new();
@@ -1410,7 +1506,19 @@ impl IdleCompactionBatch {
         let mut fallback_reason = None;
         let mut usage = UsageDelta::new();
         let mut retry_after_checkpoint = false;
+        let mut summary = None;
+        let mut semantic_fallback_reason = None;
         for (descriptor, result) in results {
+            if descriptor.id().as_str() == SEMANTIC_SUMMARY_COMPONENT_ID {
+                summary = protected_summary_from_patch(&result.patch)?;
+            }
+            if semantic_fallback_reason.is_none() {
+                semantic_fallback_reason =
+                    result.patch.events.iter().find_map(|event| match event {
+                        HarnessEvent::SemanticSummaryFallback { reason } => Some(reason.clone()),
+                        _ => None,
+                    });
+            }
             if descriptor.id().as_str() == LCM_COMPONENT_ID {
                 if let Some(state) = result.patch.state.as_ref() {
                     let next = state.clone().into_state();
@@ -1440,7 +1548,7 @@ impl IdleCompactionBatch {
             usage_records.extend(result.patch.usage);
             events.extend(result.patch.events);
         }
-        Self {
+        Ok(Self {
             updates,
             usage_records,
             events,
@@ -1448,7 +1556,9 @@ impl IdleCompactionBatch {
             fallback_reason,
             usage,
             retry_after_checkpoint,
-        }
+            summary,
+            semantic_fallback_reason,
+        })
     }
 }
 

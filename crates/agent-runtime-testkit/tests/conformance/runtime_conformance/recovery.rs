@@ -1614,3 +1614,168 @@ async fn resumed_session_continues_ids_and_event_sequences() {
 }
 
 // consumer fixtures build and run the shared loop with distinct neutral policy.
+
+#[tokio::test]
+async fn publishing_terminal_recovery_preserves_coordinator_summary_without_rerun() {
+    let id = SessionId::new("publishing-terminal-coordinator-recovery");
+    let checkpoints = Arc::new(agent_runtime_testkit::InMemoryCheckpointStore::new());
+    let artifacts = Arc::new(ScenarioArtifactStore::default());
+    let summary_model = Arc::new(CountingSummaryModel::default());
+    let summary = Arc::new(
+        SemanticSummaryCoordinator::new(
+            artifacts,
+            summary_model.clone(),
+            SemanticSummaryPolicy {
+                min_turns: 2,
+                retain_turns: 1,
+                input_budget_tokens: 100_000,
+                ..SemanticSummaryPolicy::new(RegistryRevision::new("durable-summary-v1"))
+            },
+        )
+        .unwrap(),
+    );
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let observer = RecordingObserver::shared();
+    let source_runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![
+                ScriptedStream::new(vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "first answer".into(),
+                    },
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ]),
+                ScriptedStream::new(vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "second answer".into(),
+                    },
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ]),
+            ],
+        )))
+        .checkpoint_store(checkpoints.clone())
+        .history_projector(summary.clone())
+        .turn_commit_hook(Arc::new(CountingSemanticSummaryHook {
+            inner: summary.clone(),
+            calls: hook_calls.clone(),
+        }))
+        .observer(observer.clone())
+        .build()
+        .unwrap();
+    let source = source_runtime
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    source.run(UserInput::text("first request")).await.unwrap();
+    source.run(UserInput::text("second request")).await.unwrap();
+
+    assert_eq!(hook_calls.load(Ordering::Acquire), 2);
+    assert_eq!(summary_model.calls.load(Ordering::Acquire), 1);
+    let publishing = checkpoints
+        .history(&id)
+        .into_iter()
+        .rev()
+        .find(|checkpoint| matches!(checkpoint.state, TurnState::PublishingTerminal { .. }))
+        .expect("second turn has a publishing boundary");
+    assert_eq!(
+        publishing
+            .snapshot
+            .usage
+            .records()
+            .iter()
+            .filter(|record| record.source == UsageSource::SemanticSummary)
+            .count(),
+        1,
+        "PublishingTerminal protects post-hook usage"
+    );
+    assert!(
+        publishing.snapshot.extension_state.values().any(|state| {
+            state.sensitivity == agent_runtime_core::store::SessionStateSensitivity::Sensitive
+        }),
+        "PublishingTerminal protects the semantic summary state"
+    );
+    assert!(
+        observer.events().iter().any(|event| {
+            event.seq < publishing.watermark.event_sequence
+                && matches!(
+                    &event.payload,
+                    RuntimeEvent::Usage { record }
+                        if record.source == UsageSource::SemanticSummary
+                )
+        }),
+        "the protected watermark follows the hook's usage event"
+    );
+
+    let recovery_checkpoints = Arc::new(agent_runtime_testkit::InMemoryCheckpointStore::new());
+    recovery_checkpoints.seed(publishing).unwrap();
+    let recovery_observer = RecordingObserver::shared();
+    let recovery_runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .model_profile(agent_runtime_testkit::scenarios::fake_model_profile())
+        .provider(Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            Vec::new(),
+        )))
+        .checkpoint_store(recovery_checkpoints.clone())
+        .history_projector(summary.clone())
+        .turn_commit_hook(Arc::new(CountingSemanticSummaryHook {
+            inner: summary,
+            calls: hook_calls.clone(),
+        }))
+        .observer(recovery_observer.clone())
+        .build()
+        .unwrap();
+    let recovered = recovery_runtime
+        .start_session(StartSession::resume(id))
+        .await
+        .unwrap();
+    wait_for_terminal(&recovery_observer).await;
+
+    assert_eq!(
+        hook_calls.load(Ordering::Acquire),
+        2,
+        "PublishingTerminal recovery must not invoke turn-commit hooks again"
+    );
+    assert_eq!(
+        summary_model.calls.load(Ordering::Acquire),
+        1,
+        "the idempotently keyed summary call is not repeated after its result is protected"
+    );
+    assert_eq!(
+        recovered
+            .snapshot()
+            .usage
+            .records()
+            .iter()
+            .filter(|record| record.source == UsageSource::SemanticSummary)
+            .count(),
+        1
+    );
+    assert!(
+        recovery_observer.payloads().iter().all(|event| {
+            !matches!(
+                event,
+                RuntimeEvent::Usage { record }
+                    if record.source == UsageSource::SemanticSummary
+            )
+        }),
+        "recovery does not duplicate the already protected usage event"
+    );
+    assert!(matches!(
+        recovery_checkpoints
+            .load_latest(recovered.id())
+            .await
+            .unwrap(),
+        Some(TurnCheckpoint {
+            state: TurnState::Terminal { .. },
+            ..
+        })
+    ));
+}

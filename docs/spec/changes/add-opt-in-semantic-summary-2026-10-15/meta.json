@@ -1,0 +1,14 @@
+{
+  "change_id": "add-opt-in-semantic-summary",
+  "change_ref": "add-opt-in-semantic-summary-2026-10-15",
+  "created_at": "2026-10-15T22:46:05Z",
+  "updated_at": "2026-10-16T00:11:07Z",
+  "completed_at": "2026-10-16T00:11:07Z",
+  "status": "implemented",
+  "depends_on": [
+    "add-lossless-context-memory-2026-08-11"
+  ],
+  "external_dependencies": [],
+  "implementation_started_at": "2026-10-15T23:15:30Z",
+  "approved_at": "2026-10-15T23:15:30Z"
+}

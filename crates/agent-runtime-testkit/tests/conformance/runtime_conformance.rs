@@ -14,3 +14,6 @@ mod provider_loop;
 mod recovery;
 #[path = "runtime_conformance/session.rs"]
 mod session;
+
+#[path = "runtime_conformance/semantic_summary.rs"]
+mod semantic_summary;

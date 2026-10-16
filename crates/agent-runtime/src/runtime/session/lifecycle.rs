@@ -161,6 +161,104 @@ impl SessionHandle {
         observation.result
     }
 
+    /// Restores a protected semantic-summary extension only when canonical
+    /// and protected startup state did not already provide one.
+    ///
+    /// This narrow cold-resume seam is intended for hosts whose ordinary
+    /// session store deliberately omits Sensitive extension namespaces and
+    /// retains them in a separate protected artifact. It is fail-closed: the
+    /// current summary component revision, source session, canonical history
+    /// prefix, and content-derived summary revision must all match, and no
+    /// turn or cache operation may be active. Existing Runtime-restored state
+    /// always wins and is never overwritten.
+    pub fn restore_semantic_summary_if_absent(
+        &self,
+        persisted: VersionedSessionState,
+    ) -> Result<bool, RuntimeError> {
+        let _admission = self
+            .inner
+            .admission_gate
+            .lock()
+            .expect("session admission gate poisoned");
+        // Cache admission also holds `turns` while incrementing cache_active.
+        // Retain it through installation so cache work cannot enter after the
+        // idle check but before the protected state is restored.
+        let turns = self.inner.turns.lock().expect("session turns poisoned");
+        if turns.shutting_down
+            || self.inner.recovery_deferred
+            || turns.count != 0
+            || self.inner.cancel.is_cancelled()
+            || self.inner.user_submission_pending.load(Ordering::Acquire) != 0
+            || self.inner.cache_active.load(Ordering::Acquire) != 0
+        {
+            return Err(RuntimeError::conflict(
+                "semantic summary restore requires an idle live session",
+            ));
+        }
+        let expected_revision = self
+            .inner
+            .shared
+            .driver
+            .semantic_summary_revision()
+            .ok_or_else(|| {
+                RuntimeError::config(
+                    "semantic summary restore requires a configured summary component",
+                )
+            })?;
+        {
+            let extensions = self
+                .inner
+                .execution
+                .extension_state
+                .lock()
+                .expect("session extension state poisoned");
+            if extensions.contains_key(SEMANTIC_SUMMARY_COMPONENT_ID) {
+                return Ok(false);
+            }
+        }
+
+        if persisted.revision != expected_revision {
+            return Err(RuntimeError::conflict(
+                "semantic summary restore revision does not match the active component",
+            ));
+        }
+        let summary = protected_semantic_summary_from_state(&persisted, UsageDelta::new())?;
+        if summary.source_artifact.provenance.session != self.inner.id {
+            return Err(RuntimeError::conflict(
+                "semantic summary restore artifact belongs to another session",
+            ));
+        }
+        {
+            let state = self.inner.state.lock().expect("session state poisoned");
+            if summary.omit_prefix > state.history.len()
+                || (summary.omit_prefix < state.history.len()
+                    && state.history[summary.omit_prefix].role != Role::User)
+            {
+                return Err(RuntimeError::conflict(
+                    "semantic summary restore would split or exceed canonical history",
+                ));
+            }
+            let encoded =
+                serde_json::to_vec(&state.history[..summary.omit_prefix]).map_err(|error| {
+                    RuntimeError::internal(format!(
+                        "failed to verify restored semantic summary source: {error}"
+                    ))
+                })?;
+            if Fingerprint::of(encoded) != summary.source_fingerprint {
+                return Err(RuntimeError::conflict(
+                    "semantic summary restore source no longer matches canonical history",
+                ));
+            }
+        }
+        self.inner
+            .execution
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .insert(SEMANTIC_SUMMARY_COMPONENT_ID.to_owned(), persisted);
+        Ok(true)
+    }
+
     /// The turn stopped without replay because its activation scope changed
     /// or its external backend conversation could not be re-entered.
     ///

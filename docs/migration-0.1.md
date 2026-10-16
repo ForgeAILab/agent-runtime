@@ -592,7 +592,7 @@ let runtime = RuntimeBuilder::new(model_id)
     .lcm(Arc::new(coordinator))
     .build()?;
 let session = runtime
-    .start_session(StartSession::new().with_id(session_id))
+    .start_session(StartSession::resume(session_id))
     .await?;
 ```
 
@@ -601,12 +601,20 @@ is admitted only when the host explicitly claims the protected idle boundary
 with `SessionHandle::try_idle_compaction()`. The old idle semantic-summary API
 is replaced by this call, which returns metadata only through
 `IdleCompactionAdmission::Accepted { changed, fallback_reason, usage }` (or
-`Busy`/`Shutdown`); no summary body crosses the runtime facade. Hard pressure
+`Busy`/`Shutdown`); no LCM summary body crosses the runtime facade. Hard pressure
 runs bounded, checkpointed compaction in the coordinator's pre-provider hook,
 before any provider request, and fails with a structured cannot-fit result when
 required content still cannot fit. LCM only returns versioned candidates and
 pointers; the context planner remains authoritative for final ordering, token
 accounting, structural compaction, cache identity, and provider serialization.
+
+A host that does not want LCM can keep the flat semantic summary instead:
+`RuntimeBuilder::semantic_summary(Arc::new(SemanticSummaryCoordinator::new(
+artifact_store, summary_model, policy)?))`. The two are exclusive, and `build`
+rejects a runtime that configures both. Its idle call is
+`SessionHandle::try_idle_semantic_compaction()`, which does return the
+protected summary to the host, and its persisted state resumes as is rather
+than being imported into LCM.
 
 `with_content_guard(...)` applies the host's guard to every newly produced,
 pending, imported, or loaded summary body before commit/projection. Raw

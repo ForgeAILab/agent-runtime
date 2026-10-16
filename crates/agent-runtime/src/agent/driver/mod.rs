@@ -68,7 +68,8 @@ use crate::harness::{
     CAPABILITY_ACTIVATE_TOOL_NAME, CAPABILITY_SEARCH_TOOL_NAME, ComponentDescriptor, ContextView,
     HarnessPipeline, HistoryProjection, HistoryView, IdleCompactionResult, LCM_COMPONENT_ID,
     LCM_IDLE_COMPACTION_PURPOSE, LCM_SUMMARY_PURPOSE, LiveAbilityRuntime, ModelView,
-    QUESTIONNAIRE_TOOL_NAME, ToolOutputView, TurnCommitView,
+    QUESTIONNAIRE_TOOL_NAME, SEMANTIC_SUMMARY_COMPONENT_ID,
+    SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE, ToolOutputView, TurnCommitView,
 };
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
@@ -565,6 +566,14 @@ impl Driver {
         self.config.steer_limits
     }
 
+    pub(crate) fn semantic_summary_revision(&self) -> Option<RegistryRevision> {
+        self.harness.history().iter().find_map(|component| {
+            let descriptor = component.descriptor();
+            (descriptor.id().as_str() == SEMANTIC_SUMMARY_COMPONENT_ID)
+                .then(|| descriptor.revision().clone())
+        })
+    }
+
     /// Builds a driver from its injected services and configuration.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -693,6 +702,16 @@ impl Driver {
         only_component: Option<&str>,
     ) -> Result<Vec<(ComponentDescriptor, IdleCompactionResult)>, RuntimeError> {
         let mut patches = Vec::new();
+        let (usage_component, usage_purpose, usage_kind) =
+            if self.semantic_summary_revision().is_some() {
+                (
+                    SEMANTIC_SUMMARY_COMPONENT_ID,
+                    SEMANTIC_SUMMARY_IDLE_COMPACTION_PURPOSE,
+                    "semantic-summary",
+                )
+            } else {
+                (LCM_COMPONENT_ID, LCM_IDLE_COMPACTION_PURPOSE, "LCM")
+            };
         for hook in self.harness.turn_commit() {
             let descriptor = hook.descriptor();
             if only_component.is_some_and(|component| descriptor.id().as_str() != component) {
@@ -729,12 +748,12 @@ impl Driver {
                 }
             }
             if result.patch.usage.iter().any(|record| {
-                descriptor.id().as_str() != LCM_COMPONENT_ID
+                descriptor.id().as_str() != usage_component
                     || record.source != UsageSource::SemanticSummary
-                    || record.provenance.purpose.as_deref() != Some(LCM_IDLE_COMPACTION_PURPOSE)
+                    || record.provenance.purpose.as_deref() != Some(usage_purpose)
             }) {
                 return Err(RuntimeError::conflict(format!(
-                    "idle compaction component `{}` attempted to publish non-LCM usage",
+                    "idle compaction component `{}` attempted to publish non-{usage_kind} usage",
                     descriptor.id()
                 )));
             }

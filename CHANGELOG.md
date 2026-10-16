@@ -7,6 +7,38 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
+### Added
+
+- The flat semantic summary is back as an opt-in alternative to LCM, for
+  hosts that do not use lossless context memory.
+  `RuntimeBuilder::semantic_summary(Arc<SemanticSummaryCoordinator>)`
+  installs it, and the `agent_runtime::harness` names it had before LCM
+  (`SemanticSummaryCoordinator`, `SemanticSummaryPolicy`, `SummaryModel`,
+  `ProtectedSemanticSummary`, `protected_semantic_summary_from_state`, the
+  `SEMANTIC_SUMMARY_*` constants) are public again.
+  - A runtime has at most one strategy: `build` rejects the flat summary
+    together with LCM, including a generic registration under the
+    `harness.semantic_summary` component id, and together with
+    `soft_on_turn_boundary(true)`.
+  - `SessionHandle::try_idle_semantic_compaction` runs idle compaction and
+    returns the protected summary as `SemanticIdleCompactionAdmission`.
+    LCM's `try_idle_compaction` is unchanged.
+  - `SessionHandle::restore_semantic_summary_if_absent` restores state a
+    host keeps outside its ordinary session store, fail-closed.
+  - With the flat summary configured, persisted `harness.semantic_summary`
+    state resumes as live state and is never imported into LCM. With LCM,
+    or with neither, resume behaves as before.
+  - The state keeps the schema-v1 wire format, which the LCM importer reads,
+    so a session can still move to LCM later.
+
+### Changed
+
+- **Breaking:** `HarnessEvent` gains `SemanticSummaryFallback`, reported as
+  `RuntimeEvent::Downgrade { capability: "semantic_summary" }`. The event
+  schema is unchanged. `CHECKPOINT_SCHEMA_VERSION` stays 3.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added
@@ -63,10 +95,11 @@ contain breaking changes and are coordinated with consumer proposals.
   `CheckpointStore` pair that keeps writing full snapshots.
 - The runtime does not write a journal yet. Nothing here activates a native
   writer, an import or a collector; those are later merge groups.
-- Persisted data is unchanged. `CHECKPOINT_SCHEMA_VERSION` stays 3, session
-  snapshots stay unversioned, and every checkpoint and snapshot this release
-  writes is byte for byte what v0.2.1 wrote. A host can upgrade without
-  changing a store or a schema guard, and can roll back to v0.2.1.
+- The journal changes no persisted data. `CHECKPOINT_SCHEMA_VERSION` stays 3,
+  session snapshots stay unversioned, and the journal adds nothing to the
+  checkpoints and snapshots a host's stores write. A host can upgrade without
+  changing a store or a schema guard. (External tool dispatch, below, adds
+  additive checkpoint state of its own.)
   `JOURNAL_SCHEMA_VERSION` (4) tags journal heads, objects and reference
   checkpoints only. A host that publishes those through its own
   `SessionJournal` cannot read them with an older release.

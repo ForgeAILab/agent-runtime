@@ -549,6 +549,12 @@ impl ToolOutputPatch {
 /// corresponding state and canonical tool result are durable.
 #[derive(Debug, Clone)]
 pub enum HarnessEvent {
+    /// Optional semantic summarization fell back to unchanged structural
+    /// planning. The reason is a bounded category, never model/store content.
+    SemanticSummaryFallback {
+        /// Stable safe reason category.
+        reason: String,
+    },
     /// A todo plan changed.
     PlanUpdated {
         /// Monotonic plan revision.
@@ -583,6 +589,10 @@ pub enum HarnessEvent {
 impl HarnessEvent {
     pub(crate) fn into_runtime_event(self) -> RuntimeEvent {
         match self {
+            Self::SemanticSummaryFallback { reason } => RuntimeEvent::Downgrade {
+                capability: "semantic_summary".into(),
+                detail: reason,
+            },
             Self::PlanUpdated {
                 revision,
                 sensitivity,
@@ -903,6 +913,33 @@ impl HarnessPipelineBuilder {
     pub fn turn_commit_hook(&mut self, component: Arc<dyn TurnCommitHook>) -> &mut Self {
         self.turn_commit.push(component);
         self
+    }
+
+    /// Whether any registered phase contains the component identity.
+    pub(crate) fn contains_component_id(&self, id: &str) -> bool {
+        self.tool_view
+            .iter()
+            .any(|c| c.descriptor().id().as_str() == id)
+            || self
+                .history
+                .iter()
+                .any(|c| c.descriptor().id().as_str() == id)
+            || self
+                .context
+                .iter()
+                .any(|c| c.descriptor().id().as_str() == id)
+            || self
+                .model
+                .iter()
+                .any(|c| c.descriptor().id().as_str() == id)
+            || self
+                .tool_output
+                .iter()
+                .any(|c| c.descriptor().id().as_str() == id)
+            || self
+                .turn_commit
+                .iter()
+                .any(|c| c.descriptor().id().as_str() == id)
     }
 
     /// Validates, deterministically orders, and fingerprints the pipeline.
