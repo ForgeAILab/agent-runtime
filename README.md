@@ -21,7 +21,7 @@ types.
 | `agent-runtime-registry` | The dependency-light registry kernel: namespaced identities, revisions, provenance, layered sealing, scoped views, fingerprints, and the generic `Named`/`Registry<T>`/`Sealed<T>` collection. Std-only by default. |
 | `agent-runtime-core` | Host-neutral contracts: IDs, messages/content, structured errors, cancellation, deadlines, redaction-safe metadata, versioned events, disjoint usage counters, and the provider/tool/approval/workspace/store/observer/clock traits. |
 | `agent-runtime-ability` | Descriptor-first abilities on the registry kernel: bounded `AbilityDescriptor`s, dependency/conflict/readiness metadata, lazy policy-checked activation, and the unified `Ability`/`AbilityKind` view. Registry-only by default; `tool` bridges the runtime's `Tool`. |
-| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport, SSE normalization, configurable OpenAI-compatible, native Responses, and native Gemini Interactions adapters, a deterministic fake, the attempt-recording retry/backoff classifier, and an opt-in process-bounded command-provider framework for consumer-owned model CLI codecs. |
+| `agent-runtime-provider` | Provider mechanism: injectable HTTP transport and opt-in policy-explicit reqwest transport, SSE normalization, configurable OpenAI-compatible, native Responses, and native Gemini Interactions adapters, a deterministic fake, the attempt-recording retry/backoff classifier, and an opt-in process-bounded command-provider framework for consumer-owned model CLI codecs. |
 | `agent-runtime-context` | The authoritative context engine: versioned and positioned `ContextFragment`s (including composable system-prompt sections), complete token accounting (`RequestSizer`/`CharRatioSizer`), deterministic structural compaction, and cache-aware planning through `ContextPlanner`. Deterministic and network-free. |
 | `agent-runtime-lcm` | Lossless Context Memory: immutable logical timelines, transactional hierarchical summary DAGs, deterministic tool-safe compaction planning, convergence-guaranteed summarization, and bounded expansion. Store- and provider-neutral. |
 | `agent-runtime-obs` | Observability facade over the event envelope: an async `EventSink`, `FanoutSink`, a `SinkObserver` bridge, an event-stream pump, an `ObsRow` SQL projection, and feature-gated CLI/file/SQLite sinks. |
@@ -49,6 +49,37 @@ events. Autonomous CLIs with hidden tool or retry loops are not transparent
 model providers. See [`docs/command-providers.md`](docs/command-providers.md)
 and the compile-checked
 [`command_provider` example](crates/agent-runtime-provider/examples/command_provider.rs).
+
+## Shared HTTP transport
+
+Enable `agent-runtime-provider/reqwest-transport` for the shared streaming
+implementation. Default builds retain their network-free dependency graph
+and Rust 1.86 baseline; the optional feature also builds on Rust 1.86 with the
+workspace lockfile. Hosts choose destination authority explicitly:
+
+```rust
+use agent_runtime_provider::{DestinationPolicy, ReqwestTransport};
+
+let public = ReqwestTransport::new(DestinationPolicy::PublicHttps)
+    .with_origin("https://api.example.com/v1")?;
+let local = ReqwestTransport::new(DestinationPolicy::Loopback)
+    .with_origin("http://127.0.0.1:8080/v1")?;
+```
+
+Both transports implement `HttpTransport`. `PublicHttps` preserves the CLI's
+HTTPS and restricted-address checks. `Loopback` allows HTTP/HTTPS to 127/8,
+::1 or localhost only, with every DNS answer loopback. `ConfiguredOrigin`
+allows HTTP/HTTPS to exactly the origin passed to `with_origin` on any address
+class, for a self-hosted endpoint the user configured (for example a model
+server on the local network); without an origin it rejects every request.
+Origin pinning is optional for the other two policies; the CLI always pins its
+configured origin. All policies disable proxies and redirects, cap error bodies at 8 KiB and returned
+headers at 128 (8 KiB each), and omit URL/header/body secrets from diagnostics.
+Use `.with_connect_timeout(Duration)` to override the ten-second default.
+Drop the pending request future or returned stream to cancel I/O; adapters
+still own deadlines and retries. The full
+[`ReqwestTransport` example](crates/agent-runtime-provider/src/reqwest_transport.rs)
+is compile-checked with the feature enabled.
 
 ## Renewable provider credentials
 

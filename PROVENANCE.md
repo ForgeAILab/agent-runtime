@@ -112,3 +112,19 @@ identity, Smith persistent agent-session identity, and Open Forge Room +
 AgentIdentity authorization remain host policy. Nyx SQLite migrations,
 settlement/vector-memory policy, provider prompts/catalog, scheduler policy,
 and product memory authority are not transferred.
+
+## Shared reqwest transport (internal move, 2026-10-03)
+
+The canonical source is this repository at revision
+`1e260c9a8de7f9fc8d665794c72360ec690a470d`,
+`crates/agent-runtime-cli/src/transport.rs`, moved to
+`crates/agent-runtime-provider/src/reqwest_transport.rs`. Its existing
+PublicHttps restrictions, DNS pinning, status classification, response bounds,
+streaming, and test assertions are retained. The material refactor adds an
+explicit destination policy, Loopback checks, optional origin pinning,
+configurable connect timeout, and redaction of transport origin/request URLs.
+No upstream notices were present in that file; the repository MIT license
+continues to apply. The CLI retains only a compatibility policy wrapper.
+Smith and Open Forge transports were read-only admission/design references;
+no source or history was imported from those repositories and neither was
+modified. Their adoption remains consumer-owned work.

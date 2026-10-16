@@ -1,7 +1,7 @@
 //! Reference command-line host for `agent-runtime`.
 //!
 //! This package is deliberately a leaf: it owns process configuration,
-//! concrete HTTPS transport, output rendering, and exit classification while
+//! HTTPS destination policy, output rendering, and exit classification while
 //! executing turns exclusively through the public runtime facade.
 #![forbid(unsafe_code)]
 
