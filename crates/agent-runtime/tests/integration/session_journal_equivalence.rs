@@ -3421,11 +3421,11 @@ async fn import_continuation(fixture: ImportFixture) -> ContinuationRun {
 /// the provider and tool calls that legacy resume of the same v3 pair makes,
 /// for every captured state, and publish the same barriers afterwards.
 ///
-/// Each case runs as a spawned task on a worker with 1.5 MiB of stack: a
-/// default 2 MiB Tokio worker minus 512 KiB left for the host. Before
+/// Each case runs as a spawned task on a worker with 1.75 MiB of stack: a
+/// default 2 MiB Tokio worker minus 256 KiB left for the host. Before
 /// `TurnMachine::resume` stopped inlining one stack slot per awaited state
 /// future, a debug build needed ~1.8 MiB (legacy) and ~2 MiB (native) to
-/// resume at ModelResponseReady.
+/// resume at ModelResponseReady; it now needs ~1.25 MiB.
 #[test]
 fn v3_import_continuation_matches_legacy_resume_for_every_state() {
     let fixtures = tokio::runtime::Builder::new_current_thread()
@@ -3436,7 +3436,7 @@ fn v3_import_continuation_matches_legacy_resume_for_every_state() {
     assert_eq!(fixtures.len(), 12);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        .thread_stack_size(1536 << 10)
+        .thread_stack_size(1792 << 10)
         .enable_all()
         .build()
         .unwrap();

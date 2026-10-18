@@ -50,7 +50,7 @@ all applicable gates, not merely contract merge.
   lost capability and ephemeral isolation have focused integration tests.
   Review: the matrix resumes with `Defer` (no continuation);
   `v3_import_continuation_matches_legacy_resume_for_every_state` runs import,
-  resume and continue for all 12 states on a 1.5 MiB worker and matches
+  resume and continue for all 12 states on a 1.75 MiB worker and matches
   legacy provider requests, tool calls and barriers exactly. It exposed a
   debug-build stack fault in `TurnMachine::resume` (~1.8 MiB legacy, ~2 MiB
   native at ModelResponseReady; now ~1.25 MiB). Read-only views now reject a

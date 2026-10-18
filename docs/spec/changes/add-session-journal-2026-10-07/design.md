@@ -519,7 +519,7 @@ Review (2026-10-18). The crash-cut matrix resumes with
 `CheckpointRecoveryPolicy::Defer`, so it proves representation and repair,
 not continuation. `v3_import_continuation_matches_legacy_resume_for_every_state`
 adds the continuation for all 12 states: import, resume and continue on a
-1.5 MiB worker make exactly the provider requests, tool invocations and
+1.75 MiB worker make exactly the provider requests, tool invocations and
 protected/ordinary barriers of legacy resume of the same pair (no replay of
 CallingModel, ExecutingTools, local-executing or cache-started work;
 ModelResponseReady and ToolOutcomeReady results reused). That test first
