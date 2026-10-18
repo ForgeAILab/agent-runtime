@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-18
+
 ### Changed
 
 - **Breaking:** the schema-4 journal vocabulary released in 0.5.0 grows so a
@@ -41,8 +43,10 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
-- Gemini Interactions now preserves signed Google Search call/result steps for
-  exact stateless tool-call continuation without exposing opaque search state.
+- Gemini Interactions keeps Google Search call and result steps, which can carry
+  a response's only signatures, and replays them in the order Gemini streamed
+  them. A response that searched and called tools now continues instead of
+  failing with "signed continuation is incomplete or out of order".
 - Command providers now report stderr overflow deterministically even when stdout and the child process finish first.
 
 ## [0.5.0] - 2026-10-16
