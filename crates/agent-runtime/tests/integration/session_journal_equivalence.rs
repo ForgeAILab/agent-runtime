@@ -4016,6 +4016,9 @@ async fn crash_matrix_barriers() -> Vec<CrashMatrixBarrier> {
 /// `AfterCommit` publishes with a lost acknowledgement. The writer process is
 /// always gone afterwards (its fence is revoked, as a host's lease expiry
 /// would); only a fresh reader, a fresh runtime and an independent retry act.
+/// Ambiguous outcomes resolved by the *live* writer are exercised separately,
+/// through the runtime's own commit path, by
+/// `task_2_6_runtime_resolves_ambiguous_commits_*`.
 #[derive(Debug, Clone, Copy)]
 enum CrashMatrixCase {
     /// The writer dies after this physical step of the target commit.
@@ -4857,6 +4860,505 @@ fn task_2_6_native_barrier_crash_and_ambiguous_write_matrix() {
         "TASK 2.6 MATRIX barriers={} distinct_cases={cases}",
         barriers.len()
     );
+}
+
+/// Fails the `target`-th commit attempt across both native domains at
+/// `point` while the writer process stays alive, so the runtime's own commit
+/// path (renew, head-advance check, same-operation recommit) sees the error.
+#[derive(Debug)]
+struct LiveCommitFault {
+    attempts: AtomicUsize,
+    target: usize,
+    point: JournalCommitFailurePoint,
+}
+
+impl LiveCommitFault {
+    fn fired(&self) -> bool {
+        self.attempts.load(Ordering::SeqCst) > self.target
+    }
+}
+
+#[derive(Debug)]
+struct LiveFaultJournal {
+    inner: Arc<Materializing>,
+    fault: Arc<LiveCommitFault>,
+}
+
+#[async_trait]
+impl SessionJournal for LiveFaultJournal {
+    fn storage_id(&self) -> JournalStorageId {
+        self.inner.storage_id()
+    }
+    async fn open(
+        &self,
+        session: &SessionId,
+        request: JournalOpen,
+    ) -> Result<JournalLease, RuntimeError> {
+        self.inner.open(session, request).await
+    }
+    async fn read(
+        &self,
+        lease: &JournalLease,
+        object: &JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.inner.read(lease, object).await
+    }
+    async fn commit(
+        &self,
+        lease: &JournalLease,
+        batch: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        if self.fault.attempts.fetch_add(1, Ordering::SeqCst) == self.fault.target {
+            self.inner.inner.fail_next_commit_at(self.fault.point)?;
+        }
+        self.inner.commit(lease, batch).await
+    }
+    async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        self.inner.renew(lease).await
+    }
+    async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+        self.inner.close(lease).await
+    }
+    async fn retire(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        self.inner.retire(session, expected).await
+    }
+    async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        self.inner.collect(request).await
+    }
+}
+
+#[derive(Debug)]
+struct LiveFaultStores {
+    ordinary: Arc<LiveFaultJournal>,
+    protected: Arc<LiveFaultJournal>,
+    legacy_saves: AtomicUsize,
+}
+
+impl LiveFaultStores {
+    fn new(pair: &Pair, fault: Arc<LiveCommitFault>) -> Arc<Self> {
+        Arc::new(Self {
+            ordinary: Arc::new(LiveFaultJournal {
+                inner: pair.native.ordinary.clone(),
+                fault: fault.clone(),
+            }),
+            protected: Arc::new(LiveFaultJournal {
+                inner: pair.native.protected.clone(),
+                fault,
+            }),
+            legacy_saves: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionStore for LiveFaultStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for LiveFaultStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+    async fn load_latest(&self, _: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        Ok(None)
+    }
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The legacy counterpart of a failed native commit: the `target`-th save
+/// across both stores returns the reference backend's injected error and
+/// stores nothing, so both paths see the same failure at the same barrier.
+#[derive(Debug)]
+struct FailingLegacyStores {
+    sessions: Arc<LegacySessions>,
+    checkpoints: Arc<LegacyCheckpoints>,
+    attempts: AtomicUsize,
+    target: usize,
+}
+
+impl FailingLegacyStores {
+    fn fail(&self) -> bool {
+        self.attempts.fetch_add(1, Ordering::SeqCst) == self.target
+    }
+}
+
+fn live_injected_failure() -> RuntimeError {
+    use agent_runtime::core::error::{FailureComponent, FailureStage};
+    RuntimeError::internal("injected journal commit failure")
+        .with_class(FailureClass::HostComponent {
+            stage: FailureStage::PreProvider,
+            component: FailureComponent::Checkpoint,
+        })
+        .retryable()
+}
+
+#[async_trait]
+impl SessionStore for FailingLegacyStores {
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        self.sessions.load(id).await
+    }
+    async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+        if self.fail() {
+            return Err(live_injected_failure());
+        }
+        self.sessions.save(snapshot).await
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for FailingLegacyStores {
+    async fn load_latest(&self, id: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        self.checkpoints.load_latest(id).await
+    }
+    async fn save(&self, checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        if self.fail() {
+            return Err(live_injected_failure());
+        }
+        self.checkpoints.save(checkpoint).await
+    }
+}
+
+/// Runs one drive to completion on a local task so a drive that panics on
+/// the injected failure (they unwrap) is observed as an outcome, not a test
+/// abort. A hang is a failure.
+async fn live_drive(
+    label: &str,
+    drive: Drive,
+    runtime: Runtime,
+    id: SessionId,
+) -> Option<Vec<SessionSnapshot>> {
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(async move {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                tokio::task::spawn_local(drive(runtime, id)),
+            )
+            .await
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label}: drive did not finish"));
+    outcome.ok()
+}
+
+struct LiveScenario {
+    label: &'static str,
+    first: fn() -> Phase,
+    second: fn() -> Phase,
+}
+
+fn live_ambiguity_scenarios() -> Vec<LiveScenario> {
+    vec![
+        LiveScenario {
+            label: "plain",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: two_turns,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "internal",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: internal_turn,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "tools",
+            first: || Phase {
+                provider: tool_provider,
+                configure: tools,
+                drive: tools_and_local,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "interaction",
+            first: || Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: answered_interaction_turn,
+            },
+            second: || Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: resume_and_continue,
+            },
+        },
+        LiveScenario {
+            label: "cache",
+            first: || Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: cache_turns,
+            },
+            second: || Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: resume_and_continue,
+            },
+        },
+        LiveScenario {
+            label: "bootstrap",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: create_only,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "fork",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: fork_summary,
+            },
+            second: || Phase {
+                provider: continuation,
+                configure: plain,
+                drive: resume_child,
+            },
+        },
+    ]
+}
+
+/// Lost acknowledgement at commit `target`: the live runtime must resolve it
+/// through its own renew/operation-identity path to the original head, so the
+/// whole run equals an undisturbed legacy run (no failure, no second
+/// transition, no extra or missing barrier).
+async fn assert_live_lost_acknowledgement(scenario: &LiveScenario, target: usize) {
+    let label = format!("{}/lost-ack@{target}", scenario.label);
+    let id = SessionId::new(format!("live-{}", scenario.label));
+    let pair = Pair::new(identity);
+    let fault = Arc::new(LiveCommitFault {
+        attempts: AtomicUsize::new(0),
+        target,
+        point: JournalCommitFailurePoint::AfterCommit,
+    });
+    let stores = LiveFaultStores::new(&pair, fault.clone());
+    let first = (scenario.first)();
+    let legacy = (first.drive)(
+        pair.legacy_runtime((first.provider)(), first.configure),
+        id.clone(),
+    )
+    .await;
+    let native = (first.drive)(
+        build(
+            (first.provider)(),
+            stores.clone(),
+            stores.clone(),
+            first.configure,
+        ),
+        id,
+    )
+    .await;
+    assert!(fault.fired(), "{label}: the fault never fired");
+    assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0, "{label}");
+    pair.assert_barriers_match(&label);
+    assert_same(&native, &legacy, &format!("{label}: live snapshots"));
+}
+
+/// Commit `target` fails before its visibility point while the process lives:
+/// the runtime must not publish it under a fresh identity or report success.
+/// The run, every barrier it does publish, and a fresh runtime's resume and
+/// continuation must equal legacy with the same save failing.
+async fn assert_live_failed_commit(scenario: &LiveScenario, target: usize) {
+    let label = format!("{}/failed@{target}", scenario.label);
+    let id = SessionId::new(format!("live-{}", scenario.label));
+    let pair = Pair::new(identity);
+    let fault = Arc::new(LiveCommitFault {
+        attempts: AtomicUsize::new(0),
+        target,
+        point: JournalCommitFailurePoint::AfterIdempotency,
+    });
+    let stores = LiveFaultStores::new(&pair, fault.clone());
+    let legacy_stores = Arc::new(FailingLegacyStores {
+        sessions: pair.legacy_sessions.clone(),
+        checkpoints: pair.legacy_checkpoints.clone(),
+        attempts: AtomicUsize::new(0),
+        target,
+    });
+    let first = (scenario.first)();
+    let legacy = live_drive(
+        &label,
+        first.drive,
+        build(
+            (first.provider)(),
+            legacy_stores.clone(),
+            legacy_stores.clone(),
+            first.configure,
+        ),
+        id.clone(),
+    )
+    .await;
+    let native = live_drive(
+        &label,
+        first.drive,
+        build(
+            (first.provider)(),
+            stores.clone(),
+            stores.clone(),
+            first.configure,
+        ),
+        id.clone(),
+    )
+    .await;
+    assert!(fault.fired(), "{label}: the fault never fired");
+    assert_eq!(
+        native.is_some(),
+        legacy.is_some(),
+        "{label}: live outcome differs"
+    );
+    if let (Some(native), Some(legacy)) = (&native, &legacy) {
+        assert_same(native, legacy, &format!("{label}: live snapshots"));
+    }
+    assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0, "{label}");
+    if pair.legacy_sessions.log.lock().unwrap().is_empty()
+        && pair.legacy_checkpoints.log.lock().unwrap().is_empty()
+    {
+        // The failed commit was the scenario's first: neither path published.
+        assert!(
+            pair.submission_trace().is_empty(),
+            "{label}: native published"
+        );
+    } else {
+        pair.assert_barriers_match(&format!("{label}/live"));
+    }
+    pair.crash(&id);
+
+    let second = (scenario.second)();
+    let legacy = live_drive(
+        &label,
+        second.drive,
+        pair.legacy_runtime((second.provider)(), second.configure),
+        id.clone(),
+    )
+    .await;
+    let native = live_drive(
+        &label,
+        second.drive,
+        pair.native_runtime((second.provider)(), second.configure),
+        id,
+    )
+    .await;
+    assert_eq!(
+        native.is_some(),
+        legacy.is_some(),
+        "{label}: resumed outcome differs"
+    );
+    if pair.legacy_sessions.log.lock().unwrap().is_empty()
+        && pair.legacy_checkpoints.log.lock().unwrap().is_empty()
+    {
+        assert!(
+            pair.submission_trace().is_empty(),
+            "{label}: native published"
+        );
+    } else {
+        pair.assert_barriers_match(&format!("{label}/resumed"));
+    }
+    if let (Some(native), Some(legacy)) = (&native, &legacy) {
+        assert_same(native, legacy, &format!("{label}: resumed snapshots"));
+    }
+}
+
+/// Task 2.6, ambiguous outcomes resolved by the live writer: at every commit
+/// of the scenario, a lost acknowledgement (the commit landed) and a failed
+/// commit (it did not) are returned to the running runtime itself, so its
+/// renew / head-advance / same-operation recommit path decides the outcome.
+/// Every failing commit index is reported, not only the first.
+async fn run_live_ambiguity_scenario(label: &str) {
+    use futures_util::FutureExt;
+    let scenario = live_ambiguity_scenarios()
+        .into_iter()
+        .find(|scenario| scenario.label == label)
+        .unwrap_or_else(|| panic!("unknown live-ambiguity scenario {label}"));
+    let first = (scenario.first)();
+    let pair = Pair::new(identity);
+    (first.drive)(
+        pair.native_runtime((first.provider)(), first.configure),
+        SessionId::new(format!("live-{}", scenario.label)),
+    )
+    .await;
+    let commits = pair.submission_trace().len();
+    assert!(commits > 0, "{label}: no commits");
+    let mut failures = Vec::new();
+    for target in 0..commits {
+        let lost =
+            std::panic::AssertUnwindSafe(assert_live_lost_acknowledgement(&scenario, target))
+                .catch_unwind()
+                .await;
+        if lost.is_err() {
+            failures.push(format!("lost-ack@{target}"));
+        }
+        let failed = std::panic::AssertUnwindSafe(assert_live_failed_commit(&scenario, target))
+            .catch_unwind()
+            .await;
+        if failed.is_err() {
+            failures.push(format!("failed@{target}"));
+        }
+    }
+    assert!(failures.is_empty(), "{label}: failing cases {failures:?}");
+    println!(
+        "TASK 2.6 LIVE-AMBIGUITY scenario={label} commits={commits} cases={} results=pass",
+        commits * 2
+    );
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_plain() {
+    run_live_ambiguity_scenario("plain").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_internal() {
+    run_live_ambiguity_scenario("internal").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_tools() {
+    run_live_ambiguity_scenario("tools").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_interaction() {
+    run_live_ambiguity_scenario("interaction").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_cache() {
+    run_live_ambiguity_scenario("cache").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_bootstrap() {
+    run_live_ambiguity_scenario("bootstrap").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_fork() {
+    run_live_ambiguity_scenario("fork").await;
 }
 
 #[derive(Debug, Clone)]

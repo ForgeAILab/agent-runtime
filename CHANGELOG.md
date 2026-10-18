@@ -7,6 +7,19 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- A native session no longer wedges after its terminal publication fails. When
+  a later input was saved to the ordinary store after that failure, resuming
+  republished the terminal boundary with a shorter history than the stored
+  projection; the native writer refused it as a non-append, failed the turn and
+  left the session at a non-terminal checkpoint on every resume, while the
+  legacy path overwrote the projection and continued. The writer now submits
+  such a history as one complete replacement (`JournalTransitionDelta::bootstrap`
+  over an existing head), which `InMemorySessionJournal` accepts and projects
+  like a bootstrap. Ordinary journal adapters should accept the same
+  replacement; one that still rejects it fails closed as before.
+
 ## [0.6.2] - 2026-10-18
 
 ### Fixed
