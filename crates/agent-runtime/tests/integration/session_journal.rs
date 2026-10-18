@@ -1666,3 +1666,430 @@ impl SessionJournal for RecordingJournal {
         self.inner.collect(request).await
     }
 }
+
+// Review of U9 task 2.5 (one-time v3 import).
+
+/// A v3 pair over hybrid stores that also expose native journals.
+struct ImportPair {
+    ordinary: Arc<RecordingJournal>,
+    ordinary_inner: Arc<InMemorySessionJournal>,
+    protected: Arc<RecordingJournal>,
+    protected_inner: Arc<InMemorySessionJournal>,
+    sessions: Arc<HybridSessionStore>,
+    checkpoints: Arc<HybridCheckpointStore>,
+}
+
+fn import_pair(
+    label: &str,
+    snapshot: Option<SessionSnapshot>,
+    checkpoint: Option<TurnCheckpoint>,
+    projection: fn(SessionSnapshot) -> Result<SessionSnapshot, RuntimeError>,
+) -> ImportPair {
+    let ordinary_inner = Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new(format!("{label}-ordinary")),
+        Arc::new(projection),
+    ));
+    let protected_inner = Arc::new(InMemorySessionJournal::protected(JournalStorageId::new(
+        format!("{label}-protected"),
+    )));
+    let ordinary = Arc::new(RecordingJournal::new(ordinary_inner.clone()));
+    let protected = Arc::new(RecordingJournal::new(protected_inner.clone()));
+    ImportPair {
+        sessions: Arc::new(HybridSessionStore {
+            journal: Some(ordinary.clone()),
+            snapshot: Mutex::new(snapshot),
+            saves: AtomicUsize::new(0),
+            discoveries: AtomicUsize::new(0),
+        }),
+        checkpoints: Arc::new(HybridCheckpointStore {
+            journal: Some(protected.clone()),
+            checkpoint: Mutex::new(checkpoint),
+            saves: AtomicUsize::new(0),
+            discoveries: AtomicUsize::new(0),
+        }),
+        ordinary,
+        ordinary_inner,
+        protected,
+        protected_inner,
+    }
+}
+
+fn identity_projection(snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
+    Ok(snapshot)
+}
+
+async fn head_exists(journal: &dyn SessionJournal, session: &SessionId) -> bool {
+    let lease = journal
+        .open(
+            session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new("import-review-exists"),
+                pin: JournalPinId::new("import-review-exists"),
+                intent: JournalOpenIntent::ReadOnly,
+            },
+        )
+        .await
+        .unwrap();
+    let exists = lease.head().is_some();
+    journal.close(lease).await.unwrap();
+    exists
+}
+
+/// Every check a legacy resume applies to the materialized pair also refuses
+/// the import before either native head exists, including pairs whose two
+/// halves come from different boundaries.
+#[tokio::test]
+async fn skewed_or_tampered_v3_pairs_are_refused_before_any_native_write() {
+    let id = SessionId::new("journal-import-skew");
+    let seed_sessions = Arc::new(LegacySessionStore::default());
+    let seed_checkpoints = Arc::new(LegacyCheckpointStore::default());
+    let seeded = runtime(seed_sessions.clone(), seed_checkpoints.clone())
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    seeded
+        .run(agent_runtime::core::content::UserInput::text("first"))
+        .await
+        .unwrap();
+    let first_snapshot = seed_sessions.0.lock().unwrap().clone().unwrap();
+    let first_checkpoint = seed_checkpoints.0.lock().unwrap().clone().unwrap();
+    seeded
+        .run(agent_runtime::core::content::UserInput::text("second"))
+        .await
+        .unwrap();
+    seeded.shutdown().await.unwrap();
+    let snapshot = seed_sessions.0.lock().unwrap().clone().unwrap();
+    let checkpoint = seed_checkpoints.0.lock().unwrap().clone().unwrap();
+
+    let mut schema = checkpoint.clone();
+    schema.schema_version = 99;
+    let mut transition = checkpoint.clone();
+    transition.transition_revision = 99;
+    let mut foreign_snapshot = checkpoint.clone();
+    foreign_snapshot.snapshot.id = SessionId::new("another-session");
+    let mut namespace_snapshot = snapshot.clone();
+    let mut namespace_checkpoint = checkpoint.clone();
+    namespace_snapshot.extension_state.insert(
+        "host.review".to_owned(),
+        VersionedSessionState::new(RegistryRevision::new("host-review-1"), json!(1))
+            .redaction_safe(),
+    );
+    namespace_checkpoint.snapshot.extension_state.insert(
+        "host.review".to_owned(),
+        VersionedSessionState::new(RegistryRevision::new("host-review-2"), json!(1))
+            .redaction_safe(),
+    );
+
+    for (label, candidate_snapshot, candidate_checkpoint) in [
+        ("schema", snapshot.clone(), schema),
+        ("transition", snapshot.clone(), transition),
+        ("checkpoint-snapshot-id", snapshot.clone(), foreign_snapshot),
+        ("older-ordinary", first_snapshot.clone(), checkpoint.clone()),
+        ("newer-ordinary", snapshot.clone(), first_checkpoint.clone()),
+        (
+            "namespace-revision",
+            namespace_snapshot,
+            namespace_checkpoint,
+        ),
+    ] {
+        // Parity: legacy resume refuses the same pair.
+        let legacy = runtime(
+            Arc::new(LegacySessionStore(Mutex::new(Some(
+                candidate_snapshot.clone(),
+            )))),
+            Arc::new(LegacyCheckpointStore(Mutex::new(Some(
+                candidate_checkpoint.clone(),
+            )))),
+        )
+        .start_session(StartSession::resume(id.clone()))
+        .await;
+        assert!(legacy.is_err(), "{label}: legacy resume accepted the pair");
+
+        let pair = import_pair(
+            &format!("skew-{label}"),
+            Some(candidate_snapshot.clone()),
+            Some(candidate_checkpoint.clone()),
+            identity_projection,
+        );
+        let error = runtime(pair.sessions.clone(), pair.checkpoints.clone())
+            .start_session(StartSession::resume(id.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, legacy.unwrap_err().kind, "{label}: {error:?}");
+        assert!(pair.ordinary.take_commits().is_empty(), "{label}");
+        assert!(pair.protected.take_commits().is_empty(), "{label}");
+        assert!(!head_exists(pair.ordinary.as_ref(), &id).await, "{label}");
+        assert!(!head_exists(pair.protected.as_ref(), &id).await, "{label}");
+        assert_eq!(pair.sessions.saves.load(Ordering::Relaxed), 0, "{label}");
+        assert_eq!(pair.checkpoints.saves.load(Ordering::Relaxed), 0, "{label}");
+        assert_eq!(
+            pair.sessions.snapshot.lock().unwrap().as_ref(),
+            Some(&candidate_snapshot),
+            "{label}"
+        );
+    }
+}
+
+/// A v3 ordinary record written by a host whose SessionStore did not redact
+/// is imported through the ordinary journal's projection policy: the stored
+/// head is the policy's view and never the raw record, while the exact
+/// domain keeps the raw checkpoint.
+#[tokio::test]
+async fn v3_import_applies_ordinary_projection_to_raw_legacy_records() {
+    let id = SessionId::new("journal-import-raw-ordinary");
+    let seed_sessions = Arc::new(LegacySessionStore::default());
+    let seed_checkpoints = Arc::new(LegacyCheckpointStore::default());
+    let seeded = runtime(seed_sessions.clone(), seed_checkpoints.clone())
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    seeded
+        .run(agent_runtime::core::content::UserInput::text(
+            "secret raw legacy input",
+        ))
+        .await
+        .unwrap();
+    seeded.shutdown().await.unwrap();
+    let mut raw = seed_sessions.0.lock().unwrap().clone().unwrap();
+    raw.extension_state.insert(
+        "host.sensitive".to_owned(),
+        VersionedSessionState::new(RegistryRevision::new("host-sensitive-1"), json!("secret")),
+    );
+    let checkpoint = seed_checkpoints.0.lock().unwrap().clone().unwrap();
+    assert!(serde_json::to_string(&raw).unwrap().contains("secret"));
+
+    let pair = import_pair(
+        "raw-ordinary",
+        Some(raw.clone()),
+        Some(checkpoint.clone()),
+        redact_snapshot,
+    );
+    let resumed = runtime(pair.sessions.clone(), pair.checkpoints.clone())
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap();
+    let ordinary = materialized_snapshot(pair.ordinary_inner.as_ref(), &id).await;
+    assert_eq!(ordinary, redact_snapshot(raw.clone()).unwrap());
+    assert!(!serde_json::to_string(&ordinary).unwrap().contains("secret"));
+    assert!(!ordinary.extension_state.contains_key("host.sensitive"));
+    assert_eq!(
+        materialized_checkpoint(pair.protected_inner.as_ref(), &id).await,
+        checkpoint
+    );
+    resumed.shutdown().await.unwrap();
+    assert_eq!(pair.sessions.saves.load(Ordering::Relaxed), 0);
+}
+
+/// Two processes resuming the same v3 session race for the absent-head
+/// writer reservations: exactly one imports, the other is refused before
+/// any write, and later opens discover the heads without importing again.
+#[tokio::test]
+async fn racing_v3_imports_publish_exactly_one_import() {
+    #[derive(Debug)]
+    struct Yielding(Arc<dyn SessionJournal>);
+
+    #[async_trait]
+    impl SessionJournal for Yielding {
+        fn storage_id(&self) -> JournalStorageId {
+            self.0.storage_id()
+        }
+        async fn open(
+            &self,
+            session: &SessionId,
+            request: JournalOpen,
+        ) -> Result<JournalLease, RuntimeError> {
+            tokio::task::yield_now().await;
+            let lease = self.0.open(session, request).await;
+            tokio::task::yield_now().await;
+            lease
+        }
+        async fn read(
+            &self,
+            lease: &JournalLease,
+            object: &JournalObjectId,
+        ) -> Result<Vec<u8>, RuntimeError> {
+            self.0.read(lease, object).await
+        }
+        async fn commit(
+            &self,
+            lease: &JournalLease,
+            batch: JournalCommit,
+        ) -> Result<JournalHead, RuntimeError> {
+            tokio::task::yield_now().await;
+            let head = self.0.commit(lease, batch).await;
+            tokio::task::yield_now().await;
+            head
+        }
+        async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+            self.0.renew(lease).await
+        }
+        async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+            tokio::task::yield_now().await;
+            self.0.close(lease).await
+        }
+        async fn retire(
+            &self,
+            session: &SessionId,
+            expected: JournalRevision,
+        ) -> Result<JournalRetirement, RuntimeError> {
+            self.0.retire(session, expected).await
+        }
+        async fn collect(
+            &self,
+            request: JournalGcRequest,
+        ) -> Result<JournalGcReport, RuntimeError> {
+            self.0.collect(request).await
+        }
+    }
+
+    let id = SessionId::new("journal-import-race");
+    let seed_sessions = Arc::new(LegacySessionStore::default());
+    let seed_checkpoints = Arc::new(LegacyCheckpointStore::default());
+    let seeded = runtime(seed_sessions.clone(), seed_checkpoints.clone())
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    seeded
+        .run(agent_runtime::core::content::UserInput::text("legacy seed"))
+        .await
+        .unwrap();
+    seeded.shutdown().await.unwrap();
+    let snapshot = seed_sessions.0.lock().unwrap().clone().unwrap();
+    let checkpoint = seed_checkpoints.0.lock().unwrap().clone().unwrap();
+
+    let ordinary = Arc::new(RecordingJournal::new(Arc::new(Yielding(Arc::new(
+        InMemorySessionJournal::ordinary(
+            JournalStorageId::new("race-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        ),
+    )))));
+    let protected = Arc::new(RecordingJournal::new(Arc::new(Yielding(Arc::new(
+        InMemorySessionJournal::protected(JournalStorageId::new("race-protected")),
+    )))));
+    // Each "process" has its own store objects over the shared backends.
+    let process = || {
+        runtime(
+            Arc::new(HybridSessionStore {
+                journal: Some(ordinary.clone()),
+                snapshot: Mutex::new(Some(snapshot.clone())),
+                saves: AtomicUsize::new(0),
+                discoveries: AtomicUsize::new(0),
+            }),
+            Arc::new(HybridCheckpointStore {
+                journal: Some(protected.clone()),
+                checkpoint: Mutex::new(Some(checkpoint.clone())),
+                saves: AtomicUsize::new(0),
+                discoveries: AtomicUsize::new(0),
+            }),
+        )
+    };
+    let (first, second) = (process(), process());
+    let (left, right) = tokio::join!(
+        first.start_session(StartSession::resume(id.clone())),
+        second.start_session(StartSession::resume(id.clone())),
+    );
+    assert!(
+        left.is_ok() != right.is_ok(),
+        "exactly one racing import may win: {:?} / {:?}",
+        left.as_ref().err(),
+        right.as_ref().err()
+    );
+    assert_eq!(ordinary.take_commits().len(), 1, "ordinary import count");
+    assert_eq!(protected.take_commits().len(), 1, "protected import count");
+    let winner = left.or(right).unwrap();
+    winner.shutdown().await.unwrap();
+    ordinary.take_commits();
+    protected.take_commits();
+
+    let reopened = process()
+        .start_session(StartSession::resume(id))
+        .await
+        .unwrap();
+    assert!(ordinary.take_commits().is_empty() && protected.take_commits().is_empty());
+    reopened.shutdown().await.unwrap();
+}
+
+/// Crash after the exact import commit, then a protected-only runtime runs a
+/// turn on the native exact head, then the pair is opened again. Ordinary
+/// repair must never rebuild from the v3 record once the exact head has moved
+/// past the import: the open fails closed with no ordinary write and the v3
+/// records untouched. (Within one pair configuration the repair branch is
+/// only reachable with the exact head still equal to the v3 checkpoint,
+/// because every resume repairs before it can run a turn.)
+#[tokio::test]
+async fn ordinary_repair_never_overlays_v3_after_the_exact_head_advanced() {
+    use agent_runtime::core::journal::JournalCommitFailurePoint;
+    let id = SessionId::new("journal-import-advanced-repair");
+    let seed_sessions = Arc::new(LegacySessionStore::default());
+    let seed_checkpoints = Arc::new(LegacyCheckpointStore::default());
+    let seeded = runtime(seed_sessions.clone(), seed_checkpoints.clone())
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    seeded
+        .run(agent_runtime::core::content::UserInput::text("legacy seed"))
+        .await
+        .unwrap();
+    seeded.shutdown().await.unwrap();
+    let snapshot = seed_sessions.0.lock().unwrap().clone().unwrap();
+    let checkpoint = seed_checkpoints.0.lock().unwrap().clone().unwrap();
+
+    let pair = import_pair(
+        "advanced-repair",
+        Some(snapshot.clone()),
+        Some(checkpoint.clone()),
+        identity_projection,
+    );
+    pair.ordinary_inner
+        .fail_next_commit_at(JournalCommitFailurePoint::AfterObjects)
+        .unwrap();
+    assert!(
+        runtime(pair.sessions.clone(), pair.checkpoints.clone())
+            .start_session(StartSession::resume(id.clone()))
+            .await
+            .is_err()
+    );
+    assert!(head_exists(pair.protected.as_ref(), &id).await);
+    assert!(!head_exists(pair.ordinary.as_ref(), &id).await);
+    pair.ordinary.take_commits();
+    pair.protected.take_commits();
+
+    let protected_only = runtime_with_optional_stores(None, Some(pair.checkpoints.clone()))
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap();
+    protected_only
+        .run(agent_runtime::core::content::UserInput::text(
+            "protected-only turn",
+        ))
+        .await
+        .unwrap();
+    protected_only.shutdown().await.unwrap();
+    assert!(!pair.protected.take_commits().is_empty());
+    let advanced = materialized_checkpoint(pair.protected_inner.as_ref(), &id).await;
+    assert_ne!(advanced, checkpoint);
+
+    let error = runtime(pair.sessions.clone(), pair.checkpoints.clone())
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("no longer exposes"), "{error:?}");
+    assert!(pair.ordinary.take_commits().is_empty());
+    assert!(!head_exists(pair.ordinary.as_ref(), &id).await);
+    assert_eq!(
+        materialized_checkpoint(pair.protected_inner.as_ref(), &id).await,
+        advanced
+    );
+    assert_eq!(pair.sessions.saves.load(Ordering::Relaxed), 0);
+    assert_eq!(pair.checkpoints.saves.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        pair.sessions.snapshot.lock().unwrap().as_ref(),
+        Some(&snapshot)
+    );
+    assert_eq!(
+        pair.checkpoints.checkpoint.lock().unwrap().as_ref(),
+        Some(&checkpoint)
+    );
+}
