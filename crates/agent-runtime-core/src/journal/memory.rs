@@ -114,6 +114,9 @@ struct SessionRecord {
     operations: BTreeMap<JournalOperationId, OperationRecord>,
     retained_heads: BTreeSet<JournalObjectId>,
     ordinary_snapshot: Option<SessionSnapshot>,
+    /// Latest published protected checkpoint, kept even when a later head
+    /// carries none, so checkpoint progress stays monotonic per session.
+    checkpoint_floor: Option<ReferencedTurnCheckpoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,32 +329,25 @@ impl InMemorySessionJournal {
     }
 
     fn validate_checkpoint_revision(
-        state: &State,
-        current: Option<&JournalHead>,
-        checkpoint: Option<&ReferencedTurnCheckpoint>,
+        floor: Option<&ReferencedTurnCheckpoint>,
+        next: &ReferencedTurnCheckpoint,
     ) -> Result<(), RuntimeError> {
-        let Some(next) = checkpoint else {
-            return Ok(());
-        };
         if next.schema_version != JOURNAL_SCHEMA_VERSION
             || next.transition_revision != crate::checkpoint::TURN_TRANSITION_REVISION
         {
             return Err(conflict());
         }
-        let Some(current_id) = current.and_then(|head| head.checkpoint.as_ref()) else {
+        let Some(previous) = floor else {
             return Ok(());
         };
-        let bytes = state.objects.get(current_id).ok_or_else(conflict)?;
-        let previous: ReferencedTurnCheckpoint = JournalObject {
-            id: current_id.clone(),
-            bytes: bytes.clone(),
-        }
-        .decode(JournalObjectKind::Checkpoint)?;
-        if next.watermark.checkpoint_sequence < previous.watermark.checkpoint_sequence
+        let sequence = next.watermark.checkpoint_sequence;
+        let previous_sequence = previous.watermark.checkpoint_sequence;
+        if sequence < previous_sequence
+            || (sequence == previous_sequence && next != previous)
             || (next.turn == previous.turn && next.state_revision < previous.state_revision)
             || (next.turn == previous.turn
                 && next.state_revision == previous.state_revision
-                && next != &previous)
+                && next != previous)
         {
             return Err(conflict());
         }
@@ -636,9 +632,8 @@ impl SessionJournal for InMemorySessionJournal {
                     return Err(conflict());
                 }
                 Self::validate_checkpoint_revision(
-                    &staged,
-                    current_session.current.as_ref().map(|(_, head)| head),
-                    Some(checkpoint),
+                    current_session.checkpoint_floor.as_ref(),
+                    checkpoint,
                 )?;
                 let object = JournalObject::encode(JournalObjectKind::Checkpoint, checkpoint)?;
                 if commit.batch.checkpoint.as_ref() != Some(&object.id) {
@@ -717,6 +712,9 @@ impl SessionJournal for InMemorySessionJournal {
         staged_session.current = Some((head_object.id, head.clone()));
         if let Some((snapshot, _)) = ordinary {
             staged_session.ordinary_snapshot = Some(snapshot);
+        }
+        if let Some(checkpoint) = &commit.checkpoint {
+            staged_session.checkpoint_floor = Some(checkpoint.clone());
         }
         self.fail_if_armed(JournalCommitFailurePoint::AfterHead)?;
 

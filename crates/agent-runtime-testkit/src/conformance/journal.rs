@@ -571,6 +571,47 @@ where
             .unwrap_err(),
     );
     checkpoint_fixture.journal.close(lease).await.unwrap();
+
+    // The checkpoint sequence is monotonic for the whole session, not just
+    // relative to the current head: a checkpoint-less protected boundary in
+    // between must not reopen an older checkpoint revision.
+    let floor_fixture = factory().await;
+    let session = SessionId::new("checkpoint-floor");
+    let lease = open_writer(&*floor_fixture.journal, &session, None, "checkpoint-floor").await;
+    let epoch = lease.writer_epoch().unwrap();
+    let forward = checkpoint_commit(session.clone(), epoch, None, "floor-forward", 1, 2);
+    let forward = floor_fixture.journal.commit(&lease, forward).await.unwrap();
+    let idle = append_commit(
+        session.clone(),
+        epoch,
+        &forward,
+        "floor-idle",
+        &[CHECKPOINT_BODY, "idle"],
+        "idle",
+    );
+    let idle = floor_fixture.journal.commit(&lease, idle).await.unwrap();
+    assert!(idle.checkpoint.is_none());
+    for (operation, state_revision, sequence) in [
+        ("floor-backwards-sequence", 1, 1),
+        ("floor-backwards-revision", 0, 3),
+    ] {
+        let backwards = checkpoint_commit(
+            session.clone(),
+            epoch,
+            Some(&idle),
+            operation,
+            state_revision,
+            sequence,
+        );
+        assert_conflict(
+            floor_fixture
+                .journal
+                .commit(&lease, backwards)
+                .await
+                .unwrap_err(),
+        );
+    }
+    floor_fixture.journal.close(lease).await.unwrap();
 }
 
 async fn assert_ordinary_projection_conformance() {
