@@ -259,12 +259,17 @@ The optional optimized-build after measurement (milliseconds/commit) was:
 | Tool turn | 2.1 | 10.0 | 37.3 |
 | Tool unchanged | 0.3 | 1.7 | 7.2 |
 
-The writer and reference backend reuse per-record and per-JSON-path encodings;
-the reference backend also keeps immutable objects/reachability in append-only
-copy-on-write layers. End-to-end turn time is 18–22× lower at N=4000, but it is
-not flat in N because full `SessionSnapshot` construction and host-policy
-materialization still scale with retained state; this remains explicit evidence,
-not a constant-time claim.
+The writer and reference backend reuse per-record and per-JSON-path encodings
+(cache hits require exact JSON identity, and the equivalence harness checks every
+head against a cold encoding); the reference backend also keeps immutable
+objects/reachability in merged copy-on-write layers. After the 2026-10-18 review
+fixes the N=4000 turn rows are 388 (plain) and 379 (tool) ms/commit in debug and
+32.1/31.1 ms/commit optimized, with unchanged bytes. End-to-end turn time is not
+flat in N: the reference backends resolve structured references to full values
+(the ordinary host policy and protected checkpoint validation take a complete
+`SessionSnapshot`), a `calling_model` checkpoint validates its full provider
+request, and the runtime captures a public `SessionSnapshot` per barrier as the
+legacy path also does. This remains explicit evidence, not a constant-time claim.
 
 Legacy materialized bytes remain unchanged. N=10,000 is inapplicable because
 the pre-existing cache-identity contract rejects more than 4,096 stable-history
@@ -276,10 +281,7 @@ cargo test -p agent-runtime --all-features --test integration \
   -- --exact --nocapture
 ```
 
-Raw before/after output is in
-`/Volumes/Data/tmp/refactor/u9b-4/task-2.7-before.log` and
-`/Volumes/Data/tmp/refactor/u9b-4/task-2.7-current-final.log`; the optimized
-after run is `task-2.7-current-final-release.log` in the same directory.
+Add `--release` for the optimized rows.
 
 ## Quality gates
 

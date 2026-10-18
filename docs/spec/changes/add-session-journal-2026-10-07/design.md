@@ -149,15 +149,31 @@ reuse their roots; changed structured records rebuild only changed paths.
 immutable objects and pin reachability in append-only copy-on-write layers, and
 short-circuits already validated pinned subtrees during commit reachability.
 All cached IDs are derived by the same canonical encoders: caching changes work,
-not committed roots. Ordinary referenced drafts are admitted only when every
+not committed roots. A cache hit requires exact identity
+(`journal_json_identical`: number bits, so `0.0` and `-0.0` differ, and key
+order), not `serde_json` equality, and a cached array node is reused only when
+it was built from exactly the same children; any other miss re-encodes cold.
+The equivalence harness checks every published head against a cold encoding of
+its materialized state. Ordinary referenced drafts are admitted only when every
 supplied object is reachable from the current structured delta and host policy
-preserves the Runtime-owned values exactly.
+preserves the Runtime-owned values exactly; the closure that selects them stops
+at already pinned objects. For a protected commit the cached snapshot is only a
+fast path: a delta it cannot replay or roots it does not reproduce fall back to
+full reader validation (the protected delta stays advisory). Copy-on-write
+layers are merged while the newest is at least as large as the one below, so a
+lookup scans at most log2(total)+1 layers.
 
 The detailed byte/time evidence is in `tasks.md` and `docs/development.md`.
 Bootstrap clears the ≤4× legacy-snapshot target and later serialized turns are
 smaller than the prior shape. Complete debug phase time is much lower but not
-flat in N because public `SessionSnapshot` construction and full host-policy
-materialization remain O(N); that CPU target is explicitly NOT MET.
+flat in N, so that CPU target is explicitly NOT MET. The remaining per-commit
+O(N) is mostly the reference backends resolving structured references to full
+values (the ordinary host policy and the protected checkpoint validation both
+take a complete `SessionSnapshot`), validation of a `calling_model` checkpoint's
+full provider request, and the runtime's public `SessionSnapshot` capture
+(legacy also captures and serializes the full snapshot per save). Removing it
+needs a delta-aware policy/validation contract or a decoded-value memo, not an
+encoding change.
 
 ## Exact Trait Diff and Mode Selection
 

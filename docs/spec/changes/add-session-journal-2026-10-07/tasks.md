@@ -138,12 +138,42 @@ all applicable gates, not merely contract merge.
   its raw log is `/Volumes/Data/tmp/refactor/u9b-4/task-2.7-current-final-release.log`.
 
   This is an 18–22× N=4,000 turn improvement, but complete phase time remains
-  N-dependent because full snapshot construction and host-policy materialization
-  are still O(N). The requested “roughly flat” end-to-end CPU target is therefore
-  recorded as NOT MET; the encoding/commit work itself is delta-reused. Detailed
-  commit-kind bytes are in `docs/development.md`; raw before/after logs are
+  N-dependent. The requested “roughly flat” end-to-end CPU target is therefore
+  recorded as NOT MET. Detailed commit-kind bytes are in `docs/development.md`;
+  raw before/after logs are
   `/Volumes/Data/tmp/refactor/u9b-4/task-2.7-before.log` and
   `/Volumes/Data/tmp/refactor/u9b-4/task-2.7-current-final.log`.
+  Because minimum-height arrays make a changed path O(log N) instead of a fixed
+  32 levels, two existing assertions were relaxed from equality to bounds by
+  this refinement: `native_delta_submission_is_independent_of_unchanged_history_bodies`
+  (object count N=1000 ≤ N=100 + 8) and
+  `review_one_message_turn_submissions_do_not_grow_with_history` (objects ≤ base
+  + 16, reference bytes ≤ base + 2,048). Measured growth from N=100 to N=4000 is
+  +5 objects for the cache-record commit and +10 for the ordinary terminal.
+  Review fixes (2026-10-18): a warm path cache failed every commit once a cached
+  array grew past one 64-item leaf ("JSON sequence cache is incomplete": any
+  session whose cache record or manifest outgrew 64 entries by turns) and
+  reused a two-item node for an array shrunk to an odd width; caches and the
+  writer's delta treated `0.0`/`-0.0` as unchanged; the protected fast path
+  rejected valid commits whose advisory delta did not replay; reference-backend
+  layers grew one per commit; the ordinary draft closure re-validated every
+  pinned object. Tests: `a_warm_json_cache_encodes_reshaped_arrays_like_a_cold_one`,
+  `review_arrays_growing_past_one_leaf_match_at_every_barrier`,
+  `a_warm_json_cache_distinguishes_negative_zero`,
+  `negative_zero_records_are_encoded_and_sent_like_any_change`,
+  `a_negative_zero_rewrite_is_stored_like_a_cold_encoding`,
+  `protected_commits_with_an_unreplayable_delta_fall_back_to_full_validation`,
+  `many_commits_keep_logarithmic_layers_and_exact_accounting`, three-encoder
+  boundary checks (1,023/1,024/1,025 bytes, multi-byte UTF-8, signed zero,
+  64/65/66/130 items) in the runtime and testkit, and a cold-encoding oracle
+  on every equivalence head. Byte totals are unchanged. Re-measured debug turn
+  time at N=4000 is 388/379 ms per commit (plain/tool, was 594/469) and release
+  32.1/31.1 ms (was 44.6/37.3); the debug ordinary terminal commit is 1.3/2.0 s
+  (was 3.0/3.6 s). Remaining O(N), per backend commit kind at N=4000 (debug): the
+  cache-record reference commit 628 ms (full decode of the referenced value),
+  `calling_model` 261 ms (full request validation), ordinary terminal 1.34 s
+  (decode for the host policy) versus 13 ms for a commit with no changed
+  record; see `design.md`.
 - [ ] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)

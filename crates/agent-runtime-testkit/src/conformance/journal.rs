@@ -1923,7 +1923,7 @@ impl Assembler {
     /// Independent oracle of the native persistent JSON encoding: compact
     /// values are explicit inline data; larger values are typed references.
     /// Arrays up to `JOURNAL_FANOUT` use one JSON leaf, while larger arrays use
-    /// single-item leaves under the minimum-height binary spine.
+    /// two-item bottom nodes under the minimum-height binary spine.
     fn structured_array(&mut self, values: &[serde_json::Value]) -> JournalJsonArray {
         if values.is_empty() {
             return JournalJsonArray {
