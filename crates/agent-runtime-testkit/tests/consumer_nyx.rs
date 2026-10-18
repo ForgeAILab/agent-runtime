@@ -163,3 +163,19 @@ async fn nyx_history_lcm_isolation_gate() {
 async fn nyx_legacy_identity_rejects_envelopes_with_seeded_subscription() {
     agent_runtime_testkit::conformance::normalization::assert_legacy_identity_with_seeded_history_and_subscription().await;
 }
+
+#[tokio::test]
+async fn nyx_schema_guard_accepts_a_checkpoint_materialized_from_a_native_head() {
+    agent_runtime_testkit::conformance::journal::assert_native_materialized_checkpoint_schema_guard(
+        |bytes| {
+            let value: serde_json::Value =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            if value.get("schema_version").and_then(serde_json::Value::as_u64) == Some(3) {
+                Ok(())
+            } else {
+                Err("Nyx optional durability accepts only materialized schema 3".to_owned())
+            }
+        },
+    )
+    .await;
+}

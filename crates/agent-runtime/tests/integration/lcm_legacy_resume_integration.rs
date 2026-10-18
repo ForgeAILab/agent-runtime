@@ -2439,6 +2439,77 @@ async fn audit_idle_checkpoint_failure_rolls_back_pending_memory() {
 /// checkpoint pass and then the ordinary pass. Native and legacy must publish
 /// the same materialized boundaries, and a fresh runtime must resume the
 /// compacted session without repeating summary work.
+pub(crate) async fn task_2_6_idle_compaction_trace() -> (
+    Vec<crate::session_journal_equivalence::SubmittedCommit>,
+    Vec<(String, usize)>,
+) {
+    use crate::session_journal_equivalence::{Pair, identity};
+    let session_id = SessionId::new("matrix-idle-two-stores");
+    let pair = Pair::new(identity);
+    for native in [false, true] {
+        let (sessions, checkpoints): (Arc<dyn SessionStore>, Arc<dyn CheckpointStore>) = if native {
+            (pair.native.clone(), pair.native.clone())
+        } else {
+            (
+                pair.legacy_sessions.clone(),
+                pair.legacy_checkpoints.clone(),
+            )
+        };
+        let lcm_store = Arc::new(LcmFixtureStore::new(LcmTimelineId::new(TIMELINE_ID)));
+        let model = Arc::new(CountingSummaryModel::new());
+        let coordinator = hard_pressure_coordinator(&session_id, lcm_store, model.clone());
+        let runtime = RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+            .provider(Arc::new(FakeProvider::text_reply("turn answer")))
+            .model_profile(
+                agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                    "fake",
+                    agent_runtime::core::provider::ModelId::new("fake"),
+                    agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+                ),
+            )
+            .clock(Arc::new(crate::session_journal_equivalence::FixedClock))
+            .session_store(sessions)
+            .checkpoint_store(checkpoints)
+            .lcm(coordinator)
+            .build()
+            .unwrap();
+        let session = runtime
+            .start_session(StartSession::create(session_id.clone(), idle_history()))
+            .await
+            .unwrap();
+        session
+            .run(UserInput::text("one turn first"))
+            .await
+            .unwrap();
+        let before = pair.submission_trace().len();
+        session.try_idle_compaction().await.unwrap();
+        session.shutdown().await.unwrap();
+        if native {
+            let trace = pair.submission_trace();
+            let mut targets = Vec::new();
+            for (index, submission) in trace.iter().enumerate().skip(before) {
+                let label = match submission.role {
+                    agent_runtime::core::journal::JournalRole::Protected => "idle_compaction_exact",
+                    agent_runtime::core::journal::JournalRole::Ordinary => {
+                        "idle_compaction_projection"
+                    }
+                };
+                if !targets.iter().any(|(existing, _)| existing == label) {
+                    targets.push((label.to_owned(), index));
+                }
+            }
+            assert_eq!(
+                targets.len(),
+                2,
+                "idle compaction did not publish both domains"
+            );
+            pair.assert_barriers_match("task-2.6-idle-trace");
+            return (trace, targets);
+        }
+    }
+    unreachable!()
+}
+
 #[tokio::test]
 async fn review_native_two_store_idle_compaction_matches_legacy_barriers() {
     use crate::session_journal_equivalence::{Pair, identity};

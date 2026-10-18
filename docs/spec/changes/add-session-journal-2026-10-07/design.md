@@ -544,6 +544,34 @@ Version-4 readers run for the entire first release; future legacy-reader removal
 is a separate proposal with all consumer gates. U10 has its own format change
 and continues to read v3 during its first adoption release.
 
+### Task 2.8 materialized checkpoint decision (2026-10-18)
+
+Keep `CHECKPOINT_SCHEMA_VERSION` at 3. A native head changes the protected
+storage representation, not the materialized `TurnCheckpoint` contract.
+`JournalReader::checkpoint` reconstructs the same owned checkpoint fields and
+sets schema 3 before running the existing validation and transition checks; the
+schema-4 reference envelope, object IDs and roots are not serialized into the
+materialized value. The task-2.6 matrix reads every published outcome through a
+fresh `JournalReader`, compares its roots with a cold encoding, and resumes the
+result through the same public checkpoint type as the legacy path.
+
+The released-reader evidence is direct. There is no persisted checkpoint-type
+or validation diff from tag `v0.5.0` through `v0.6.0`, `v0.6.1` and this
+decision; those releases require schema 3 and deserialize the same state,
+snapshot, watermark, identity and operation fields. The native writer released
+in 0.6.x therefore produces no new materialized byte interpretation for an
+older reader. The Smith, Nyx and Open Forge consumer fixtures each apply their
+own restrictive schema guard to JSON materialized from a real native
+schema-4 head: all require schema 3, Smith/Forge require the inline `snapshot`,
+and Forge rejects a journal-only `snapshot_roots` field. The resulting bytes
+round-trip and validate as `TurnCheckpoint` in every row.
+
+Consequently no reader-first schema-4 materialized-checkpoint plan and no new
+CHANGELOG rollback limit are needed. The existing native-adoption downgrade
+limit remains: an older binary must not resume a migrated native *store head*
+that it cannot discover or fence. That operational store limitation does not
+turn a separately materialized schema-3 checkpoint into a new wire schema.
+
 ## Existing Proposal Delta Ordering
 
 Main has implemented U3, U6, U7/U8, U11 and durable hard admission while their

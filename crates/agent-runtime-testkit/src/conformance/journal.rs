@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use agent_runtime::registry::RegistryRevision;
 use agent_runtime_core::checkpoint::{
-    CheckpointWatermark, TURN_TRANSITION_REVISION, TurnCheckpoint, TurnState,
+    CHECKPOINT_SCHEMA_VERSION, CheckpointWatermark, TURN_TRANSITION_REVISION, TurnCheckpoint,
+    TurnState,
 };
 use agent_runtime_core::clock::{Deadline, Timestamp};
 use agent_runtime_core::content::{Message, UserInput};
@@ -105,6 +106,51 @@ pub async fn assert_session_journal_reference_conformance() {
     assert_session_journal_conformance(|| async { reference_fixture() }).await;
     assert_ordinary_projection_conformance().await;
     assert_ordinary_session_journal_conformance(reference_ordinary).await;
+}
+
+/// Materializes a checkpoint from a native version-4 head and passes its exact
+/// public JSON bytes to a consumer-style persisted-schema guard. The native
+/// representation must disappear at this boundary: the bytes remain a valid
+/// schema-3 [`TurnCheckpoint`] that round-trips through the materialized
+/// reader used by released 0.5.x/0.6.x consumers.
+pub async fn assert_native_materialized_checkpoint_schema_guard(
+    guard: impl Fn(&[u8]) -> Result<(), String>,
+) {
+    let journal =
+        InMemorySessionJournal::protected(JournalStorageId::new("consumer-materialized-schema"));
+    let session = SessionId::new("consumer-materialized-schema");
+    let lease = open_writer(&journal, &session, None, "consumer-materialized-schema").await;
+    let commit = checkpoint_commit(
+        session.clone(),
+        lease.writer_epoch().unwrap(),
+        None,
+        "consumer-materialized-schema",
+        1,
+        1,
+    );
+    let head = journal.commit(&lease, commit).await.unwrap();
+    let reader = open_reader(
+        &journal,
+        &session,
+        Some(head.revision),
+        "consumer-materialized-schema-read",
+    )
+    .await;
+    let checkpoint = JournalReader::new(&journal, &reader, LIMITS)
+        .unwrap()
+        .checkpoint()
+        .await
+        .unwrap()
+        .expect("native protected head materializes a checkpoint");
+    let bytes = serde_json::to_vec(&checkpoint).unwrap();
+    guard(&bytes).unwrap_or_else(|error| panic!("consumer schema guard rejected: {error}"));
+    assert_eq!(checkpoint.schema_version, CHECKPOINT_SCHEMA_VERSION);
+    assert_eq!(checkpoint.schema_version, 3);
+    let decoded: TurnCheckpoint = serde_json::from_slice(&bytes).unwrap();
+    decoded.validate().unwrap();
+    assert_eq!(decoded, checkpoint);
+    journal.close(reader).await.unwrap();
+    journal.close(lease).await.unwrap();
 }
 
 /// Runs the ordinary-role contract against a caller-supplied ordinary

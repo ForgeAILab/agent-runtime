@@ -58,7 +58,38 @@ all applicable gates, not merely contract merge.
   to the exact head (`ordinary_repair_requires_the_exact_head_to_be_the_v3_import`).
   Added refusal-parity, raw-ordinary projection, racing-import and
   advanced-exact repair tests.
-- [ ] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
+- [x] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
+  Evidence (2026-10-18):
+  `task_2_6_native_barrier_crash_and_ambiguous_write_matrix` enumerates all 22
+  all-feature `TurnState` checkpoint tags plus ordinary bootstrap, terminal
+  projection, fork intent/child seed/parent supersession and both idle-
+  compaction publications. Protected rows cross seven physical commit cuts
+  (`AfterObjects`, checkpoint, batch, pin, head, idempotency and publication)
+  plus writer-pin close with crash, ambiguous-success and ambiguous-failure;
+  ordinary rows omit the nonexistent checkpoint-object cut. All 678 rows
+  reopen through a fresh reader, accept only the complete before/after
+  boundary, compare materialization and a cold encoding, continue on a
+  1.75-MiB worker against legacy resume (same provider requests, tool calls
+  and later barriers), and independently retry the same operation to the
+  original head. The actual ordinary-only hard-admission path adds 18
+  physical-cut/outcome rows while retaining its real LCM store/model and never
+  repeating summary work. Durable child rebind remains covered by its existing
+  fresh-process native/legacy conformance; its emitted Accepted-through-
+  Terminal and ordinary catalog publications use the same enumerated rows,
+  not a separate object format. Total crash/ambiguity rows: 696.
+
+  `task_2_6_committed_corruption_fails_closed_without_stale_fallback` covers
+  truncated/garbled objects and batches, a published head with a missing or
+  corrupt referenced object, digest substitution and a corrupt ordinary
+  projection beside a valid exact head. All eight return explicit
+  `StateConflict` before provider I/O and refuse both a retained predecessor
+  and a deliberately retained stale v3 pair; restoring verified backend bytes
+  recovers the latest exact content with cold roots and no lost history,
+  usage, extension or manifest data. The separate unpublished torn-tail row
+  returns the prior published head and permits trim only with an exclusive
+  writer fence, matching the design's sole automatic repair. No production
+  defect or object-format change was found; all changes are tests and decision
+  documentation.
 - [x] 2.7 Count serialized submission/new-object bytes at N=100/1000/4000 (and 10000 when the cache-identity limit permits) and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.
   Evidence (implementation measurement, 2026-10-18; exact bytes, each cell is
   `serialized submission / new immutable-object bytes`): the pre-change
@@ -205,7 +236,19 @@ all applicable gates, not merely contract merge.
   `calling_model` 261 ms (full request validation), ordinary terminal 1.34 s
   (decode for the host policy) versus 13 ms for a commit with no changed
   record; see `design.md`.
-- [ ] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
+- [x] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
+  Decision (2026-10-18): no new materialized tag is needed. Native schema 4
+  is confined to journal heads, objects and reference envelopes;
+  `JournalReader` reconstructs and validates the unchanged schema-3
+  `TurnCheckpoint`. The checkpoint DTO/validation has no persisted-contract
+  diff between released `v0.5.0`, `v0.6.0`, `v0.6.1` and this decision. New
+  Smith, Nyx and Open Forge fixture rows pass their restrictive schema-3 guards
+  over JSON materialized from a real native head (including inline `snapshot`
+  and absence of journal-only `snapshot_roots` where guarded), then round-trip
+  and validate the checkpoint. Task-2.6 fresh-reader/cold-encoding and
+  legacy-continuation comparisons supply state-by-state evidence. The existing
+  warning against downgrading a migrated native store remains, but no reader-
+  first materialized schema or additional CHANGELOG rollback limit is required.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)
 

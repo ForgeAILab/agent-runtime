@@ -1003,3 +1003,303 @@ async fn review_native_hard_admission_crash_cuts_match_legacy_publications() {
         assert_eq!(native_nodes, usize::from(fault == LcmCommitFault::After));
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardAdmissionWriteOutcome {
+    Crash,
+    AmbiguousSuccess,
+    AmbiguousFailure,
+}
+
+impl HardAdmissionWriteOutcome {
+    const ALL: [Self; 3] = [Self::Crash, Self::AmbiguousSuccess, Self::AmbiguousFailure];
+}
+
+#[derive(Debug)]
+struct HardAdmissionMatrixJournal {
+    inner: InMemorySessionJournal,
+    plan: Mutex<Option<(JournalCommitFailurePoint, HardAdmissionWriteOutcome)>>,
+    crashed: std::sync::atomic::AtomicBool,
+    attempted: Mutex<Option<agent_runtime::core::journal::JournalCommit>>,
+    committed: std::sync::atomic::AtomicBool,
+}
+
+impl HardAdmissionMatrixJournal {
+    fn new(point: JournalCommitFailurePoint, outcome: HardAdmissionWriteOutcome) -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemorySessionJournal::ordinary(
+                JournalStorageId::new(format!("hard-matrix-{point:?}-{outcome:?}")),
+                Arc::new(IdentityJournalProjection),
+            ),
+            plan: Mutex::new(Some((point, outcome))),
+            crashed: std::sync::atomic::AtomicBool::new(false),
+            attempted: Mutex::new(None),
+            committed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn is_hard_intent(commit: &agent_runtime::core::journal::JournalCommit) -> bool {
+        commit.delta.bootstrap.as_deref().is_some_and(pending)
+            || commit
+                .delta
+                .extension_updates
+                .get("harness.lcm")
+                .and_then(Option::as_ref)
+                .is_some_and(|state| {
+                    state
+                        .value
+                        .get("pending_summary")
+                        .is_some_and(|value| !value.is_null())
+                })
+    }
+
+    fn recover(&self) {
+        self.crashed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionJournal for HardAdmissionMatrixJournal {
+    fn storage_id(&self) -> agent_runtime::core::journal::JournalStorageId {
+        self.inner.storage_id()
+    }
+
+    async fn open(
+        &self,
+        session: &SessionId,
+        request: agent_runtime::core::journal::JournalOpen,
+    ) -> Result<agent_runtime::core::journal::JournalLease, RuntimeError> {
+        self.inner.open(session, request).await
+    }
+
+    async fn read(
+        &self,
+        lease: &agent_runtime::core::journal::JournalLease,
+        object: &agent_runtime::core::journal::JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.inner.read(lease, object).await
+    }
+
+    async fn commit(
+        &self,
+        lease: &agent_runtime::core::journal::JournalLease,
+        commit: agent_runtime::core::journal::JournalCommit,
+    ) -> Result<agent_runtime::core::journal::JournalHead, RuntimeError> {
+        if self.crashed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RuntimeError::internal("hard-admission process is crashed"));
+        }
+        let plan = if Self::is_hard_intent(&commit) {
+            self.plan.lock().unwrap().take()
+        } else {
+            None
+        };
+        let Some((point, outcome)) = plan else {
+            return self.inner.commit(lease, commit).await;
+        };
+        *self.attempted.lock().unwrap() = Some(commit.clone());
+        let result = match outcome {
+            HardAdmissionWriteOutcome::Crash => {
+                self.inner.fail_next_commit_at(point).unwrap();
+                let result = self.inner.commit(lease, commit).await;
+                self.committed
+                    .store(point.is_after_commit(), std::sync::atomic::Ordering::SeqCst);
+                result
+            }
+            HardAdmissionWriteOutcome::AmbiguousSuccess => {
+                self.inner.commit(lease, commit).await?;
+                self.committed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(RuntimeError::internal(
+                    "hard-admission write acknowledgement was ambiguous",
+                ))
+            }
+            HardAdmissionWriteOutcome::AmbiguousFailure => Err(RuntimeError::internal(
+                "hard-admission write failed ambiguously",
+            )),
+        };
+        self.crashed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        result
+    }
+
+    async fn renew(
+        &self,
+        lease: &agent_runtime::core::journal::JournalLease,
+    ) -> Result<agent_runtime::core::journal::JournalLease, RuntimeError> {
+        if self.crashed.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(RuntimeError::internal(
+                "hard-admission ambiguity requires a fresh process",
+            ))
+        } else {
+            self.inner.renew(lease).await
+        }
+    }
+
+    async fn close(
+        &self,
+        lease: agent_runtime::core::journal::JournalLease,
+    ) -> Result<(), RuntimeError> {
+        if self.crashed.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(RuntimeError::internal(
+                "crashed hard-admission writer did not close its pin",
+            ))
+        } else {
+            self.inner.close(lease).await
+        }
+    }
+
+    async fn retire(
+        &self,
+        session: &SessionId,
+        expected: agent_runtime::core::journal::JournalRevision,
+    ) -> Result<agent_runtime::core::journal::JournalRetirement, RuntimeError> {
+        self.inner.retire(session, expected).await
+    }
+
+    async fn collect(
+        &self,
+        request: agent_runtime::core::journal::JournalGcRequest,
+    ) -> Result<agent_runtime::core::journal::JournalGcReport, RuntimeError> {
+        self.inner.collect(request).await
+    }
+}
+
+#[derive(Debug)]
+struct HardAdmissionMatrixSessions(Arc<HardAdmissionMatrixJournal>);
+
+#[async_trait::async_trait]
+impl SessionStore for HardAdmissionMatrixSessions {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.0.clone())
+    }
+
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        panic!("hard-admission matrix fell back to a materialized save")
+    }
+}
+
+async fn hard_admission_matrix_head(
+    journal: &HardAdmissionMatrixJournal,
+) -> Option<agent_runtime::core::journal::JournalHead> {
+    use agent_runtime::core::journal::{
+        JournalOpen, JournalOpenIntent, JournalOperationId, JournalPinId, JournalRootSelection,
+    };
+    let lease = journal
+        .inner
+        .open(
+            &id(),
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new("hard-matrix-read"),
+                pin: JournalPinId::new("hard-matrix-read"),
+                intent: JournalOpenIntent::ReadOnly,
+            },
+        )
+        .await
+        .unwrap();
+    let head = lease.head().cloned();
+    journal.inner.close(lease).await.unwrap();
+    head
+}
+
+/// Task 2.6 hard-admission row: the actual pending-summary write is cut at
+/// every reference-backend physical stage under crash and both ambiguous
+/// outcomes. Fresh recovery never repeats the already-run summary model, and
+/// the saved operation remains lifetime-idempotent.
+#[tokio::test]
+async fn task_2_6_hard_admission_physical_write_matrix() {
+    use agent_runtime::core::journal::{
+        JournalDigest, JournalOpen, JournalOpenIntent, JournalOperationId, JournalPinId,
+        JournalRootSelection,
+    };
+    let mut cases = 0usize;
+    for &point in JournalCommitFailurePoint::ALL
+        .iter()
+        .filter(|point| !matches!(point, JournalCommitFailurePoint::AfterCheckpoint))
+    {
+        for outcome in HardAdmissionWriteOutcome::ALL {
+            let label = format!("{point:?}/{outcome:?}");
+            let f = Fixture::new(SaveFault::None);
+            let journal = HardAdmissionMatrixJournal::new(point, outcome);
+            let sessions: Arc<dyn SessionStore> =
+                Arc::new(HardAdmissionMatrixSessions(journal.clone()));
+            let runtime = review_runtime(&f, sessions.clone());
+            let session = runtime
+                .start_session(StartSession::create(id(), history()))
+                .await
+                .unwrap();
+            session
+                .run(UserInput::text("interrupted request"))
+                .await
+                .unwrap();
+            drop(session);
+            drop(runtime);
+            let _ = journal.inner.revoke_writer(&id());
+            let committed = journal.committed.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                hard_admission_matrix_head(&journal).await.is_some(),
+                committed,
+                "{label}: partial visibility"
+            );
+            journal.recover();
+
+            let calls_before_resume = f.model.calls().len();
+            assert_eq!(calls_before_resume, 1, "{label}: summary call count");
+            let restarted = review_runtime(&f, sessions);
+            let resumed = restarted.start_session(StartSession::resume(id())).await;
+            match resumed {
+                Ok(handle) => {
+                    assert!(committed, "{label}: resumed without a durable intent");
+                    assert_eq!(
+                        f.model.calls().len(),
+                        calls_before_resume,
+                        "{label}: resume repeated summary work"
+                    );
+                    handle.shutdown().await.unwrap();
+                }
+                Err(_) => assert!(!committed, "{label}: committed intent did not resume"),
+            }
+            drop(restarted);
+
+            let writer = journal
+                .inner
+                .open(
+                    &id(),
+                    JournalOpen {
+                        root: JournalRootSelection::Latest,
+                        expected_revision: None,
+                        operation: JournalOperationId::new("hard-matrix-retry"),
+                        pin: JournalPinId::new("hard-matrix-retry"),
+                        intent: JournalOpenIntent::ExclusiveWriter,
+                    },
+                )
+                .await
+                .unwrap();
+            let mut retry = journal.attempted.lock().unwrap().clone().unwrap();
+            if !committed {
+                retry.batch.expected_revision = writer.head().map(|head| head.revision);
+                retry.batch.sequence = writer
+                    .head()
+                    .map_or(1, |head| head.batch_sequence.saturating_add(1));
+                retry.batch.predecessor = writer
+                    .head()
+                    .map(|head| JournalDigest::parse(head.batch.as_str()).unwrap());
+                retry.batch.writer_epoch = writer.writer_epoch().unwrap();
+                retry.digest = retry.input_digest().unwrap();
+            }
+            let original = journal.inner.commit(&writer, retry.clone()).await.unwrap();
+            let duplicate = journal.inner.commit(&writer, retry).await.unwrap();
+            assert_eq!(duplicate, original, "{label}: retry advanced twice");
+            journal.inner.close(writer).await.unwrap();
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 18);
+    println!("TASK 2.6 HARD-ADMISSION cases={cases} results=pass");
+}

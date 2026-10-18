@@ -226,3 +226,25 @@ async fn open_forge_history_lcm_isolation_gate() {
 async fn forge_opt_in_normalization_keeps_canonical_schema_and_denial() {
     agent_runtime_testkit::conformance::normalization::assert_opt_in_normalization_preserves_denial_and_schema().await;
 }
+
+#[tokio::test]
+async fn forge_schema_guard_accepts_a_checkpoint_materialized_from_a_native_head() {
+    agent_runtime_testkit::conformance::journal::assert_native_materialized_checkpoint_schema_guard(
+        |bytes| {
+            let value: serde_json::Value =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            let schema = value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64);
+            if schema == Some(3)
+                && value.get("snapshot").is_some()
+                && value.get("snapshot_roots").is_none()
+            {
+                Ok(())
+            } else {
+                Err(format!("Forge materialized guard rejected schema {schema:?}"))
+            }
+        },
+    )
+    .await;
+}
