@@ -883,14 +883,20 @@ impl SessionJournal for InMemorySessionJournal {
         let prepared = if full_protected_validation {
             None
         } else {
-            Some(self.project_snapshot(
+            let prepared = self.project_snapshot(
                 lease.session(),
                 &current_session,
                 &commit,
                 &supplied,
                 &state.objects,
                 &lease_record.reachable,
-            )?)
+            );
+            match self.role {
+                JournalRole::Ordinary => Some(prepared?),
+                // The delta is advisory for a protected commit: one the
+                // cached fast path cannot replay is verified in full instead.
+                JournalRole::Protected => prepared.ok(),
+            }
         };
         let mut protected = None;
         let ordinary = if self.role == JournalRole::Ordinary {
@@ -3079,6 +3085,58 @@ mod structured_json_tests {
                 .cloned()
         );
         assert!(head.snapshot == ObjectAssembler::default().snapshot(&current, 0).unwrap());
+    }
+
+    /// A protected backend verifies submitted roots and objects; the delta is
+    /// advisory there (the writer documents that a redacted prefix may not
+    /// replay). A delta the cached fast path cannot replay must fall back to
+    /// full validation instead of rejecting a valid commit.
+    #[tokio::test]
+    async fn protected_commits_with_an_unreplayable_delta_fall_back_to_full_validation() {
+        let journal = InMemorySessionJournal::protected(JournalStorageId::new("advisory"));
+        let session = SessionId::new("advisory");
+        let lease = writer(&journal, &session, "w0").await;
+        let epoch = lease.writer_epoch().unwrap();
+        let objects = |snapshot: &SessionSnapshot, known: &BTreeSet<JournalObjectId>| {
+            let mut assembler = ObjectAssembler::default();
+            assembler.snapshot(snapshot, 0).unwrap();
+            assembler
+                .objects
+                .into_iter()
+                .filter(|(id, _)| !known.contains(id))
+                .map(|(id, bytes)| JournalObject { id, bytes })
+                .collect::<Vec<_>>()
+        };
+        let first = snapshot(&session, 3);
+        let head = journal
+            .commit(
+                &lease,
+                commit(
+                    &first,
+                    None,
+                    epoch,
+                    "bootstrap",
+                    objects(&first, &BTreeSet::new()),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut next = first.clone();
+        next.history.push(Message::user("appended"));
+        // Exact roots and every new object, but no `history_append`.
+        let advisory = commit(
+            &next,
+            Some(&head),
+            epoch,
+            "advisory",
+            objects(&next, &published(&first)),
+            false,
+            BTreeMap::new(),
+        );
+        let head = journal.commit(&lease, advisory).await.unwrap();
+        assert!(head.snapshot == ObjectAssembler::default().snapshot(&next, 0).unwrap());
     }
 
     /// N reference commits share the unchanged spine; each adds O(log N)
