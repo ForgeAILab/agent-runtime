@@ -100,8 +100,12 @@ the existing bounded sequence objects with single-reference leaves and a
 fixed-height binary spine. JSON object entries preserve their order explicitly.
 An append therefore submits only changed scalar/entry objects and one bounded
 root path; materialization still reconstructs the identical public
-`TurnManifest` and `VersionedSessionState` values. Earlier schema-4 inline
-objects remain readable and migrate representation once on the next commit.
+`TurnManifest` and `VersionedSessionState` values. Readers still accept the
+schema-4 inline `Manifest`/`Extension` object kinds that group A released, but
+the native writer does not migrate them: no released runtime wrote a native
+head, so a protected head whose roots the writer cannot re-derive exactly fails
+closed as an incompatible store, and an ordinary head in another
+representation is followed by one complete structured submission.
 
 This does **not** change the opaque-extension contract: every other namespace
 remains a whole-value replacement and keeps its full replacement-byte cost.

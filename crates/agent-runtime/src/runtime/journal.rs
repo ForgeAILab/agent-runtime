@@ -572,22 +572,23 @@ async fn open_domain(
         if let (Some(head), Some(snapshot)) = (&head, &candidate) {
             let mut assembler = ObjectAssembler::default();
             let roots = assembler.snapshot(snapshot, head.snapshot.planned_step_count)?;
-            // Readers accept the earlier schema-4 inline manifest/extension
-            // representation. A mismatching but fully materialized root is a
-            // one-time representation migration: do not claim any new-form
-            // candidate is already stored, so the next commit supplies its
-            // complete closure once.
+            // The protected domain stores this writer's exact candidates, so
+            // a root it cannot re-derive is foreign or corrupt and fails
+            // closed (no released runtime wrote another representation). An
+            // ordinary backend owns its projected representation: only an
+            // exact match lets the writer omit already-stored drafts.
             let representation_matches = roots == head.snapshot;
-            if representation_matches {
-                if let Some(checkpoint) = &checkpoint {
-                    let referenced = assembler.checkpoint(checkpoint, roots)?;
-                    let checkpoint_object =
-                        JournalObject::encode(JournalObjectKind::Checkpoint, &referenced)?;
-                    if head.checkpoint.as_ref() != Some(&checkpoint_object.id) {
-                        return Err(incompatible_store());
-                    }
-                    known_candidates.insert(checkpoint_object.id);
+            if role == JournalRole::Protected && !representation_matches {
+                return Err(incompatible_store());
+            }
+            if let Some(checkpoint) = &checkpoint {
+                let referenced = assembler.checkpoint(checkpoint, roots)?;
+                let checkpoint_object =
+                    JournalObject::encode(JournalObjectKind::Checkpoint, &referenced)?;
+                if head.checkpoint.as_ref() != Some(&checkpoint_object.id) {
+                    return Err(incompatible_store());
                 }
+                known_candidates.insert(checkpoint_object.id);
             }
             if representation_matches {
                 known_candidates.extend(assembler.objects.keys().cloned());
@@ -1384,6 +1385,87 @@ mod tests {
 
     fn assistant(text: &str) -> Message {
         Message::assistant(vec![ContentPart::text(text)])
+    }
+
+    /// No released runtime wrote a protected head whose structured records
+    /// are inline (v0.5.0 shipped no native writer), so a protected head this
+    /// writer cannot re-derive exactly is foreign or corrupt. It must fail
+    /// closed instead of being "migrated" with the checkpoint identity check
+    /// skipped.
+    #[tokio::test]
+    async fn a_protected_head_the_writer_cannot_rederive_fails_closed() {
+        use agent_runtime_core::journal::{InMemorySessionJournal, JournalStorageId};
+        use agent_runtime_core::store::VersionedSessionState;
+        use agent_runtime_registry::RegistryRevision;
+
+        let journal: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::protected(
+            JournalStorageId::new("inline-protected"),
+        ));
+        let session = SessionId::new("delta");
+        let base = snapshot(vec![Message::user("one")]);
+        let cache = VersionedSessionState::new(
+            RegistryRevision::new("previous-cache-state-1"),
+            serde_json::json!({"entries": [1, 2, 3]}),
+        )
+        .redaction_safe();
+        // The writer's own roots, except that the Runtime-owned cache record
+        // is an opaque inline leaf that readers still accept.
+        let mut assembler = ObjectAssembler::default();
+        let mut roots = assembler.snapshot(&base, 0).unwrap();
+        let inline = assembler.add(JournalObjectKind::Extension, &cache).unwrap();
+        roots.extensions = assembler
+            .map(vec![JournalMapEntry {
+                key: RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                value: inline,
+            }])
+            .unwrap();
+        let lease = journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("seed-open"),
+                    pin: JournalPinId::new("seed-pin"),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap();
+        let mut commit = JournalCommit {
+            batch: JournalBatch {
+                session: session.clone(),
+                sequence: 1,
+                predecessor: None,
+                expected_revision: None,
+                writer_epoch: lease.writer_epoch().unwrap(),
+                operation: JournalOperationId::new("seed"),
+                boundary: boundary(),
+                snapshot: roots,
+                checkpoint: None,
+            },
+            digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+            objects: assembler.objects.into_values().collect(),
+            delta: JournalTransitionDelta {
+                boundary: boundary(),
+                bootstrap: None,
+                history_append: Vec::new(),
+                usage_append: Vec::new(),
+                extension_updates: BTreeMap::new(),
+                extension_references: BTreeMap::new(),
+                manifests_append: Vec::new(),
+                manifest_references: Vec::new(),
+            },
+            checkpoint: None,
+        };
+        commit.digest = commit.input_digest().unwrap();
+        journal.commit(&lease, commit).await.unwrap();
+        journal.close(lease).await.unwrap();
+
+        let Err(error) = open_domain(journal, JournalRole::Protected, &session).await else {
+            panic!("a protected head the writer cannot re-derive was accepted");
+        };
+        assert_eq!(error.message, incompatible_store().message);
     }
 
     #[test]
