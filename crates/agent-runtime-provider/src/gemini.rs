@@ -47,6 +47,14 @@ const MAX_MESSAGES: usize = 2_048;
 const MAX_CONTENT_PARTS: usize = 8_192;
 const MAX_TEXT_CHARS: usize = 2 * 1024 * 1024;
 const MAX_SIGNATURE_CHARS: usize = 128 * 1024;
+const MAX_BUILTIN_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;
+/// Adapter-private continuation envelope: this non-base64 prefix identifies a
+/// v1 Gemini built-in tool step stored as a reasoning signature. The payload
+/// is compact JSON `{"step": <step as received>, "after_call": <id or null>}`.
+/// `after_call` names the function call that preceded the step in the stream:
+/// canonical history keeps reasoning ahead of tool calls, but Gemini rejects a
+/// replay whose search result no longer follows the call it was emitted after.
+const BUILTIN_STEP_ENVELOPE_PREFIX: &str = "agent-runtime.gemini.builtin-step.v1:";
 const MAX_TOOL_NAME_CHARS: usize = 256;
 const MAX_TOOL_CALLS: usize = 512;
 const MAX_ARGUMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -557,7 +565,10 @@ fn translate_history(
                 input.push(json!({"type": "user_input", "content": content}));
             }
             Role::Assistant => {
-                let mut saw_signed_thought = false;
+                let mut saw_signed_continuation = false;
+                // Built-in steps the stream emitted after a function call wait
+                // here until that call has been replayed.
+                let mut deferred: Vec<BuiltinStep> = Vec::new();
                 for part in &message.content {
                     match part {
                         ContentPart::Text { text } => {
@@ -574,6 +585,19 @@ fn translate_history(
                             signature: Some(signature),
                             ..
                         } => {
+                            if let Some(builtin) = decode_builtin_step_envelope(signature)? {
+                                let waits = builtin
+                                    .after_call
+                                    .as_ref()
+                                    .is_some_and(|call| !calls.contains_key(call));
+                                if waits {
+                                    deferred.push(builtin);
+                                } else {
+                                    saw_signed_continuation |= builtin.signed;
+                                    input.push(builtin.step);
+                                }
+                                continue;
+                            }
                             validate_text(text, "Gemini thought summary")?;
                             validate_signature(signature)?;
                             let summary = if text.is_empty() {
@@ -586,7 +610,7 @@ fn translate_history(
                                 "signature": signature,
                                 "summary": summary,
                             }));
-                            saw_signed_thought = true;
+                            saw_signed_continuation = true;
                         }
                         ContentPart::Reasoning { .. } => {
                             // Unsigned reasoning is not valid Gemini provider
@@ -597,7 +621,7 @@ fn translate_history(
                             if config.capabilities.reasoning != ReasoningSupport::Unsupported
                                 && last_user_index
                                     .is_none_or(|last_user_index| message_index > last_user_index)
-                                && !saw_signed_thought
+                                && !saw_signed_continuation
                             {
                                 return Err(compatibility_error());
                             }
@@ -621,6 +645,16 @@ fn translate_history(
                                 "name": call.name,
                                 "arguments": call.arguments,
                             }));
+                            let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut deferred)
+                                .into_iter()
+                                .partition(|builtin| {
+                                    builtin.after_call.as_deref() == Some(call.id.as_str())
+                                });
+                            deferred = waiting;
+                            for builtin in ready {
+                                saw_signed_continuation |= builtin.signed;
+                                input.push(builtin.step);
+                            }
                         }
                         ContentPart::Image { .. } | ContentPart::ToolResult(_) => {
                             return Err(bad_request(
@@ -628,6 +662,11 @@ fn translate_history(
                             ));
                         }
                     }
+                }
+                // A step anchored to a call this message never made cannot be
+                // placed where Gemini emitted it.
+                if !deferred.is_empty() {
+                    return Err(compatibility_error());
                 }
             }
             Role::Tool => {
@@ -738,6 +777,63 @@ fn validate_signature(signature: &str) -> Result<(), ProviderError> {
         return Err(compatibility_error());
     }
     Ok(())
+}
+
+fn encode_builtin_step_envelope(
+    step: &Value,
+    after_call: Option<&str>,
+) -> Result<String, ProviderError> {
+    let json = serde_json::to_string(&json!({"step": step, "after_call": after_call}))
+        .map_err(|_| malformed("invalid Gemini built-in tool step"))?;
+    if json.len() > MAX_BUILTIN_STEP_JSON_BYTES {
+        return Err(malformed("Gemini built-in tool step exceeded its bound"));
+    }
+    Ok(format!("{BUILTIN_STEP_ENVELOPE_PREFIX}{json}"))
+}
+
+/// A decoded built-in step envelope.
+#[derive(Debug)]
+struct BuiltinStep {
+    step: Value,
+    signed: bool,
+    after_call: Option<String>,
+}
+
+fn decode_builtin_step_envelope(envelope: &str) -> Result<Option<BuiltinStep>, ProviderError> {
+    let Some(json) = envelope.strip_prefix(BUILTIN_STEP_ENVELOPE_PREFIX) else {
+        return Ok(None);
+    };
+    if json.len() > MAX_BUILTIN_STEP_JSON_BYTES {
+        return Err(compatibility_error());
+    }
+    let Value::Object(mut payload) =
+        serde_json::from_str(json).map_err(|_| compatibility_error())?
+    else {
+        return Err(compatibility_error());
+    };
+    let after_call = match payload.remove("after_call") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() => Some(id),
+        Some(_) => return Err(compatibility_error()),
+    };
+    let step = payload.remove("step").ok_or_else(compatibility_error)?;
+    if !payload.is_empty()
+        || !matches!(
+            step.get("type").and_then(Value::as_str),
+            Some("google_search_call" | "google_search_result")
+        )
+    {
+        return Err(compatibility_error());
+    }
+    let signed = step
+        .get("signature")
+        .and_then(Value::as_str)
+        .is_some_and(|signature| !signature.is_empty());
+    Ok(Some(BuiltinStep {
+        step,
+        signed,
+        after_call,
+    }))
 }
 
 fn validate_bounded_name(value: &str, label: &'static str) -> Result<(), ProviderError> {
@@ -882,9 +978,9 @@ enum WireEvent {
     #[serde(rename = "interaction.status_update")]
     InteractionStatusUpdate,
     #[serde(rename = "step.start")]
-    StepStart { index: u32, step: WireStep },
+    StepStart { index: u32, step: Value },
     #[serde(rename = "step.delta")]
-    StepDelta { index: u32, delta: WireDelta },
+    StepDelta { index: u32, delta: Value },
     #[serde(rename = "step.stop")]
     StepStop { index: u32 },
     #[serde(rename = "interaction.completed")]
@@ -1027,11 +1123,25 @@ struct WireError {
 
 #[derive(Debug)]
 enum ActiveStep {
-    HostedSearch { queries: Vec<String> },
-    HostedResult,
-    ModelOutput { bytes: usize },
-    Thought { bytes: usize, signed: bool },
-    FunctionCall { arguments: String },
+    HostedSearch {
+        queries: Vec<String>,
+        step: Value,
+        after_call: Option<String>,
+    },
+    HostedResult {
+        step: Value,
+        after_call: Option<String>,
+    },
+    ModelOutput {
+        bytes: usize,
+    },
+    Thought {
+        bytes: usize,
+        signed: bool,
+    },
+    FunctionCall {
+        arguments: String,
+    },
 }
 
 #[derive(Debug)]
@@ -1060,6 +1170,9 @@ struct StreamState {
     usage_reported: bool,
     saw_function_call: bool,
     saw_semantic_event: bool,
+    /// The most recent function call id in stream order, recorded on each
+    /// built-in step so replay can restore Gemini's original step order.
+    last_function_call: Option<String>,
 }
 
 fn decode_event(data: &str) -> Result<WireEvent, ProviderError> {
@@ -1084,6 +1197,41 @@ fn add_stream_bytes(current: &mut usize, added: usize) -> Result<(), ProviderErr
         return Err(malformed("Gemini stream step exceeded its bound"));
     }
     Ok(())
+}
+
+fn merge_builtin_step_delta(step: &mut Value, delta: Value) -> Result<(), ProviderError> {
+    let (Some(step), Value::Object(delta)) = (step.as_object_mut(), delta) else {
+        return Err(malformed("invalid Gemini built-in tool step delta"));
+    };
+    for (key, value) in delta {
+        if key == "type" {
+            continue;
+        }
+        match (step.get_mut(&key), value) {
+            (Some(Value::Object(target)), Value::Object(delta)) => {
+                merge_json_object(target, delta);
+            }
+            (Some(Value::Array(target)), Value::Array(delta)) => target.extend(delta),
+            (_, value) => {
+                step.insert(key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_json_object(target: &mut Map<String, Value>, delta: Map<String, Value>) {
+    for (key, value) in delta {
+        match (target.get_mut(&key), value) {
+            (Some(Value::Object(target)), Value::Object(delta)) => {
+                merge_json_object(target, delta);
+            }
+            (Some(Value::Array(target)), Value::Array(delta)) => target.extend(delta),
+            (_, value) => {
+                target.insert(key, value);
+            }
+        }
+    }
 }
 
 fn annotation_citations(
@@ -1261,13 +1409,17 @@ fn event_to_events(
             if !state.seen_indices.insert(index) || state.active.contains_key(&index) {
                 return Err(malformed("Gemini stream repeated a step index"));
             }
-            match step {
+            let typed_step: WireStep = serde_json::from_value(step.clone())
+                .map_err(|_| malformed("invalid Gemini stream step"))?;
+            match typed_step {
                 WireStep::GoogleSearchCall { arguments } => {
                     state.buffer_text = true;
                     state.active.insert(
                         index,
                         ActiveStep::HostedSearch {
                             queries: arguments.queries,
+                            step,
+                            after_call: state.last_function_call.clone(),
                         },
                     );
                     state.saw_semantic_event = true;
@@ -1278,7 +1430,13 @@ fn event_to_events(
                             .iter()
                             .filter_map(|result| super::hosted::source(result, "url")),
                     );
-                    state.active.insert(index, ActiveStep::HostedResult);
+                    state.active.insert(
+                        index,
+                        ActiveStep::HostedResult {
+                            step,
+                            after_call: state.last_function_call.clone(),
+                        },
+                    );
                 }
                 WireStep::ModelOutput { content, grounding } => {
                     let mut bytes = 0;
@@ -1341,6 +1499,7 @@ fn event_to_events(
                     arguments,
                 } => {
                     validate_stream_identity(&id, &name)?;
+                    state.last_function_call = Some(id.clone());
                     let arguments = if arguments.is_null()
                         || arguments.as_object().is_some_and(Map::is_empty)
                     {
@@ -1372,23 +1531,30 @@ fn event_to_events(
             }
         }
         WireEvent::StepDelta { index, delta } => {
+            let typed_delta: WireDelta = serde_json::from_value(delta.clone())
+                .map_err(|_| malformed("invalid Gemini stream delta"))?;
             let active = state
                 .active
                 .get_mut(&index)
                 .ok_or_else(|| malformed("Gemini stream delta has no active step"))?;
-            match (active, delta) {
+            match (active, typed_delta) {
                 (
-                    ActiveStep::HostedSearch { queries },
+                    ActiveStep::HostedSearch { queries, step, .. },
                     WireDelta::GoogleSearchCall { arguments },
                 ) => {
                     queries.extend(arguments.queries);
+                    merge_builtin_step_delta(step, delta)?;
                 }
-                (ActiveStep::HostedResult, WireDelta::GoogleSearchResult { result }) => {
+                (
+                    ActiveStep::HostedResult { step, .. },
+                    WireDelta::GoogleSearchResult { result },
+                ) => {
                     state.search_sources.extend(
                         result
                             .iter()
                             .filter_map(|result| super::hosted::source(result, "url")),
                     );
+                    merge_builtin_step_delta(step, delta)?;
                 }
                 (
                     ActiveStep::ModelOutput { .. },
@@ -1477,12 +1643,36 @@ fn event_to_events(
                 .remove(&index)
                 .ok_or_else(|| malformed("Gemini stream stopped an inactive step"))?;
             match active {
-                ActiveStep::HostedSearch { queries } => {
+                ActiveStep::HostedSearch {
+                    queries,
+                    step,
+                    after_call,
+                } => {
                     if queries.is_empty() {
                         state.search_queries.push(None);
                     } else {
                         state.search_queries.extend(queries.into_iter().map(Some));
                     }
+                    out.push(ProviderStreamEvent::ReasoningDelta {
+                        text: String::new(),
+                        redacted: true,
+                        signature: Some(encode_builtin_step_envelope(
+                            &step,
+                            after_call.as_deref(),
+                        )?),
+                    });
+                    state.saw_semantic_event = true;
+                }
+                ActiveStep::HostedResult { step, after_call } => {
+                    out.push(ProviderStreamEvent::ReasoningDelta {
+                        text: String::new(),
+                        redacted: true,
+                        signature: Some(encode_builtin_step_envelope(
+                            &step,
+                            after_call.as_deref(),
+                        )?),
+                    });
+                    state.saw_semantic_event = true;
                 }
                 ActiveStep::Thought { signed: false, .. } => {
                     return Err(malformed("Gemini thought ended without a signature"));
@@ -2149,6 +2339,23 @@ mod tests {
         events
     }
 
+    fn builtin_reasoning(step: &Value, after_call: Option<&str>) -> ContentPart {
+        ContentPart::Reasoning {
+            text: String::new(),
+            redacted: true,
+            signature: Some(encode_builtin_step_envelope(step, after_call).unwrap()),
+            producer: None,
+        }
+    }
+
+    fn assert_compatibility_error(error: &ProviderError) {
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert_eq!(
+            error.message,
+            "Gemini signed continuation is incomplete or out of order"
+        );
+    }
+
     fn completed_stream() -> &'static str {
         concat!(
             "event: interaction.created\n",
@@ -2458,6 +2665,191 @@ mod tests {
             },
         });
         assert_eq!(sent[0].body, serde_json::to_vec(&expected).unwrap());
+    }
+
+    #[test]
+    fn builtin_search_steps_replay_verbatim_in_stream_order() {
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
+                .unwrap();
+        let search_call = json!({
+            "type": "google_search_call",
+            "id": "opaque-search-call",
+            "arguments": {"queries": ["rust docs"]},
+            "signature": "opaque-call-signature",
+        });
+        let search_result = json!({
+            "type": "google_search_result",
+            "call_id": "opaque-search-call",
+            "result": [{"url": "https://rust.test", "raw": "opaque-result-payload"}],
+            "signature": "opaque-result-signature",
+        });
+        let request = ProviderRequest::new(
+            ModelId::new("gemini-test"),
+            vec![
+                Message::user("search"),
+                // Gemini streamed call, function call, then result; history
+                // keeps reasoning first, so the result's anchor restores it.
+                Message::assistant(vec![
+                    builtin_reasoning(&search_call, None),
+                    builtin_reasoning(&search_result, Some("call-1")),
+                    ContentPart::ToolCall(ToolCall {
+                        id: ToolCallId::new("call-1"),
+                        name: "inspect".into(),
+                        arguments: json!({"path": "a.png"}),
+                    }),
+                ]),
+                Message::tool_result(ToolResultBlock {
+                    call_id: ToolCallId::new("call-1"),
+                    name: "inspect".into(),
+                    content: vec![ContentPart::text("ok")],
+                    is_error: false,
+                }),
+            ],
+        );
+
+        let body = provider.build_payload(&request).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .map(|step| step["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "user_input",
+                "google_search_call",
+                "function_call",
+                "google_search_result",
+                "function_result",
+            ]
+        );
+        assert_eq!(
+            serde_json::to_vec(&input[1]).unwrap(),
+            serde_json::to_vec(&search_call).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&input[3]).unwrap(),
+            serde_json::to_vec(&search_result).unwrap()
+        );
+    }
+
+    #[test]
+    fn unsigned_or_invalid_builtin_search_continuation_is_rejected() {
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
+                .unwrap();
+        let unsigned_call = json!({
+            "type": "google_search_call",
+            "id": "opaque-search-call",
+            "arguments": {"queries": ["rust docs"]},
+        });
+        let unsigned_result = json!({
+            "type": "google_search_result",
+            "call_id": "opaque-search-call",
+            "result": [],
+        });
+        let tool_call = ContentPart::ToolCall(ToolCall {
+            id: ToolCallId::new("call-1"),
+            name: "inspect".into(),
+            arguments: json!({}),
+        });
+        let request_with = |reasoning| {
+            ProviderRequest::new(
+                ModelId::new("gemini-test"),
+                vec![
+                    Message::user("search"),
+                    Message::assistant(vec![reasoning, tool_call.clone()]),
+                ],
+            )
+        };
+
+        let unsigned = ProviderRequest::new(
+            ModelId::new("gemini-test"),
+            vec![
+                Message::user("search"),
+                Message::assistant(vec![
+                    builtin_reasoning(&unsigned_call, None),
+                    builtin_reasoning(&unsigned_result, Some("call-1")),
+                    tool_call.clone(),
+                ]),
+            ],
+        );
+        assert_compatibility_error(&provider.build_payload(&unsigned).unwrap_err());
+
+        // A signature Gemini emitted after the call does not cover that call.
+        let signed_result = json!({
+            "type": "google_search_result",
+            "call_id": "opaque-search-call",
+            "result": [],
+            "signature": "late-signature",
+        });
+        let late = ProviderRequest::new(
+            ModelId::new("gemini-test"),
+            vec![
+                Message::user("search"),
+                Message::assistant(vec![
+                    builtin_reasoning(&unsigned_call, None),
+                    builtin_reasoning(&signed_result, Some("call-1")),
+                    tool_call.clone(),
+                ]),
+            ],
+        );
+        assert_compatibility_error(&provider.build_payload(&late).unwrap_err());
+
+        // A step anchored to a call the message never made cannot be placed.
+        let signed_call = json!({
+            "type": "google_search_call",
+            "id": "opaque-search-call",
+            "signature": "signed",
+        });
+        let orphan = ProviderRequest::new(
+            ModelId::new("gemini-test"),
+            vec![
+                Message::user("search"),
+                Message::assistant(vec![
+                    builtin_reasoning(&signed_call, None),
+                    builtin_reasoning(&signed_result, Some("call-missing")),
+                    tool_call.clone(),
+                ]),
+            ],
+        );
+        assert_compatibility_error(&provider.build_payload(&orphan).unwrap_err());
+
+        for signature in [
+            format!("{BUILTIN_STEP_ENVELOPE_PREFIX}{{"),
+            format!(
+                "{BUILTIN_STEP_ENVELOPE_PREFIX}{}",
+                json!({"step": {"type": "google_maps_call", "signature": "signed"}, "after_call": null})
+            ),
+            format!(
+                "{BUILTIN_STEP_ENVELOPE_PREFIX}{}",
+                json!({"type": "google_search_call", "signature": "signed"})
+            ),
+            format!(
+                "{BUILTIN_STEP_ENVELOPE_PREFIX}{}",
+                json!({"step": {"type": "google_search_call", "signature": "signed"}, "after_call": 7})
+            ),
+            format!(
+                "{BUILTIN_STEP_ENVELOPE_PREFIX}{}",
+                json!({"step": {"type": "google_search_call", "signature": "signed"}, "after_call": null, "extra": true})
+            ),
+            format!(
+                "{BUILTIN_STEP_ENVELOPE_PREFIX}\"{}\"",
+                "x".repeat(MAX_BUILTIN_STEP_JSON_BYTES)
+            ),
+        ] {
+            let reasoning = ContentPart::Reasoning {
+                text: String::new(),
+                redacted: true,
+                signature: Some(signature),
+                producer: None,
+            };
+            assert_compatibility_error(
+                &provider
+                    .build_payload(&request_with(reasoning))
+                    .unwrap_err(),
+            );
+        }
     }
 
     #[tokio::test]
@@ -3166,7 +3558,31 @@ mod tests {
                 reported.unwrap_or(1)
             );
             assert_eq!(usage.total(), 5);
-            let serialized = serde_json::to_string(&events).unwrap();
+            let envelopes = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderStreamEvent::ReasoningDelta {
+                        text,
+                        redacted: true,
+                        signature: Some(signature),
+                    } if text.is_empty() => decode_builtin_step_envelope(signature)
+                        .unwrap()
+                        .map(|builtin| builtin.step),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                envelopes,
+                vec![
+                    json!({"type":"google_search_call","id":"opaque-call","arguments":{"queries":["rust docs"]},"signature":"opaque-signature"}),
+                    json!({"type":"google_search_result","call_id":"opaque-call","result":[{"search_suggestions":"raw-grounding-canary"}]}),
+                ]
+            );
+            let public_events = events
+                .iter()
+                .filter(|event| !matches!(event, ProviderStreamEvent::ReasoningDelta { .. }))
+                .collect::<Vec<_>>();
+            let serialized = serde_json::to_string(&public_events).unwrap();
             for opaque in [
                 "opaque-call",
                 "opaque-signature",
@@ -3181,6 +3597,146 @@ mod tests {
                     .any(|event| matches!(event, ProviderStreamEvent::ToolCallDelta { .. }))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn signed_search_steps_merge_deltas_without_exposing_opaque_state() {
+        use agent_runtime_core::provider::HostedTool;
+
+        let expected_call = json!({
+            "type": "google_search_call",
+            "id": "opaque-call-id",
+            "arguments": {"queries": ["rust", "docs"]},
+            "signature": "opaque-call-signature",
+        });
+        let expected_result = json!({
+            "type": "google_search_result",
+            "call_id": "opaque-call-id",
+            "result": [
+                {"url": "https://rust.test", "title": "Rust"},
+                {"raw": "opaque-result-payload"},
+            ],
+            "signature": "opaque-result-signature",
+        });
+        let frames = [
+            json!({"event_type":"step.start","index":0,"step":{"type":"google_search_call","id":"opaque-call-id","arguments":{"queries":["rust"]}}}),
+            json!({"event_type":"step.delta","index":0,"delta":{"type":"google_search_call","arguments":{"queries":["docs"]},"signature":"opaque-call-signature"}}),
+            json!({"event_type":"step.stop","index":0}),
+            // Gemini's observed order: the result follows the function call.
+            json!({"event_type":"step.start","index":1,"step":{"type":"function_call","id":"call-1","name":"inspect","arguments":{"path":"a.png"}}}),
+            json!({"event_type":"step.stop","index":1}),
+            json!({"event_type":"step.start","index":2,"step":{"type":"google_search_result","call_id":"opaque-call-id","result":[{"url":"https://rust.test","title":"Rust"}]}}),
+            json!({"event_type":"step.delta","index":2,"delta":{"type":"google_search_result","result":[{"raw":"opaque-result-payload"}],"signature":"opaque-result-signature"}}),
+            json!({"event_type":"step.stop","index":2}),
+            json!({"event_type":"interaction.completed","interaction":{"status":"requires_action"}}),
+        ];
+        let body = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([body]), config()).unwrap();
+        let request =
+            ProviderRequest::new(ModelId::new("gemini-test"), vec![Message::user("search")])
+                .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]);
+        let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+
+        let envelopes = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::ReasoningDelta {
+                    text,
+                    redacted: true,
+                    signature: Some(signature),
+                } if text.is_empty() => {
+                    decode_builtin_step_envelope(signature)
+                        .unwrap()
+                        .map(|builtin| {
+                            assert!(builtin.signed);
+                            (builtin.step, builtin.after_call)
+                        })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            envelopes,
+            vec![
+                (expected_call, None),
+                (expected_result, Some("call-1".to_owned())),
+            ]
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderStreamEvent::HostedSearch {
+                query: Some(query),
+                sources,
+                ..
+            } if query == "rust" && sources.iter().any(|source| source.url == "https://rust.test")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderStreamEvent::ToolCallDelta { id: Some(id), name: Some(name), .. }
+                if id == "call-1" && name == "inspect"
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Finish {
+                reason: FinishReason::ToolCalls
+            })
+        ));
+        let public_events = events
+            .iter()
+            .filter(|event| !matches!(event, ProviderStreamEvent::ReasoningDelta { .. }))
+            .collect::<Vec<_>>();
+        let public = format!("{public_events:?}");
+        for opaque in [
+            "opaque-call-id",
+            "opaque-call-signature",
+            "opaque-result-signature",
+            "opaque-result-payload",
+        ] {
+            assert!(!public.contains(opaque));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_builtin_search_step_is_a_malformed_stream() {
+        let oversized = "x".repeat(MAX_BUILTIN_STEP_JSON_BYTES + 1);
+        let frames = [
+            json!({"event_type":"step.start","index":0,"step":{"type":"google_search_result","call_id":"opaque-call","result":[{"raw":oversized}]}}),
+            json!({"event_type":"step.stop","index":0}),
+        ];
+        let body = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>();
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([body]), config()).unwrap();
+        let events = collect(
+            provider
+                .stream(
+                    ProviderRequest::new(
+                        ModelId::new("gemini-test"),
+                        vec![Message::user("search")],
+                    ),
+                    ctx(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(ProviderStreamEvent::Error {
+                error: ProviderError {
+                    kind: ProviderErrorKind::MalformedStream,
+                    ..
+                }
+            })
+        ));
+        assert!(!format!("{:?}", events.last()).contains("opaque-call"));
     }
 
     #[tokio::test]

@@ -666,6 +666,36 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_projection_drops_foreign_gemini_builtin_step_envelopes() {
+        let gemini = ReasoningProducer {
+            provider: "google".into(),
+            model: ModelId::new("gemini-4-argon"),
+        };
+        let other = ReasoningProducer {
+            provider: "anthropic".into(),
+            model: ModelId::new("claude-test"),
+        };
+        let envelope = ContentPart::Reasoning {
+            text: String::new(),
+            redacted: true,
+            signature: Some(
+                "agent-runtime.gemini.builtin-step.v1:{\"after_call\":null,\"step\":{\"type\":\"google_search_call\",\"signature\":\"opaque\"}}"
+                    .into(),
+            ),
+            producer: Some(gemini),
+        };
+        let message = Message::assistant(vec![envelope, ContentPart::text("answer")]);
+
+        assert_eq!(
+            message
+                .for_reasoning_replay(&other, false, false)
+                .unwrap()
+                .content,
+            vec![ContentPart::text("answer")]
+        );
+    }
+
+    #[test]
     fn internal_turn_input_is_bounded_and_roundtrips() {
         let input = InternalTurnInput::new(
             "Continue the current goal.",
