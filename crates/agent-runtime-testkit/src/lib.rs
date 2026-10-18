@@ -20,6 +20,10 @@ pub mod tools;
 pub mod transport;
 pub mod workspace;
 
+pub use agent_runtime_core::journal::{
+    IdentityJournalProjection, InMemorySessionJournal, JournalCommitFailurePoint,
+    JournalProjectionPolicy,
+};
 pub use agent_runtime_core::provider_credential::StaticProviderCredentialSource;
 pub use clock::{ManualClock, ManualClockSnapshot};
 pub use credentials::{

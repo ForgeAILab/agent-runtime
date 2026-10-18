@@ -19,7 +19,8 @@ all applicable gates, not merely contract merge.
 
 ## 2. Merge group B — Native writer and migration (independent of U10)
 
-- [ ] 2.1 Implement reference-counted-by-reachability roots, atomic commit/idempotency index, pinned reads and monotonic writer fences in neutral reference backends; reject different payload reuse and stale revisions.
+- [x] 2.1 Implement reference-counted-by-reachability roots, atomic commit/idempotency index, pinned reads and monotonic writer fences in neutral reference backends; reject different payload reuse and stale revisions.
+  Evidence: the reusable seven-test journal conformance suite passes against protected and policy-projecting ordinary `InMemorySessionJournal` backends, including every injected commit cut, replay, isolation, fencing, closure and revision case.
 - [ ] 2.2 Route all transition, acceptance, child, internal, local-action, cache, idle-compaction, fork/seed and ordinary-only hard-admission barriers through deltas; unchanged boundaries submit no old bodies.
 - [ ] 2.3 Freeze final planned requests as ordered object references without replanning; deduplicate history, requests, usage prefixes, diagnostics and extension leaves, preserving opaque replacement costs.
 - [ ] 2.4 Preserve distinct exact/projection domains and existing terminal/nonterminal overlay rules, U3 boundary counters, hard-admission exact-successor proof, U7 authority and U8 durable fork ordering.

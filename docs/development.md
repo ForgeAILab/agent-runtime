@@ -124,6 +124,29 @@ persisted session to silently rebase. Use `SessionHandle::expand_lcm` for
 bounded authorized inspection; never expose or reconstruct `LcmView` grants
 from an opaque node or cursor supplied by a caller.
 
+## Session journal reference backend and conformance
+
+`agent-runtime-core::journal::InMemorySessionJournal` is the volatile neutral
+reference implementation of `SessionJournal`. Construct protected stores with
+`InMemorySessionJournal::protected`; ordinary stores require an explicit
+`JournalProjectionPolicy` through `InMemorySessionJournal::ordinary`, and the
+projected values are encoded and hashed only after that policy succeeds. The U9
+design names no durable neutral file/database adapter: production hosts remain
+responsible for crash-safe framing, flushes and cross-process fencing.
+
+The reference backend has no wall-clock lease expiry. It implements atomic
+commit, lifetime idempotency, pinned reachability and monotonic writer fences.
+`retire` and `collect` deliberately return the typed
+`JournalRetirement`/`JournalCollection` unsupported capabilities and retain all
+content until U9 group C. It is not wired into the runtime turn loop; native
+writer selection and migration belong to later group-B tasks.
+
+Adapters can run the reusable task-2.1 contract through
+`agent_runtime_testkit::conformance::journal::assert_session_journal_conformance`.
+Its `SessionJournalConformanceFixture` pairs the adapter with a deterministic
+failure injector for every commit visibility cut. The reference implementation
+also exposes `assert_session_journal_reference_conformance`.
+
 ## Quality gates
 
 ```sh
