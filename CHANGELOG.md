@@ -19,7 +19,9 @@ contain breaking changes and are coordinated with consumer proposals.
   persistent JSON drafts: an ordinary `SessionJournal` adapter must resolve
   them from the commit's drafts or its own pinned closure and store that form
   under the same object IDs (`assert_ordinary_session_journal_conformance`
-  now checks this), and a `JournalProjectionPolicy` that changes or omits
+  now checks this; `assert_session_journal_conformance` checks that protected
+  adapters admit and keep shared structured prefixes), and a
+  `JournalProjectionPolicy` that changes or omits
   those records on a commit that references them rejects the commit.
 
 ### Added

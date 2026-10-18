@@ -97,6 +97,7 @@ where
     assert_pinned_and_cross_session_reads(&factory).await;
     assert_writer_fences(&factory).await;
     assert_publish_validation(&factory).await;
+    assert_structured_prefix_sharing(&factory).await;
 }
 
 /// Runs the reusable suite against the volatile neutral reference backend.
@@ -1154,6 +1155,161 @@ where
     journal.close(reader).await.unwrap();
 }
 
+/// One exact commit whose cache record is persistent JSON (an
+/// `ExtensionReference` over `JsonValue` nodes and spine sequences), supplying
+/// only objects the writer has not already published.
+fn protected_structured_commit(
+    snapshot: &SessionSnapshot,
+    writer_epoch: u64,
+    current: Option<&JournalHead>,
+    operation: &str,
+    known: &std::collections::BTreeSet<JournalObjectId>,
+) -> (JournalCommit, std::collections::BTreeSet<JournalObjectId>) {
+    let mut base = snapshot.clone();
+    let cache = base
+        .extension_state
+        .remove(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+        .unwrap();
+    let mut assembler = Assembler::default();
+    let mut roots = assembler.snapshot(&base, 0);
+    let value = assembler.structured_cache(&cache);
+    let map = assembler.add(
+        JournalObjectKind::Map,
+        &JournalMapNode::Leaf {
+            entries: vec![JournalMapEntry {
+                key: RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                value: value.clone(),
+            }],
+        },
+    );
+    roots.extensions = JournalMap {
+        root: Some(map),
+        len: 1,
+        height: 0,
+    };
+    let boundary = JournalBoundary {
+        version: 1,
+        session: snapshot.id.clone(),
+        turn: None,
+        checkpoint_sequence: 0,
+        planned_step_count: 0,
+    };
+    let published = assembler.objects.keys().cloned().collect();
+    let mut commit = JournalCommit {
+        batch: JournalBatch {
+            session: snapshot.id.clone(),
+            sequence: current.map_or(1, |head| head.batch_sequence + 1),
+            predecessor: current.map(|head| JournalDigest::parse(head.batch.as_str()).unwrap()),
+            expected_revision: current.map(|head| head.revision),
+            writer_epoch,
+            operation: JournalOperationId::new(operation),
+            boundary: boundary.clone(),
+            snapshot: roots,
+            checkpoint: None,
+        },
+        digest: zero_digest(),
+        objects: assembler
+            .objects
+            .into_iter()
+            .filter(|(id, _)| !known.contains(id))
+            .map(|(id, (_, bytes))| JournalObject { id, bytes })
+            .collect(),
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: None,
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::from([(
+                RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                Some(value),
+            )]),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        },
+        checkpoint: None,
+    };
+    commit.digest = commit.input_digest().unwrap();
+    (commit, published)
+}
+
+/// N exact commits share a spine-sized persistent-JSON prefix by reference.
+/// The backend must follow every structured kind when it admits a closure,
+/// keep the shared prefix through a collection attempt, and let a fresh
+/// writer reuse it from its pinned head.
+async fn assert_structured_prefix_sharing<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = SessionJournalConformanceFixture>,
+{
+    let fixture = factory().await;
+    let journal = fixture.journal.clone();
+    let session = SessionId::new("protected-structured");
+    let lease = open_writer(&*journal, &session, None, "protected-structured-0").await;
+    let base = 100;
+    let snapshot_at = |items| {
+        let mut snapshot = structured_snapshot(&session, items, 0);
+        snapshot.manifests.clear();
+        snapshot
+    };
+    let (commit, mut known) = protected_structured_commit(
+        &snapshot_at(base),
+        lease.writer_epoch().unwrap(),
+        None,
+        "protected-structured-boot",
+        &std::collections::BTreeSet::new(),
+    );
+    let mut head = journal.commit(&lease, commit).await.unwrap();
+    let mut current = known.clone();
+    for step in 1..=6 {
+        let (commit, published) = protected_structured_commit(
+            &snapshot_at(base + step),
+            lease.writer_epoch().unwrap(),
+            Some(&head),
+            &format!("protected-structured-{step}"),
+            &known,
+        );
+        assert!(commit.objects.len() < 96, "drafts must be O(log N)");
+        let next = journal.commit(&lease, commit.clone()).await.unwrap();
+        assert_eq!(journal.commit(&lease, commit).await.unwrap(), next);
+        head = next;
+        known.extend(published.iter().cloned());
+        current = published;
+    }
+    journal.close(lease).await.unwrap();
+    let _ = journal
+        .collect(JournalGcRequest {
+            storage_id: journal.storage_id(),
+            expected_root_epoch: 0,
+            max_objects: u64::MAX,
+        })
+        .await;
+    let lease = open_writer(
+        &*journal,
+        &session,
+        Some(head.revision),
+        "protected-structured-1",
+    )
+    .await;
+    let resumed = snapshot_at(base + 7);
+    let (commit, _) = protected_structured_commit(
+        &resumed,
+        lease.writer_epoch().unwrap(),
+        Some(&head),
+        "protected-structured-resumed",
+        &current,
+    );
+    assert!(
+        commit.objects.len() < 96,
+        "a fresh writer resubmitted the prefix"
+    );
+    journal.commit(&lease, commit).await.unwrap();
+    journal.close(lease).await.unwrap();
+    let materialized = materialize_latest(&*journal, &session, "protected-structured-read").await;
+    assert_eq!(materialized.extension_state, resumed.extension_state);
+    assert_eq!(materialized.history, resumed.history);
+}
+
 fn structured_cache(items: usize) -> VersionedSessionState {
     VersionedSessionState::new(
         RegistryRevision::new("previous-cache-state-1"),
@@ -2069,6 +2225,12 @@ mod tests {
     #[tokio::test]
     async fn ordinary_appends_continue_after_policy_omits_an_extension() {
         super::assert_ordinary_append_after_omission(&super::reference_ordinary).await;
+    }
+
+    #[tokio::test]
+    async fn structured_prefixes_are_shared_and_survive_collection() {
+        super::assert_structured_prefix_sharing(&|| async { super::reference_fixture() }).await;
+        super::assert_ordinary_structured_references(&super::reference_ordinary).await;
     }
 
     #[tokio::test]
