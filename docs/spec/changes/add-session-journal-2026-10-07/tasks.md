@@ -48,6 +48,16 @@ all applicable gates, not merely contract merge.
   test imports a committed pending response without another summary-model or
   provider call. Redacted/exact separation, invalid evidence, v3 mixed pairs,
   lost capability and ephemeral isolation have focused integration tests.
+  Review: the matrix resumes with `Defer` (no continuation);
+  `v3_import_continuation_matches_legacy_resume_for_every_state` runs import,
+  resume and continue for all 12 states on a 1.5 MiB worker and matches
+  legacy provider requests, tool calls and barriers exactly. It exposed a
+  debug-build stack fault in `TurnMachine::resume` (~1.8 MiB legacy, ~2 MiB
+  native at ModelResponseReady; now ~1.25 MiB). Read-only views now reject a
+  lost capability like open. Ordinary repair requires a v3 checkpoint equal
+  to the exact head (`ordinary_repair_requires_the_exact_head_to_be_the_v3_import`).
+  Added refusal-parity, raw-ordinary projection, racing-import and
+  advanced-exact repair tests.
 - [ ] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
 - [x] 2.7 Count serialized submission/new-object bytes at N=100/1000/4000 (and 10000 when the cache-identity limit permits) and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.
   Evidence (implementation measurement, 2026-10-18; exact bytes, each cell is

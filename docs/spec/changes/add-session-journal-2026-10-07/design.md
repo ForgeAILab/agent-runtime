@@ -515,6 +515,30 @@ unchanged. Additional tests cover redacted ordinary versus exact protected
 roots, v3 mixed-pair fallback, invalid evidence before head publication,
 one-time discovery, lost capability and ephemeral isolation.
 
+Review (2026-10-18). The crash-cut matrix resumes with
+`CheckpointRecoveryPolicy::Defer`, so it proves representation and repair,
+not continuation. `v3_import_continuation_matches_legacy_resume_for_every_state`
+adds the continuation for all 12 states: import, resume and continue on a
+1.5 MiB worker make exactly the provider requests, tool invocations and
+protected/ordinary barriers of legacy resume of the same pair (no replay of
+CallingModel, ExecutingTools, local-executing or cache-started work;
+ModelResponseReady and ToolOutcomeReady results reused). That test first
+overflowed: in debug builds `TurnMachine::resume` kept one stack slot per
+awaited state future (~787 KiB), so ModelResponseReady recovery needed
+~1.8 MiB legacy and ~2 MiB native; it now boxes each awaited future out of
+line (~1.25 MiB). The read-only views used by fork, child recovery and child
+rebind now apply open's lost-capability rule, since imported sessions keep
+their v3 records. Import refusal matches legacy resume for tampered
+schema/transition, foreign snapshot identity, skewed ordinary halves and
+namespace revisions; raw v3 ordinary records are stored only as the host
+projection; racing imports publish once; and ordinary repair refuses (writes
+nothing) once a protected-only runtime has advanced the exact head past the
+import, which is reachable only by changing the configured store set between
+the crash and the repair. Repair now also requires a v3 checkpoint equal to
+the exact head: a v3 pair without a checkpoint never writes the exact domain,
+so an exact head there is native progress and a missing ordinary head must
+not be rebuilt from the pre-import v3 record.
+
 Keep public snapshot/history/recent_manifests projections and event variants.
 Version-4 readers run for the entire first release; future legacy-reader removal
 is a separate proposal with all consumer gates. U10 has its own format change

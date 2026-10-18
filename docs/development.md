@@ -156,14 +156,20 @@ identity/operation/namespace and pair evidence, publishes the exact protected
 head first, then publishes the host-projected ordinary head. Import operations
 and content roots are stable. A failure before the exact visibility point
 leaves v3 authoritative; a failure after it is repaired from that native head
-plus the unchanged legacy ordinary record, without a migration marker. Import
+plus the unchanged legacy ordinary record, without a migration marker, but
+only while the exact head is still the imported v3 checkpoint. Import
 leases stay pinned through both publications and are closed before fresh live
 writer leases are opened. The original v3 records are not saved, pruned or
-rewritten.
+rewritten, so a release older than the import must never resume a migrated
+session (it would read the stale v3 pair), and older legacy-mode writers of a
+session must be stopped before a new runtime resumes it: legacy mode holds no
+journal fence.
 
 Mixed capability pairs remain wholly on the materialized legacy path while no
 native head exists, and a detectable native head whose configured pair lost a
-capability is incompatible rather than a reason to use stale v3 data. An
+capability is incompatible rather than a reason to use stale v3 data. That
+rule applies at open and in the read-only views used by fork, child recovery
+and child rebind alike. An
 ordinary head published before the session's first exact checkpoint resumes
 alone, as a legacy snapshot does; one published after an exact checkpoint
 requires the protected head. If every configured store stops exposing
