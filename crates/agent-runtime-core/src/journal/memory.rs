@@ -157,7 +157,57 @@ impl ReachableSet {
     fn extend(&mut self, objects: BTreeSet<JournalObjectId>) {
         if !objects.is_empty() {
             self.layers.push(Arc::new(objects));
+            merge_layers(&mut self.layers);
         }
+    }
+}
+
+/// One immutable copy-on-write layer of the object store or a pin closure.
+trait Layer: Clone {
+    fn entries(&self) -> usize;
+    /// Moves (or, while it is still shared, copies) `newer` into `self`.
+    fn absorb(&mut self, newer: Arc<Self>);
+}
+
+impl Layer for BTreeSet<JournalObjectId> {
+    fn entries(&self) -> usize {
+        self.len()
+    }
+
+    fn absorb(&mut self, newer: Arc<Self>) {
+        match Arc::try_unwrap(newer) {
+            Ok(newer) => self.extend(newer),
+            Err(newer) => self.extend(newer.iter().cloned()),
+        }
+    }
+}
+
+impl Layer for BTreeMap<JournalObjectId, Vec<u8>> {
+    fn entries(&self) -> usize {
+        self.len()
+    }
+
+    fn absorb(&mut self, newer: Arc<Self>) {
+        match Arc::try_unwrap(newer) {
+            Ok(newer) => self.extend(newer),
+            Err(newer) => self.extend(newer.iter().map(|(id, bytes)| (id.clone(), bytes.clone()))),
+        }
+    }
+}
+
+/// Merges the newest layer into the one below while it is at least as large,
+/// so layer sizes strictly decrease upwards: at most log2(total) + 1 layers
+/// stay to be scanned per lookup, and each entry is copied O(log total) times.
+/// Published layers are shared with the live state and are copied, never
+/// mutated in place, so a failed commit leaves them untouched.
+fn merge_layers<T: Layer>(layers: &mut Vec<Arc<T>>) {
+    while layers.len() >= 2 {
+        let top = layers.len() - 1;
+        if layers[top].entries() < layers[top - 1].entries() {
+            break;
+        }
+        let newest = layers.pop().expect("two layers");
+        Arc::make_mut(layers.last_mut().expect("two layers")).absorb(newest);
     }
 }
 
@@ -185,6 +235,7 @@ impl ObjectStore {
     }
 
     fn begin_layer(&mut self) {
+        merge_layers(&mut self.layers);
         self.layers.push(Arc::new(BTreeMap::new()));
     }
 
@@ -2942,6 +2993,88 @@ mod structured_json_tests {
             head.snapshot.extensions == cold.extensions,
             "the warm ordinary cache kept the 0.0 record"
         );
+    }
+
+    /// Copy-on-write layers must not grow by one per commit: every lookup
+    /// scans them, so reads would degrade linearly with the commit count.
+    /// Merged layers keep exact retained-object/byte accounting and reads.
+    #[tokio::test]
+    async fn many_commits_keep_logarithmic_layers_and_exact_accounting() {
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("layered-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let session = SessionId::new("layered");
+        let lease = writer(&journal, &session, "w0").await;
+        let epoch = lease.writer_epoch().unwrap();
+        let mut current = snapshot(&session, 3);
+        let mut head = journal
+            .commit(
+                &lease,
+                commit(
+                    &current,
+                    None,
+                    epoch,
+                    "bootstrap",
+                    Vec::new(),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        for index in 0..300 {
+            let message = Message::user(format!("turn {index}"));
+            let mut next = current.clone();
+            next.history.push(message.clone());
+            let mut append = commit(
+                &next,
+                Some(&head),
+                epoch,
+                &format!("turn-{index}"),
+                Vec::new(),
+                false,
+                BTreeMap::new(),
+            );
+            append.delta.history_append = vec![message];
+            append.digest = append.input_digest().unwrap();
+            head = journal.commit(&lease, append).await.unwrap();
+            current = next;
+        }
+        {
+            let state = journal.lock().unwrap();
+            let mut recount = BTreeMap::new();
+            for layer in &state.objects.layers {
+                for (id, bytes) in layer.iter() {
+                    assert!(recount.insert(id.clone(), bytes.len()).is_none());
+                }
+            }
+            assert_eq!(state.objects.len, recount.len());
+            assert_eq!(state.objects.bytes, recount.values().sum::<usize>());
+            assert!(
+                state.objects.layers.len() <= 16,
+                "{} object layers after 301 commits",
+                state.objects.layers.len()
+            );
+            let reachable_layers = state
+                .leases
+                .values()
+                .map(|lease| lease.reachable.layers.len())
+                .max()
+                .unwrap();
+            assert!(
+                reachable_layers <= 16,
+                "{reachable_layers} reachability layers after 301 commits"
+            );
+        }
+        assert_eq!(
+            materialized_cache(&journal, &session).await,
+            current
+                .extension_state
+                .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+                .cloned()
+        );
+        assert!(head.snapshot == ObjectAssembler::default().snapshot(&current, 0).unwrap());
     }
 
     /// N reference commits share the unchanged spine; each adds O(log N)
