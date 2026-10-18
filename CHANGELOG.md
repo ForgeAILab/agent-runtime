@@ -7,6 +7,13 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- Starting a session or a child session no longer overflows a 2 MiB stack in
+  debug builds. The startup body introduced with the session journal (~30 KB as
+  a future) is boxed, so hosts that spawn children from inside a tool call stay
+  within default test and worker thread stacks.
+
 ## [0.6.0] - 2026-10-18
 
 ### Changed

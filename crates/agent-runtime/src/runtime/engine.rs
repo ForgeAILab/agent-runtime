@@ -1332,7 +1332,9 @@ impl Runtime {
         .await?;
         let persistence = opened_persistence.persistence;
         let startup_persistence = persistence.clone();
-        let startup_result = async move {
+        // Boxed: this body is ~30 KB as a future, and every session start and
+        // child spawn awaits it; inline, debug builds overflow 2 MiB stacks.
+        let startup_result = Box::pin(async move {
 
         // Resume only when the caller explicitly supplied the identity. A
         // freshly minted id must never silently load an older snapshot.
@@ -1764,7 +1766,7 @@ impl Runtime {
             }
         }
         Ok(session)
-        }
+        })
         .await;
         if startup_result.is_err() {
             let _ = startup_persistence.close().await;
@@ -1793,6 +1795,28 @@ mod tests {
             .allow_child_interaction(allow_child_interaction)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn session_start_futures_stay_small_enough_to_nest() {
+        // Hosts await these inside their own deep futures (delegation spawns
+        // a child session from a tool call). Debug builds copy nested futures
+        // onto the stack, so an inline ~30 KB startup body overflowed 2 MiB
+        // test and worker threads in Smith.
+        const LIMIT: usize = 8 * 1024;
+        let runtime = runtime(false);
+        let root = runtime.start_session(StartSession::new());
+        assert!(
+            std::mem::size_of_val(&root) < LIMIT,
+            "start_session future is {} bytes",
+            std::mem::size_of_val(&root)
+        );
+        let child = runtime.start_child_session(StartSession::new(), SessionId::new("parent"));
+        assert!(
+            std::mem::size_of_val(&child) < LIMIT,
+            "start_child_session future is {} bytes",
+            std::mem::size_of_val(&child)
+        );
     }
 
     #[tokio::test]
