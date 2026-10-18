@@ -78,6 +78,11 @@ struct NativeDomain {
     /// ordinary head loaded after restart this begins as its projected view;
     /// cardinality-based history deltas keep policy domains distinct.
     candidate: Option<SessionSnapshot>,
+    /// Whether `candidate` is this writer's own last submitted input rather
+    /// than a view loaded at open. Only then can the next boundary's history
+    /// prefix be compared byte for byte; a loaded view may legitimately be
+    /// host-redacted relative to live history.
+    candidate_submitted: bool,
     checkpoint: Option<TurnCheckpoint>,
     /// Candidate objects already submitted in this writer lineage. A backend
     /// may store projected IDs in the ordinary domain; this set intentionally
@@ -587,6 +592,7 @@ async fn open_domain(
         lease: Some(lease),
         head,
         candidate,
+        candidate_submitted: false,
         checkpoint,
         known_candidates,
     })
@@ -643,7 +649,12 @@ async fn commit_domain(
     // Canonical map order already gives stable commit digests; make the order
     // explicit for adapters that retain the submitted vector verbatim.
     objects.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    let delta = transition_delta(domain.candidate.as_ref(), snapshot, boundary.clone())?;
+    let delta = transition_delta(
+        domain.candidate.as_ref(),
+        domain.candidate_submitted,
+        snapshot,
+        boundary.clone(),
+    )?;
     let operation_payload = serde_json::to_vec(&(
         domain.role,
         current.map(|head| head.revision),
@@ -709,6 +720,7 @@ async fn commit_domain(
     }
     domain.head = Some(head);
     domain.candidate = Some(snapshot.clone());
+    domain.candidate_submitted = true;
     if domain.role == JournalRole::Protected {
         domain.checkpoint = checkpoint.cloned();
     }
@@ -721,8 +733,22 @@ async fn commit_domain(
     Ok(())
 }
 
+/// Builds the semantic delta from the preceding candidate to `next`.
+///
+/// History deltas are appends by cardinality. The ordinary backend replays
+/// `history_append` onto its stored projection, so a rewritten prefix must
+/// never be expressed as an append: when `previous` is this writer's own last
+/// submission the prefix must be identical, and otherwise (a view loaded at
+/// open, possibly host-redacted) message roles must still line up. After a
+/// terminal resume on a redacting host the next exact checkpoint
+/// legitimately carries the redacted canonical prefix (see
+/// `merge_terminal_checkpoint_snapshot`), exactly as a legacy CheckpointStore
+/// receives it; for the protected domain `history_append` is therefore
+/// advisory and protected backends verify the submitted roots and objects
+/// rather than replaying the delta.
 fn transition_delta(
     previous: Option<&SessionSnapshot>,
+    previous_submitted: bool,
     next: &SessionSnapshot,
     boundary: JournalBoundary,
 ) -> Result<JournalTransitionDelta, RuntimeError> {
@@ -741,13 +767,21 @@ fn transition_delta(
             "native journal history did not advance by append",
         ));
     }
-    // History deltas are by cardinality in both domains. After a terminal
-    // resume the host-redacted ordinary history is canonical (see
-    // `merge_terminal_checkpoint_snapshot`), so the next exact checkpoint
-    // legitimately carries that redacted prefix, exactly as a legacy
-    // CheckpointStore receives it. Protected roots and candidate objects
-    // describe the complete exact history; the backend verifies them rather
-    // than replaying this delta.
+    let prefix = &next.history[..previous.history.len()];
+    let appended = if previous_submitted {
+        previous.history == prefix
+    } else {
+        previous
+            .history
+            .iter()
+            .zip(prefix)
+            .all(|(stored, live)| stored.role == live.role)
+    };
+    if !appended {
+        return Err(RuntimeError::conflict(
+            "native journal history was rewritten rather than appended",
+        ));
+    }
     let previous_usage = previous.usage.records();
     let next_usage = next.usage.records();
     if previous_usage.len() > next_usage.len()
@@ -1064,5 +1098,85 @@ impl ObjectAssembler {
             watermark: checkpoint.watermark.clone(),
             updated: checkpoint.updated,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_runtime_core::clock::Timestamp;
+    use agent_runtime_core::content::{ContentPart, Message};
+
+    use super::*;
+
+    fn snapshot(history: Vec<Message>) -> SessionSnapshot {
+        SessionSnapshot {
+            id: SessionId::new("delta"),
+            history,
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: Vec::new(),
+            extension_state: BTreeMap::new(),
+            updated: Timestamp(1),
+        }
+    }
+
+    fn boundary() -> JournalBoundary {
+        JournalBoundary {
+            version: 1,
+            session: SessionId::new("delta"),
+            turn: None,
+            checkpoint_sequence: 0,
+            planned_step_count: 0,
+        }
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message::assistant(vec![ContentPart::text(text)])
+    }
+
+    #[test]
+    fn a_loaded_redacted_prefix_continues_by_cardinality() {
+        let loaded = snapshot(vec![Message::user("[redacted]"), assistant("[redacted]")]);
+        let live = snapshot(vec![
+            Message::user("secret"),
+            assistant("secret reply"),
+            Message::user("next"),
+        ]);
+        let delta = transition_delta(Some(&loaded), false, &live, boundary()).unwrap();
+        assert_eq!(delta.history_append, vec![Message::user("next")]);
+        assert!(delta.bootstrap.is_none());
+    }
+
+    #[test]
+    fn a_rewritten_prefix_of_this_writers_own_submission_is_never_an_append() {
+        // The ordinary backend replays `history_append` onto its projection:
+        // expressing a replaced history as an append of the same length would
+        // persist the stale prefix plus a wrong tail.
+        let submitted = snapshot(vec![Message::user("one"), assistant("two")]);
+        let replaced = snapshot(vec![
+            Message::user("adopted timeline"),
+            assistant("two"),
+            Message::user("three"),
+        ]);
+        let error = transition_delta(Some(&submitted), true, &replaced, boundary()).unwrap_err();
+        assert!(error.message.contains("rewritten"), "{error:?}");
+        let appended = snapshot(vec![
+            Message::user("one"),
+            assistant("two"),
+            Message::user("three"),
+        ]);
+        assert_eq!(
+            transition_delta(Some(&submitted), true, &appended, boundary())
+                .unwrap()
+                .history_append,
+            vec![Message::user("three")]
+        );
+    }
+
+    #[test]
+    fn a_loaded_prefix_with_different_roles_is_rejected() {
+        let loaded = snapshot(vec![Message::user("[redacted]"), assistant("[redacted]")]);
+        let live = snapshot(vec![assistant("a"), Message::user("b"), Message::user("c")]);
+        assert!(transition_delta(Some(&loaded), false, &live, boundary()).is_err());
     }
 }
