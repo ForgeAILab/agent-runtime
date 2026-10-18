@@ -35,12 +35,14 @@ const LIMITS: JournalReadLimits = JournalReadLimits {
 
 type FailureInjector =
     dyn Fn(JournalCommitFailurePoint) -> Result<(), RuntimeError> + Send + Sync + 'static;
+type WriterRevoker = dyn Fn(&SessionId) -> Result<(), RuntimeError> + Send + Sync + 'static;
 
-/// Fresh backend and its deterministic transaction-cut control.
+/// Fresh backend with its deterministic transaction-cut and lease controls.
 pub struct SessionJournalConformanceFixture {
     /// Protected journal under test.
     pub journal: Arc<dyn SessionJournal>,
     failure: Arc<FailureInjector>,
+    revoke: Arc<WriterRevoker>,
 }
 
 impl fmt::Debug for SessionJournalConformanceFixture {
@@ -53,14 +55,18 @@ impl fmt::Debug for SessionJournalConformanceFixture {
 }
 
 impl SessionJournalConformanceFixture {
-    /// Binds any journal adapter to its test-only failure control.
+    /// Binds any journal adapter to its test-only failure control and to the
+    /// host's own writer-lease expiry/revocation, which the suite uses to hand
+    /// the fence to a successor while the stale holder still has its handle.
     pub fn new(
         journal: Arc<dyn SessionJournal>,
         failure: impl Fn(JournalCommitFailurePoint) -> Result<(), RuntimeError> + Send + Sync + 'static,
+        revoke_writer: impl Fn(&SessionId) -> Result<(), RuntimeError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             journal,
             failure: Arc::new(failure),
+            revoke: Arc::new(revoke_writer),
         }
     }
 
@@ -70,6 +76,11 @@ impl SessionJournalConformanceFixture {
         point: JournalCommitFailurePoint,
     ) -> Result<(), RuntimeError> {
         (self.failure)(point)
+    }
+
+    /// Expires or revokes the session's current writer lease, as host policy.
+    pub fn revoke_writer(&self, session: &SessionId) -> Result<(), RuntimeError> {
+        (self.revoke)(session)
     }
 }
 
@@ -100,7 +111,12 @@ fn reference_fixture() -> SessionJournalConformanceFixture {
         "reference-protected",
     )));
     let control = Arc::clone(&journal);
-    SessionJournalConformanceFixture::new(journal, move |point| control.fail_next_commit_at(point))
+    let revoke = Arc::clone(&journal);
+    SessionJournalConformanceFixture::new(
+        journal,
+        move |point| control.fail_next_commit_at(point),
+        move |session| revoke.revoke_writer(session),
+    )
 }
 
 async fn assert_commit_atomicity<F, Fut>(factory: &F)
@@ -404,6 +420,77 @@ where
         .unwrap_err();
     assert_conflict(contender);
     fixture.journal.close(next).await.unwrap();
+
+    // A read-only pin never carries execution authority.
+    let reader = open_reader(&*fixture.journal, &session, None, "read-only-commit").await;
+    let read_only = append_commit(
+        session.clone(),
+        first_epoch,
+        &head,
+        "read-only-commit",
+        &["winner", "read-only"],
+        "read-only",
+    );
+    assert_conflict(
+        fixture
+            .journal
+            .commit(&reader, read_only)
+            .await
+            .unwrap_err(),
+    );
+    fixture.journal.close(reader).await.unwrap();
+
+    // Host lease expiry/revocation hands the fence to a successor; the stale
+    // holder still has its handle but fails before any read or commit.
+    let session = SessionId::new("revoked-writer");
+    let stale = open_writer(&*fixture.journal, &session, None, "revoked").await;
+    let stale_epoch = stale.writer_epoch().unwrap();
+    let (create, message) =
+        bootstrap_commit(session.clone(), stale_epoch, "revoked-create", "revoked");
+    let head = fixture.journal.commit(&stale, create).await.unwrap();
+    fixture.revoke_writer(&session).unwrap();
+    assert_conflict(fixture.journal.read(&stale, &message).await.unwrap_err());
+    let successor = open_writer(
+        &*fixture.journal,
+        &session,
+        Some(head.revision),
+        "successor",
+    )
+    .await;
+    let successor_epoch = successor.writer_epoch().unwrap();
+    assert!(successor_epoch > stale_epoch);
+    let late = append_commit(
+        session.clone(),
+        stale_epoch,
+        &head,
+        "late-stale-append",
+        &["revoked", "late"],
+        "late",
+    );
+    assert_conflict(
+        fixture
+            .journal
+            .commit(&stale, late.clone())
+            .await
+            .unwrap_err(),
+    );
+    assert_conflict(fixture.journal.read(&stale, &message).await.unwrap_err());
+    assert_conflict(fixture.journal.renew(&stale).await.unwrap_err());
+    assert_conflict(fixture.journal.close(stale).await.unwrap_err());
+    // The live successor must also refuse a batch carrying the stale fence.
+    assert_conflict(fixture.journal.commit(&successor, late).await.unwrap_err());
+    let current = append_commit(
+        session.clone(),
+        successor_epoch,
+        &head,
+        "successor-append",
+        &["revoked", "late"],
+        "late",
+    );
+    let advanced = fixture.journal.commit(&successor, current).await.unwrap();
+    assert_eq!(advanced.writer_epoch, successor_epoch);
+    assert!(fixture.journal.read(&successor, &message).await.is_ok());
+    fixture.journal.close(successor).await.unwrap();
 }
 
 async fn assert_publish_validation<F, Fut>(factory: &F)

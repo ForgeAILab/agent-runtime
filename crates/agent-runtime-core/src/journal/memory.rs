@@ -219,6 +219,22 @@ impl InMemorySessionJournal {
         Ok(())
     }
 
+    /// Host lease control: revokes the session's current exclusive writer, as
+    /// a host's own lease expiry or revocation policy would. The revoked
+    /// handle's fence, pin and token stop working at once, so its holder fails
+    /// before any read, commit, renew or close; the next exclusive open gets a
+    /// strictly greater fence. Committed roots and idempotency records are
+    /// untouched. The backend never revokes on its own (no wall-clock expiry).
+    pub fn revoke_writer(&self, session: &SessionId) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let record = state.sessions.get_mut(session).ok_or_else(conflict)?;
+        let handle = record.active_writer.take().ok_or_else(conflict)?;
+        if let Some(lease) = state.leases.remove(&handle) {
+            state.active_pins.remove(&(lease.session, lease.pin));
+        }
+        Ok(())
+    }
+
     /// Number of immutable objects physically retained by this volatile domain.
     /// Primarily useful for deterministic adapter tests; it exposes no IDs.
     pub fn object_count(&self) -> Result<usize, RuntimeError> {
