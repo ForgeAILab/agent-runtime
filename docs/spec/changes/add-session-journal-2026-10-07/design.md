@@ -539,6 +539,19 @@ the exact head: a v3 pair without a checkpoint never writes the exact domain,
 so an exact head there is native progress and a missing ordinary head must
 not be rebuilt from the pre-import v3 record.
 
+### Task 2.6 review refinement (2026-10-18)
+
+A failed terminal publication can leave the ordinary head ahead of the exact
+boundary: the protected checkpoint stays at `Completing`/`PublishingTerminal`
+while a later input is saved to the ordinary store. Terminal republication on
+resume then writes the boundary's shorter canonical history, as a legacy
+`SessionStore::save` overwrites it. The native writer submits such a shorter
+history as one complete replacement (`JournalTransitionDelta::bootstrap` over
+an existing head, with no appends), which the ordinary role projects like a
+bootstrap; a rewritten prefix of equal or greater length still fails closed.
+Refusing the replacement wedged the session at a non-terminal checkpoint on
+every resume while the legacy path continued.
+
 Keep public snapshot/history/recent_manifests projections and event variants.
 Version-4 readers run for the entire first release; future legacy-reader removal
 is a separate proposal with all consumer gates. U10 has its own format change
@@ -553,18 +566,22 @@ sets schema 3 before running the existing validation and transition checks; the
 schema-4 reference envelope, object IDs and roots are not serialized into the
 materialized value. The task-2.6 matrix reads every published outcome through a
 fresh `JournalReader`, compares its roots with a cold encoding, and resumes the
-result through the same public checkpoint type as the legacy path.
+result through the same public checkpoint type as the legacy path; the
+materialized checkpoint and snapshot bytes equal the legacy store's bytes at
+every barrier of the task-2.8 byte test.
 
 The released-reader evidence is direct. There is no persisted checkpoint-type
 or validation diff from tag `v0.5.0` through `v0.6.0`, `v0.6.1` and this
 decision; those releases require schema 3 and deserialize the same state,
 snapshot, watermark, identity and operation fields. The native writer released
 in 0.6.x therefore produces no new materialized byte interpretation for an
-older reader. The Smith, Nyx and Open Forge consumer fixtures each apply their
-own restrictive schema guard to JSON materialized from a real native
-schema-4 head: all require schema 3, Smith/Forge require the inline `snapshot`,
-and Forge rejects a journal-only `snapshot_roots` field. The resulting bytes
-round-trip and validate as `TurnCheckpoint` in every row.
+older reader. The Smith, Nyx and Open Forge consumer fixtures apply
+hypothetical strict guards (not the consumers' own code) to JSON materialized
+from a native schema-4 head: all require schema 3, Smith/Forge the inline
+`snapshot`, Forge the absence of `snapshot_roots`; the bytes round-trip and
+validate as `TurnCheckpoint`. Open Forge's real adapter deserializes the typed
+checkpoint of a pinned pre-`v0.2.0` runtime revision; that is the same
+question for legacy writes and is not changed by the native writer.
 
 Consequently no reader-first schema-4 materialized-checkpoint plan and no new
 CHANGELOG rollback limit are needed. The existing native-adoption downgrade
