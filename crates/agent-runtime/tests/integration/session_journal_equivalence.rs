@@ -8,7 +8,7 @@
 //! either path fails. Resume always uses a freshly built runtime over the same
 //! durable state, then continues the session and compares again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +23,7 @@ use agent_runtime::core::clock::{Clock, Timestamp};
 use agent_runtime::core::content::{
     ContentPart, InternalTurnInput, InternalTurnSensitivity, InternalTurnSource, UserInput,
 };
-use agent_runtime::core::error::RuntimeError;
+use agent_runtime::core::error::{ErrorKind, FailureClass, RuntimeError};
 use agent_runtime::core::ids::SessionId;
 use agent_runtime::core::interaction::{
     InteractionBroker, InteractionOutcomeKind, InteractionReadiness, InteractionRequest,
@@ -158,13 +158,24 @@ pub(crate) enum Materialized {
     Checkpoint(Box<TurnCheckpoint>),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SubmittedCommit {
+    pub(crate) order: usize,
+    pub(crate) role: JournalRole,
+    pub(crate) commit: JournalCommit,
+    pub(crate) head: JournalHead,
+    pub(crate) materialized: Materialized,
+}
+
 /// Reads back every published head exactly as a fresh reader would.
 #[derive(Debug)]
 pub(crate) struct Materializing {
     inner: Arc<InMemorySessionJournal>,
     role: JournalRole,
     log: Mutex<Vec<Materialized>>,
+    submissions: Mutex<Vec<SubmittedCommit>>,
     commits: AtomicUsize,
+    publication_order: Arc<AtomicUsize>,
     pins: AtomicUsize,
     fail_next_renew: AtomicUsize,
     fail_next_close_before: AtomicUsize,
@@ -173,11 +184,21 @@ pub(crate) struct Materializing {
 
 impl Materializing {
     fn new(inner: InMemorySessionJournal, role: JournalRole) -> Arc<Self> {
+        Self::new_with_publication_order(inner, role, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn new_with_publication_order(
+        inner: InMemorySessionJournal,
+        role: JournalRole,
+        publication_order: Arc<AtomicUsize>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(inner),
             role,
             log: Mutex::new(Vec::new()),
+            submissions: Mutex::new(Vec::new()),
             commits: AtomicUsize::new(0),
+            publication_order,
             pins: AtomicUsize::new(0),
             fail_next_renew: AtomicUsize::new(0),
             fail_next_close_before: AtomicUsize::new(0),
@@ -255,7 +276,7 @@ impl SessionJournal for Materializing {
         batch: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
         let session = batch.batch.session.clone();
-        let head = self.inner.commit(lease, batch).await?;
+        let head = self.inner.commit(lease, batch.clone()).await?;
         let index = self.commits.fetch_add(1, Ordering::Relaxed);
         let value = self.materialize(&session).await?;
         let materialized = match &value {
@@ -267,7 +288,15 @@ impl SessionJournal for Materializing {
             "{:?} commit {index}: warm encoding caches committed other roots than a cold encoding of the same state",
             self.role
         );
-        self.log.lock().unwrap().push(value);
+        let order = self.publication_order.fetch_add(1, Ordering::SeqCst);
+        self.log.lock().unwrap().push(value.clone());
+        self.submissions.lock().unwrap().push(SubmittedCommit {
+            order,
+            role: self.role,
+            commit: batch,
+            head: head.clone(),
+            materialized: value,
+        });
         Ok(head)
     }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
@@ -495,6 +524,7 @@ pub(crate) struct Pair {
 impl Pair {
     pub(crate) fn new(projection: Projection) -> Self {
         let tag = uuid::Uuid::new_v4();
+        let publication_order = Arc::new(AtomicUsize::new(0));
         Self {
             legacy_sessions: Arc::new(LegacySessions {
                 projection,
@@ -503,18 +533,20 @@ impl Pair {
             }),
             legacy_checkpoints: Arc::new(LegacyCheckpoints::default()),
             native: Arc::new(NativeStores {
-                ordinary: Materializing::new(
+                ordinary: Materializing::new_with_publication_order(
                     InMemorySessionJournal::ordinary(
                         JournalStorageId::new(format!("review-ordinary-{tag}")),
                         Arc::new(projection),
                     ),
                     JournalRole::Ordinary,
+                    publication_order.clone(),
                 ),
-                protected: Materializing::new(
+                protected: Materializing::new_with_publication_order(
                     InMemorySessionJournal::protected(JournalStorageId::new(format!(
                         "review-protected-{tag}"
                     ))),
                     JournalRole::Protected,
+                    publication_order,
                 ),
                 legacy_saves: AtomicUsize::new(0),
             }),
@@ -543,6 +575,13 @@ impl Pair {
     pub(crate) fn crash(&self, session: &SessionId) {
         self.native.ordinary.revoke(session);
         self.native.protected.revoke(session);
+    }
+
+    pub(crate) fn submission_trace(&self) -> Vec<SubmittedCommit> {
+        let mut trace = self.native.ordinary.submissions.lock().unwrap().clone();
+        trace.extend(self.native.protected.submissions.lock().unwrap().clone());
+        trace.sort_by_key(|submission| submission.order);
+        trace
     }
 
     #[track_caller]
@@ -664,6 +703,15 @@ fn build(
     sessions: Arc<dyn SessionStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     configure: Configure,
+) -> Runtime {
+    build_with(provider, sessions, checkpoints, configure)
+}
+
+fn build_with(
+    provider: Arc<FakeProvider>,
+    sessions: Arc<dyn SessionStore>,
+    checkpoints: Arc<dyn CheckpointStore>,
+    configure: impl FnOnce(RuntimeBuilder) -> RuntimeBuilder,
 ) -> Runtime {
     configure(
         RuntimeBuilder::new(ModelId::new("fake"))
@@ -3518,4 +3566,2509 @@ fn v3_import_continuation_matches_legacy_resume_for_every_state() {
             native.checkpoints.iter().map(state_tag).collect::<Vec<_>>()
         );
     }
+}
+
+/// `CountingEcho` with a per-runtime counter for the crash matrix.
+#[derive(Debug)]
+struct MatrixCountingEcho {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LegacyTool for MatrixCountingEcho {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Returns the exact text argument."
+    }
+    fn input_schema(&self) -> Value {
+        CountingEcho.input_schema()
+    }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default().with_spawn()
+    }
+    async fn invoke_legacy(
+        &self,
+        arguments: Value,
+        _: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutcome::text(
+            arguments["text"].as_str().unwrap_or_default(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashMatrixProfile {
+    Plain,
+    Tools,
+    Interaction,
+    Cache,
+    #[cfg(feature = "external-agent")]
+    External,
+}
+
+impl CrashMatrixProfile {
+    /// Builds one resume runtime. Tool executions are counted per runtime,
+    /// never through a process-global counter, so concurrently running tests
+    /// (other matrix shards, the v3 continuation test) cannot leak calls into
+    /// this runtime's count.
+    fn runtime(
+        self,
+        provider: Arc<FakeProvider>,
+        sessions: Arc<dyn SessionStore>,
+        checkpoints: Arc<dyn CheckpointStore>,
+        tool_calls: Arc<AtomicUsize>,
+    ) -> Runtime {
+        let configure: Configure = match self {
+            Self::Plain => plain,
+            Self::Tools => {
+                return build_with(provider, sessions, checkpoints, move |builder| {
+                    builder
+                        .legacy_approval_authority()
+                        .approval(Arc::new(AllowAll))
+                        .tool(Arc::new(MatrixCountingEcho { calls: tool_calls }))
+                });
+            }
+            Self::Interaction => answering_interaction_tools,
+            Self::Cache => cache_config,
+            #[cfg(feature = "external-agent")]
+            Self::External => crate::external_agent::task_2_6_external_recovery_config,
+        };
+        build(provider, sessions, checkpoints, configure)
+    }
+
+    fn provider(self) -> Arc<FakeProvider> {
+        match self {
+            Self::Cache => cache_provider(),
+            Self::Plain | Self::Tools | Self::Interaction => provider(vec![
+                reply("matrix recovery one"),
+                reply("matrix recovery two"),
+                reply("matrix recovery three"),
+                reply("matrix recovery four"),
+            ]),
+            #[cfg(feature = "external-agent")]
+            Self::External => provider(Vec::new()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CrashMatrixBarrier {
+    label: String,
+    profile: CrashMatrixProfile,
+    trace: Arc<Vec<SubmittedCommit>>,
+    target: usize,
+}
+
+fn answered_interaction_provider() -> Arc<FakeProvider> {
+    let mut question = tool_call_fragments(
+        0,
+        "call-matrix-question",
+        QUESTIONNAIRE_TOOL_NAME,
+        &json!({
+            "questions": [{
+                "id": "choice",
+                "header": "Choice",
+                "prompt": "Choose one",
+                "allow_free_form": true
+            }]
+        })
+        .to_string(),
+    );
+    question.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    provider(vec![
+        reply("interaction seed"),
+        ScriptedStream::new(question),
+        reply("interaction complete"),
+        reply("interaction after resume"),
+    ])
+}
+
+fn answered_interaction_turn(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let session = runtime
+            .start_session(StartSession::create(id, Vec::new()))
+            .await
+            .unwrap();
+        session.run(UserInput::text("seed")).await.unwrap();
+        session.run(UserInput::text("ask me")).await.unwrap();
+        let snapshot = session.snapshot();
+        session.shutdown().await.unwrap();
+        vec![snapshot]
+    })
+}
+
+fn add_protected_crash_matrix_barriers(
+    barriers: &mut BTreeMap<String, CrashMatrixBarrier>,
+    trace: Vec<SubmittedCommit>,
+    profile: CrashMatrixProfile,
+) {
+    let trace = Arc::new(trace);
+    for (target, submission) in trace.iter().enumerate() {
+        let Materialized::Checkpoint(checkpoint) = &submission.materialized else {
+            continue;
+        };
+        let label = state_tag(checkpoint);
+        barriers
+            .entry(label.clone())
+            .or_insert_with(|| CrashMatrixBarrier {
+                label,
+                profile,
+                trace: trace.clone(),
+                target,
+            });
+    }
+}
+
+fn add_ordinary_crash_matrix_barrier(
+    barriers: &mut Vec<CrashMatrixBarrier>,
+    label: &str,
+    trace: Vec<SubmittedCommit>,
+    profile: CrashMatrixProfile,
+    predicate: impl Fn(&SubmittedCommit) -> bool,
+) {
+    let target = trace
+        .iter()
+        .position(predicate)
+        .unwrap_or_else(|| panic!("missing ordinary crash-matrix barrier {label}"));
+    barriers.push(CrashMatrixBarrier {
+        label: label.to_owned(),
+        profile,
+        trace: Arc::new(trace),
+        target,
+    });
+}
+
+async fn crash_matrix_barriers() -> Vec<CrashMatrixBarrier> {
+    let plain_pair = equivalent(
+        "matrix-plain",
+        identity,
+        Phase {
+            provider: text_turns,
+            configure: plain,
+            drive: two_turns,
+        },
+        continue_phase(),
+    )
+    .await;
+    let plain_trace = plain_pair.submission_trace();
+
+    let internal_pair = equivalent(
+        "matrix-internal",
+        identity,
+        Phase {
+            provider: text_turns,
+            configure: plain,
+            drive: internal_turn,
+        },
+        continue_phase(),
+    )
+    .await;
+    let tools_pair = equivalent(
+        "matrix-tools",
+        identity,
+        Phase {
+            provider: tool_provider,
+            configure: tools,
+            drive: tools_and_local,
+        },
+        continue_phase(),
+    )
+    .await;
+    let interaction_pair = equivalent(
+        "matrix-interaction",
+        identity,
+        Phase {
+            provider: answered_interaction_provider,
+            configure: answering_interaction_tools,
+            drive: answered_interaction_turn,
+        },
+        Phase {
+            provider: answered_interaction_provider,
+            configure: answering_interaction_tools,
+            drive: resume_and_continue,
+        },
+    )
+    .await;
+    let cache_pair = equivalent(
+        "matrix-cache",
+        identity,
+        Phase {
+            provider: cache_provider,
+            configure: cache_config,
+            drive: cache_turns,
+        },
+        Phase {
+            provider: cache_provider,
+            configure: cache_config,
+            drive: resume_and_continue,
+        },
+    )
+    .await;
+
+    let mut protected = BTreeMap::new();
+    add_protected_crash_matrix_barriers(
+        &mut protected,
+        plain_trace.clone(),
+        CrashMatrixProfile::Plain,
+    );
+    add_protected_crash_matrix_barriers(
+        &mut protected,
+        internal_pair.submission_trace(),
+        CrashMatrixProfile::Plain,
+    );
+    add_protected_crash_matrix_barriers(
+        &mut protected,
+        tools_pair.submission_trace(),
+        CrashMatrixProfile::Tools,
+    );
+    add_protected_crash_matrix_barriers(
+        &mut protected,
+        interaction_pair.submission_trace(),
+        CrashMatrixProfile::Interaction,
+    );
+    add_protected_crash_matrix_barriers(
+        &mut protected,
+        cache_pair.submission_trace(),
+        CrashMatrixProfile::Cache,
+    );
+    #[cfg(feature = "external-agent")]
+    add_protected_crash_matrix_barriers(
+        &mut protected,
+        crate::external_agent::task_2_6_external_tool_call_trace().await,
+        CrashMatrixProfile::External,
+    );
+    let mut expected = [
+        "accepted",
+        "internal_accepted",
+        "local_action_accepted",
+        "local_action_prepared",
+        "local_action_executing",
+        "local_action_outcome_ready",
+        "local_action_result_ready",
+        "planning",
+        "calling_model",
+        "model_response_ready",
+        "awaiting_approval",
+        "awaiting_interaction",
+        "tool_outcome_ready",
+        "executing_tools",
+        "completing",
+        "publishing_terminal",
+        "terminal",
+        "cache_operation_prepared",
+        "cache_operation_started",
+        "cache_operation_result_ready",
+        "cache_operation_terminal",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    #[cfg(feature = "external-agent")]
+    expected.insert("external_tool_call");
+    assert_eq!(
+        protected
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected,
+        "native checkpoint barrier inventory changed; classify the new barrier before extending the crash matrix"
+    );
+
+    let create_pair = equivalent(
+        "matrix-bootstrap",
+        identity,
+        Phase {
+            provider: text_turns,
+            configure: plain,
+            drive: create_only,
+        },
+        continue_phase(),
+    )
+    .await;
+    let fork_pair = equivalent(
+        "matrix-fork",
+        identity,
+        Phase {
+            provider: text_turns,
+            configure: plain,
+            drive: fork_summary,
+        },
+        Phase {
+            provider: continuation,
+            configure: plain,
+            drive: resume_child,
+        },
+    )
+    .await;
+    let fork_trace = fork_pair.submission_trace();
+    let parent = SessionId::new("review-matrix-fork");
+    let child = SessionId::new("review-matrix-fork-child");
+    let mut ordinary = Vec::new();
+    add_ordinary_crash_matrix_barrier(
+        &mut ordinary,
+        "bootstrap",
+        create_pair.submission_trace(),
+        CrashMatrixProfile::Plain,
+        |submission| {
+            submission.role == JournalRole::Ordinary && submission.commit.delta.bootstrap.is_some()
+        },
+    );
+    // The live writer's host persist at shutdown: the first ordinary
+    // publication made directly after a protected Terminal (the terminal
+    // projection precedes Terminal; the next turn starts with Accepted).
+    let persist = plain_trace
+        .windows(2)
+        .position(|pair| {
+            matches!(
+                &pair[0].materialized,
+                Materialized::Checkpoint(checkpoint) if checkpoint.state.is_terminal()
+            ) && pair[1].role == JournalRole::Ordinary
+        })
+        .map(|index| index + 1)
+        .expect("plain trace persists the ordinary state at shutdown");
+    ordinary.push(CrashMatrixBarrier {
+        label: "ordinary_persist".to_owned(),
+        profile: CrashMatrixProfile::Plain,
+        trace: Arc::new(plain_trace.clone()),
+        target: persist,
+    });
+    add_ordinary_crash_matrix_barrier(
+        &mut ordinary,
+        "ordinary_terminal_projection",
+        plain_trace,
+        CrashMatrixProfile::Plain,
+        |submission| {
+            submission.role == JournalRole::Ordinary
+                && submission.commit.batch.boundary.turn.is_some()
+        },
+    );
+    add_ordinary_crash_matrix_barrier(
+        &mut ordinary,
+        "fork_intent",
+        fork_trace.clone(),
+        CrashMatrixProfile::Plain,
+        |submission| {
+            submission.role == JournalRole::Ordinary
+                && submission.commit.batch.session == parent
+                && submission
+                    .commit
+                    .delta
+                    .extension_updates
+                    .contains_key("runtime.session.fork_pending")
+        },
+    );
+    add_ordinary_crash_matrix_barrier(
+        &mut ordinary,
+        "fork_child_seed",
+        fork_trace.clone(),
+        CrashMatrixProfile::Plain,
+        |submission| {
+            submission.role == JournalRole::Ordinary
+                && submission.commit.batch.session == child
+                && submission.commit.delta.bootstrap.is_some()
+        },
+    );
+    add_ordinary_crash_matrix_barrier(
+        &mut ordinary,
+        "fork_parent_supersession",
+        fork_trace,
+        CrashMatrixProfile::Plain,
+        |submission| {
+            submission.role == JournalRole::Ordinary
+                && submission.commit.batch.session == parent
+                && submission
+                    .commit
+                    .delta
+                    .extension_updates
+                    .contains_key("runtime.session.superseded")
+        },
+    );
+
+    let (idle_trace, idle_targets) =
+        crate::lcm_legacy_resume_integration::task_2_6_idle_compaction_trace().await;
+    let idle_trace = Arc::new(idle_trace);
+    for (label, target) in idle_targets {
+        ordinary.push(CrashMatrixBarrier {
+            label,
+            profile: CrashMatrixProfile::Plain,
+            trace: idle_trace.clone(),
+            target,
+        });
+    }
+
+    let mut barriers = protected.into_values().collect::<Vec<_>>();
+    barriers.extend(ordinary);
+    barriers.sort_by(|left, right| left.label.cmp(&right.label));
+    barriers
+}
+
+/// One physically distinct way the target commit can end. The reference
+/// backend stages every physical step on a private copy and publishes at one
+/// visibility point, so a cut before `AfterCommit` leaves nothing visible and
+/// `AfterCommit` publishes with a lost acknowledgement. The writer process is
+/// always gone afterwards (its fence is revoked, as a host's lease expiry
+/// would); only a fresh reader, a fresh runtime and an independent retry act.
+/// Ambiguous outcomes resolved by the *live* writer are exercised separately,
+/// through the runtime's own commit path, by
+/// `task_2_6_runtime_resolves_ambiguous_commits_*`.
+#[derive(Debug, Clone, Copy)]
+enum CrashMatrixCase {
+    /// The writer dies after this physical step of the target commit.
+    Crash(JournalCommitFailurePoint),
+    /// The writer dies before it submits the target commit.
+    CrashBeforeCommit,
+    /// The commit is acknowledged; the writer dies before closing its pin.
+    CrashAfterAcknowledgement,
+    /// The commit is acknowledged and the writer's pin close succeeds.
+    ClosedAfterAcknowledgement,
+}
+
+fn crash_matrix_cases(role: JournalRole) -> Vec<CrashMatrixCase> {
+    JournalCommitFailurePoint::ALL
+        .iter()
+        .copied()
+        .filter(|point| {
+            role == JournalRole::Protected
+                || !matches!(point, JournalCommitFailurePoint::AfterCheckpoint)
+        })
+        .map(CrashMatrixCase::Crash)
+        .chain([
+            CrashMatrixCase::CrashBeforeCommit,
+            CrashMatrixCase::CrashAfterAcknowledgement,
+            CrashMatrixCase::ClosedAfterAcknowledgement,
+        ])
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CrashMatrixDomainView {
+    head: JournalHead,
+    materialized: Materialized,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CrashMatrixView {
+    ordinary: Option<CrashMatrixDomainView>,
+    protected: Option<CrashMatrixDomainView>,
+}
+
+#[derive(Clone)]
+struct CrashMatrixJournals {
+    ordinary: Arc<InMemorySessionJournal>,
+    protected: Arc<InMemorySessionJournal>,
+}
+
+impl CrashMatrixJournals {
+    fn new(label: &str) -> Self {
+        let nonce = uuid::Uuid::new_v4();
+        Self {
+            ordinary: Arc::new(InMemorySessionJournal::ordinary(
+                JournalStorageId::new(format!("matrix-ordinary-{label}-{nonce}")),
+                Arc::new(IdentityJournalProjection),
+            )),
+            protected: Arc::new(InMemorySessionJournal::protected(JournalStorageId::new(
+                format!("matrix-protected-{label}-{nonce}"),
+            ))),
+        }
+    }
+
+    fn journal(&self, role: JournalRole) -> &Arc<InMemorySessionJournal> {
+        match role {
+            JournalRole::Ordinary => &self.ordinary,
+            JournalRole::Protected => &self.protected,
+        }
+    }
+}
+
+struct CrashMatrixWriter {
+    role: JournalRole,
+    session: SessionId,
+    lease: JournalLease,
+    head: Option<JournalHead>,
+}
+
+fn rewrite_crash_matrix_commit(
+    mut commit: JournalCommit,
+    writer: &CrashMatrixWriter,
+) -> JournalCommit {
+    commit.batch.expected_revision = writer.head.as_ref().map(|head| head.revision);
+    commit.batch.sequence = writer
+        .head
+        .as_ref()
+        .map_or(1, |head| head.batch_sequence.saturating_add(1));
+    commit.batch.predecessor = writer
+        .head
+        .as_ref()
+        .map(|head| JournalDigest::parse(head.batch.as_str()).unwrap());
+    commit.batch.writer_epoch = writer.lease.writer_epoch().unwrap();
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+async fn crash_matrix_writer(
+    journals: &CrashMatrixJournals,
+    writers: &mut Vec<CrashMatrixWriter>,
+    role: JournalRole,
+    session: &SessionId,
+) -> usize {
+    if let Some(index) = writers
+        .iter()
+        .position(|writer| writer.role == role && writer.session == *session)
+    {
+        return index;
+    }
+    let nonce = uuid::Uuid::new_v4();
+    let lease = journals
+        .journal(role)
+        .open(
+            session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new(format!("matrix-writer-{nonce}")),
+                pin: JournalPinId::new(format!("matrix-writer-{nonce}")),
+                intent: JournalOpenIntent::ExclusiveWriter,
+            },
+        )
+        .await
+        .unwrap();
+    let head = lease.head().cloned();
+    writers.push(CrashMatrixWriter {
+        role,
+        session: session.clone(),
+        lease,
+        head,
+    });
+    writers.len() - 1
+}
+
+async fn replay_crash_matrix_prefix(
+    barrier: &CrashMatrixBarrier,
+    journals: &CrashMatrixJournals,
+) -> (Vec<CrashMatrixWriter>, usize, JournalCommit) {
+    let mut writers = Vec::new();
+    for submission in barrier.trace.iter().take(barrier.target) {
+        let session = &submission.commit.batch.session;
+        let index = crash_matrix_writer(journals, &mut writers, submission.role, session).await;
+        let commit = rewrite_crash_matrix_commit(submission.commit.clone(), &writers[index]);
+        let head = journals
+            .journal(submission.role)
+            .commit(&writers[index].lease, commit)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: prefix replay {} failed: {error:?}",
+                    barrier.label, submission.order
+                )
+            });
+        writers[index].head = Some(head);
+    }
+    let target = &barrier.trace[barrier.target];
+    let writer = crash_matrix_writer(
+        journals,
+        &mut writers,
+        target.role,
+        &target.commit.batch.session,
+    )
+    .await;
+    let commit = rewrite_crash_matrix_commit(target.commit.clone(), &writers[writer]);
+    (writers, writer, commit)
+}
+
+async fn crash_matrix_domain_view(
+    journal: &Arc<InMemorySessionJournal>,
+    role: JournalRole,
+    session: &SessionId,
+    label: &str,
+) -> Option<CrashMatrixDomainView> {
+    let nonce = uuid::Uuid::new_v4();
+    let lease = journal
+        .open(
+            session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new(format!("matrix-read-{nonce}")),
+                pin: JournalPinId::new(format!("matrix-read-{nonce}")),
+                intent: JournalOpenIntent::ReadOnly,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: fresh read open failed: {error:?}"));
+    let Some(head) = lease.head().cloned() else {
+        journal.close(lease).await.unwrap();
+        return None;
+    };
+    let mut reader = JournalReader::new(journal.as_ref(), &lease, LIMITS)
+        .unwrap_or_else(|error| panic!("{label}: reader construction failed: {error:?}"));
+    let materialized = match role {
+        JournalRole::Ordinary => Materialized::Snapshot(Box::new(
+            reader
+                .snapshot()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: snapshot read failed: {error:?}"))
+                .expect("ordinary head must materialize a snapshot"),
+        )),
+        JournalRole::Protected => Materialized::Checkpoint(Box::new(
+            reader
+                .checkpoint()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: checkpoint read failed: {error:?}"))
+                .expect("protected matrix head must materialize a checkpoint"),
+        )),
+    };
+    let snapshot = match &materialized {
+        Materialized::Snapshot(snapshot) => (**snapshot).clone(),
+        Materialized::Checkpoint(checkpoint) => checkpoint.snapshot.clone(),
+    };
+    assert_eq!(
+        cold_roots(&head, snapshot).await,
+        head.snapshot,
+        "{label}: materialized head differs from a cold encoding"
+    );
+    journal.close(lease).await.unwrap();
+    Some(CrashMatrixDomainView { head, materialized })
+}
+
+async fn crash_matrix_view(
+    journals: &CrashMatrixJournals,
+    session: &SessionId,
+    label: &str,
+) -> CrashMatrixView {
+    CrashMatrixView {
+        ordinary: crash_matrix_domain_view(
+            &journals.ordinary,
+            JournalRole::Ordinary,
+            session,
+            label,
+        )
+        .await,
+        protected: crash_matrix_domain_view(
+            &journals.protected,
+            JournalRole::Protected,
+            session,
+            label,
+        )
+        .await,
+    }
+}
+
+fn crash_matrix_role_view(
+    view: &CrashMatrixView,
+    role: JournalRole,
+) -> &Option<CrashMatrixDomainView> {
+    match role {
+        JournalRole::Ordinary => &view.ordinary,
+        JournalRole::Protected => &view.protected,
+    }
+}
+
+struct CrashMatrixInjection {
+    journals: CrashMatrixJournals,
+    view: CrashMatrixView,
+    attempted: JournalCommit,
+    committed_head: Option<JournalHead>,
+    target_role: JournalRole,
+    target_session: SessionId,
+    committed: bool,
+}
+
+async fn revoke_crash_matrix_writers(
+    journals: &CrashMatrixJournals,
+    writers: &[CrashMatrixWriter],
+) {
+    for writer in writers {
+        let _ = journals.journal(writer.role).revoke_writer(&writer.session);
+    }
+}
+
+async fn inject_crash_matrix_case(
+    barrier: &CrashMatrixBarrier,
+    case: CrashMatrixCase,
+) -> CrashMatrixInjection {
+    let label = format!("{} / {case:?}", barrier.label);
+    let target = &barrier.trace[barrier.target];
+    let session = target.commit.batch.session.clone();
+    let journals = CrashMatrixJournals::new(&barrier.label);
+    let (mut writers, writer, attempted) = replay_crash_matrix_prefix(barrier, &journals).await;
+    let before = crash_matrix_view(&journals, &session, &format!("{label}: before")).await;
+    let journal = journals.journal(target.role);
+    let mut committed_head = None;
+    let committed = match case {
+        CrashMatrixCase::Crash(point) => {
+            journal.fail_next_commit_at(point).unwrap();
+            let result = journal
+                .commit(&writers[writer].lease, attempted.clone())
+                .await;
+            assert!(result.is_err(), "{label}: injected crash returned success");
+            point.is_after_commit()
+        }
+        CrashMatrixCase::CrashBeforeCommit => false,
+        CrashMatrixCase::CrashAfterAcknowledgement
+        | CrashMatrixCase::ClosedAfterAcknowledgement => {
+            committed_head = Some(
+                journal
+                    .commit(&writers[writer].lease, attempted.clone())
+                    .await
+                    .unwrap(),
+            );
+            if matches!(case, CrashMatrixCase::ClosedAfterAcknowledgement) {
+                let lease = writers.remove(writer).lease;
+                journal.close(lease).await.unwrap();
+            }
+            true
+        }
+    };
+    revoke_crash_matrix_writers(&journals, &writers).await;
+    let view = crash_matrix_view(&journals, &session, &format!("{label}: reopened")).await;
+
+    let before_target = crash_matrix_role_view(&before, target.role);
+    let actual_target = crash_matrix_role_view(&view, target.role);
+    if committed {
+        let actual = actual_target
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: committed outcome has no head"));
+        let expected_revision = before_target.as_ref().map_or(JournalRevision(1), |state| {
+            JournalRevision(state.head.revision.0 + 1)
+        });
+        assert_eq!(actual.head.revision, expected_revision, "{label}");
+        assert_eq!(actual.head.snapshot, target.head.snapshot, "{label}: roots");
+        assert_eq!(
+            actual.materialized, target.materialized,
+            "{label}: after state"
+        );
+    } else {
+        assert_eq!(actual_target, before_target, "{label}: before state");
+    }
+    match target.role {
+        JournalRole::Ordinary => assert_eq!(
+            view.protected, before.protected,
+            "{label}: protected domain changed partially"
+        ),
+        JournalRole::Protected => assert_eq!(
+            view.ordinary, before.ordinary,
+            "{label}: ordinary domain changed partially"
+        ),
+    }
+
+    CrashMatrixInjection {
+        journals,
+        view,
+        attempted,
+        committed_head,
+        target_role: target.role,
+        target_session: session,
+        committed,
+    }
+}
+
+async fn assert_crash_matrix_retry(barrier: &CrashMatrixBarrier, case: CrashMatrixCase) {
+    let injection = inject_crash_matrix_case(barrier, case).await;
+    let label = format!("{} / {case:?}", barrier.label);
+    let journal = injection.journals.journal(injection.target_role);
+    let nonce = uuid::Uuid::new_v4();
+    let lease = journal
+        .open(
+            &injection.target_session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new(format!("matrix-retry-{nonce}")),
+                pin: JournalPinId::new(format!("matrix-retry-{nonce}")),
+                intent: JournalOpenIntent::ExclusiveWriter,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: retry open failed: {error:?}"));
+    let mut writer = CrashMatrixWriter {
+        role: injection.target_role,
+        session: injection.target_session.clone(),
+        head: lease.head().cloned(),
+        lease,
+    };
+    let retry = if injection.committed {
+        injection.attempted
+    } else {
+        rewrite_crash_matrix_commit(injection.attempted, &writer)
+    };
+    let original = journal
+        .commit(&writer.lease, retry.clone())
+        .await
+        .unwrap_or_else(|error| panic!("{label}: first retry failed: {error:?}"));
+    if let Some(committed) = injection.committed_head {
+        assert_eq!(original, committed, "{label}: lost original head");
+    }
+    let duplicate = journal
+        .commit(&writer.lease, retry)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: idempotent retry failed: {error:?}"));
+    assert_eq!(duplicate, original, "{label}: retry advanced twice");
+    writer.head = Some(original.clone());
+    journal.close(writer.lease).await.unwrap();
+
+    let after = crash_matrix_domain_view(
+        journal,
+        injection.target_role,
+        &injection.target_session,
+        &format!("{label}: retry read"),
+    )
+    .await
+    .expect("retry must publish the target head");
+    assert_eq!(after.head, original, "{label}: retry head not current");
+    assert_eq!(
+        after.materialized, barrier.trace[barrier.target].materialized,
+        "{label}: retry materialization"
+    );
+}
+
+#[derive(Debug)]
+struct CrashMatrixNativeStores {
+    ordinary: Arc<Materializing>,
+    protected: Arc<Materializing>,
+    legacy_saves: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionStore for CrashMatrixNativeStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for CrashMatrixNativeStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+
+    async fn load_latest(&self, _: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CrashMatrixResume {
+    outcome: Value,
+    requests: Vec<agent_runtime::core::provider::ProviderRequest>,
+    tool_calls: usize,
+    checkpoints: Vec<TurnCheckpoint>,
+    snapshots: Vec<SessionSnapshot>,
+}
+
+async fn observe_crash_matrix_resume(
+    runtime: Runtime,
+    provider: Arc<FakeProvider>,
+    session: SessionId,
+    tool_calls: Arc<AtomicUsize>,
+) -> CrashMatrixResume {
+    let outcome = match runtime.start_session(StartSession::resume(session)).await {
+        Ok(handle) => {
+            let interrupted = handle.interrupted_on_resume().is_some();
+            let continued = handle.run(UserInput::text(CRASH_MATRIX_CONTINUATION)).await;
+            let snapshot = handle.snapshot();
+            let shutdown = handle.shutdown().await;
+            json!({
+                "started": true,
+                "interrupted": interrupted,
+                "continued": continued.as_ref().map(|turn| turn.id().as_str()).map_err(|error| serde_json::to_value(error).unwrap()),
+                "snapshot": snapshot,
+                "shutdown": shutdown.map_err(|error| serde_json::to_value(error).unwrap()),
+            })
+        }
+        Err(error) => json!({
+            "started": false,
+            "error": serde_json::to_value(error).unwrap(),
+        }),
+    };
+    CrashMatrixResume {
+        outcome,
+        requests: provider.requests(),
+        tool_calls: tool_calls.load(Ordering::SeqCst),
+        checkpoints: Vec::new(),
+        snapshots: Vec::new(),
+    }
+}
+
+fn materialized_checkpoint_log(journal: &Materializing) -> Vec<TurnCheckpoint> {
+    journal
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|value| match value {
+            Materialized::Checkpoint(checkpoint) => (**checkpoint).clone(),
+            Materialized::Snapshot(_) => unreachable!(),
+        })
+        .collect()
+}
+
+fn materialized_snapshot_log(journal: &Materializing) -> Vec<SessionSnapshot> {
+    journal
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|value| match value {
+            Materialized::Snapshot(snapshot) => (**snapshot).clone(),
+            Materialized::Checkpoint(_) => unreachable!(),
+        })
+        .collect()
+}
+
+#[track_caller]
+fn assert_crash_matrix_resume_matches(
+    native: &CrashMatrixResume,
+    legacy: &CrashMatrixResume,
+    label: &str,
+) {
+    assert_eq!(native.outcome, legacy.outcome, "{label}: resume outcome");
+    assert_eq!(
+        serde_json::to_value(&native.requests).unwrap(),
+        serde_json::to_value(&legacy.requests).unwrap(),
+        "{label}: provider requests"
+    );
+    assert_eq!(native.tool_calls, legacy.tool_calls, "{label}: tool calls");
+    assert_eq!(
+        native.checkpoints.iter().map(state_tag).collect::<Vec<_>>(),
+        legacy.checkpoints.iter().map(state_tag).collect::<Vec<_>>(),
+        "{label}: protected barrier sequence"
+    );
+    assert_eq!(
+        native.checkpoints.len(),
+        legacy.checkpoints.len(),
+        "{label}: protected barrier count"
+    );
+    for (index, (native, legacy)) in native
+        .checkpoints
+        .iter()
+        .zip(&legacy.checkpoints)
+        .enumerate()
+    {
+        assert_same(
+            native,
+            legacy,
+            &format!("{label}: protected barrier {index}"),
+        );
+    }
+    assert_eq!(
+        native.snapshots.len(),
+        legacy.snapshots.len(),
+        "{label}: ordinary barrier count"
+    );
+    for (index, (native, legacy)) in native.snapshots.iter().zip(&legacy.snapshots).enumerate() {
+        assert_same(
+            native,
+            legacy,
+            &format!("{label}: ordinary barrier {index}"),
+        );
+    }
+}
+
+/// Boundaries whose in-flight provider or cache call may already have run:
+/// resuming one must not issue a provider request before the next input.
+const CRASH_MATRIX_PROVIDER_INDETERMINATE: [&str; 2] = ["calling_model", "cache_operation_started"];
+
+/// Boundaries whose tool or local-action execution may already have run:
+/// resuming one must not execute it again (the runtime may still report the
+/// indeterminate outcome to the model, which is a new request, not a replay).
+const CRASH_MATRIX_TOOL_INDETERMINATE: [&str; 2] = ["executing_tools", "local_action_executing"];
+
+const CRASH_MATRIX_CONTINUATION: &str = "continue after crash matrix";
+
+/// Absolute no-replay oracle, checked on both paths: the legacy comparison
+/// alone cannot see a replay that shared resume code makes on both sides.
+#[track_caller]
+fn assert_crash_matrix_no_replay(run: &CrashMatrixResume, visible: &str, label: &str) {
+    if CRASH_MATRIX_TOOL_INDETERMINATE.contains(&visible) {
+        assert_eq!(
+            run.tool_calls, 0,
+            "{label}: resume from {visible} re-ran tool or local-action work"
+        );
+    }
+    if CRASH_MATRIX_PROVIDER_INDETERMINATE.contains(&visible) {
+        for request in &run.requests {
+            assert!(
+                request.messages.iter().any(|message| {
+                    message.content.iter().any(|part| {
+                        part.as_text()
+                            .is_some_and(|text| text.contains(CRASH_MATRIX_CONTINUATION))
+                    })
+                }),
+                "{label}: resume from {visible} re-issued provider work before the next input"
+            );
+        }
+    }
+}
+
+async fn assert_crash_matrix_continuation(barrier: &CrashMatrixBarrier, case: CrashMatrixCase) {
+    let injection = inject_crash_matrix_case(barrier, case).await;
+    let label = format!("{} / {case:?}", barrier.label);
+    let ordinary_snapshot =
+        injection
+            .view
+            .ordinary
+            .as_ref()
+            .map(|state| match &state.materialized {
+                Materialized::Snapshot(snapshot) => (**snapshot).clone(),
+                Materialized::Checkpoint(_) => unreachable!(),
+            });
+    let protected_checkpoint =
+        injection
+            .view
+            .protected
+            .as_ref()
+            .map(|state| match &state.materialized {
+                Materialized::Checkpoint(checkpoint) => (**checkpoint).clone(),
+                Materialized::Snapshot(_) => unreachable!(),
+            });
+
+    let visible = protected_checkpoint
+        .as_ref()
+        .map(state_tag)
+        .unwrap_or_default();
+    let legacy_sessions = Arc::new(LegacySessions {
+        projection: identity,
+        current: Mutex::new(ordinary_snapshot.into_iter().collect()),
+        log: Mutex::new(Vec::new()),
+    });
+    let legacy_checkpoints = Arc::new(LegacyCheckpoints {
+        current: Mutex::new(protected_checkpoint.into_iter().collect()),
+        log: Mutex::new(Vec::new()),
+    });
+    let publication_order = Arc::new(AtomicUsize::new(0));
+    let native_stores = Arc::new(CrashMatrixNativeStores {
+        ordinary: Materializing::new_with_publication_order(
+            injection.journals.ordinary.as_ref().clone(),
+            JournalRole::Ordinary,
+            publication_order.clone(),
+        ),
+        protected: Materializing::new_with_publication_order(
+            injection.journals.protected.as_ref().clone(),
+            JournalRole::Protected,
+            publication_order,
+        ),
+        legacy_saves: AtomicUsize::new(0),
+    });
+    let legacy_provider = barrier.profile.provider();
+    let native_provider = barrier.profile.provider();
+    let legacy_tool_calls = Arc::new(AtomicUsize::new(0));
+    let native_tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut legacy = observe_crash_matrix_resume(
+        barrier.profile.runtime(
+            legacy_provider.clone(),
+            legacy_sessions.clone(),
+            legacy_checkpoints.clone(),
+            legacy_tool_calls.clone(),
+        ),
+        legacy_provider,
+        injection.target_session.clone(),
+        legacy_tool_calls,
+    )
+    .await;
+    legacy.checkpoints = legacy_checkpoints.log.lock().unwrap().clone();
+    legacy.snapshots = legacy_sessions.log.lock().unwrap().clone();
+
+    let mut native = observe_crash_matrix_resume(
+        barrier.profile.runtime(
+            native_provider.clone(),
+            native_stores.clone(),
+            native_stores.clone(),
+            native_tool_calls.clone(),
+        ),
+        native_provider,
+        injection.target_session,
+        native_tool_calls,
+    )
+    .await;
+    native.checkpoints = materialized_checkpoint_log(&native_stores.protected);
+    native.snapshots = materialized_snapshot_log(&native_stores.ordinary);
+    assert_eq!(
+        native_stores.legacy_saves.load(Ordering::SeqCst),
+        0,
+        "{label}: native resume used a materialized save"
+    );
+    assert_crash_matrix_no_replay(&legacy, &visible, &format!("{label} (legacy)"));
+    assert_crash_matrix_no_replay(&native, &visible, &format!("{label} (native)"));
+    assert_crash_matrix_resume_matches(&native, &legacy, &label);
+}
+
+fn crash_matrix_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(1792 << 10)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// The recorded barrier traces, built once per test process and shared by
+/// every shard (they are immutable submissions; each case replays them into
+/// fresh journals).
+fn crash_matrix_inventory() -> &'static [CrashMatrixBarrier] {
+    static BARRIERS: std::sync::OnceLock<Vec<CrashMatrixBarrier>> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| crash_matrix_runtime().block_on(crash_matrix_barriers()))
+}
+
+/// Task 2.6: every runtime checkpoint state and every ordinary bootstrap,
+/// terminal, fork and idle-compaction publication is replayed through every
+/// physical commit cut plus the three acknowledgement/close variants. Each
+/// case is observed from a fresh reader, continued by a fresh runtime against
+/// the equivalent legacy materialization (with an absolute no-replay check
+/// for indeterminate boundaries), and retried by operation identity on an
+/// independent replay. Continuations run on a normal-size worker so the
+/// matrix does not borrow the test harness thread's stack. One test per
+/// barrier lets the harness run barriers in parallel.
+fn run_crash_matrix_barrier(label: &str) {
+    let barrier = crash_matrix_inventory()
+        .iter()
+        .find(|barrier| barrier.label == label)
+        .unwrap_or_else(|| panic!("crash-matrix barrier {label} is not in the inventory"))
+        .clone();
+    let runtime = crash_matrix_runtime();
+    let role = barrier.trace[barrier.target].role;
+    let mut cases = 0usize;
+    for case in crash_matrix_cases(role) {
+        let continuation = barrier.clone();
+        runtime
+            .block_on(runtime.spawn(async move {
+                assert_crash_matrix_continuation(&continuation, case).await;
+            }))
+            .unwrap();
+        let retry = barrier.clone();
+        runtime
+            .block_on(runtime.spawn(async move {
+                assert_crash_matrix_retry(&retry, case).await;
+            }))
+            .unwrap();
+        cases += 1;
+    }
+    println!("TASK 2.6 MATRIX barrier={label} role={role:?} cases={cases} results=pass");
+}
+
+macro_rules! crash_matrix_barrier_tests {
+    ($($(#[$meta:meta])* $name:ident => $label:literal;)+) => {
+        #[allow(clippy::vec_init_then_push)]
+        fn crash_matrix_barrier_test_labels() -> Vec<&'static str> {
+            let mut labels = Vec::new();
+            $($(#[$meta])* labels.push($label);)+
+            labels
+        }
+        $(
+            $(#[$meta])*
+            #[test]
+            fn $name() {
+                run_crash_matrix_barrier($label);
+            }
+        )+
+    };
+}
+
+crash_matrix_barrier_tests! {
+    task_2_6_crash_matrix_accepted => "accepted";
+    task_2_6_crash_matrix_internal_accepted => "internal_accepted";
+    task_2_6_crash_matrix_local_action_accepted => "local_action_accepted";
+    task_2_6_crash_matrix_local_action_prepared => "local_action_prepared";
+    task_2_6_crash_matrix_local_action_executing => "local_action_executing";
+    task_2_6_crash_matrix_local_action_outcome_ready => "local_action_outcome_ready";
+    task_2_6_crash_matrix_local_action_result_ready => "local_action_result_ready";
+    task_2_6_crash_matrix_planning => "planning";
+    task_2_6_crash_matrix_calling_model => "calling_model";
+    task_2_6_crash_matrix_model_response_ready => "model_response_ready";
+    task_2_6_crash_matrix_awaiting_approval => "awaiting_approval";
+    task_2_6_crash_matrix_awaiting_interaction => "awaiting_interaction";
+    task_2_6_crash_matrix_tool_outcome_ready => "tool_outcome_ready";
+    task_2_6_crash_matrix_executing_tools => "executing_tools";
+    task_2_6_crash_matrix_completing => "completing";
+    task_2_6_crash_matrix_publishing_terminal => "publishing_terminal";
+    task_2_6_crash_matrix_terminal => "terminal";
+    task_2_6_crash_matrix_cache_operation_prepared => "cache_operation_prepared";
+    task_2_6_crash_matrix_cache_operation_started => "cache_operation_started";
+    task_2_6_crash_matrix_cache_operation_result_ready => "cache_operation_result_ready";
+    task_2_6_crash_matrix_cache_operation_terminal => "cache_operation_terminal";
+    #[cfg(feature = "external-agent")]
+    task_2_6_crash_matrix_external_tool_call => "external_tool_call";
+    task_2_6_crash_matrix_bootstrap => "bootstrap";
+    task_2_6_crash_matrix_ordinary_terminal_projection => "ordinary_terminal_projection";
+    task_2_6_crash_matrix_ordinary_persist => "ordinary_persist";
+    task_2_6_crash_matrix_fork_intent => "fork_intent";
+    task_2_6_crash_matrix_fork_child_seed => "fork_child_seed";
+    task_2_6_crash_matrix_fork_parent_supersession => "fork_parent_supersession";
+    task_2_6_crash_matrix_idle_compaction_exact => "idle_compaction_exact";
+    task_2_6_crash_matrix_idle_compaction_projection => "idle_compaction_projection";
+}
+
+/// The barrier inventory the shards above must cover exactly: a barrier the
+/// writer starts emitting, or a shard naming a barrier that no longer exists,
+/// fails here instead of silently leaving the matrix.
+#[test]
+fn task_2_6_native_barrier_crash_and_ambiguous_write_matrix() {
+    let barriers = crash_matrix_inventory();
+    assert_eq!(
+        barriers.len(),
+        if cfg!(feature = "external-agent") {
+            30
+        } else {
+            29
+        }
+    );
+    let inventory = barriers
+        .iter()
+        .map(|barrier| barrier.label.as_str())
+        .collect::<BTreeSet<_>>();
+    let tested = crash_matrix_barrier_test_labels();
+    assert_eq!(tested.len(), barriers.len(), "duplicate barrier test");
+    assert_eq!(
+        tested.into_iter().collect::<BTreeSet<_>>(),
+        inventory,
+        "every inventoried barrier needs exactly one crash-matrix test"
+    );
+    let cases = barriers
+        .iter()
+        .map(|barrier| crash_matrix_cases(barrier.trace[barrier.target].role).len())
+        .sum::<usize>();
+    assert_eq!(
+        cases,
+        if cfg!(feature = "external-agent") {
+            293
+        } else {
+            283
+        }
+    );
+    println!(
+        "TASK 2.6 MATRIX barriers={} distinct_cases={cases}",
+        barriers.len()
+    );
+}
+
+/// Fails the `target`-th commit attempt across both native domains at
+/// `point` while the writer process stays alive, so the runtime's own commit
+/// path (renew, head-advance check, same-operation recommit) sees the error.
+#[derive(Debug)]
+struct LiveCommitFault {
+    attempts: AtomicUsize,
+    target: usize,
+    point: JournalCommitFailurePoint,
+}
+
+impl LiveCommitFault {
+    fn fired(&self) -> bool {
+        self.attempts.load(Ordering::SeqCst) > self.target
+    }
+}
+
+#[derive(Debug)]
+struct LiveFaultJournal {
+    inner: Arc<Materializing>,
+    fault: Arc<LiveCommitFault>,
+}
+
+#[async_trait]
+impl SessionJournal for LiveFaultJournal {
+    fn storage_id(&self) -> JournalStorageId {
+        self.inner.storage_id()
+    }
+    async fn open(
+        &self,
+        session: &SessionId,
+        request: JournalOpen,
+    ) -> Result<JournalLease, RuntimeError> {
+        self.inner.open(session, request).await
+    }
+    async fn read(
+        &self,
+        lease: &JournalLease,
+        object: &JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.inner.read(lease, object).await
+    }
+    async fn commit(
+        &self,
+        lease: &JournalLease,
+        batch: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        if self.fault.attempts.fetch_add(1, Ordering::SeqCst) == self.fault.target {
+            self.inner.inner.fail_next_commit_at(self.fault.point)?;
+        }
+        self.inner.commit(lease, batch).await
+    }
+    async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        self.inner.renew(lease).await
+    }
+    async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+        self.inner.close(lease).await
+    }
+    async fn retire(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        self.inner.retire(session, expected).await
+    }
+    async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        self.inner.collect(request).await
+    }
+}
+
+#[derive(Debug)]
+struct LiveFaultStores {
+    ordinary: Arc<LiveFaultJournal>,
+    protected: Arc<LiveFaultJournal>,
+    legacy_saves: AtomicUsize,
+}
+
+impl LiveFaultStores {
+    fn new(pair: &Pair, fault: Arc<LiveCommitFault>) -> Arc<Self> {
+        Arc::new(Self {
+            ordinary: Arc::new(LiveFaultJournal {
+                inner: pair.native.ordinary.clone(),
+                fault: fault.clone(),
+            }),
+            protected: Arc::new(LiveFaultJournal {
+                inner: pair.native.protected.clone(),
+                fault,
+            }),
+            legacy_saves: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionStore for LiveFaultStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for LiveFaultStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+    async fn load_latest(&self, _: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        Ok(None)
+    }
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The legacy counterpart of a failed native commit: the `target`-th save
+/// across both stores returns the reference backend's injected error and
+/// stores nothing, so both paths see the same failure at the same barrier.
+#[derive(Debug)]
+struct FailingLegacyStores {
+    sessions: Arc<LegacySessions>,
+    checkpoints: Arc<LegacyCheckpoints>,
+    attempts: AtomicUsize,
+    target: usize,
+}
+
+impl FailingLegacyStores {
+    fn fail(&self) -> bool {
+        self.attempts.fetch_add(1, Ordering::SeqCst) == self.target
+    }
+}
+
+fn live_injected_failure() -> RuntimeError {
+    use agent_runtime::core::error::{FailureComponent, FailureStage};
+    RuntimeError::internal("injected journal commit failure")
+        .with_class(FailureClass::HostComponent {
+            stage: FailureStage::PreProvider,
+            component: FailureComponent::Checkpoint,
+        })
+        .retryable()
+}
+
+#[async_trait]
+impl SessionStore for FailingLegacyStores {
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        self.sessions.load(id).await
+    }
+    async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+        if self.fail() {
+            return Err(live_injected_failure());
+        }
+        self.sessions.save(snapshot).await
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for FailingLegacyStores {
+    async fn load_latest(&self, id: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        self.checkpoints.load_latest(id).await
+    }
+    async fn save(&self, checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        if self.fail() {
+            return Err(live_injected_failure());
+        }
+        self.checkpoints.save(checkpoint).await
+    }
+}
+
+/// Runs one drive to completion on a local task so a drive that panics on
+/// the injected failure (they unwrap) is observed as an outcome, not a test
+/// abort. A hang is a failure.
+async fn live_drive(
+    label: &str,
+    drive: Drive,
+    runtime: Runtime,
+    id: SessionId,
+) -> Option<Vec<SessionSnapshot>> {
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(async move {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                tokio::task::spawn_local(drive(runtime, id)),
+            )
+            .await
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label}: drive did not finish"));
+    outcome.ok()
+}
+
+struct LiveScenario {
+    label: &'static str,
+    first: fn() -> Phase,
+    second: fn() -> Phase,
+}
+
+fn live_ambiguity_scenarios() -> Vec<LiveScenario> {
+    vec![
+        LiveScenario {
+            label: "plain",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: two_turns,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "internal",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: internal_turn,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "tools",
+            first: || Phase {
+                provider: tool_provider,
+                configure: tools,
+                drive: tools_and_local,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "interaction",
+            first: || Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: answered_interaction_turn,
+            },
+            second: || Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: resume_and_continue,
+            },
+        },
+        LiveScenario {
+            label: "cache",
+            first: || Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: cache_turns,
+            },
+            second: || Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: resume_and_continue,
+            },
+        },
+        LiveScenario {
+            label: "bootstrap",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: create_only,
+            },
+            second: continue_phase,
+        },
+        LiveScenario {
+            label: "fork",
+            first: || Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: fork_summary,
+            },
+            second: || Phase {
+                provider: continuation,
+                configure: plain,
+                drive: resume_child,
+            },
+        },
+    ]
+}
+
+/// Lost acknowledgement at commit `target`: the live runtime must resolve it
+/// through its own renew/operation-identity path to the original head, so the
+/// whole run equals an undisturbed legacy run (no failure, no second
+/// transition, no extra or missing barrier).
+async fn assert_live_lost_acknowledgement(scenario: &LiveScenario, target: usize) {
+    let label = format!("{}/lost-ack@{target}", scenario.label);
+    let id = SessionId::new(format!("live-{}", scenario.label));
+    let pair = Pair::new(identity);
+    let fault = Arc::new(LiveCommitFault {
+        attempts: AtomicUsize::new(0),
+        target,
+        point: JournalCommitFailurePoint::AfterCommit,
+    });
+    let stores = LiveFaultStores::new(&pair, fault.clone());
+    let first = (scenario.first)();
+    let legacy = (first.drive)(
+        pair.legacy_runtime((first.provider)(), first.configure),
+        id.clone(),
+    )
+    .await;
+    let native = (first.drive)(
+        build(
+            (first.provider)(),
+            stores.clone(),
+            stores.clone(),
+            first.configure,
+        ),
+        id,
+    )
+    .await;
+    assert!(fault.fired(), "{label}: the fault never fired");
+    assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0, "{label}");
+    pair.assert_barriers_match(&label);
+    assert_same(&native, &legacy, &format!("{label}: live snapshots"));
+}
+
+/// Commit `target` fails before its visibility point while the process lives:
+/// the runtime must not publish it under a fresh identity or report success.
+/// The run, every barrier it does publish, and a fresh runtime's resume and
+/// continuation must equal legacy with the same save failing.
+async fn assert_live_failed_commit(scenario: &LiveScenario, target: usize) {
+    let label = format!("{}/failed@{target}", scenario.label);
+    let id = SessionId::new(format!("live-{}", scenario.label));
+    let pair = Pair::new(identity);
+    let fault = Arc::new(LiveCommitFault {
+        attempts: AtomicUsize::new(0),
+        target,
+        point: JournalCommitFailurePoint::AfterIdempotency,
+    });
+    let stores = LiveFaultStores::new(&pair, fault.clone());
+    let legacy_stores = Arc::new(FailingLegacyStores {
+        sessions: pair.legacy_sessions.clone(),
+        checkpoints: pair.legacy_checkpoints.clone(),
+        attempts: AtomicUsize::new(0),
+        target,
+    });
+    let first = (scenario.first)();
+    let legacy = live_drive(
+        &label,
+        first.drive,
+        build(
+            (first.provider)(),
+            legacy_stores.clone(),
+            legacy_stores.clone(),
+            first.configure,
+        ),
+        id.clone(),
+    )
+    .await;
+    let native = live_drive(
+        &label,
+        first.drive,
+        build(
+            (first.provider)(),
+            stores.clone(),
+            stores.clone(),
+            first.configure,
+        ),
+        id.clone(),
+    )
+    .await;
+    assert!(fault.fired(), "{label}: the fault never fired");
+    assert_eq!(
+        native.is_some(),
+        legacy.is_some(),
+        "{label}: live outcome differs"
+    );
+    if let (Some(native), Some(legacy)) = (&native, &legacy) {
+        assert_same(native, legacy, &format!("{label}: live snapshots"));
+    }
+    assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0, "{label}");
+    if pair.legacy_sessions.log.lock().unwrap().is_empty()
+        && pair.legacy_checkpoints.log.lock().unwrap().is_empty()
+    {
+        // The failed commit was the scenario's first: neither path published.
+        assert!(
+            pair.submission_trace().is_empty(),
+            "{label}: native published"
+        );
+    } else {
+        pair.assert_barriers_match(&format!("{label}/live"));
+    }
+    pair.crash(&id);
+
+    let second = (scenario.second)();
+    let legacy = live_drive(
+        &label,
+        second.drive,
+        pair.legacy_runtime((second.provider)(), second.configure),
+        id.clone(),
+    )
+    .await;
+    let native = live_drive(
+        &label,
+        second.drive,
+        pair.native_runtime((second.provider)(), second.configure),
+        id,
+    )
+    .await;
+    assert_eq!(
+        native.is_some(),
+        legacy.is_some(),
+        "{label}: resumed outcome differs"
+    );
+    if pair.legacy_sessions.log.lock().unwrap().is_empty()
+        && pair.legacy_checkpoints.log.lock().unwrap().is_empty()
+    {
+        assert!(
+            pair.submission_trace().is_empty(),
+            "{label}: native published"
+        );
+    } else {
+        pair.assert_barriers_match(&format!("{label}/resumed"));
+    }
+    if let (Some(native), Some(legacy)) = (&native, &legacy) {
+        assert_same(native, legacy, &format!("{label}: resumed snapshots"));
+    }
+}
+
+/// Task 2.6, ambiguous outcomes resolved by the live writer: at every commit
+/// of the scenario, a lost acknowledgement (the commit landed) and a failed
+/// commit (it did not) are returned to the running runtime itself, so its
+/// renew / head-advance / same-operation recommit path decides the outcome.
+/// Every failing commit index is reported, not only the first.
+async fn run_live_ambiguity_scenario(label: &str) {
+    use futures_util::FutureExt;
+    let scenario = live_ambiguity_scenarios()
+        .into_iter()
+        .find(|scenario| scenario.label == label)
+        .unwrap_or_else(|| panic!("unknown live-ambiguity scenario {label}"));
+    let first = (scenario.first)();
+    let pair = Pair::new(identity);
+    (first.drive)(
+        pair.native_runtime((first.provider)(), first.configure),
+        SessionId::new(format!("live-{}", scenario.label)),
+    )
+    .await;
+    let commits = pair.submission_trace().len();
+    assert!(commits > 0, "{label}: no commits");
+    let mut failures = Vec::new();
+    for target in 0..commits {
+        let lost =
+            std::panic::AssertUnwindSafe(assert_live_lost_acknowledgement(&scenario, target))
+                .catch_unwind()
+                .await;
+        if lost.is_err() {
+            failures.push(format!("lost-ack@{target}"));
+        }
+        let failed = std::panic::AssertUnwindSafe(assert_live_failed_commit(&scenario, target))
+            .catch_unwind()
+            .await;
+        if failed.is_err() {
+            failures.push(format!("failed@{target}"));
+        }
+    }
+    assert!(failures.is_empty(), "{label}: failing cases {failures:?}");
+    println!(
+        "TASK 2.6 LIVE-AMBIGUITY scenario={label} commits={commits} cases={} results=pass",
+        commits * 2
+    );
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_plain() {
+    run_live_ambiguity_scenario("plain").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_internal() {
+    run_live_ambiguity_scenario("internal").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_tools() {
+    run_live_ambiguity_scenario("tools").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_interaction() {
+    run_live_ambiguity_scenario("interaction").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_cache() {
+    run_live_ambiguity_scenario("cache").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_bootstrap() {
+    run_live_ambiguity_scenario("bootstrap").await;
+}
+
+#[tokio::test]
+async fn task_2_6_runtime_resolves_ambiguous_commits_fork() {
+    run_live_ambiguity_scenario("fork").await;
+}
+
+/// Task 2.8 evidence: a checkpoint materialized from a native head is the
+/// same *bytes* a legacy `CheckpointStore` receives for that boundary, not
+/// only an equal value (`PartialEq` would accept `0.0` for `-0.0`). Every
+/// protected and ordinary barrier of several scenarios is compared as
+/// serialized JSON, and each native checkpoint is schema 3 and re-serializes
+/// to the same bytes after a typed round trip.
+#[tokio::test]
+async fn task_2_8_materialized_checkpoint_bytes_equal_legacy_at_every_barrier() {
+    let scenarios: Vec<(&str, Phase, Phase)> = vec![
+        (
+            "bytes-plain",
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: two_turns,
+            },
+            continue_phase(),
+        ),
+        (
+            "bytes-tools",
+            Phase {
+                provider: tool_provider,
+                configure: tools,
+                drive: tools_and_local,
+            },
+            continue_phase(),
+        ),
+        (
+            "bytes-interaction",
+            Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: answered_interaction_turn,
+            },
+            Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: resume_and_continue,
+            },
+        ),
+        (
+            "bytes-cache",
+            Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: cache_turns,
+            },
+            Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: resume_and_continue,
+            },
+        ),
+        (
+            "bytes-fork",
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: fork_summary,
+            },
+            Phase {
+                provider: continuation,
+                configure: plain,
+                drive: resume_child,
+            },
+        ),
+    ];
+    let mut compared = 0usize;
+    let mut states = BTreeSet::new();
+    for (label, first, second) in scenarios {
+        let pair = equivalent(label, identity, first, second).await;
+        let legacy = pair.legacy_checkpoints.log.lock().unwrap().clone();
+        let native = materialized_checkpoint_log(&pair.native.protected);
+        assert_eq!(native.len(), legacy.len(), "{label}");
+        for (index, (native, legacy)) in native.iter().zip(&legacy).enumerate() {
+            let native_bytes = serde_json::to_vec(native).unwrap();
+            assert_eq!(
+                native_bytes,
+                serde_json::to_vec(legacy).unwrap(),
+                "{label}: checkpoint {index} ({}) bytes",
+                state_tag(native)
+            );
+            assert_eq!(native.schema_version, 3, "{label}: checkpoint {index}");
+            let decoded: TurnCheckpoint = serde_json::from_slice(&native_bytes).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&decoded).unwrap(),
+                native_bytes,
+                "{label}: checkpoint {index} round trip"
+            );
+            states.insert(state_tag(native));
+            compared += 1;
+        }
+        let legacy = pair.legacy_sessions.log.lock().unwrap().clone();
+        let native = materialized_snapshot_log(&pair.native.ordinary);
+        assert_eq!(native.len(), legacy.len(), "{label}");
+        for (index, (native, legacy)) in native.iter().zip(&legacy).enumerate() {
+            assert_eq!(
+                serde_json::to_vec(native).unwrap(),
+                serde_json::to_vec(legacy).unwrap(),
+                "{label}: ordinary snapshot {index} bytes"
+            );
+            compared += 1;
+        }
+    }
+    println!(
+        "TASK 2.8 BYTES records={compared} checkpoint_states={} states={states:?}",
+        states.len()
+    );
+}
+
+#[derive(Debug, Clone)]
+enum JournalReadFault {
+    Missing(JournalObjectId),
+    Truncated(JournalObjectId),
+    Garbled(JournalObjectId),
+    Replaced {
+        object: JournalObjectId,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug)]
+struct ReadAdversarialJournal {
+    inner: Arc<InMemorySessionJournal>,
+    fault: Mutex<Option<JournalReadFault>>,
+    unpublished_tail: Mutex<Option<Vec<u8>>>,
+}
+
+impl ReadAdversarialJournal {
+    fn new(inner: InMemorySessionJournal) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(inner),
+            fault: Mutex::new(None),
+            unpublished_tail: Mutex::new(None),
+        })
+    }
+
+    fn set_fault(&self, fault: JournalReadFault) {
+        *self.fault.lock().unwrap() = Some(fault);
+    }
+
+    fn restore_verified_bytes(&self) {
+        *self.fault.lock().unwrap() = None;
+    }
+
+    fn append_unpublished_tail(&self, bytes: Vec<u8>) {
+        *self.unpublished_tail.lock().unwrap() = Some(bytes);
+    }
+
+    fn repair_unpublished_tail(&self, lease: &JournalLease) -> Result<(), RuntimeError> {
+        if lease.writer_epoch().is_none() {
+            return Err(RuntimeError::conflict(
+                "unpublished-tail repair requires the writer fence",
+            ));
+        }
+        *self.unpublished_tail.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SessionJournal for ReadAdversarialJournal {
+    fn storage_id(&self) -> JournalStorageId {
+        self.inner.storage_id()
+    }
+
+    async fn open(
+        &self,
+        session: &SessionId,
+        request: JournalOpen,
+    ) -> Result<JournalLease, RuntimeError> {
+        self.inner.open(session, request).await
+    }
+
+    async fn read(
+        &self,
+        lease: &JournalLease,
+        object: &JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let fault = self.fault.lock().unwrap().clone();
+        match fault {
+            Some(JournalReadFault::Missing(target)) if target == *object => Err(
+                RuntimeError::conflict("published journal object is missing"),
+            ),
+            Some(JournalReadFault::Truncated(target)) if target == *object => {
+                let mut bytes = self.inner.read(lease, object).await?;
+                bytes.pop();
+                Ok(bytes)
+            }
+            Some(JournalReadFault::Garbled(target)) if target == *object => {
+                let mut bytes = self.inner.read(lease, object).await?;
+                let first = bytes
+                    .first_mut()
+                    .ok_or_else(|| RuntimeError::conflict("published object is empty"))?;
+                *first ^= 0x5a;
+                Ok(bytes)
+            }
+            Some(JournalReadFault::Replaced {
+                object: target,
+                bytes,
+            }) if target == *object => Ok(bytes),
+            _ => self.inner.read(lease, object).await,
+        }
+    }
+
+    async fn commit(
+        &self,
+        lease: &JournalLease,
+        batch: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        self.inner.commit(lease, batch).await
+    }
+
+    async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        self.inner.renew(lease).await
+    }
+
+    async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+        self.inner.close(lease).await
+    }
+
+    async fn retire(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        self.inner.retire(session, expected).await
+    }
+
+    async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        self.inner.collect(request).await
+    }
+}
+
+#[derive(Debug)]
+struct CorruptionStores {
+    ordinary: Arc<ReadAdversarialJournal>,
+    protected: Arc<ReadAdversarialJournal>,
+    stale_snapshot: Mutex<Option<SessionSnapshot>>,
+    stale_checkpoint: Mutex<Option<TurnCheckpoint>>,
+    legacy_saves: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionStore for CorruptionStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+
+    async fn load(&self, session: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(self
+            .stale_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|snapshot| snapshot.id == *session)
+            .cloned())
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for CorruptionStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+
+    async fn load_latest(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        Ok(self
+            .stale_checkpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|checkpoint| checkpoint.session == *session)
+            .cloned())
+    }
+
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct CorruptionFixture {
+    stores: Arc<CorruptionStores>,
+    session: SessionId,
+    expected: SessionSnapshot,
+    ordinary_head: JournalHead,
+    protected_head: JournalHead,
+    ordinary_history: JournalObjectId,
+    protected_history: JournalObjectId,
+    ordinary_batch_bytes: Vec<u8>,
+    protected_batch_bytes: Vec<u8>,
+}
+
+async fn latest_raw_head(
+    journal: &ReadAdversarialJournal,
+    session: &SessionId,
+    label: &str,
+) -> (JournalHead, Vec<u8>) {
+    let nonce = uuid::Uuid::new_v4();
+    let lease = journal
+        .inner
+        .open(
+            session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new(format!("corruption-{label}-{nonce}")),
+                pin: JournalPinId::new(format!("corruption-{label}-{nonce}")),
+                intent: JournalOpenIntent::ReadOnly,
+            },
+        )
+        .await
+        .unwrap();
+    let head = lease.head().expect("seeded native head").clone();
+    let batch = journal.inner.read(&lease, &head.batch).await.unwrap();
+    journal.inner.close(lease).await.unwrap();
+    (head, batch)
+}
+
+async fn corruption_fixture(label: &str) -> CorruptionFixture {
+    let session = SessionId::new(format!("corruption-{label}"));
+    let ordinary = ReadAdversarialJournal::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new(format!("corruption-ordinary-{label}")),
+        Arc::new(IdentityJournalProjection),
+    ));
+    let protected = ReadAdversarialJournal::new(InMemorySessionJournal::protected(
+        JournalStorageId::new(format!("corruption-protected-{label}")),
+    ));
+    let stores = Arc::new(CorruptionStores {
+        ordinary,
+        protected,
+        stale_snapshot: Mutex::new(None),
+        stale_checkpoint: Mutex::new(None),
+        legacy_saves: AtomicUsize::new(0),
+    });
+    let runtime = build(text_turns(), stores.clone(), stores.clone(), plain);
+    let handle = runtime
+        .start_session(StartSession::create(session.clone(), Vec::new()))
+        .await
+        .unwrap();
+    handle.run(UserInput::text("first turn")).await.unwrap();
+    let ordinary_stale = crash_matrix_domain_view(
+        &stores.ordinary.inner,
+        JournalRole::Ordinary,
+        &session,
+        "corruption stale ordinary",
+    )
+    .await
+    .expect("first ordinary head");
+    let protected_stale = crash_matrix_domain_view(
+        &stores.protected.inner,
+        JournalRole::Protected,
+        &session,
+        "corruption stale protected",
+    )
+    .await
+    .expect("first protected head");
+    *stores.stale_snapshot.lock().unwrap() = Some(match ordinary_stale.materialized {
+        Materialized::Snapshot(snapshot) => *snapshot,
+        Materialized::Checkpoint(_) => unreachable!(),
+    });
+    *stores.stale_checkpoint.lock().unwrap() = Some(match protected_stale.materialized {
+        Materialized::Checkpoint(checkpoint) => *checkpoint,
+        Materialized::Snapshot(_) => unreachable!(),
+    });
+    handle.run(UserInput::text("second turn")).await.unwrap();
+    let expected = handle.snapshot();
+    handle.shutdown().await.unwrap();
+    let (ordinary_head, ordinary_batch_bytes) =
+        latest_raw_head(&stores.ordinary, &session, "ordinary").await;
+    let (protected_head, protected_batch_bytes) =
+        latest_raw_head(&stores.protected, &session, "protected").await;
+    let ordinary_history = ordinary_head
+        .snapshot
+        .history
+        .root
+        .clone()
+        .expect("ordinary history root");
+    let protected_history = protected_head
+        .snapshot
+        .history
+        .root
+        .clone()
+        .expect("protected history root");
+    CorruptionFixture {
+        stores,
+        session,
+        expected,
+        ordinary_head,
+        protected_head,
+        ordinary_history,
+        protected_history,
+        ordinary_batch_bytes,
+        protected_batch_bytes,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommittedCorruptionCase {
+    TruncatedLastObject,
+    GarbledLastObject,
+    TruncatedBatch,
+    GarbledBatch,
+    MissingReferencedObject,
+    CorruptReferencedObject,
+    DigestMismatch,
+    CorruptOrdinaryProjection,
+}
+
+impl CommittedCorruptionCase {
+    const ALL: [Self; 8] = [
+        Self::TruncatedLastObject,
+        Self::GarbledLastObject,
+        Self::TruncatedBatch,
+        Self::GarbledBatch,
+        Self::MissingReferencedObject,
+        Self::CorruptReferencedObject,
+        Self::DigestMismatch,
+        Self::CorruptOrdinaryProjection,
+    ];
+}
+
+fn arm_committed_corruption(fixture: &CorruptionFixture, case: CommittedCorruptionCase) {
+    match case {
+        CommittedCorruptionCase::TruncatedLastObject => {
+            fixture
+                .stores
+                .protected
+                .set_fault(JournalReadFault::Truncated(
+                    fixture.protected_history.clone(),
+                ))
+        }
+        CommittedCorruptionCase::GarbledLastObject => fixture
+            .stores
+            .protected
+            .set_fault(JournalReadFault::Garbled(fixture.protected_history.clone())),
+        CommittedCorruptionCase::TruncatedBatch => {
+            fixture
+                .stores
+                .protected
+                .set_fault(JournalReadFault::Truncated(
+                    fixture.protected_head.batch.clone(),
+                ))
+        }
+        CommittedCorruptionCase::GarbledBatch => fixture.stores.ordinary.set_fault(
+            JournalReadFault::Garbled(fixture.ordinary_head.batch.clone()),
+        ),
+        CommittedCorruptionCase::MissingReferencedObject => fixture
+            .stores
+            .protected
+            .set_fault(JournalReadFault::Missing(fixture.protected_history.clone())),
+        // Distinct from `GarbledLastObject` (the history root): the head's
+        // referenced checkpoint object itself is corrupt.
+        CommittedCorruptionCase::CorruptReferencedObject => {
+            fixture
+                .stores
+                .protected
+                .set_fault(JournalReadFault::Garbled(
+                    fixture
+                        .protected_head
+                        .checkpoint
+                        .clone()
+                        .expect("protected head references a checkpoint"),
+                ))
+        }
+        CommittedCorruptionCase::DigestMismatch => {
+            fixture
+                .stores
+                .protected
+                .set_fault(JournalReadFault::Replaced {
+                    object: fixture.protected_history.clone(),
+                    bytes: fixture.protected_batch_bytes.clone(),
+                })
+        }
+        CommittedCorruptionCase::CorruptOrdinaryProjection => {
+            fixture
+                .stores
+                .ordinary
+                .set_fault(JournalReadFault::Replaced {
+                    object: fixture.ordinary_history.clone(),
+                    bytes: fixture.ordinary_batch_bytes.clone(),
+                })
+        }
+    }
+}
+
+fn assert_state_conflict(error: &RuntimeError, label: &str) {
+    assert!(
+        matches!(error.class, FailureClass::StateConflict { .. }),
+        "{label}: expected StateConflict, got {error:?}"
+    );
+}
+
+/// Published closure corruption is never repaired by selecting a retained
+/// predecessor or the deliberately retained stale v3 pair. The only supported
+/// repair is a host-verified byte restoration; after that repair the latest
+/// exact content materializes without loss and without provider work.
+#[test]
+fn task_2_6_committed_corruption_fails_closed_without_stale_fallback() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(1792 << 10)
+        .enable_all()
+        .build()
+        .unwrap();
+    for case in CommittedCorruptionCase::ALL {
+        runtime
+            .block_on(runtime.spawn(async move {
+                let label = format!("{case:?}");
+                let fixture = corruption_fixture(&label).await;
+                arm_committed_corruption(&fixture, case);
+                let provider = continuation();
+                let result = build(
+                    provider.clone(),
+                    fixture.stores.clone(),
+                    fixture.stores.clone(),
+                    plain,
+                )
+                .start_session(StartSession::resume(fixture.session.clone()))
+                .await;
+                let error = result.expect_err("committed corruption must fail closed");
+                assert_state_conflict(&error, &label);
+                assert!(
+                    provider.requests().is_empty(),
+                    "{label}: corruption fallback reached provider I/O"
+                );
+                assert_eq!(
+                    fixture.stores.legacy_saves.load(Ordering::SeqCst),
+                    0,
+                    "{label}: native corruption fell back to legacy writes"
+                );
+
+                fixture.stores.ordinary.restore_verified_bytes();
+                fixture.stores.protected.restore_verified_bytes();
+                let repaired_provider = continuation();
+                let repaired = build(
+                    repaired_provider.clone(),
+                    fixture.stores.clone(),
+                    fixture.stores.clone(),
+                    plain,
+                )
+                .start_session(StartSession::resume(fixture.session.clone()))
+                .await
+                .unwrap_or_else(|error| panic!("{label}: verified repair failed: {error:?}"));
+                let repaired_snapshot = repaired.snapshot();
+                assert_eq!(
+                    repaired_snapshot.id, fixture.expected.id,
+                    "{label}: session"
+                );
+                assert_eq!(
+                    repaired_snapshot.history, fixture.expected.history,
+                    "{label}: history content"
+                );
+                assert_eq!(
+                    repaired_snapshot.usage, fixture.expected.usage,
+                    "{label}: usage content"
+                );
+                assert_eq!(
+                    repaired_snapshot.extension_state, fixture.expected.extension_state,
+                    "{label}: extension content"
+                );
+                assert_eq!(
+                    repaired_snapshot.manifests, fixture.expected.manifests,
+                    "{label}: manifest content"
+                );
+                assert!(
+                    repaired_snapshot.identity.event >= fixture.expected.identity.event,
+                    "{label}: resume moved an identity floor backwards"
+                );
+                assert!(
+                    repaired_provider.requests().is_empty(),
+                    "{label}: terminal repair repeated provider work"
+                );
+                repaired.shutdown().await.unwrap();
+                let ordinary = crash_matrix_domain_view(
+                    &fixture.stores.ordinary.inner,
+                    JournalRole::Ordinary,
+                    &fixture.session,
+                    &format!("{label}: repaired ordinary cold read"),
+                )
+                .await
+                .unwrap();
+                let protected = crash_matrix_domain_view(
+                    &fixture.stores.protected.inner,
+                    JournalRole::Protected,
+                    &fixture.session,
+                    &format!("{label}: repaired protected cold read"),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(ordinary.materialized, Materialized::Snapshot(_)));
+                assert!(matches!(
+                    protected.materialized,
+                    Materialized::Checkpoint(_)
+                ));
+            }))
+            .unwrap();
+    }
+    println!("TASK 2.6 CORRUPTION committed_cases=8 results=fail-closed+repaired");
+}
+
+/// The adversarial adapter's unpublished trailing frame is outside the
+/// published closure. Readers keep returning the exact head; trimming the tail
+/// is allowed only while holding the exclusive writer fence.
+#[test]
+fn task_2_6_unpublished_torn_tail_requires_fenced_trim() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(1792 << 10)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(runtime.spawn(async {
+            let fixture = corruption_fixture("unpublished-tail").await;
+            fixture
+                .stores
+                .ordinary
+                .append_unpublished_tail(br#"{\"length\":99,\"partial\":"#.to_vec());
+
+            let read_nonce = uuid::Uuid::new_v4();
+            let reader = fixture
+                .stores
+                .ordinary
+                .open(
+                    &fixture.session,
+                    JournalOpen {
+                        root: JournalRootSelection::Latest,
+                        expected_revision: None,
+                        operation: JournalOperationId::new(format!("tail-reader-{read_nonce}")),
+                        pin: JournalPinId::new(format!("tail-reader-{read_nonce}")),
+                        intent: JournalOpenIntent::ReadOnly,
+                    },
+                )
+                .await
+                .unwrap();
+            let error = fixture
+                .stores
+                .ordinary
+                .repair_unpublished_tail(&reader)
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Conflict);
+            fixture.stores.ordinary.close(reader).await.unwrap();
+
+            let provider = continuation();
+            let resumed = build(
+                provider.clone(),
+                fixture.stores.clone(),
+                fixture.stores.clone(),
+                plain,
+            )
+            .start_session(StartSession::resume(fixture.session.clone()))
+            .await
+            .unwrap();
+            let resumed_snapshot = resumed.snapshot();
+            assert_eq!(resumed_snapshot.id, fixture.expected.id);
+            assert_eq!(resumed_snapshot.history, fixture.expected.history);
+            assert_eq!(resumed_snapshot.usage, fixture.expected.usage);
+            assert_eq!(
+                resumed_snapshot.extension_state,
+                fixture.expected.extension_state
+            );
+            assert_eq!(resumed_snapshot.manifests, fixture.expected.manifests);
+            assert!(provider.requests().is_empty());
+            resumed.shutdown().await.unwrap();
+
+            let nonce = uuid::Uuid::new_v4();
+            let writer = fixture
+                .stores
+                .ordinary
+                .open(
+                    &fixture.session,
+                    JournalOpen {
+                        root: JournalRootSelection::Latest,
+                        expected_revision: None,
+                        operation: JournalOperationId::new(format!("tail-writer-{nonce}")),
+                        pin: JournalPinId::new(format!("tail-writer-{nonce}")),
+                        intent: JournalOpenIntent::ExclusiveWriter,
+                    },
+                )
+                .await
+                .unwrap();
+            fixture
+                .stores
+                .ordinary
+                .repair_unpublished_tail(&writer)
+                .unwrap();
+            fixture.stores.ordinary.close(writer).await.unwrap();
+            assert!(
+                fixture
+                    .stores
+                    .ordinary
+                    .unpublished_tail
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            );
+        }))
+        .unwrap();
+    println!("TASK 2.6 TORN-TAIL unpublished_cases=1 results=prior-head+fenced-trim");
 }

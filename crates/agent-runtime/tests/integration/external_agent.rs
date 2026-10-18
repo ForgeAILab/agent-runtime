@@ -590,6 +590,51 @@ fn dispatch_builder(backend: Arc<ScriptedBackend>) -> RuntimeBuilder {
         .external_agent(backend)
 }
 
+pub(crate) fn task_2_6_external_recovery_config(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder.external_agent(ScriptedBackend::new(vec![vec![
+        ExternalAgentEvent::Text {
+            text: "external recovery continuation".into(),
+        },
+        ExternalAgentEvent::Completed,
+    ]]))
+}
+
+pub(crate) async fn task_2_6_external_tool_call_trace()
+-> Vec<crate::session_journal_equivalence::SubmittedCommit> {
+    use crate::session_journal_equivalence::{Pair, identity};
+    let pair = Pair::new(identity);
+    let id = agent_runtime_core::ids::SessionId::new("matrix-external-tool-call");
+    for native in [false, true] {
+        let backend = ScriptedBackend::steps(vec![
+            DispatchStep::Call("count", json!({"n": 1})),
+            text("external complete"),
+            completed(),
+        ]);
+        let tool = CountingTool::new("count");
+        let mut builder = dispatch_builder(backend)
+            .clock(Arc::new(crate::session_journal_equivalence::FixedClock))
+            .tool(tool);
+        if native {
+            builder = builder
+                .session_store(pair.native.clone())
+                .checkpoint_store(pair.native.clone());
+        } else {
+            builder = builder
+                .session_store(pair.legacy_sessions.clone())
+                .checkpoint_store(pair.legacy_checkpoints.clone());
+        }
+        let runtime = builder.build().unwrap();
+        let session = runtime
+            .start_session(StartSession::create(id.clone(), Vec::new()))
+            .await
+            .unwrap();
+        session.run(UserInput::text("external turn")).await.unwrap();
+        session.shutdown().await.unwrap();
+    }
+    pair.assert_barriers_match("task-2.6-external-tool-call");
+    pair.submission_trace()
+}
+
 async fn collect_terminal(
     events: &mut agent_runtime::runtime::RuntimeEventStream,
 ) -> Vec<agent_runtime_core::event::EventEnvelope> {

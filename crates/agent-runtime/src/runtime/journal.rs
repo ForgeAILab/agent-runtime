@@ -1054,10 +1054,29 @@ fn transition_delta(
             manifest_references: Vec::new(),
         });
     };
-    if previous.id != next.id || previous.history.len() > next.history.len() {
+    if previous.id != next.id {
         return Err(RuntimeError::conflict(
             "native journal history did not advance by append",
         ));
+    }
+    if previous.history.len() > next.history.len() {
+        // A shorter history can never be an append. It is reached when the
+        // stored projection ran ahead of the exact boundary (an input saved
+        // after a failed terminal publication) and terminal republication
+        // restores the boundary's canonical history, exactly as a legacy
+        // `SessionStore::save` overwrites it. Submit it as one complete
+        // replacement instead of refusing it, which would wedge the session
+        // at a non-terminal checkpoint on every resume.
+        return Ok(JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(next.clone())),
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        });
     }
     let prefix = &next.history[..previous.history.len()];
     let appended = if previous_submitted {

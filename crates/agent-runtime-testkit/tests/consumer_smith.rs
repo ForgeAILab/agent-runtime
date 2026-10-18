@@ -45,6 +45,21 @@ async fn smith_adapter_passes_shared_conformance() {
 }
 
 #[tokio::test]
+async fn smith_schema_guard_accepts_a_checkpoint_materialized_from_a_native_head() {
+    agent_runtime_testkit::conformance::journal::assert_native_materialized_checkpoint_schema_guard(
+        |bytes| {
+            let value: serde_json::Value =
+                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+            match value.get("schema_version").and_then(serde_json::Value::as_u64) {
+                Some(3) if value.get("snapshot").is_some() => Ok(()),
+                other => Err(format!("Smith accepts only materialized schema 3, got {other:?}")),
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn smith_adapter_consumes_typed_steering_without_a_future_turn() {
     let observer = RecordingObserver::shared();
     let provider = Arc::new(scenarios::SteeringBarrierProvider::new(vec![

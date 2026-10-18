@@ -561,7 +561,9 @@ impl InMemorySessionJournal {
             ),
         };
         let mut snapshot = match (current_snapshot, &commit.delta.bootstrap) {
-            (None, Some(snapshot))
+            // An initial bootstrap, or a complete replacement of an existing
+            // head (see `JournalTransitionDelta::bootstrap`).
+            (_, Some(snapshot))
                 if commit.delta.history_append.is_empty()
                     && commit.delta.usage_append.is_empty()
                     && commit.delta.extension_updates.is_empty()

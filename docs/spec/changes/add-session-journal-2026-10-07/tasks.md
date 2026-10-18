@@ -58,7 +58,65 @@ all applicable gates, not merely contract merge.
   to the exact head (`ordinary_repair_requires_the_exact_head_to_be_the_v3_import`).
   Added refusal-parity, raw-ordinary projection, racing-import and
   advanced-exact repair tests.
-- [ ] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
+- [x] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
+  Evidence (2026-10-18, revised in review):
+  The crash matrix (`task_2_6_crash_matrix_<barrier>`, one test per barrier;
+  `task_2_6_native_barrier_crash_and_ambiguous_write_matrix` is its inventory
+  tripwire) covers all 22 all-feature `TurnState` checkpoint tags plus
+  ordinary bootstrap, terminal projection, shutdown persist, fork intent/child
+  seed/parent supersession and both idle-compaction publications: 30
+  barriers, 293 distinct cases. Each barrier is crashed after every physical
+  commit step of the reference backend (`AfterObjects`, checkpoint (protected
+  only), batch, pin, head, idempotency, and `AfterCommit` with a lost
+  acknowledgement), before submission, after an acknowledged commit, and after
+  an acknowledged commit plus pin close. The reference backend stages every
+  step on a private copy and publishes at one point, so every pre-visibility
+  cut is observably "before" and is a regression guard for that atomicity
+  (a backend publishing the head before its batch, or before its idempotency
+  record, fails these rows). Every case reopens through a fresh reader,
+  accepts only the complete before/after boundary with cold-encoded roots,
+  continues on a 1.75-MiB worker against legacy resume (same provider
+  requests, tool calls and later barriers) with an absolute no-replay check
+  for `calling_model`/`cache_operation_started` (no provider request before
+  the next input) and `executing_tools`/`local_action_executing` (no tool
+  re-execution), and retries the same operation to the original head. The
+  first version of this matrix counted 678 rows by crossing every cut with
+  two "ambiguous" outcomes that ignored the cut (a plain commit and no
+  commit), never reached the runtime's own commit path, and compared resume
+  only against legacy, so a replay in shared resume code passed.
+
+  Ambiguous outcomes seen by the live writer are
+  `task_2_6_runtime_resolves_ambiguous_commits_{plain,internal,tools,interaction,cache,bootstrap,fork}`:
+  at every commit of each scenario (125 commits, 250 cases) the running
+  runtime receives a lost acknowledgement (the commit landed; its
+  renew/head-advance/same-operation recommit must reach the original head
+  and the whole run must equal undisturbed legacy) or a failed pre-visibility
+  commit (the run, its published barriers, a fresh resume and continuation
+  must equal legacy with the same save failing). This found a production
+  defect (fixed): after a failed terminal publication followed by a saved
+  input, terminal republication on resume had a shorter history than the
+  ordinary head and the writer refused it as a non-append, wedging the
+  session; it is now submitted as a complete replacement. The ordinary-only
+  hard-admission path keeps its 18-row matrix with the real LCM store/model
+  (6 distinct cuts plus the two cut-independent outcomes, renew blocked so
+  the fresh process resolves). Durable child rebind remains covered by its
+  existing fresh-process native/legacy conformance test, not by matrix rows;
+  resume-time repaired-successor and start-time namespace-replacement saves
+  (`runtime/engine.rs`) have no dedicated row.
+
+  `task_2_6_committed_corruption_fails_closed_without_stale_fallback` covers
+  truncated/garbled history objects and batches, a missing history object, a
+  corrupt referenced checkpoint object, digest substitution and a corrupt
+  ordinary projection beside a valid exact head. All eight return explicit
+  `StateConflict` before provider I/O and refuse both a retained predecessor
+  and a deliberately retained stale v3 pair; restoring verified backend bytes
+  recovers the latest exact content with cold roots and no lost history,
+  usage, extension or manifest data. No runtime path trims or rolls back. The
+  unpublished torn-tail row only illustrates the `SessionJournal::read`
+  rustdoc rule (trim only under a writer fence): the volatile backend has no
+  physical frame tail, the adapter never exposes the tail bytes, and the
+  fence check is the adapter's own; a file/database adapter must enforce it
+  itself, and no conformance test can.
 - [x] 2.7 Count serialized submission/new-object bytes at N=100/1000/4000 (and 10000 when the cache-identity limit permits) and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.
   Evidence (implementation measurement, 2026-10-18; exact bytes, each cell is
   `serialized submission / new immutable-object bytes`): the pre-change
@@ -205,7 +263,25 @@ all applicable gates, not merely contract merge.
   `calling_model` 261 ms (full request validation), ordinary terminal 1.34 s
   (decode for the host policy) versus 13 ms for a commit with no changed
   record; see `design.md`.
-- [ ] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
+- [x] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
+  Decision (2026-10-18, confirmed in review): no new materialized tag is
+  needed. Native schema 4 is confined to journal heads, objects and reference
+  envelopes; `JournalReader` reconstructs and validates the unchanged schema-3
+  `TurnCheckpoint`. `task_2_8_materialized_checkpoint_bytes_equal_legacy_at_every_barrier`
+  shows the materialized bytes equal the bytes a legacy `CheckpointStore`
+  receives at every barrier of five scenarios (159 records, 20 checkpoint
+  states; serialized JSON, not only `PartialEq`) and survive a typed round
+  trip. The checkpoint DTO/validation has no persisted-contract diff between
+  released `v0.5.0`, `v0.6.0`, `v0.6.1` and this decision, so no released
+  reader sees a byte it could not already receive from the legacy path. The
+  Smith, Nyx and Open Forge consumer rows apply *hypothetical* strict JSON
+  guards (schema 3, inline `snapshot`, no `snapshot_roots`); they are not the
+  consumers' code. Open Forge's actual adapter deserializes the typed
+  `TurnCheckpoint` of a pinned pre-`v0.2.0` runtime revision, which predates
+  this release window; that compatibility question is the same for legacy
+  writes and is unaffected by the native writer. The existing warning
+  against downgrading a migrated native store remains, but no reader-first
+  materialized schema or additional CHANGELOG rollback limit is required.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)
 

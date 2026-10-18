@@ -486,7 +486,10 @@ pub struct JournalBoundary {
 pub struct JournalTransitionDelta {
     /// Boundary evidence, never inferred from content hashes.
     pub boundary: JournalBoundary,
-    /// Complete initial snapshot on bootstrap/import only.
+    /// Complete snapshot on bootstrap/import, or a complete replacement of an
+    /// existing head whose history cannot be expressed as an append (a shorter
+    /// history). With it, every append/update/reference field is empty; the
+    /// ordinary role projects it under host policy like a bootstrap.
     pub bootstrap: Option<Box<SessionSnapshot>>,
     /// Newly appended canonical messages.
     pub history_append: Vec<Message>,
