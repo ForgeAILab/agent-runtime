@@ -17,8 +17,9 @@ contain breaking changes and are coordinated with consumer proposals.
   legacy path overwrote the projection and continued. The writer now submits
   such a history as one complete replacement (`JournalTransitionDelta::bootstrap`
   over an existing head), which `InMemorySessionJournal` accepts and projects
-  like a bootstrap. Ordinary journal adapters should accept the same
-  replacement; one that still rejects it fails closed as before.
+  like a bootstrap. `assert_ordinary_session_journal_conformance` now requires
+  ordinary journal adapters to accept the same replacement; one that still
+  rejects it fails closed as before.
 
 ## [0.6.2] - 2026-10-18
 
