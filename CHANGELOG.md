@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-18
+
 ### Fixed
 
 - Gemini Interactions no longer rejects history that holds an unsigned
