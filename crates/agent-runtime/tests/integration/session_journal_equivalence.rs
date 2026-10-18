@@ -1805,3 +1805,105 @@ async fn review_ordinary_head_after_lost_exact_domain_fails_closed() {
         .unwrap_err();
     assert!(error.message.contains("no longer exposes"), "{error:?}");
 }
+
+fn changed_prompt(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder.system_prompt("a different system prompt after restart")
+}
+
+/// A crash while the provider call is in flight leaves CallingModel as the
+/// exact boundary. On resume (the default `Resume` policy) both paths must
+/// behave identically, and any re-issued call must use the frozen request
+/// read back from references, not a request replanned under the restarted
+/// runtime's changed system prompt.
+#[tokio::test]
+async fn review_crash_at_calling_model_resumes_the_frozen_request_like_legacy() {
+    let pair = Pair::new(identity);
+    let id = SessionId::new("review-calling-model-crash");
+    let mut observed = Vec::new();
+    for native in [false, true] {
+        let first = blocking_provider();
+        let runtime = if native {
+            pair.native_runtime(first.clone(), plain)
+        } else {
+            pair.legacy_runtime(first.clone(), plain)
+        };
+        let session = runtime
+            .start_session(StartSession::create(id.clone(), Vec::new()))
+            .await
+            .unwrap();
+        let _turn = session.send(UserInput::text("frozen input")).unwrap();
+        for _ in 0..400 {
+            if !first.requests().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(first.requests().len(), 1, "native={native}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        std::mem::forget(session);
+        std::mem::forget(runtime);
+        if native {
+            pair.crash(&id);
+        }
+
+        let second = provider(vec![reply("resumed reply"), reply("again")]);
+        let fresh = if native {
+            pair.native_runtime(second.clone(), changed_prompt)
+        } else {
+            pair.legacy_runtime(second.clone(), changed_prompt)
+        };
+        let resumed = fresh
+            .start_session(StartSession::resume(id.clone()))
+            .await
+            .unwrap();
+        let terminal = |pair: &Pair| {
+            if native {
+                matches!(
+                    pair.native.protected.log.lock().unwrap().last(),
+                    Some(Materialized::Checkpoint(checkpoint)) if checkpoint.state.is_terminal()
+                )
+            } else {
+                pair.legacy_checkpoints
+                    .log
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|checkpoint| checkpoint.state.is_terminal())
+            }
+        };
+        for _ in 0..400 {
+            if terminal(&pair) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(terminal(&pair), "native={native}: resumed turn never ended");
+        observed.push((second.requests(), resumed.snapshot()));
+        resumed.shutdown().await.unwrap();
+    }
+    pair.assert_barriers_match("calling-model-crash");
+    let frozen = pair
+        .legacy_checkpoints
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|checkpoint| match &checkpoint.state {
+            TurnState::CallingModel { request, .. } => Some(request.clone()),
+            _ => None,
+        })
+        .expect("a CallingModel boundary was published");
+    let (native_requests, native_snapshot) = observed.pop().unwrap();
+    let (legacy_requests, legacy_snapshot) = observed.pop().unwrap();
+    assert_same(&native_snapshot, &legacy_snapshot, "calling-model resumed");
+    assert_eq!(native_requests, legacy_requests);
+    // An in-flight model call is indeterminate: neither path replays it, so
+    // the restarted runtime's changed prompt is never planned for it.
+    assert!(native_requests.is_empty(), "{native_requests:?}");
+    assert!(frozen.messages.iter().all(|message| {
+        message.content.iter().all(|part| {
+            part.as_text()
+                .is_none_or(|text| !text.contains("after restart"))
+        })
+    }));
+}
