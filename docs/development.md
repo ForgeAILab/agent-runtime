@@ -9,10 +9,10 @@ manifest MUST NOT require a sibling relative path to this repository.
 ```toml
 # In a consumer Cargo.toml — pin an exact release.
 [dependencies]
-agent-runtime = "=0.5.0"
+agent-runtime = "=0.6.0"
 
 # Or, before a registry release exists, pin an exact revision:
-# agent-runtime = { git = "https://example.invalid/agent-runtime", tag = "v0.5.0" }
+# agent-runtime = { git = "https://example.invalid/agent-runtime", tag = "v0.6.0" }
 ```
 
 ## Local cross-repository development (uncommitted override)
