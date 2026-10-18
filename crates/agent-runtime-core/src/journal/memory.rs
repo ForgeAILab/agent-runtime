@@ -402,10 +402,16 @@ impl InMemorySessionJournal {
         };
         snapshot.identity = commit.batch.snapshot.identity.clone();
         snapshot.updated = commit.batch.snapshot.updated;
+        // The base of an append is the previously *projected* view, which may
+        // have omitted Sensitive namespaces that the exact candidate roots still
+        // count. Extension cardinality is therefore comparable only on bootstrap;
+        // the ordered history/usage/manifest counts are policy-preserved.
+        let bootstrap = commit.delta.bootstrap.is_some();
         if &snapshot.id != session
             || snapshot.history.len() as u64 != commit.batch.snapshot.history.len
             || snapshot.usage.records().len() as u64 != commit.batch.snapshot.usage.len
-            || snapshot.extension_state.len() as u64 != commit.batch.snapshot.extensions.len
+            || (bootstrap
+                && snapshot.extension_state.len() as u64 != commit.batch.snapshot.extensions.len)
             || snapshot.manifests.len() as u64 != commit.batch.snapshot.manifests.len
         {
             return Err(conflict());

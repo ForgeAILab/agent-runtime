@@ -92,6 +92,7 @@ where
 pub async fn assert_session_journal_reference_conformance() {
     assert_session_journal_conformance(|| async { reference_fixture() }).await;
     assert_ordinary_projection_conformance().await;
+    assert_ordinary_append_after_omission().await;
 }
 
 fn reference_fixture() -> SessionJournalConformanceFixture {
@@ -654,6 +655,70 @@ async fn assert_ordinary_projection_conformance() {
     rejecting.close(lease).await.unwrap();
 }
 
+/// A redacting policy may omit a Sensitive extension namespace. Later raw
+/// candidates still carry that namespace in their exact roots, so ordinary
+/// appends must keep working after the omission.
+async fn assert_ordinary_append_after_omission() {
+    let policy = |mut snapshot: SessionSnapshot| {
+        for message in &mut snapshot.history {
+            *message = Message::user("[redacted]");
+        }
+        snapshot.extension_state.remove("sensitive.fixture");
+        Ok(snapshot)
+    };
+    let journal: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new("reference-ordinary-append"),
+        Arc::new(policy),
+    ));
+    let session = SessionId::new("ordinary-append-session");
+    let lease = open_writer(&*journal, &session, None, "ordinary-append").await;
+    let epoch = lease.writer_epoch().unwrap();
+    let mut raw = basic_snapshot(session.clone(), "first raw body", Timestamp(1));
+    raw.extension_state.insert(
+        "sensitive.fixture".to_owned(),
+        VersionedSessionState::new(
+            RegistryRevision::new("sensitive-v1"),
+            serde_json::json!({"secret":"do not persist raw"}),
+        ),
+    );
+    let (bootstrap, _) = bootstrap_from_snapshot(raw.clone(), epoch, "ordinary-append-1", None);
+    let first = journal.commit(&lease, bootstrap).await.unwrap();
+    assert_eq!(first.snapshot.extensions.len, 0);
+
+    raw.history.push(Message::user("second raw body"));
+    raw.updated = Timestamp(2);
+    let append = append_from_snapshot(
+        &raw,
+        epoch,
+        &first,
+        "ordinary-append-2",
+        vec![Message::user("second raw body")],
+        BTreeMap::new(),
+    );
+    let second = journal.commit(&lease, append).await.unwrap();
+    assert_eq!(second.revision, JournalRevision(2));
+    assert_eq!(second.snapshot.history.len, 2);
+    assert_eq!(second.snapshot.extensions.len, 0);
+    journal.close(lease).await.unwrap();
+
+    let reader = open_reader(
+        &*journal,
+        &session,
+        Some(second.revision),
+        "ordinary-append",
+    )
+    .await;
+    let materialized = JournalReader::new(&*journal, &reader, LIMITS)
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(materialized.history, vec![Message::user("[redacted]"); 2]);
+    assert!(materialized.extension_state.is_empty());
+    journal.close(reader).await.unwrap();
+}
+
 async fn open_writer(
     journal: &dyn SessionJournal,
     session: &SessionId,
@@ -839,6 +904,57 @@ fn append_commit(
             history_append: vec![Message::user(appended)],
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            manifests_append: Vec::new(),
+        },
+        checkpoint: None,
+    };
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+/// Builds a non-bootstrap commit whose exact roots describe `snapshot` and
+/// whose typed delta carries only the given changes.
+fn append_from_snapshot(
+    snapshot: &SessionSnapshot,
+    writer_epoch: u64,
+    current: &JournalHead,
+    operation: &str,
+    history_append: Vec<Message>,
+    extension_updates: BTreeMap<String, Option<VersionedSessionState>>,
+) -> JournalCommit {
+    let mut assembler = Assembler::default();
+    let roots = assembler.snapshot(snapshot, snapshot.manifests.len() as u64);
+    let boundary = JournalBoundary {
+        version: 1,
+        session: snapshot.id.clone(),
+        turn: None,
+        checkpoint_sequence: 0,
+        planned_step_count: roots.planned_step_count,
+    };
+    let mut commit = JournalCommit {
+        batch: JournalBatch {
+            session: snapshot.id.clone(),
+            sequence: current.batch_sequence + 1,
+            predecessor: Some(JournalDigest::parse(current.batch.as_str()).unwrap()),
+            expected_revision: Some(current.revision),
+            writer_epoch,
+            operation: JournalOperationId::new(operation),
+            boundary: boundary.clone(),
+            snapshot: roots,
+            checkpoint: None,
+        },
+        digest: zero_digest(),
+        objects: assembler
+            .objects
+            .into_iter()
+            .map(|(id, (_, bytes))| JournalObject { id, bytes })
+            .collect(),
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: None,
+            history_append,
+            usage_append: Vec::new(),
+            extension_updates,
             manifests_append: Vec::new(),
         },
         checkpoint: None,
@@ -1174,6 +1290,11 @@ mod tests {
     #[tokio::test]
     async fn ordinary_projection_precedes_object_hashing() {
         super::assert_ordinary_projection_conformance().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_appends_continue_after_policy_omits_an_extension() {
+        super::assert_ordinary_append_after_omission().await;
     }
 
     #[tokio::test]
