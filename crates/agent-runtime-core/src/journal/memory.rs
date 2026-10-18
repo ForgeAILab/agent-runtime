@@ -3220,6 +3220,84 @@ mod structured_json_tests {
         assert!(head.snapshot == ObjectAssembler::default().snapshot(&current, 0).unwrap());
     }
 
+    /// Host policy output can change between commits for records the commit
+    /// did not touch (a namespace revoked, a value now redacted). The backend
+    /// cache is keyed on the projected value, so the new policy output is what
+    /// gets stored, never the previously verified encoding.
+    #[tokio::test]
+    async fn a_policy_change_between_commits_is_applied_to_unchanged_records() {
+        use std::sync::atomic::AtomicBool;
+        let strict = Arc::new(AtomicBool::new(false));
+        let policy_strict = Arc::clone(&strict);
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("policy-change"),
+            Arc::new(move |mut snapshot: SessionSnapshot| {
+                if policy_strict.load(Ordering::SeqCst) {
+                    snapshot.extension_state.remove("host.revoked");
+                    if let Some(state) = snapshot.extension_state.get_mut("host.redacted") {
+                        state.value = json!("[redacted]");
+                    }
+                    for message in &mut snapshot.history {
+                        *message = Message::user("[redacted]");
+                    }
+                }
+                Ok(snapshot)
+            }),
+        );
+        let session = SessionId::new("policy-change");
+        let lease = writer(&journal, &session, "w0").await;
+        let epoch = lease.writer_epoch().unwrap();
+        let mut first = snapshot(&session, 3);
+        for namespace in ["host.revoked", "host.redacted"] {
+            first.extension_state.insert(
+                namespace.to_owned(),
+                VersionedSessionState::new(RegistryRevision::new("host-1"), json!("secret")),
+            );
+        }
+        let head = journal
+            .commit(
+                &lease,
+                commit(
+                    &first,
+                    None,
+                    epoch,
+                    "bootstrap",
+                    Vec::new(),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        strict.store(true, Ordering::SeqCst);
+        let message = Message::user("next");
+        let mut next = first.clone();
+        next.history.push(message.clone());
+        let mut append = commit(
+            &next,
+            Some(&head),
+            epoch,
+            "append",
+            Vec::new(),
+            false,
+            BTreeMap::new(),
+        );
+        append.delta.history_append = vec![message];
+        append.digest = append.input_digest().unwrap();
+        let head = journal.commit(&lease, append).await.unwrap();
+        let mut expected = next;
+        expected.extension_state.remove("host.revoked");
+        expected
+            .extension_state
+            .get_mut("host.redacted")
+            .unwrap()
+            .value = json!("[redacted]");
+        for message in &mut expected.history {
+            *message = Message::user("[redacted]");
+        }
+        assert!(head.snapshot == ObjectAssembler::default().snapshot(&expected, 0).unwrap());
+    }
+
     /// N reference commits share the unchanged spine; each adds O(log N)
     /// objects, resolves only from this writer's pinned closure (also after
     /// a fresh lease), materializes exactly, and retries idempotently.
