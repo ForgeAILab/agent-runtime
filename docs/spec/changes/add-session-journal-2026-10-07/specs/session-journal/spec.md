@@ -29,9 +29,10 @@ A native commit MUST atomically publish an expected-revision, writer-fenced head
 
 #### Scenario: History length grows with a fixed append
 
-- **WHEN** N=100, 1000 and 10000 histories each receive the same one-message append
+- **WHEN** N=100, 1000 and 4000 histories each receive the same one-message append
 - **THEN** new-body bytes are independent of unchanged-prefix length
 - **AND** counted writes separately report reference paths, changing diagnostics and opaque extension replacements
+- **AND** an attempted N=10000 case is reported as inapplicable while the 4096-entry cache-identity history limit rejects it before provider I/O
 
 ### Requirement: Requests and protected state are referenced exactly
 

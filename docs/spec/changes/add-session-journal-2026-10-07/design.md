@@ -91,6 +91,42 @@ counted writes to prove zero resubmission of an unchanged history prefix,
 ledger prefix and request bodies for N=100/1000/10000. Legacy adapter retains B.
 U9 still allows B_lcm to write a second content copy; U10 removes that copy.
 
+### Task 2.7 implementation refinement (2026-10-18)
+
+The native writer now treats two Runtime-owned, redaction-safe records as
+structured journal data rather than opaque replacement leaves: retained
+`TurnManifest` values and `runtime.core.previous_cache`. Their JSON arrays use
+the existing bounded sequence objects with single-reference leaves and a
+fixed-height binary spine. JSON object entries preserve their order explicitly.
+An append therefore submits only changed scalar/entry objects and one bounded
+root path; materialization still reconstructs the identical public
+`TurnManifest` and `VersionedSessionState` values. Readers still accept the
+schema-4 inline `Manifest`/`Extension` object kinds that group A released, but
+the native writer does not migrate them: no released runtime wrote a native
+head, so a protected head whose roots the writer cannot re-derive exactly fails
+closed as an incompatible store, and an ordinary head in another
+representation is followed by one complete structured submission.
+
+This does **not** change the opaque-extension contract: every other namespace
+remains a whole-value replacement and keeps its full replacement-byte cost.
+The cache namespace is Runtime-owned, declares `RedactionSafe`, and retains the
+same revision, sensitivity, value and cache-identity semantics. Ordinary
+projection must preserve this Runtime-owned value and manifests exactly; it may
+still redact/omit host-owned extension values under the existing policy.
+
+`JournalTransitionDelta` carries references for these structured records.
+Ordinary commits submit their referenced drafts once and carry other changed
+records only in the semantic delta, eliminating the previous draft-plus-delta
+duplication. Protected commits retain exact candidate verification. The
+reference backend resolves draft references only from the current pinned
+closure or the current commit, never from another session's stored objects.
+
+The executed task-2.7 table is in `tasks.md` and `docs/development.md`; raw rows
+are in `/Volumes/Data/tmp/refactor/u9b-3/task-2.7-measurement-1.log`. N=10,000
+cannot exercise a turn: the cache identity's 4,096-entry stable-history limit
+rejects both legacy and native planning before provider I/O. N=4,000 is the
+largest comparable successful case.
+
 ## Exact Trait Diff and Mode Selection
 
 Illustrative Rust signatures below fix names, arguments, return types and

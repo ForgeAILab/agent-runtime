@@ -7,6 +7,29 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** the schema-4 journal vocabulary released in 0.5.0 grows so a
+  native turn costs O(delta). `JournalObjectKind` gains `ExtensionReference`,
+  `ManifestReference`, `JsonValue` and `JsonObjectEntry`, and
+  `JournalTransitionDelta` gains `extension_references` and
+  `manifest_references`, so exhaustive matches and struct literals must add
+  them. The native writer now sends the Runtime-owned
+  `runtime.core.previous_cache` record and new manifests only by reference to
+  persistent JSON drafts: an ordinary `SessionJournal` adapter must resolve
+  them from the commit's drafts or its own pinned closure and store that form
+  under the same object IDs (`assert_ordinary_session_journal_conformance`
+  now checks this; `assert_session_journal_conformance` checks that protected
+  adapters admit and keep shared structured prefixes), and a
+  `JournalProjectionPolicy` that changes or omits
+  those records on a commit that references them rejects the commit.
+
+### Added
+
+- `RUNTIME_PREVIOUS_CACHE_NAMESPACE`, `JournalJsonValue`,
+  `JournalJsonObjectEntry`, `ReferencedSessionState`, `ReferencedTurnManifest`
+  and `InMemorySessionJournal::object_bytes`.
+
 ### Fixed
 
 - Command providers now report stderr overflow deterministically even when stdout and the child process finish first.

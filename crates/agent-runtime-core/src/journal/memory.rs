@@ -34,7 +34,10 @@ static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
 /// message/extension values or omit extension namespaces, but must preserve the
 /// session identity, ordered history/usage/manifest cardinalities, execution
 /// counters and timestamp. Returning an error rejects the whole commit before
-/// raw drafts become visible.
+/// raw drafts become visible. Native structured deltas additionally require
+/// manifests and the Runtime-owned redaction-safe
+/// [`RUNTIME_PREVIOUS_CACHE_NAMESPACE`] value to remain exact; host-owned opaque
+/// extensions retain their whole-value projection/replacement contract.
 pub trait JournalProjectionPolicy: Send + Sync + 'static {
     /// Produces the host-policy view that the ordinary store may encode.
     fn project(&self, snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError>;
@@ -250,6 +253,17 @@ impl InMemorySessionJournal {
         Ok(self.lock()?.objects.len())
     }
 
+    /// Total canonical encoded bytes retained across immutable objects.
+    /// Primarily useful for deterministic cost tests; it exposes no content or IDs.
+    pub fn object_bytes(&self) -> Result<usize, RuntimeError> {
+        self.lock()?
+            .objects
+            .values()
+            .try_fold(0usize, |total, bytes| {
+                total.checked_add(bytes.len()).ok_or_else(conflict)
+            })
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, State>, RuntimeError> {
         self.state.lock().map_err(|_| host_failure())
     }
@@ -384,13 +398,27 @@ impl InMemorySessionJournal {
         session: &SessionId,
         current: &SessionRecord,
         commit: &JournalCommit,
+        supplied: &BTreeMap<JournalObjectId, Vec<u8>>,
+        stored: &BTreeMap<JournalObjectId, Vec<u8>>,
+        reachable: &BTreeSet<JournalObjectId>,
     ) -> Result<ProjectedSnapshot, RuntimeError> {
+        if commit
+            .delta
+            .extension_updates
+            .keys()
+            .any(|key| commit.delta.extension_references.contains_key(key))
+        {
+            return Err(conflict());
+        }
+        let drafts = DraftReader::new(stored, supplied, reachable);
         let mut snapshot = match (&current.ordinary_snapshot, &commit.delta.bootstrap) {
             (None, Some(snapshot))
                 if commit.delta.history_append.is_empty()
                     && commit.delta.usage_append.is_empty()
                     && commit.delta.extension_updates.is_empty()
-                    && commit.delta.manifests_append.is_empty() =>
+                    && commit.delta.extension_references.is_empty()
+                    && commit.delta.manifests_append.is_empty()
+                    && commit.delta.manifest_references.is_empty() =>
             {
                 (**snapshot).clone()
             }
@@ -414,9 +442,24 @@ impl InMemorySessionJournal {
                         }
                     }
                 }
+                for (namespace, value) in &commit.delta.extension_references {
+                    match value {
+                        Some(value) => {
+                            snapshot
+                                .extension_state
+                                .insert(namespace.clone(), drafts.extension(namespace, value)?);
+                        }
+                        None => {
+                            snapshot.extension_state.remove(namespace);
+                        }
+                    }
+                }
                 snapshot
                     .manifests
                     .extend(commit.delta.manifests_append.iter().cloned());
+                for manifest in &commit.delta.manifest_references {
+                    snapshot.manifests.push(drafts.manifest(manifest)?);
+                }
                 let retained =
                     usize::try_from(commit.batch.snapshot.manifests.len).map_err(|_| conflict())?;
                 if snapshot.manifests.len() < retained {
@@ -453,6 +496,29 @@ impl InMemorySessionJournal {
             || projected.history.len() != snapshot.history.len()
             || projected.usage.records().len() != snapshot.usage.records().len()
             || projected.manifests.len() != snapshot.manifests.len()
+        {
+            return Err(conflict());
+        }
+        let structured_manifests = !commit.delta.manifest_references.is_empty()
+            || (bootstrap && !snapshot.manifests.is_empty());
+        if structured_manifests && projected.manifests != snapshot.manifests {
+            return Err(conflict());
+        }
+        let structured_previous_cache = commit
+            .delta
+            .extension_references
+            .contains_key(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+            || (bootstrap
+                && snapshot
+                    .extension_state
+                    .contains_key(RUNTIME_PREVIOUS_CACHE_NAMESPACE));
+        if structured_previous_cache
+            && projected
+                .extension_state
+                .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+                != snapshot
+                    .extension_state
+                    .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
         {
             return Err(conflict());
         }
@@ -637,8 +703,14 @@ impl SessionJournal for InMemorySessionJournal {
         let mut staged = state.clone();
         let mut admitted = lease_record.reachable.clone();
         let ordinary = if self.role == JournalRole::Ordinary {
-            let (snapshot, roots, projected) =
-                self.project_snapshot(lease.session(), &current_session, &commit)?;
+            let (snapshot, roots, projected) = self.project_snapshot(
+                lease.session(),
+                &current_session,
+                &commit,
+                &supplied,
+                &state.objects,
+                &lease_record.reachable,
+            )?;
             for (id, bytes) in projected {
                 admitted.insert(id.clone());
                 Self::add_object(&mut staged.objects, JournalObject { id, bytes })?;
@@ -886,6 +958,105 @@ impl ObjectAssembler {
         trees.pop().ok_or_else(conflict)
     }
 
+    fn structured_sequence(
+        &mut self,
+        items: Vec<JournalObjectId>,
+    ) -> Result<JournalSequence, RuntimeError> {
+        if items.is_empty() {
+            return Ok(JournalSequence::default());
+        }
+        if items.len() <= JOURNAL_FANOUT {
+            let len = items.len() as u64;
+            let root = self.add(
+                JournalObjectKind::Sequence,
+                &JournalSequenceNode::Leaf { items },
+            )?;
+            return Ok(JournalSequence {
+                root: Some(root),
+                len,
+                height: 0,
+            });
+        }
+        let mut trees = Vec::new();
+        // Match the writer's single-reference leaves: changed-path bytes stay
+        // independent of the prior array's partially filled tail.
+        for items in items.chunks(1) {
+            let root = self.add(
+                JournalObjectKind::Sequence,
+                &JournalSequenceNode::Leaf {
+                    items: items.to_vec(),
+                },
+            )?;
+            trees.push(JournalSequence {
+                root: Some(root),
+                len: items.len() as u64,
+                height: 0,
+            });
+        }
+        for _ in 0..JOURNAL_MAX_TREE_HEIGHT {
+            let mut parents = Vec::new();
+            for children in trees.chunks(2) {
+                let root = self.add(
+                    JournalObjectKind::Sequence,
+                    &JournalSequenceNode::Branch {
+                        children: children.to_vec(),
+                    },
+                )?;
+                parents.push(JournalSequence {
+                    root: Some(root),
+                    len: children.iter().map(|child| child.len).sum(),
+                    height: children[0].height.checked_add(1).ok_or_else(conflict)?,
+                });
+            }
+            trees = parents;
+        }
+        if trees.len() != 1 {
+            return Err(conflict());
+        }
+        trees.pop().ok_or_else(conflict)
+    }
+
+    fn structured_object_sequence(
+        &mut self,
+        items: Vec<JournalObjectId>,
+    ) -> Result<JournalSequence, RuntimeError> {
+        if items.is_empty() {
+            return Ok(JournalSequence::default());
+        }
+        let mut trees = Vec::new();
+        for items in items.chunks(JOURNAL_FANOUT) {
+            let root = self.add(
+                JournalObjectKind::Sequence,
+                &JournalSequenceNode::Leaf {
+                    items: items.to_vec(),
+                },
+            )?;
+            trees.push(JournalSequence {
+                root: Some(root),
+                len: items.len() as u64,
+                height: 0,
+            });
+        }
+        while trees.len() > 1 {
+            let mut parents = Vec::new();
+            for children in trees.chunks(JOURNAL_FANOUT) {
+                let root = self.add(
+                    JournalObjectKind::Sequence,
+                    &JournalSequenceNode::Branch {
+                        children: children.to_vec(),
+                    },
+                )?;
+                parents.push(JournalSequence {
+                    root: Some(root),
+                    len: children.iter().map(|child| child.len).sum(),
+                    height: children[0].height.checked_add(1).ok_or_else(conflict)?,
+                });
+            }
+            trees = parents;
+        }
+        trees.pop().ok_or_else(conflict)
+    }
+
     fn map(&mut self, entries: Vec<JournalMapEntry>) -> Result<JournalMap, RuntimeError> {
         if entries.is_empty() {
             return Ok(JournalMap::default());
@@ -939,6 +1110,73 @@ impl ObjectAssembler {
         Ok(trees.pop().ok_or_else(conflict)?.tree)
     }
 
+    fn json_value(&mut self, value: &serde_json::Value) -> Result<JournalObjectId, RuntimeError> {
+        let node = match value {
+            serde_json::Value::Array(values) => {
+                let items = values
+                    .iter()
+                    .map(|value| self.json_value(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                JournalJsonValue::Array {
+                    items: self.structured_sequence(items)?,
+                }
+            }
+            serde_json::Value::Object(values) => {
+                let entries = values
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = self.json_value(value)?;
+                        self.add(
+                            JournalObjectKind::JsonObjectEntry,
+                            &JournalJsonObjectEntry {
+                                key: key.clone(),
+                                value,
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+                JournalJsonValue::Object {
+                    entries: self.structured_object_sequence(entries)?,
+                }
+            }
+            scalar => JournalJsonValue::Scalar {
+                scalar: scalar.clone(),
+            },
+        };
+        self.add(JournalObjectKind::JsonValue, &node)
+    }
+
+    fn extension(
+        &mut self,
+        namespace: &str,
+        value: &crate::store::VersionedSessionState,
+    ) -> Result<JournalObjectId, RuntimeError> {
+        if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+            return self.add(JournalObjectKind::Extension, value);
+        }
+        if value.sensitivity != crate::store::SessionStateSensitivity::RedactionSafe {
+            return Err(conflict());
+        }
+        let value = serde_json::to_value(value).map_err(|_| conflict())?;
+        let value = self.json_value(&value)?;
+        self.add(
+            JournalObjectKind::ExtensionReference,
+            &ReferencedSessionState { value },
+        )
+    }
+
+    fn manifest(
+        &mut self,
+        manifest: &crate::store::TurnManifest,
+    ) -> Result<JournalObjectId, RuntimeError> {
+        let value = serde_json::to_value(manifest).map_err(|_| conflict())?;
+        let value = self.json_value(&value)?;
+        self.add(
+            JournalObjectKind::ManifestReference,
+            &ReferencedTurnManifest { value },
+        )
+    }
+
     fn snapshot(
         &mut self,
         snapshot: &SessionSnapshot,
@@ -961,7 +1199,7 @@ impl ObjectAssembler {
         let manifest_ids = snapshot
             .manifests
             .iter()
-            .map(|manifest| self.add(JournalObjectKind::Manifest, manifest))
+            .map(|manifest| self.manifest(manifest))
             .collect::<Result<Vec<_>, _>>()?;
         let manifests = self.sequence(manifest_ids)?;
         if planned_step_count < manifests.len {
@@ -971,7 +1209,7 @@ impl ObjectAssembler {
         for (key, value) in &snapshot.extension_state {
             entries.push(JournalMapEntry {
                 key: key.clone(),
-                value: self.add(JournalObjectKind::Extension, value)?,
+                value: self.extension(key, value)?,
             });
         }
         let extensions = self.map(entries)?;
@@ -985,6 +1223,175 @@ impl ObjectAssembler {
             identity: snapshot.identity.clone(),
             updated: snapshot.updated,
         })
+    }
+}
+
+/// Resolves candidate structured records from already-projected reachable
+/// objects plus the current commit's drafts. Drafts are never made readable in
+/// the ordinary domain; after host policy runs, only the projected assembler's
+/// objects are installed.
+struct DraftReader<'a> {
+    stored: &'a BTreeMap<JournalObjectId, Vec<u8>>,
+    supplied: &'a BTreeMap<JournalObjectId, Vec<u8>>,
+    reachable: &'a BTreeSet<JournalObjectId>,
+}
+
+impl<'a> DraftReader<'a> {
+    fn new(
+        stored: &'a BTreeMap<JournalObjectId, Vec<u8>>,
+        supplied: &'a BTreeMap<JournalObjectId, Vec<u8>>,
+        reachable: &'a BTreeSet<JournalObjectId>,
+    ) -> Self {
+        Self {
+            stored,
+            supplied,
+            reachable,
+        }
+    }
+
+    fn object<T: serde::de::DeserializeOwned + Serialize>(
+        &self,
+        id: &JournalObjectId,
+        kind: JournalObjectKind,
+    ) -> Result<T, RuntimeError> {
+        let bytes = self
+            .supplied
+            .get(id)
+            .or_else(|| {
+                self.reachable
+                    .contains(id)
+                    .then(|| self.stored.get(id))
+                    .flatten()
+            })
+            .cloned()
+            .ok_or_else(conflict)?;
+        JournalObject {
+            id: id.clone(),
+            bytes,
+        }
+        .decode(kind)
+    }
+
+    fn sequence(&self, sequence: &JournalSequence) -> Result<Vec<JournalObjectId>, RuntimeError> {
+        if (sequence.root.is_none() != (sequence.len == 0))
+            || (sequence.len == 0 && sequence.height != 0)
+            || sequence.height > JOURNAL_MAX_TREE_HEIGHT
+        {
+            return Err(conflict());
+        }
+        let mut pending = vec![sequence.clone()];
+        let mut items = Vec::new();
+        while let Some(tree) = pending.pop() {
+            let Some(root) = tree.root else {
+                continue;
+            };
+            let node: JournalSequenceNode = self.object(&root, JournalObjectKind::Sequence)?;
+            match node {
+                JournalSequenceNode::Leaf { items: leaves } => {
+                    if tree.height != 0
+                        || leaves.is_empty()
+                        || leaves.len() > JOURNAL_FANOUT
+                        || leaves.len() as u64 != tree.len
+                    {
+                        return Err(conflict());
+                    }
+                    items.extend(leaves);
+                }
+                JournalSequenceNode::Branch { children } => {
+                    if tree.height == 0 || children.is_empty() || children.len() > JOURNAL_FANOUT {
+                        return Err(conflict());
+                    }
+                    let mut len = 0u64;
+                    for child in &children {
+                        if child.root.is_none() || child.len == 0 || child.height != tree.height - 1
+                        {
+                            return Err(conflict());
+                        }
+                        len = len.checked_add(child.len).ok_or_else(conflict)?;
+                    }
+                    if len != tree.len {
+                        return Err(conflict());
+                    }
+                    pending.extend(children.into_iter().rev());
+                }
+            }
+            if items.len() as u64 > sequence.len {
+                return Err(conflict());
+            }
+        }
+        if items.len() as u64 != sequence.len {
+            return Err(conflict());
+        }
+        Ok(items)
+    }
+
+    fn json_value(
+        &self,
+        id: &JournalObjectId,
+        depth: u32,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        if depth > JOURNAL_MAX_TREE_HEIGHT {
+            return Err(conflict());
+        }
+        match self.object::<JournalJsonValue>(id, JournalObjectKind::JsonValue)? {
+            JournalJsonValue::Scalar { scalar } => {
+                if scalar.is_array() || scalar.is_object() {
+                    return Err(conflict());
+                }
+                Ok(scalar)
+            }
+            JournalJsonValue::Array { items } => self
+                .sequence(&items)?
+                .into_iter()
+                .map(|item| self.json_value(&item, depth + 1))
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_json::Value::Array),
+            JournalJsonValue::Object { entries } => {
+                let mut values = serde_json::Map::new();
+                for entry in self.sequence(&entries)? {
+                    let entry: JournalJsonObjectEntry =
+                        self.object(&entry, JournalObjectKind::JsonObjectEntry)?;
+                    if values.contains_key(&entry.key) {
+                        return Err(conflict());
+                    }
+                    values.insert(entry.key, self.json_value(&entry.value, depth + 1)?);
+                }
+                Ok(serde_json::Value::Object(values))
+            }
+        }
+    }
+
+    fn extension(
+        &self,
+        namespace: &str,
+        id: &JournalObjectId,
+    ) -> Result<crate::store::VersionedSessionState, RuntimeError> {
+        if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+            return Err(conflict());
+        }
+        let reference: ReferencedSessionState =
+            self.object(id, JournalObjectKind::ExtensionReference)?;
+        let value = self.json_value(&reference.value, 0)?;
+        let state: crate::store::VersionedSessionState =
+            serde_json::from_value(value.clone()).map_err(|_| conflict())?;
+        if state.sensitivity != crate::store::SessionStateSensitivity::RedactionSafe
+            || canonical_journal_json(&state)? != canonical_journal_json(&value)?
+        {
+            return Err(conflict());
+        }
+        Ok(state)
+    }
+
+    fn manifest(&self, id: &JournalObjectId) -> Result<crate::store::TurnManifest, RuntimeError> {
+        let reference: ReferencedTurnManifest =
+            self.object(id, JournalObjectKind::ManifestReference)?;
+        let value = self.json_value(&reference.value, 0)?;
+        let manifest: crate::store::TurnManifest =
+            serde_json::from_value(value.clone()).map_err(|_| conflict())?;
+        if canonical_journal_json(&manifest)? != canonical_journal_json(&value)? {
+            return Err(conflict());
+        }
+        Ok(manifest)
     }
 }
 
@@ -1102,10 +1509,19 @@ fn stored_object(state: &State, id: &JournalObjectId) -> Result<JournalObject, R
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ExpectedObject {
+enum ExpectedLeaf {
     Kind(JournalObjectKind),
-    Sequence(JournalObjectKind),
-    Map(JournalObjectKind),
+    Extension,
+    Manifest,
+    JsonValue,
+    JsonObjectEntry,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExpectedObject {
+    Leaf(ExpectedLeaf),
+    Sequence(ExpectedLeaf),
+    Map(ExpectedLeaf),
 }
 
 fn snapshot_links(snapshot: &JournalSnapshotRoots) -> Vec<(JournalObjectId, ExpectedObject)> {
@@ -1113,19 +1529,19 @@ fn snapshot_links(snapshot: &JournalSnapshotRoots) -> Vec<(JournalObjectId, Expe
     for (root, expected) in [
         (
             &snapshot.history.root,
-            ExpectedObject::Sequence(JournalObjectKind::Message),
+            ExpectedObject::Sequence(ExpectedLeaf::Kind(JournalObjectKind::Message)),
         ),
         (
             &snapshot.usage.root,
-            ExpectedObject::Sequence(JournalObjectKind::UsageRecord),
+            ExpectedObject::Sequence(ExpectedLeaf::Kind(JournalObjectKind::UsageRecord)),
         ),
         (
             &snapshot.extensions.root,
-            ExpectedObject::Map(JournalObjectKind::Extension),
+            ExpectedObject::Map(ExpectedLeaf::Extension),
         ),
         (
             &snapshot.manifests.root,
-            ExpectedObject::Sequence(JournalObjectKind::Manifest),
+            ExpectedObject::Sequence(ExpectedLeaf::Manifest),
         ),
     ] {
         if let Some(root) = root {
@@ -1137,46 +1553,63 @@ fn snapshot_links(snapshot: &JournalSnapshotRoots) -> Vec<(JournalObjectId, Expe
 
 fn sequence_links(
     sequence: &JournalSequence,
-    item_kind: JournalObjectKind,
+    item: ExpectedLeaf,
 ) -> Vec<(JournalObjectId, ExpectedObject)> {
     sequence
         .root
         .iter()
         .cloned()
-        .map(|root| (root, ExpectedObject::Sequence(item_kind)))
+        .map(|root| (root, ExpectedObject::Sequence(item)))
         .collect()
+}
+
+fn expected_matches(expected: ExpectedObject, kind: JournalObjectKind) -> bool {
+    let leaf_matches = |leaf| match leaf {
+        ExpectedLeaf::Kind(expected) => kind == expected,
+        ExpectedLeaf::Extension => matches!(
+            kind,
+            JournalObjectKind::Extension | JournalObjectKind::ExtensionReference
+        ),
+        ExpectedLeaf::Manifest => matches!(
+            kind,
+            JournalObjectKind::Manifest | JournalObjectKind::ManifestReference
+        ),
+        ExpectedLeaf::JsonValue => kind == JournalObjectKind::JsonValue,
+        ExpectedLeaf::JsonObjectEntry => kind == JournalObjectKind::JsonObjectEntry,
+    };
+    match expected {
+        ExpectedObject::Leaf(leaf) => leaf_matches(leaf),
+        ExpectedObject::Sequence(_) => kind == JournalObjectKind::Sequence,
+        ExpectedObject::Map(_) => kind == JournalObjectKind::Map,
+    }
 }
 
 fn object_links(
     object: &JournalObject,
     expected: ExpectedObject,
 ) -> Result<Vec<(JournalObjectId, ExpectedObject)>, RuntimeError> {
-    let expected_kind = match expected {
-        ExpectedObject::Kind(kind) => kind,
-        ExpectedObject::Sequence(_) => JournalObjectKind::Sequence,
-        ExpectedObject::Map(_) => JournalObjectKind::Map,
-    };
-    if object.kind()? != expected_kind {
+    let kind = object.kind()?;
+    if !expected_matches(expected, kind) {
         return Err(conflict());
     }
     let links = match expected {
-        ExpectedObject::Sequence(item_kind) => {
+        ExpectedObject::Sequence(item) => {
             match object.decode::<JournalSequenceNode>(JournalObjectKind::Sequence)? {
                 JournalSequenceNode::Leaf { items } => items
                     .into_iter()
-                    .map(|id| (id, ExpectedObject::Kind(item_kind)))
+                    .map(|id| (id, ExpectedObject::Leaf(item)))
                     .collect(),
                 JournalSequenceNode::Branch { children } => children
                     .iter()
-                    .flat_map(|child| sequence_links(child, item_kind))
+                    .flat_map(|child| sequence_links(child, item))
                     .collect(),
             }
         }
-        ExpectedObject::Map(value_kind) => {
+        ExpectedObject::Map(value) => {
             match object.decode::<JournalMapNode>(JournalObjectKind::Map)? {
                 JournalMapNode::Leaf { entries } => entries
                     .into_iter()
-                    .map(|entry| (entry.value, ExpectedObject::Kind(value_kind)))
+                    .map(|entry| (entry.value, ExpectedObject::Leaf(value)))
                     .collect(),
                 JournalMapNode::Branch { children } => children
                     .into_iter()
@@ -1184,94 +1617,164 @@ fn object_links(
                         child
                             .tree
                             .root
-                            .map(|root| (root, ExpectedObject::Map(value_kind)))
+                            .map(|root| (root, ExpectedObject::Map(value)))
                     })
                     .collect(),
             }
         }
-        ExpectedObject::Kind(JournalObjectKind::Request) => {
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Request)) => {
             let request: ReferencedProviderRequest = object.decode(JournalObjectKind::Request)?;
-            let mut links = sequence_links(&request.messages, JournalObjectKind::Message);
+            let mut links = sequence_links(
+                &request.messages,
+                ExpectedLeaf::Kind(JournalObjectKind::Message),
+            );
             links.extend(sequence_links(
                 &request.tools,
-                JournalObjectKind::ToolSchema,
+                ExpectedLeaf::Kind(JournalObjectKind::ToolSchema),
             ));
             links.push((
                 request.settings,
-                ExpectedObject::Kind(JournalObjectKind::RequestSettings),
+                ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::RequestSettings)),
             ));
             links
         }
-        ExpectedObject::Kind(JournalObjectKind::TurnState) => {
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::TurnState)) => {
             let state: ReferencedTurnState = object.decode(JournalObjectKind::TurnState)?;
             let mut links = Vec::new();
             for value in state.fields.into_values() {
                 match value {
                     JournalStateValue::Object { object } => {
-                        links.push((object, ExpectedObject::Kind(JournalObjectKind::StateValue)));
+                        links.push((
+                            object,
+                            ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::StateValue)),
+                        ));
                     }
                     JournalStateValue::Sequence { sequence } => {
-                        links.extend(sequence_links(&sequence, JournalObjectKind::StateValue));
+                        links.extend(sequence_links(
+                            &sequence,
+                            ExpectedLeaf::Kind(JournalObjectKind::StateValue),
+                        ));
                     }
                     JournalStateValue::Request { object } => {
-                        links.push((object, ExpectedObject::Kind(JournalObjectKind::Request)));
+                        links.push((
+                            object,
+                            ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Request)),
+                        ));
                     }
                 }
             }
             links
         }
-        ExpectedObject::Kind(JournalObjectKind::Checkpoint) => {
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Checkpoint)) => {
             let checkpoint: ReferencedTurnCheckpoint =
                 object.decode(JournalObjectKind::Checkpoint)?;
             let mut links = snapshot_links(&checkpoint.snapshot);
             links.push((
                 checkpoint.state,
-                ExpectedObject::Kind(JournalObjectKind::TurnState),
+                ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::TurnState)),
             ));
             if let Some(input) = checkpoint.internal_input {
                 links.push((
                     input,
-                    ExpectedObject::Kind(JournalObjectKind::InternalInput),
+                    ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::InternalInput)),
                 ));
             }
             links
         }
-        ExpectedObject::Kind(JournalObjectKind::Head) => {
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)) => {
             let head: JournalHead = object.decode(JournalObjectKind::Head)?;
             head.validate()?;
             let mut links = snapshot_links(&head.snapshot);
-            links.push((head.batch, ExpectedObject::Kind(JournalObjectKind::Batch)));
+            links.push((
+                head.batch,
+                ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Batch)),
+            ));
             if let Some(checkpoint) = head.checkpoint {
                 links.push((
                     checkpoint,
-                    ExpectedObject::Kind(JournalObjectKind::Checkpoint),
+                    ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Checkpoint)),
                 ));
             }
             links
         }
-        ExpectedObject::Kind(JournalObjectKind::Batch) => {
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Batch)) => {
             let batch: JournalBatch = object.decode(JournalObjectKind::Batch)?;
             let mut links = snapshot_links(&batch.snapshot);
             if let Some(checkpoint) = batch.checkpoint {
                 links.push((
                     checkpoint,
-                    ExpectedObject::Kind(JournalObjectKind::Checkpoint),
+                    ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Checkpoint)),
                 ));
             }
             links
         }
-        ExpectedObject::Kind(kind @ JournalObjectKind::Message)
-        | ExpectedObject::Kind(kind @ JournalObjectKind::UsageRecord)
-        | ExpectedObject::Kind(kind @ JournalObjectKind::Extension)
-        | ExpectedObject::Kind(kind @ JournalObjectKind::Manifest)
-        | ExpectedObject::Kind(kind @ JournalObjectKind::RequestSettings)
-        | ExpectedObject::Kind(kind @ JournalObjectKind::ToolSchema)
-        | ExpectedObject::Kind(kind @ JournalObjectKind::StateValue)
-        | ExpectedObject::Kind(kind @ JournalObjectKind::InternalInput) => {
+        ExpectedObject::Leaf(ExpectedLeaf::Extension) => match kind {
+            JournalObjectKind::Extension => {
+                validate_leaf(object, kind)?;
+                Vec::new()
+            }
+            JournalObjectKind::ExtensionReference => {
+                let reference: ReferencedSessionState = object.decode(kind)?;
+                vec![(
+                    reference.value,
+                    ExpectedObject::Leaf(ExpectedLeaf::JsonValue),
+                )]
+            }
+            _ => return Err(conflict()),
+        },
+        ExpectedObject::Leaf(ExpectedLeaf::Manifest) => match kind {
+            JournalObjectKind::Manifest => {
+                validate_leaf(object, kind)?;
+                Vec::new()
+            }
+            JournalObjectKind::ManifestReference => {
+                let reference: ReferencedTurnManifest = object.decode(kind)?;
+                vec![(
+                    reference.value,
+                    ExpectedObject::Leaf(ExpectedLeaf::JsonValue),
+                )]
+            }
+            _ => return Err(conflict()),
+        },
+        ExpectedObject::Leaf(ExpectedLeaf::JsonValue) => {
+            match object.decode::<JournalJsonValue>(kind)? {
+                JournalJsonValue::Scalar { scalar } => {
+                    if scalar.is_array() || scalar.is_object() {
+                        return Err(conflict());
+                    }
+                    Vec::new()
+                }
+                JournalJsonValue::Array { items } => {
+                    sequence_links(&items, ExpectedLeaf::JsonValue)
+                }
+                JournalJsonValue::Object { entries } => {
+                    sequence_links(&entries, ExpectedLeaf::JsonObjectEntry)
+                }
+            }
+        }
+        ExpectedObject::Leaf(ExpectedLeaf::JsonObjectEntry) => {
+            let entry: JournalJsonObjectEntry = object.decode(kind)?;
+            vec![(entry.value, ExpectedObject::Leaf(ExpectedLeaf::JsonValue))]
+        }
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::Message))
+        | ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::UsageRecord))
+        | ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::Extension))
+        | ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::Manifest))
+        | ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::RequestSettings))
+        | ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::ToolSchema))
+        | ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::StateValue))
+        | ExpectedObject::Leaf(ExpectedLeaf::Kind(kind @ JournalObjectKind::InternalInput)) => {
             validate_leaf(object, kind)?;
             Vec::new()
         }
-        ExpectedObject::Kind(JournalObjectKind::Sequence | JournalObjectKind::Map) => {
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(
+            JournalObjectKind::Sequence
+            | JournalObjectKind::Map
+            | JournalObjectKind::ExtensionReference
+            | JournalObjectKind::ManifestReference
+            | JournalObjectKind::JsonValue
+            | JournalObjectKind::JsonObjectEntry,
+        )) => {
             return Err(conflict());
         }
     };
@@ -1284,7 +1787,10 @@ fn reachable_closure(
     admitted: Option<&BTreeSet<JournalObjectId>>,
 ) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
     let mut reachable = BTreeSet::new();
-    let mut pending = vec![(root.clone(), ExpectedObject::Kind(JournalObjectKind::Head))];
+    let mut pending = vec![(
+        root.clone(),
+        ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
+    )];
     while let Some((id, expected)) = pending.pop() {
         if admitted.is_some_and(|admitted| !admitted.contains(&id)) {
             return Err(conflict());
@@ -1293,12 +1799,7 @@ fn reachable_closure(
             id: id.clone(),
             bytes: objects.get(&id).cloned().ok_or_else(conflict)?,
         };
-        let expected_kind = match expected {
-            ExpectedObject::Kind(kind) => kind,
-            ExpectedObject::Sequence(_) => JournalObjectKind::Sequence,
-            ExpectedObject::Map(_) => JournalObjectKind::Map,
-        };
-        if object.kind()? != expected_kind {
+        if !expected_matches(expected, object.kind()?) {
             return Err(conflict());
         }
         if !reachable.insert(id) {
@@ -1357,4 +1858,547 @@ fn injected_failure() -> RuntimeError {
             component: FailureComponent::Checkpoint,
         })
         .retryable()
+}
+
+#[cfg(test)]
+mod structured_json_tests {
+    //! Review of U9 task 2.7: the persistent JSON representation of
+    //! Runtime-owned records (`runtime.core.previous_cache`, manifests).
+    use super::*;
+    use crate::content::Message;
+    use crate::store::VersionedSessionState;
+    use agent_runtime_registry::RegistryRevision;
+    use serde_json::{Value, json};
+
+    /// Encodes with the backend assembler and decodes both from the commit's
+    /// drafts and from a pinned stored closure; stored objects outside the
+    /// pinned closure must never resolve.
+    fn round_trip(value: &Value) {
+        let mut assembler = ObjectAssembler::default();
+        let root = assembler.json_value(value).unwrap();
+        let none = BTreeMap::new();
+        let pinned: BTreeSet<_> = assembler.objects.keys().cloned().collect();
+        for reader in [
+            DraftReader::new(&none, &assembler.objects, &BTreeSet::new()),
+            DraftReader::new(&assembler.objects, &none, &pinned),
+        ] {
+            let decoded = reader.json_value(&root, 0).unwrap();
+            assert_eq!(&decoded, value);
+            assert_eq!(
+                canonical_journal_json(&decoded).unwrap(),
+                canonical_journal_json(value).unwrap()
+            );
+        }
+        assert!(
+            DraftReader::new(&assembler.objects, &none, &BTreeSet::new())
+                .json_value(&root, 0)
+                .is_err(),
+            "an unpinned stored object resolved as a draft"
+        );
+        let mut again = ObjectAssembler::default();
+        assert_eq!(
+            again.json_value(value).unwrap(),
+            root,
+            "encoding is deterministic"
+        );
+    }
+
+    const SPINE_BOUNDARIES: [usize; 15] = [
+        0, 1, 2, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4_095, 4_096, 4_097,
+    ];
+
+    #[test]
+    fn persistent_json_round_trips_at_every_spine_boundary() {
+        for len in SPINE_BOUNDARIES {
+            round_trip(&Value::Array((0..len as u64).map(Value::from).collect()));
+            // Equal elements share one node yet keep every position.
+            round_trip(&Value::Array(vec![json!("same"); len]));
+            round_trip(&json!({
+                "entries": (0..len).map(|i| json!({"k": i, "v": [i, {"n": null}]})).collect::<Vec<_>>()
+            }));
+            round_trip(&Value::Object(
+                (0..len)
+                    .map(|i| (format!("key-{i:05}"), json!(i)))
+                    .collect(),
+            ));
+        }
+    }
+
+    #[test]
+    fn values_shaped_like_journal_nodes_remain_plain_data() {
+        let id = "a".repeat(64);
+        for value in [
+            json!({"value": "array", "items": {"root": id, "len": 1, "height": 0}}),
+            json!({"value": "object", "entries": {"root": null, "len": 0, "height": 0}}),
+            json!({"value": "scalar", "scalar": {"value": "scalar", "scalar": [1]}}),
+            json!({"key": "k", "value": id}),
+            json!({
+                "encoding": "journal-json-1",
+                "kind": "json_value",
+                "schema_version": 4,
+                "value": {"value": "scalar", "scalar": 1}
+            }),
+            json!({"items": [id, id], "root": id, "children": [{"root": id}]}),
+            json!([id]),
+            json!(id),
+            json!({"": "", "value": null, "scalar": [], "items": {}, "entries": [[]]}),
+            json!({"\u{e9}\u{0}": "\u{1F600}", "\\": "\""}),
+            json!([[], {}, [[]], [{}], {"a": {"b": [1, {"c": []}]}}]),
+            json!([0, -0.0, 1.5, -1, i64::MIN, u64::MAX, 1e300, 5e-324, 0.1]),
+            Value::Null,
+            json!(true),
+            json!(""),
+        ] {
+            round_trip(&value);
+        }
+    }
+
+    #[test]
+    fn nesting_beyond_the_reader_bound_fails_explicitly() {
+        let nest = |depth: usize| (0..depth).fold(json!(1), |inner, _| json!([inner]));
+        round_trip(&nest(32));
+        let mut assembler = ObjectAssembler::default();
+        let root = assembler.json_value(&nest(40)).unwrap();
+        let none = BTreeMap::new();
+        assert!(
+            DraftReader::new(&none, &assembler.objects, &BTreeSet::new())
+                .json_value(&root, 0)
+                .is_err()
+        );
+    }
+
+    fn cache(items: usize) -> VersionedSessionState {
+        VersionedSessionState::new(
+            RegistryRevision::new("previous-cache-state-1"),
+            json!({"entries": (0..items).map(|i| json!({"index": i, "tag": "e"})).collect::<Vec<_>>()}),
+        )
+        .redaction_safe()
+    }
+
+    fn snapshot(session: &SessionId, items: usize) -> SessionSnapshot {
+        SessionSnapshot {
+            id: session.clone(),
+            history: vec![Message::user("body")],
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: Vec::new(),
+            extension_state: BTreeMap::from([(
+                RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                cache(items),
+            )]),
+            updated: crate::clock::Timestamp(1),
+        }
+    }
+
+    async fn writer(
+        journal: &InMemorySessionJournal,
+        session: &SessionId,
+        pin: &str,
+    ) -> JournalLease {
+        journal
+            .open(
+                session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new(format!("{pin}-open")),
+                    pin: JournalPinId::new(pin),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    fn commit(
+        snapshot: &SessionSnapshot,
+        current: Option<&JournalHead>,
+        epoch: u64,
+        operation: &str,
+        objects: Vec<JournalObject>,
+        bootstrap: bool,
+        extension_references: BTreeMap<String, Option<JournalObjectId>>,
+    ) -> JournalCommit {
+        let mut assembler = ObjectAssembler::default();
+        let roots = assembler.snapshot(snapshot, 0).unwrap();
+        let boundary = JournalBoundary {
+            version: 1,
+            session: snapshot.id.clone(),
+            turn: None,
+            checkpoint_sequence: 0,
+            planned_step_count: 0,
+        };
+        let mut commit = JournalCommit {
+            batch: JournalBatch {
+                session: snapshot.id.clone(),
+                sequence: current.map_or(1, |head| head.batch_sequence + 1),
+                predecessor: current.map(|head| JournalDigest::parse(head.batch.as_str()).unwrap()),
+                expected_revision: current.map(|head| head.revision),
+                writer_epoch: epoch,
+                operation: JournalOperationId::new(operation),
+                boundary: boundary.clone(),
+                snapshot: roots,
+                checkpoint: None,
+            },
+            digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+            objects,
+            delta: JournalTransitionDelta {
+                boundary,
+                bootstrap: bootstrap.then(|| Box::new(snapshot.clone())),
+                history_append: Vec::new(),
+                usage_append: Vec::new(),
+                extension_updates: BTreeMap::new(),
+                extension_references,
+                manifests_append: Vec::new(),
+                manifest_references: Vec::new(),
+            },
+            checkpoint: None,
+        };
+        commit.digest = commit.input_digest().unwrap();
+        commit
+    }
+
+    /// Writer-side drafts for `next`'s cache record, omitting everything the
+    /// writer already published (`known`), exactly as the native writer does.
+    fn cache_drafts(
+        next: &SessionSnapshot,
+        known: &BTreeSet<JournalObjectId>,
+    ) -> (JournalObjectId, Vec<JournalObject>) {
+        let mut assembler = ObjectAssembler::default();
+        let id = assembler
+            .extension(
+                RUNTIME_PREVIOUS_CACHE_NAMESPACE,
+                &next.extension_state[RUNTIME_PREVIOUS_CACHE_NAMESPACE],
+            )
+            .unwrap();
+        let drafts = assembler
+            .objects
+            .into_iter()
+            .filter(|(id, _)| !known.contains(id))
+            .map(|(id, bytes)| JournalObject { id, bytes })
+            .collect();
+        (id, drafts)
+    }
+
+    fn published(snapshot: &SessionSnapshot) -> BTreeSet<JournalObjectId> {
+        let mut assembler = ObjectAssembler::default();
+        assembler.snapshot(snapshot, 0).unwrap();
+        assembler.objects.into_keys().collect()
+    }
+
+    fn refs(id: Option<JournalObjectId>) -> BTreeMap<String, Option<JournalObjectId>> {
+        BTreeMap::from([(RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(), id)])
+    }
+
+    async fn materialized_cache(
+        journal: &InMemorySessionJournal,
+        session: &SessionId,
+    ) -> Option<VersionedSessionState> {
+        let lease = journal
+            .open(
+                session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("read"),
+                    pin: JournalPinId::new("read-pin"),
+                    intent: JournalOpenIntent::ReadOnly,
+                },
+            )
+            .await
+            .unwrap();
+        let limits = JournalReadLimits {
+            objects: 1_000_000,
+            encoded_bytes: 1 << 30,
+            entries: 1_000_000,
+        };
+        let snapshot = JournalReader::new(journal, &lease, limits)
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        journal.close(lease).await.unwrap();
+        snapshot
+            .extension_state
+            .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+            .cloned()
+    }
+
+    /// N reference commits share the unchanged spine; each adds O(log N)
+    /// objects, resolves only from this writer's pinned closure (also after
+    /// a fresh lease), materializes exactly, and retries idempotently.
+    #[tokio::test]
+    async fn ordinary_draft_references_share_a_prefix_across_commits_and_leases() {
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("structured-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let session = SessionId::new("structured");
+        let mut lease = writer(&journal, &session, "w0").await;
+        let base = 300;
+        let first = snapshot(&session, base);
+        let mut head = journal
+            .commit(
+                &lease,
+                commit(
+                    &first,
+                    None,
+                    lease.writer_epoch().unwrap(),
+                    "boot",
+                    Vec::new(),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut known = published(&first);
+        let bootstrap_objects = journal.object_count().unwrap();
+        assert!(bootstrap_objects > 3 * base);
+        for step in 1..=6 {
+            if step == 4 {
+                // A fresh runtime pins, and knows, only the current head.
+                journal.close(lease).await.unwrap();
+                lease = writer(&journal, &session, "w1").await;
+                known = published(&snapshot(&session, base + step - 1));
+            }
+            let next = snapshot(&session, base + step);
+            let (id, drafts) = cache_drafts(&next, &known);
+            assert!(
+                drafts.len() < 96,
+                "drafts must be O(log N): {}",
+                drafts.len()
+            );
+            let before = journal.object_count().unwrap();
+            let request = commit(
+                &next,
+                Some(&head),
+                lease.writer_epoch().unwrap(),
+                &format!("step-{step}"),
+                drafts,
+                false,
+                refs(Some(id)),
+            );
+            let published_head = journal.commit(&lease, request.clone()).await.unwrap();
+            // An ambiguous-error retry returns the original head.
+            assert_eq!(
+                journal.commit(&lease, request).await.unwrap(),
+                published_head
+            );
+            head = published_head;
+            let added = journal.object_count().unwrap() - before;
+            assert!(added < 96, "commit {step} stored {added} objects");
+            assert_eq!(
+                materialized_cache(&journal, &session).await,
+                Some(cache(base + step))
+            );
+            known.extend(published(&next));
+        }
+        // Removal by reference.
+        let mut removed = snapshot(&session, 0);
+        removed.extension_state.clear();
+        head = journal
+            .commit(
+                &lease,
+                commit(
+                    &removed,
+                    Some(&head),
+                    lease.writer_epoch().unwrap(),
+                    "remove",
+                    Vec::new(),
+                    false,
+                    refs(None),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.snapshot.extensions.len, 0);
+        assert_eq!(materialized_cache(&journal, &session).await, None);
+    }
+
+    #[tokio::test]
+    async fn draft_references_never_resolve_across_sessions_or_unpinned_objects() {
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("structured-authority"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let alice = SessionId::new("alice");
+        let bob = SessionId::new("bob");
+        let alice_lease = writer(&journal, &alice, "alice").await;
+        let alice_snapshot = snapshot(&alice, 100);
+        journal
+            .commit(
+                &alice_lease,
+                commit(
+                    &alice_snapshot,
+                    None,
+                    alice_lease.writer_epoch().unwrap(),
+                    "alice-boot",
+                    Vec::new(),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let bob_lease = writer(&journal, &bob, "bob").await;
+        let mut bob_snapshot = snapshot(&bob, 0);
+        bob_snapshot.extension_state.clear();
+        let bob_head = journal
+            .commit(
+                &bob_lease,
+                commit(
+                    &bob_snapshot,
+                    None,
+                    bob_lease.writer_epoch().unwrap(),
+                    "bob-boot",
+                    Vec::new(),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        // Bob names Alice's stored cache record without supplying it, and
+        // then supplies only the root wrapper over Alice's stored children.
+        let stolen = snapshot(&bob, 100);
+        let (alice_root, all) = cache_drafts(&stolen, &BTreeSet::new());
+        let wrapper = all
+            .iter()
+            .filter(|object| object.id == alice_root)
+            .cloned()
+            .collect();
+        let before = journal.object_count().unwrap();
+        for (label, drafts) in [("none", Vec::new()), ("wrapper", wrapper)] {
+            let error = journal
+                .commit(
+                    &bob_lease,
+                    commit(
+                        &stolen,
+                        Some(&bob_head),
+                        bob_lease.writer_epoch().unwrap(),
+                        label,
+                        drafts,
+                        false,
+                        refs(Some(alice_root.clone())),
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.message, conflict().message, "{label}");
+        }
+        assert_eq!(journal.object_count().unwrap(), before);
+
+        // Host-owned namespaces cannot use references, a namespace cannot be
+        // both replaced and referenced, and a fenced writer resolves nothing.
+        let (own_root, own) = cache_drafts(&stolen, &BTreeSet::new());
+        let mut host = BTreeMap::from([("host.owned".to_owned(), Some(own_root.clone()))]);
+        let mut request = commit(
+            &stolen,
+            Some(&bob_head),
+            bob_lease.writer_epoch().unwrap(),
+            "host",
+            own.clone(),
+            false,
+            host.clone(),
+        );
+        assert!(journal.commit(&bob_lease, request.clone()).await.is_err());
+        host = refs(Some(own_root.clone()));
+        request = commit(
+            &stolen,
+            Some(&bob_head),
+            bob_lease.writer_epoch().unwrap(),
+            "both",
+            own.clone(),
+            false,
+            host.clone(),
+        );
+        request.delta.extension_updates.insert(
+            RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+            Some(cache(100)),
+        );
+        request.digest = request.input_digest().unwrap();
+        assert!(journal.commit(&bob_lease, request).await.is_err());
+        journal.revoke_writer(&bob).unwrap();
+        request = commit(
+            &stolen,
+            Some(&bob_head),
+            bob_lease.writer_epoch().unwrap(),
+            "fenced",
+            own,
+            false,
+            host,
+        );
+        assert!(journal.commit(&bob_lease, request).await.is_err());
+        assert_eq!(journal.object_count().unwrap(), before);
+    }
+
+    /// Host policy still sees every referenced record: a policy that would
+    /// change the Runtime-owned cache record rejects the commit rather than
+    /// storing the unprojected draft.
+    #[tokio::test]
+    async fn a_policy_change_to_a_referenced_record_rejects_without_storing_drafts() {
+        fn scrub(mut snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
+            if let Some(state) = snapshot
+                .extension_state
+                .get_mut(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+            {
+                if state.value["entries"]
+                    .as_array()
+                    .is_some_and(|entries| entries.len() > 100)
+                {
+                    state.value = json!({"entries": "[redacted]"});
+                }
+            }
+            Ok(snapshot)
+        }
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("structured-policy"),
+            Arc::new(scrub),
+        );
+        let session = SessionId::new("policy");
+        let lease = writer(&journal, &session, "policy").await;
+        let first = snapshot(&session, 100);
+        let head = journal
+            .commit(
+                &lease,
+                commit(
+                    &first,
+                    None,
+                    lease.writer_epoch().unwrap(),
+                    "boot",
+                    Vec::new(),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let next = snapshot(&session, 101);
+        let (id, drafts) = cache_drafts(&next, &published(&first));
+        let before = journal.object_count().unwrap();
+        assert!(
+            journal
+                .commit(
+                    &lease,
+                    commit(
+                        &next,
+                        Some(&head),
+                        lease.writer_epoch().unwrap(),
+                        "scrubbed",
+                        drafts,
+                        false,
+                        refs(Some(id))
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(journal.object_count().unwrap(), before);
+        assert_eq!(
+            materialized_cache(&journal, &session).await,
+            Some(cache(100))
+        );
+    }
 }

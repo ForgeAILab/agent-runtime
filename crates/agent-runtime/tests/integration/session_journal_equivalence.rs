@@ -1306,12 +1306,21 @@ struct Submission {
     state: Option<String>,
     objects: usize,
     object_bytes: usize,
+    /// Logical serialized bytes crossing the journal boundary: object
+    /// envelopes plus semantic delta and batch/checkpoint envelopes.
+    submission_bytes: usize,
+    /// Newly retained immutable objects produced by this commit.
+    new_objects: usize,
+    /// Canonical bytes of newly retained immutable objects.
+    new_object_bytes: usize,
     delta_bytes: usize,
     envelope_bytes: usize,
     history_append: usize,
     bootstrap: bool,
     /// Changed extension namespaces with their replacement bytes.
     extensions: Vec<(String, usize)>,
+    reference_extensions: usize,
+    manifest_references: usize,
     usage_append: usize,
     /// Submitted object bytes of new message/usage bodies.
     body_bytes: usize,
@@ -1351,11 +1360,17 @@ impl SessionJournal for Counting {
         lease: &JournalLease,
         batch: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
-        let state = batch.checkpoint.as_ref().map(|checkpoint| {
+        let before_objects = self.inner.object_count()?;
+        let before_bytes = self.inner.object_bytes()?;
+        let state_id = batch
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.state.clone());
+        let state = state_id.as_ref().and_then(|state| {
             batch
                 .objects
                 .iter()
-                .find(|object| object.id == checkpoint.state)
+                .find(|object| &object.id == state)
                 .map(|object| {
                     object
                         .decode::<agent_runtime::core::journal::ReferencedTurnState>(
@@ -1364,7 +1379,6 @@ impl SessionJournal for Counting {
                         .unwrap()
                         .tag
                 })
-                .unwrap_or_else(|| "unchanged-state".into())
         });
         let mut body_bytes = 0;
         let mut opaque_bytes = 0;
@@ -1379,16 +1393,22 @@ impl SessionJournal for Counting {
         let mut core_delta = batch.delta.clone();
         core_delta.extension_updates.clear();
         core_delta.manifests_append.clear();
-        self.log.lock().unwrap().push(Submission {
+        let object_bytes = batch.objects.iter().map(|object| object.bytes.len()).sum();
+        let delta_bytes = serde_json::to_vec(&batch.delta).unwrap().len();
+        let envelope_bytes = serde_json::to_vec(&batch.batch).unwrap().len()
+            + serde_json::to_vec(&batch.checkpoint).unwrap().len();
+        let mut submission = Submission {
             body_bytes,
             opaque_bytes,
             delta_core_bytes: serde_json::to_vec(&core_delta).unwrap().len(),
             state,
             objects: batch.objects.len(),
-            object_bytes: batch.objects.iter().map(|object| object.bytes.len()).sum(),
-            delta_bytes: serde_json::to_vec(&batch.delta).unwrap().len(),
-            envelope_bytes: serde_json::to_vec(&batch.batch).unwrap().len()
-                + serde_json::to_vec(&batch.checkpoint).unwrap().len(),
+            object_bytes,
+            submission_bytes: object_bytes + delta_bytes + envelope_bytes,
+            new_objects: 0,
+            new_object_bytes: 0,
+            delta_bytes,
+            envelope_bytes,
             history_append: batch.delta.history_append.len(),
             bootstrap: batch.delta.bootstrap.is_some(),
             extensions: batch
@@ -1397,9 +1417,27 @@ impl SessionJournal for Counting {
                 .iter()
                 .map(|(key, value)| (key.clone(), serde_json::to_vec(value).unwrap().len()))
                 .collect(),
+            reference_extensions: batch.delta.extension_references.len(),
+            manifest_references: batch.delta.manifest_references.len(),
             usage_append: batch.delta.usage_append.len(),
-        });
-        self.inner.commit(lease, batch).await
+        };
+        let head = self.inner.commit(lease, batch).await?;
+        if submission.state.is_none() {
+            if let Some(state) = state_id {
+                let bytes = self.inner.read(lease, &state).await?;
+                submission.state = Some(
+                    agent_runtime::core::journal::JournalObject { id: state, bytes }
+                        .decode::<agent_runtime::core::journal::ReferencedTurnState>(
+                            agent_runtime::core::journal::JournalObjectKind::TurnState,
+                        )?
+                        .tag,
+                );
+            }
+        }
+        submission.new_objects = self.inner.object_count()?.saturating_sub(before_objects);
+        submission.new_object_bytes = self.inner.object_bytes()?.saturating_sub(before_bytes);
+        self.log.lock().unwrap().push(submission);
+        Ok(head)
     }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
         self.inner.renew(lease).await
@@ -1613,6 +1651,284 @@ async fn review_one_message_turn_submissions_do_not_grow_with_history() {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(names(base), names(at), "N={n}");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LegacyByteSubmission {
+    domain: &'static str,
+    state: String,
+    bytes: usize,
+}
+
+async fn task_27_native_submissions(
+    n: usize,
+    tool_turn: bool,
+) -> (
+    Vec<Submission>,
+    Vec<Submission>,
+    Vec<Submission>,
+    Vec<Submission>,
+) {
+    let label = if tool_turn { "tool" } else { "plain" };
+    let stores = Arc::new(CountingStores {
+        ordinary: Arc::new(Counting {
+            inner: InMemorySessionJournal::ordinary(
+                JournalStorageId::new(format!("task-27-{label}-ordinary-{n}")),
+                Arc::new(identity as Projection),
+            ),
+            log: Mutex::new(Vec::new()),
+        }),
+        protected: Arc::new(Counting {
+            inner: InMemorySessionJournal::protected(JournalStorageId::new(format!(
+                "task-27-{label}-protected-{n}"
+            ))),
+            log: Mutex::new(Vec::new()),
+        }),
+    });
+    let scripts = if tool_turn {
+        vec![
+            reply("bootstrap"),
+            tool_round("task-27"),
+            reply("tool complete"),
+        ]
+    } else {
+        vec![reply("bootstrap"), reply("delta reply")]
+    };
+    let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider(scripts))
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(4_000_000, 4_000_000, 4_096),
+        ))
+        .clock(Arc::new(FixedClock))
+        .session_store(stores.clone())
+        .checkpoint_store(stores.clone());
+    if tool_turn {
+        builder = tools(builder);
+    }
+    let runtime = builder.build().unwrap();
+    let seed = (0..n)
+        .map(|index| {
+            agent_runtime::core::content::Message::user(format!("seed message number {index}"))
+        })
+        .collect();
+    let session = runtime
+        .start_session(StartSession::create(
+            SessionId::new(format!("task-27-{label}-{n}")),
+            seed,
+        ))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("bootstrap turn"))
+        .await
+        .unwrap();
+    let mut bootstrap = std::mem::take(&mut *stores.protected.log.lock().unwrap());
+    bootstrap.extend(std::mem::take(&mut *stores.ordinary.log.lock().unwrap()));
+
+    session
+        .run(UserInput::text(if tool_turn {
+            "use the tool"
+        } else {
+            "one more message"
+        }))
+        .await
+        .unwrap();
+    let protected = std::mem::take(&mut *stores.protected.log.lock().unwrap());
+    let ordinary = std::mem::take(&mut *stores.ordinary.log.lock().unwrap());
+    session.persist().await.unwrap();
+    session.persist().await.unwrap();
+    let unchanged = std::mem::take(&mut *stores.ordinary.log.lock().unwrap());
+    session.shutdown().await.unwrap();
+    (bootstrap, protected, ordinary, unchanged)
+}
+
+async fn task_27_legacy_submissions(n: usize, tool_turn: bool) -> Vec<LegacyByteSubmission> {
+    let sessions = Arc::new(LegacySessions {
+        projection: identity,
+        current: Mutex::new(Vec::new()),
+        log: Mutex::new(Vec::new()),
+    });
+    let checkpoints = Arc::new(LegacyCheckpoints::default());
+    let scripts = if tool_turn {
+        vec![
+            reply("bootstrap"),
+            tool_round("task-27"),
+            reply("tool complete"),
+        ]
+    } else {
+        vec![reply("bootstrap"), reply("delta reply")]
+    };
+    let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider(scripts))
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(4_000_000, 4_000_000, 4_096),
+        ))
+        .clock(Arc::new(FixedClock))
+        .session_store(sessions.clone())
+        .checkpoint_store(checkpoints.clone());
+    if tool_turn {
+        builder = tools(builder);
+    }
+    let runtime = builder.build().unwrap();
+    let label = if tool_turn { "tool" } else { "plain" };
+    let seed = (0..n)
+        .map(|index| {
+            agent_runtime::core::content::Message::user(format!("seed message number {index}"))
+        })
+        .collect();
+    let session = runtime
+        .start_session(StartSession::create(
+            SessionId::new(format!("task-27-legacy-{label}-{n}")),
+            seed,
+        ))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("bootstrap turn"))
+        .await
+        .unwrap();
+    sessions.log.lock().unwrap().clear();
+    checkpoints.log.lock().unwrap().clear();
+    session
+        .run(UserInput::text(if tool_turn {
+            "use the tool"
+        } else {
+            "one more message"
+        }))
+        .await
+        .unwrap();
+    let mut rows = checkpoints
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|checkpoint| LegacyByteSubmission {
+            domain: "protected",
+            state: serde_json::to_value(&checkpoint.state).unwrap()["state"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            bytes: serde_json::to_vec(checkpoint).unwrap().len(),
+        })
+        .collect::<Vec<_>>();
+    rows.extend(
+        sessions
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|snapshot| LegacyByteSubmission {
+                domain: "ordinary",
+                state: "terminal".to_owned(),
+                bytes: serde_json::to_vec(snapshot).unwrap().len(),
+            }),
+    );
+    sessions.log.lock().unwrap().clear();
+    session.persist().await.unwrap();
+    session.persist().await.unwrap();
+    rows.extend(
+        sessions
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|snapshot| LegacyByteSubmission {
+                domain: "ordinary",
+                state: "unchanged".to_owned(),
+                bytes: serde_json::to_vec(snapshot).unwrap().len(),
+            }),
+    );
+    session.shutdown().await.unwrap();
+    rows
+}
+
+/// Task 2.7 cost evidence. The persistent runtime-owned cache record and U3
+/// manifest window may add bounded reference metadata, but unchanged history
+/// bodies never reappear in a submission. N=10_000 is deliberately excluded:
+/// the cache-identity contract accepts at most 4_096 stable-history entries,
+/// so both legacy and native turns fail before provider I/O at that size.
+#[tokio::test]
+async fn task_2_7_native_turn_bytes_are_delta_bounded() {
+    for tool_turn in [false, true] {
+        let scenario = if tool_turn { "tool" } else { "plain" };
+        let mut native_rows = Vec::new();
+        for n in [100, 1_000, 4_000] {
+            let (bootstrap, protected, ordinary, unchanged) =
+                task_27_native_submissions(n, tool_turn).await;
+            for (phase, domain, submissions) in [
+                ("bootstrap", "mixed", &bootstrap),
+                ("turn", "protected", &protected),
+                ("turn", "ordinary", &ordinary),
+                ("unchanged", "ordinary", &unchanged),
+            ] {
+                for (ordinal, submission) in submissions.iter().enumerate() {
+                    eprintln!(
+                        "TASK27 native scenario={scenario} N={n} phase={phase} domain={domain} ordinal={ordinal} kind={} submission_bytes={} new_objects={} new_object_bytes={} draft_objects={} draft_bytes={} delta_bytes={} envelope_bytes={} body_bytes={} opaque_delta_bytes={} extension_refs={} manifest_refs={}",
+                        submission.state.as_deref().unwrap_or("ordinary"),
+                        submission.submission_bytes,
+                        submission.new_objects,
+                        submission.new_object_bytes,
+                        submission.objects,
+                        submission.object_bytes,
+                        submission.delta_bytes,
+                        submission.envelope_bytes,
+                        submission.body_bytes,
+                        submission
+                            .delta_bytes
+                            .saturating_sub(submission.delta_core_bytes),
+                        submission.reference_extensions,
+                        submission.manifest_references,
+                    );
+                }
+            }
+            assert!(
+                protected
+                    .iter()
+                    .chain(&ordinary)
+                    .all(|submission| submission.body_bytes <= 512),
+                "N={n} resubmitted unchanged message/usage bodies"
+            );
+            assert!(unchanged.iter().all(|submission| {
+                submission.objects == 0
+                    && submission.object_bytes == 0
+                    && submission.body_bytes == 0
+            }));
+            native_rows.push((n, protected, ordinary));
+
+            let legacy = task_27_legacy_submissions(n, tool_turn).await;
+            for (ordinal, submission) in legacy.iter().enumerate() {
+                eprintln!(
+                    "TASK27 legacy scenario={scenario} N={n} ordinal={ordinal} domain={} kind={} submission_bytes={}",
+                    submission.domain, submission.state, submission.bytes
+                );
+            }
+        }
+
+        let (_, base_protected, base_ordinary) = &native_rows[0];
+        for (n, protected, ordinary) in &native_rows[1..] {
+            assert_eq!(protected.len(), base_protected.len(), "N={n}");
+            assert_eq!(ordinary.len(), base_ordinary.len(), "N={n}");
+            for (base, at) in base_protected
+                .iter()
+                .zip(protected)
+                .chain(base_ordinary.iter().zip(ordinary))
+            {
+                assert_eq!(base.state, at.state, "N={n}");
+                assert!(
+                    at.submission_bytes <= base.submission_bytes + 2_048,
+                    "serialized submission grew with unchanged N={n}: {base:?} -> {at:?}"
+                );
+                assert!(
+                    at.new_object_bytes <= base.new_object_bytes + 8_192,
+                    "new immutable bytes grew with unchanged N={n}: {base:?} -> {at:?}"
+                );
             }
         }
     }
@@ -1906,4 +2222,205 @@ async fn review_crash_at_calling_model_resumes_the_frozen_request_like_legacy() 
                 .is_none_or(|text| !text.contains("after restart"))
         })
     }));
+}
+
+/// Review of U9 task 2.7: the persistent JSON spine only engages above
+/// `JOURNAL_FANOUT` (64) array items, so the empty-history scenarios above
+/// never decode it. These seed histories across the 64/128/256 boundaries.
+fn seeded_two_turns<const N: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!(
+                    "seeded secret message {index}"
+                ))
+            })
+            .collect();
+        let session = runtime
+            .start_session(StartSession::create(id, seed))
+            .await
+            .unwrap();
+        session
+            .run(UserInput::text("first secret input"))
+            .await
+            .unwrap();
+        let first = session.snapshot();
+        session.run(UserInput::text("second input")).await.unwrap();
+        let second = session.snapshot();
+        session.shutdown().await.unwrap();
+        vec![first, second]
+    })
+}
+
+fn seeded_tools<const N: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!("seeded tool message {index}"))
+            })
+            .collect();
+        let session = runtime
+            .start_session(StartSession::create(id, seed))
+            .await
+            .unwrap();
+        session.run(UserInput::text("use the tool")).await.unwrap();
+        let tool = session.snapshot();
+        session
+            .run_local_tool("echo", json!({"text": "local action"}), 5_000)
+            .await
+            .unwrap();
+        let local = session.snapshot();
+        session.shutdown().await.unwrap();
+        vec![tool, local]
+    })
+}
+
+fn longest_array(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(longest_array)
+            .max()
+            .unwrap_or(0)
+            .max(items.len()),
+        Value::Object(entries) => entries.values().map(longest_array).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Some ordinary barrier carried a cache record and a manifest whose arrays
+/// are long enough to use the binary spine.
+#[track_caller]
+fn assert_spine_engaged(pair: &Pair, label: &str) {
+    let log = pair.native.ordinary.log.lock().unwrap();
+    let snapshots = log
+        .iter()
+        .map(|value| match value {
+            Materialized::Snapshot(snapshot) => snapshot,
+            Materialized::Checkpoint(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        snapshots.iter().any(|snapshot| snapshot
+            .extension_state
+            .get("runtime.core.previous_cache")
+            .is_some_and(|cache| longest_array(&cache.value) > 64)),
+        "{label}: cache record never reached the spine"
+    );
+    assert!(
+        snapshots.iter().any(|snapshot| snapshot
+            .manifests
+            .iter()
+            .any(|manifest| longest_array(&serde_json::to_value(manifest).unwrap()) > 64)),
+        "{label}: no manifest reached the spine"
+    );
+}
+
+#[tokio::test]
+async fn review_spine_sized_histories_match_at_every_barrier_and_after_fresh_resume() {
+    // 70 crosses the 64-item leaf limit, 130 and 260 the 2^7 and 2^8 spine
+    // boundaries; every run compares each barrier and a fresh resume.
+    let runs: [(&str, Drive, Projection); 4] = [
+        ("seeded-70-identity", seeded_two_turns::<70>, identity),
+        ("seeded-70-redacted", seeded_two_turns::<70>, redact),
+        ("seeded-130-identity", seeded_two_turns::<130>, identity),
+        ("seeded-260-redacted", seeded_two_turns::<260>, redact),
+    ];
+    for (label, drive, projection) in runs {
+        let pair = equivalent(
+            label,
+            projection,
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive,
+            },
+            continue_phase(),
+        )
+        .await;
+        assert_spine_engaged(&pair, label);
+    }
+    let pair = equivalent(
+        "seeded-tools-130",
+        identity,
+        Phase {
+            provider: tool_provider,
+            configure: tools,
+            drive: seeded_tools::<130>,
+        },
+        continue_phase(),
+    )
+    .await;
+    assert_spine_engaged(&pair, "seeded-tools-130");
+}
+
+fn seeded_fork<const N: usize, const FROM: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!("seeded parent {index}"))
+            })
+            .collect();
+        let parent = runtime
+            .start_session(StartSession::create(id.clone(), seed))
+            .await
+            .unwrap();
+        parent.run(UserInput::text("parent turn")).await.unwrap();
+        parent.shutdown().await.unwrap();
+        let child = runtime
+            .fork_session(ForkSession {
+                from: id.clone(),
+                new_id: SessionId::new(format!("{}-child", id.as_str())),
+                seed: if FROM == 0 {
+                    ForkSeed::Summary("stable summary".into())
+                } else {
+                    ForkSeed::FromIndex(FROM)
+                },
+                lcm: ForkLcm::NewTimeline,
+            })
+            .await
+            .unwrap();
+        child.run(UserInput::text("child turn")).await.unwrap();
+        let child_snapshot = child.snapshot();
+        child.shutdown().await.unwrap();
+        vec![child_snapshot]
+    })
+}
+
+/// Forks of a spine-sized parent (Summary, and FromIndex keeping more than
+/// one leaf of history) match legacy at every barrier and after the child
+/// resumes from a fresh runtime.
+#[tokio::test]
+async fn review_spine_sized_forks_match_at_every_barrier() {
+    let runs: [(&str, Drive); 2] = [
+        ("seeded-fork-summary", seeded_fork::<70, 0>),
+        ("seeded-fork-from-index", seeded_fork::<130, 100>),
+    ];
+    for (label, drive) in runs {
+        let pair = equivalent(
+            label,
+            identity,
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive,
+            },
+            Phase {
+                provider: continuation,
+                configure: plain,
+                drive: resume_child,
+            },
+        )
+        .await;
+        assert_spine_engaged(&pair, label);
+    }
 }

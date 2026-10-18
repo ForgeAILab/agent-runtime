@@ -97,6 +97,7 @@ where
     assert_pinned_and_cross_session_reads(&factory).await;
     assert_writer_fences(&factory).await;
     assert_publish_validation(&factory).await;
+    assert_structured_prefix_sharing(&factory).await;
 }
 
 /// Runs the reusable suite against the volatile neutral reference backend.
@@ -121,6 +122,7 @@ where
     assert_ordinary_projection_contract(&factory).await;
     assert_ordinary_append_after_omission(&factory).await;
     assert_ordinary_refusals(&factory).await;
+    assert_ordinary_structured_references(&factory).await;
 }
 
 async fn reference_ordinary(policy: Arc<dyn JournalProjectionPolicy>) -> Arc<dyn SessionJournal> {
@@ -1153,6 +1155,372 @@ where
     journal.close(reader).await.unwrap();
 }
 
+/// One exact commit whose cache record is persistent JSON (an
+/// `ExtensionReference` over `JsonValue` nodes and spine sequences), supplying
+/// only objects the writer has not already published.
+fn protected_structured_commit(
+    snapshot: &SessionSnapshot,
+    writer_epoch: u64,
+    current: Option<&JournalHead>,
+    operation: &str,
+    known: &std::collections::BTreeSet<JournalObjectId>,
+) -> (JournalCommit, std::collections::BTreeSet<JournalObjectId>) {
+    let mut base = snapshot.clone();
+    let cache = base
+        .extension_state
+        .remove(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+        .unwrap();
+    let mut assembler = Assembler::default();
+    let mut roots = assembler.snapshot(&base, 0);
+    let value = assembler.structured_cache(&cache);
+    let map = assembler.add(
+        JournalObjectKind::Map,
+        &JournalMapNode::Leaf {
+            entries: vec![JournalMapEntry {
+                key: RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                value: value.clone(),
+            }],
+        },
+    );
+    roots.extensions = JournalMap {
+        root: Some(map),
+        len: 1,
+        height: 0,
+    };
+    let boundary = JournalBoundary {
+        version: 1,
+        session: snapshot.id.clone(),
+        turn: None,
+        checkpoint_sequence: 0,
+        planned_step_count: 0,
+    };
+    let published = assembler.objects.keys().cloned().collect();
+    let mut commit = JournalCommit {
+        batch: JournalBatch {
+            session: snapshot.id.clone(),
+            sequence: current.map_or(1, |head| head.batch_sequence + 1),
+            predecessor: current.map(|head| JournalDigest::parse(head.batch.as_str()).unwrap()),
+            expected_revision: current.map(|head| head.revision),
+            writer_epoch,
+            operation: JournalOperationId::new(operation),
+            boundary: boundary.clone(),
+            snapshot: roots,
+            checkpoint: None,
+        },
+        digest: zero_digest(),
+        objects: assembler
+            .objects
+            .into_iter()
+            .filter(|(id, _)| !known.contains(id))
+            .map(|(id, (_, bytes))| JournalObject { id, bytes })
+            .collect(),
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: None,
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::from([(
+                RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                Some(value),
+            )]),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        },
+        checkpoint: None,
+    };
+    commit.digest = commit.input_digest().unwrap();
+    (commit, published)
+}
+
+/// N exact commits share a spine-sized persistent-JSON prefix by reference.
+/// The backend must follow every structured kind when it admits a closure,
+/// keep the shared prefix through a collection attempt, and let a fresh
+/// writer reuse it from its pinned head.
+async fn assert_structured_prefix_sharing<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = SessionJournalConformanceFixture>,
+{
+    let fixture = factory().await;
+    let journal = fixture.journal.clone();
+    let session = SessionId::new("protected-structured");
+    let lease = open_writer(&*journal, &session, None, "protected-structured-0").await;
+    let base = 100;
+    let snapshot_at = |items| {
+        let mut snapshot = structured_snapshot(&session, items, 0);
+        snapshot.manifests.clear();
+        snapshot
+    };
+    let (commit, mut known) = protected_structured_commit(
+        &snapshot_at(base),
+        lease.writer_epoch().unwrap(),
+        None,
+        "protected-structured-boot",
+        &std::collections::BTreeSet::new(),
+    );
+    let mut head = journal.commit(&lease, commit).await.unwrap();
+    let mut current = known.clone();
+    for step in 1..=6 {
+        let (commit, published) = protected_structured_commit(
+            &snapshot_at(base + step),
+            lease.writer_epoch().unwrap(),
+            Some(&head),
+            &format!("protected-structured-{step}"),
+            &known,
+        );
+        assert!(commit.objects.len() < 96, "drafts must be O(log N)");
+        let next = journal.commit(&lease, commit.clone()).await.unwrap();
+        assert_eq!(journal.commit(&lease, commit).await.unwrap(), next);
+        head = next;
+        known.extend(published.iter().cloned());
+        current = published;
+    }
+    journal.close(lease).await.unwrap();
+    let _ = journal
+        .collect(JournalGcRequest {
+            storage_id: journal.storage_id(),
+            expected_root_epoch: 0,
+            max_objects: u64::MAX,
+        })
+        .await;
+    let lease = open_writer(
+        &*journal,
+        &session,
+        Some(head.revision),
+        "protected-structured-1",
+    )
+    .await;
+    let resumed = snapshot_at(base + 7);
+    let (commit, _) = protected_structured_commit(
+        &resumed,
+        lease.writer_epoch().unwrap(),
+        Some(&head),
+        "protected-structured-resumed",
+        &current,
+    );
+    assert!(
+        commit.objects.len() < 96,
+        "a fresh writer resubmitted the prefix"
+    );
+    journal.commit(&lease, commit).await.unwrap();
+    journal.close(lease).await.unwrap();
+    let materialized = materialize_latest(&*journal, &session, "protected-structured-read").await;
+    assert_eq!(materialized.extension_state, resumed.extension_state);
+    assert_eq!(materialized.history, resumed.history);
+}
+
+fn structured_cache(items: usize) -> VersionedSessionState {
+    VersionedSessionState::new(
+        RegistryRevision::new("previous-cache-state-1"),
+        serde_json::json!({
+            "entries": (0..items)
+                .map(|index| serde_json::json!({"index": index, "tag": "entry"}))
+                .collect::<Vec<_>>()
+        }),
+    )
+    .redaction_safe()
+}
+
+fn structured_snapshot(session: &SessionId, items: usize, manifests: usize) -> SessionSnapshot {
+    let mut snapshot = basic_snapshot(session.clone(), "structured body", Timestamp(1));
+    snapshot.extension_state.insert(
+        RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+        structured_cache(items),
+    );
+    snapshot.manifests = (0..manifests)
+        .map(|index| {
+            agent_runtime_core::store::TurnManifest::new(
+                TurnId::new(format!("structured-turn-{index}")),
+                super::replay::conformance_manifest_requiring(
+                    agent_runtime::registry::RegistryId::tool(format!("structured.{index}")),
+                    RegistryRevision::new("structured-1"),
+                ),
+            )
+        })
+        .collect();
+    snapshot
+}
+
+/// Drafts a native writer submits for `next`: the structured cache record
+/// and any appended manifests, minus every object it already published.
+fn structured_reference_commit(
+    next: &SessionSnapshot,
+    writer_epoch: u64,
+    current: &JournalHead,
+    operation: &str,
+    known: &std::collections::BTreeSet<JournalObjectId>,
+    appended_manifests: usize,
+) -> JournalCommit {
+    let mut commit = append_from_snapshot(
+        next,
+        writer_epoch,
+        current,
+        operation,
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    let mut assembler = Assembler::default();
+    let cache = assembler.structured_cache(&next.extension_state[RUNTIME_PREVIOUS_CACHE_NAMESPACE]);
+    let first = next.manifests.len() - appended_manifests;
+    commit.delta.manifest_references = next.manifests[first..]
+        .iter()
+        .map(|manifest| assembler.structured_manifest(manifest))
+        .collect();
+    commit.delta.extension_references =
+        BTreeMap::from([(RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(), Some(cache))]);
+    commit.objects = assembler
+        .objects
+        .into_iter()
+        .filter(|(id, _)| !known.contains(id))
+        .map(|(id, (_, bytes))| JournalObject { id, bytes })
+        .collect();
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+fn structured_closure(snapshot: &SessionSnapshot) -> std::collections::BTreeSet<JournalObjectId> {
+    let mut assembler = Assembler::default();
+    assembler.structured_cache(&snapshot.extension_state[RUNTIME_PREVIOUS_CACHE_NAMESPACE]);
+    for manifest in &snapshot.manifests {
+        assembler.structured_manifest(manifest);
+    }
+    assembler.objects.into_keys().collect()
+}
+
+async fn materialize_latest(
+    journal: &dyn SessionJournal,
+    session: &SessionId,
+    label: &str,
+) -> SessionSnapshot {
+    let reader = open_reader(journal, session, None, label).await;
+    let snapshot = JournalReader::new(journal, &reader, STRUCTURED_LIMITS)
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    journal.close(reader).await.unwrap();
+    snapshot
+}
+
+const STRUCTURED_LIMITS: JournalReadLimits = JournalReadLimits {
+    objects: 100_000,
+    encoded_bytes: 64_000_000,
+    entries: 100_000,
+};
+
+/// Native writers name the Runtime-owned cache record and new manifests by
+/// reference to persistent JSON drafts (U9 task 2.7). An ordinary adapter
+/// must resolve each reference from the current commit or its own pinned
+/// closure, keep the shared prefix alive across N commits, a collection
+/// attempt and a fresh writer, and never resolve another session's objects.
+async fn assert_ordinary_structured_references<F, Fut>(factory: &F)
+where
+    F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
+    Fut: Future<Output = Arc<dyn SessionJournal>>,
+{
+    let journal = factory(Arc::new(IdentityJournalProjection)).await;
+    let session = SessionId::new("ordinary-structured");
+    let lease = open_writer(&*journal, &session, None, "structured-0").await;
+    let base = 100;
+    let mut current = structured_snapshot(&session, base, 0);
+    let (commit, _) = bootstrap_from_snapshot(
+        current.clone(),
+        lease.writer_epoch().unwrap(),
+        "structured-boot",
+        None,
+    );
+    let mut head = journal.commit(&lease, commit).await.unwrap();
+    let mut known = structured_closure(&current);
+    for step in 1..=8 {
+        let manifests = usize::from(step % 3 == 1);
+        let next = structured_snapshot(&session, base + step, current.manifests.len() + manifests);
+        let commit = structured_reference_commit(
+            &next,
+            lease.writer_epoch().unwrap(),
+            &head,
+            &format!("structured-{step}"),
+            &known,
+            manifests,
+        );
+        assert!(
+            commit.objects.len() < 96 * (1 + manifests),
+            "drafts must be O(log N)"
+        );
+        let published = journal.commit(&lease, commit.clone()).await.unwrap();
+        assert_eq!(
+            journal.commit(&lease, commit).await.unwrap(),
+            published,
+            "an ambiguous retry must return the original head"
+        );
+        head = published;
+        known.extend(structured_closure(&next));
+        let materialized =
+            materialize_latest(&*journal, &session, &format!("structured-read-{step}")).await;
+        assert_eq!(
+            materialized.extension_state, next.extension_state,
+            "step {step}"
+        );
+        assert_eq!(materialized.manifests, next.manifests, "step {step}");
+        current = next;
+    }
+    journal.close(lease).await.unwrap();
+
+    // A collector may run between processes; the live head's shared prefix
+    // must survive it, whether or not the adapter supports collection.
+    let _ = journal
+        .collect(JournalGcRequest {
+            storage_id: journal.storage_id(),
+            expected_root_epoch: 0,
+            max_objects: u64::MAX,
+        })
+        .await;
+
+    // A fresh writer knows only its pinned current head and still resolves
+    // the unchanged prefix from it.
+    let lease = open_writer(&*journal, &session, Some(head.revision), "structured-1").await;
+    let next = structured_snapshot(&session, base + 9, current.manifests.len());
+    let commit = structured_reference_commit(
+        &next,
+        lease.writer_epoch().unwrap(),
+        &head,
+        "structured-resumed",
+        &structured_closure(&current),
+        0,
+    );
+    head = journal.commit(&lease, commit).await.unwrap();
+    journal.close(lease).await.unwrap();
+    let materialized = materialize_latest(&*journal, &session, "structured-read-resumed").await;
+    assert_eq!(materialized.extension_state, next.extension_state);
+    assert_eq!(materialized.manifests, next.manifests);
+
+    // Another session cannot name this session's stored records.
+    let other = SessionId::new("ordinary-structured-other");
+    let lease = open_writer(&*journal, &other, None, "structured-other").await;
+    let mut empty = structured_snapshot(&other, 0, 0);
+    empty.extension_state.clear();
+    let (commit, _) = bootstrap_from_snapshot(
+        empty,
+        lease.writer_epoch().unwrap(),
+        "structured-other-boot",
+        None,
+    );
+    let other_head = journal.commit(&lease, commit).await.unwrap();
+    let stolen = structured_snapshot(&other, base + 9, 0);
+    let commit = structured_reference_commit(
+        &stolen,
+        lease.writer_epoch().unwrap(),
+        &other_head,
+        "structured-stolen",
+        &structured_closure(&stolen),
+        0,
+    );
+    assert_conflict(journal.commit(&lease, commit).await.unwrap_err());
+    journal.close(lease).await.unwrap();
+    let _ = head;
+}
+
 async fn open_writer(
     journal: &dyn SessionJournal,
     session: &SessionId,
@@ -1280,7 +1648,9 @@ fn bootstrap_from_snapshot(
             history_append: Vec::new(),
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint,
     };
@@ -1338,7 +1708,9 @@ fn append_commit(
             history_append: vec![Message::user(appended)],
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint: None,
     };
@@ -1389,7 +1761,9 @@ fn append_from_snapshot(
             history_append,
             usage_append: Vec::new(),
             extension_updates,
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint: None,
     };
@@ -1452,7 +1826,9 @@ fn checkpoint_commit(
             history_append: Vec::new(),
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint: Some(checkpoint),
     };
@@ -1542,6 +1918,122 @@ impl Assembler {
             len,
             height: 0,
         }
+    }
+
+    /// Independent oracle of the native persistent JSON encoding: up to
+    /// `JOURNAL_FANOUT` array items in one leaf, otherwise single-reference
+    /// leaves under a fixed-height binary spine; object entries in fanout
+    /// leaves. Adapters must store these exact IDs for shared prefixes.
+    fn structured_array(&mut self, items: Vec<JournalObjectId>) -> JournalSequence {
+        if items.len() <= JOURNAL_FANOUT {
+            return self.sequence(items);
+        }
+        let mut trees = items
+            .into_iter()
+            .map(|item| JournalSequence {
+                root: Some(self.add(
+                    JournalObjectKind::Sequence,
+                    &JournalSequenceNode::Leaf { items: vec![item] },
+                )),
+                len: 1,
+                height: 0,
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..JOURNAL_MAX_TREE_HEIGHT {
+            trees = trees
+                .chunks(2)
+                .map(|children| JournalSequence {
+                    root: Some(self.add(
+                        JournalObjectKind::Sequence,
+                        &JournalSequenceNode::Branch {
+                            children: children.to_vec(),
+                        },
+                    )),
+                    len: children.iter().map(|child| child.len).sum(),
+                    height: children[0].height + 1,
+                })
+                .collect();
+        }
+        assert_eq!(trees.len(), 1);
+        trees.pop().unwrap()
+    }
+
+    fn structured_entries(&mut self, items: Vec<JournalObjectId>) -> JournalSequence {
+        let mut trees = items
+            .chunks(JOURNAL_FANOUT)
+            .map(|items| self.sequence(items.to_vec()))
+            .collect::<Vec<_>>();
+        while trees.len() > 1 {
+            trees = trees
+                .chunks(JOURNAL_FANOUT)
+                .map(|children| JournalSequence {
+                    root: Some(self.add(
+                        JournalObjectKind::Sequence,
+                        &JournalSequenceNode::Branch {
+                            children: children.to_vec(),
+                        },
+                    )),
+                    len: children.iter().map(|child| child.len).sum(),
+                    height: children[0].height + 1,
+                })
+                .collect();
+        }
+        trees.pop().unwrap_or_default()
+    }
+
+    fn structured_json(&mut self, value: &serde_json::Value) -> JournalObjectId {
+        let node = match value {
+            serde_json::Value::Array(values) => {
+                let items = values
+                    .iter()
+                    .map(|value| self.structured_json(value))
+                    .collect();
+                JournalJsonValue::Array {
+                    items: self.structured_array(items),
+                }
+            }
+            serde_json::Value::Object(values) => {
+                let entries = values
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = self.structured_json(value);
+                        self.add(
+                            JournalObjectKind::JsonObjectEntry,
+                            &JournalJsonObjectEntry {
+                                key: key.clone(),
+                                value,
+                            },
+                        )
+                    })
+                    .collect();
+                JournalJsonValue::Object {
+                    entries: self.structured_entries(entries),
+                }
+            }
+            scalar => JournalJsonValue::Scalar {
+                scalar: scalar.clone(),
+            },
+        };
+        self.add(JournalObjectKind::JsonValue, &node)
+    }
+
+    fn structured_cache(&mut self, state: &VersionedSessionState) -> JournalObjectId {
+        let value = self.structured_json(&serde_json::to_value(state).unwrap());
+        self.add(
+            JournalObjectKind::ExtensionReference,
+            &ReferencedSessionState { value },
+        )
+    }
+
+    fn structured_manifest(
+        &mut self,
+        manifest: &agent_runtime_core::store::TurnManifest,
+    ) -> JournalObjectId {
+        let value = self.structured_json(&serde_json::to_value(manifest).unwrap());
+        self.add(
+            JournalObjectKind::ManifestReference,
+            &ReferencedTurnManifest { value },
+        )
     }
 
     fn snapshot(
@@ -1733,6 +2225,12 @@ mod tests {
     #[tokio::test]
     async fn ordinary_appends_continue_after_policy_omits_an_extension() {
         super::assert_ordinary_append_after_omission(&super::reference_ordinary).await;
+    }
+
+    #[tokio::test]
+    async fn structured_prefixes_are_shared_and_survive_collection() {
+        super::assert_structured_prefix_sharing(&|| async { super::reference_fixture() }).await;
+        super::assert_ordinary_structured_references(&super::reference_ordinary).await;
     }
 
     #[tokio::test]

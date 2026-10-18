@@ -101,6 +101,14 @@ pub enum JournalObjectKind {
     Extension,
     /// One retained planned-step diagnostic.
     Manifest,
+    /// Runtime-owned redaction-safe extension reconstructed from persistent JSON.
+    ExtensionReference,
+    /// Redaction-safe manifest reconstructed from persistent JSON.
+    ManifestReference,
+    /// One scalar/container node in a persistent JSON value.
+    JsonValue,
+    /// One ordered object entry in a persistent JSON value.
+    JsonObjectEntry,
     /// Bounded persistent sequence node.
     Sequence,
     /// Bounded persistent map node.
@@ -133,6 +141,10 @@ impl JournalObjectKind {
             Self::UsageRecord => "usage_record",
             Self::Extension => "extension",
             Self::Manifest => "manifest",
+            Self::ExtensionReference => "extension_reference",
+            Self::ManifestReference => "manifest_reference",
+            Self::JsonValue => "json_value",
+            Self::JsonObjectEntry => "json_object_entry",
             Self::Sequence => "sequence",
             Self::Map => "map",
             Self::Request => "request",

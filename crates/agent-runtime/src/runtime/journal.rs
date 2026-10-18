@@ -13,12 +13,14 @@ use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::journal::{
     JOURNAL_FANOUT, JOURNAL_MAX_TREE_HEIGHT, JOURNAL_SCHEMA_VERSION, JournalBatch, JournalBoundary,
-    JournalCommit, JournalDigest, JournalHead, JournalLease, JournalMap, JournalMapChild,
-    JournalMapEntry, JournalMapNode, JournalObject, JournalObjectId, JournalObjectKind,
-    JournalOpen, JournalOpenIntent, JournalOperationId, JournalPinId, JournalReadLimits,
-    JournalReader, JournalRole, JournalRootSelection, JournalSequence, JournalSequenceNode,
-    JournalSnapshotRoots, JournalStateValue, JournalTransitionDelta, ReferencedProviderRequest,
-    ReferencedTurnCheckpoint, ReferencedTurnState, SessionJournal, journal_history_chain,
+    JournalCommit, JournalDigest, JournalHead, JournalJsonObjectEntry, JournalJsonValue,
+    JournalLease, JournalMap, JournalMapChild, JournalMapEntry, JournalMapNode, JournalObject,
+    JournalObjectId, JournalObjectKind, JournalOpen, JournalOpenIntent, JournalOperationId,
+    JournalPinId, JournalReadLimits, JournalReader, JournalRole, JournalRootSelection,
+    JournalSequence, JournalSequenceNode, JournalSnapshotRoots, JournalStateValue,
+    JournalTransitionDelta, RUNTIME_PREVIOUS_CACHE_NAMESPACE, ReferencedProviderRequest,
+    ReferencedSessionState, ReferencedTurnCheckpoint, ReferencedTurnManifest, ReferencedTurnState,
+    SessionJournal, journal_history_chain,
 };
 use agent_runtime_core::provider::ProviderRequest;
 use agent_runtime_core::store::{SessionSnapshot, SessionStore, TurnManifest};
@@ -570,7 +572,13 @@ async fn open_domain(
         if let (Some(head), Some(snapshot)) = (&head, &candidate) {
             let mut assembler = ObjectAssembler::default();
             let roots = assembler.snapshot(snapshot, head.snapshot.planned_step_count)?;
-            if role == JournalRole::Protected && roots != head.snapshot {
+            // The protected domain stores this writer's exact candidates, so
+            // a root it cannot re-derive is foreign or corrupt and fails
+            // closed (no released runtime wrote another representation). An
+            // ordinary backend owns its projected representation: only an
+            // exact match lets the writer omit already-stored drafts.
+            let representation_matches = roots == head.snapshot;
+            if role == JournalRole::Protected && !representation_matches {
                 return Err(incompatible_store());
             }
             if let Some(checkpoint) = &checkpoint {
@@ -582,7 +590,9 @@ async fn open_domain(
                 }
                 known_candidates.insert(checkpoint_object.id);
             }
-            known_candidates.extend(assembler.objects.keys().cloned());
+            if representation_matches {
+                known_candidates.extend(assembler.objects.keys().cloned());
+            }
         }
         let follows_protected = match (&head, role) {
             (Some(head), JournalRole::Ordinary) => {
@@ -661,21 +671,35 @@ async fn commit_domain(
         planned_step_count,
     };
     let current = domain.head.as_ref();
-    let mut objects = assembler
-        .objects
-        .values()
-        .filter(|object| !domain.known_candidates.contains(&object.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    // Canonical map order already gives stable commit digests; make the order
-    // explicit for adapters that retain the submitted vector verbatim.
-    objects.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     let delta = transition_delta(
         domain.candidate.as_ref(),
         domain.candidate_submitted,
         snapshot,
         boundary.clone(),
+        &mut assembler,
     )?;
+    let mut objects = if domain.role == JournalRole::Ordinary {
+        if delta.bootstrap.is_some() {
+            Vec::new()
+        } else {
+            assembler
+                .structured
+                .iter()
+                .filter(|id| !domain.known_candidates.contains(*id))
+                .filter_map(|id| assembler.objects.get(id).cloned())
+                .collect::<Vec<_>>()
+        }
+    } else {
+        assembler
+            .objects
+            .values()
+            .filter(|object| !domain.known_candidates.contains(&object.id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Canonical map order already gives stable commit digests; make the order
+    // explicit for adapters that retain the submitted vector verbatim.
+    objects.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
     let operation_payload = serde_json::to_vec(&(
         domain.role,
         current.map(|head| head.revision),
@@ -745,6 +769,9 @@ async fn commit_domain(
     if domain.role == JournalRole::Protected {
         domain.checkpoint = checkpoint.cloned();
     }
+    // This live writer lease pins every closure it has published, so objects
+    // from an earlier boundary remain valid candidates until close. A fresh
+    // runtime rebuilds this set from only its newly pinned current head.
     domain
         .known_candidates
         .extend(assembler.objects.keys().cloned());
@@ -772,6 +799,7 @@ fn transition_delta(
     previous_submitted: bool,
     next: &SessionSnapshot,
     boundary: JournalBoundary,
+    assembler: &mut ObjectAssembler,
 ) -> Result<JournalTransitionDelta, RuntimeError> {
     let Some(previous) = previous else {
         return Ok(JournalTransitionDelta {
@@ -780,7 +808,9 @@ fn transition_delta(
             history_append: Vec::new(),
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         });
     };
     if previous.id != next.id || previous.history.len() > next.history.len() {
@@ -813,23 +843,39 @@ fn transition_delta(
         ));
     }
     let mut extension_updates = BTreeMap::new();
+    let mut extension_references = BTreeMap::new();
     for key in previous
         .extension_state
         .keys()
         .chain(next.extension_state.keys())
     {
         if previous.extension_state.get(key) != next.extension_state.get(key) {
-            extension_updates.insert(key.clone(), next.extension_state.get(key).cloned());
+            if key == RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+                let value = next
+                    .extension_state
+                    .get(key)
+                    .map(|value| assembler.extension(key, value))
+                    .transpose()?;
+                extension_references.insert(key.clone(), value);
+            } else {
+                extension_updates.insert(key.clone(), next.extension_state.get(key).cloned());
+            }
         }
     }
     let overlap = retained_overlap(&previous.manifests, &next.manifests);
+    let manifest_references = next.manifests[overlap..]
+        .iter()
+        .map(|manifest| assembler.manifest(manifest))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(JournalTransitionDelta {
         boundary,
         bootstrap: None,
         history_append: next.history[previous.history.len()..].to_vec(),
         usage_append: next_usage[previous_usage.len()..].to_vec(),
         extension_updates,
-        manifests_append: next.manifests[overlap..].to_vec(),
+        extension_references,
+        manifests_append: Vec::new(),
+        manifest_references,
     })
 }
 
@@ -850,6 +896,8 @@ fn incompatible_store() -> RuntimeError {
 #[derive(Default)]
 struct ObjectAssembler {
     objects: BTreeMap<JournalObjectId, JournalObject>,
+    /// Candidate structured metadata reachable from reference-only deltas.
+    structured: BTreeSet<JournalObjectId>,
 }
 
 impl ObjectAssembler {
@@ -870,6 +918,16 @@ impl ObjectAssembler {
                 Ok(id)
             }
         }
+    }
+
+    fn add_structured<T: Serialize>(
+        &mut self,
+        kind: JournalObjectKind,
+        value: &T,
+    ) -> Result<JournalObjectId, RuntimeError> {
+        let id = self.add(kind, value)?;
+        self.structured.insert(id.clone());
+        Ok(id)
     }
 
     fn sequence(&mut self, items: Vec<JournalObjectId>) -> Result<JournalSequence, RuntimeError> {
@@ -921,6 +979,180 @@ impl ObjectAssembler {
         trees
             .pop()
             .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))
+    }
+
+    fn structured_sequence(
+        &mut self,
+        items: Vec<JournalObjectId>,
+    ) -> Result<JournalSequence, RuntimeError> {
+        if items.is_empty() {
+            return Ok(JournalSequence::default());
+        }
+        if items.len() <= JOURNAL_FANOUT {
+            let len = items.len() as u64;
+            let root = self.add_structured(
+                JournalObjectKind::Sequence,
+                &JournalSequenceNode::Leaf { items },
+            )?;
+            return Ok(JournalSequence {
+                root: Some(root),
+                len,
+                height: 0,
+            });
+        }
+        let mut trees = Vec::new();
+        // One reference per leaf keeps the changed path's byte size stable;
+        // a partially filled fanout leaf would oscillate by O(fanout) bytes
+        // as N changes even though only one logical item was appended.
+        for items in items.chunks(1) {
+            let root = self.add_structured(
+                JournalObjectKind::Sequence,
+                &JournalSequenceNode::Leaf {
+                    items: items.to_vec(),
+                },
+            )?;
+            trees.push(JournalSequence {
+                root: Some(root),
+                len: items.len() as u64,
+                height: 0,
+            });
+        }
+        for _ in 0..JOURNAL_MAX_TREE_HEIGHT {
+            let mut parents = Vec::new();
+            for children in trees.chunks(2) {
+                let root = self.add_structured(
+                    JournalObjectKind::Sequence,
+                    &JournalSequenceNode::Branch {
+                        children: children.to_vec(),
+                    },
+                )?;
+                parents.push(JournalSequence {
+                    root: Some(root),
+                    len: children.iter().map(|child| child.len).sum(),
+                    height: children[0].height.checked_add(1).ok_or_else(|| {
+                        RuntimeError::conflict("journal sequence height overflow")
+                    })?,
+                });
+            }
+            trees = parents;
+        }
+        if trees.len() != 1 {
+            return Err(RuntimeError::conflict(
+                "structured journal sequence exceeds the supported persistent index",
+            ));
+        }
+        trees
+            .pop()
+            .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))
+    }
+
+    fn structured_object_sequence(
+        &mut self,
+        items: Vec<JournalObjectId>,
+    ) -> Result<JournalSequence, RuntimeError> {
+        if items.is_empty() {
+            return Ok(JournalSequence::default());
+        }
+        let mut trees = Vec::new();
+        for items in items.chunks(JOURNAL_FANOUT) {
+            let root = self.add_structured(
+                JournalObjectKind::Sequence,
+                &JournalSequenceNode::Leaf {
+                    items: items.to_vec(),
+                },
+            )?;
+            trees.push(JournalSequence {
+                root: Some(root),
+                len: items.len() as u64,
+                height: 0,
+            });
+        }
+        while trees.len() > 1 {
+            let mut parents = Vec::new();
+            for children in trees.chunks(JOURNAL_FANOUT) {
+                let root = self.add_structured(
+                    JournalObjectKind::Sequence,
+                    &JournalSequenceNode::Branch {
+                        children: children.to_vec(),
+                    },
+                )?;
+                parents.push(JournalSequence {
+                    root: Some(root),
+                    len: children.iter().map(|child| child.len).sum(),
+                    height: children[0].height.checked_add(1).ok_or_else(|| {
+                        RuntimeError::conflict("journal sequence height overflow")
+                    })?,
+                });
+            }
+            trees = parents;
+        }
+        trees
+            .pop()
+            .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))
+    }
+
+    fn json_value(&mut self, value: &Value) -> Result<JournalObjectId, RuntimeError> {
+        let node = match value {
+            Value::Array(values) => {
+                let items = values
+                    .iter()
+                    .map(|value| self.json_value(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                JournalJsonValue::Array {
+                    items: self.structured_sequence(items)?,
+                }
+            }
+            Value::Object(values) => {
+                let entries = values
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = self.json_value(value)?;
+                        self.add_structured(
+                            JournalObjectKind::JsonObjectEntry,
+                            &JournalJsonObjectEntry {
+                                key: key.clone(),
+                                value,
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+                JournalJsonValue::Object {
+                    entries: self.structured_object_sequence(entries)?,
+                }
+            }
+            scalar => JournalJsonValue::Scalar {
+                scalar: scalar.clone(),
+            },
+        };
+        self.add_structured(JournalObjectKind::JsonValue, &node)
+    }
+
+    fn extension(
+        &mut self,
+        namespace: &str,
+        value: &agent_runtime_core::store::VersionedSessionState,
+    ) -> Result<JournalObjectId, RuntimeError> {
+        if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+            return self.add(JournalObjectKind::Extension, value);
+        }
+        if value.sensitivity != agent_runtime_core::store::SessionStateSensitivity::RedactionSafe {
+            return Err(RuntimeError::conflict(
+                "runtime previous-cache state is not redaction-safe",
+            ));
+        }
+        let value = self.json_value(&serde_json::to_value(value)?)?;
+        self.add_structured(
+            JournalObjectKind::ExtensionReference,
+            &ReferencedSessionState { value },
+        )
+    }
+
+    fn manifest(&mut self, manifest: &TurnManifest) -> Result<JournalObjectId, RuntimeError> {
+        let value = self.json_value(&serde_json::to_value(manifest)?)?;
+        self.add_structured(
+            JournalObjectKind::ManifestReference,
+            &ReferencedTurnManifest { value },
+        )
     }
 
     fn map(&mut self, entries: Vec<JournalMapEntry>) -> Result<JournalMap, RuntimeError> {
@@ -996,7 +1228,7 @@ impl ObjectAssembler {
         let manifest_ids = snapshot
             .manifests
             .iter()
-            .map(|manifest| self.add(JournalObjectKind::Manifest, manifest))
+            .map(|manifest| self.manifest(manifest))
             .collect::<Result<Vec<_>, _>>()?;
         let manifests = self.sequence(manifest_ids)?;
         if planned_step_count < manifests.len {
@@ -1010,7 +1242,7 @@ impl ObjectAssembler {
             .map(|(key, value)| {
                 Ok(JournalMapEntry {
                     key: key.clone(),
-                    value: self.add(JournalObjectKind::Extension, value)?,
+                    value: self.extension(key, value)?,
                 })
             })
             .collect::<Result<Vec<_>, RuntimeError>>()?;
@@ -1155,6 +1387,87 @@ mod tests {
         Message::assistant(vec![ContentPart::text(text)])
     }
 
+    /// No released runtime wrote a protected head whose structured records
+    /// are inline (v0.5.0 shipped no native writer), so a protected head this
+    /// writer cannot re-derive exactly is foreign or corrupt. It must fail
+    /// closed instead of being "migrated" with the checkpoint identity check
+    /// skipped.
+    #[tokio::test]
+    async fn a_protected_head_the_writer_cannot_rederive_fails_closed() {
+        use agent_runtime_core::journal::{InMemorySessionJournal, JournalStorageId};
+        use agent_runtime_core::store::VersionedSessionState;
+        use agent_runtime_registry::RegistryRevision;
+
+        let journal: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::protected(
+            JournalStorageId::new("inline-protected"),
+        ));
+        let session = SessionId::new("delta");
+        let base = snapshot(vec![Message::user("one")]);
+        let cache = VersionedSessionState::new(
+            RegistryRevision::new("previous-cache-state-1"),
+            serde_json::json!({"entries": [1, 2, 3]}),
+        )
+        .redaction_safe();
+        // The writer's own roots, except that the Runtime-owned cache record
+        // is an opaque inline leaf that readers still accept.
+        let mut assembler = ObjectAssembler::default();
+        let mut roots = assembler.snapshot(&base, 0).unwrap();
+        let inline = assembler.add(JournalObjectKind::Extension, &cache).unwrap();
+        roots.extensions = assembler
+            .map(vec![JournalMapEntry {
+                key: RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                value: inline,
+            }])
+            .unwrap();
+        let lease = journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("seed-open"),
+                    pin: JournalPinId::new("seed-pin"),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap();
+        let mut commit = JournalCommit {
+            batch: JournalBatch {
+                session: session.clone(),
+                sequence: 1,
+                predecessor: None,
+                expected_revision: None,
+                writer_epoch: lease.writer_epoch().unwrap(),
+                operation: JournalOperationId::new("seed"),
+                boundary: boundary(),
+                snapshot: roots,
+                checkpoint: None,
+            },
+            digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+            objects: assembler.objects.into_values().collect(),
+            delta: JournalTransitionDelta {
+                boundary: boundary(),
+                bootstrap: None,
+                history_append: Vec::new(),
+                usage_append: Vec::new(),
+                extension_updates: BTreeMap::new(),
+                extension_references: BTreeMap::new(),
+                manifests_append: Vec::new(),
+                manifest_references: Vec::new(),
+            },
+            checkpoint: None,
+        };
+        commit.digest = commit.input_digest().unwrap();
+        journal.commit(&lease, commit).await.unwrap();
+        journal.close(lease).await.unwrap();
+
+        let Err(error) = open_domain(journal, JournalRole::Protected, &session).await else {
+            panic!("a protected head the writer cannot re-derive was accepted");
+        };
+        assert_eq!(error.message, incompatible_store().message);
+    }
+
     #[test]
     fn a_loaded_redacted_prefix_continues_by_cardinality() {
         let loaded = snapshot(vec![Message::user("[redacted]"), assistant("[redacted]")]);
@@ -1163,7 +1476,14 @@ mod tests {
             assistant("secret reply"),
             Message::user("next"),
         ]);
-        let delta = transition_delta(Some(&loaded), false, &live, boundary()).unwrap();
+        let delta = transition_delta(
+            Some(&loaded),
+            false,
+            &live,
+            boundary(),
+            &mut ObjectAssembler::default(),
+        )
+        .unwrap();
         assert_eq!(delta.history_append, vec![Message::user("next")]);
         assert!(delta.bootstrap.is_none());
     }
@@ -1179,7 +1499,14 @@ mod tests {
             assistant("two"),
             Message::user("three"),
         ]);
-        let error = transition_delta(Some(&submitted), true, &replaced, boundary()).unwrap_err();
+        let error = transition_delta(
+            Some(&submitted),
+            true,
+            &replaced,
+            boundary(),
+            &mut ObjectAssembler::default(),
+        )
+        .unwrap_err();
         assert!(error.message.contains("rewritten"), "{error:?}");
         let appended = snapshot(vec![
             Message::user("one"),
@@ -1187,9 +1514,15 @@ mod tests {
             Message::user("three"),
         ]);
         assert_eq!(
-            transition_delta(Some(&submitted), true, &appended, boundary())
-                .unwrap()
-                .history_append,
+            transition_delta(
+                Some(&submitted),
+                true,
+                &appended,
+                boundary(),
+                &mut ObjectAssembler::default(),
+            )
+            .unwrap()
+            .history_append,
             vec![Message::user("three")]
         );
     }
@@ -1198,6 +1531,15 @@ mod tests {
     fn a_loaded_prefix_with_different_roles_is_rejected() {
         let loaded = snapshot(vec![Message::user("[redacted]"), assistant("[redacted]")]);
         let live = snapshot(vec![assistant("a"), Message::user("b"), Message::user("c")]);
-        assert!(transition_delta(Some(&loaded), false, &live, boundary()).is_err());
+        assert!(
+            transition_delta(
+                Some(&loaded),
+                false,
+                &live,
+                boundary(),
+                &mut ObjectAssembler::default(),
+            )
+            .is_err()
+        );
     }
 }
