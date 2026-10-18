@@ -1369,9 +1369,13 @@ impl ObjectAssembler {
                 let mut unchanged = prior.is_some_and(|(prior_values, entries, _)| {
                     prior_values.len() == values.len() && entries.len() == values.len()
                 });
+                // Index the prior map once; `iter().nth(index)` per entry made
+                // a wide object quadratic.
+                let prior_pairs =
+                    prior.map(|(prior_values, _, _)| prior_values.iter().collect::<Vec<_>>());
                 for (index, (key, value)) in values.iter().enumerate() {
-                    let prior_entry = prior.and_then(|(prior_values, entries, _)| {
-                        let (prior_key, prior_value) = prior_values.iter().nth(index)?;
+                    let prior_entry = prior.and_then(|(_, entries, _)| {
+                        let (prior_key, prior_value) = *prior_pairs.as_ref()?.get(index)?;
                         let entry = entries.get(index)?;
                         (prior_key == key && entry.key == *key).then_some((
                             prior_value,
@@ -2146,6 +2150,54 @@ mod tests {
                 )
                 .unwrap_or_else(|error| panic!("warm encoding of {len} items failed: {error:?}"));
             assert!(warm.root == cold.root, "warm root differs for {len} items");
+            previous = Some((value, warm));
+        }
+    }
+
+    /// Wide objects keep warm == cold through key insertion in the middle,
+    /// removal, value changes and a value crossing the compact threshold.
+    #[test]
+    fn a_warm_json_cache_encodes_reshaped_objects_like_a_cold_one() {
+        let object = |keys: &[usize], big: usize| {
+            Value::Object(
+                keys.iter()
+                    .map(|key| {
+                        let value = if *key == big {
+                            json!("x".repeat(2_000))
+                        } else {
+                            json!(format!("value-{key:032}"))
+                        };
+                        (format!("k{key:03}"), value)
+                    })
+                    .collect(),
+            )
+        };
+        let all = (0..130).collect::<Vec<_>>();
+        let without_middle = (0..130).filter(|key| *key != 64).collect::<Vec<_>>();
+        let shapes = [
+            object(&all, usize::MAX),
+            object(&without_middle, usize::MAX),
+            object(&all, usize::MAX),
+            object(&all, 7),
+            object(&all[..65], 7),
+            object(&all[..64], usize::MAX),
+            object(&all, usize::MAX),
+        ];
+        let mut previous: Option<(Value, JsonEncodingCache)> = None;
+        for (step, value) in shapes.into_iter().enumerate() {
+            let cold = ObjectAssembler::default()
+                .json_value_cached(&value, None)
+                .unwrap();
+            let warm = ObjectAssembler::default()
+                .json_value_cached(
+                    &value,
+                    previous.as_ref().map(|(value, cache)| (value, cache)),
+                )
+                .unwrap();
+            assert!(
+                warm.root == cold.root,
+                "warm object root differs at step {step}"
+            );
             previous = Some((value, warm));
         }
     }
