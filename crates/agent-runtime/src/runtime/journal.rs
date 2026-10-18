@@ -406,14 +406,17 @@ impl SessionPersistence {
         {
             // Repair the only legal partial import: the exact visibility point
             // committed, but the separately projected ordinary head did not.
-            // A different protected checkpoint means the native session has
-            // advanced and stale v3 evidence must never be overlaid onto it.
+            // That exact head is then the v3 checkpoint itself. A different
+            // protected checkpoint, or any exact head when v3 had no
+            // checkpoint (the import never writes the exact domain then),
+            // means the native session has advanced and stale v3 evidence
+            // must never be overlaid onto it.
             let exact = protected
                 .as_ref()
                 .and_then(|domain| domain.checkpoint.clone());
             if legacy_checkpoint
                 .as_ref()
-                .is_some_and(|legacy| exact.as_ref().is_none_or(|native| native != legacy))
+                .is_none_or(|legacy| exact.as_ref().is_none_or(|native| native != legacy))
             {
                 let _ = close_import_domains(&mut ordinary, &mut protected).await;
                 return Err(incompatible_store());

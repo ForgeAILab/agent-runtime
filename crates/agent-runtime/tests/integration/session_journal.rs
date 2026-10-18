@@ -2093,3 +2093,105 @@ async fn ordinary_repair_never_overlays_v3_after_the_exact_head_advanced() {
         Some(&checkpoint)
     );
 }
+
+/// A v3 session that had no protected checkpoint imports only its ordinary
+/// record. Once native turns have published an exact head, a lost ordinary
+/// head is not a partial import (the import never wrote the exact domain),
+/// so the stale v3 ordinary record must not be "repaired" into the journal.
+#[tokio::test]
+async fn ordinary_repair_requires_the_exact_head_to_be_the_v3_import() {
+    let id = SessionId::new("journal-import-no-v3-checkpoint");
+    let seed_sessions = Arc::new(LegacySessionStore::default());
+    let seeded = runtime_with_optional_stores(Some(seed_sessions.clone()), None)
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    seeded
+        .run(agent_runtime::core::content::UserInput::text(
+            "v3 ordinary only",
+        ))
+        .await
+        .unwrap();
+    seeded.shutdown().await.unwrap();
+    let v3 = seed_sessions.0.lock().unwrap().clone().unwrap();
+
+    let pair = import_pair(
+        "no-v3-checkpoint",
+        Some(v3.clone()),
+        None,
+        identity_projection,
+    );
+    let imported = runtime(pair.sessions.clone(), pair.checkpoints.clone())
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap();
+    assert!(!head_exists(pair.protected.as_ref(), &id).await);
+    imported.shutdown().await.unwrap();
+
+    // A native turn publishes its first exact checkpoints, then the process
+    // dies while the provider call is in flight (exact head: CallingModel).
+    let blocking = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![ScriptedStream::blocking(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "partial".into(),
+                },
+            ])],
+        )))
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(32_000, 32_000, 4_096),
+        ))
+        .clock(Arc::new(FixedClock))
+        .session_store(pair.sessions.clone())
+        .checkpoint_store(pair.checkpoints.clone())
+        .build()
+        .unwrap();
+    let native = blocking
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap();
+    let _turn = native
+        .send(agent_runtime::core::content::UserInput::text("native turn"))
+        .unwrap();
+    for _ in 0..400 {
+        if head_exists(pair.protected.as_ref(), &id).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    std::mem::forget(native);
+    std::mem::forget(blocking);
+    let _ = pair.ordinary_inner.revoke_writer(&id);
+    let _ = pair.protected_inner.revoke_writer(&id);
+    let exact = materialized_checkpoint(pair.protected_inner.as_ref(), &id).await;
+    assert!(!exact.state.is_terminal(), "{:?}", exact.state);
+
+    // The ordinary journal later comes back without its head.
+    let emptied = Arc::new(RecordingJournal::new(Arc::new(
+        InMemorySessionJournal::ordinary(
+            JournalStorageId::new("no-v3-checkpoint-emptied"),
+            Arc::new(IdentityJournalProjection),
+        ),
+    )));
+    let sessions = Arc::new(HybridSessionStore {
+        journal: Some(emptied.clone()),
+        snapshot: Mutex::new(Some(v3.clone())),
+        saves: AtomicUsize::new(0),
+        discoveries: AtomicUsize::new(0),
+    });
+    let reopened = runtime(sessions.clone(), pair.checkpoints.clone())
+        .start_session(StartSession::resume(id.clone()))
+        .await;
+    assert!(
+        emptied.take_commits().is_empty(),
+        "stale v3 ordinary state was written over a native session"
+    );
+    let error = reopened.unwrap_err();
+    assert!(error.message.contains("no longer exposes"), "{error:?}");
+    assert_eq!(sessions.saves.load(Ordering::Relaxed), 0);
+}
