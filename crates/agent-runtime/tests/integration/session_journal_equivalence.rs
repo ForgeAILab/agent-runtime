@@ -8,6 +8,7 @@
 //! either path fails. Resume always uses a freshly built runtime over the same
 //! durable state, then continues the session and compares again.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,10 +26,12 @@ use agent_runtime::core::content::{
 use agent_runtime::core::error::RuntimeError;
 use agent_runtime::core::ids::SessionId;
 use agent_runtime::core::journal::{
-    InMemorySessionJournal, JournalCommit, JournalCommitFailurePoint, JournalGcReport,
-    JournalGcRequest, JournalHead, JournalLease, JournalObjectId, JournalOpen, JournalOpenIntent,
-    JournalOperationId, JournalPinId, JournalReadLimits, JournalReader, JournalRetirement,
-    JournalRevision, JournalRole, JournalRootSelection, JournalStorageId, SessionJournal,
+    IdentityJournalProjection, InMemorySessionJournal, JournalBatch, JournalBoundary,
+    JournalCommit, JournalCommitFailurePoint, JournalDigest, JournalGcReport, JournalGcRequest,
+    JournalHead, JournalLease, JournalObjectId, JournalOpen, JournalOpenIntent, JournalOperationId,
+    JournalPinId, JournalReadLimits, JournalReader, JournalRetirement, JournalRevision,
+    JournalRole, JournalRootSelection, JournalSnapshotRoots, JournalStorageId,
+    JournalTransitionDelta, SessionJournal,
 };
 use agent_runtime::core::provider::{
     Capabilities, FinishReason, ModelId, ProviderError, ProviderErrorKind, ProviderStreamEvent,
@@ -230,8 +233,17 @@ impl SessionJournal for Materializing {
     ) -> Result<JournalHead, RuntimeError> {
         let session = batch.batch.session.clone();
         let head = self.inner.commit(lease, batch).await?;
-        self.commits.fetch_add(1, Ordering::Relaxed);
+        let index = self.commits.fetch_add(1, Ordering::Relaxed);
         let value = self.materialize(&session).await?;
+        let materialized = match &value {
+            Materialized::Snapshot(snapshot) => (**snapshot).clone(),
+            Materialized::Checkpoint(checkpoint) => checkpoint.snapshot.clone(),
+        };
+        assert!(
+            cold_roots(&head, materialized).await == head.snapshot,
+            "{:?} commit {index}: warm encoding caches committed other roots than a cold encoding of the same state",
+            self.role
+        );
         self.log.lock().unwrap().push(value);
         Ok(head)
     }
@@ -251,6 +263,65 @@ impl SessionJournal for Materializing {
     async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
         self.inner.collect(request).await
     }
+}
+
+/// Cold-cache oracle for every published head: a fresh ordinary journal has
+/// no writer or backend encoding cache, so bootstrapping the materialized
+/// state into it re-encodes every record from scratch. Warm writer and
+/// backend caches must have committed exactly those roots.
+async fn cold_roots(head: &JournalHead, snapshot: SessionSnapshot) -> JournalSnapshotRoots {
+    let oracle = InMemorySessionJournal::ordinary(
+        JournalStorageId::new("review-cold-oracle"),
+        Arc::new(IdentityJournalProjection),
+    );
+    let lease = oracle
+        .open(
+            &head.session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new("cold-open"),
+                pin: JournalPinId::new("cold-pin"),
+                intent: JournalOpenIntent::ExclusiveWriter,
+            },
+        )
+        .await
+        .unwrap();
+    let boundary = JournalBoundary {
+        version: 1,
+        session: head.session.clone(),
+        turn: None,
+        checkpoint_sequence: 0,
+        planned_step_count: head.snapshot.planned_step_count,
+    };
+    let mut commit = JournalCommit {
+        batch: JournalBatch {
+            session: head.session.clone(),
+            sequence: 1,
+            predecessor: None,
+            expected_revision: None,
+            writer_epoch: lease.writer_epoch().unwrap(),
+            operation: JournalOperationId::new("cold"),
+            boundary: boundary.clone(),
+            snapshot: head.snapshot.clone(),
+            checkpoint: None,
+        },
+        digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+        objects: Vec::new(),
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(snapshot)),
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        },
+        checkpoint: None,
+    };
+    commit.digest = commit.input_digest().unwrap();
+    oracle.commit(&lease, commit).await.unwrap().snapshot
 }
 
 #[derive(Debug)]
