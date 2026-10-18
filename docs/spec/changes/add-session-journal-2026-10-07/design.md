@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-09T00:00:00Z
+updated_at: 2026-10-18T00:00:00Z
 ---
 
 # Design: Delta persistence without changing storage authority
@@ -483,6 +483,37 @@ Do not invent a legacy snapshot tag as a precondition for reading it.
    may execute a migrated head. Downgrade requires an explicit idle export with
    independently verified semantics, or restoring a backup under a stopped
    writer; never silently resurrect a stale v3 mid-turn checkpoint.
+
+### Task 2.5 implementation evidence (2026-10-18)
+
+`SessionPersistence::open` now reserves both native writer domains before its
+single v3 pair load. `validate_legacy_import_records` applies the same
+checkpoint fingerprint, session/snapshot identity, manifest-boundary,
+ordinary/protected overlay, delegation and LCM namespace checks used during
+resume before any import commit. Import uses stable `runtime-import-v3-*`
+operation identities and the canonical object encoder. It publishes protected
+first, repairs a missing ordinary head after a crash, closes both import pins
+only after all available publications, then reopens and discovers the native
+heads without consulting a marker. V3 records are read-only throughout.
+
+`v3_import_crash_cut_matrix_repairs_exactly_without_provider_io` captures real
+legacy checkpoints at idle, CallingModel, ModelResponseReady,
+AwaitingApproval, AwaitingInteraction, ExecutingTools, ToolOutcomeReady,
+LocalActionExecuting and all four cache phases. For each state it cuts every
+protected and ordinary reference-backend commit stage (`AfterObjects`,
+`AfterCheckpoint`, `AfterBatch`, `AfterPin`, `AfterHead`, `AfterIdempotency`,
+and ambiguous `AfterCommit`) plus import-pin close before and after release.
+Every fresh open materializes the original v3 ordinary/checkpoint values and
+checks their roots against a cold encoding; configured providers receive zero
+requests. `v3_pair_import_preserves_pending_lcm_summary_without_repeating_model_work`
+covers a protected pending LCM response whose DAG CAS landed before import.
+The authorized split of
+`legacy_v3_records_and_mixed_pairs_keep_the_materialized_path` is
+`legacy_v3_records_with_both_capabilities_import_once` plus
+`mixed_pairs_keep_the_materialized_path`; the latter expectations are
+unchanged. Additional tests cover redacted ordinary versus exact protected
+roots, v3 mixed-pair fallback, invalid evidence before head publication,
+one-time discovery, lost capability and ephemeral isolation.
 
 Keep public snapshot/history/recent_manifests projections and event variants.
 Version-4 readers run for the entire first release; future legacy-reader removal

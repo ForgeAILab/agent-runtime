@@ -68,6 +68,12 @@ enum PersistenceMode {
     Native(Box<NativePersistence>),
 }
 
+#[derive(Clone, Copy)]
+enum CommitPurpose {
+    Transition,
+    Import,
+}
+
 struct NativePersistence {
     ordinary: Option<Mutex<NativeDomain>>,
     protected: Option<Mutex<NativeDomain>>,
@@ -210,25 +216,20 @@ impl SessionPersistence {
         }
     }
 
-    /// Loads legacy records, discovers native capabilities, and fixes this
-    /// session's mode. A legacy v3 record remains legacy until the separately
-    /// scoped import task lands. Ephemeral callers pass no stores and therefore
-    /// perform no journal discovery.
+    /// Discovers native capabilities and fixes this session's mode. A fully
+    /// capable pair acquires its create/import writer reservations before it
+    /// loads the legacy records exactly once. A resumable v3 pair is imported
+    /// only when both configured policy stores expose native journals.
+    /// Ephemeral callers pass no stores and therefore perform no discovery.
     pub(crate) async fn open(
         session: SessionId,
         explicit_id: bool,
+        import_legacy: bool,
+        flat_summary: bool,
+        lcm: Option<Arc<crate::harness::LcmCoordinator>>,
         session_store: Option<Arc<dyn SessionStore>>,
         checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     ) -> Result<OpenedSessionPersistence, RuntimeError> {
-        let legacy_snapshot = match (explicit_id, &session_store) {
-            (true, Some(store)) => store.load(&session).await?,
-            _ => None,
-        };
-        let legacy_checkpoint = match (explicit_id, &checkpoint_store) {
-            (true, Some(store)) => store.load_latest(&session).await?,
-            _ => None,
-        };
-
         let ordinary_journal = session_store.as_ref().and_then(|store| store.journal());
         let protected_journal = checkpoint_store.as_ref().and_then(|store| store.journal());
         let every_configured_store_is_native = session_store
@@ -247,8 +248,8 @@ impl SessionPersistence {
                     checkpoint_store,
                     mode: PersistenceMode::Legacy,
                 }),
-                snapshot: legacy_snapshot,
-                checkpoint: legacy_checkpoint,
+                snapshot: None,
+                checkpoint: None,
             });
         }
 
@@ -264,6 +265,13 @@ impl SessionPersistence {
                     return Err(incompatible_store());
                 }
             }
+            let (legacy_snapshot, legacy_checkpoint) = load_legacy_records(
+                &session,
+                explicit_id,
+                session_store.as_ref(),
+                checkpoint_store.as_ref(),
+            )
+            .await?;
             return Ok(OpenedSessionPersistence {
                 persistence: Arc::new(Self {
                     session,
@@ -297,6 +305,21 @@ impl SessionPersistence {
             None => None,
         };
 
+        let loaded = load_legacy_records(
+            &session,
+            explicit_id,
+            session_store.as_ref(),
+            checkpoint_store.as_ref(),
+        )
+        .await;
+        let (legacy_snapshot, legacy_checkpoint) = match loaded {
+            Ok(records) => records,
+            Err(error) => {
+                let _ = close_import_domains(&mut ordinary, &mut protected).await;
+                return Err(error);
+            }
+        };
+
         let native_exists = protected
             .as_ref()
             .is_some_and(|domain| domain.head.is_some())
@@ -304,23 +327,111 @@ impl SessionPersistence {
                 .as_ref()
                 .is_some_and(|domain| domain.head.is_some());
         let legacy_exists = legacy_snapshot.is_some() || legacy_checkpoint.is_some();
+        let can_import = import_legacy
+            && session_store.is_some()
+            && checkpoint_store.is_some()
+            && ordinary.is_some()
+            && protected.is_some();
         if !native_exists && legacy_exists {
-            if let Some(domain) = ordinary.as_mut() {
-                domain.close().await?;
+            if !can_import {
+                close_import_domains(&mut ordinary, &mut protected).await?;
+                return Ok(OpenedSessionPersistence {
+                    persistence: Arc::new(Self {
+                        session,
+                        session_store,
+                        checkpoint_store,
+                        mode: PersistenceMode::Legacy,
+                    }),
+                    snapshot: legacy_snapshot,
+                    checkpoint: legacy_checkpoint,
+                });
             }
-            if let Some(domain) = protected.as_mut() {
-                domain.close().await?;
+
+            let import_result = async {
+                crate::runtime::engine::validate_legacy_import_records(
+                    &session,
+                    legacy_snapshot.as_ref(),
+                    legacy_checkpoint.as_ref(),
+                    flat_summary,
+                    lcm.as_deref(),
+                )?;
+                // The exact head is the import visibility point. Before it
+                // lands, v3 remains authoritative; after it lands, discovery
+                // repairs any missing ordinary publication from the unchanged
+                // v3 pair.
+                if let Some(checkpoint) = legacy_checkpoint.as_ref() {
+                    Box::pin(commit_domain(
+                        protected.as_mut().expect("native pair checked above"),
+                        &checkpoint.snapshot,
+                        Some(checkpoint),
+                        CommitPurpose::Import,
+                    ))
+                    .await?;
+                }
+                if let Some(snapshot) = legacy_snapshot.as_ref() {
+                    Box::pin(commit_domain(
+                        ordinary.as_mut().expect("native pair checked above"),
+                        snapshot,
+                        legacy_checkpoint.as_ref(),
+                        CommitPurpose::Import,
+                    ))
+                    .await?;
+                }
+                Ok::<_, RuntimeError>(())
             }
-            return Ok(OpenedSessionPersistence {
-                persistence: Arc::new(Self {
-                    session,
-                    session_store,
-                    checkpoint_store,
-                    mode: PersistenceMode::Legacy,
-                }),
-                snapshot: legacy_snapshot,
-                checkpoint: legacy_checkpoint,
-            });
+            .await;
+            if let Err(error) = import_result {
+                let _ = close_import_domains(&mut ordinary, &mut protected).await;
+                return Err(error);
+            }
+            Box::pin(reopen_after_import(&session, &mut ordinary, &mut protected)).await?;
+        } else if can_import
+            && legacy_snapshot.is_some()
+            && ordinary
+                .as_ref()
+                .is_some_and(|domain| domain.head.is_none())
+            && protected
+                .as_ref()
+                .is_some_and(|domain| domain.head.is_some())
+        {
+            // Repair the only legal partial import: the exact visibility point
+            // committed, but the separately projected ordinary head did not.
+            // A different protected checkpoint means the native session has
+            // advanced and stale v3 evidence must never be overlaid onto it.
+            let exact = protected
+                .as_ref()
+                .and_then(|domain| domain.checkpoint.clone());
+            if legacy_checkpoint
+                .as_ref()
+                .is_some_and(|legacy| exact.as_ref().is_none_or(|native| native != legacy))
+            {
+                let _ = close_import_domains(&mut ordinary, &mut protected).await;
+                return Err(incompatible_store());
+            }
+            let repair_result = async {
+                crate::runtime::engine::validate_legacy_import_records(
+                    &session,
+                    legacy_snapshot.as_ref(),
+                    exact.as_ref(),
+                    flat_summary,
+                    lcm.as_deref(),
+                )?;
+                Box::pin(commit_domain(
+                    ordinary.as_mut().expect("partial import checked above"),
+                    legacy_snapshot
+                        .as_ref()
+                        .expect("partial import checked above"),
+                    exact.as_ref(),
+                    CommitPurpose::Import,
+                ))
+                .await
+            }
+            .await;
+            if let Err(error) = repair_result {
+                let _ = close_import_domains(&mut ordinary, &mut protected).await;
+                return Err(error);
+            }
+            Box::pin(reopen_after_import(&session, &mut ordinary, &mut protected)).await?;
         }
 
         // With two configured domains, an ordinary head published after a
@@ -410,6 +521,7 @@ impl SessionPersistence {
                         &mut *domain.lock().await,
                         &checkpoint.snapshot,
                         Some(checkpoint),
+                        CommitPurpose::Transition,
                     ))
                     .await
                 }
@@ -442,6 +554,7 @@ impl SessionPersistence {
                         &mut *domain.lock().await,
                         snapshot,
                         checkpoint.as_ref(),
+                        CommitPurpose::Transition,
                     ))
                     .await
                 }
@@ -508,6 +621,78 @@ impl NativeDomain {
             None => Ok(()),
         }
     }
+}
+
+async fn load_legacy_records(
+    session: &SessionId,
+    explicit_id: bool,
+    session_store: Option<&Arc<dyn SessionStore>>,
+    checkpoint_store: Option<&Arc<dyn CheckpointStore>>,
+) -> Result<(Option<SessionSnapshot>, Option<TurnCheckpoint>), RuntimeError> {
+    if !explicit_id {
+        return Ok((None, None));
+    }
+    let snapshot = match session_store {
+        Some(store) => store.load(session).await?,
+        None => None,
+    };
+    let checkpoint = match checkpoint_store {
+        Some(store) => store.load_latest(session).await?,
+        None => None,
+    };
+    Ok((snapshot, checkpoint))
+}
+
+async fn close_import_domains(
+    ordinary: &mut Option<NativeDomain>,
+    protected: &mut Option<NativeDomain>,
+) -> Result<(), RuntimeError> {
+    let ordinary_result = match ordinary.as_mut() {
+        Some(domain) => domain.close().await,
+        None => Ok(()),
+    };
+    let protected_result = match protected.as_mut() {
+        Some(domain) => domain.close().await,
+        None => Ok(()),
+    };
+    ordinary_result.and(protected_result)
+}
+
+/// Releases the create/import reservations only after every available policy
+/// publication is durable, then proves discovery from the native heads by
+/// acquiring the live runtime writers afresh. No migration marker participates
+/// in this decision.
+async fn reopen_after_import(
+    session: &SessionId,
+    ordinary: &mut Option<NativeDomain>,
+    protected: &mut Option<NativeDomain>,
+) -> Result<(), RuntimeError> {
+    let ordinary_journal = ordinary.as_ref().map(|domain| domain.journal.clone());
+    let protected_journal = protected.as_ref().map(|domain| domain.journal.clone());
+    close_import_domains(ordinary, protected).await?;
+
+    let mut reopened_protected = match protected_journal {
+        Some(journal) => {
+            Some(Box::pin(open_domain(journal, JournalRole::Protected, session)).await?)
+        }
+        None => None,
+    };
+    let reopened_ordinary = match ordinary_journal {
+        Some(journal) => match Box::pin(open_domain(journal, JournalRole::Ordinary, session)).await
+        {
+            Ok(domain) => Some(domain),
+            Err(error) => {
+                if let Some(domain) = reopened_protected.as_mut() {
+                    let _ = domain.close().await;
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    *ordinary = reopened_ordinary;
+    *protected = reopened_protected;
+    Ok(())
 }
 
 async fn inspect_head(
@@ -653,6 +838,7 @@ async fn commit_domain(
     domain: &mut NativeDomain,
     snapshot: &SessionSnapshot,
     checkpoint: Option<&TurnCheckpoint>,
+    purpose: CommitPurpose,
 ) -> Result<(), RuntimeError> {
     // In the ordinary domain `checkpoint` is only a boundary hint; it is
     // never stored or made reachable there.
@@ -731,14 +917,15 @@ async fn commit_domain(
         &roots,
         &referenced_checkpoint,
     ))?;
-    let operation = JournalOperationId::new(format!(
-        "runtime-{}-{}",
-        match domain.role {
-            JournalRole::Ordinary => "ordinary",
-            JournalRole::Protected => "protected",
-        },
-        Fingerprint::of(operation_payload).as_str()
-    ));
+    let role = match domain.role {
+        JournalRole::Ordinary => "ordinary",
+        JournalRole::Protected => "protected",
+    };
+    let fingerprint = Fingerprint::of(operation_payload);
+    let operation = JournalOperationId::new(match purpose {
+        CommitPurpose::Transition => format!("runtime-{role}-{}", fingerprint.as_str()),
+        CommitPurpose::Import => format!("runtime-import-v3-{role}-{}", fingerprint.as_str()),
+    });
     let batch = JournalBatch {
         session: snapshot.id.clone(),
         sequence: current.map_or(1, |head| head.batch_sequence.saturating_add(1)),

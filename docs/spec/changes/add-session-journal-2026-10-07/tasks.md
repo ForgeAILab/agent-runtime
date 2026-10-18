@@ -27,7 +27,27 @@ all applicable gates, not merely contract merge.
   Evidence: `native_delta_submission_is_independent_of_unchanged_history_bodies` proves referenced request/history bodies stay constant at N=100/1000 while changed leaves retain replacement bytes. Review measurement (`review_one_message_turn_submissions_do_not_grow_with_history`, N=100/1000/4000): Accepted (36 objects, 143 new body bytes, ~9.8-10.4 KB) and CallingModel (6 objects/1.7 KB; 39 objects/11 KB with a system prompt) commits are constant and unchanged boundaries submit 0 objects, but a whole one-message turn is still O(N): the runtime-owned `runtime.core.previous_cache` plan record (~113 bytes per history message) is replaced at every ModelResponseReady and ordinary terminal save, and the turn manifest is likewise O(N); ordinary commits carry each changed leaf twice (draft object and delta). At N=4000 one turn submits ~465 KB protected and ~1.9 MB ordinary. N=10000 is not measurable here: legacy and native both end that turn Failed before provider I/O. Task 2.7 must quantify and decide these costs.
 - [x] 2.4 Preserve distinct exact/projection domains and existing terminal/nonterminal overlay rules, U3 boundary counters, hard-admission exact-successor proof, U7 authority and U8 durable fork ordering.
   Evidence: redacted terminal overlay, native hard-admission/idle recovery, and Summary/Empty/FromIndex fork equivalence tests pass with existing transition validation unchanged. Review: exact checkpoints after a terminal resume carry the host-redacted canonical prefix exactly as legacy does (protected `history_append` is advisory; backends verify roots); a rewritten history is never expressed as an append to the ordinary projection; an ordinary head published after an exact checkpoint still requires its protected head.
-- [ ] 2.5 Implement idempotent one-time v3 import and mixed native/legacy detection; cut crashes at each import write, including pending approval, CallingModel, model/tool results, cache phases and pending summary.
+- [x] 2.5 Implement idempotent one-time v3 import and mixed native/legacy detection; cut crashes at each import write, including pending approval, CallingModel, model/tool results, cache phases and pending summary.
+  Evidence (2026-10-18): fully capable pairs reserve absent heads before one
+  v3 load, validate identity/operation/namespace/pair evidence, publish exact
+  first under stable `runtime-import-v3-*` operations, repair a missing
+  ordinary projection from the unchanged v3 pair, close the import pins only
+  after both publications and rediscover the committed heads. Mixed pairs stay
+  wholly legacy before a head; a detectable head plus a lost capability fails
+  incompatible; ephemeral sessions still make zero store/journal calls. The
+  authorized old selection test was split into
+  `legacy_v3_records_with_both_capabilities_import_once` (native heads equal
+  the v3 materializations, no legacy save, no second import) and the unchanged
+  `mixed_pairs_keep_the_materialized_path` expectations. The equivalence
+  harness's `v3_import_crash_cut_matrix_repairs_exactly_without_provider_io`
+  covers 12 real states (idle, approval, interaction, CallingModel,
+  ModelResponseReady, ExecutingTools, ToolOutcomeReady, local executing, and
+  four cache phases) across all seven protected and seven ordinary commit cuts
+  plus pin close before/after release; every reopened head equals v3 and its
+  cold encoding and provider requests remain zero. The dedicated pending-LCM
+  test imports a committed pending response without another summary-model or
+  provider call. Redacted/exact separation, invalid evidence, v3 mixed pairs,
+  lost capability and ephemeral isolation have focused integration tests.
 - [ ] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
 - [x] 2.7 Count serialized submission/new-object bytes at N=100/1000/4000 (and 10000 when the cache-identity limit permits) and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.
   Evidence (implementation measurement, 2026-10-18; exact bytes, each cell is

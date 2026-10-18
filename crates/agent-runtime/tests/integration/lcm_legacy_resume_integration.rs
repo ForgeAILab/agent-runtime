@@ -69,6 +69,32 @@ struct NativeSessionFixtureStore {
     legacy_saves: AtomicUsize,
 }
 
+#[derive(Debug)]
+struct NativeImportPairStore {
+    snapshot: Mutex<Option<SessionSnapshot>>,
+    checkpoint: Mutex<Option<TurnCheckpoint>>,
+    ordinary: Arc<InMemorySessionJournal>,
+    protected: Arc<InMemorySessionJournal>,
+    legacy_saves: AtomicUsize,
+}
+
+impl NativeImportPairStore {
+    fn new(snapshot: SessionSnapshot, checkpoint: TurnCheckpoint) -> Arc<Self> {
+        Arc::new(Self {
+            snapshot: Mutex::new(Some(snapshot)),
+            checkpoint: Mutex::new(Some(checkpoint)),
+            ordinary: Arc::new(InMemorySessionJournal::ordinary(
+                JournalStorageId::new(format!("lcm-import-ordinary-{}", uuid::Uuid::new_v4())),
+                Arc::new(IdentityJournalProjection),
+            )),
+            protected: Arc::new(InMemorySessionJournal::protected(JournalStorageId::new(
+                format!("lcm-import-protected-{}", uuid::Uuid::new_v4()),
+            ))),
+            legacy_saves: AtomicUsize::new(0),
+        })
+    }
+}
+
 #[async_trait]
 impl SessionStore for NativeSessionFixtureStore {
     fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
@@ -81,6 +107,53 @@ impl SessionStore for NativeSessionFixtureStore {
 
     async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
         self.legacy_saves.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SessionStore for NativeImportPairStore {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+
+    async fn load(&self, session: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(self
+            .snapshot
+            .lock()
+            .expect("import snapshot lock")
+            .as_ref()
+            .filter(|snapshot| snapshot.id == *session)
+            .cloned())
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for NativeImportPairStore {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+
+    async fn load_latest(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        Ok(self
+            .checkpoint
+            .lock()
+            .expect("import checkpoint lock")
+            .as_ref()
+            .filter(|checkpoint| checkpoint.session == *session)
+            .cloned())
+    }
+
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -1586,6 +1659,161 @@ async fn pending_node_resume_repairs_and_saves_state_before_handle_creation() {
     assert_eq!(model.calls(), 1, "resume must not repeat summary work");
     assert!(provider.requests().is_empty());
     drop(session);
+}
+
+#[tokio::test]
+async fn v3_pair_import_preserves_pending_lcm_summary_without_repeating_model_work() {
+    let session_id = SessionId::new("lcm-v3-pending-import");
+    let legacy_sessions = Arc::new(SessionFixtureStore::default());
+    let legacy_checkpoints = Arc::new(CheckpointFixtureStore::default());
+    let seed_provider = Arc::new(FakeProvider::text_reply("legacy terminal"));
+    let seed_runtime = RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+        .provider(seed_provider)
+        .model_profile(
+            agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                "fake",
+                agent_runtime::core::provider::ModelId::new("fake"),
+                agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+            ),
+        )
+        .session_store(legacy_sessions.clone())
+        .checkpoint_store(legacy_checkpoints.clone())
+        .build()
+        .unwrap();
+    let seeded = seed_runtime
+        .start_session(StartSession::create(session_id.clone(), idle_history()))
+        .await
+        .unwrap();
+    seeded
+        .run(UserInput::text("legacy pending-summary boundary"))
+        .await
+        .unwrap();
+    seeded.shutdown().await.unwrap();
+    let mut snapshot = legacy_sessions.latest(&session_id);
+    let mut checkpoint = legacy_checkpoints
+        .latest
+        .lock()
+        .expect("checkpoint fixture lock")
+        .clone()
+        .expect("legacy terminal checkpoint");
+
+    let lcm_store = Arc::new(LcmFixtureStore::new(LcmTimelineId::new(TIMELINE_ID)));
+    let model = Arc::new(CountingSummaryModel::new());
+    let coordinator = hard_pressure_coordinator(&session_id, lcm_store.clone(), model.clone());
+    let staged = coordinator
+        .before_provider(&admission_view(&session_id, &snapshot.history, None))
+        .await
+        .expect("hard admission stages a protected response");
+    let pending_patch = staged.patch.state.expect("pending summary checkpoint");
+    let pending_state = VersionedSessionState {
+        revision: pending_patch.revision,
+        sensitivity: pending_patch.sensitivity,
+        value: pending_patch.value,
+    };
+    let commit_value = pending_state
+        .value
+        .get("pending_summary")
+        .and_then(|pending| pending.get("Leaf"))
+        .and_then(|leaf| leaf.get("commit"))
+        .cloned()
+        .expect("serialized pending leaf commit");
+    let commit: LeafCommit = serde_json::from_value(commit_value).unwrap();
+    let binding = LcmTimelineBinding::new(
+        session_id.clone(),
+        LcmTimelineId::new(TIMELINE_ID),
+        RegistryRevision::new(BINDING_REVISION),
+        lcm_store.authority(),
+    )
+    .unwrap();
+    lcm_store
+        .commit_leaf(&binding.view(), commit)
+        .await
+        .unwrap();
+    let calls_before_import = model.calls();
+    snapshot
+        .extension_state
+        .insert(LCM_COMPONENT_ID.to_owned(), pending_state.clone());
+    checkpoint
+        .snapshot
+        .extension_state
+        .insert(LCM_COMPONENT_ID.to_owned(), pending_state);
+    checkpoint.validate().unwrap();
+
+    let mut invalid_snapshot = snapshot.clone();
+    let mut invalid_checkpoint = checkpoint.clone();
+    invalid_snapshot
+        .extension_state
+        .get_mut(LCM_COMPONENT_ID)
+        .unwrap()
+        .value["timeline_id"] = json!("foreign-import-timeline");
+    invalid_checkpoint
+        .snapshot
+        .extension_state
+        .get_mut(LCM_COMPONENT_ID)
+        .unwrap()
+        .value["timeline_id"] = json!("foreign-import-timeline");
+    let invalid_stores = NativeImportPairStore::new(invalid_snapshot, invalid_checkpoint);
+    let invalid_provider = Arc::new(FakeProvider::text_reply("must not run"));
+    let invalid_runtime = RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+        .provider(invalid_provider.clone())
+        .model_profile(
+            agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                "fake",
+                agent_runtime::core::provider::ModelId::new("fake"),
+                agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+            ),
+        )
+        .session_store(invalid_stores.clone())
+        .checkpoint_store(invalid_stores.clone())
+        .lcm(coordinator.clone())
+        .build()
+        .unwrap();
+    assert!(
+        invalid_runtime
+            .start_session(StartSession::resume(session_id.clone()))
+            .await
+            .is_err(),
+        "foreign LCM binding was imported"
+    );
+    assert!(invalid_provider.requests().is_empty());
+    assert_eq!(invalid_stores.ordinary.object_count().unwrap(), 0);
+    assert_eq!(invalid_stores.protected.object_count().unwrap(), 0);
+
+    let stores = NativeImportPairStore::new(snapshot, checkpoint);
+    let provider = Arc::new(FakeProvider::text_reply("must not run during import"));
+    let runtime = RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+        .provider(provider.clone())
+        .model_profile(
+            agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                "fake",
+                agent_runtime::core::provider::ModelId::new("fake"),
+                agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+            ),
+        )
+        .session_store(stores.clone())
+        .checkpoint_store(stores.clone())
+        .lcm(coordinator)
+        .build()
+        .unwrap();
+    let resumed = runtime
+        .start_session(StartSession::resume(session_id.clone()))
+        .await
+        .expect("pending summary imports and repairs");
+    assert!(provider.requests().is_empty());
+    assert_eq!(model.calls(), calls_before_import);
+    assert_eq!(lcm_store.node_count(), 1);
+    assert!(
+        resumed
+            .snapshot()
+            .extension_state
+            .get(LCM_COMPONENT_ID)
+            .is_some_and(|state| state.value["pending_summary"].is_null())
+    );
+    assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0);
+    assert!(stores.ordinary.object_count().unwrap() > 0);
+    assert!(stores.protected.object_count().unwrap() > 0);
+    resumed.shutdown().await.unwrap();
+    assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -48,7 +48,7 @@ pub(crate) const IDLE_BOUNDARY_NAMESPACE: &str = "runtime.lcm.idle_boundary";
 /// the ordinary view, which is allowed to omit sensitive values. A namespace
 /// whose state-schema revision differs cannot be interpreted safely and fails
 /// closed.
-fn merge_terminal_checkpoint_snapshot(
+pub(crate) fn merge_terminal_checkpoint_snapshot(
     canonical: &mut SessionSnapshot,
     protected: &SessionSnapshot,
     flat_summary: bool,
@@ -191,7 +191,7 @@ fn merge_terminal_checkpoint_snapshot(
 /// canonical turn state, but the delegation namespaces must not regress to
 /// the older checkpoint view. No history, usage, manifest, or identity state
 /// is copied from the ordinary snapshot here.
-fn merge_newer_nonterminal_delegation_state(
+pub(crate) fn merge_newer_nonterminal_delegation_state(
     protected: &mut SessionSnapshot,
     ordinary: &SessionSnapshot,
     flat_summary: bool,
@@ -292,6 +292,104 @@ fn merge_durable_lcm_import(
             ));
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Validates the complete materialized evidence before a v3 pair is allowed
+/// to become a native journal head.
+///
+/// Import is a representation change, so it must reject every record that a
+/// normal resume would reject before publishing the first native boundary.
+/// The later resume path still performs live LCM store/claim/DAG validation;
+/// this check covers the persisted identity, configured LCM binding/frontier,
+/// checkpoint operation, manifest boundary, strategy namespace and
+/// ordinary/protected pair binding without provider, model or tool work.
+pub(crate) fn validate_legacy_import_records(
+    session: &SessionId,
+    snapshot: Option<&SessionSnapshot>,
+    checkpoint: Option<&TurnCheckpoint>,
+    flat_summary: bool,
+    lcm: Option<&LcmCoordinator>,
+) -> Result<(), RuntimeError> {
+    fn validate_strategy_namespaces(
+        snapshot: &SessionSnapshot,
+        flat_summary: bool,
+        lcm: Option<&LcmCoordinator>,
+    ) -> Result<(), RuntimeError> {
+        let legacy = snapshot
+            .extension_state
+            .contains_key(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID);
+        let current = snapshot.extension_state.contains_key(LCM_COMPONENT_ID);
+        if legacy && current {
+            return Err(RuntimeError::conflict(
+                "session contains both legacy semantic-summary and LCM state",
+            ));
+        }
+        if flat_summary && current {
+            return Err(RuntimeError::conflict(
+                "persisted LCM state requires its configured LCM coordinator",
+            ));
+        }
+        if !flat_summary && lcm.is_none() && (legacy || current) {
+            return Err(RuntimeError::conflict(
+                "persisted semantic-compaction state requires RuntimeBuilder::lcm",
+            ));
+        }
+        if let (Some(coordinator), Some(state)) =
+            (lcm, snapshot.extension_state.get(LCM_COMPONENT_ID))
+        {
+            coordinator.validate_import_state(&snapshot.id, &snapshot.history, state)?;
+        }
+        Ok(())
+    }
+
+    if let Some(snapshot) = snapshot {
+        if &snapshot.id != session {
+            return Err(RuntimeError::conflict(
+                "session store returned another session's state",
+            ));
+        }
+        crate::runtime::manifests::snapshot_planned_steps(snapshot)?;
+        validate_strategy_namespaces(snapshot, flat_summary, lcm)?;
+    }
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.validate()?;
+        if &checkpoint.session != session {
+            return Err(RuntimeError::conflict(
+                "checkpoint store returned another session's state",
+            ));
+        }
+        crate::runtime::manifests::snapshot_planned_steps(&checkpoint.snapshot)?;
+        validate_strategy_namespaces(&checkpoint.snapshot, flat_summary, lcm)?;
+        if matches!(checkpoint.state, TurnState::CacheOperationTerminal { .. })
+            && !checkpoint
+                .snapshot
+                .extension_state
+                .contains_key(crate::cache::CACHE_MECHANISM_STATE_NAMESPACE)
+        {
+            return Err(RuntimeError::conflict(
+                "terminal cache checkpoint is missing its protected cache extension",
+            ));
+        }
+    }
+
+    let (Some(ordinary), Some(checkpoint)) = (snapshot, checkpoint) else {
+        return Ok(());
+    };
+    if matches!(checkpoint.state, TurnState::Terminal { .. }) {
+        let mut canonical = ordinary.clone();
+        merge_terminal_checkpoint_snapshot(&mut canonical, &checkpoint.snapshot, flat_summary)?;
+    } else {
+        let mut protected = checkpoint.snapshot.clone();
+        merge_newer_nonterminal_delegation_state(&mut protected, ordinary, flat_summary)?;
+        // This also validates both manifest-boundary records. Diagnostics are
+        // not imported into the exact domain; the call is validation-only.
+        carry_compatible_diagnostics(
+            &mut protected,
+            ordinary,
+            crate::runtime::manifests::DEFAULT_MANIFEST_WINDOW,
+        )?;
     }
     Ok(())
 }
@@ -1326,6 +1424,9 @@ impl Runtime {
         let opened_persistence = Box::pin(SessionPersistence::open(
             session_id.clone(),
             explicit_id,
+            request.mode == StartSessionMode::Resume,
+            self.shared.driver.semantic_summary_revision().is_some(),
+            self.shared.lcm.clone(),
             self.shared.session_store.clone(),
             self.shared.checkpoint_store.clone(),
         ))

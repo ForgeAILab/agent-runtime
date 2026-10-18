@@ -149,16 +149,28 @@ projection policy runs, so a policy must not call back into the same journal.
 `JournalRetirement`/`JournalCollection` unsupported capabilities and retain all
 content until U9 group C. The runtime selects native mode for a fresh session
 when every configured store exposes `journal()` (or for a session with a native
-head), keeps mixed capability pairs and existing v3 records on the materialized
-legacy path, and rejects a detectable native head whose configured pair lost a
-capability. An ordinary head published before the session's first exact
-checkpoint resumes alone, as a legacy snapshot does; one published after an
-exact checkpoint requires the protected head. If every configured store stops
-exposing `journal()` there is nothing left to ask, so a native-only session
-then reports not found unless the host also kept a materialized record.
-Writer fences are released at shutdown and when a session handle is dropped.
-Ephemeral sessions bypass discovery entirely. V3 import remains a later
-group-B task.
+head). On explicit resume, an existing v3 pair whose ordinary and protected
+stores both expose the capability is imported once: the runtime reserves both
+absent heads before its single legacy load, validates the materialized
+identity/operation/namespace and pair evidence, publishes the exact protected
+head first, then publishes the host-projected ordinary head. Import operations
+and content roots are stable. A failure before the exact visibility point
+leaves v3 authoritative; a failure after it is repaired from that native head
+plus the unchanged legacy ordinary record, without a migration marker. Import
+leases stay pinned through both publications and are closed before fresh live
+writer leases are opened. The original v3 records are not saved, pruned or
+rewritten.
+
+Mixed capability pairs remain wholly on the materialized legacy path while no
+native head exists, and a detectable native head whose configured pair lost a
+capability is incompatible rather than a reason to use stale v3 data. An
+ordinary head published before the session's first exact checkpoint resumes
+alone, as a legacy snapshot does; one published after an exact checkpoint
+requires the protected head. If every configured store stops exposing
+`journal()` there is nothing left to ask, so a native-only session then reports
+not found unless the host also kept a materialized record. Writer fences are
+released at shutdown and when a session handle is dropped. Ephemeral sessions
+bypass discovery entirely.
 
 Adapters run the reusable task-2.1 contract with
 `agent_runtime_testkit::conformance::journal::assert_session_journal_conformance`

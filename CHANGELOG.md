@@ -9,6 +9,18 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Changed
 
+- Existing schema-3 sessions now move once to native journaling when both the
+  ordinary and protected stores expose `SessionJournal`. Import is fenced and
+  idempotent, publishes the exact checkpoint head before the separately
+  projected ordinary head, repairs an interrupted ordinary publication on the
+  next open, and never rewrites or prunes the v3 records. Mixed-capability
+  pairs remain wholly materialized until a native head exists; after that, a
+  detectable lost capability is an incompatible-store error rather than a
+  fallback to stale v3 state. Mid-turn requests, prepared interactions,
+  committed model/tool/cache results, deadlines, watermarks and pending LCM
+  summaries retain their exact protected representation, without provider,
+  model or tool calls during import.
+
 - **Breaking:** the schema-4 journal vocabulary released in 0.5.0 grows so a
   native turn costs O(delta). `JournalObjectKind` gains `ExtensionReference`,
   `ManifestReference`, `JsonValue`, `JsonInline`, `JsonBranch` and
