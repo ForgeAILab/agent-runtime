@@ -151,8 +151,14 @@ content until U9 group C. The runtime selects native mode for a fresh session
 when every configured store exposes `journal()` (or for a session with a native
 head), keeps mixed capability pairs and existing v3 records on the materialized
 legacy path, and rejects a detectable native head whose configured pair lost a
-capability. Ephemeral sessions bypass discovery entirely. V3 import remains a
-later group-B task.
+capability. An ordinary head published before the session's first exact
+checkpoint resumes alone, as a legacy snapshot does; one published after an
+exact checkpoint requires the protected head. If every configured store stops
+exposing `journal()` there is nothing left to ask, so a native-only session
+then reports not found unless the host also kept a materialized record.
+Writer fences are released at shutdown and when a session handle is dropped.
+Ephemeral sessions bypass discovery entirely. V3 import remains a later
+group-B task.
 
 Adapters run the reusable task-2.1 contract with
 `agent_runtime_testkit::conformance::journal::assert_session_journal_conformance`
