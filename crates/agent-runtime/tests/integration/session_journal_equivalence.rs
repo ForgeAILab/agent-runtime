@@ -4564,7 +4564,41 @@ fn assert_crash_matrix_resume_matches(
     }
 }
 
+/// Boundaries whose in-flight provider or cache call may already have run:
+/// resuming one must not issue a provider request before the next input.
+const CRASH_MATRIX_PROVIDER_INDETERMINATE: [&str; 2] = ["calling_model", "cache_operation_started"];
+
+/// Boundaries whose tool or local-action execution may already have run:
+/// resuming one must not execute it again (the runtime may still report the
+/// indeterminate outcome to the model, which is a new request, not a replay).
+const CRASH_MATRIX_TOOL_INDETERMINATE: [&str; 2] = ["executing_tools", "local_action_executing"];
+
 const CRASH_MATRIX_CONTINUATION: &str = "continue after crash matrix";
+
+/// Absolute no-replay oracle, checked on both paths: the legacy comparison
+/// alone cannot see a replay that shared resume code makes on both sides.
+#[track_caller]
+fn assert_crash_matrix_no_replay(run: &CrashMatrixResume, visible: &str, label: &str) {
+    if CRASH_MATRIX_TOOL_INDETERMINATE.contains(&visible) {
+        assert_eq!(
+            run.tool_calls, 0,
+            "{label}: resume from {visible} re-ran tool or local-action work"
+        );
+    }
+    if CRASH_MATRIX_PROVIDER_INDETERMINATE.contains(&visible) {
+        for request in &run.requests {
+            assert!(
+                request.messages.iter().any(|message| {
+                    message.content.iter().any(|part| {
+                        part.as_text()
+                            .is_some_and(|text| text.contains(CRASH_MATRIX_CONTINUATION))
+                    })
+                }),
+                "{label}: resume from {visible} re-issued provider work before the next input"
+            );
+        }
+    }
+}
 
 async fn assert_crash_matrix_continuation(barrier: &CrashMatrixBarrier, case: CrashMatrixCase) {
     let injection = inject_crash_matrix_case(barrier, case).await;
@@ -4588,6 +4622,10 @@ async fn assert_crash_matrix_continuation(barrier: &CrashMatrixBarrier, case: Cr
                 Materialized::Snapshot(_) => unreachable!(),
             });
 
+    let visible = protected_checkpoint
+        .as_ref()
+        .map(state_tag)
+        .unwrap_or_default();
     let legacy_sessions = Arc::new(LegacySessions {
         projection: identity,
         current: Mutex::new(ordinary_snapshot.into_iter().collect()),
@@ -4649,6 +4687,8 @@ async fn assert_crash_matrix_continuation(barrier: &CrashMatrixBarrier, case: Cr
         0,
         "{label}: native resume used a materialized save"
     );
+    assert_crash_matrix_no_replay(&legacy, &visible, &format!("{label} (legacy)"));
+    assert_crash_matrix_no_replay(&native, &visible, &format!("{label} (native)"));
     assert_crash_matrix_resume_matches(&native, &legacy, &label);
 }
 
@@ -4673,7 +4713,8 @@ fn crash_matrix_inventory() -> &'static [CrashMatrixBarrier] {
 /// terminal, fork and idle-compaction publication is replayed through every
 /// physical commit cut plus the three acknowledgement/close variants. Each
 /// case is observed from a fresh reader, continued by a fresh runtime against
-/// the equivalent legacy materialization, and retried by operation identity on an
+/// the equivalent legacy materialization (with an absolute no-replay check
+/// for indeterminate boundaries), and retried by operation identity on an
 /// independent replay. Continuations run on a normal-size worker so the
 /// matrix does not borrow the test harness thread's stack. One test per
 /// barrier lets the harness run barriers in parallel.
