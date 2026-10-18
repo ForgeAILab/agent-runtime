@@ -145,8 +145,8 @@ impl CheckpointStore for LegacyCheckpoints {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Materialized {
-    Snapshot(SessionSnapshot),
-    Checkpoint(TurnCheckpoint),
+    Snapshot(Box<SessionSnapshot>),
+    Checkpoint(Box<TurnCheckpoint>),
 }
 
 /// Reads back every published head exactly as a fresh reader would.
@@ -188,11 +188,11 @@ impl Materializing {
         let mut reader = JournalReader::new(self.inner.as_ref(), &lease, LIMITS)?;
         let value = match self.role {
             JournalRole::Ordinary => {
-                Materialized::Snapshot(reader.snapshot().await?.expect("ordinary head"))
+                Materialized::Snapshot(Box::new(reader.snapshot().await?.expect("ordinary head")))
             }
-            JournalRole::Protected => {
-                Materialized::Checkpoint(reader.checkpoint().await?.expect("protected head"))
-            }
+            JournalRole::Protected => Materialized::Checkpoint(Box::new(
+                reader.checkpoint().await?.expect("protected head"),
+            )),
         };
         self.inner.close(lease).await?;
         Ok(value)
@@ -357,7 +357,7 @@ impl Pair {
             .unwrap()
             .iter()
             .map(|value| match value {
-                Materialized::Snapshot(snapshot) => snapshot.clone(),
+                Materialized::Snapshot(snapshot) => (**snapshot).clone(),
                 Materialized::Checkpoint(_) => unreachable!(),
             })
             .collect::<Vec<_>>();
@@ -370,12 +370,12 @@ impl Pair {
             .unwrap()
             .iter()
             .map(|value| match value {
-                Materialized::Checkpoint(checkpoint) => checkpoint.clone(),
+                Materialized::Checkpoint(checkpoint) => (**checkpoint).clone(),
                 Materialized::Snapshot(_) => unreachable!(),
             })
             .collect::<Vec<_>>();
         assert!(
-            !legacy_checkpoints.is_empty(),
+            !legacy_checkpoints.is_empty() || !legacy_snapshots.is_empty(),
             "{label}: scenario crossed no barrier"
         );
         assert_eq!(
@@ -816,7 +816,7 @@ fn cancelled_turn(
             .unwrap();
         let turn = session.send(UserInput::text("will be cancelled")).unwrap();
         for _ in 0..200 {
-            if session.history().len() >= 1 {
+            if !session.history().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1259,7 +1259,7 @@ async fn review_lost_writer_fence_mid_turn_fails_closed_without_publication() {
         "a fenced-out writer published state"
     );
     let last = match pair.native.protected.log.lock().unwrap().last().cloned() {
-        Some(Materialized::Checkpoint(checkpoint)) => checkpoint,
+        Some(Materialized::Checkpoint(checkpoint)) => *checkpoint,
         other => panic!("unexpected protected log tail {other:?}"),
     };
     assert!(
@@ -1698,8 +1698,7 @@ fn cache_turns(
                 Deadline::at(Timestamp(10_000)),
             )
             .unwrap();
-        let result = session.dispatch_cache_operation(operation).await.unwrap();
-        assert!(format!("{result:?}").len() > 0);
+        session.dispatch_cache_operation(operation).await.unwrap();
         let snapshot = session.snapshot();
         session.shutdown().await.unwrap();
         vec![snapshot]
@@ -1739,4 +1738,70 @@ async fn review_cache_operation_phases_match_at_every_barrier_and_resume() {
     ] {
         assert!(states.iter().any(|state| state == required), "{states:?}");
     }
+}
+
+fn create_only(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        // A session persisted before its first turn (a host persist, a
+        // delegating parent's child catalog, a plain shutdown) has ordinary
+        // state but no protected checkpoint yet.
+        let session = runtime
+            .start_session(StartSession::create(id, Vec::new()))
+            .await
+            .unwrap();
+        session.persist().await.unwrap();
+        let snapshot = session.snapshot();
+        session.shutdown().await.unwrap();
+        vec![snapshot]
+    })
+}
+
+#[tokio::test]
+async fn review_session_persisted_before_its_first_turn_resumes_like_legacy() {
+    equivalent(
+        "before-first-turn",
+        identity,
+        Phase {
+            provider: text_turns,
+            configure: plain,
+            drive: create_only,
+        },
+        continue_phase(),
+    )
+    .await;
+}
+
+/// The precise form of the predecessor rule: an ordinary head published
+/// after exact checkpoints existed must not resume against an exact domain
+/// that has lost them (no silent fallback to the redacted projection).
+#[tokio::test]
+async fn review_ordinary_head_after_lost_exact_domain_fails_closed() {
+    let pair = Pair::new(identity);
+    let id = SessionId::new("review-lost-exact-domain");
+    let runtime = pair.native_runtime(text_turns(), plain);
+    let session = runtime
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("first secret input"))
+        .await
+        .unwrap();
+    session.shutdown().await.unwrap();
+    let emptied = Arc::new(NativeStores {
+        ordinary: pair.native.ordinary.clone(),
+        protected: Materializing::new(
+            InMemorySessionJournal::protected(JournalStorageId::new("review-emptied")),
+            JournalRole::Protected,
+        ),
+        legacy_saves: AtomicUsize::new(0),
+    });
+    let error = build(continuation(), emptied.clone(), emptied, plain)
+        .start_session(StartSession::resume(id))
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("no longer exposes"), "{error:?}");
 }

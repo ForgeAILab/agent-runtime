@@ -13,6 +13,11 @@ async fn native_durable_child_lifecycle_uses_only_journal_barriers() {
 }
 
 #[tokio::test]
+async fn native_durable_child_rebinds_after_restart_like_legacy() {
+    delegation::assert_native_durable_child_rebinds_after_restart_like_legacy().await;
+}
+
+#[tokio::test]
 async fn child_artifact_results_are_transferred_into_parent_ownership() {
     delegation::assert_child_artifact_result_transfers_to_parent().await;
 }

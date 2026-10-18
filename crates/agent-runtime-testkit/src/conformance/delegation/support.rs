@@ -173,6 +173,17 @@ async fn durable_parent_session(
         || checkpoint_store.load_latest(&id).await.expect("parent checkpoint loads").is_some() {
         StartSession::resume(id)
     } else { StartSession::create(id, Vec::new()) };
+    start_durable_parent(request, session_store, checkpoint_store).await
+}
+
+/// Starts a delegating parent with an explicit create/resume request. Native
+/// journal stores have no materialized record to probe, so restart scenarios
+/// over them must ask for resume explicitly.
+pub async fn start_durable_parent(
+    request: StartSession,
+    session_store: Arc<dyn SessionStore>,
+    checkpoint_store: Arc<dyn CheckpointStore>,
+) -> (Runtime, SessionHandle) {
     let runtime = RuntimeBuilder::new(ModelId::new("fake"))
         .provider(Arc::new(FakeProvider::text_reply("parent")))
         .model_profile(profile())

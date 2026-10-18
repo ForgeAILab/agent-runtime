@@ -83,6 +83,10 @@ struct NativeDomain {
     /// prefix be compared byte for byte; a loaded view may legitimately be
     /// host-redacted relative to live history.
     candidate_submitted: bool,
+    /// Whether the loaded ordinary head was published after a protected
+    /// checkpoint existed (its batch boundary names a turn). Such a head
+    /// without any protected head means the exact domain lost its data.
+    follows_protected: bool,
     checkpoint: Option<TurnCheckpoint>,
     /// Candidate objects already submitted in this writer lineage. A backend
     /// may store projected IDs in the ordinary domain; this set intentionally
@@ -311,14 +315,18 @@ impl SessionPersistence {
             });
         }
 
-        // With two configured domains an ordinary head can only follow a
-        // protected boundary. The inverse is expected for unfinished turns:
-        // exact checkpoints advance while the ordinary projection remains
-        // absent or behind.
+        // With two configured domains, an ordinary head published after a
+        // protected checkpoint existed proves the exact domain must have a
+        // head. An ordinary head published before any checkpoint (a session
+        // persisted before its first turn, a delegating parent's catalog, or
+        // a host that configured its checkpoint store later) is valid alone,
+        // exactly as a legacy snapshot without a checkpoint. The inverse is
+        // expected for unfinished turns: exact checkpoints advance while the
+        // ordinary projection remains absent or behind.
         if checkpoint_store.is_some()
             && ordinary
                 .as_ref()
-                .is_some_and(|domain| domain.head.is_some())
+                .is_some_and(|domain| domain.head.is_some() && domain.follows_protected)
             && protected
                 .as_ref()
                 .is_none_or(|domain| domain.head.is_none())
@@ -576,10 +584,22 @@ async fn open_domain(
             }
             known_candidates.extend(assembler.objects.keys().cloned());
         }
-        Ok::<_, RuntimeError>((candidate, checkpoint, known_candidates))
+        let follows_protected = match (&head, role) {
+            (Some(head), JournalRole::Ordinary) => {
+                let bytes = journal.read(&lease, &head.batch).await?;
+                let batch: JournalBatch = JournalObject {
+                    id: head.batch.clone(),
+                    bytes,
+                }
+                .decode(JournalObjectKind::Batch)?;
+                batch.boundary.turn.is_some()
+            }
+            _ => false,
+        };
+        Ok::<_, RuntimeError>((candidate, checkpoint, known_candidates, follows_protected))
     }
     .await;
-    let (candidate, checkpoint, known_candidates) = match loaded {
+    let (candidate, checkpoint, known_candidates, follows_protected) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
             let _ = journal.close(lease).await;
@@ -593,6 +613,7 @@ async fn open_domain(
         head,
         candidate,
         candidate_submitted: false,
+        follows_protected,
         checkpoint,
         known_candidates,
     })

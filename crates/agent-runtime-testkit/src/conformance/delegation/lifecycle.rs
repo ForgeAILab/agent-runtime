@@ -101,6 +101,74 @@ pub async fn assert_native_durable_child_lifecycle() {
     assert_eq!(stores.legacy_saves.load(Ordering::Relaxed), 0);
 }
 
+/// A durable child survives a parent restart and rebinds from its exact
+/// checkpoint identically with legacy stores and with native journals on
+/// both stores: same child state, result, turn count and parent history.
+pub async fn assert_native_durable_child_rebinds_after_restart_like_legacy() {
+    let mut outcomes = Vec::new();
+    for native in [false, true] {
+        let parent_id = format!("rebind-parent-{native}");
+        let (sessions, checkpoints): (Arc<dyn SessionStore>, Arc<dyn CheckpointStore>) = if native {
+            let stores = NativeDurableStores::new("child-rebind");
+            (stores.clone(), stores)
+        } else {
+            (
+                Arc::new(crate::InMemorySessionStore::new()),
+                Arc::new(crate::InMemoryCheckpointStore::new()),
+            )
+        };
+        let mut initial = text_child_script("first answer");
+        let mut follow_up = text_child_script("second answer");
+        let factory = Arc::new(
+            ScriptedChildFactory::new(vec![vec![initial.remove(0)], vec![follow_up.remove(0)]])
+                .with_durable_stores(sessions.clone(), checkpoints.clone()),
+        );
+        let (runtime, parent) =
+            durable_parent_session(&parent_id, sessions.clone(), checkpoints.clone()).await;
+        let coordinator =
+            DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default())
+                .unwrap();
+        let (child, handle) = match coordinator.spawn(child_spec("first task")).await.unwrap() {
+            SpawnOutcome::Spawned { child, handle } => (child, handle),
+            other => panic!("expected a spawned child, got {other:?}"),
+        };
+        assert_eq!(
+            coordinator.wait(&child).await.unwrap().state,
+            ChildState::Idle
+        );
+        handle.shutdown().await.unwrap();
+        coordinator.flush().await.unwrap();
+        drop(coordinator);
+        parent.shutdown().await.unwrap();
+        drop(parent);
+        drop(runtime);
+
+        let (_runtime, parent) = start_durable_parent(
+            StartSession::resume(agent_runtime_core::ids::SessionId::new(parent_id.as_str())),
+            sessions.clone(),
+            checkpoints.clone(),
+        )
+        .await;
+        let coordinator =
+            DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+        coordinator
+            .follow_up(&child, UserInput::text("after restart"))
+            .await
+            .unwrap_or_else(|error| panic!("native={native}: {error:?}"));
+        let status = coordinator.wait(&child).await.unwrap();
+        outcomes.push((
+            status.state,
+            status.last_result.clone(),
+            status.turns_used,
+            parent.history(),
+        ));
+        coordinator.flush().await.unwrap();
+        parent.shutdown().await.unwrap();
+    }
+    assert_eq!(outcomes[0].1.as_deref(), Some("second answer"));
+    assert_eq!(outcomes[1], outcomes[0]);
+}
+
 /// A child-produced artifact is copied explicitly into parent ownership,
 /// retains source lineage, and remains recoverable only under the new owner.
 pub async fn assert_child_artifact_result_transfers_to_parent() {
