@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-18
+
 ### Fixed
 
 - Starting a session or a child session no longer overflows a 2 MiB stack in
