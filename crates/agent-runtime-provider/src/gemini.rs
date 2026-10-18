@@ -55,6 +55,11 @@ const MAX_BUILTIN_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;
 /// canonical history keeps reasoning ahead of tool calls, but Gemini rejects a
 /// replay whose search result no longer follows the call it was emitted after.
 const BUILTIN_STEP_ENVELOPE_PREFIX: &str = "agent-runtime.gemini.builtin-step.v1:";
+/// Google's documented placeholder signature for a function-call step Gemini
+/// did not sign: history from another provider, or a turn saved without its
+/// signed steps. Google notes it can lower answer quality, so it is sent only
+/// on steps Gemini would otherwise reject.
+const SKIP_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
 const MAX_TOOL_NAME_CHARS: usize = 256;
 const MAX_TOOL_CALLS: usize = 512;
 const MAX_ARGUMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -538,9 +543,7 @@ fn translate_history(
     let mut input = Vec::new();
     let mut calls = BTreeMap::<String, String>::new();
     let mut results = BTreeSet::new();
-    let last_user_index = messages
-        .iter()
-        .rposition(|message| message.role == Role::User);
+    let checked = signature_checked_messages(messages);
 
     for (message_index, message) in messages.iter().enumerate() {
         match message.role {
@@ -565,7 +568,18 @@ fn translate_history(
                 input.push(json!({"type": "user_input", "content": content}));
             }
             Role::Assistant => {
-                let mut saw_signed_continuation = false;
+                if checked[message_index]
+                    && config.capabilities.reasoning != ReasoningSupport::Unsupported
+                    && !signs_its_calls(message)?
+                {
+                    // First in the step: Gemini rejects a thinking-model turn
+                    // whose thought does not lead it.
+                    input.push(json!({
+                        "type": "thought",
+                        "signature": SKIP_SIGNATURE_VALIDATOR,
+                        "summary": [],
+                    }));
+                }
                 // Built-in steps the stream emitted after a function call wait
                 // here until that call has been replayed.
                 let mut deferred: Vec<BuiltinStep> = Vec::new();
@@ -593,7 +607,6 @@ fn translate_history(
                                 if waits {
                                     deferred.push(builtin);
                                 } else {
-                                    saw_signed_continuation |= builtin.signed;
                                     input.push(builtin.step);
                                 }
                                 continue;
@@ -610,21 +623,12 @@ fn translate_history(
                                 "signature": signature,
                                 "summary": summary,
                             }));
-                            saw_signed_continuation = true;
                         }
                         ContentPart::Reasoning { .. } => {
                             // Unsigned reasoning is not valid Gemini provider
                             // continuation and has no native step representation.
                         }
                         ContentPart::ToolCall(call) => {
-                            // Earlier turns may have had another provider's reasoning omitted.
-                            if config.capabilities.reasoning != ReasoningSupport::Unsupported
-                                && last_user_index
-                                    .is_none_or(|last_user_index| message_index > last_user_index)
-                                && !saw_signed_continuation
-                            {
-                                return Err(compatibility_error());
-                            }
                             validate_bounded_name(&call.name, "Gemini function name")?;
                             validate_bounded_name(call.id.as_str(), "Gemini function call id")?;
                             if calls.len() >= MAX_TOOL_CALLS
@@ -652,7 +656,6 @@ fn translate_history(
                                 });
                             deferred = waiting;
                             for builtin in ready {
-                                saw_signed_continuation |= builtin.signed;
                                 input.push(builtin.step);
                             }
                         }
@@ -695,6 +698,60 @@ fn translate_history(
         }
     }
     Ok((system.join("\n\n"), input))
+}
+
+/// Which messages Gemini checks for function-call signatures: every message of
+/// the current turn, and of any earlier turn that did not end with model text.
+/// Measured on `gemini-4-argon`; a turn that ended with an answer is exempt.
+fn signature_checked_messages(messages: &[Message]) -> Vec<bool> {
+    let mut checked = vec![false; messages.len()];
+    let mut current_turn = true;
+    let mut earlier_turn_open = None;
+    for (index, message) in messages.iter().enumerate().rev() {
+        match message.role {
+            Role::User => {
+                current_turn = false;
+                earlier_turn_open = None;
+            }
+            Role::System => {}
+            Role::Assistant | Role::Tool => {
+                // Walking backwards, the first message of an earlier turn met
+                // here is its last one, which decides whether it answered.
+                let open = *earlier_turn_open.get_or_insert_with(|| {
+                    let answered = message.role == Role::Assistant
+                        && message.tool_calls().next().is_none()
+                        && message.content.iter().any(
+                            |part| matches!(part, ContentPart::Text { text } if !text.is_empty()),
+                        );
+                    !answered
+                });
+                checked[index] = current_turn || open;
+            }
+        }
+    }
+    checked
+}
+
+/// Whether a step replays a signature before its first function call, or has
+/// no function call to sign.
+fn signs_its_calls(message: &Message) -> Result<bool, ProviderError> {
+    for part in &message.content {
+        match part {
+            ContentPart::ToolCall(_) => return Ok(false),
+            ContentPart::Reasoning {
+                signature: Some(signature),
+                ..
+            } => match decode_builtin_step_envelope(signature)? {
+                None => return Ok(true),
+                Some(builtin) if builtin.signed && builtin.after_call.is_none() => {
+                    return Ok(true);
+                }
+                Some(_) => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(true)
 }
 
 fn translate_input_content(
@@ -2348,6 +2405,23 @@ mod tests {
         }
     }
 
+    /// The input step types, with a validator-skip thought shown as `thought:skip`.
+    fn input_steps(body: &Value) -> Vec<&str> {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| {
+                if step["type"] == "thought" && step["signature"] == SKIP_SIGNATURE_VALIDATOR {
+                    assert_eq!(step["summary"], json!([]));
+                    "thought:skip"
+                } else {
+                    step["type"].as_str().unwrap()
+                }
+            })
+            .collect()
+    }
+
     fn assert_compatibility_error(error: &ProviderError) {
         assert_eq!(error.kind, ProviderErrorKind::BadRequest);
         assert_eq!(
@@ -2734,7 +2808,7 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_or_invalid_builtin_search_continuation_is_rejected() {
+    fn unsigned_builtin_steps_get_the_validator_skip_and_invalid_envelopes_are_rejected() {
         let provider =
             GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
                 .unwrap();
@@ -2774,7 +2848,17 @@ mod tests {
                 ]),
             ],
         );
-        assert_compatibility_error(&provider.build_payload(&unsigned).unwrap_err());
+        let skipped = vec![
+            "user_input",
+            "thought:skip",
+            "google_search_call",
+            "function_call",
+            "google_search_result",
+        ];
+        assert_eq!(
+            input_steps(&provider.build_payload(&unsigned).unwrap()),
+            skipped
+        );
 
         // A signature Gemini emitted after the call does not cover that call.
         let signed_result = json!({
@@ -2794,7 +2878,10 @@ mod tests {
                 ]),
             ],
         );
-        assert_compatibility_error(&provider.build_payload(&late).unwrap_err());
+        assert_eq!(
+            input_steps(&provider.build_payload(&late).unwrap()),
+            skipped
+        );
 
         // A step anchored to a call the message never made cannot be placed.
         let signed_call = json!({
@@ -2852,137 +2939,161 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn missing_or_reordered_signed_thought_fails_before_transport() {
+    fn inspect_call(id: &str) -> ContentPart {
+        ContentPart::ToolCall(ToolCall {
+            id: ToolCallId::new(id),
+            name: "inspect".into(),
+            arguments: json!({}),
+        })
+    }
+
+    fn inspect_result(id: &str) -> Message {
+        Message::tool_result(ToolResultBlock {
+            call_id: ToolCallId::new(id),
+            name: "inspect".into(),
+            content: vec![ContentPart::text("ok")],
+            is_error: false,
+        })
+    }
+
+    fn thinking_payload(messages: Vec<Message>) -> Value {
         let provider =
             GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
                 .unwrap();
+        let mut request = ProviderRequest::new(ModelId::new("gemini-test"), messages);
+        request.reasoning = Some(ReasoningConfig {
+            effort: Some("high".into()),
+            max_tokens: None,
+        });
+        provider.build_payload(&request).unwrap()
+    }
+
+    #[test]
+    fn unsigned_current_turn_step_leads_with_the_validator_skip() {
+        // Another provider's call, continued on Gemini, with text before it.
+        let body = thinking_payload(vec![
+            Message::user("use a tool"),
+            Message::assistant(vec![ContentPart::text("Checking."), inspect_call("call-1")]),
+            inspect_result("call-1"),
+        ]);
+        assert_eq!(
+            input_steps(&body),
+            [
+                "user_input",
+                "thought:skip",
+                "model_output",
+                "function_call",
+                "function_result",
+            ]
+        );
+    }
+
+    #[test]
+    fn each_unsigned_step_gets_one_skip_and_parallel_calls_share_it() {
+        let body = thinking_payload(vec![
+            Message::user("use tools"),
+            Message::assistant(vec![inspect_call("call-1"), inspect_call("call-2")]),
+            inspect_result("call-1"),
+            inspect_result("call-2"),
+            Message::assistant(vec![inspect_call("call-3")]),
+            inspect_result("call-3"),
+        ]);
+        assert_eq!(
+            input_steps(&body),
+            [
+                "user_input",
+                "thought:skip",
+                "function_call",
+                "function_call",
+                "function_result",
+                "function_result",
+                "thought:skip",
+                "function_call",
+                "function_result",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_earlier_turn_that_answered_is_sent_without_a_skip() {
+        let body = thinking_payload(vec![
+            Message::user("use a tool"),
+            Message::assistant(vec![inspect_call("call-1")]),
+            inspect_result("call-1"),
+            Message::assistant(vec![ContentPart::text("done")]),
+            Message::user("continue on Gemini"),
+        ]);
+        assert_eq!(
+            input_steps(&body),
+            [
+                "user_input",
+                "function_call",
+                "function_result",
+                "model_output",
+                "user_input",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_earlier_turn_that_stopped_mid_tools_gets_a_skip() {
+        // A turn that failed or was interrupted before it answered.
+        let body = thinking_payload(vec![
+            Message::user("use a tool"),
+            Message::assistant(vec![inspect_call("call-1")]),
+            inspect_result("call-1"),
+            Message::user("continue on Gemini"),
+            Message::assistant(vec![inspect_call("call-2")]),
+        ]);
+        assert_eq!(
+            input_steps(&body),
+            [
+                "user_input",
+                "thought:skip",
+                "function_call",
+                "function_result",
+                "user_input",
+                "thought:skip",
+                "function_call",
+            ]
+        );
+    }
+
+    #[test]
+    fn signed_steps_and_non_thinking_models_get_no_skip() {
+        let signed = thinking_payload(vec![
+            Message::user("use a tool"),
+            Message::assistant(vec![
+                ContentPart::Reasoning {
+                    text: String::new(),
+                    redacted: true,
+                    signature: Some("real-signature".into()),
+                    producer: None,
+                },
+                inspect_call("call-1"),
+            ]),
+            inspect_result("call-1"),
+        ]);
+        assert_eq!(
+            input_steps(&signed),
+            ["user_input", "thought", "function_call", "function_result"]
+        );
+
+        let mut config = config();
+        config.capabilities.reasoning = ReasoningSupport::Unsupported;
+        let provider =
+            GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config).unwrap();
         let request = ProviderRequest::new(
             ModelId::new("gemini-test"),
             vec![
                 Message::user("use a tool"),
-                Message::assistant(vec![ContentPart::ToolCall(ToolCall {
-                    id: ToolCallId::new("call-1"),
-                    name: "inspect".into(),
-                    arguments: json!({}),
-                })]),
-                Message::tool_result(ToolResultBlock {
-                    call_id: ToolCallId::new("call-1"),
-                    name: "inspect".into(),
-                    content: vec![ContentPart::text("ok")],
-                    is_error: false,
-                }),
+                Message::assistant(vec![inspect_call("call-1")]),
+                inspect_result("call-1"),
             ],
         );
-
-        let error = provider
-            .stream(request, ctx())
-            .await
-            .err()
-            .expect("invalid continuation is rejected");
-        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
         assert_eq!(
-            error.message,
-            "Gemini signed continuation is incomplete or out of order"
-        );
-        assert!(provider.transport().requests().is_empty());
-    }
-
-    #[test]
-    fn earlier_turn_unsigned_tool_history_is_accepted_without_a_thought_step() {
-        let provider =
-            GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
-                .unwrap();
-        let mut request = ProviderRequest::new(
-            ModelId::new("gemini-test"),
-            vec![
-                Message::user("use a tool"),
-                Message::assistant(vec![ContentPart::ToolCall(ToolCall {
-                    id: ToolCallId::new("call-1"),
-                    name: "inspect".into(),
-                    arguments: json!({"path": "a.png"}),
-                })]),
-                Message::tool_result(ToolResultBlock {
-                    call_id: ToolCallId::new("call-1"),
-                    name: "inspect".into(),
-                    content: vec![ContentPart::text("ok")],
-                    is_error: false,
-                }),
-                Message::user("continue on Gemini"),
-            ],
-        );
-        request.reasoning = Some(ReasoningConfig {
-            effort: Some("high".into()),
-            max_tokens: None,
-        });
-
-        let body = provider.build_payload(&request).unwrap();
-        assert_eq!(
-            body["input"],
-            json!([
-                {
-                    "type": "user_input",
-                    "content": [{"type": "text", "text": "use a tool"}],
-                },
-                {
-                    "type": "function_call",
-                    "id": "call-1",
-                    "name": "inspect",
-                    "arguments": {"path": "a.png"},
-                },
-                {
-                    "type": "function_result",
-                    "name": "inspect",
-                    "call_id": "call-1",
-                    "result": [{"type": "text", "text": "ok"}],
-                    "is_error": false,
-                },
-                {
-                    "type": "user_input",
-                    "content": [{"type": "text", "text": "continue on Gemini"}],
-                },
-            ])
-        );
-    }
-
-    #[test]
-    fn active_continuation_unsigned_tool_call_is_rejected_after_an_unsigned_earlier_turn() {
-        let provider =
-            GeminiInteractionsProvider::new(ReplayTransport::new([] as [&str; 0]), config())
-                .unwrap();
-        let mut request = ProviderRequest::new(
-            ModelId::new("gemini-test"),
-            vec![
-                Message::user("use a tool"),
-                Message::assistant(vec![ContentPart::ToolCall(ToolCall {
-                    id: ToolCallId::new("call-1"),
-                    name: "inspect".into(),
-                    arguments: json!({}),
-                })]),
-                Message::tool_result(ToolResultBlock {
-                    call_id: ToolCallId::new("call-1"),
-                    name: "inspect".into(),
-                    content: vec![ContentPart::text("ok")],
-                    is_error: false,
-                }),
-                Message::user("continue on Gemini"),
-                Message::assistant(vec![ContentPart::ToolCall(ToolCall {
-                    id: ToolCallId::new("call-2"),
-                    name: "inspect".into(),
-                    arguments: json!({}),
-                })]),
-            ],
-        );
-        request.reasoning = Some(ReasoningConfig {
-            effort: Some("high".into()),
-            max_tokens: None,
-        });
-
-        let error = provider.build_payload(&request).unwrap_err();
-        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
-        assert_eq!(
-            error.message,
-            "Gemini signed continuation is incomplete or out of order"
+            input_steps(&provider.build_payload(&request).unwrap()),
+            ["user_input", "function_call", "function_result"]
         );
     }
 

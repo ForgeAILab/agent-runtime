@@ -7,6 +7,14 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- Gemini Interactions no longer rejects history that holds an unsigned
+  function-call step it still checks: tool calls continued from another
+  provider, or a turn saved before it answered. Such steps now lead with
+  Google's `skip_thought_signature_validator` placeholder thought. Steps in
+  earlier turns that ended with an answer are sent unchanged.
+
 ## [0.6.1] - 2026-10-18
 
 ### Fixed
