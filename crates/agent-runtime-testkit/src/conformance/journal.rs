@@ -1280,7 +1280,9 @@ fn bootstrap_from_snapshot(
             history_append: Vec::new(),
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint,
     };
@@ -1338,7 +1340,9 @@ fn append_commit(
             history_append: vec![Message::user(appended)],
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint: None,
     };
@@ -1389,7 +1393,9 @@ fn append_from_snapshot(
             history_append,
             usage_append: Vec::new(),
             extension_updates,
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint: None,
     };
@@ -1452,7 +1458,9 @@ fn checkpoint_commit(
             history_append: Vec::new(),
             usage_append: Vec::new(),
             extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
             manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
         },
         checkpoint: Some(checkpoint),
     };

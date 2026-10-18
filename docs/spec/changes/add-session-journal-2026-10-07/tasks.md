@@ -29,7 +29,58 @@ all applicable gates, not merely contract merge.
   Evidence: redacted terminal overlay, native hard-admission/idle recovery, and Summary/Empty/FromIndex fork equivalence tests pass with existing transition validation unchanged. Review: exact checkpoints after a terminal resume carry the host-redacted canonical prefix exactly as legacy does (protected `history_append` is advisory; backends verify roots); a rewritten history is never expressed as an append to the ordinary projection; an ordinary head published after an exact checkpoint still requires its protected head.
 - [ ] 2.5 Implement idempotent one-time v3 import and mixed native/legacy detection; cut crashes at each import write, including pending approval, CallingModel, model/tool results, cache phases and pending summary.
 - [ ] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
-- [ ] 2.7 Count serialized submission/new-object bytes at N=100/1000/10000 and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.
+- [x] 2.7 Count serialized submission/new-object bytes at N=100/1000/4000 (and 10000 when the cache-identity limit permits) and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.
+  Evidence (implementation measurement, 2026-10-18; exact bytes, each cell is
+  `serialized submission / new immutable-object bytes`): the pre-change
+  serialized totals are reconstructed from the 2.2–2.4 review's component
+  columns; that review did not count backend new-object bytes. A "turn" is the
+  complete second turn after one bootstrap turn.
+
+  | Path / boundary | N=100 | N=1000 | N=4000 |
+  | --- | ---: | ---: | ---: |
+  | Before: plain protected turn | 61,513 / n/a | 264,356 / n/a | 941,480 / n/a |
+  | After: plain protected turn | 52,327 / 58,337 | 53,871 / 59,895 | 52,998 / 59,022 |
+  | Before: plain ordinary terminal | 70,827 / n/a | 498,042 / n/a | 1,931,604 / n/a |
+  | After: plain ordinary terminal | 29,620 / 34,177 | 30,259 / 36,430 | 30,265 / 40,412 |
+  | After: tool protected turn | 127,974 / 139,853 | 131,154 / 143,061 | 129,408 / 141,315 |
+  | After: tool ordinary terminal | 46,492 / 51,328 | 47,341 / 53,791 | 47,350 / 57,776 |
+  | After: one unchanged ordinary boundary | 1,183 / 2,011 | 1,187 / 2,017 | 1,187 / 2,017 |
+
+  The unchanged boundary submits 0 drafts, 0 draft bytes and 0 body bytes; its
+  nonzero serialized/new-object totals are the revisioned delta/batch/head
+  metadata measured here. Every second-turn commit submitted at most 512 bytes
+  of new Message/Usage bodies, independent of N. The changed cache record's
+  `ModelResponseReady` commit is 18,343/19,137 bytes at N=100,
+  18,669/19,465 at N=1000 and 18,672/19,468 at N=4000, replacing the review's
+  13,362/114,171/453,171 draft bytes. The ordinary terminal contains one cache
+  reference and one (plain) or two (tool) manifest references; its only opaque
+  replacement is `runtime.manifest_boundary`, 140 serialized delta bytes at
+  every N. Other opaque namespaces retain full replacement cost, once rather
+  than both draft and delta in the ordinary submission.
+
+  | Control / bootstrap total | N=100 | N=1000 | N=4000 |
+  | --- | ---: | ---: | ---: |
+  | Native plain bootstrap | 285,872 / 607,811 | 2,318,762 / 5,107,642 | 9,114,257 / 20,124,203 |
+  | Native tool bootstrap | 294,745 / 619,525 | 2,327,637 / 5,119,362 | 9,123,130 / 20,135,917 |
+  | Legacy plain protected turn / ordinary terminal | 154,348 / 48,207 | 1,414,421 / 443,321 | 5,659,421 / 1,772,321 |
+  | Legacy tool protected turn / ordinary terminal | 316,555 / 63,352 | 2,836,721 / 570,973 | 11,326,721 / 2,277,973 |
+
+  Bootstrap and unchanged legacy saves remain intentionally O(N); legacy
+  materialized bytes and schemas are unchanged. N=10,000 is not a successful
+  turn in either mode because the existing 4,096-entry stable-history cache
+  identity limit rejects planning before provider I/O. The regular test
+  `task_2_7_native_turn_bytes_are_delta_bounded` covers plain/tool/unchanged
+  cases and both byte counters at all three successful sizes; the pre-existing
+  equivalence suite still compares every barrier and fresh-runtime resume.
+  Detailed per-commit-kind rows are recorded in `docs/development.md` and
+  `/Volumes/Data/tmp/refactor/u9b-3/task-2.7-measurement-1.log`.
+  Verification: `fmt --all -- --check` and all-target/all-feature Clippy with
+  warnings denied pass; agent-runtime-core passes 262 tests, agent-runtime
+  passes 592 tests (including the unchanged 2.2–2.4 equivalence harness and
+  both scale tests), agent-runtime-testkit passes 364 tests including all
+  consumer fixtures, agent-runtime-lcm passes 62 tests, and the requested Rust
+  1.86 build of agent-runtime-core plus agent-runtime succeeds. Logs are under
+  `/Volumes/Data/tmp/refactor/u9b-3/`.
 - [ ] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)

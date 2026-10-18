@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use agent_runtime_registry::Fingerprint;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{JournalDigest, JournalObject, JournalObjectId};
 use crate::checkpoint::CheckpointWatermark;
@@ -20,6 +21,10 @@ pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
 pub const JOURNAL_FANOUT: usize = 64;
 /// Maximum tree height accepted by readers (well above a u64-sized fanout-64 tree).
 pub const JOURNAL_MAX_TREE_HEIGHT: u32 = 32;
+/// Runtime-owned redaction-safe cache predecessor stored structurally in native journals.
+///
+/// Other extension namespaces retain their opaque whole-value replacement contract.
+pub const RUNTIME_PREVIOUS_CACHE_NAMESPACE: &str = "runtime.core.previous_cache";
 
 macro_rules! opaque_identity {
     ($name:ident, $doc:literal) => {
@@ -229,6 +234,45 @@ pub enum JournalMapNode {
     Branch { children: Vec<JournalMapChild> },
 }
 
+/// A persistent JSON node used only by native journal-owned structured records.
+///
+/// Arrays and objects use the existing bounded persistent sequence encoding so
+/// an unchanged prefix remains reachable by reference. Arbitrary host-owned
+/// opaque extensions do not use this representation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "value", rename_all = "snake_case")]
+pub enum JournalJsonValue {
+    /// Null, boolean, number or string. Containers are rejected by readers.
+    Scalar { scalar: Value },
+    /// Ordered array entries.
+    Array { items: JournalSequence },
+    /// Ordered object entries, preserving insertion order when available.
+    Object { entries: JournalSequence },
+}
+
+/// One ordered key/value edge in a persistent JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalJsonObjectEntry {
+    /// Exact JSON object key; empty keys remain valid JSON keys.
+    pub key: String,
+    /// Persistent JSON value in the same policy domain.
+    pub value: JournalObjectId,
+}
+
+/// Runtime-owned extension wrapper whose exact public value materializes unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferencedSessionState {
+    /// Root persistent JSON node for one `VersionedSessionState`.
+    pub value: JournalObjectId,
+}
+
+/// Redaction-safe manifest wrapper whose public value materializes unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferencedTurnManifest {
+    /// Root persistent JSON node for one `TurnManifest`.
+    pub value: JournalObjectId,
+}
+
 /// Complete roots/counters for a materialized session snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalSnapshotRoots {
@@ -327,8 +371,18 @@ pub struct JournalTransitionDelta {
     pub usage_append: Vec<UsageRecord>,
     /// Replacements/removals; host policy may omit Sensitive values.
     pub extension_updates: BTreeMap<String, Option<VersionedSessionState>>,
+    /// Runtime-owned structured replacements/removals, referenced from candidate drafts.
+    /// Keys MUST be disjoint from `extension_updates`. Ordinary projection MUST
+    /// preserve these redaction-safe values exactly; arbitrary host-owned
+    /// opaque extensions continue to use `extension_updates`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extension_references: BTreeMap<String, Option<JournalObjectId>>,
     /// Newly produced diagnostics; retention decisions stay host-owned.
     pub manifests_append: Vec<TurnManifest>,
+    /// Newly produced structured diagnostics, referenced from candidate drafts.
+    /// Ordinary projection MUST preserve these redaction-safe records exactly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manifest_references: Vec<JournalObjectId>,
 }
 
 impl fmt::Debug for JournalTransitionDelta {
@@ -338,7 +392,14 @@ impl fmt::Debug for JournalTransitionDelta {
             .field("history_append_count", &self.history_append.len())
             .field("usage_append_count", &self.usage_append.len())
             .field("extension_update_count", &self.extension_updates.len())
-            .field("manifest_append_count", &self.manifests_append.len())
+            .field(
+                "extension_reference_count",
+                &self.extension_references.len(),
+            )
+            .field(
+                "manifest_append_count",
+                &(self.manifests_append.len() + self.manifest_references.len()),
+            )
             .finish_non_exhaustive()
     }
 }

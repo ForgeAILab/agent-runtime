@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -170,11 +172,10 @@ impl<'a> JournalReader<'a> {
         })
     }
 
-    async fn object<T: DeserializeOwned + Serialize>(
+    async fn encoded_object(
         &mut self,
         id: &JournalObjectId,
-        kind: JournalObjectKind,
-    ) -> Result<T, RuntimeError> {
+    ) -> Result<JournalObject, RuntimeError> {
         self.reads = self.reads.checked_add(1).ok_or_else(conflict)?;
         if self.reads > self.limits.objects {
             return Err(conflict());
@@ -191,11 +192,18 @@ impl<'a> JournalReader<'a> {
         if self.bytes > self.limits.encoded_bytes {
             return Err(conflict());
         }
-        JournalObject {
+        Ok(JournalObject {
             id: id.clone(),
             bytes,
-        }
-        .decode(kind)
+        })
+    }
+
+    async fn object<T: DeserializeOwned + Serialize>(
+        &mut self,
+        id: &JournalObjectId,
+        kind: JournalObjectKind,
+    ) -> Result<T, RuntimeError> {
+        self.encoded_object(id).await?.decode(kind)
     }
 
     async fn sequence(
@@ -333,6 +341,93 @@ impl<'a> JournalReader<'a> {
         Ok(entries)
     }
 
+    fn json_value<'b>(
+        &'b mut self,
+        id: &'b JournalObjectId,
+        depth: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, RuntimeError>> + Send + 'b>> {
+        Box::pin(async move {
+            if depth > JOURNAL_MAX_TREE_HEIGHT {
+                return Err(conflict());
+            }
+            let node: JournalJsonValue = self.object(id, JournalObjectKind::JsonValue).await?;
+            match node {
+                JournalJsonValue::Scalar { scalar } => {
+                    if scalar.is_array() || scalar.is_object() {
+                        return Err(conflict());
+                    }
+                    Ok(scalar)
+                }
+                JournalJsonValue::Array { items } => {
+                    let mut values = Vec::new();
+                    for item in self.sequence(&items).await? {
+                        values.push(self.json_value(&item, depth + 1).await?);
+                    }
+                    Ok(Value::Array(values))
+                }
+                JournalJsonValue::Object { entries } => {
+                    let mut values = serde_json::Map::new();
+                    for entry in self.sequence(&entries).await? {
+                        let entry: JournalJsonObjectEntry = self
+                            .object(&entry, JournalObjectKind::JsonObjectEntry)
+                            .await?;
+                        if values.contains_key(&entry.key) {
+                            return Err(conflict());
+                        }
+                        values.insert(entry.key, self.json_value(&entry.value, depth + 1).await?);
+                    }
+                    Ok(Value::Object(values))
+                }
+            }
+        })
+    }
+
+    async fn extension(
+        &mut self,
+        namespace: &str,
+        id: &JournalObjectId,
+    ) -> Result<VersionedSessionState, RuntimeError> {
+        let object = self.encoded_object(id).await?;
+        match object.kind()? {
+            JournalObjectKind::Extension => object.decode(JournalObjectKind::Extension),
+            JournalObjectKind::ExtensionReference
+                if namespace == RUNTIME_PREVIOUS_CACHE_NAMESPACE =>
+            {
+                let reference: ReferencedSessionState =
+                    object.decode(JournalObjectKind::ExtensionReference)?;
+                let value = self.json_value(&reference.value, 0).await?;
+                let state: VersionedSessionState =
+                    serde_json::from_value(value.clone()).map_err(|_| conflict())?;
+                if state.sensitivity != crate::store::SessionStateSensitivity::RedactionSafe
+                    || canonical_journal_json(&state)? != canonical_journal_json(&value)?
+                {
+                    return Err(conflict());
+                }
+                Ok(state)
+            }
+            _ => Err(conflict()),
+        }
+    }
+
+    async fn manifest(&mut self, id: &JournalObjectId) -> Result<TurnManifest, RuntimeError> {
+        let object = self.encoded_object(id).await?;
+        match object.kind()? {
+            JournalObjectKind::Manifest => object.decode(JournalObjectKind::Manifest),
+            JournalObjectKind::ManifestReference => {
+                let reference: ReferencedTurnManifest =
+                    object.decode(JournalObjectKind::ManifestReference)?;
+                let value = self.json_value(&reference.value, 0).await?;
+                let manifest: TurnManifest =
+                    serde_json::from_value(value.clone()).map_err(|_| conflict())?;
+                if canonical_journal_json(&manifest)? != canonical_journal_json(&value)? {
+                    return Err(conflict());
+                }
+                Ok(manifest)
+            }
+            _ => Err(conflict()),
+        }
+    }
+
     async fn batch(&mut self, head: &JournalHead) -> Result<JournalBatch, RuntimeError> {
         head.validate()?;
         if head.retirement.is_some() {
@@ -387,18 +482,12 @@ impl<'a> JournalReader<'a> {
         }
         let mut manifests = Vec::new();
         for id in self.sequence(&roots.manifests).await? {
-            manifests.push(
-                self.object::<TurnManifest>(&id, JournalObjectKind::Manifest)
-                    .await?,
-            );
+            manifests.push(self.manifest(&id).await?);
         }
         let mut extension_state = BTreeMap::new();
         for entry in self.map(&roots.extensions).await? {
-            extension_state.insert(
-                entry.key,
-                self.object::<VersionedSessionState>(&entry.value, JournalObjectKind::Extension)
-                    .await?,
-            );
+            let value = self.extension(&entry.key, &entry.value).await?;
+            extension_state.insert(entry.key, value);
         }
         Ok(SessionSnapshot {
             id: session.clone(),
