@@ -159,7 +159,8 @@ pub async fn assert_native_materialized_checkpoint_schema_guard(
 /// redacting database/file adapters run the same checks as the reference:
 /// policy before hashing, raw drafts unreadable, appends after a Sensitive
 /// omission, rejected projections storing nothing, exact checkpoint roots
-/// refused, and the private idempotency digest absent from stored records.
+/// refused, the private idempotency digest absent from stored records, and a
+/// shorter history accepted as a complete replacement of the existing head.
 pub async fn assert_ordinary_session_journal_conformance<F, Fut>(factory: F)
 where
     F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
@@ -167,6 +168,7 @@ where
 {
     assert_ordinary_projection_contract(&factory).await;
     assert_ordinary_append_after_omission(&factory).await;
+    assert_ordinary_shorter_history_replacement(&factory).await;
     assert_ordinary_refusals(&factory).await;
     assert_ordinary_structured_references(&factory).await;
 }
@@ -1198,6 +1200,69 @@ where
         .unwrap();
     assert_eq!(materialized.history, vec![Message::user("[redacted]"); 2]);
     assert!(materialized.extension_state.is_empty());
+    journal.close(reader).await.unwrap();
+}
+
+/// Terminal republication after a failed terminal publication restores the
+/// exact boundary's canonical history, which can be shorter than the stored
+/// projection. The runtime submits it as `bootstrap` over the existing head
+/// with no appends; an ordinary adapter must publish it as a complete
+/// replacement, or the session wedges at a non-terminal checkpoint.
+async fn assert_ordinary_shorter_history_replacement<F, Fut>(factory: &F)
+where
+    F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
+    Fut: Future<Output = Arc<dyn SessionJournal>>,
+{
+    let journal = factory(Arc::new(IdentityJournalProjection)).await;
+    let session = SessionId::new("ordinary-replacement-session");
+    let lease = open_writer(&*journal, &session, None, "ordinary-replacement").await;
+    let epoch = lease.writer_epoch().unwrap();
+    let mut raw = basic_snapshot(session.clone(), "canonical", Timestamp(1));
+    let (bootstrap, _) = bootstrap_from_snapshot(raw.clone(), epoch, "ordinary-replace-1", None);
+    let first = journal.commit(&lease, bootstrap).await.unwrap();
+    raw.history
+        .push(Message::user("saved after a failed terminal"));
+    raw.updated = Timestamp(2);
+    let append = append_from_snapshot(
+        &raw,
+        epoch,
+        &first,
+        "ordinary-replace-2",
+        vec![Message::user("saved after a failed terminal")],
+        BTreeMap::new(),
+    );
+    let second = journal.commit(&lease, append).await.unwrap();
+    assert_eq!(second.snapshot.history.len, 2);
+
+    let shorter = basic_snapshot(session.clone(), "canonical", Timestamp(3));
+    let (mut replacement, _) =
+        bootstrap_from_snapshot(shorter.clone(), epoch, "ordinary-replace-3", None);
+    replacement.batch.sequence = second.batch_sequence + 1;
+    replacement.batch.predecessor = Some(JournalDigest::parse(second.batch.as_str()).unwrap());
+    replacement.batch.expected_revision = Some(second.revision);
+    replacement.digest = replacement.input_digest().unwrap();
+    let third = journal
+        .commit(&lease, replacement)
+        .await
+        .expect("a shorter history is published as a complete replacement");
+    assert_eq!(third.revision, JournalRevision(3));
+    assert_eq!(third.snapshot.history.len, 1);
+    journal.close(lease).await.unwrap();
+
+    let reader = open_reader(
+        &*journal,
+        &session,
+        Some(third.revision),
+        "ordinary-replacement",
+    )
+    .await;
+    let materialized = JournalReader::new(&*journal, &reader, LIMITS)
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(materialized.history, shorter.history);
     journal.close(reader).await.unwrap();
 }
 
