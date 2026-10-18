@@ -124,6 +124,47 @@ persisted session to silently rebase. Use `SessionHandle::expand_lcm` for
 bounded authorized inspection; never expose or reconstruct `LcmView` grants
 from an opaque node or cursor supplied by a caller.
 
+## Session journal reference backend and conformance
+
+`agent-runtime-core::journal::InMemorySessionJournal` is the volatile neutral
+reference implementation of `SessionJournal`. Construct protected stores with
+`InMemorySessionJournal::protected`; ordinary stores require an explicit
+`JournalProjectionPolicy` through `InMemorySessionJournal::ordinary`, and the
+projected values are encoded and hashed only after that policy succeeds. The U9
+design names no durable neutral file/database adapter: production hosts remain
+responsible for crash-safe framing, flushes and cross-process fencing.
+
+The reference backend has no wall-clock lease expiry. It implements atomic
+commit, lifetime idempotency, pinned reachability and monotonic writer fences.
+Before a head becomes visible it is materialized through `JournalReader`, so a
+boundary with a wrong history chain or count, or a checkpoint whose operation
+fingerprint does not match its state, is refused instead of published.
+Checkpoint progress is compared with the latest published checkpoint of the
+session, even across heads that carry none. Lease expiry and revocation stay
+host policy: `InMemorySessionJournal::revoke_writer` is that host control, and a
+writer lease dropped without `close` keeps the session's writer slot until the
+host revokes it. The single transaction lock is held while the ordinary
+projection policy runs, so a policy must not call back into the same journal.
+`retire` and `collect` deliberately return the typed
+`JournalRetirement`/`JournalCollection` unsupported capabilities and retain all
+content until U9 group C. It is not wired into the runtime turn loop; native
+writer selection and migration belong to later group-B tasks.
+
+Adapters run the reusable task-2.1 contract with
+`agent_runtime_testkit::conformance::journal::assert_session_journal_conformance`
+(protected role) and `assert_ordinary_session_journal_conformance` (ordinary
+role, built from a factory that receives the scenario's host policy). A
+`SessionJournalConformanceFixture` pairs a protected adapter with a
+deterministic failure injector for every commit visibility cut and with the
+host's writer-lease revocation, which the suite uses to hand the fence to a
+successor. `assert_session_journal_reference_conformance` runs both against the
+reference. The testkit's unit tests also run the suite against deliberately
+broken backends (non-atomic commit, idempotency outside the transaction or
+keyed by operation only, reads that skip the lease, foreign-object resolution,
+unverified object reuse, a revocation that keeps the writer, an ordinary
+adapter ignoring policy or dropping exact roots) and require each to be
+rejected.
+
 ## Quality gates
 
 ```sh

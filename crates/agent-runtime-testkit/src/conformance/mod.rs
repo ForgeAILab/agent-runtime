@@ -14,6 +14,7 @@ pub mod context;
 pub mod delegation;
 pub mod event_schema;
 pub mod history;
+pub mod journal;
 pub mod lcm;
 pub mod manifests;
 pub mod normalization;

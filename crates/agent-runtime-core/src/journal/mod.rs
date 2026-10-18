@@ -13,11 +13,13 @@
 //! pinned closure reads and durable idempotency. A digest is never a read grant.
 
 mod encoding;
+mod memory;
 mod model;
 mod reader;
 mod snapshot;
 
 pub use encoding::*;
+pub use memory::*;
 pub use model::*;
 pub use reader::*;
 pub use snapshot::*;

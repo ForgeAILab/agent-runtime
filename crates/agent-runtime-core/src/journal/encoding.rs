@@ -256,6 +256,23 @@ impl JournalObject {
         })
     }
 
+    /// Validates the complete envelope and returns its declared object kind.
+    ///
+    /// Backends use this before admitting a candidate object. The returned kind
+    /// is metadata, not read authority; callers still need a live pinned lease
+    /// before a backend may return the object's bytes.
+    pub fn kind(&self) -> Result<JournalObjectKind, RuntimeError> {
+        let envelope: Envelope = serde_json::from_slice(&self.bytes).map_err(|_| conflict())?;
+        if envelope.encoding != JOURNAL_ENCODING
+            || envelope.schema_version != JOURNAL_SCHEMA_VERSION
+            || journal_object_id(envelope.kind, JOURNAL_SCHEMA_VERSION, &self.bytes) != self.id
+            || canonical_journal_json(&envelope)? != self.bytes
+        {
+            return Err(conflict());
+        }
+        Ok(envelope.kind)
+    }
+
     /// Verifies digest, exact type/schema, canonical bytes (including duplicate
     /// keys/numeric spelling), then deserializes. Failures carry no payload/ID.
     pub fn decode<T: DeserializeOwned + Serialize>(
