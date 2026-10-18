@@ -155,14 +155,15 @@ all applicable gates, not merely contract merge.
   session whose cache record or manifest outgrew 64 entries by turns) and
   reused a two-item node for an array shrunk to an odd width; caches and the
   writer's delta treated `0.0`/`-0.0` as unchanged; the protected fast path
-  rejected valid commits whose advisory delta did not replay; reference-backend
-  layers grew one per commit; the ordinary draft closure re-validated every
-  pinned object. Tests: `a_warm_json_cache_encodes_reshaped_arrays_like_a_cold_one`,
+  rejected valid commits whose advisory delta did not replay and never re-armed
+  after a writer change; reference-backend layers grew one per commit; the
+  ordinary draft closure re-validated every pinned object. Tests: `a_warm_json_cache_encodes_reshaped_arrays_like_a_cold_one`,
   `review_arrays_growing_past_one_leaf_match_at_every_barrier`,
   `a_warm_json_cache_distinguishes_negative_zero`,
   `negative_zero_records_are_encoded_and_sent_like_any_change`,
   `a_negative_zero_rewrite_is_stored_like_a_cold_encoding`,
   `protected_commits_with_an_unreplayable_delta_fall_back_to_full_validation`,
+  `the_protected_fast_path_reseeds_after_a_writer_change`,
   `many_commits_keep_logarithmic_layers_and_exact_accounting`, three-encoder
   boundary checks (1,023/1,024/1,025 bytes, multi-byte UTF-8, signed zero,
   64/65/66/130 items) in the runtime and testkit, and a cold-encoding oracle

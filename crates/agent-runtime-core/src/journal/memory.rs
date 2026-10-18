@@ -1012,13 +1012,29 @@ impl SessionJournal for InMemorySessionJournal {
                 snapshot.clone(),
             )?;
         } else if self.role == JournalRole::Protected {
-            materialize_staged_snapshot(
+            let snapshot = materialize_staged_snapshot(
                 &self.storage_id,
                 &head,
                 &staged.objects,
                 &closure,
                 &lease_record.reachable,
             )?;
+            // Re-seed the fast path from the fully validated head (after a
+            // writer change, or a delta/representation the cache could not
+            // follow) when its canonical encoding reproduces the head's roots;
+            // otherwise later commits keep validating in full.
+            let mut assembler = ObjectAssembler::default();
+            protected = assembler
+                .snapshot_cached(
+                    &snapshot,
+                    head.snapshot.planned_step_count,
+                    None,
+                    None,
+                    None,
+                )
+                .ok()
+                .filter(|(roots, _)| *roots == head.snapshot)
+                .map(|(_, encoding)| (snapshot, encoding));
         }
 
         let token = self.token(lease)?;
@@ -2085,7 +2101,7 @@ fn materialize_staged_snapshot(
     objects: &ObjectStore,
     closure: &BTreeSet<JournalObjectId>,
     trusted: &ReachableSet,
-) -> Result<(), RuntimeError> {
+) -> Result<SessionSnapshot, RuntimeError> {
     let view = StagedClosure {
         storage_id,
         objects,
@@ -2106,7 +2122,7 @@ fn materialize_staged_snapshot(
     };
     let mut materialized = pin!(async {
         let mut reader = JournalReader::new(&view, &lease, limits)?;
-        reader.snapshot().await.map(|_| ())
+        reader.snapshot().await?.ok_or_else(conflict)
     });
     match materialized
         .as_mut()
@@ -3137,6 +3153,71 @@ mod structured_json_tests {
         );
         let head = journal.commit(&lease, advisory).await.unwrap();
         assert!(head.snapshot == ObjectAssembler::default().snapshot(&next, 0).unwrap());
+    }
+
+    /// A writer change forces one full validation; the fast path must then be
+    /// re-seeded from that validated head instead of staying off for the rest
+    /// of the session.
+    #[tokio::test]
+    async fn the_protected_fast_path_reseeds_after_a_writer_change() {
+        let journal = InMemorySessionJournal::protected(JournalStorageId::new("reseed"));
+        let session = SessionId::new("reseed");
+        let objects = |snapshot: &SessionSnapshot, known: &BTreeSet<JournalObjectId>| {
+            let mut assembler = ObjectAssembler::default();
+            assembler.snapshot(snapshot, 0).unwrap();
+            assembler
+                .objects
+                .into_iter()
+                .filter(|(id, _)| !known.contains(id))
+                .map(|(id, bytes)| JournalObject { id, bytes })
+                .collect::<Vec<_>>()
+        };
+        let cached = |journal: &InMemorySessionJournal| {
+            journal.lock().unwrap().sessions[&session]
+                .protected_snapshot
+                .is_some()
+        };
+        let first_writer = writer(&journal, &session, "w0").await;
+        let first = snapshot(&session, 3);
+        let mut head = journal
+            .commit(
+                &first_writer,
+                commit(
+                    &first,
+                    None,
+                    first_writer.writer_epoch().unwrap(),
+                    "bootstrap",
+                    objects(&first, &BTreeSet::new()),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(cached(&journal));
+        journal.revoke_writer(&session).unwrap();
+        let second_writer = writer(&journal, &session, "w1").await;
+        let mut current = first;
+        for turn in 0..2 {
+            let message = Message::user(format!("after the writer change {turn}"));
+            let mut next = current.clone();
+            next.history.push(message.clone());
+            let mut append = commit(
+                &next,
+                Some(&head),
+                second_writer.writer_epoch().unwrap(),
+                &format!("append-{turn}"),
+                objects(&next, &published(&current)),
+                false,
+                BTreeMap::new(),
+            );
+            append.delta.history_append = vec![message];
+            append.digest = append.input_digest().unwrap();
+            head = journal.commit(&second_writer, append).await.unwrap();
+            assert!(cached(&journal), "fast path still off after commit {turn}");
+            current = next;
+        }
+        assert!(head.snapshot == ObjectAssembler::default().snapshot(&current, 0).unwrap());
     }
 
     /// N reference commits share the unchanged spine; each adds O(log N)

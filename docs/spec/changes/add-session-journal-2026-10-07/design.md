@@ -159,7 +159,9 @@ supplied object is reachable from the current structured delta and host policy
 preserves the Runtime-owned values exactly; the closure that selects them stops
 at already pinned objects. For a protected commit the cached snapshot is only a
 fast path: a delta it cannot replay or roots it does not reproduce fall back to
-full reader validation (the protected delta stays advisory). Copy-on-write
+full reader validation (the protected delta stays advisory), and a fully
+validated head whose canonical encoding reproduces its roots re-seeds the fast
+path, so a writer change costs one full validation. Copy-on-write
 layers are merged while the newest is at least as large as the one below, so a
 lookup scans at most log2(total)+1 layers.
 
