@@ -3991,24 +3991,25 @@ async fn crash_matrix_barriers() -> Vec<CrashMatrixBarrier> {
     barriers
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CrashMatrixOutcome {
-    Crash,
-    AmbiguousSuccess,
-    AmbiguousFailure,
-}
-
-impl CrashMatrixOutcome {
-    const ALL: [Self; 3] = [Self::Crash, Self::AmbiguousSuccess, Self::AmbiguousFailure];
-}
-
+/// One physically distinct way the target commit can end. The reference
+/// backend stages every physical step on a private copy and publishes at one
+/// visibility point, so a cut before `AfterCommit` leaves nothing visible and
+/// `AfterCommit` publishes with a lost acknowledgement. The writer process is
+/// always gone afterwards (its fence is revoked, as a host's lease expiry
+/// would); only a fresh reader, a fresh runtime and an independent retry act.
 #[derive(Debug, Clone, Copy)]
-enum CrashMatrixCut {
-    Commit(JournalCommitFailurePoint),
-    PinClose,
+enum CrashMatrixCase {
+    /// The writer dies after this physical step of the target commit.
+    Crash(JournalCommitFailurePoint),
+    /// The writer dies before it submits the target commit.
+    CrashBeforeCommit,
+    /// The commit is acknowledged; the writer dies before closing its pin.
+    CrashAfterAcknowledgement,
+    /// The commit is acknowledged and the writer's pin close succeeds.
+    ClosedAfterAcknowledgement,
 }
 
-fn crash_matrix_cuts(role: JournalRole) -> Vec<CrashMatrixCut> {
+fn crash_matrix_cases(role: JournalRole) -> Vec<CrashMatrixCase> {
     JournalCommitFailurePoint::ALL
         .iter()
         .copied()
@@ -4016,8 +4017,12 @@ fn crash_matrix_cuts(role: JournalRole) -> Vec<CrashMatrixCut> {
             role == JournalRole::Protected
                 || !matches!(point, JournalCommitFailurePoint::AfterCheckpoint)
         })
-        .map(CrashMatrixCut::Commit)
-        .chain(std::iter::once(CrashMatrixCut::PinClose))
+        .map(CrashMatrixCase::Crash)
+        .chain([
+            CrashMatrixCase::CrashBeforeCommit,
+            CrashMatrixCase::CrashAfterAcknowledgement,
+            CrashMatrixCase::ClosedAfterAcknowledgement,
+        ])
         .collect()
 }
 
@@ -4265,10 +4270,9 @@ async fn revoke_crash_matrix_writers(
 
 async fn inject_crash_matrix_case(
     barrier: &CrashMatrixBarrier,
-    cut: CrashMatrixCut,
-    outcome: CrashMatrixOutcome,
+    case: CrashMatrixCase,
 ) -> CrashMatrixInjection {
-    let label = format!("{} / {cut:?} / {outcome:?}", barrier.label);
+    let label = format!("{} / {case:?}", barrier.label);
     let target = &barrier.trace[barrier.target];
     let session = target.commit.batch.session.clone();
     let journals = CrashMatrixJournals::new(&barrier.label);
@@ -4276,36 +4280,25 @@ async fn inject_crash_matrix_case(
     let before = crash_matrix_view(&journals, &session, &format!("{label}: before")).await;
     let journal = journals.journal(target.role);
     let mut committed_head = None;
-    let committed = match cut {
-        CrashMatrixCut::Commit(point) => match outcome {
-            CrashMatrixOutcome::Crash => {
-                journal.fail_next_commit_at(point).unwrap();
-                let result = journal
-                    .commit(&writers[writer].lease, attempted.clone())
-                    .await;
-                assert!(result.is_err(), "{label}: injected crash returned success");
-                point.is_after_commit()
-            }
-            CrashMatrixOutcome::AmbiguousSuccess => {
-                committed_head = Some(
-                    journal
-                        .commit(&writers[writer].lease, attempted.clone())
-                        .await
-                        .unwrap(),
-                );
-                true
-            }
-            CrashMatrixOutcome::AmbiguousFailure => false,
-        },
-        CrashMatrixCut::PinClose => {
+    let committed = match case {
+        CrashMatrixCase::Crash(point) => {
+            journal.fail_next_commit_at(point).unwrap();
+            let result = journal
+                .commit(&writers[writer].lease, attempted.clone())
+                .await;
+            assert!(result.is_err(), "{label}: injected crash returned success");
+            point.is_after_commit()
+        }
+        CrashMatrixCase::CrashBeforeCommit => false,
+        CrashMatrixCase::CrashAfterAcknowledgement
+        | CrashMatrixCase::ClosedAfterAcknowledgement => {
             committed_head = Some(
                 journal
                     .commit(&writers[writer].lease, attempted.clone())
                     .await
                     .unwrap(),
             );
-            writers[writer].head = committed_head.clone();
-            if outcome == CrashMatrixOutcome::AmbiguousSuccess {
+            if matches!(case, CrashMatrixCase::ClosedAfterAcknowledgement) {
                 let lease = writers.remove(writer).lease;
                 journal.close(lease).await.unwrap();
             }
@@ -4355,13 +4348,9 @@ async fn inject_crash_matrix_case(
     }
 }
 
-async fn assert_crash_matrix_retry(
-    barrier: &CrashMatrixBarrier,
-    cut: CrashMatrixCut,
-    outcome: CrashMatrixOutcome,
-) {
-    let injection = inject_crash_matrix_case(barrier, cut, outcome).await;
-    let label = format!("{} / {cut:?} / {outcome:?}", barrier.label);
+async fn assert_crash_matrix_retry(barrier: &CrashMatrixBarrier, case: CrashMatrixCase) {
+    let injection = inject_crash_matrix_case(barrier, case).await;
+    let label = format!("{} / {case:?}", barrier.label);
     let journal = injection.journals.journal(injection.target_role);
     let nonce = uuid::Uuid::new_v4();
     let lease = journal
@@ -4475,9 +4464,7 @@ async fn observe_crash_matrix_resume(
     let outcome = match runtime.start_session(StartSession::resume(session)).await {
         Ok(handle) => {
             let interrupted = handle.interrupted_on_resume().is_some();
-            let continued = handle
-                .run(UserInput::text("continue after crash matrix"))
-                .await;
+            let continued = handle.run(UserInput::text(CRASH_MATRIX_CONTINUATION)).await;
             let snapshot = handle.snapshot();
             let shutdown = handle.shutdown().await;
             json!({
@@ -4577,13 +4564,11 @@ fn assert_crash_matrix_resume_matches(
     }
 }
 
-async fn assert_crash_matrix_continuation(
-    barrier: &CrashMatrixBarrier,
-    cut: CrashMatrixCut,
-    outcome: CrashMatrixOutcome,
-) {
-    let injection = inject_crash_matrix_case(barrier, cut, outcome).await;
-    let label = format!("{} / {cut:?} / {outcome:?}", barrier.label);
+const CRASH_MATRIX_CONTINUATION: &str = "continue after crash matrix";
+
+async fn assert_crash_matrix_continuation(barrier: &CrashMatrixBarrier, case: CrashMatrixCase) {
+    let injection = inject_crash_matrix_case(barrier, case).await;
+    let label = format!("{} / {case:?}", barrier.label);
     let ordinary_snapshot =
         injection
             .view
@@ -4667,22 +4652,115 @@ async fn assert_crash_matrix_continuation(
     assert_crash_matrix_resume_matches(&native, &legacy, &label);
 }
 
-/// Task 2.6: every runtime checkpoint state and every ordinary bootstrap,
-/// terminal, and fork publication is replayed through every physical commit
-/// cut. Crash, ambiguous-success and ambiguous-failure outcomes are observed
-/// from a fresh reader, continued by a fresh runtime against the equivalent
-/// legacy materialization, and retried by operation identity on an independent
-/// replay. Each continuation is spawned on a normal-size worker so the matrix
-/// does not borrow the test harness thread's stack.
-#[test]
-fn task_2_6_native_barrier_crash_and_ambiguous_write_matrix() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+fn crash_matrix_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_stack_size(1792 << 10)
         .enable_all()
         .build()
-        .unwrap();
-    let barriers = runtime.block_on(crash_matrix_barriers());
+        .unwrap()
+}
+
+/// The recorded barrier traces, built once per test process and shared by
+/// every shard (they are immutable submissions; each case replays them into
+/// fresh journals).
+fn crash_matrix_inventory() -> &'static [CrashMatrixBarrier] {
+    static BARRIERS: std::sync::OnceLock<Vec<CrashMatrixBarrier>> = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| crash_matrix_runtime().block_on(crash_matrix_barriers()))
+}
+
+/// Task 2.6: every runtime checkpoint state and every ordinary bootstrap,
+/// terminal, fork and idle-compaction publication is replayed through every
+/// physical commit cut plus the three acknowledgement/close variants. Each
+/// case is observed from a fresh reader, continued by a fresh runtime against
+/// the equivalent legacy materialization, and retried by operation identity on an
+/// independent replay. Continuations run on a normal-size worker so the
+/// matrix does not borrow the test harness thread's stack. One test per
+/// barrier lets the harness run barriers in parallel.
+fn run_crash_matrix_barrier(label: &str) {
+    let barrier = crash_matrix_inventory()
+        .iter()
+        .find(|barrier| barrier.label == label)
+        .unwrap_or_else(|| panic!("crash-matrix barrier {label} is not in the inventory"))
+        .clone();
+    let runtime = crash_matrix_runtime();
+    let role = barrier.trace[barrier.target].role;
+    let mut cases = 0usize;
+    for case in crash_matrix_cases(role) {
+        let continuation = barrier.clone();
+        runtime
+            .block_on(runtime.spawn(async move {
+                assert_crash_matrix_continuation(&continuation, case).await;
+            }))
+            .unwrap();
+        let retry = barrier.clone();
+        runtime
+            .block_on(runtime.spawn(async move {
+                assert_crash_matrix_retry(&retry, case).await;
+            }))
+            .unwrap();
+        cases += 1;
+    }
+    println!("TASK 2.6 MATRIX barrier={label} role={role:?} cases={cases} results=pass");
+}
+
+macro_rules! crash_matrix_barrier_tests {
+    ($($(#[$meta:meta])* $name:ident => $label:literal;)+) => {
+        fn crash_matrix_barrier_test_labels() -> Vec<&'static str> {
+            #[allow(unused_mut)]
+            let mut labels = Vec::new();
+            $($(#[$meta])* labels.push($label);)+
+            labels
+        }
+        $(
+            $(#[$meta])*
+            #[test]
+            fn $name() {
+                run_crash_matrix_barrier($label);
+            }
+        )+
+    };
+}
+
+crash_matrix_barrier_tests! {
+    task_2_6_crash_matrix_accepted => "accepted";
+    task_2_6_crash_matrix_internal_accepted => "internal_accepted";
+    task_2_6_crash_matrix_local_action_accepted => "local_action_accepted";
+    task_2_6_crash_matrix_local_action_prepared => "local_action_prepared";
+    task_2_6_crash_matrix_local_action_executing => "local_action_executing";
+    task_2_6_crash_matrix_local_action_outcome_ready => "local_action_outcome_ready";
+    task_2_6_crash_matrix_local_action_result_ready => "local_action_result_ready";
+    task_2_6_crash_matrix_planning => "planning";
+    task_2_6_crash_matrix_calling_model => "calling_model";
+    task_2_6_crash_matrix_model_response_ready => "model_response_ready";
+    task_2_6_crash_matrix_awaiting_approval => "awaiting_approval";
+    task_2_6_crash_matrix_awaiting_interaction => "awaiting_interaction";
+    task_2_6_crash_matrix_tool_outcome_ready => "tool_outcome_ready";
+    task_2_6_crash_matrix_executing_tools => "executing_tools";
+    task_2_6_crash_matrix_completing => "completing";
+    task_2_6_crash_matrix_publishing_terminal => "publishing_terminal";
+    task_2_6_crash_matrix_terminal => "terminal";
+    task_2_6_crash_matrix_cache_operation_prepared => "cache_operation_prepared";
+    task_2_6_crash_matrix_cache_operation_started => "cache_operation_started";
+    task_2_6_crash_matrix_cache_operation_result_ready => "cache_operation_result_ready";
+    task_2_6_crash_matrix_cache_operation_terminal => "cache_operation_terminal";
+    #[cfg(feature = "external-agent")]
+    task_2_6_crash_matrix_external_tool_call => "external_tool_call";
+    task_2_6_crash_matrix_bootstrap => "bootstrap";
+    task_2_6_crash_matrix_ordinary_terminal_projection => "ordinary_terminal_projection";
+    task_2_6_crash_matrix_fork_intent => "fork_intent";
+    task_2_6_crash_matrix_fork_child_seed => "fork_child_seed";
+    task_2_6_crash_matrix_fork_parent_supersession => "fork_parent_supersession";
+    task_2_6_crash_matrix_idle_compaction_exact => "idle_compaction_exact";
+    task_2_6_crash_matrix_idle_compaction_projection => "idle_compaction_projection";
+}
+
+/// The barrier inventory the shards above must cover exactly: a barrier the
+/// writer starts emitting, or a shard naming a barrier that no longer exists,
+/// fails here instead of silently leaving the matrix.
+#[test]
+fn task_2_6_native_barrier_crash_and_ambiguous_write_matrix() {
+    let barriers = crash_matrix_inventory();
     assert_eq!(
         barriers.len(),
         if cfg!(feature = "external-agent") {
@@ -4691,44 +4769,32 @@ fn task_2_6_native_barrier_crash_and_ambiguous_write_matrix() {
             28
         }
     );
-    let mut cases = 0usize;
-    for barrier in barriers {
-        let barrier_label = barrier.label.clone();
-        let role = barrier.trace[barrier.target].role;
-        for cut in crash_matrix_cuts(role) {
-            for outcome in CrashMatrixOutcome::ALL {
-                let continuation = barrier.clone();
-                runtime
-                    .block_on(runtime.spawn(async move {
-                        assert_crash_matrix_continuation(&continuation, cut, outcome).await;
-                    }))
-                    .unwrap();
-                let retry = barrier.clone();
-                runtime
-                    .block_on(runtime.spawn(async move {
-                        assert_crash_matrix_retry(&retry, cut, outcome).await;
-                    }))
-                    .unwrap();
-                cases += 1;
-            }
-        }
-        println!("TASK 2.6 MATRIX barrier={barrier_label} cumulative_cases={cases}");
-    }
+    let inventory = barriers
+        .iter()
+        .map(|barrier| barrier.label.as_str())
+        .collect::<BTreeSet<_>>();
+    let tested = crash_matrix_barrier_test_labels();
+    assert_eq!(tested.len(), barriers.len(), "duplicate barrier test");
+    assert_eq!(
+        tested.into_iter().collect::<BTreeSet<_>>(),
+        inventory,
+        "every inventoried barrier needs exactly one crash-matrix test"
+    );
+    let cases = barriers
+        .iter()
+        .map(|barrier| crash_matrix_cases(barrier.trace[barrier.target].role).len())
+        .sum::<usize>();
     assert_eq!(
         cases,
         if cfg!(feature = "external-agent") {
-            678
+            284
         } else {
-            654
+            274
         }
     );
     println!(
-        "TASK 2.6 MATRIX barriers={} cases={cases} results=pass",
-        if cfg!(feature = "external-agent") {
-            29
-        } else {
-            28
-        }
+        "TASK 2.6 MATRIX barriers={} distinct_cases={cases}",
+        barriers.len()
     );
 }
 
