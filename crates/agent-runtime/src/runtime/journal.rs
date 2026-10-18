@@ -446,6 +446,40 @@ impl SessionPersistence {
     }
 }
 
+impl Drop for SessionPersistence {
+    /// A live session dropped without `shutdown` (by a host, or internally by
+    /// `fork_session`/`abort_fork` after starting an idle parent) is no longer
+    /// live, exactly as its in-process active-session lease is released on
+    /// drop. Release its writer fences too, or the same process could never
+    /// reopen that session. The backend close is attempted synchronously so
+    /// an immediate resume observes it; a backend that must suspend finishes
+    /// on the current Tokio runtime, and one with neither relies on host lease
+    /// expiry exactly as after a crash. Close never publishes state.
+    fn drop(&mut self) {
+        let PersistenceMode::Native(native) = &mut self.mode else {
+            return;
+        };
+        for domain in [native.ordinary.as_mut(), native.protected.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            let domain = domain.get_mut();
+            let Some(lease) = domain.lease.take() else {
+                continue;
+            };
+            let journal = domain.journal.clone();
+            let mut close = Box::pin(async move {
+                let _ = journal.close(lease).await;
+            });
+            if futures_util::FutureExt::now_or_never(&mut close).is_none() {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(close);
+                }
+            }
+        }
+    }
+}
+
 impl NativeDomain {
     async fn close(&mut self) -> Result<(), RuntimeError> {
         match self.lease.take() {

@@ -1085,3 +1085,40 @@ async fn review_fork_summary_empty_and_from_index_match_at_every_barrier() {
     )
     .await;
 }
+
+/// A session handle dropped without `shutdown` is no longer live: legacy
+/// stores let the same process resume it at once. Native writer fences must
+/// be released too, or every runtime path that starts and drops a handle
+/// (fork of an idle parent, `abort_fork`, delegated children) wedges it.
+#[tokio::test]
+async fn review_dropped_handles_release_native_writer_fences() {
+    let pair = Pair::new(identity);
+    for native in [false, true] {
+        let runtime = if native {
+            pair.native_runtime(text_turns(), plain)
+        } else {
+            pair.legacy_runtime(text_turns(), plain)
+        };
+        let id = SessionId::new("review-dropped-handle");
+        let session = runtime
+            .start_session(StartSession::create(id.clone(), Vec::new()))
+            .await
+            .unwrap();
+        session
+            .run(UserInput::text("first secret input"))
+            .await
+            .unwrap();
+        drop(session);
+        // abort_fork on an idle parent with nothing pending starts the
+        // parent, finds no intent and drops that handle internally.
+        runtime.abort_fork(&id).await.unwrap();
+        tokio::task::yield_now().await;
+        let resumed = runtime
+            .start_session(StartSession::resume(id.clone()))
+            .await
+            .unwrap_or_else(|error| panic!("native={native}: {error:?}"));
+        resumed.run(UserInput::text("second input")).await.unwrap();
+        resumed.shutdown().await.unwrap();
+    }
+    pair.assert_barriers_match("dropped-handle");
+}
