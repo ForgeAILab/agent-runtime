@@ -41,6 +41,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
+- Gemini Interactions now preserves signed Google Search call/result steps for
+  exact stateless tool-call continuation without exposing opaque search state.
 - Command providers now report stderr overflow deterministically even when stdout and the child process finish first.
 
 ## [0.5.0] - 2026-10-16
