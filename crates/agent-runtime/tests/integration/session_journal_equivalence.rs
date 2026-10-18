@@ -3921,6 +3921,25 @@ async fn crash_matrix_barriers() -> Vec<CrashMatrixBarrier> {
             submission.role == JournalRole::Ordinary && submission.commit.delta.bootstrap.is_some()
         },
     );
+    // The live writer's host persist at shutdown: the first ordinary
+    // publication made directly after a protected Terminal (the terminal
+    // projection precedes Terminal; the next turn starts with Accepted).
+    let persist = plain_trace
+        .windows(2)
+        .position(|pair| {
+            matches!(
+                &pair[0].materialized,
+                Materialized::Checkpoint(checkpoint) if checkpoint.state.is_terminal()
+            ) && pair[1].role == JournalRole::Ordinary
+        })
+        .map(|index| index + 1)
+        .expect("plain trace persists the ordinary state at shutdown");
+    ordinary.push(CrashMatrixBarrier {
+        label: "ordinary_persist".to_owned(),
+        profile: CrashMatrixProfile::Plain,
+        trace: Arc::new(plain_trace.clone()),
+        target: persist,
+    });
     add_ordinary_crash_matrix_barrier(
         &mut ordinary,
         "ordinary_terminal_projection",
@@ -4789,6 +4808,7 @@ crash_matrix_barrier_tests! {
     task_2_6_crash_matrix_external_tool_call => "external_tool_call";
     task_2_6_crash_matrix_bootstrap => "bootstrap";
     task_2_6_crash_matrix_ordinary_terminal_projection => "ordinary_terminal_projection";
+    task_2_6_crash_matrix_ordinary_persist => "ordinary_persist";
     task_2_6_crash_matrix_fork_intent => "fork_intent";
     task_2_6_crash_matrix_fork_child_seed => "fork_child_seed";
     task_2_6_crash_matrix_fork_parent_supersession => "fork_parent_supersession";
@@ -4805,9 +4825,9 @@ fn task_2_6_native_barrier_crash_and_ambiguous_write_matrix() {
     assert_eq!(
         barriers.len(),
         if cfg!(feature = "external-agent") {
-            29
+            30
         } else {
-            28
+            29
         }
     );
     let inventory = barriers
@@ -4828,9 +4848,9 @@ fn task_2_6_native_barrier_crash_and_ambiguous_write_matrix() {
     assert_eq!(
         cases,
         if cfg!(feature = "external-agent") {
-            284
+            293
         } else {
-            274
+            283
         }
     );
     println!(
