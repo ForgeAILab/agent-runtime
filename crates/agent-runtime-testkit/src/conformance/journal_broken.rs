@@ -429,3 +429,81 @@ async fn ordinary_suite_rejects_an_adapter_that_drops_exact_roots() {
     ))
     .await;
 }
+
+/// An ordinary adapter written to the replay-only delta contract: it applies
+/// history, usage, opaque extension and inline manifest changes, but drops
+/// the structured references a native writer now sends for the Runtime-owned
+/// cache record and new manifests.
+#[derive(Debug)]
+struct DropsStructuredReferences(Arc<dyn SessionJournal>);
+
+#[async_trait]
+impl SessionJournal for DropsStructuredReferences {
+    fn storage_id(&self) -> JournalStorageId {
+        self.0.storage_id()
+    }
+
+    async fn open(
+        &self,
+        session: &SessionId,
+        request: JournalOpen,
+    ) -> Result<JournalLease, RuntimeError> {
+        self.0.open(session, request).await
+    }
+
+    async fn read(
+        &self,
+        lease: &JournalLease,
+        object: &JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.0.read(lease, object).await
+    }
+
+    async fn commit(
+        &self,
+        lease: &JournalLease,
+        mut batch: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        if !batch.delta.extension_references.is_empty()
+            || !batch.delta.manifest_references.is_empty()
+        {
+            batch.delta.extension_references.clear();
+            batch.delta.manifest_references.clear();
+            batch.digest = batch.input_digest()?;
+        }
+        self.0.commit(lease, batch).await
+    }
+
+    async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        self.0.renew(lease).await
+    }
+
+    async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+        self.0.close(lease).await
+    }
+
+    async fn retire(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        self.0.retire(session, expected).await
+    }
+
+    async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        self.0.collect(request).await
+    }
+}
+
+#[tokio::test]
+async fn ordinary_suite_rejects_an_adapter_that_drops_structured_references() {
+    suite_rejects(super::assert_ordinary_structured_references(
+        &|policy: Arc<dyn JournalProjectionPolicy>| async move {
+            let journal: Arc<dyn SessionJournal> = Arc::new(DropsStructuredReferences(
+                super::reference_ordinary(policy).await,
+            ));
+            journal
+        },
+    ))
+    .await;
+}
