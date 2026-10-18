@@ -2162,12 +2162,21 @@ mod tests {
         for bytes in [1_023, 1_024, 1_025] {
             map.insert(format!("ascii-{bytes}"), ascii(bytes));
         }
-        map.insert("escaped-1024".into(), json!(format!("{}ab", "\"\\\n".repeat(170))));
-        map.insert("escaped-1026".into(), json!(format!("{}abcd", "\"\\\n".repeat(170))));
+        map.insert(
+            "escaped-1024".into(),
+            json!(format!("{}ab", "\"\\\n".repeat(170))),
+        );
+        map.insert(
+            "escaped-1026".into(),
+            json!(format!("{}abcd", "\"\\\n".repeat(170))),
+        );
         map.insert("utf8-1024".into(), json!("é".repeat(511)));
         map.insert("utf8-1026".into(), json!("é".repeat(512)));
         map.insert("emoji-1023".into(), json!(format!("{}a", "😀".repeat(255))));
-        map.insert("emoji-1025".into(), json!(format!("{}abc", "😀".repeat(255))));
+        map.insert(
+            "emoji-1025".into(),
+            json!(format!("{}abc", "😀".repeat(255))),
+        );
         map.insert("negative-zero".into(), json!(-0.0));
         map.insert("zero".into(), json!(0.0));
         map.insert("large".into(), json!(1e300));
@@ -2232,7 +2241,9 @@ mod tests {
         let value = boundary_value();
         for bytes in [1_023usize, 1_024, 1_025] {
             assert_eq!(
-                serde_json::to_vec(&value[format!("ascii-{bytes}")]).unwrap().len(),
+                serde_json::to_vec(&value[format!("ascii-{bytes}")])
+                    .unwrap()
+                    .len(),
                 bytes
             );
         }
@@ -2244,12 +2255,19 @@ mod tests {
             ("emoji-1023", 1_023),
             ("emoji-1025", 1_025),
         ] {
-            assert_eq!(serde_json::to_vec(&value[key]).unwrap().len(), bytes, "{key}");
+            assert_eq!(
+                serde_json::to_vec(&value[key]).unwrap().len(),
+                bytes,
+                "{key}"
+            );
         }
         live.extension_state.insert(
             RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
-            VersionedSessionState::new(RegistryRevision::new("previous-cache-state-1"), value.clone())
-                .redaction_safe(),
+            VersionedSessionState::new(
+                RegistryRevision::new("previous-cache-state-1"),
+                value.clone(),
+            )
+            .redaction_safe(),
         );
         let roots = ObjectAssembler::default().snapshot(&live, 0).unwrap();
         let lease = journal

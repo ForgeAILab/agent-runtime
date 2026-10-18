@@ -2525,11 +2525,15 @@ fn draft_reachable_closure(
         if !closure.insert(id.clone()) {
             continue;
         }
-        let bytes = supplied
-            .get(&id)
-            .or_else(|| reachable.contains(&id).then(|| stored.get(&id)).flatten())
-            .cloned()
-            .ok_or_else(conflict)?;
+        let Some(bytes) = supplied.get(&id).cloned() else {
+            // A pinned object's closure is pinned and was validated when it
+            // was published; it cannot lead to a draft, and the caller has
+            // already decoded these references with their expected kinds.
+            if reachable.contains(&id) && stored.get(&id).is_some() {
+                continue;
+            }
+            return Err(conflict());
+        };
         let object = JournalObject { id, bytes };
         if !expected_matches(expected, object.kind()?) {
             return Err(conflict());

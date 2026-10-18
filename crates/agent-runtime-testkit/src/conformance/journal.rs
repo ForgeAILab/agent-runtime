@@ -2368,11 +2368,17 @@ mod tests {
         for bytes in [1_023, 1_024, 1_025] {
             map.insert(format!("ascii-{bytes}"), ascii(bytes));
         }
-        map.insert("escaped-1024".into(), json!(format!("{}ab", "\"\\\n".repeat(170))));
+        map.insert(
+            "escaped-1024".into(),
+            json!(format!("{}ab", "\"\\\n".repeat(170))),
+        );
         map.insert("utf8-1024".into(), json!("é".repeat(511)));
         map.insert("utf8-1026".into(), json!("é".repeat(512)));
         map.insert("emoji-1023".into(), json!(format!("{}a", "😀".repeat(255))));
-        map.insert("emoji-1025".into(), json!(format!("{}abc", "😀".repeat(255))));
+        map.insert(
+            "emoji-1025".into(),
+            json!(format!("{}abc", "😀".repeat(255))),
+        );
         map.insert("negative-zero".into(), json!(-0.0));
         map.insert("zero".into(), json!(0.0));
         map.insert("u64".into(), json!(u64::MAX));
