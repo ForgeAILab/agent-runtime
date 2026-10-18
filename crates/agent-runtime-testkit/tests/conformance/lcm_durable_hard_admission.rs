@@ -1,6 +1,10 @@
 //! Ordinary-store hard admission through RuntimeBuilder::lcm; no network.
 use std::sync::{Arc, Mutex};
 
+use agent_runtime::core::journal::{
+    IdentityJournalProjection, InMemorySessionJournal, JournalCommitFailurePoint, JournalStorageId,
+    SessionJournal,
+};
 use agent_runtime::core::store::{SessionSnapshot, SessionStateSensitivity, SessionStore};
 use agent_runtime::harness::{
     LcmCoordinator, LcmCoordinatorPolicy, LcmTimelineBinding, StaticLcmTimelineResolver,
@@ -162,6 +166,59 @@ impl Fixture {
             builder = builder.checkpoint_store(checkpoints);
         }
         builder.build().unwrap()
+    }
+
+    fn runtime_with_session_store(
+        &self,
+        sessions: Arc<dyn SessionStore>,
+        observer: Arc<RecordingObserver>,
+    ) -> Runtime {
+        let binding = LcmTimelineBinding::new(
+            id(),
+            LcmTimelineId::new("durable.timeline"),
+            RegistryRevision::new("binding-1"),
+            self.dag.inner.authority(),
+        )
+        .unwrap();
+        let coordinator = Arc::new(
+            LcmCoordinator::new(
+                self.dag.clone(),
+                self.model.clone(),
+                Arc::new(StaticLcmTimelineResolver::new(binding)),
+                self.policy.clone(),
+            )
+            .unwrap(),
+        );
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .model_profile(scenarios::fake_model_profile())
+            .provider(Arc::new(scenarios::fake_text("new answer")))
+            .lcm(coordinator)
+            .observer(observer)
+            .session_store(sessions)
+            .build()
+            .unwrap()
+    }
+}
+
+#[derive(Debug)]
+struct NativeSessions {
+    journal: Arc<InMemorySessionJournal>,
+    legacy_saves: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl SessionStore for NativeSessions {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.journal.clone())
+    }
+
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        *self.legacy_saves.lock().unwrap() += 1;
+        Ok(())
     }
 }
 
@@ -344,6 +401,79 @@ async fn ordinary_staging_save_failure_aborts_before_dag_and_provider() {
     assert_eq!(f.dag.inner.node_count(), 0);
     assert!(f.sessions.writes.lock().unwrap().intents.is_empty());
     assert_eq!(&session.history()[..history().len()], history().as_slice());
+}
+
+#[tokio::test]
+async fn native_ordinary_hard_admission_persists_exact_successor_and_resumes_once() {
+    let f = Fixture::new(SaveFault::None);
+    let journal = Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new("native-hard-admission"),
+        Arc::new(IdentityJournalProjection),
+    ));
+    let sessions = Arc::new(NativeSessions {
+        journal,
+        legacy_saves: Mutex::new(0),
+    });
+    let runtime = f.runtime_with_session_store(sessions.clone(), RecordingObserver::shared());
+    let session = runtime
+        .start_session(StartSession::create(id(), history()))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("active request"))
+        .await
+        .unwrap();
+    let expected = session.history();
+    assert_eq!(f.model.calls().len(), 1);
+    assert_eq!(f.dag.inner.node_count(), 1);
+    session.shutdown().await.unwrap();
+    drop(runtime);
+
+    let restarted = f.runtime_with_session_store(sessions.clone(), RecordingObserver::shared());
+    let resumed = restarted
+        .start_session(StartSession::resume(id()))
+        .await
+        .unwrap();
+    assert_eq!(resumed.history(), expected);
+    assert_eq!(f.model.calls().len(), 1, "resume repeated summary work");
+    assert_eq!(f.dag.inner.node_count(), 1);
+    resumed.shutdown().await.unwrap();
+    assert_eq!(*sessions.legacy_saves.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn native_ordinary_hard_admission_failure_precedes_dag_and_provider() {
+    let f = Fixture::new(SaveFault::None);
+    let observer = RecordingObserver::shared();
+    let journal = Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new("native-hard-admission-failure"),
+        Arc::new(IdentityJournalProjection),
+    ));
+    let sessions = Arc::new(NativeSessions {
+        journal: journal.clone(),
+        legacy_saves: Mutex::new(0),
+    });
+    let runtime = f.runtime_with_session_store(sessions.clone(), observer.clone());
+    let session = runtime
+        .start_session(StartSession::create(id(), history()))
+        .await
+        .unwrap();
+    journal
+        .fail_next_commit_at(JournalCommitFailurePoint::AfterObjects)
+        .unwrap();
+    session
+        .run(UserInput::text("active request"))
+        .await
+        .unwrap();
+    assert_no_provider(&observer);
+    assert_eq!(f.dag.inner.node_count(), 0);
+    assert_eq!(
+        f.model.calls().len(),
+        1,
+        "the staged summary itself runs once"
+    );
+    assert_eq!(*sessions.legacy_saves.lock().unwrap(), 0);
+    session.shutdown().await.unwrap();
 }
 
 #[tokio::test]

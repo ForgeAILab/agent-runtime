@@ -20,6 +20,7 @@ use agent_runtime_registry::RegistryRevision;
 use crate::agent::planning::{PREVIOUS_CACHE_STATE_NAMESPACE, RunPlanner};
 use crate::capability::ActivationEpoch;
 use crate::harness::{ACTIVATION_STATE_NAMESPACE, SessionAbilities};
+use crate::runtime::journal::SessionPersistence;
 
 /// Protected extension namespace for one child interaction returned to its
 /// parent. Ordinary redacted snapshots may omit it; exact checkpoints retain
@@ -79,6 +80,8 @@ pub struct ActiveTurn {
 /// Mutable execution metadata owned by exactly one session.
 #[derive(Debug)]
 pub struct SessionExecutionContext {
+    /// Persistence mode selected once before this live session was built.
+    pub(crate) persistence: Arc<SessionPersistence>,
     history_generations: Mutex<super::history::HistoryGenerations>,
     /// Volatile backend observations, deliberately outside all snapshot state.
     #[cfg(feature = "external-agent")]
@@ -118,16 +121,36 @@ pub struct SessionExecutionContext {
 
 impl SessionExecutionContext {
     /// Creates an independent execution context.
+    #[cfg(test)]
     pub(crate) fn new(
+        session: &SessionId,
+        planner: RunPlanner,
+        interaction_disposition: InteractionDisposition,
+        extension_state: BTreeMap<String, VersionedSessionState>,
+        abilities: Option<SessionAbilities>,
+    ) -> Result<Self, RuntimeError> {
+        Self::new_with_persistence(
+            session,
+            planner,
+            interaction_disposition,
+            extension_state,
+            abilities,
+            SessionPersistence::disabled(session.clone()),
+        )
+    }
+
+    pub(crate) fn new_with_persistence(
         session: &SessionId,
         planner: RunPlanner,
         interaction_disposition: InteractionDisposition,
         mut extension_state: BTreeMap<String, VersionedSessionState>,
         abilities: Option<SessionAbilities>,
+        persistence: Arc<SessionPersistence>,
     ) -> Result<Self, RuntimeError> {
         let returned_interaction = take_returned_interaction_state(&mut extension_state)?;
         let artifacts = restore_artifact_references(&extension_state, session)?;
         Ok(Self {
+            persistence,
             #[cfg(feature = "external-agent")]
             backend_tool_observations: Mutex::new(Default::default()),
             planner,

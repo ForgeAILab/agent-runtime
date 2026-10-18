@@ -554,9 +554,13 @@ impl DelegationCoordinator {
             let store = self.inner.factory.checkpoint_store().ok_or_else(|| {
                 RuntimeError::conflict("durable child runtime has no checkpoint store")
             })?;
-            let checkpoint = store.load_latest(&session).await?.ok_or_else(|| {
-                RuntimeError::conflict(format!("child `{child}` has no exact checkpoint to resume"))
-            })?;
+            let checkpoint = SessionPersistence::load_checkpoint_view(&store, &session)
+                .await?
+                .ok_or_else(|| {
+                    RuntimeError::conflict(format!(
+                        "child `{child}` has no exact checkpoint to resume"
+                    ))
+                })?;
             if checkpoint.state.is_terminal() {
                 return Err(RuntimeError::conflict(format!(
                     "child `{child}` checkpoint is terminal and cannot be resumed"

@@ -27,6 +27,7 @@ use crate::runtime::command::{
 };
 use crate::runtime::emitter::EventEmitter;
 use crate::runtime::inject::InjectionQueue;
+use crate::runtime::journal::SessionPersistence;
 use crate::runtime::manifests::{
     carry_compatible_diagnostics, initialize_boundary, trim, validate_boundary_pair,
 };
@@ -301,6 +302,7 @@ fn merge_durable_lcm_import(
 /// that commit, a later resume adopts the exact existing node.
 async fn prepare_lcm_resume(
     shared: &RuntimeShared,
+    persistence: &SessionPersistence,
     session: &SessionId,
     snapshot: &mut SessionSnapshot,
     policy: Option<crate::harness::LcmRecoveryPolicy>,
@@ -335,7 +337,7 @@ async fn prepare_lcm_resume(
     };
 
     if let Some(current) = current {
-        let validation = if shared.checkpoint_store.is_none() && shared.session_store.is_some() {
+        let validation = if !persistence.has_checkpoint_store() && persistence.has_session_store() {
             coordinator
                 .validate_ordinary_resume_state(session, &snapshot.history, &current, policy)
                 .await?
@@ -351,13 +353,13 @@ async fn prepare_lcm_resume(
             .extension_state
             .insert(LCM_COMPONENT_ID.to_owned(), repaired);
         snapshot.updated = shared.clock.now();
-        if let Some(session_store) = shared.session_store.as_ref() {
+        if persistence.has_session_store() {
             // A repaired successor is the new protected authority. Persist it
             // before constructing a live handle so a second crash cannot
             // discard the proof and repeat recovery work.
             initialize_boundary(snapshot)?;
             trim(&mut snapshot.manifests, shared.manifest_window);
-            session_store.save(snapshot).await?;
+            persistence.save_snapshot(snapshot).await?;
         }
         return Ok((Vec::new(), true));
     }
@@ -384,11 +386,11 @@ async fn prepare_lcm_resume(
         }
         return Ok((Vec::new(), changed));
     };
-    let session_store = shared.session_store.as_ref().ok_or_else(|| {
-        RuntimeError::conflict(
+    if !persistence.has_session_store() {
+        return Err(RuntimeError::conflict(
             "legacy semantic-summary import requires durable session persistence",
-        )
-    })?;
+        ));
+    }
     let previous_binding = coordinator.timeline_binding(session)?;
     let initialized = coordinator
         .claim_session(session, &snapshot.history, policy, true)
@@ -411,7 +413,7 @@ async fn prepare_lcm_resume(
             );
         }
         snapshot.updated = shared.clock.now();
-        session_store.save(snapshot).await?;
+        persistence.save_snapshot(snapshot).await?;
         return Ok((Vec::new(), true));
     }
     let patch = import_semantic_summary_v1(
@@ -456,7 +458,7 @@ async fn prepare_lcm_resume(
     // attempts the replacement save again without another model call.
     initialize_boundary(snapshot)?;
     trim(&mut snapshot.manifests, shared.manifest_window);
-    session_store.save(snapshot).await?;
+    persistence.save_snapshot(snapshot).await?;
     Ok((patch.events, true))
 }
 
@@ -758,12 +760,18 @@ impl Runtime {
 
     pub(crate) async fn session_exists(&self, id: &SessionId) -> Result<bool, RuntimeError> {
         if let Some(store) = &self.shared.session_store {
-            if store.load(id).await?.is_some() {
+            if SessionPersistence::load_snapshot_view(store, id)
+                .await?
+                .is_some()
+            {
                 return Ok(true);
             }
         }
         if let Some(store) = &self.shared.checkpoint_store {
-            if store.load_latest(id).await?.is_some() {
+            if SessionPersistence::load_checkpoint_view(store, id)
+                .await?
+                .is_some()
+            {
                 return Ok(true);
             }
         }
@@ -806,8 +814,9 @@ impl Runtime {
             .checkpoint_store
             .as_ref()
             .expect("checked store")
-            .load_latest(&request.from)
-            .await?;
+            .clone();
+        let durable_parent =
+            SessionPersistence::load_checkpoint_view(&durable_parent, &request.from).await?;
         if let Some(snapshot) = durable_parent
             .as_ref()
             .map(|checkpoint| &checkpoint.snapshot)
@@ -1314,6 +1323,17 @@ impl Runtime {
             _ => None,
         };
 
+        let opened_persistence = Box::pin(SessionPersistence::open(
+            session_id.clone(),
+            explicit_id,
+            self.shared.session_store.clone(),
+            self.shared.checkpoint_store.clone(),
+        ))
+        .await?;
+        let persistence = opened_persistence.persistence;
+        let startup_persistence = persistence.clone();
+        let startup_result = async move {
+
         // Resume only when the caller explicitly supplied the identity. A
         // freshly minted id must never silently load an older snapshot.
         let mut state = SessionState::with_history(request.seed);
@@ -1322,14 +1342,8 @@ impl Runtime {
             String,
             agent_runtime_core::store::VersionedSessionState,
         > = BTreeMap::new();
-        let snapshot = match (explicit_id, &self.shared.session_store) {
-            (true, Some(store)) => store.load(&session_id).await?,
-            _ => None,
-        };
-        let mut checkpoint = match (explicit_id, &self.shared.checkpoint_store) {
-            (true, Some(store)) => store.load_latest(&session_id).await?,
-            _ => None,
-        };
+        let snapshot = opened_persistence.snapshot;
+        let mut checkpoint = opened_persistence.checkpoint;
         let resumed = snapshot.is_some() || checkpoint.is_some();
         match request.mode {
             StartSessionMode::Create if resumed => {
@@ -1503,7 +1517,14 @@ impl Runtime {
                 .extension_state
                 .contains_key(LEGACY_SEMANTIC_SUMMARY_COMPONENT_ID)
             {
-                prepare_lcm_resume(&self.shared, &session_id, canonical, request.lcm_policy).await?
+                prepare_lcm_resume(
+                    &self.shared,
+                    persistence.as_ref(),
+                    &session_id,
+                    canonical,
+                    request.lcm_policy,
+                )
+                .await?
             } else if let Some(coordinator) = &self.shared.lcm {
                 coordinator.validate_fork_source(
                     &session_id,
@@ -1518,9 +1539,14 @@ impl Runtime {
                 (Vec::new(), false)
             }
         } else if let Some(canonical) = snapshot.as_mut() {
-            let (events, repaired) =
-                prepare_lcm_resume(&self.shared, &session_id, canonical, request.lcm_policy)
-                    .await?;
+            let (events, repaired) = prepare_lcm_resume(
+                &self.shared,
+                persistence.as_ref(),
+                &session_id,
+                canonical,
+                request.lcm_policy,
+            )
+            .await?;
             if repaired || !events.is_empty() {
                 // Recovery must continue from the replacement namespace even
                 // when the loaded protected checkpoint still contains schema
@@ -1601,6 +1627,7 @@ impl Runtime {
                     parent.clone(),
                     recovery_deferred,
                     rebase_completed_activation || allow_interrupted_rebase,
+                    persistence.clone(),
                     extension_state,
                 )
                 .await?,
@@ -1685,13 +1712,7 @@ impl Runtime {
                 .await;
             // Never return a writable session until the interruption has a
             // durable terminal boundary. A failed save can be retried safely.
-            let recovered = self
-                .shared
-                .checkpoint_store
-                .as_ref()
-                .expect("loaded checkpoint has a store")
-                .load_latest(&inner.id)
-                .await?;
+            let recovered = inner.execution.persistence.latest_checkpoint().await?;
             if !recovered
                 .as_ref()
                 .is_some_and(|saved| saved.turn == checkpoint.turn && saved.state.is_terminal())
@@ -1712,7 +1733,7 @@ impl Runtime {
             .insert(inner.id.clone(), Arc::downgrade(&inner));
         let session = SessionHandle::new(inner);
         if seed_generated
-            && self.shared.checkpoint_store.is_some()
+            && persistence.has_checkpoint_store()
             && checkpoint
                 .as_ref()
                 .is_none_or(|checkpoint| checkpoint.state.is_terminal())
@@ -1743,6 +1764,12 @@ impl Runtime {
             }
         }
         Ok(session)
+        }
+        .await;
+        if startup_result.is_err() {
+            let _ = startup_persistence.close().await;
+        }
+        startup_result
     }
 }
 

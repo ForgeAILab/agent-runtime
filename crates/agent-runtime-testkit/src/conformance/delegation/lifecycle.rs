@@ -73,6 +73,34 @@ pub async fn assert_spawn_lifecycle_and_result() {
     );
 }
 
+/// Runs the same child lifecycle with native journals backing both parent and
+/// child stores. No materialized store method may receive a write.
+pub async fn assert_native_durable_child_lifecycle() {
+    let stores = NativeDurableStores::new("child-lifecycle");
+    let (_runtime, parent) =
+        native_durable_parent_session("native-delegation-parent", stores.clone()).await;
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![text_child_script("native child answer")])
+            .with_durable_stores(stores.clone(), stores.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+    let (child, handle) = match coordinator.spawn(child_spec("review")).await.unwrap() {
+        SpawnOutcome::Spawned { child, handle } => (child, handle),
+        other => panic!("expected a spawned native child, got {other:?}"),
+    };
+    let status = coordinator.wait(&child).await.unwrap();
+    assert_eq!(status.state, ChildState::Idle);
+    assert_eq!(status.last_result.as_deref(), Some("native child answer"));
+    assert_eq!(
+        coordinator.result(&child).unwrap().as_deref(),
+        Some("native child answer")
+    );
+    handle.shutdown().await.unwrap();
+    parent.shutdown().await.unwrap();
+    assert_eq!(stores.legacy_saves.load(Ordering::Relaxed), 0);
+}
+
 /// A child-produced artifact is copied explicitly into parent ownership,
 /// retains source lineage, and remains recoverable only under the new owner.
 pub async fn assert_child_artifact_result_transfers_to_parent() {

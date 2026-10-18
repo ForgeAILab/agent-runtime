@@ -12,10 +12,10 @@ impl SessionHandle {
     /// accepted result with a fallback reason and consumes the attempt; it is
     /// never retried automatically. The canonical history remains unchanged.
     pub(crate) async fn idle_checkpoint_is_safe(&self) -> Result<bool, RuntimeError> {
-        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+        if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(true);
-        };
-        let Some(checkpoint) = store.load_latest(&self.inner.id).await? else {
+        }
+        let Some(checkpoint) = self.inner.execution.persistence.latest_checkpoint().await? else {
             return Ok(true);
         };
         checkpoint.validate()?;
@@ -27,10 +27,10 @@ impl SessionHandle {
 
     /// Saves exact idle extension state, retaining the preceding turn identity.
     pub(crate) async fn protect_session_boundary(&self) -> Result<(), RuntimeError> {
-        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+        if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(());
-        };
-        let previous = store.load_latest(self.id()).await?;
+        }
+        let previous = self.inner.execution.persistence.latest_checkpoint().await?;
         let snapshot = self.checkpoint_snapshot()?;
         let sequence = self.inner.emitter.begin_checkpoint_barrier();
         let result = async {
@@ -54,7 +54,11 @@ impl SessionHandle {
                 }
                 None => TurnCheckpoint::session_boundary(snapshot, sequence)?,
             };
-            store.save(&next).await
+            self.inner
+                .execution
+                .persistence
+                .save_checkpoint(&next)
+                .await
         }
         .await;
         self.inner.emitter.end_checkpoint_barrier();
@@ -65,10 +69,10 @@ impl SessionHandle {
     /// checkpoint successor validator fences session, turn, history boundary,
     /// operation identity and monotonically increasing revisions.
     async fn checkpoint_idle_batch(&self) -> Result<bool, RuntimeError> {
-        let Some(store) = &self.inner.shared.checkpoint_store else {
+        if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(false);
-        };
-        let Some(previous) = store.load_latest(&self.inner.id).await? else {
+        }
+        let Some(previous) = self.inner.execution.persistence.latest_checkpoint().await? else {
             return Ok(false);
         };
         if !previous.state.is_terminal() {
@@ -104,7 +108,11 @@ impl SessionHandle {
         next.updated = self.inner.shared.clock.now();
         let result = async {
             previous.validate_successor(&next)?;
-            store.save(&next).await
+            self.inner
+                .execution
+                .persistence
+                .save_checkpoint(&next)
+                .await
         }
         .await;
         self.inner.emitter.end_checkpoint_barrier();
@@ -116,7 +124,6 @@ impl SessionHandle {
     /// boundary. LCM's first pass therefore cannot reach its CAS mutation
     /// until its protected pending response and usage have been saved.
     async fn persist_idle_batch(&self, batch: &IdleCompactionBatch) -> Result<(), RuntimeError> {
-        let store = self.inner.shared.session_store.as_ref();
         let previous_extensions = {
             let mut extensions = self
                 .inner
@@ -188,10 +195,12 @@ impl SessionHandle {
                 return Err(error);
             }
         };
-        let result = match store {
-            Some(store) => store.save(&self.snapshot()).await,
-            None => Ok(()),
-        };
+        let result = self
+            .inner
+            .execution
+            .persistence
+            .save_snapshot(&self.snapshot())
+            .await;
         // Once exact progress is durable, keep it on ordinary-save failure:
         // the exact checkpoint is its saved counterpart, and cold restore
         // rolls the ordinary ledger forward from its fenced predecessor. An
@@ -333,7 +342,8 @@ impl SessionHandle {
         if self.inner.cancel.is_cancelled() {
             return Ok(IdleBoundaryAdmission::Shutdown);
         }
-        if self.inner.shared.lcm.is_some() && self.inner.shared.session_store.is_none() {
+        if self.inner.shared.lcm.is_some() && !self.inner.execution.persistence.has_session_store()
+        {
             return Ok(IdleBoundaryAdmission::Busy);
         }
         if !self.idle_checkpoint_is_safe().await? {
@@ -872,8 +882,12 @@ impl SessionHandle {
                 snapshot.extension_state.remove(GoalComponent::namespace());
             }
         }
-        if let Some(store) = &self.inner.shared.session_store {
-            store.save(&snapshot).await?;
+        if self.inner.execution.persistence.has_session_store() {
+            self.inner
+                .execution
+                .persistence
+                .save_snapshot(&snapshot)
+                .await?;
         }
 
         {

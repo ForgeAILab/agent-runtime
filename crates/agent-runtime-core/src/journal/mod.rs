@@ -1,12 +1,14 @@
 //! Opt-in session journal contracts and readers (journal schema 4).
 //!
-//! This module does not install a native writer or change runtime mode selection.
-//! Existing stores keep their materialized load/save path, and the runtime still
-//! writes schema-3 checkpoints and unversioned snapshots byte for byte as before:
-//! a host that adopts nothing here can roll back to the previous release.
+//! This core module does not install a backend or choose runtime mode. The
+//! embeddable runtime selects native writing only when every configured store
+//! for a fresh/native session exposes this capability. Existing/legacy stores
+//! keep their materialized load/save path, including schema-3 checkpoints and
+//! unversioned snapshots byte for byte: a host that adopts nothing here can
+//! roll back to the previous release.
 //! [`JOURNAL_SCHEMA_VERSION`] tags journal heads, objects and reference
-//! checkpoints only; nothing in the runtime writes them yet. Once a host does
-//! publish a journal head, older binaries cannot read it. Retention is host-owned.
+//! checkpoints only. Once a host publishes a journal head, older binaries
+//! cannot read it. Retention is host-owned.
 //!
 //! Object hashes attest integrity, not authority or confidentiality. Backend
 //! implementations must enforce protection-domain isolation, fenced publication,

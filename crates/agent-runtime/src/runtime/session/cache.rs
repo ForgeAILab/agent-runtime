@@ -72,10 +72,11 @@ impl SessionHandle {
         operation: agent_runtime_core::checkpoint::CacheOperationCheckpoint,
         deadline: Deadline,
     ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
-        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+        if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(None);
-        };
-        let checkpoint_sequence = match store.load_latest(&self.inner.id).await? {
+        }
+        let checkpoint_sequence = match self.inner.execution.persistence.latest_checkpoint().await?
+        {
             None => 1,
             Some(previous) if previous.state.is_terminal() => {
                 previous.watermark.checkpoint_sequence.saturating_add(1)
@@ -104,7 +105,12 @@ impl SessionHandle {
                 return Err(error);
             }
         };
-        let save = store.save(&checkpoint).await;
+        let save = self
+            .inner
+            .execution
+            .persistence
+            .save_checkpoint(&checkpoint)
+            .await;
         self.inner.emitter.end_checkpoint_barrier();
         save?;
         Ok(Some(checkpoint))
@@ -143,8 +149,13 @@ impl SessionHandle {
                 return Err(error);
             }
         };
-        if let Some(store) = self.inner.shared.checkpoint_store.as_ref() {
-            let save = store.save(&next).await;
+        if self.inner.execution.persistence.has_checkpoint_store() {
+            let save = self
+                .inner
+                .execution
+                .persistence
+                .save_checkpoint(&next)
+                .await;
             self.inner.emitter.end_checkpoint_barrier();
             save?;
         } else {
@@ -233,10 +244,11 @@ impl SessionHandle {
         &self,
         result: &CacheOperationResult,
     ) -> Result<(), RuntimeError> {
-        let Some(store) = self.inner.shared.checkpoint_store.as_ref() else {
+        if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(());
-        };
-        let Some(mut checkpoint) = store.load_latest(&self.inner.id).await? else {
+        }
+        let Some(mut checkpoint) = self.inner.execution.persistence.latest_checkpoint().await?
+        else {
             return Err(RuntimeError::conflict(
                 "cache result has no protected checkpoint to repair",
             ));
@@ -507,11 +519,8 @@ impl SessionHandle {
             .shared
             .cache
             .operation_reserved(&self.inner.id, operation.operation());
-        let prepared_retry_checkpoint = if self.inner.shared.checkpoint_store.is_some() {
-            match self.inner.shared.checkpoint_store.as_ref() {
-                Some(store) => store.load_latest(&self.inner.id).await?,
-                None => None,
-            }
+        let prepared_retry_checkpoint = if self.inner.execution.persistence.has_checkpoint_store() {
+            self.inner.execution.persistence.latest_checkpoint().await?
         } else {
             None
         };
@@ -561,7 +570,7 @@ impl SessionHandle {
         }
         if reserved_existing
             && prepared_retry_checkpoint.is_none()
-            && self.inner.shared.checkpoint_store.is_some()
+            && self.inner.execution.persistence.has_checkpoint_store()
         {
             // A duplicate arriving while a protected cache checkpoint is
             // non-terminal must not try to allocate another revision-zero
@@ -583,7 +592,7 @@ impl SessionHandle {
             && prepared_retry_checkpoint.is_none()
             && !self.cache_identity_matches_last_plan(operation.synthetic().identity())
         {
-            let checkpoint = if self.inner.shared.checkpoint_store.is_some() {
+            let checkpoint = if self.inner.execution.persistence.has_checkpoint_store() {
                 let prepared = operation.checkpoint_metadata_with_rejection(
                     Some(request_id.clone()),
                     agent_runtime_core::event::CacheOperationReason::IdentityChanged,
@@ -683,7 +692,7 @@ impl SessionHandle {
             .reserve_synthetic_for_dispatch(&self.inner.id, &operation, &self.inner.cancel)
             .is_ok()
             || (reserved_existing && protected_retry);
-        if reserved && self.inner.shared.checkpoint_store.is_none() {
+        if reserved && !self.inner.execution.persistence.has_checkpoint_store() {
             // The operation id is now durable before any provider future is
             // polled. A crash after Started cannot replay the same action on
             // restart. A SessionStore error is intentionally ambiguous: keep
@@ -694,7 +703,7 @@ impl SessionHandle {
         }
         let checkpoint = if let Some(checkpoint) = prepared_retry_checkpoint {
             Some(checkpoint)
-        } else if self.inner.shared.checkpoint_store.is_some() {
+        } else if self.inner.execution.persistence.has_checkpoint_store() {
             let prepared = match if self.inner.cancel.is_cancelled() {
                 Some(agent_runtime_core::event::CacheOperationReason::Shutdown)
             } else {
@@ -734,7 +743,7 @@ impl SessionHandle {
         } else {
             None
         };
-        if reserved && self.inner.shared.checkpoint_store.is_some() {
+        if reserved && self.inner.execution.persistence.has_checkpoint_store() {
             self.persist_locked().await?;
         }
         let checkpoint_slot =
@@ -984,11 +993,8 @@ impl SessionHandle {
             .shared
             .cache
             .operation_reserved(&self.inner.id, operation.operation());
-        let prepared_retry_checkpoint = if self.inner.shared.checkpoint_store.is_some() {
-            match self.inner.shared.checkpoint_store.as_ref() {
-                Some(store) => store.load_latest(&self.inner.id).await?,
-                None => None,
-            }
+        let prepared_retry_checkpoint = if self.inner.execution.persistence.has_checkpoint_store() {
+            self.inner.execution.persistence.latest_checkpoint().await?
         } else {
             None
         };
@@ -1038,7 +1044,7 @@ impl SessionHandle {
         }
         if reserved_existing
             && prepared_retry_checkpoint.is_none()
-            && self.inner.shared.checkpoint_store.is_some()
+            && self.inner.execution.persistence.has_checkpoint_store()
         {
             let prepared = operation.checkpoint_metadata(Some(request_id.clone()), None);
             self.emit_cache_prepared(&prepared);
@@ -1071,7 +1077,7 @@ impl SessionHandle {
             && prepared_retry_checkpoint.is_none()
             && !self.cache_identity_matches_last_plan(operation.identity())
         {
-            let checkpoint = if self.inner.shared.checkpoint_store.is_some() {
+            let checkpoint = if self.inner.execution.persistence.has_checkpoint_store() {
                 let prepared = operation.checkpoint_metadata_with_rejection(
                     Some(request_id.clone()),
                     agent_runtime_core::event::CacheOperationReason::IdentityChanged,
@@ -1156,12 +1162,12 @@ impl SessionHandle {
             .reserve_resource_for_dispatch(&self.inner.id, &operation, &self.inner.cancel)
             .is_ok()
             || (reserved_existing && protected_retry);
-        if reserved && self.inner.shared.checkpoint_store.is_none() {
+        if reserved && !self.inner.execution.persistence.has_checkpoint_store() {
             self.persist_locked().await?;
         }
         let checkpoint = if let Some(checkpoint) = prepared_retry_checkpoint {
             Some(checkpoint)
-        } else if self.inner.shared.checkpoint_store.is_some() {
+        } else if self.inner.execution.persistence.has_checkpoint_store() {
             let prepared = match if self.inner.cancel.is_cancelled() {
                 Some(agent_runtime_core::event::CacheOperationReason::Shutdown)
             } else {
@@ -1201,7 +1207,7 @@ impl SessionHandle {
         } else {
             None
         };
-        if reserved && self.inner.shared.checkpoint_store.is_some() {
+        if reserved && self.inner.execution.persistence.has_checkpoint_store() {
             self.persist_locked().await?;
         }
         let checkpoint_slot =

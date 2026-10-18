@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-09T00:00:00Z
+updated_at: 2026-10-18T00:00:00Z
 ---
 
 # Tasks: SessionJournal and referenced checkpoints
@@ -21,9 +21,12 @@ all applicable gates, not merely contract merge.
 
 - [x] 2.1 Implement reference-counted-by-reachability roots, atomic commit/idempotency index, pinned reads and monotonic writer fences in neutral reference backends; reject different payload reuse and stale revisions.
   Evidence: the reusable protected (`assert_session_journal_conformance`) and ordinary (`assert_ordinary_session_journal_conformance`) suites pass against `InMemorySessionJournal`, covering every injected commit cut, replay, pin isolation, fence takeover via host revocation, closure, materialization and revision case, and reject nine deliberately broken backends (review fix, 2026-10-18).
-- [ ] 2.2 Route all transition, acceptance, child, internal, local-action, cache, idle-compaction, fork/seed and ordinary-only hard-admission barriers through deltas; unchanged boundaries submit no old bodies.
-- [ ] 2.3 Freeze final planned requests as ordered object references without replanning; deduplicate history, requests, usage prefixes, diagnostics and extension leaves, preserving opaque replacement costs.
-- [ ] 2.4 Preserve distinct exact/projection domains and existing terminal/nonterminal overlay rules, U3 boundary counters, hard-admission exact-successor proof, U7 authority and U8 durable fork ordering.
+- [x] 2.2 Route all transition, acceptance, child, internal, local-action, cache, idle-compaction, fork/seed and ordinary-only hard-admission barriers through deltas; unchanged boundaries submit no old bodies.
+  Evidence: native barrier/equivalence suites cover plain/tool/approval/local/internal/cache/child/idle/fork/hard-admission paths and unchanged ordinary commits submit 0 objects/0 bytes.
+- [x] 2.3 Freeze final planned requests as ordered object references without replanning; deduplicate history, requests, usage prefixes, diagnostics and extension leaves, preserving opaque replacement costs.
+  Evidence: `native_delta_submission_is_independent_of_unchanged_history_bodies` proves referenced request/history bodies stay constant at N=100/1000 while changed leaves retain replacement bytes.
+- [x] 2.4 Preserve distinct exact/projection domains and existing terminal/nonterminal overlay rules, U3 boundary counters, hard-admission exact-successor proof, U7 authority and U8 durable fork ordering.
+  Evidence: redacted terminal overlay, native hard-admission/idle recovery, and Summary/Empty/FromIndex fork equivalence tests pass with existing transition validation unchanged.
 - [ ] 2.5 Implement idempotent one-time v3 import and mixed native/legacy detection; cut crashes at each import write, including pending approval, CallingModel, model/tool results, cache phases and pending summary.
 - [ ] 2.6 Exhaustively inject crash/ambiguous write outcomes between physical object, batch, protected head, ordinary projection and publication writes; test torn tails and committed corruption fail-closed repair.
 - [ ] 2.7 Count serialized submission/new-object bytes at N=100/1000/10000 and fixed deltas; prove no unchanged-prefix writes and quantify changing metadata, opaque extensions, bootstrap and legacy-path costs.

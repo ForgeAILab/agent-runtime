@@ -43,6 +43,9 @@ use agent_runtime_core::grant::{
 };
 use agent_runtime_core::ids::{SessionId, TurnId};
 use agent_runtime_core::interaction::{InteractionOrigin, InteractionRequest, InteractionResponse};
+use agent_runtime_core::journal::{
+    IdentityJournalProjection, InMemorySessionJournal, JournalStorageId, SessionJournal,
+};
 use agent_runtime_core::provider::{
     Capabilities, FinishReason, ModelDescriptor, ModelId, Provider, ProviderCallContext,
     ProviderError, ProviderRequest, ProviderStream, ProviderStreamEvent,
@@ -190,6 +193,87 @@ async fn durable_parent_session(
         .start_session(request)
         .await
         .expect("durable parent session starts");
+    (runtime, session)
+}
+
+#[derive(Debug)]
+pub struct NativeDurableStores {
+    ordinary: Arc<InMemorySessionJournal>,
+    protected: Arc<InMemorySessionJournal>,
+    pub legacy_saves: AtomicUsize,
+}
+
+impl NativeDurableStores {
+    pub fn new(label: &str) -> Arc<Self> {
+        Arc::new(Self {
+            ordinary: Arc::new(InMemorySessionJournal::ordinary(
+                JournalStorageId::new(format!("delegation-ordinary-{label}")),
+                Arc::new(IdentityJournalProjection),
+            )),
+            protected: Arc::new(InMemorySessionJournal::protected(JournalStorageId::new(
+                format!("delegation-protected-{label}"),
+            ))),
+            legacy_saves: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionStore for NativeDurableStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for NativeDurableStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+
+    async fn load_latest(&self, _: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+pub async fn native_durable_parent_session(
+    id: &str,
+    stores: Arc<NativeDurableStores>,
+) -> (Runtime, SessionHandle) {
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(Arc::new(FakeProvider::text_reply("parent")))
+        .model_profile(profile())
+        .session_store(stores.clone())
+        .checkpoint_store(stores)
+        .security_check(
+            Arc::new(AllowAllCheck {
+                id: SecurityCheckId::new("allow-delegation"),
+                revision: SecurityCheckRevision::new("v1"),
+            }),
+            SecurityCheckMode::Authoritative,
+            PermissionSet::single(Permission::other(DELEGATION_PERMISSION.to_string())),
+            ActionClass::new("delegation"),
+        )
+        .build()
+        .expect("native durable parent runtime builds");
+    let session = runtime
+        .start_session(StartSession::create(SessionId::new(id), Vec::new()))
+        .await
+        .expect("native durable parent starts");
     (runtime, session)
 }
 
