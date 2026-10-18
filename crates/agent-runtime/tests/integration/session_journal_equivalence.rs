@@ -4769,8 +4769,8 @@ fn run_crash_matrix_barrier(label: &str) {
 
 macro_rules! crash_matrix_barrier_tests {
     ($($(#[$meta:meta])* $name:ident => $label:literal;)+) => {
+        #[allow(clippy::vec_init_then_push)]
         fn crash_matrix_barrier_test_labels() -> Vec<&'static str> {
-            #[allow(unused_mut)]
             let mut labels = Vec::new();
             $($(#[$meta])* labels.push($label);)+
             labels
