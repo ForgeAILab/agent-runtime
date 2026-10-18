@@ -85,7 +85,9 @@ all applicable gates, not merely contract merge.
   equivalence scenarios never decoded the >64-item binary spine, so
   `review_spine_sized_histories_match_at_every_barrier_and_after_fresh_resume`
   now seeds 70/130/260 messages (identity and redacting policies, plus tools
-  and a local action) and compares every barrier and a fresh resume. Core
+  and a local action) and compares every barrier and a fresh resume;
+  `review_spine_sized_forks_match_at_every_barrier` does the same for
+  Summary and FromIndex forks of spine-sized parents. Core
   unit tests round-trip the persistent JSON at every 2^k/2^k±1 boundary up to
   4,097 items and for node-shaped values, and prove draft references never
   resolve across sessions, from unpinned objects, for host namespaces or a
