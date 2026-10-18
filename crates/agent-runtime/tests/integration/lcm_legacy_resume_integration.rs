@@ -2435,10 +2435,9 @@ async fn audit_idle_checkpoint_failure_rolls_back_pending_memory() {
     );
 }
 
-/// Idle compaction with BOTH stores configured crosses the exact idle
-/// checkpoint pass and then the ordinary pass. Native and legacy must publish
-/// the same materialized boundaries, and a fresh runtime must resume the
-/// compacted session without repeating summary work.
+/// Task 2.6 trace producer: the idle-compaction publications of a two-store
+/// session, with the first exact and the first ordinary compaction commit as
+/// crash-matrix targets.
 pub(crate) async fn task_2_6_idle_compaction_trace() -> (
     Vec<crate::session_journal_equivalence::SubmittedCommit>,
     Vec<(String, usize)>,
@@ -2510,6 +2509,10 @@ pub(crate) async fn task_2_6_idle_compaction_trace() -> (
     unreachable!()
 }
 
+/// Idle compaction with BOTH stores configured crosses the exact idle
+/// checkpoint pass and then the ordinary pass. Native and legacy must publish
+/// the same materialized boundaries, and a fresh runtime must resume the
+/// compacted session without repeating summary work.
 #[tokio::test]
 async fn review_native_two_store_idle_compaction_matches_legacy_barriers() {
     use crate::session_journal_equivalence::{Pair, identity};

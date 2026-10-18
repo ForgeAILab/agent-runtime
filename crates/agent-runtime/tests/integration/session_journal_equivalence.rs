@@ -5822,10 +5822,20 @@ fn arm_committed_corruption(fixture: &CorruptionFixture, case: CommittedCorrupti
             .stores
             .protected
             .set_fault(JournalReadFault::Missing(fixture.protected_history.clone())),
-        CommittedCorruptionCase::CorruptReferencedObject => fixture
-            .stores
-            .protected
-            .set_fault(JournalReadFault::Garbled(fixture.protected_history.clone())),
+        // Distinct from `GarbledLastObject` (the history root): the head's
+        // referenced checkpoint object itself is corrupt.
+        CommittedCorruptionCase::CorruptReferencedObject => {
+            fixture
+                .stores
+                .protected
+                .set_fault(JournalReadFault::Garbled(
+                    fixture
+                        .protected_head
+                        .checkpoint
+                        .clone()
+                        .expect("protected head references a checkpoint"),
+                ))
+        }
         CommittedCorruptionCase::DigestMismatch => {
             fixture
                 .stores
