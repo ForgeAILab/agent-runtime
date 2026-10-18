@@ -202,6 +202,17 @@ and built-in tool payloads MUST remain non-rendered and non-diagnostic. A
 Gemini built-in tool step with a non-empty signature SHALL satisfy the signed
 continuation requirement exactly as a signed thought step does.
 
+Gemini checks the signature of every function-call step in the current turn
+and in any earlier turn that did not end with model text. Where such a step
+has no replayable signature (history from another provider, or a turn saved
+without its signed steps), the adapter SHALL lead that step with a thought
+carrying Google's documented placeholder signature
+`skip_thought_signature_validator` instead of failing. The placeholder SHALL
+be the step's first block, one placeholder SHALL cover the step's parallel
+calls, and a step in an earlier turn that ended with model text SHALL be sent
+without one. Malformed or unplaceable continuation state MUST still fail
+before transport.
+
 #### Scenario: Continue a signed function call
 
 - **GIVEN** Gemini emitted a signed thought step followed by a function call
@@ -210,13 +221,30 @@ continuation requirement exactly as a signed thought step does.
   original order before the result
 - **AND** sends no `previous_interaction_id`
 
-#### Scenario: Signed continuation is incomplete
+#### Scenario: Continuation state cannot be placed
 
-- **GIVEN** current-turn function-call history lacks a required thought or
-  built-in-tool signature, or has reordered continuation parts
+- **GIVEN** a stored built-in step envelope is malformed, names an unknown
+  step type, or is anchored to a call its message does not contain
 - **WHEN** the adapter prepares the next request
 - **THEN** it fails before transport with a bounded compatibility error
-- **AND** does not send degraded history
+
+#### Scenario: An unsigned step is continued with the placeholder
+
+- **GIVEN** the current turn holds a function-call step with no replayable
+  signature, with model text before the call
+- **WHEN** the adapter prepares the next request
+- **THEN** the step starts with a `thought` whose signature is
+  `skip_thought_signature_validator` and whose summary is empty, ahead of the
+  text and the call
+- **AND** a later unsigned step in the same turn gets its own placeholder
+
+#### Scenario: An earlier turn's tools are exempt only after an answer
+
+- **GIVEN** an earlier turn whose unsigned tool calls were followed by model
+  text, and another earlier turn that stopped after a tool result
+- **WHEN** the adapter prepares a request after a new user message
+- **THEN** the answered turn's steps are sent without a placeholder
+- **AND** the stopped turn's unsigned steps lead with the placeholder
 
 #### Scenario: Search steps carry the only signature
 
@@ -226,7 +254,7 @@ continuation requirement exactly as a signed thought step does.
 - **WHEN** a later request includes the correlated function results
 - **THEN** the adapter replays the search steps and function calls in their
   original stream order before the results
-- **AND** the signed search steps satisfy the signed-continuation guard
+- **AND** the signed search steps count as that step's signature
 
 #### Scenario: Search result follows the function call
 
@@ -236,7 +264,7 @@ continuation requirement exactly as a signed thought step does.
 - **THEN** the input holds the search call, the function call, the search
   result, and then the function result, in that order
 - **AND** a search-step signature emitted after a function call does not
-  satisfy the guard for that call
+  count as that call's signature
 
 ### Requirement: Native Gemini stream normalization
 
@@ -611,9 +639,10 @@ the adapter when it renders the wire.
 
 - **GIVEN** an earlier turn on another provider made tool calls
 - **WHEN** the session continues on a Gemini model with reasoning enabled
-- **THEN** the request is accepted with those calls unsigned
-- **AND** tool calls in the active continuation still require Gemini's
-  signed thought
+- **THEN** a turn that ended with an answer is sent with those calls unsigned
+- **AND** a turn that stopped before answering, and unsigned steps in the
+  active continuation, lead each step with Gemini's
+  `skip_thought_signature_validator` placeholder
 
 ### Requirement: Chat Completions carries tool-result images
 
