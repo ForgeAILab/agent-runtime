@@ -20,6 +20,23 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Changed
 
+- Existing schema-3 sessions now move once to native journaling when both the
+  ordinary and protected stores expose `SessionJournal`. Import is fenced and
+  idempotent, publishes the exact checkpoint head before the separately
+  projected ordinary head, repairs an interrupted ordinary publication on the
+  next open (only while the exact head is still the imported v3 checkpoint;
+  otherwise the open is an incompatible-store error), and never rewrites or
+  prunes the v3 records. Mixed-capability
+  pairs remain wholly materialized until a native head exists; after that, a
+  detectable lost capability is an incompatible-store error rather than a
+  fallback to stale v3 state. Mid-turn requests, prepared interactions,
+  committed model/tool/cache results, deadlines, watermarks and pending LCM
+  summaries retain their exact protected representation, without provider,
+  model or tool calls during import. Because the v3 records stay in place, a
+  release older than this one must not resume a migrated session: it would
+  read the stale v3 pair. Upgrades must also stop older writers of a session
+  before a new runtime resumes it; legacy-mode writers hold no journal fence.
+
 - **Breaking:** the schema-4 journal vocabulary released in 0.5.0 grows so a
   native turn costs O(delta). `JournalObjectKind` gains `ExtensionReference`,
   `ManifestReference`, `JsonValue`, `JsonInline`, `JsonBranch` and
@@ -57,6 +74,16 @@ contain breaking changes and are coordinated with consumer proposals.
   them. A response that searched and called tools now continues instead of
   failing with "signed continuation is incomplete or out of order".
 - Command providers now report stderr overflow deterministically even when stdout and the child process finish first.
+- Resuming an unfinished turn no longer needs close to 2 MiB of stack in debug
+  builds. `ModelResponseReady` recovery plus its continuation used ~1.8 MiB on
+  the materialized path and ~2 MiB on the native path (so for every imported
+  session), within 64 KiB of a default Tokio worker; it now needs ~1.25 MiB.
+  Release builds were unaffected.
+- The read-only session/checkpoint views used by fork, child recovery and
+  child rebind now report an incompatible store when their store lost its
+  journal capability but the paired store has a native head, instead of
+  returning that store's stale materialized (for example pre-import v3)
+  record.
 
 ## [0.5.0] - 2026-10-16
 

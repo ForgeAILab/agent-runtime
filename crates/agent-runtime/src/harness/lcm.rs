@@ -1559,6 +1559,29 @@ impl LcmCoordinator {
         Ok(state)
     }
 
+    /// Validates persisted LCM identity/binding/frontier evidence before a
+    /// representation-only session-journal import may publish it. This is a
+    /// pure validation boundary: it does not claim, repair or write the
+    /// timeline and never invokes the summary model.
+    pub(crate) fn validate_import_state(
+        &self,
+        session: &SessionId,
+        history: &[Message],
+        persisted: &VersionedSessionState,
+    ) -> Result<(), RuntimeError> {
+        let binding = self.timeline_binding(session)?;
+        let state = self.decode_state(&binding, persisted)?;
+        if state.history_len > history.len() {
+            return Err(RuntimeError::conflict(
+                "LCM checkpoint history frontier exceeds canonical history",
+            ));
+        }
+        if let Some(pending) = &state.pending_summary {
+            self.validate_pending_metadata(&binding, pending)?;
+        }
+        Ok(())
+    }
+
     fn tunables_changed(&self, persisted: &VersionedSessionState, state: &LcmState) -> bool {
         persisted.revision != *self.descriptor_value().revision()
             || state.policy_revision != self.policy.pressure.revision

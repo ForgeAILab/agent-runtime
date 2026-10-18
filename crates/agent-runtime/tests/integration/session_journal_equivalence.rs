@@ -25,6 +25,10 @@ use agent_runtime::core::content::{
 };
 use agent_runtime::core::error::RuntimeError;
 use agent_runtime::core::ids::SessionId;
+use agent_runtime::core::interaction::{
+    InteractionBroker, InteractionOutcomeKind, InteractionReadiness, InteractionRequest,
+    InteractionResponse,
+};
 use agent_runtime::core::journal::{
     IdentityJournalProjection, InMemorySessionJournal, JournalBatch, JournalBoundary,
     JournalCommit, JournalCommitFailurePoint, JournalDigest, JournalGcReport, JournalGcRequest,
@@ -38,6 +42,7 @@ use agent_runtime::core::provider::{
 };
 use agent_runtime::core::store::{SessionSnapshot, SessionStateSensitivity, SessionStore};
 use agent_runtime::core::tool::{InvocationContext, LegacyTool, ToolEffects, ToolOutcome};
+use agent_runtime::harness::{QUESTIONNAIRE_TOOL_NAME, QuestionnaireTool};
 use agent_runtime::prelude::AllowAll;
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, tool_call_fragments};
 use agent_runtime::registry::RegistryRevision;
@@ -161,6 +166,9 @@ pub(crate) struct Materializing {
     log: Mutex<Vec<Materialized>>,
     commits: AtomicUsize,
     pins: AtomicUsize,
+    fail_next_renew: AtomicUsize,
+    fail_next_close_before: AtomicUsize,
+    fail_next_close_after: AtomicUsize,
 }
 
 impl Materializing {
@@ -171,6 +179,9 @@ impl Materializing {
             log: Mutex::new(Vec::new()),
             commits: AtomicUsize::new(0),
             pins: AtomicUsize::new(0),
+            fail_next_renew: AtomicUsize::new(0),
+            fail_next_close_before: AtomicUsize::new(0),
+            fail_next_close_after: AtomicUsize::new(0),
         })
     }
 
@@ -204,6 +215,18 @@ impl Materializing {
 
     fn revoke(&self, session: &SessionId) {
         let _ = self.inner.revoke_writer(session);
+    }
+
+    fn fail_ambiguous_commit(&self) {
+        self.fail_next_renew.store(1, Ordering::SeqCst);
+    }
+
+    fn fail_import_pin_close_after_release(&self) {
+        self.fail_next_close_after.store(1, Ordering::SeqCst);
+    }
+
+    fn fail_import_pin_close_before_release(&self) {
+        self.fail_next_close_before.store(1, Ordering::SeqCst);
     }
 }
 
@@ -248,10 +271,26 @@ impl SessionJournal for Materializing {
         Ok(head)
     }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        if self.fail_next_renew.swap(0, Ordering::SeqCst) != 0 {
+            return Err(RuntimeError::internal(
+                "fixture simulated a crash before ambiguous commit resolution",
+            ));
+        }
         self.inner.renew(lease).await
     }
     async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
-        self.inner.close(lease).await
+        if self.fail_next_close_before.swap(0, Ordering::SeqCst) != 0 {
+            return Err(RuntimeError::internal(
+                "fixture crashed before releasing the import pin",
+            ));
+        }
+        self.inner.close(lease).await?;
+        if self.fail_next_close_after.swap(0, Ordering::SeqCst) != 0 {
+            return Err(RuntimeError::internal(
+                "fixture lost the import-pin close acknowledgement",
+            ));
+        }
+        Ok(())
     }
     async fn retire(
         &self,
@@ -355,6 +394,94 @@ impl CheckpointStore for NativeStores {
     }
     async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
         self.legacy_saves.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// A real v3 pair with native capabilities added in place. Loads keep serving
+/// the original materialized records so a partial import can be repaired;
+/// native mode must never call either legacy save method.
+#[derive(Debug)]
+struct ImportStores {
+    snapshot: Mutex<Option<SessionSnapshot>>,
+    checkpoint: Mutex<Option<TurnCheckpoint>>,
+    ordinary: Arc<Materializing>,
+    protected: Arc<Materializing>,
+    legacy_saves: AtomicUsize,
+    legacy_loads: AtomicUsize,
+}
+
+impl ImportStores {
+    fn new(
+        snapshot: Option<SessionSnapshot>,
+        checkpoint: Option<TurnCheckpoint>,
+        projection: Projection,
+    ) -> Arc<Self> {
+        let tag = uuid::Uuid::new_v4();
+        Arc::new(Self {
+            snapshot: Mutex::new(snapshot),
+            checkpoint: Mutex::new(checkpoint),
+            ordinary: Materializing::new(
+                InMemorySessionJournal::ordinary(
+                    JournalStorageId::new(format!("import-ordinary-{tag}")),
+                    Arc::new(projection),
+                ),
+                JournalRole::Ordinary,
+            ),
+            protected: Materializing::new(
+                InMemorySessionJournal::protected(JournalStorageId::new(format!(
+                    "import-protected-{tag}"
+                ))),
+                JournalRole::Protected,
+            ),
+            legacy_saves: AtomicUsize::new(0),
+            legacy_loads: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionStore for ImportStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        self.legacy_loads.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|snapshot| snapshot.id == *id)
+            .cloned())
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for ImportStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+
+    async fn load_latest(&self, id: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        self.legacy_loads.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .checkpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|checkpoint| checkpoint.session == *id)
+            .cloned())
+    }
+
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -2349,6 +2476,465 @@ async fn review_crash_at_calling_model_resumes_the_frozen_request_like_legacy() 
     }));
 }
 
+#[derive(Clone)]
+struct ImportFixture {
+    label: &'static str,
+    snapshot: SessionSnapshot,
+    checkpoint: TurnCheckpoint,
+    configure: Configure,
+    provider: fn() -> Arc<FakeProvider>,
+}
+
+fn no_io_provider() -> Arc<FakeProvider> {
+    provider(Vec::new())
+}
+
+#[derive(Debug)]
+struct PendingInteraction;
+
+#[async_trait]
+impl InteractionBroker for PendingInteraction {
+    fn readiness(&self) -> InteractionReadiness {
+        InteractionReadiness::Ready
+    }
+
+    async fn interact(&self, _: &InteractionRequest) -> InteractionResponse {
+        std::future::pending().await
+    }
+
+    fn close(&self, _: &agent_runtime::core::ids::InteractionRequestId, _: InteractionOutcomeKind) {
+    }
+}
+
+fn interaction_tools(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+        .legacy_approval_authority()
+        .approval(Arc::new(AllowAll))
+        .tool(Arc::new(QuestionnaireTool::new()))
+        .interaction_broker(Arc::new(PendingInteraction))
+}
+
+fn interaction_provider() -> Arc<FakeProvider> {
+    let mut question = tool_call_fragments(
+        0,
+        "call-import-question",
+        QUESTIONNAIRE_TOOL_NAME,
+        &json!({
+            "questions": [{
+                "id": "choice",
+                "header": "Choice",
+                "prompt": "Choose one",
+                "allow_free_form": true
+            }]
+        })
+        .to_string(),
+    );
+    question.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    provider(vec![
+        reply("interaction seed"),
+        ScriptedStream::new(question),
+    ])
+}
+
+async fn legacy_import_fixtures() -> Vec<ImportFixture> {
+    let pair = Pair::new(identity);
+    let id = SessionId::new("review-import-tool-fixtures");
+    let runtime = pair.legacy_runtime(
+        provider(vec![
+            reply("seed reply"),
+            tool_round("import tool result"),
+            reply("tool turn complete"),
+        ]),
+        tools,
+    );
+    let session = runtime
+        .start_session(StartSession::create(id, Vec::new()))
+        .await
+        .unwrap();
+    session.run(UserInput::text("seed")).await.unwrap();
+    let before_tool = session.snapshot();
+    let tool_start = pair.legacy_checkpoints.log.lock().unwrap().len();
+    session.run(UserInput::text("use the tool")).await.unwrap();
+    let after_tool = session.snapshot();
+    let tool_checkpoints = pair.legacy_checkpoints.log.lock().unwrap()[tool_start..].to_vec();
+    let local_start = pair.legacy_checkpoints.log.lock().unwrap().len();
+    session
+        .run_local_tool("echo", json!({"text": "local import"}), 5_000)
+        .await
+        .unwrap();
+    let after_local = session.snapshot();
+    let local_checkpoints = pair.legacy_checkpoints.log.lock().unwrap()[local_start..].to_vec();
+    session.shutdown().await.unwrap();
+
+    let find_tool = |label, predicate: fn(&TurnState) -> bool| ImportFixture {
+        label,
+        snapshot: before_tool.clone(),
+        checkpoint: tool_checkpoints
+            .iter()
+            .find(|checkpoint| predicate(&checkpoint.state))
+            .unwrap_or_else(|| panic!("missing {label} fixture"))
+            .clone(),
+        configure: tools,
+        provider: no_io_provider,
+    };
+    let mut fixtures = vec![
+        find_tool("calling_model", |state| {
+            matches!(state, TurnState::CallingModel { .. })
+        }),
+        find_tool("model_response_ready", |state| {
+            matches!(state, TurnState::ModelResponseReady { .. })
+        }),
+        find_tool("awaiting_approval", |state| {
+            matches!(state, TurnState::AwaitingApproval { .. })
+        }),
+        find_tool("executing_tools", |state| {
+            matches!(state, TurnState::ExecutingTools { .. })
+        }),
+        find_tool("tool_outcome_ready", |state| {
+            matches!(state, TurnState::ToolOutcomeReady { .. })
+        }),
+    ];
+    fixtures.push(ImportFixture {
+        label: "local_action_executing",
+        snapshot: after_tool,
+        checkpoint: local_checkpoints
+            .iter()
+            .find(|checkpoint| matches!(checkpoint.state, TurnState::LocalActionExecuting { .. }))
+            .expect("missing local executing fixture")
+            .clone(),
+        configure: tools,
+        provider: no_io_provider,
+    });
+    fixtures.push(ImportFixture {
+        label: "idle",
+        snapshot: after_local,
+        checkpoint: local_checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| matches!(checkpoint.state, TurnState::Terminal { .. }))
+            .expect("missing idle fixture")
+            .clone(),
+        configure: tools,
+        provider: no_io_provider,
+    });
+
+    let interaction_pair = Pair::new(identity);
+    let interaction_id = SessionId::new("review-import-interaction-fixture");
+    let interaction_runtime =
+        interaction_pair.legacy_runtime(interaction_provider(), interaction_tools);
+    let interaction_session = interaction_runtime
+        .start_session(StartSession::create(interaction_id, Vec::new()))
+        .await
+        .unwrap();
+    interaction_session
+        .run(UserInput::text("seed"))
+        .await
+        .unwrap();
+    let before_interaction = interaction_session.snapshot();
+    let interaction_start = interaction_pair
+        .legacy_checkpoints
+        .log
+        .lock()
+        .unwrap()
+        .len();
+    let interaction_turn = interaction_session.send(UserInput::text("ask me")).unwrap();
+    let mut interaction_checkpoint = None;
+    for _ in 0..400 {
+        interaction_checkpoint = interaction_pair.legacy_checkpoints.log.lock().unwrap()
+            [interaction_start..]
+            .iter()
+            .find(|checkpoint| matches!(checkpoint.state, TurnState::AwaitingInteraction { .. }))
+            .cloned();
+        if interaction_checkpoint.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let interaction_checkpoint =
+        interaction_checkpoint.expect("missing awaiting interaction fixture");
+    interaction_turn.interrupt(CancelReason::UserRequested);
+    interaction_turn.completed().await;
+    interaction_session.shutdown().await.unwrap();
+    fixtures.push(ImportFixture {
+        label: "awaiting_interaction",
+        snapshot: before_interaction,
+        checkpoint: interaction_checkpoint,
+        configure: interaction_tools,
+        provider: no_io_provider,
+    });
+
+    let cache_pair = Pair::new(identity);
+    let cache_id = SessionId::new("review-import-cache-fixtures");
+    (cache_turns(
+        cache_pair.legacy_runtime(cache_provider(), cache_config),
+        cache_id,
+    ))
+    .await;
+    let cache_snapshots = cache_pair.legacy_sessions.log.lock().unwrap().clone();
+    let before_cache = cache_snapshots
+        .get(1)
+        .expect("two completed turns precede the cache operation")
+        .clone();
+    let cache_checkpoints = cache_pair.legacy_checkpoints.log.lock().unwrap().clone();
+    for (label, predicate) in [
+        (
+            "cache_prepared",
+            (|state: &TurnState| matches!(state, TurnState::CacheOperationPrepared { .. }))
+                as fn(&TurnState) -> bool,
+        ),
+        (
+            "cache_started",
+            (|state: &TurnState| matches!(state, TurnState::CacheOperationStarted { .. }))
+                as fn(&TurnState) -> bool,
+        ),
+        (
+            "cache_result_ready",
+            (|state: &TurnState| matches!(state, TurnState::CacheOperationResultReady { .. }))
+                as fn(&TurnState) -> bool,
+        ),
+        (
+            "cache_terminal",
+            (|state: &TurnState| matches!(state, TurnState::CacheOperationTerminal { .. }))
+                as fn(&TurnState) -> bool,
+        ),
+    ] {
+        fixtures.push(ImportFixture {
+            label,
+            snapshot: before_cache.clone(),
+            checkpoint: cache_checkpoints
+                .iter()
+                .find(|checkpoint| predicate(&checkpoint.state))
+                .unwrap_or_else(|| panic!("missing {label} fixture"))
+                .clone(),
+            configure: cache_config,
+            provider: cache_provider,
+        });
+    }
+    fixtures
+}
+
+#[derive(Clone, Copy)]
+enum ImportCrashCut {
+    Protected(JournalCommitFailurePoint),
+    Ordinary(JournalCommitFailurePoint),
+    PinCloseBefore,
+    PinCloseAfter,
+}
+
+impl ImportCrashCut {
+    fn label(self) -> String {
+        match self {
+            Self::Protected(point) => format!("protected-{point:?}"),
+            Self::Ordinary(point) => format!("ordinary-{point:?}"),
+            Self::PinCloseBefore => "pin-close-before".into(),
+            Self::PinCloseAfter => "pin-close-after".into(),
+        }
+    }
+}
+
+async fn assert_import_head(
+    journal: &Arc<Materializing>,
+    session: &SessionId,
+    expected: Materialized,
+    label: &str,
+) {
+    let nonce = uuid::Uuid::new_v4();
+    let lease = journal
+        .inner
+        .open(
+            session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new(format!("import-check-{nonce}")),
+                pin: JournalPinId::new(format!("import-check-{nonce}")),
+                intent: JournalOpenIntent::ReadOnly,
+            },
+        )
+        .await
+        .unwrap();
+    let head = lease.head().expect("imported head").clone();
+    let mut reader = JournalReader::new(journal.inner.as_ref(), &lease, LIMITS).unwrap();
+    let actual = match expected {
+        Materialized::Snapshot(expected) => {
+            let actual = reader.snapshot().await.unwrap().expect("ordinary head");
+            assert_same(&actual, expected.as_ref(), label);
+            Materialized::Snapshot(Box::new(actual))
+        }
+        Materialized::Checkpoint(expected) => {
+            let actual = reader.checkpoint().await.unwrap().expect("protected head");
+            assert_same(&actual, expected.as_ref(), label);
+            Materialized::Checkpoint(Box::new(actual))
+        }
+    };
+    let snapshot = match actual {
+        Materialized::Snapshot(snapshot) => *snapshot,
+        Materialized::Checkpoint(checkpoint) => checkpoint.snapshot,
+    };
+    assert!(
+        cold_roots(&head, snapshot).await == head.snapshot,
+        "{label}: imported roots differ from a cold encoding"
+    );
+    journal.inner.close(lease).await.unwrap();
+}
+
+async fn import_head_exists(journal: &Arc<Materializing>, session: &SessionId) -> bool {
+    let nonce = uuid::Uuid::new_v4();
+    let lease = journal
+        .inner
+        .open(
+            session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new(format!("import-exists-{nonce}")),
+                pin: JournalPinId::new(format!("import-exists-{nonce}")),
+                intent: JournalOpenIntent::ReadOnly,
+            },
+        )
+        .await
+        .unwrap();
+    let exists = lease.head().is_some();
+    journal.inner.close(lease).await.unwrap();
+    exists
+}
+
+/// Every physical reference-backend write cut is exercised for every v3
+/// mid-turn representation. A first open must fail at the injected crash; a
+/// fresh runtime then either imports from v3 (pre-exact cuts), repairs the
+/// ordinary side (post-exact cuts), or discovers both native heads (post-
+/// ordinary/close cuts). No import may call the configured provider.
+#[tokio::test]
+async fn v3_import_crash_cut_matrix_repairs_exactly_without_provider_io() {
+    let fixtures = legacy_import_fixtures().await;
+    let mut cuts = Vec::new();
+    for point in JournalCommitFailurePoint::ALL {
+        cuts.push(ImportCrashCut::Protected(*point));
+        cuts.push(ImportCrashCut::Ordinary(*point));
+    }
+    cuts.push(ImportCrashCut::PinCloseBefore);
+    cuts.push(ImportCrashCut::PinCloseAfter);
+
+    for fixture in fixtures {
+        for cut in &cuts {
+            let cut = *cut;
+            let label = format!("{} / {}", fixture.label, cut.label());
+            let stores = ImportStores::new(
+                Some(fixture.snapshot.clone()),
+                Some(fixture.checkpoint.clone()),
+                identity,
+            );
+            match cut {
+                ImportCrashCut::Protected(point) => {
+                    stores.protected.inner.fail_next_commit_at(point).unwrap();
+                    if point.is_after_commit() {
+                        stores.protected.fail_ambiguous_commit();
+                    }
+                }
+                ImportCrashCut::Ordinary(point) => {
+                    stores.ordinary.inner.fail_next_commit_at(point).unwrap();
+                    if point.is_after_commit() {
+                        stores.ordinary.fail_ambiguous_commit();
+                    }
+                }
+                ImportCrashCut::PinCloseBefore => {
+                    stores.ordinary.fail_import_pin_close_before_release();
+                }
+                ImportCrashCut::PinCloseAfter => {
+                    stores.ordinary.fail_import_pin_close_after_release();
+                }
+            }
+
+            let first_provider = (fixture.provider)();
+            let first = build(
+                first_provider.clone(),
+                stores.clone(),
+                stores.clone(),
+                fixture.configure,
+            )
+            .start_session(
+                StartSession::resume(fixture.snapshot.id.clone())
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+            )
+            .await;
+            assert!(first.is_err(), "{label}: injected crash was not observed");
+            assert!(
+                first_provider.requests().is_empty(),
+                "{label}: import performed provider I/O"
+            );
+            assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0, "{label}");
+            assert_same(
+                stores.snapshot.lock().unwrap().as_ref().unwrap(),
+                &fixture.snapshot,
+                &format!("{label}: v3 snapshot was modified"),
+            );
+            assert_same(
+                stores.checkpoint.lock().unwrap().as_ref().unwrap(),
+                &fixture.checkpoint,
+                &format!("{label}: v3 checkpoint was modified"),
+            );
+            let protected_exists =
+                import_head_exists(&stores.protected, &fixture.snapshot.id).await;
+            let ordinary_exists = import_head_exists(&stores.ordinary, &fixture.snapshot.id).await;
+            match cut {
+                ImportCrashCut::Protected(point) => {
+                    assert_eq!(protected_exists, point.is_after_commit(), "{label}");
+                    assert!(!ordinary_exists, "{label}");
+                }
+                ImportCrashCut::Ordinary(point) => {
+                    assert!(
+                        protected_exists,
+                        "{label}: exact head was not authoritative"
+                    );
+                    assert_eq!(ordinary_exists, point.is_after_commit(), "{label}");
+                }
+                ImportCrashCut::PinCloseBefore | ImportCrashCut::PinCloseAfter => {
+                    assert!(protected_exists && ordinary_exists, "{label}");
+                }
+            }
+            if matches!(cut, ImportCrashCut::PinCloseBefore) {
+                stores.ordinary.revoke(&fixture.snapshot.id);
+            }
+
+            let fresh_provider = (fixture.provider)();
+            let resumed = build(
+                fresh_provider.clone(),
+                stores.clone(),
+                stores.clone(),
+                fixture.configure,
+            )
+            .start_session(
+                StartSession::resume(fixture.snapshot.id.clone())
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label}: fresh import failed: {error:?}"));
+            assert!(
+                fresh_provider.requests().is_empty(),
+                "{label}: repair performed provider I/O"
+            );
+            assert_import_head(
+                &stores.ordinary,
+                &fixture.snapshot.id,
+                Materialized::Snapshot(Box::new(fixture.snapshot.clone())),
+                &format!("{label}: ordinary"),
+            )
+            .await;
+            assert_import_head(
+                &stores.protected,
+                &fixture.snapshot.id,
+                Materialized::Checkpoint(Box::new(fixture.checkpoint.clone())),
+                &format!("{label}: protected"),
+            )
+            .await;
+            assert_eq!(stores.legacy_saves.load(Ordering::SeqCst), 0, "{label}");
+            resumed.shutdown().await.unwrap();
+        }
+    }
+}
+
 /// Review of U9 task 2.7: the persistent JSON spine only engages above
 /// `JOURNAL_FANOUT` (64) array items, so the empty-history scenarios above
 /// never decode it. These seed histories across the 64/128/256 boundaries.
@@ -2604,4 +3190,332 @@ async fn review_arrays_growing_past_one_leaf_match_at_every_barrier() {
     )
     .await;
     assert_spine_engaged(&pair, "growth-58");
+}
+
+// Review of U9 task 2.5: import -> resume -> continue, per v3 state.
+
+static IMPORT_ECHO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// `Echo` with an invocation counter, so a replayed tool is observable.
+#[derive(Debug)]
+struct CountingEcho;
+
+#[async_trait]
+impl LegacyTool for CountingEcho {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Returns the exact text argument."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"],
+            "additionalProperties": false
+        })
+    }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default().with_spawn()
+    }
+    async fn invoke_legacy(
+        &self,
+        arguments: Value,
+        _: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        IMPORT_ECHO_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutcome::text(
+            arguments["text"].as_str().unwrap_or_default(),
+        ))
+    }
+}
+
+fn counted_tools(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+        .legacy_approval_authority()
+        .approval(Arc::new(AllowAll))
+        .tool(Arc::new(CountingEcho))
+}
+
+#[derive(Debug)]
+struct AnsweringInteraction;
+
+#[async_trait]
+impl InteractionBroker for AnsweringInteraction {
+    fn readiness(&self) -> InteractionReadiness {
+        InteractionReadiness::Ready
+    }
+
+    async fn interact(&self, request: &InteractionRequest) -> InteractionResponse {
+        let answers = request
+            .questionnaire_payload()
+            .questions()
+            .iter()
+            .map(|question| {
+                agent_runtime::core::interaction::QuestionAnswer::free_form(
+                    question.id().clone(),
+                    "imported answer",
+                )
+            })
+            .collect();
+        InteractionResponse::answered(request.id().clone(), answers)
+    }
+
+    fn close(&self, _: &agent_runtime::core::ids::InteractionRequestId, _: InteractionOutcomeKind) {
+    }
+}
+
+fn answering_interaction_tools(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+        .legacy_approval_authority()
+        .approval(Arc::new(AllowAll))
+        .tool(Arc::new(QuestionnaireTool::new()))
+        .interaction_broker(Arc::new(AnsweringInteraction))
+}
+
+fn continuation_configure(fixture: &ImportFixture) -> Configure {
+    match fixture.label {
+        "awaiting_interaction" => answering_interaction_tools,
+        label if label.starts_with("cache_") => cache_config,
+        _ => counted_tools,
+    }
+}
+
+fn continuation_provider(fixture: &ImportFixture) -> Arc<FakeProvider> {
+    if fixture.label.starts_with("cache_") {
+        cache_provider()
+    } else {
+        provider(vec![
+            reply("after import"),
+            reply("continued"),
+            reply("spare"),
+        ])
+    }
+}
+
+/// What one resume of a v3 pair did: provider/tool calls, the materialized
+/// result and every barrier it published after the resume.
+#[derive(Debug)]
+struct ContinuationRun {
+    requests: Vec<agent_runtime::core::provider::ProviderRequest>,
+    tool_calls: usize,
+    interrupted: bool,
+    snapshot: SessionSnapshot,
+    checkpoints: Vec<TurnCheckpoint>,
+    snapshots: Vec<SessionSnapshot>,
+}
+
+async fn resume_then_continue(runtime: Runtime, id: SessionId) -> (SessionSnapshot, bool) {
+    let session = runtime
+        .start_session(StartSession::resume(id))
+        .await
+        .unwrap();
+    let interrupted = session.interrupted_on_resume().is_some();
+    session
+        .run(UserInput::text("continue after import"))
+        .await
+        .unwrap();
+    let snapshot = session.snapshot();
+    session.shutdown().await.unwrap();
+    (snapshot, interrupted)
+}
+
+async fn legacy_continuation(fixture: ImportFixture) -> ContinuationRun {
+    let pair = Pair::new(identity);
+    pair.legacy_sessions
+        .current
+        .lock()
+        .unwrap()
+        .push(fixture.snapshot.clone());
+    pair.legacy_checkpoints
+        .current
+        .lock()
+        .unwrap()
+        .push(fixture.checkpoint.clone());
+    let provider = continuation_provider(&fixture);
+    let before = IMPORT_ECHO_CALLS.load(Ordering::SeqCst);
+    let (snapshot, interrupted) = resume_then_continue(
+        pair.legacy_runtime(provider.clone(), continuation_configure(&fixture)),
+        fixture.snapshot.id.clone(),
+    )
+    .await;
+    ContinuationRun {
+        requests: provider.requests(),
+        tool_calls: IMPORT_ECHO_CALLS.load(Ordering::SeqCst) - before,
+        interrupted,
+        snapshot,
+        checkpoints: pair.legacy_checkpoints.log.lock().unwrap().clone(),
+        snapshots: pair.legacy_sessions.log.lock().unwrap().clone(),
+    }
+}
+
+async fn import_continuation(fixture: ImportFixture) -> ContinuationRun {
+    let stores = ImportStores::new(
+        Some(fixture.snapshot.clone()),
+        Some(fixture.checkpoint.clone()),
+        identity,
+    );
+    let provider = continuation_provider(&fixture);
+    let before = IMPORT_ECHO_CALLS.load(Ordering::SeqCst);
+    let (snapshot, interrupted) = resume_then_continue(
+        build(
+            provider.clone(),
+            stores.clone(),
+            stores.clone(),
+            continuation_configure(&fixture),
+        ),
+        fixture.snapshot.id.clone(),
+    )
+    .await;
+    assert_eq!(
+        stores.legacy_saves.load(Ordering::SeqCst),
+        0,
+        "{}: an imported session saved to the v3 stores",
+        fixture.label
+    );
+    let mut checkpoints = stores
+        .protected
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|value| match value {
+            Materialized::Checkpoint(checkpoint) => (**checkpoint).clone(),
+            Materialized::Snapshot(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let mut snapshots = stores
+        .ordinary
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|value| match value {
+            Materialized::Snapshot(snapshot) => (**snapshot).clone(),
+            Materialized::Checkpoint(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    // The first publication in each domain is the import itself.
+    assert_same(
+        &checkpoints.remove(0),
+        &fixture.checkpoint,
+        &format!("{}: protected import", fixture.label),
+    );
+    assert_same(
+        &snapshots.remove(0),
+        &fixture.snapshot,
+        &format!("{}: ordinary import", fixture.label),
+    );
+    ContinuationRun {
+        requests: provider.requests(),
+        tool_calls: IMPORT_ECHO_CALLS.load(Ordering::SeqCst) - before,
+        interrupted,
+        snapshot,
+        checkpoints,
+        snapshots,
+    }
+}
+
+/// Review of U9 task 2.5: the continuation after an import must make exactly
+/// the provider and tool calls that legacy resume of the same v3 pair makes,
+/// for every captured state, and publish the same barriers afterwards.
+///
+/// Each case runs as a spawned task on a worker with 1.75 MiB of stack: a
+/// default 2 MiB Tokio worker minus 256 KiB left for the host. Before
+/// `TurnMachine::resume` stopped inlining one stack slot per awaited state
+/// future, a debug build needed ~1.8 MiB (legacy) and ~2 MiB (native) to
+/// resume at ModelResponseReady; it now needs ~1.25 MiB.
+#[test]
+fn v3_import_continuation_matches_legacy_resume_for_every_state() {
+    let fixtures = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(legacy_import_fixtures()));
+    assert_eq!(fixtures.len(), 12);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(1792 << 10)
+        .enable_all()
+        .build()
+        .unwrap();
+    for fixture in fixtures {
+        let label = fixture.label;
+        let legacy = runtime
+            .block_on(runtime.spawn(legacy_continuation(fixture.clone())))
+            .unwrap();
+        let native = runtime
+            .block_on(runtime.spawn(import_continuation(fixture)))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&native.requests).unwrap(),
+            serde_json::to_value(&legacy.requests).unwrap(),
+            "{label}: provider requests"
+        );
+        assert_eq!(native.tool_calls, legacy.tool_calls, "{label}: tool calls");
+        assert_eq!(
+            native.interrupted, legacy.interrupted,
+            "{label}: interrupted"
+        );
+        assert_same(
+            &native.snapshot,
+            &legacy.snapshot,
+            &format!("{label}: snapshot"),
+        );
+        assert_eq!(
+            native.checkpoints.iter().map(state_tag).collect::<Vec<_>>(),
+            legacy.checkpoints.iter().map(state_tag).collect::<Vec<_>>(),
+            "{label}: protected barrier sequence"
+        );
+        for (index, (native, legacy)) in native
+            .checkpoints
+            .iter()
+            .zip(&legacy.checkpoints)
+            .enumerate()
+        {
+            assert_same(
+                native,
+                legacy,
+                &format!("{label}: protected barrier {index}"),
+            );
+        }
+        assert_eq!(
+            native.snapshots.len(),
+            legacy.snapshots.len(),
+            "{label}: ordinary barrier count"
+        );
+        for (index, (native, legacy)) in native.snapshots.iter().zip(&legacy.snapshots).enumerate()
+        {
+            assert_same(
+                native,
+                legacy,
+                &format!("{label}: ordinary barrier {index}"),
+            );
+        }
+        // Indeterminate work is never replayed; committed results are reused.
+        match label {
+            "executing_tools" | "tool_outcome_ready" | "local_action_executing" => {
+                assert_eq!(native.tool_calls, 0, "{label}: tool replayed");
+            }
+            "model_response_ready" | "awaiting_approval" => {
+                assert_eq!(native.tool_calls, 1, "{label}: tool not executed once");
+            }
+            _ => {}
+        }
+        if matches!(
+            label,
+            "calling_model" | "local_action_executing" | "cache_started" | "idle"
+        ) {
+            // Only the follow-up turn reaches the provider.
+            assert_eq!(native.requests.len(), 1, "{label}: provider replayed");
+        }
+        println!(
+            "IMPORT CONTINUATION {label}: requests={} tools={} interrupted={} checkpoints={:?}",
+            native.requests.len(),
+            native.tool_calls,
+            native.interrupted,
+            native.checkpoints.iter().map(state_tag).collect::<Vec<_>>()
+        );
+    }
 }

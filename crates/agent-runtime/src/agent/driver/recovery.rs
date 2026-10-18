@@ -3,6 +3,22 @@ use super::*;
 const TOOLS_CHANGED_BEFORE_RESULT: &str = "this unfinished action was not retried after the available tools changed; its outcome is unverified; inspect previous changes before retrying";
 pub(super) const TURN_FAILED_BEFORE_RESULT: &str = "the turn failed before this action's result was recorded; it was not retried and its outcome is unverified; inspect previous changes before retrying";
 
+/// Debug builds give an async fn's poll frame its own slot for every future
+/// it awaits, so `resume` (one arm per checkpoint state) needed ~790 KiB of
+/// stack before its continuation even started, leaving an imported or native
+/// session resumed at `ModelResponseReady` within 64 KiB of a 2 MiB Tokio
+/// worker stack. Constructing each awaited future inside this out-of-line
+/// helper leaves only a pointer in the caller's frame.
+#[inline(never)]
+fn boxed<'f, F>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<dyn Future<Output = F::Output> + Send + 'f>>
+where
+    F: Future + Send + 'f,
+{
+    Box::pin(make())
+}
+
 impl<'a> TurnMachine<'a> {
     /// Finalizes one validated non-terminal checkpoint from a turn that is
     /// no longer running as an explicit `Failed` terminal.
@@ -211,19 +227,21 @@ impl<'a> TurnMachine<'a> {
             TurnState::Accepted { .. } => {
                 // The exact input is already present at active_history_start;
                 // never append it again on recovery.
-                self.run_loop(
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    0,
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.run_loop(
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        0,
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::LocalActionAccepted { request_id, call } => {
                 self.emit_tool_requested(&call, false);
-                if let Err(error) = self
-                    .prepare_and_run_local(request_id, call, checkpoint.deadline)
-                    .await
+                if let Err(error) =
+                    boxed(|| self.prepare_and_run_local(request_id, call, checkpoint.deadline))
+                        .await
                 {
                     self.emit_non_durable_failure(error, false);
                 }
@@ -233,9 +251,10 @@ impl<'a> TurnMachine<'a> {
                 call,
                 prepared,
             } => {
-                if let Err(error) = self
-                    .resume_local_prepared(request_id, call, prepared, checkpoint.deadline)
-                    .await
+                if let Err(error) = boxed(|| {
+                    self.resume_local_prepared(request_id, call, prepared, checkpoint.deadline)
+                })
+                .await
                 {
                     self.emit_non_durable_failure(error, false);
                 }
@@ -248,7 +267,9 @@ impl<'a> TurnMachine<'a> {
                     "indeterminate local tool outcome after restart; the runtime did not replay this invocation",
                     self.driver.config.output_limit,
                 );
-                if let Err(error) = self.commit_local_result(request_id, call, result).await {
+                if let Err(error) =
+                    boxed(|| self.commit_local_result(request_id, call, result)).await
+                {
                     self.emit_non_durable_failure(error, false);
                 }
             }
@@ -257,29 +278,31 @@ impl<'a> TurnMachine<'a> {
                 call,
                 outcome,
             } => {
-                if let Err(error) = self
-                    .process_local_outcome(request_id, call, outcome, checkpoint.deadline)
-                    .await
+                if let Err(error) = boxed(|| {
+                    self.process_local_outcome(request_id, call, outcome, checkpoint.deadline)
+                })
+                .await
                 {
                     self.emit_non_durable_failure(error, false);
                 }
             }
             TurnState::LocalActionResultReady { result, .. } => {
                 self.publish_local_result(&result);
-                if let Err(error) = self
-                    .complete_local(local_finish(&result, &self.cancel))
-                    .await
+                if let Err(error) =
+                    boxed(|| self.complete_local(local_finish(&result, &self.cancel))).await
                 {
                     self.emit_non_durable_failure(error, false);
                 }
             }
             TurnState::Planning { step } => {
-                self.run_loop(
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    step,
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.run_loop(
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        step,
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::CallingModel { .. } => {
@@ -291,16 +314,17 @@ impl<'a> TurnMachine<'a> {
                         ),
                     },
                 );
-                self.complete(TurnFinish::Failed, checkpoint.visible_output)
-                    .await;
+                boxed(|| self.complete(TurnFinish::Failed, checkpoint.visible_output)).await;
             }
             TurnState::InternalAccepted { .. } => {
-                self.run_loop(
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    0,
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.run_loop(
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        0,
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::ModelResponseReady {
@@ -308,14 +332,16 @@ impl<'a> TurnMachine<'a> {
                 response,
                 step,
             } => {
-                self.resume_model_response(
-                    request_id,
-                    response,
-                    step,
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.resume_model_response(
+                        request_id,
+                        response,
+                        step,
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::AwaitingApproval {
@@ -334,15 +360,16 @@ impl<'a> TurnMachine<'a> {
                     );
                     return;
                 }
-                let prepared_batch = match self
-                    .resume_approval_batch(
+                let prepared_batch = match boxed(|| {
+                    self.resume_approval_batch(
                         &tool_calls,
                         &slots,
                         &request_id,
                         step,
                         checkpoint.deadline,
                     )
-                    .await
+                })
+                .await
                 {
                     Ok(batch) => batch,
                     Err(error) => {
@@ -350,24 +377,27 @@ impl<'a> TurnMachine<'a> {
                         return;
                     }
                 };
-                if let Err(error) = self
-                    .execute_prepared_tool_batch(
+                if let Err(error) = boxed(|| {
+                    self.execute_prepared_tool_batch(
                         prepared_batch,
                         &request_id,
                         step,
                         checkpoint.deadline,
                     )
-                    .await
+                })
+                .await
                 {
                     self.emit_non_durable_failure(error, checkpoint.visible_output);
                     return;
                 }
-                self.resume_after_tool_boundary(
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    step.saturating_add(1),
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.resume_after_tool_boundary(
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        step.saturating_add(1),
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::ToolOutcomeReady {
@@ -398,8 +428,8 @@ impl<'a> TurnMachine<'a> {
                     );
                     return;
                 };
-                if let Err(error) = self
-                    .process_and_commit_tool_outcome(
+                if let Err(error) = boxed(|| {
+                    self.process_and_commit_tool_outcome(
                         &request_id,
                         &source_calls,
                         &slots,
@@ -409,7 +439,8 @@ impl<'a> TurnMachine<'a> {
                         &call,
                         outcome,
                     )
-                    .await
+                })
+                .await
                 {
                     self.emit_non_durable_failure(error, checkpoint.visible_output);
                     return;
@@ -417,15 +448,16 @@ impl<'a> TurnMachine<'a> {
 
                 let suffix_start = outcome_index.saturating_add(1);
                 if suffix_start < source_calls.len() {
-                    let mut prepared_batch = match self
-                        .reauthorize_interaction_suffix(
+                    let mut prepared_batch = match boxed(|| {
+                        self.reauthorize_interaction_suffix(
                             &source_calls,
                             &slots,
                             suffix_start,
                             &request_id,
                             checkpoint.deadline,
                         )
-                        .await
+                    })
+                    .await
                     {
                         Ok(batch) => batch,
                         Err(error) => {
@@ -435,8 +467,8 @@ impl<'a> TurnMachine<'a> {
                     };
                     let interactions = self
                         .materialize_interaction_requests(&mut prepared_batch, checkpoint.deadline);
-                    if let Err(error) = self
-                        .execute_prepared_segments(
+                    if let Err(error) = boxed(|| {
+                        self.execute_prepared_segments(
                             prepared_batch,
                             interactions,
                             slots,
@@ -446,18 +478,21 @@ impl<'a> TurnMachine<'a> {
                             step,
                             checkpoint.deadline,
                         )
-                        .await
+                    })
+                    .await
                     {
                         self.emit_non_durable_failure(error, checkpoint.visible_output);
                         return;
                     }
                 }
-                self.resume_after_tool_boundary(
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    step.saturating_add(1),
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.resume_after_tool_boundary(
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        step.saturating_add(1),
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::ExecutingTools {
@@ -502,8 +537,8 @@ impl<'a> TurnMachine<'a> {
                                 checkpoint.deadline,
                             ) {
                                 Ok(Some(request)) => {
-                                    if let Err(error) = self
-                                        .transition(TurnState::AwaitingInteraction {
+                                    if let Err(error) = boxed(|| {
+                                        self.transition(TurnState::AwaitingInteraction {
                                             request_id: request_id.clone(),
                                             source_calls: source_calls.clone(),
                                             slots: slots.clone(),
@@ -513,7 +548,8 @@ impl<'a> TurnMachine<'a> {
                                             response: None,
                                             step,
                                         })
-                                        .await
+                                    })
+                                    .await
                                     {
                                         self.emit_non_durable_failure(
                                             error,
@@ -521,19 +557,21 @@ impl<'a> TurnMachine<'a> {
                                         );
                                         return;
                                     }
-                                    self.resume_awaiting_interaction(
-                                        request_id,
-                                        source_calls,
-                                        slots,
-                                        completed,
-                                        index,
-                                        request,
-                                        None,
-                                        step,
-                                        checkpoint.active_history_start,
-                                        checkpoint.deadline,
-                                        checkpoint.visible_output,
-                                    )
+                                    boxed(|| {
+                                        self.resume_awaiting_interaction(
+                                            request_id,
+                                            source_calls,
+                                            slots,
+                                            completed,
+                                            index,
+                                            request,
+                                            None,
+                                            step,
+                                            checkpoint.active_history_start,
+                                            checkpoint.deadline,
+                                            checkpoint.visible_output,
+                                        )
+                                    })
                                     .await;
                                     return;
                                 }
@@ -550,8 +588,8 @@ impl<'a> TurnMachine<'a> {
                             }
                         }
                     };
-                    if let Err(error) = self
-                        .commit_tool_result(
+                    if let Err(error) = boxed(|| {
+                        self.commit_tool_result(
                             &request_id,
                             &source_calls,
                             &slots,
@@ -559,19 +597,22 @@ impl<'a> TurnMachine<'a> {
                             step,
                             block,
                         )
-                        .await
+                    })
+                    .await
                     {
                         self.emit_non_durable_failure(error, checkpoint.visible_output);
                         return;
                     }
                 }
                 self.driver.drain_injected(&self.state, &self.inbox);
-                self.resume_after_tool_boundary(
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    step.saturating_add(1),
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.resume_after_tool_boundary(
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        step.saturating_add(1),
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::Completing {
@@ -582,19 +623,25 @@ impl<'a> TurnMachine<'a> {
                 if checkpoint.internal_input.is_none()
                     && checkpoint.active_history_start == checkpoint.snapshot.history.len()
                 {
-                    if let Err(error) = self.complete_local(finish).await {
+                    if let Err(error) = boxed(|| self.complete_local(finish)).await {
                         self.emit_non_durable_failure(error, false);
                     }
                 } else {
-                    self.complete_with_provider_error(finish, visible_output, provider_error_kind)
-                        .await;
+                    boxed(|| {
+                        self.complete_with_provider_error(
+                            finish,
+                            visible_output,
+                            provider_error_kind,
+                        )
+                    })
+                    .await;
                 }
             }
             TurnState::PublishingTerminal {
                 finish,
                 visible_output,
             } => {
-                self.publish_terminal(finish, visible_output).await;
+                boxed(|| self.publish_terminal(finish, visible_output)).await;
             }
             TurnState::AwaitingInteraction {
                 request_id,
@@ -606,19 +653,21 @@ impl<'a> TurnMachine<'a> {
                 response,
                 step,
             } => {
-                self.resume_awaiting_interaction(
-                    request_id,
-                    source_calls,
-                    slots,
-                    completed,
-                    interaction_index,
-                    request,
-                    response,
-                    step,
-                    checkpoint.active_history_start,
-                    checkpoint.deadline,
-                    checkpoint.visible_output,
-                )
+                boxed(|| {
+                    self.resume_awaiting_interaction(
+                        request_id,
+                        source_calls,
+                        slots,
+                        completed,
+                        interaction_index,
+                        request,
+                        response,
+                        step,
+                        checkpoint.active_history_start,
+                        checkpoint.deadline,
+                        checkpoint.visible_output,
+                    )
+                })
                 .await;
             }
             TurnState::CacheOperationPrepared { .. }
@@ -646,8 +695,7 @@ impl<'a> TurnMachine<'a> {
                         ),
                     },
                 );
-                self.complete(TurnFinish::Failed, checkpoint.visible_output)
-                    .await;
+                boxed(|| self.complete(TurnFinish::Failed, checkpoint.visible_output)).await;
             }
         }
     }
