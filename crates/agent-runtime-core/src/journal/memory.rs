@@ -182,7 +182,9 @@ impl Layer for BTreeSet<JournalObjectId> {
     }
 }
 
-impl Layer for BTreeMap<JournalObjectId, Vec<u8>> {
+/// Object bytes are shared, so merging (or copying a published layer) moves
+/// reference counts rather than encoded payloads.
+impl Layer for BTreeMap<JournalObjectId, Arc<Vec<u8>>> {
     fn entries(&self) -> usize {
         self.len()
     }
@@ -190,7 +192,11 @@ impl Layer for BTreeMap<JournalObjectId, Vec<u8>> {
     fn absorb(&mut self, newer: Arc<Self>) {
         match Arc::try_unwrap(newer) {
             Ok(newer) => self.extend(newer),
-            Err(newer) => self.extend(newer.iter().map(|(id, bytes)| (id.clone(), bytes.clone()))),
+            Err(newer) => self.extend(
+                newer
+                    .iter()
+                    .map(|(id, bytes)| (id.clone(), Arc::clone(bytes))),
+            ),
         }
     }
 }
@@ -224,14 +230,18 @@ struct State {
 /// to the delta instead of to every immutable object retained so far.
 #[derive(Debug, Clone, Default)]
 struct ObjectStore {
-    layers: Vec<Arc<BTreeMap<JournalObjectId, Vec<u8>>>>,
+    layers: Vec<Arc<BTreeMap<JournalObjectId, Arc<Vec<u8>>>>>,
     len: usize,
     bytes: usize,
 }
 
 impl ObjectStore {
     fn get(&self, id: &JournalObjectId) -> Option<&Vec<u8>> {
-        self.layers.iter().rev().find_map(|layer| layer.get(id))
+        self.layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.get(id))
+            .map(Arc::as_ref)
     }
 
     fn begin_layer(&mut self) {
@@ -244,7 +254,7 @@ impl ObjectStore {
         let layer = Arc::get_mut(layer).ok_or_else(conflict)?;
         self.len = self.len.checked_add(1).ok_or_else(conflict)?;
         self.bytes = self.bytes.checked_add(bytes.len()).ok_or_else(conflict)?;
-        layer.insert(id, bytes);
+        layer.insert(id, Arc::new(bytes));
         Ok(())
     }
 
@@ -253,7 +263,12 @@ impl ObjectStore {
         let bytes = objects.values().map(Vec::len).sum();
         let len = objects.len();
         Self {
-            layers: vec![Arc::new(objects)],
+            layers: vec![Arc::new(
+                objects
+                    .into_iter()
+                    .map(|(id, bytes)| (id, Arc::new(bytes)))
+                    .collect(),
+            )],
             len,
             bytes,
         }
