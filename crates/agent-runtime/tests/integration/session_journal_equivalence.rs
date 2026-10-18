@@ -3191,3 +3191,331 @@ async fn review_arrays_growing_past_one_leaf_match_at_every_barrier() {
     .await;
     assert_spine_engaged(&pair, "growth-58");
 }
+
+// Review of U9 task 2.5: import -> resume -> continue, per v3 state.
+
+static IMPORT_ECHO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// `Echo` with an invocation counter, so a replayed tool is observable.
+#[derive(Debug)]
+struct CountingEcho;
+
+#[async_trait]
+impl LegacyTool for CountingEcho {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Returns the exact text argument."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"],
+            "additionalProperties": false
+        })
+    }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default().with_spawn()
+    }
+    async fn invoke_legacy(
+        &self,
+        arguments: Value,
+        _: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        IMPORT_ECHO_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutcome::text(
+            arguments["text"].as_str().unwrap_or_default(),
+        ))
+    }
+}
+
+fn counted_tools(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+        .legacy_approval_authority()
+        .approval(Arc::new(AllowAll))
+        .tool(Arc::new(CountingEcho))
+}
+
+#[derive(Debug)]
+struct AnsweringInteraction;
+
+#[async_trait]
+impl InteractionBroker for AnsweringInteraction {
+    fn readiness(&self) -> InteractionReadiness {
+        InteractionReadiness::Ready
+    }
+
+    async fn interact(&self, request: &InteractionRequest) -> InteractionResponse {
+        let answers = request
+            .questionnaire_payload()
+            .questions()
+            .iter()
+            .map(|question| {
+                agent_runtime::core::interaction::QuestionAnswer::free_form(
+                    question.id().clone(),
+                    "imported answer",
+                )
+            })
+            .collect();
+        InteractionResponse::answered(request.id().clone(), answers)
+    }
+
+    fn close(&self, _: &agent_runtime::core::ids::InteractionRequestId, _: InteractionOutcomeKind) {
+    }
+}
+
+fn answering_interaction_tools(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+        .legacy_approval_authority()
+        .approval(Arc::new(AllowAll))
+        .tool(Arc::new(QuestionnaireTool::new()))
+        .interaction_broker(Arc::new(AnsweringInteraction))
+}
+
+fn continuation_configure(fixture: &ImportFixture) -> Configure {
+    match fixture.label {
+        "awaiting_interaction" => answering_interaction_tools,
+        label if label.starts_with("cache_") => cache_config,
+        _ => counted_tools,
+    }
+}
+
+fn continuation_provider(fixture: &ImportFixture) -> Arc<FakeProvider> {
+    if fixture.label.starts_with("cache_") {
+        cache_provider()
+    } else {
+        provider(vec![
+            reply("after import"),
+            reply("continued"),
+            reply("spare"),
+        ])
+    }
+}
+
+/// What one resume of a v3 pair did: provider/tool calls, the materialized
+/// result and every barrier it published after the resume.
+#[derive(Debug)]
+struct ContinuationRun {
+    requests: Vec<agent_runtime::core::provider::ProviderRequest>,
+    tool_calls: usize,
+    interrupted: bool,
+    snapshot: SessionSnapshot,
+    checkpoints: Vec<TurnCheckpoint>,
+    snapshots: Vec<SessionSnapshot>,
+}
+
+async fn resume_then_continue(runtime: Runtime, id: SessionId) -> (SessionSnapshot, bool) {
+    let session = runtime
+        .start_session(StartSession::resume(id))
+        .await
+        .unwrap();
+    let interrupted = session.interrupted_on_resume().is_some();
+    session
+        .run(UserInput::text("continue after import"))
+        .await
+        .unwrap();
+    let snapshot = session.snapshot();
+    session.shutdown().await.unwrap();
+    (snapshot, interrupted)
+}
+
+async fn legacy_continuation(fixture: ImportFixture) -> ContinuationRun {
+    let pair = Pair::new(identity);
+    pair.legacy_sessions
+        .current
+        .lock()
+        .unwrap()
+        .push(fixture.snapshot.clone());
+    pair.legacy_checkpoints
+        .current
+        .lock()
+        .unwrap()
+        .push(fixture.checkpoint.clone());
+    let provider = continuation_provider(&fixture);
+    let before = IMPORT_ECHO_CALLS.load(Ordering::SeqCst);
+    let (snapshot, interrupted) = resume_then_continue(
+        pair.legacy_runtime(provider.clone(), continuation_configure(&fixture)),
+        fixture.snapshot.id.clone(),
+    )
+    .await;
+    ContinuationRun {
+        requests: provider.requests(),
+        tool_calls: IMPORT_ECHO_CALLS.load(Ordering::SeqCst) - before,
+        interrupted,
+        snapshot,
+        checkpoints: pair.legacy_checkpoints.log.lock().unwrap().clone(),
+        snapshots: pair.legacy_sessions.log.lock().unwrap().clone(),
+    }
+}
+
+async fn import_continuation(fixture: ImportFixture) -> ContinuationRun {
+    let stores = ImportStores::new(
+        Some(fixture.snapshot.clone()),
+        Some(fixture.checkpoint.clone()),
+        identity,
+    );
+    let provider = continuation_provider(&fixture);
+    let before = IMPORT_ECHO_CALLS.load(Ordering::SeqCst);
+    let (snapshot, interrupted) = resume_then_continue(
+        build(
+            provider.clone(),
+            stores.clone(),
+            stores.clone(),
+            continuation_configure(&fixture),
+        ),
+        fixture.snapshot.id.clone(),
+    )
+    .await;
+    assert_eq!(
+        stores.legacy_saves.load(Ordering::SeqCst),
+        0,
+        "{}: an imported session saved to the v3 stores",
+        fixture.label
+    );
+    let mut checkpoints = stores
+        .protected
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|value| match value {
+            Materialized::Checkpoint(checkpoint) => (**checkpoint).clone(),
+            Materialized::Snapshot(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let mut snapshots = stores
+        .ordinary
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|value| match value {
+            Materialized::Snapshot(snapshot) => (**snapshot).clone(),
+            Materialized::Checkpoint(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    // The first publication in each domain is the import itself.
+    assert_same(
+        &checkpoints.remove(0),
+        &fixture.checkpoint,
+        &format!("{}: protected import", fixture.label),
+    );
+    assert_same(
+        &snapshots.remove(0),
+        &fixture.snapshot,
+        &format!("{}: ordinary import", fixture.label),
+    );
+    ContinuationRun {
+        requests: provider.requests(),
+        tool_calls: IMPORT_ECHO_CALLS.load(Ordering::SeqCst) - before,
+        interrupted,
+        snapshot,
+        checkpoints,
+        snapshots,
+    }
+}
+
+/// Review of U9 task 2.5: the continuation after an import must make exactly
+/// the provider and tool calls that legacy resume of the same v3 pair makes,
+/// for every captured state, and publish the same barriers afterwards.
+///
+/// Each case runs as a spawned task on a worker with 1.5 MiB of stack: a
+/// default 2 MiB Tokio worker minus 512 KiB left for the host. Before
+/// `TurnMachine::resume` stopped inlining one stack slot per awaited state
+/// future, a debug build needed ~1.8 MiB (legacy) and ~2 MiB (native) to
+/// resume at ModelResponseReady.
+#[test]
+fn v3_import_continuation_matches_legacy_resume_for_every_state() {
+    let fixtures = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(legacy_import_fixtures()));
+    assert_eq!(fixtures.len(), 12);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(1536 << 10)
+        .enable_all()
+        .build()
+        .unwrap();
+    for fixture in fixtures {
+        let label = fixture.label;
+        let legacy = runtime
+            .block_on(runtime.spawn(legacy_continuation(fixture.clone())))
+            .unwrap();
+        let native = runtime
+            .block_on(runtime.spawn(import_continuation(fixture)))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&native.requests).unwrap(),
+            serde_json::to_value(&legacy.requests).unwrap(),
+            "{label}: provider requests"
+        );
+        assert_eq!(native.tool_calls, legacy.tool_calls, "{label}: tool calls");
+        assert_eq!(
+            native.interrupted, legacy.interrupted,
+            "{label}: interrupted"
+        );
+        assert_same(
+            &native.snapshot,
+            &legacy.snapshot,
+            &format!("{label}: snapshot"),
+        );
+        assert_eq!(
+            native.checkpoints.iter().map(state_tag).collect::<Vec<_>>(),
+            legacy.checkpoints.iter().map(state_tag).collect::<Vec<_>>(),
+            "{label}: protected barrier sequence"
+        );
+        for (index, (native, legacy)) in native
+            .checkpoints
+            .iter()
+            .zip(&legacy.checkpoints)
+            .enumerate()
+        {
+            assert_same(
+                native,
+                legacy,
+                &format!("{label}: protected barrier {index}"),
+            );
+        }
+        assert_eq!(
+            native.snapshots.len(),
+            legacy.snapshots.len(),
+            "{label}: ordinary barrier count"
+        );
+        for (index, (native, legacy)) in native.snapshots.iter().zip(&legacy.snapshots).enumerate()
+        {
+            assert_same(
+                native,
+                legacy,
+                &format!("{label}: ordinary barrier {index}"),
+            );
+        }
+        // Indeterminate work is never replayed; committed results are reused.
+        match label {
+            "executing_tools" | "tool_outcome_ready" | "local_action_executing" => {
+                assert_eq!(native.tool_calls, 0, "{label}: tool replayed");
+            }
+            "model_response_ready" | "awaiting_approval" => {
+                assert_eq!(native.tool_calls, 1, "{label}: tool not executed once");
+            }
+            _ => {}
+        }
+        if matches!(
+            label,
+            "calling_model" | "local_action_executing" | "cache_started" | "idle"
+        ) {
+            // Only the follow-up turn reaches the provider.
+            assert_eq!(native.requests.len(), 1, "{label}: provider replayed");
+        }
+        println!(
+            "IMPORT CONTINUATION {label}: requests={} tools={} interrupted={} checkpoints={:?}",
+            native.requests.len(),
+            native.tool_calls,
+            native.interrupted,
+            native.checkpoints.iter().map(state_tag).collect::<Vec<_>>()
+        );
+    }
+}
