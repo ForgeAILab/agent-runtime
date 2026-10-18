@@ -24,10 +24,10 @@ use agent_runtime::core::content::{
 use agent_runtime::core::error::RuntimeError;
 use agent_runtime::core::ids::SessionId;
 use agent_runtime::core::journal::{
-    InMemorySessionJournal, JournalCommit, JournalGcReport, JournalGcRequest, JournalHead,
-    JournalLease, JournalObjectId, JournalOpen, JournalOpenIntent, JournalOperationId,
-    JournalPinId, JournalReadLimits, JournalReader, JournalRetirement, JournalRevision,
-    JournalRole, JournalRootSelection, JournalStorageId, SessionJournal,
+    InMemorySessionJournal, JournalCommit, JournalCommitFailurePoint, JournalGcReport,
+    JournalGcRequest, JournalHead, JournalLease, JournalObjectId, JournalOpen, JournalOpenIntent,
+    JournalOperationId, JournalPinId, JournalReadLimits, JournalReader, JournalRetirement,
+    JournalRevision, JournalRole, JournalRootSelection, JournalStorageId, SessionJournal,
 };
 use agent_runtime::core::provider::{
     Capabilities, FinishReason, ModelId, ProviderError, ProviderErrorKind, ProviderStreamEvent,
@@ -44,7 +44,7 @@ use agent_runtime::runtime::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-type Projection = fn(SessionSnapshot) -> Result<SessionSnapshot, RuntimeError>;
+pub(crate) type Projection = fn(SessionSnapshot) -> Result<SessionSnapshot, RuntimeError>;
 type Drive = fn(Runtime, SessionId) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>>;
 type Configure = fn(RuntimeBuilder) -> RuntimeBuilder;
 
@@ -55,7 +55,7 @@ const LIMITS: JournalReadLimits = JournalReadLimits {
 };
 
 #[derive(Debug)]
-struct FixedClock;
+pub(crate) struct FixedClock;
 
 impl Clock for FixedClock {
     fn now(&self) -> Timestamp {
@@ -63,7 +63,7 @@ impl Clock for FixedClock {
     }
 }
 
-fn identity(snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
+pub(crate) fn identity(snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
     Ok(snapshot)
 }
 
@@ -84,7 +84,7 @@ fn redact(mut snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError
 }
 
 #[derive(Debug)]
-struct LegacySessions {
+pub(crate) struct LegacySessions {
     projection: Projection,
     current: Mutex<Vec<SessionSnapshot>>,
     log: Mutex<Vec<SessionSnapshot>>,
@@ -113,9 +113,9 @@ impl SessionStore for LegacySessions {
 }
 
 #[derive(Debug, Default)]
-struct LegacyCheckpoints {
+pub(crate) struct LegacyCheckpoints {
     current: Mutex<Vec<TurnCheckpoint>>,
-    log: Mutex<Vec<TurnCheckpoint>>,
+    pub(crate) log: Mutex<Vec<TurnCheckpoint>>,
 }
 
 #[async_trait]
@@ -144,14 +144,14 @@ impl CheckpointStore for LegacyCheckpoints {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Materialized {
+pub(crate) enum Materialized {
     Snapshot(SessionSnapshot),
     Checkpoint(TurnCheckpoint),
 }
 
 /// Reads back every published head exactly as a fresh reader would.
 #[derive(Debug)]
-struct Materializing {
+pub(crate) struct Materializing {
     inner: Arc<InMemorySessionJournal>,
     role: JournalRole,
     log: Mutex<Vec<Materialized>>,
@@ -253,7 +253,7 @@ impl SessionJournal for Materializing {
 }
 
 #[derive(Debug)]
-struct NativeStores {
+pub(crate) struct NativeStores {
     ordinary: Arc<Materializing>,
     protected: Arc<Materializing>,
     legacy_saves: AtomicUsize,
@@ -287,14 +287,14 @@ impl CheckpointStore for NativeStores {
     }
 }
 
-struct Pair {
-    legacy_sessions: Arc<LegacySessions>,
-    legacy_checkpoints: Arc<LegacyCheckpoints>,
-    native: Arc<NativeStores>,
+pub(crate) struct Pair {
+    pub(crate) legacy_sessions: Arc<LegacySessions>,
+    pub(crate) legacy_checkpoints: Arc<LegacyCheckpoints>,
+    pub(crate) native: Arc<NativeStores>,
 }
 
 impl Pair {
-    fn new(projection: Projection) -> Self {
+    pub(crate) fn new(projection: Projection) -> Self {
         let tag = uuid::Uuid::new_v4();
         Self {
             legacy_sessions: Arc::new(LegacySessions {
@@ -341,13 +341,13 @@ impl Pair {
     }
 
     /// Simulates host lease expiry after a process crash.
-    fn crash(&self, session: &SessionId) {
+    pub(crate) fn crash(&self, session: &SessionId) {
         self.native.ordinary.revoke(session);
         self.native.protected.revoke(session);
     }
 
     #[track_caller]
-    fn assert_barriers_match(&self, label: &str) {
+    pub(crate) fn assert_barriers_match(&self, label: &str) {
         let legacy_snapshots = self.legacy_sessions.log.lock().unwrap().clone();
         let native_snapshots = self
             .native
@@ -417,7 +417,7 @@ impl Pair {
 
 /// Equality with a readable first-difference path instead of two dumps.
 #[track_caller]
-fn assert_same<T: serde::Serialize + PartialEq>(native: &T, legacy: &T, label: &str) {
+pub(crate) fn assert_same<T: serde::Serialize + PartialEq>(native: &T, legacy: &T, label: &str) {
     if native == legacy {
         return;
     }
@@ -1121,4 +1121,622 @@ async fn review_dropped_handles_release_native_writer_fences() {
         resumed.shutdown().await.unwrap();
     }
     pair.assert_barriers_match("dropped-handle");
+}
+
+/// An acknowledgement lost after the atomic commit landed is resolved by the
+/// operation index: the runtime reuses the original head instead of failing
+/// or advancing twice, so every barrier still equals the legacy sequence.
+#[tokio::test]
+async fn review_lost_commit_acknowledgements_resolve_to_the_original_head() {
+    let pair = Pair::new(identity);
+    let id = SessionId::new("review-ambiguous-ack");
+    for native in [false, true] {
+        let runtime = if native {
+            pair.native_runtime(text_turns(), plain)
+        } else {
+            pair.legacy_runtime(text_turns(), plain)
+        };
+        let session = runtime
+            .start_session(StartSession::create(id.clone(), Vec::new()))
+            .await
+            .unwrap();
+        if native {
+            pair.native
+                .protected
+                .inner
+                .fail_next_commit_at(JournalCommitFailurePoint::AfterCommit)
+                .unwrap();
+            pair.native
+                .ordinary
+                .inner
+                .fail_next_commit_at(JournalCommitFailurePoint::AfterCommit)
+                .unwrap();
+        }
+        session
+            .run(UserInput::text("first secret input"))
+            .await
+            .unwrap();
+        session.shutdown().await.unwrap();
+    }
+    pair.assert_barriers_match("ambiguous-ack");
+    let history = pair
+        .legacy_sessions
+        .log
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .history
+        .len();
+    assert_eq!(history, 2, "the turn completed on both paths");
+}
+
+#[derive(Debug)]
+struct RevokingTool {
+    journals: Vec<Arc<Materializing>>,
+    session: SessionId,
+    calls: AtomicUsize,
+    published_at_revocation: AtomicUsize,
+}
+
+#[async_trait]
+impl LegacyTool for RevokingTool {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Loses the writer fence while executing."
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default().with_spawn()
+    }
+    async fn invoke_legacy(
+        &self,
+        _: Value,
+        _: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let published = self
+            .journals
+            .iter()
+            .map(|journal| journal.commits.load(Ordering::SeqCst))
+            .sum();
+        self.published_at_revocation
+            .store(published, Ordering::SeqCst);
+        for journal in &self.journals {
+            journal.revoke(&self.session);
+        }
+        Ok(ToolOutcome::text("side effect done"))
+    }
+}
+
+/// Losing the writer fence mid-turn fails closed: nothing is published after
+/// the loss, the stale writer cannot persist even at shutdown, and the next
+/// writer resumes the last published exact boundary without replaying the
+/// tool whose execution was in flight.
+#[tokio::test]
+async fn review_lost_writer_fence_mid_turn_fails_closed_without_publication() {
+    let pair = Pair::new(identity);
+    let id = SessionId::new("review-lost-fence");
+    let tool = Arc::new(RevokingTool {
+        journals: vec![pair.native.ordinary.clone(), pair.native.protected.clone()],
+        session: id.clone(),
+        calls: AtomicUsize::new(0),
+        published_at_revocation: AtomicUsize::new(0),
+    });
+    let runtime = {
+        RuntimeBuilder::new(ModelId::new("fake"))
+            .provider(provider(vec![tool_round("x"), reply("never reached")]))
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(32_000, 32_000, 4_096),
+            ))
+            .clock(Arc::new(FixedClock))
+            .legacy_approval_authority()
+            .approval(Arc::new(AllowAll))
+            .tool(tool.clone())
+            .session_store(pair.native.clone())
+            .checkpoint_store(pair.native.clone())
+            .build()
+            .unwrap()
+    };
+    let session = runtime
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    let turn = session.run(UserInput::text("use the tool")).await.unwrap();
+    turn.completed().await;
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    let published = pair.native.ordinary.commits.load(Ordering::SeqCst)
+        + pair.native.protected.commits.load(Ordering::SeqCst);
+    assert_eq!(
+        published,
+        tool.published_at_revocation.load(Ordering::SeqCst),
+        "a fenced-out writer published state"
+    );
+    let last = match pair.native.protected.log.lock().unwrap().last().cloned() {
+        Some(Materialized::Checkpoint(checkpoint)) => checkpoint,
+        other => panic!("unexpected protected log tail {other:?}"),
+    };
+    assert!(
+        matches!(last.state, TurnState::ExecutingTools { .. }),
+        "last published boundary is {}",
+        state_tag(&last)
+    );
+    assert!(
+        session.shutdown().await.is_err(),
+        "a fenced-out writer reported a durable shutdown"
+    );
+    assert_eq!(
+        pair.native.ordinary.commits.load(Ordering::SeqCst)
+            + pair.native.protected.commits.load(Ordering::SeqCst),
+        published
+    );
+    drop(session);
+    drop(runtime);
+
+    let restarted = build(
+        continuation(),
+        pair.native.clone(),
+        pair.native.clone(),
+        tools,
+    );
+    let resumed = restarted
+        .start_session(
+            StartSession::resume(id)
+                .with_checkpoint_recovery(CheckpointRecoveryPolicy::ResumeOrInterrupt),
+        )
+        .await
+        .unwrap();
+    resumed.shutdown().await.unwrap();
+    assert_eq!(
+        tool.calls.load(Ordering::SeqCst),
+        1,
+        "an in-flight tool was replayed"
+    );
+    assert_eq!(pair.native.legacy_saves.load(Ordering::Relaxed), 0);
+}
+
+#[derive(Debug, Clone)]
+struct Submission {
+    state: Option<String>,
+    objects: usize,
+    object_bytes: usize,
+    delta_bytes: usize,
+    envelope_bytes: usize,
+    history_append: usize,
+    bootstrap: bool,
+    /// Changed extension namespaces with their replacement bytes.
+    extensions: Vec<(String, usize)>,
+    usage_append: usize,
+    /// Submitted object bytes of new message/usage bodies.
+    body_bytes: usize,
+    /// Submitted object bytes of changed opaque extension and manifest leaves.
+    opaque_bytes: usize,
+    /// Delta bytes outside extension/manifest replacements.
+    delta_core_bytes: usize,
+}
+
+#[derive(Debug)]
+struct Counting {
+    inner: InMemorySessionJournal,
+    log: Mutex<Vec<Submission>>,
+}
+
+#[async_trait]
+impl SessionJournal for Counting {
+    fn storage_id(&self) -> JournalStorageId {
+        self.inner.storage_id()
+    }
+    async fn open(
+        &self,
+        session: &SessionId,
+        request: JournalOpen,
+    ) -> Result<JournalLease, RuntimeError> {
+        self.inner.open(session, request).await
+    }
+    async fn read(
+        &self,
+        lease: &JournalLease,
+        object: &JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.inner.read(lease, object).await
+    }
+    async fn commit(
+        &self,
+        lease: &JournalLease,
+        batch: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        let state = batch.checkpoint.as_ref().map(|checkpoint| {
+            batch
+                .objects
+                .iter()
+                .find(|object| object.id == checkpoint.state)
+                .map(|object| {
+                    object
+                        .decode::<agent_runtime::core::journal::ReferencedTurnState>(
+                            agent_runtime::core::journal::JournalObjectKind::TurnState,
+                        )
+                        .unwrap()
+                        .tag
+                })
+                .unwrap_or_else(|| "unchanged-state".into())
+        });
+        let mut body_bytes = 0;
+        let mut opaque_bytes = 0;
+        for object in &batch.objects {
+            use agent_runtime::core::journal::JournalObjectKind as Kind;
+            match object.kind()? {
+                Kind::Message | Kind::UsageRecord => body_bytes += object.bytes.len(),
+                Kind::Extension | Kind::Manifest => opaque_bytes += object.bytes.len(),
+                _ => {}
+            }
+        }
+        let mut core_delta = batch.delta.clone();
+        core_delta.extension_updates.clear();
+        core_delta.manifests_append.clear();
+        self.log.lock().unwrap().push(Submission {
+            body_bytes,
+            opaque_bytes,
+            delta_core_bytes: serde_json::to_vec(&core_delta).unwrap().len(),
+            state,
+            objects: batch.objects.len(),
+            object_bytes: batch.objects.iter().map(|object| object.bytes.len()).sum(),
+            delta_bytes: serde_json::to_vec(&batch.delta).unwrap().len(),
+            envelope_bytes: serde_json::to_vec(&batch.batch).unwrap().len()
+                + serde_json::to_vec(&batch.checkpoint).unwrap().len(),
+            history_append: batch.delta.history_append.len(),
+            bootstrap: batch.delta.bootstrap.is_some(),
+            extensions: batch
+                .delta
+                .extension_updates
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json::to_vec(value).unwrap().len()))
+                .collect(),
+            usage_append: batch.delta.usage_append.len(),
+        });
+        self.inner.commit(lease, batch).await
+    }
+    async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        self.inner.renew(lease).await
+    }
+    async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+        self.inner.close(lease).await
+    }
+    async fn retire(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        self.inner.retire(session, expected).await
+    }
+    async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        self.inner.collect(request).await
+    }
+}
+
+#[derive(Debug)]
+struct CountingStores {
+    ordinary: Arc<Counting>,
+    protected: Arc<Counting>,
+}
+
+#[async_trait]
+impl SessionStore for CountingStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.ordinary.clone())
+    }
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        panic!("native mode fell back to a materialized save")
+    }
+}
+
+#[async_trait]
+impl CheckpointStore for CountingStores {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.protected.clone())
+    }
+    async fn load_latest(&self, _: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        Ok(None)
+    }
+    async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        panic!("native mode fell back to a materialized save")
+    }
+}
+
+/// Submissions of the second turn at history length `n`: (protected, ordinary,
+/// unchanged ordinary).
+async fn second_turn_submissions(
+    n: usize,
+    system_prompt: bool,
+) -> (Vec<Submission>, Vec<Submission>, Vec<Submission>) {
+    let stores = Arc::new(CountingStores {
+        ordinary: Arc::new(Counting {
+            inner: InMemorySessionJournal::ordinary(
+                JournalStorageId::new(format!("count-ordinary-{n}")),
+                Arc::new(identity as Projection),
+            ),
+            log: Mutex::new(Vec::new()),
+        }),
+        protected: Arc::new(Counting {
+            inner: InMemorySessionJournal::protected(JournalStorageId::new(format!(
+                "count-protected-{n}"
+            ))),
+            log: Mutex::new(Vec::new()),
+        }),
+    });
+    let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider(vec![reply("bootstrap"), reply("delta reply")]))
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(4_000_000, 4_000_000, 4_096),
+        ))
+        .clock(Arc::new(FixedClock))
+        .session_store(stores.clone())
+        .checkpoint_store(stores.clone());
+    if system_prompt {
+        builder = builder.system_prompt("a stable system prompt shifts request order");
+    }
+    let runtime = builder.build().unwrap();
+    let seed = (0..n)
+        .map(|index| {
+            agent_runtime::core::content::Message::user(format!("seed message number {index}"))
+        })
+        .collect();
+    let session = runtime
+        .start_session(StartSession::create(
+            SessionId::new(format!("count-{n}")),
+            seed,
+        ))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("bootstrap turn"))
+        .await
+        .unwrap();
+    stores.ordinary.log.lock().unwrap().clear();
+    stores.protected.log.lock().unwrap().clear();
+    session
+        .run(UserInput::text("one more message"))
+        .await
+        .unwrap();
+    let protected = std::mem::take(&mut *stores.protected.log.lock().unwrap());
+    let ordinary = std::mem::take(&mut *stores.ordinary.log.lock().unwrap());
+    session.persist().await.unwrap();
+    session.persist().await.unwrap();
+    let unchanged = std::mem::take(&mut *stores.ordinary.log.lock().unwrap());
+    session.shutdown().await.unwrap();
+    (protected, ordinary, unchanged)
+}
+
+/// Independent measurement of the 2.3 claims at N = 100, 1000 and 10000:
+/// the same one-message turn submits the same body objects and delta bytes
+/// whatever the unchanged prefix length; reference/envelope bytes grow only
+/// with decimal count metadata; an unchanged boundary submits nothing.
+#[tokio::test]
+async fn review_one_message_turn_submissions_do_not_grow_with_history() {
+    for system_prompt in [false, true] {
+        let mut rows = Vec::new();
+        // At N=10000 both legacy and native end this turn identically with a
+        // Failed terminal before provider I/O, consistent with the 4096-entry
+        // cache-identity history bound, so the largest measured N stays below.
+        let sizes: &[usize] = if system_prompt {
+            &[100, 1_000]
+        } else {
+            &[100, 1_000, 4_000]
+        };
+        for &n in sizes {
+            let (protected, ordinary, unchanged) = second_turn_submissions(n, system_prompt).await;
+            for (index, submission) in unchanged.iter().enumerate() {
+                assert_eq!(
+                    (
+                        submission.objects,
+                        submission.object_bytes,
+                        submission.history_append
+                    ),
+                    (0, 0, 0),
+                    "unchanged ordinary boundary {index} at N={n} resubmitted content"
+                );
+            }
+            assert!(protected.iter().chain(&ordinary).all(|s| !s.bootstrap));
+            rows.push((n, protected, ordinary, unchanged));
+        }
+        for (n, protected, ordinary, unchanged) in &rows {
+            for submission in protected.iter().chain(ordinary).chain(unchanged) {
+                eprintln!(
+                    "system_prompt={system_prompt} N={n:>5} {:<22} objects={:>3} object_bytes={:>6} body_bytes={:>4} opaque_bytes={:>6} delta_bytes={:>6} delta_core_bytes={:>4} envelope_bytes={:>5} history_append={} usage_append={} extensions={:?}",
+                    submission.state.as_deref().unwrap_or("ordinary"),
+                    submission.objects,
+                    submission.object_bytes,
+                    submission.body_bytes,
+                    submission.opaque_bytes,
+                    submission.delta_bytes,
+                    submission.delta_core_bytes,
+                    submission.envelope_bytes,
+                    submission.history_append,
+                    submission.usage_append,
+                    submission.extensions,
+                );
+            }
+        }
+        let (_, base_protected, base_ordinary, _) = &rows[0];
+        for (n, protected, ordinary, _) in &rows[1..] {
+            assert_eq!(protected.len(), base_protected.len(), "N={n}");
+            assert_eq!(ordinary.len(), base_ordinary.len(), "N={n}");
+            for (base, at) in base_protected
+                .iter()
+                .zip(protected)
+                .chain(base_ordinary.iter().zip(ordinary))
+            {
+                assert_eq!(base.state, at.state, "N={n}");
+                assert_eq!(
+                    base.objects, at.objects,
+                    "object count grew at N={n}: {at:?}"
+                );
+                assert_eq!(base.history_append, at.history_append, "N={n}");
+                assert_eq!(base.usage_append, at.usage_append, "N={n}");
+                assert_eq!(
+                    base.body_bytes, at.body_bytes,
+                    "new body bytes depend on the unchanged prefix at N={n}"
+                );
+                // Only decimal counts/sequence numbers inside reference and
+                // envelope objects may grow: bounded by a few bytes per field.
+                assert!(
+                    at.object_bytes - at.opaque_bytes
+                        <= base.object_bytes - base.opaque_bytes + 1_024,
+                    "reference bytes grew with history at N={n}: {base:?} -> {at:?}"
+                );
+                assert!(
+                    at.delta_core_bytes <= base.delta_core_bytes + 64,
+                    "delta bytes grew with history at N={n}: {base:?} -> {at:?}"
+                );
+                assert!(
+                    at.envelope_bytes <= base.envelope_bytes + 256,
+                    "envelope bytes grew with history at N={n}: {base:?} -> {at:?}"
+                );
+                // Changed opaque leaves keep their full replacement cost. The
+                // runtime-owned previous-cache plan record is one such leaf
+                // and is O(history): see the U9 2.3/2.7 evidence note.
+                let names = |submission: &Submission| {
+                    submission
+                        .extensions
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(names(base), names(at), "N={n}");
+            }
+        }
+    }
+}
+
+fn cache_capabilities() -> Capabilities {
+    use agent_runtime::core::provider::{
+        CacheEvidenceCapabilities, PromptCacheControl, ProviderAttemptPurpose,
+        ProviderCacheBehavior, ProviderCacheContract, SyntheticConformance,
+    };
+    let mut maintenance = std::collections::BTreeSet::new();
+    maintenance.insert(ProviderAttemptPurpose::CacheKeepalive);
+    Capabilities {
+        cache: true,
+        prompt_cache: PromptCacheControl::Implicit,
+        cache_contract: Some(ProviderCacheContract {
+            behavior: ProviderCacheBehavior::ImplicitPrefix,
+            evidence: CacheEvidenceCapabilities {
+                stream: true,
+                ..Default::default()
+            },
+            maintenance,
+            conformance: Some(SyntheticConformance::complete()),
+            ..ProviderCacheContract::default()
+        }),
+        ..Capabilities::basic_streaming()
+    }
+}
+
+fn cache_provider() -> Arc<FakeProvider> {
+    let finish = || {
+        ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+            reason: FinishReason::Stop,
+        }])
+    };
+    Arc::new(FakeProvider::new(
+        "fake",
+        cache_capabilities(),
+        vec![finish(), finish(), finish(), finish()],
+    ))
+}
+
+fn cache_config(builder: RuntimeBuilder) -> RuntimeBuilder {
+    use agent_runtime::context::ProviderCacheCapability;
+    use agent_runtime::core::provider::CacheEndpointIdentity;
+    builder
+        .system_prompt("stable cache prefix")
+        .cache_endpoint_identity(CacheEndpointIdentity::from_opaque(
+            "review-cache-endpoint",
+            RegistryRevision::new("endpoint-1"),
+        ))
+        .cache_capability(ProviderCacheCapability::from_contract(
+            RegistryRevision::new("cache-1"),
+            "fake",
+            cache_capabilities().cache_contract.unwrap(),
+        ))
+}
+
+fn cache_turns(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        use agent_runtime::core::cancel::Cancellation;
+        use agent_runtime::core::clock::Deadline;
+        use agent_runtime::core::ids::CacheOperationId;
+        use agent_runtime::core::provider::{
+            CacheAuthority, CacheOperationBudget, ProviderAttemptPurpose,
+        };
+        let session = runtime
+            .start_session(StartSession::create(id, Vec::new()))
+            .await
+            .unwrap();
+        session.run(UserInput::text("seed")).await.unwrap();
+        session.run(UserInput::text("second")).await.unwrap();
+        let operation = session
+            .cache_operation_from_last_plan(
+                CacheOperationId::new("review-cache-operation"),
+                ProviderAttemptPurpose::CacheKeepalive,
+                CacheAuthority::new("review-cache-authority"),
+                CacheOperationBudget::default(),
+                Cancellation::new(),
+                Deadline::at(Timestamp(10_000)),
+            )
+            .unwrap();
+        let result = session.dispatch_cache_operation(operation).await.unwrap();
+        assert!(format!("{result:?}").len() > 0);
+        let snapshot = session.snapshot();
+        session.shutdown().await.unwrap();
+        vec![snapshot]
+    })
+}
+
+#[tokio::test]
+async fn review_cache_operation_phases_match_at_every_barrier_and_resume() {
+    let pair = equivalent(
+        "cache",
+        identity,
+        Phase {
+            provider: cache_provider,
+            configure: cache_config,
+            drive: cache_turns,
+        },
+        Phase {
+            provider: cache_provider,
+            configure: cache_config,
+            drive: resume_and_continue,
+        },
+    )
+    .await;
+    let states = pair
+        .legacy_checkpoints
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(state_tag)
+        .collect::<Vec<_>>();
+    for required in [
+        "cache_operation_prepared",
+        "cache_operation_started",
+        "cache_operation_result_ready",
+        "cache_operation_terminal",
+    ] {
+        assert!(states.iter().any(|state| state == required), "{states:?}");
+    }
 }

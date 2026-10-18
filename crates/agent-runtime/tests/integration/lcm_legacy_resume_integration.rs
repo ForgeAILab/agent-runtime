@@ -2206,3 +2206,90 @@ async fn audit_idle_checkpoint_failure_rolls_back_pending_memory() {
         "unsaved usage must roll back"
     );
 }
+
+/// Idle compaction with BOTH stores configured crosses the exact idle
+/// checkpoint pass and then the ordinary pass. Native and legacy must publish
+/// the same materialized boundaries, and a fresh runtime must resume the
+/// compacted session without repeating summary work.
+#[tokio::test]
+async fn review_native_two_store_idle_compaction_matches_legacy_barriers() {
+    use crate::session_journal_equivalence::{Pair, identity};
+    let session_id = SessionId::new("review-idle-two-stores");
+    let pair = Pair::new(identity);
+    let mut snapshots = Vec::new();
+    for native in [false, true] {
+        let (sessions, checkpoints): (Arc<dyn SessionStore>, Arc<dyn CheckpointStore>) = if native {
+            (pair.native.clone(), pair.native.clone())
+        } else {
+            (
+                pair.legacy_sessions.clone(),
+                pair.legacy_checkpoints.clone(),
+            )
+        };
+        let lcm_store = Arc::new(LcmFixtureStore::new(LcmTimelineId::new(TIMELINE_ID)));
+        let model = Arc::new(CountingSummaryModel::new());
+        let coordinator = hard_pressure_coordinator(&session_id, lcm_store.clone(), model.clone());
+        let build = |coordinator: Arc<LcmCoordinator>| {
+            RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+                .provider(Arc::new(FakeProvider::text_reply("turn answer")))
+                .model_profile(
+                    agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                        "fake",
+                        agent_runtime::core::provider::ModelId::new("fake"),
+                        agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+                    ),
+                )
+                .clock(Arc::new(crate::session_journal_equivalence::FixedClock))
+                .session_store(sessions.clone())
+                .checkpoint_store(checkpoints.clone())
+                .lcm(coordinator)
+                .build()
+                .expect("runtime builds")
+        };
+        let runtime = build(coordinator.clone());
+        let session = runtime
+            .start_session(StartSession::create(session_id.clone(), idle_history()))
+            .await
+            .unwrap();
+        session
+            .run(UserInput::text("one turn first"))
+            .await
+            .unwrap();
+        let admission = session.try_idle_compaction().await.unwrap();
+        let calls = model.calls();
+        let nodes = lcm_store.node_count();
+        let live = session.snapshot();
+        session.shutdown().await.unwrap();
+        drop(runtime);
+        if native {
+            pair.crash(&session_id);
+        }
+
+        let restarted = build(coordinator);
+        let resumed = restarted
+            .start_session(StartSession::resume(session_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(model.calls(), calls, "resume repeated summary work");
+        assert_eq!(lcm_store.node_count(), nodes);
+        snapshots.push((format!("{admission:?}"), live, resumed.snapshot()));
+        resumed.shutdown().await.unwrap();
+    }
+    pair.assert_barriers_match("idle-two-stores");
+    let native = snapshots.pop().unwrap();
+    let legacy = snapshots.pop().unwrap();
+    assert_eq!(native.0, legacy.0);
+    crate::session_journal_equivalence::assert_same(&native.1, &legacy.1, "idle live");
+    crate::session_journal_equivalence::assert_same(&native.2, &legacy.2, "idle resumed");
+    assert!(
+        pair.legacy_checkpoints
+            .log
+            .lock()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair[0].turn == pair[1].turn
+                && pair[0].state.is_terminal()
+                && pair[1].state_revision > pair[0].state_revision),
+        "the exact idle pass never ran"
+    );
+}
