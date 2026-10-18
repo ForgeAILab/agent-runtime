@@ -156,8 +156,16 @@ type ProjectedSnapshot = (
 /// against a cloned state and swapped at one visibility point, which makes
 /// objects, batch, pins, head/checkpoint and the idempotency index atomic. The
 /// store records roots and traces their closures; it has no writer-maintained
-/// reference counts. Collection and retirement intentionally return typed
-/// unsupported capability errors and retain every object until group C.
+/// reference counts. A candidate head is materialized through
+/// [`JournalReader`] before that visibility point, so nothing the reader would
+/// reject is ever published. Collection and retirement intentionally return
+/// typed unsupported capability errors and retain every object until group C.
+///
+/// The lock is synchronous and never held across an `.await`; it is held while
+/// an ordinary projection policy runs, so a policy must not call back into the
+/// same journal. Leases never expire on their own: a writer lease dropped
+/// without [`SessionJournal::close`] keeps the session's writer slot until the
+/// host calls [`Self::revoke_writer`].
 #[derive(Clone)]
 pub struct InMemorySessionJournal {
     backend_id: u64,
