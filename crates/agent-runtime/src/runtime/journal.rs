@@ -133,14 +133,22 @@ impl SessionPersistence {
     /// Read-only existence/recovery probe used before a live session acquires
     /// its writer fence (notably fork repair). A visible native head is always
     /// authoritative over a stale materialized record.
+    ///
+    /// `counterpart` is the other configured policy store's journal. An
+    /// imported session keeps its v3 records, so when this store no longer
+    /// exposes its capability a native head on the counterpart proves those
+    /// records are stale: that is an incompatible store, exactly as at open,
+    /// never a reason to return the v3 value.
     pub(crate) async fn load_snapshot_view(
         store: &Arc<dyn SessionStore>,
+        counterpart: Option<Arc<dyn SessionJournal>>,
         session: &SessionId,
     ) -> Result<Option<SessionSnapshot>, RuntimeError> {
-        let legacy = store.load(session).await?;
         let Some(journal) = store.journal() else {
-            return Ok(legacy);
+            reject_lost_capability(counterpart, session).await?;
+            return store.load(session).await;
         };
+        let legacy = store.load(session).await?;
         let nonce = uuid::Uuid::new_v4();
         let lease = journal
             .open(
@@ -177,12 +185,14 @@ impl SessionPersistence {
     /// Protected counterpart of [`Self::load_snapshot_view`].
     pub(crate) async fn load_checkpoint_view(
         store: &Arc<dyn CheckpointStore>,
+        counterpart: Option<Arc<dyn SessionJournal>>,
         session: &SessionId,
     ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
-        let legacy = store.load_latest(session).await?;
         let Some(journal) = store.journal() else {
-            return Ok(legacy);
+            reject_lost_capability(counterpart, session).await?;
+            return store.load_latest(session).await;
         };
+        let legacy = store.load_latest(session).await?;
         let nonce = uuid::Uuid::new_v4();
         let lease = journal
             .open(
@@ -692,6 +702,21 @@ async fn reopen_after_import(
     };
     *ordinary = reopened_ordinary;
     *protected = reopened_protected;
+    Ok(())
+}
+
+/// A read-only view of a store without a journal capability may use its
+/// materialized record only while the configured counterpart has no native
+/// head for the session (a mixed pair before any native head exists).
+async fn reject_lost_capability(
+    counterpart: Option<Arc<dyn SessionJournal>>,
+    session: &SessionId,
+) -> Result<(), RuntimeError> {
+    if let Some(counterpart) = counterpart {
+        if inspect_head(counterpart.as_ref(), session).await?.is_some() {
+            return Err(incompatible_store());
+        }
+    }
     Ok(())
 }
 
@@ -2654,5 +2679,106 @@ mod tests {
                 .contains_key(RUNTIME_PREVIOUS_CACHE_NAMESPACE),
             "a -0.0 cache record was not referenced"
         );
+    }
+    /// An imported session keeps its v3 records. When one store of the pair
+    /// stops exposing its journal, the read-only views used by fork, child
+    /// recovery and child rebind must fail like open does once the other
+    /// store has a native head, instead of returning the stale v3 value.
+    #[tokio::test]
+    async fn read_only_views_reject_lost_capability_instead_of_stale_v3() {
+        use agent_runtime_core::journal::{
+            IdentityJournalProjection, InMemorySessionJournal, JournalStorageId,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct StaleV3 {
+            loads: AtomicUsize,
+            snapshot: Option<SessionSnapshot>,
+        }
+
+        #[async_trait::async_trait]
+        impl SessionStore for StaleV3 {
+            async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                Ok(self.snapshot.clone())
+            }
+            async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+                panic!("a read-only view saved")
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl CheckpointStore for StaleV3 {
+            async fn load_latest(
+                &self,
+                _: &SessionId,
+            ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            async fn save(&self, _: &TurnCheckpoint) -> Result<(), RuntimeError> {
+                panic!("a read-only view saved")
+            }
+        }
+
+        let session = SessionId::new("delta");
+        let native: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::ordinary(
+            JournalStorageId::new("view-native"),
+            Arc::new(IdentityJournalProjection),
+        ));
+        let empty: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::ordinary(
+            JournalStorageId::new("view-empty"),
+            Arc::new(IdentityJournalProjection),
+        ));
+        let mut domain = open_domain(native.clone(), JournalRole::Ordinary, &session)
+            .await
+            .unwrap();
+        commit_domain(
+            &mut domain,
+            &snapshot(vec![Message::user("native")]),
+            None,
+            CommitPurpose::Transition,
+        )
+        .await
+        .unwrap();
+        domain.close().await.unwrap();
+
+        let stale = Arc::new(StaleV3 {
+            loads: AtomicUsize::new(0),
+            snapshot: Some(snapshot(vec![Message::user("stale v3")])),
+        });
+        let sessions: Arc<dyn SessionStore> = stale.clone();
+        let checkpoints: Arc<dyn CheckpointStore> = stale.clone();
+
+        let error =
+            SessionPersistence::load_snapshot_view(&sessions, Some(native.clone()), &session)
+                .await
+                .unwrap_err();
+        assert_eq!(error.message, incompatible_store().message);
+        let error =
+            SessionPersistence::load_checkpoint_view(&checkpoints, Some(native.clone()), &session)
+                .await
+                .unwrap_err();
+        assert_eq!(error.message, incompatible_store().message);
+        assert_eq!(stale.loads.load(Ordering::SeqCst), 0, "stale v3 was read");
+
+        // A mixed pair before any native head, and a fully legacy pair, keep
+        // reading the materialized records.
+        let mixed = SessionPersistence::load_snapshot_view(&sessions, Some(empty), &session)
+            .await
+            .unwrap();
+        assert_eq!(mixed, stale.snapshot);
+        let legacy = SessionPersistence::load_snapshot_view(&sessions, None, &session)
+            .await
+            .unwrap();
+        assert_eq!(legacy, stale.snapshot);
+        assert!(
+            SessionPersistence::load_checkpoint_view(&checkpoints, None, &session)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(stale.loads.load(Ordering::SeqCst), 3);
     }
 }

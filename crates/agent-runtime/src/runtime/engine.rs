@@ -858,7 +858,12 @@ impl Runtime {
 
     pub(crate) async fn session_exists(&self, id: &SessionId) -> Result<bool, RuntimeError> {
         if let Some(store) = &self.shared.session_store {
-            if SessionPersistence::load_snapshot_view(store, id)
+            let counterpart = self
+                .shared
+                .checkpoint_store
+                .as_ref()
+                .and_then(|store| store.journal());
+            if SessionPersistence::load_snapshot_view(store, counterpart, id)
                 .await?
                 .is_some()
             {
@@ -866,7 +871,12 @@ impl Runtime {
             }
         }
         if let Some(store) = &self.shared.checkpoint_store {
-            if SessionPersistence::load_checkpoint_view(store, id)
+            let counterpart = self
+                .shared
+                .session_store
+                .as_ref()
+                .and_then(|store| store.journal());
+            if SessionPersistence::load_checkpoint_view(store, counterpart, id)
                 .await?
                 .is_some()
             {
@@ -913,8 +923,14 @@ impl Runtime {
             .as_ref()
             .expect("checked store")
             .clone();
+        let counterpart = self
+            .shared
+            .session_store
+            .as_ref()
+            .and_then(|store| store.journal());
         let durable_parent =
-            SessionPersistence::load_checkpoint_view(&durable_parent, &request.from).await?;
+            SessionPersistence::load_checkpoint_view(&durable_parent, counterpart, &request.from)
+                .await?;
         if let Some(snapshot) = durable_parent
             .as_ref()
             .map(|checkpoint| &checkpoint.snapshot)
