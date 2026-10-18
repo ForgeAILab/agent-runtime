@@ -704,6 +704,15 @@ fn build(
     checkpoints: Arc<dyn CheckpointStore>,
     configure: Configure,
 ) -> Runtime {
+    build_with(provider, sessions, checkpoints, configure)
+}
+
+fn build_with(
+    provider: Arc<FakeProvider>,
+    sessions: Arc<dyn SessionStore>,
+    checkpoints: Arc<dyn CheckpointStore>,
+    configure: impl FnOnce(RuntimeBuilder) -> RuntimeBuilder,
+) -> Runtime {
     configure(
         RuntimeBuilder::new(ModelId::new("fake"))
             .provider(provider)
@@ -3559,6 +3568,38 @@ fn v3_import_continuation_matches_legacy_resume_for_every_state() {
     }
 }
 
+/// `CountingEcho` with a per-runtime counter for the crash matrix.
+#[derive(Debug)]
+struct MatrixCountingEcho {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LegacyTool for MatrixCountingEcho {
+    fn name(&self) -> &str {
+        "echo"
+    }
+    fn description(&self) -> &str {
+        "Returns the exact text argument."
+    }
+    fn input_schema(&self) -> Value {
+        CountingEcho.input_schema()
+    }
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::default().with_spawn()
+    }
+    async fn invoke_legacy(
+        &self,
+        arguments: Value,
+        _: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutcome::text(
+            arguments["text"].as_str().unwrap_or_default(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CrashMatrixProfile {
     Plain,
@@ -3570,15 +3611,33 @@ enum CrashMatrixProfile {
 }
 
 impl CrashMatrixProfile {
-    fn configure(self) -> Configure {
-        match self {
+    /// Builds one resume runtime. Tool executions are counted per runtime,
+    /// never through a process-global counter, so concurrently running tests
+    /// (other matrix shards, the v3 continuation test) cannot leak calls into
+    /// this runtime's count.
+    fn runtime(
+        self,
+        provider: Arc<FakeProvider>,
+        sessions: Arc<dyn SessionStore>,
+        checkpoints: Arc<dyn CheckpointStore>,
+        tool_calls: Arc<AtomicUsize>,
+    ) -> Runtime {
+        let configure: Configure = match self {
             Self::Plain => plain,
-            Self::Tools => counted_tools,
+            Self::Tools => {
+                return build_with(provider, sessions, checkpoints, move |builder| {
+                    builder
+                        .legacy_approval_authority()
+                        .approval(Arc::new(AllowAll))
+                        .tool(Arc::new(MatrixCountingEcho { calls: tool_calls }))
+                });
+            }
             Self::Interaction => answering_interaction_tools,
             Self::Cache => cache_config,
             #[cfg(feature = "external-agent")]
             Self::External => crate::external_agent::task_2_6_external_recovery_config,
-        }
+        };
+        build(provider, sessions, checkpoints, configure)
     }
 
     fn provider(self) -> Arc<FakeProvider> {
@@ -4411,8 +4470,8 @@ async fn observe_crash_matrix_resume(
     runtime: Runtime,
     provider: Arc<FakeProvider>,
     session: SessionId,
+    tool_calls: Arc<AtomicUsize>,
 ) -> CrashMatrixResume {
-    let before = IMPORT_ECHO_CALLS.load(Ordering::SeqCst);
     let outcome = match runtime.start_session(StartSession::resume(session)).await {
         Ok(handle) => {
             let interrupted = handle.interrupted_on_resume().is_some();
@@ -4437,7 +4496,7 @@ async fn observe_crash_matrix_resume(
     CrashMatrixResume {
         outcome,
         requests: provider.requests(),
-        tool_calls: IMPORT_ECHO_CALLS.load(Ordering::SeqCst) - before,
+        tool_calls: tool_calls.load(Ordering::SeqCst),
         checkpoints: Vec::new(),
         snapshots: Vec::new(),
     }
@@ -4569,29 +4628,33 @@ async fn assert_crash_matrix_continuation(
     });
     let legacy_provider = barrier.profile.provider();
     let native_provider = barrier.profile.provider();
+    let legacy_tool_calls = Arc::new(AtomicUsize::new(0));
+    let native_tool_calls = Arc::new(AtomicUsize::new(0));
     let mut legacy = observe_crash_matrix_resume(
-        build(
+        barrier.profile.runtime(
             legacy_provider.clone(),
             legacy_sessions.clone(),
             legacy_checkpoints.clone(),
-            barrier.profile.configure(),
+            legacy_tool_calls.clone(),
         ),
         legacy_provider,
         injection.target_session.clone(),
+        legacy_tool_calls,
     )
     .await;
     legacy.checkpoints = legacy_checkpoints.log.lock().unwrap().clone();
     legacy.snapshots = legacy_sessions.log.lock().unwrap().clone();
 
     let mut native = observe_crash_matrix_resume(
-        build(
+        barrier.profile.runtime(
             native_provider.clone(),
             native_stores.clone(),
             native_stores.clone(),
-            barrier.profile.configure(),
+            native_tool_calls.clone(),
         ),
         native_provider,
         injection.target_session,
+        native_tool_calls,
     )
     .await;
     native.checkpoints = materialized_checkpoint_log(&native_stores.protected);
