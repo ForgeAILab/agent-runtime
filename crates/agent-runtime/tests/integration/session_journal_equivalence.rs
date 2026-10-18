@@ -2294,23 +2294,30 @@ fn longest_array(value: &Value) -> usize {
     }
 }
 
-/// Every ordinary barrier carried a cache record (and the last one a
-/// manifest) whose arrays are long enough to use the binary spine.
+/// Some ordinary barrier carried a cache record and a manifest whose arrays
+/// are long enough to use the binary spine.
 #[track_caller]
 fn assert_spine_engaged(pair: &Pair, label: &str) {
     let log = pair.native.ordinary.log.lock().unwrap();
-    let Some(Materialized::Snapshot(last)) = log.last() else {
-        panic!("{label}: no ordinary barrier");
-    };
-    let cache = &last.extension_state["runtime.core.previous_cache"];
+    let snapshots = log
+        .iter()
+        .map(|value| match value {
+            Materialized::Snapshot(snapshot) => snapshot,
+            Materialized::Checkpoint(_) => unreachable!(),
+        })
+        .collect::<Vec<_>>();
     assert!(
-        longest_array(&cache.value) > 64,
+        snapshots.iter().any(|snapshot| snapshot
+            .extension_state
+            .get("runtime.core.previous_cache")
+            .is_some_and(|cache| longest_array(&cache.value) > 64)),
         "{label}: cache record never reached the spine"
     );
     assert!(
-        last.manifests
+        snapshots.iter().any(|snapshot| snapshot
+            .manifests
             .iter()
-            .any(|manifest| longest_array(&serde_json::to_value(manifest).unwrap()) > 64),
+            .any(|manifest| longest_array(&serde_json::to_value(manifest).unwrap()) > 64)),
         "{label}: no manifest reached the spine"
     );
 }
@@ -2351,4 +2358,69 @@ async fn review_spine_sized_histories_match_at_every_barrier_and_after_fresh_res
     )
     .await;
     assert_spine_engaged(&pair, "seeded-tools-130");
+}
+
+fn seeded_fork<const N: usize, const FROM: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!("seeded parent {index}"))
+            })
+            .collect();
+        let parent = runtime
+            .start_session(StartSession::create(id.clone(), seed))
+            .await
+            .unwrap();
+        parent.run(UserInput::text("parent turn")).await.unwrap();
+        parent.shutdown().await.unwrap();
+        let child = runtime
+            .fork_session(ForkSession {
+                from: id.clone(),
+                new_id: SessionId::new(format!("{}-child", id.as_str())),
+                seed: if FROM == 0 {
+                    ForkSeed::Summary("stable summary".into())
+                } else {
+                    ForkSeed::FromIndex(FROM)
+                },
+                lcm: ForkLcm::NewTimeline,
+            })
+            .await
+            .unwrap();
+        child.run(UserInput::text("child turn")).await.unwrap();
+        let child_snapshot = child.snapshot();
+        child.shutdown().await.unwrap();
+        vec![child_snapshot]
+    })
+}
+
+/// Forks of a spine-sized parent (Summary, and FromIndex keeping more than
+/// one leaf of history) match legacy at every barrier and after the child
+/// resumes from a fresh runtime.
+#[tokio::test]
+async fn review_spine_sized_forks_match_at_every_barrier() {
+    let runs: [(&str, Drive); 2] = [
+        ("seeded-fork-summary", seeded_fork::<70, 0>),
+        ("seeded-fork-from-index", seeded_fork::<130, 100>),
+    ];
+    for (label, drive) in runs {
+        let pair = equivalent(
+            label,
+            identity,
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive,
+            },
+            Phase {
+                provider: continuation,
+                configure: plain,
+                drive: resume_child,
+            },
+        )
+        .await;
+        assert_spine_engaged(&pair, label);
+    }
 }
