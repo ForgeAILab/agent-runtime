@@ -7,7 +7,7 @@ use agent_runtime_registry::Fingerprint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{JournalDigest, JournalObject, JournalObjectId};
+use super::{JournalDigest, JournalObject, JournalObjectId, conflict};
 use crate::checkpoint::CheckpointWatermark;
 use crate::clock::{Deadline, Timestamp};
 use crate::content::Message;
@@ -21,6 +21,13 @@ pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
 pub const JOURNAL_FANOUT: usize = 64;
 /// Maximum tree height accepted by readers (well above a u64-sized fanout-64 tree).
 pub const JOURNAL_MAX_TREE_HEIGHT: u32 = 32;
+/// Maximum canonical JSON payload stored inline in a persistent JSON parent.
+///
+/// Values at or below 1,024 bytes avoid scalar/key subobjects and 64-hex
+/// reference. Larger values remain independently addressed so their unchanged
+/// subtrees can be shared. The explicit [`JournalJsonItem`] tag, never the
+/// user's JSON shape, selects inline data versus an object reference.
+pub const JOURNAL_INLINE_JSON_MAX_BYTES: usize = 1_024;
 /// Runtime-owned redaction-safe cache predecessor stored structurally in native journals.
 ///
 /// Other extension namespaces retain their opaque whole-value replacement contract.
@@ -185,15 +192,131 @@ pub struct JournalSequence {
     pub height: u32,
 }
 
+/// One persistent JSON child, explicitly distinguished from user JSON data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "storage", rename_all = "snake_case")]
+pub enum JournalJsonItem {
+    /// A compact JSON value stored directly in its containing node.
+    Inline { value: Value },
+    /// A larger persistent JSON value stored as a typed `JsonValue` object.
+    Reference { object: JournalObjectId },
+}
+
+/// Compact Z85 form of a 32-byte object ID inside JSON-only branch nodes.
+/// Public object identities remain canonical 64-hex [`JournalObjectId`] values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JournalCompactObjectId(String);
+
+impl JournalCompactObjectId {
+    /// Encodes one canonical object ID without padding.
+    pub fn from_object(id: &JournalObjectId) -> Self {
+        const ALPHABET: &[u8; 85] =
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+        let mut encoded = Vec::with_capacity(40);
+        for chunk in id.to_bytes().chunks_exact(4) {
+            let mut value = u32::from_be_bytes(chunk.try_into().expect("four-byte chunk"));
+            let mut digits = [0u8; 5];
+            for digit in digits.iter_mut().rev() {
+                *digit = ALPHABET[(value % 85) as usize];
+                value /= 85;
+            }
+            encoded.extend_from_slice(&digits);
+        }
+        Self(String::from_utf8(encoded).expect("Z85 alphabet is ASCII"))
+    }
+
+    /// Restores the canonical object ID and rejects noncanonical Z85.
+    pub fn to_object(&self) -> Result<JournalObjectId, crate::error::RuntimeError> {
+        const ALPHABET: &[u8; 85] =
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+        if self.0.len() != 40 {
+            return Err(conflict());
+        }
+        let mut bytes = [0u8; 32];
+        for (chunk, output) in self
+            .0
+            .as_bytes()
+            .chunks_exact(5)
+            .zip(bytes.chunks_exact_mut(4))
+        {
+            let mut value = 0u64;
+            for byte in chunk {
+                let digit = ALPHABET
+                    .iter()
+                    .position(|candidate| candidate == byte)
+                    .ok_or_else(conflict)? as u64;
+                value = value
+                    .checked_mul(85)
+                    .and_then(|value| value.checked_add(digit))
+                    .ok_or_else(conflict)?;
+            }
+            let value = u32::try_from(value).map_err(|_| conflict())?;
+            output.copy_from_slice(&value.to_be_bytes());
+        }
+        if Self::from_object(&JournalObjectId::from_bytes(bytes)).0 != self.0 {
+            return Err(conflict());
+        }
+        Ok(JournalObjectId::from_bytes(bytes))
+    }
+}
+
 /// Bounded immutable sequence node; append changes only a path to its root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "node", rename_all = "snake_case")]
 pub enum JournalSequenceNode {
     /// Ordered object references, at most [`JOURNAL_FANOUT`].
     Leaf { items: Vec<JournalObjectId> },
+    /// Ordered persistent JSON children, at most [`JOURNAL_FANOUT`].
+    ///
+    /// This variant is valid only below [`JournalJsonValue::Array`]. Generic
+    /// typed sequences reject it instead of interpreting a user's value shape.
+    #[serde(rename = "jl")]
+    JsonLeaf {
+        #[serde(rename = "i")]
+        items: Vec<JournalJsonItem>,
+    },
+    /// Bottom binary branch for arrays wider than one fanout leaf. Its JSON
+    /// children are logical height-zero leaves stored directly in this node.
+    #[serde(rename = "jv")]
+    JsonValueBranch {
+        #[serde(rename = "i")]
+        items: Vec<JournalJsonItem>,
+    },
+    /// Binary persistent-JSON branch with child lengths/heights inferred from
+    /// its parent descriptor. Omitting repeated descriptor fields keeps each
+    /// changed path compact while retaining typed, schema-driven traversal.
+    #[serde(rename = "jb")]
+    JsonBranch {
+        #[serde(rename = "c")]
+        children: Vec<JournalCompactObjectId>,
+    },
     /// Ordered subtree descriptors, at most [`JOURNAL_FANOUT`].
     Branch { children: Vec<JournalSequence> },
 }
+
+/// Persistent JSON array root stored directly in its `JsonValue` parent.
+/// Internal descendants remain content-addressed sequence objects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalJsonArray {
+    /// Total logical JSON item count.
+    pub len: u64,
+    /// Logical root height; zero is an inline root leaf.
+    pub height: u32,
+    /// Typed inline root node. Generic reference leaves/branches are invalid.
+    pub node: JournalSequenceNode,
+}
+
+/// Compact internal persistent-JSON branch. Its dedicated envelope kind makes
+/// references unambiguous without repeating a sequence-node discriminator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JournalJsonBranch(pub Vec<JournalCompactObjectId>);
+
+/// Compact JSON data stored in a dedicated typed object envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JournalJsonInline(pub Value);
 
 /// Persistent lexically ordered extension map descriptor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,7 +368,7 @@ pub enum JournalJsonValue {
     /// Null, boolean, number or string. Containers are rejected by readers.
     Scalar { scalar: Value },
     /// Ordered array entries.
-    Array { items: JournalSequence },
+    Array { items: JournalJsonArray },
     /// Ordered object entries, preserving insertion order when available.
     Object { entries: JournalSequence },
 }
@@ -255,8 +378,8 @@ pub enum JournalJsonValue {
 pub struct JournalJsonObjectEntry {
     /// Exact JSON object key; empty keys remain valid JSON keys.
     pub key: String,
-    /// Persistent JSON value in the same policy domain.
-    pub value: JournalObjectId,
+    /// Compact inline value or a typed persistent JSON reference in this domain.
+    pub value: JournalJsonItem,
 }
 
 /// Runtime-owned extension wrapper whose exact public value materializes unchanged.

@@ -124,6 +124,37 @@ fn bounded(len: usize) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+fn json_branch_children(
+    tree: &JournalSequence,
+    children: Vec<JournalCompactObjectId>,
+) -> Result<Vec<JournalSequence>, RuntimeError> {
+    if tree.height == 0 || children.is_empty() || children.len() > 2 {
+        return Err(conflict());
+    }
+    let child_height = tree.height - 1;
+    let capacity = 1u64.checked_shl(child_height).ok_or_else(conflict)?;
+    if tree.len == 0 || tree.len > capacity.checked_mul(2).ok_or_else(conflict)? {
+        return Err(conflict());
+    }
+    let left_len = tree.len.min(capacity);
+    let right_len = tree.len - left_len;
+    let expected = if right_len == 0 { 1 } else { 2 };
+    if children.len() != expected {
+        return Err(conflict());
+    }
+    children
+        .into_iter()
+        .enumerate()
+        .map(|(index, root)| {
+            Ok(JournalSequence {
+                root: Some(root.to_object()?),
+                len: [left_len, right_len][index],
+                height: child_height,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()
+}
+
 /// Materializes only the head selected by an already pinned lease. No planner,
 /// provider, tool, fallback scan or write is available to this reader. Errors
 /// never expose object IDs or payloads, and missing published objects conflict.
@@ -233,6 +264,9 @@ impl<'a> JournalReader<'a> {
                         return Err(conflict());
                     }
                 }
+                JournalSequenceNode::JsonLeaf { .. } => return Err(conflict()),
+                JournalSequenceNode::JsonValueBranch { .. } => return Err(conflict()),
+                JournalSequenceNode::JsonBranch { .. } => return Err(conflict()),
                 JournalSequenceNode::Branch { children } => {
                     bounded(children.len())?;
                     if tree.height == 0 {
@@ -254,6 +288,81 @@ impl<'a> JournalReader<'a> {
             }
         }
         if items.len() as u64 != sequence.len {
+            return Err(conflict());
+        }
+        Ok(items)
+    }
+
+    async fn json_array(
+        &mut self,
+        array: JournalJsonArray,
+    ) -> Result<Vec<JournalJsonItem>, RuntimeError> {
+        if array.height > JOURNAL_MAX_TREE_HEIGHT || array.len > self.limits.entries {
+            return Err(conflict());
+        }
+        let total = array.len;
+        let mut pending = vec![(
+            JournalSequence {
+                root: None,
+                len: array.len,
+                height: array.height,
+            },
+            Some(array.node),
+        )];
+        let mut items = Vec::new();
+        while let Some((tree, inline)) = pending.pop() {
+            let root_inline = inline.is_some();
+            let node = match inline {
+                Some(node) => node,
+                None => {
+                    validate_sequence(&tree)?;
+                    let root = tree.root.as_ref().ok_or_else(conflict)?;
+                    if tree.height == 1 {
+                        self.object(root, JournalObjectKind::Sequence).await?
+                    } else {
+                        let branch: JournalJsonBranch =
+                            self.object(root, JournalObjectKind::JsonBranch).await?;
+                        JournalSequenceNode::JsonBranch { children: branch.0 }
+                    }
+                }
+            };
+            match node {
+                JournalSequenceNode::JsonLeaf { items: leaves } => {
+                    if (!leaves.is_empty() || !root_inline || tree.len != 0)
+                        && (leaves.is_empty() || leaves.len() > JOURNAL_FANOUT)
+                    {
+                        return Err(conflict());
+                    }
+                    if tree.height != 0 || leaves.len() as u64 != tree.len {
+                        return Err(conflict());
+                    }
+                    items.extend(leaves);
+                    if items.len() as u64 > total {
+                        return Err(conflict());
+                    }
+                }
+                JournalSequenceNode::JsonValueBranch { items: leaves } => {
+                    if leaves.is_empty()
+                        || leaves.len() > 2
+                        || tree.height != 1
+                        || leaves.len() as u64 != tree.len
+                    {
+                        return Err(conflict());
+                    }
+                    items.extend(leaves);
+                    if items.len() as u64 > total {
+                        return Err(conflict());
+                    }
+                }
+                JournalSequenceNode::Leaf { .. } => return Err(conflict()),
+                JournalSequenceNode::JsonBranch { children } => {
+                    let children = json_branch_children(&tree, children)?;
+                    pending.extend(children.into_iter().rev().map(|child| (child, None)));
+                }
+                JournalSequenceNode::Branch { .. } => return Err(conflict()),
+            }
+        }
+        if items.len() as u64 != total {
             return Err(conflict());
         }
         Ok(items)
@@ -350,7 +459,13 @@ impl<'a> JournalReader<'a> {
             if depth > JOURNAL_MAX_TREE_HEIGHT {
                 return Err(conflict());
             }
-            let node: JournalJsonValue = self.object(id, JournalObjectKind::JsonValue).await?;
+            let object = self.encoded_object(id).await?;
+            if object.kind()? == JournalObjectKind::JsonInline {
+                let inline: JournalJsonInline = object.decode(JournalObjectKind::JsonInline)?;
+                validate_inline_json(&inline.0, depth, self.limits.entries)?;
+                return Ok(inline.0);
+            }
+            let node: JournalJsonValue = object.decode(JournalObjectKind::JsonValue)?;
             match node {
                 JournalJsonValue::Scalar { scalar } => {
                     if scalar.is_array() || scalar.is_object() {
@@ -360,8 +475,8 @@ impl<'a> JournalReader<'a> {
                 }
                 JournalJsonValue::Array { items } => {
                     let mut values = Vec::new();
-                    for item in self.sequence(&items).await? {
-                        values.push(self.json_value(&item, depth + 1).await?);
+                    for item in self.json_array(items).await? {
+                        values.push(self.json_item(item, depth + 1).await?);
                     }
                     Ok(Value::Array(values))
                 }
@@ -374,10 +489,26 @@ impl<'a> JournalReader<'a> {
                         if values.contains_key(&entry.key) {
                             return Err(conflict());
                         }
-                        values.insert(entry.key, self.json_value(&entry.value, depth + 1).await?);
+                        values.insert(entry.key, self.json_item(entry.value, depth + 1).await?);
                     }
                     Ok(Value::Object(values))
                 }
+            }
+        })
+    }
+
+    fn json_item<'b>(
+        &'b mut self,
+        item: JournalJsonItem,
+        depth: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, RuntimeError>> + Send + 'b>> {
+        Box::pin(async move {
+            match item {
+                JournalJsonItem::Inline { value } => {
+                    validate_inline_json(&value, depth, self.limits.entries)?;
+                    Ok(value)
+                }
+                JournalJsonItem::Reference { object } => self.json_value(&object, depth).await,
             }
         })
     }
@@ -605,6 +736,24 @@ impl<'a> JournalReader<'a> {
         self.checkpoint_with_snapshot(&head, snapshot)
             .await
             .map(Some)
+    }
+
+    /// Validates a protected head/checkpoint against a snapshot already
+    /// reconstructed and root-checked by the committing backend. This avoids
+    /// decoding an unchanged snapshot closure a second time at every commit.
+    pub(crate) async fn validate_checkpoint_with_snapshot(
+        &mut self,
+        snapshot: SessionSnapshot,
+    ) -> Result<(), RuntimeError> {
+        let head = self.lease.head().cloned().ok_or_else(conflict)?;
+        if snapshot.id != head.session {
+            return Err(conflict());
+        }
+        self.batch(&head).await?;
+        if head.checkpoint.is_some() {
+            self.checkpoint_with_snapshot(&head, snapshot).await?;
+        }
+        Ok(())
     }
 
     async fn checkpoint_with_snapshot(

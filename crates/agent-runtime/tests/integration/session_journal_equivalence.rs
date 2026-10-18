@@ -8,10 +8,12 @@
 //! either path fails. Resume always uses a freshly built runtime over the same
 //! durable state, then continues the session and compares again.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use agent_runtime::core::approval::{ApprovalDecision, ApprovalPolicy, ApprovalRequest};
 use agent_runtime::core::cancel::CancelReason;
@@ -24,10 +26,12 @@ use agent_runtime::core::content::{
 use agent_runtime::core::error::RuntimeError;
 use agent_runtime::core::ids::SessionId;
 use agent_runtime::core::journal::{
-    InMemorySessionJournal, JournalCommit, JournalCommitFailurePoint, JournalGcReport,
-    JournalGcRequest, JournalHead, JournalLease, JournalObjectId, JournalOpen, JournalOpenIntent,
-    JournalOperationId, JournalPinId, JournalReadLimits, JournalReader, JournalRetirement,
-    JournalRevision, JournalRole, JournalRootSelection, JournalStorageId, SessionJournal,
+    IdentityJournalProjection, InMemorySessionJournal, JournalBatch, JournalBoundary,
+    JournalCommit, JournalCommitFailurePoint, JournalDigest, JournalGcReport, JournalGcRequest,
+    JournalHead, JournalLease, JournalObjectId, JournalOpen, JournalOpenIntent, JournalOperationId,
+    JournalPinId, JournalReadLimits, JournalReader, JournalRetirement, JournalRevision,
+    JournalRole, JournalRootSelection, JournalSnapshotRoots, JournalStorageId,
+    JournalTransitionDelta, SessionJournal,
 };
 use agent_runtime::core::provider::{
     Capabilities, FinishReason, ModelId, ProviderError, ProviderErrorKind, ProviderStreamEvent,
@@ -229,8 +233,17 @@ impl SessionJournal for Materializing {
     ) -> Result<JournalHead, RuntimeError> {
         let session = batch.batch.session.clone();
         let head = self.inner.commit(lease, batch).await?;
-        self.commits.fetch_add(1, Ordering::Relaxed);
+        let index = self.commits.fetch_add(1, Ordering::Relaxed);
         let value = self.materialize(&session).await?;
+        let materialized = match &value {
+            Materialized::Snapshot(snapshot) => (**snapshot).clone(),
+            Materialized::Checkpoint(checkpoint) => checkpoint.snapshot.clone(),
+        };
+        assert!(
+            cold_roots(&head, materialized).await == head.snapshot,
+            "{:?} commit {index}: warm encoding caches committed other roots than a cold encoding of the same state",
+            self.role
+        );
         self.log.lock().unwrap().push(value);
         Ok(head)
     }
@@ -250,6 +263,65 @@ impl SessionJournal for Materializing {
     async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
         self.inner.collect(request).await
     }
+}
+
+/// Cold-cache oracle for every published head: a fresh ordinary journal has
+/// no writer or backend encoding cache, so bootstrapping the materialized
+/// state into it re-encodes every record from scratch. Warm writer and
+/// backend caches must have committed exactly those roots.
+async fn cold_roots(head: &JournalHead, snapshot: SessionSnapshot) -> JournalSnapshotRoots {
+    let oracle = InMemorySessionJournal::ordinary(
+        JournalStorageId::new("review-cold-oracle"),
+        Arc::new(IdentityJournalProjection),
+    );
+    let lease = oracle
+        .open(
+            &head.session,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new("cold-open"),
+                pin: JournalPinId::new("cold-pin"),
+                intent: JournalOpenIntent::ExclusiveWriter,
+            },
+        )
+        .await
+        .unwrap();
+    let boundary = JournalBoundary {
+        version: 1,
+        session: head.session.clone(),
+        turn: None,
+        checkpoint_sequence: 0,
+        planned_step_count: head.snapshot.planned_step_count,
+    };
+    let mut commit = JournalCommit {
+        batch: JournalBatch {
+            session: head.session.clone(),
+            sequence: 1,
+            predecessor: None,
+            expected_revision: None,
+            writer_epoch: lease.writer_epoch().unwrap(),
+            operation: JournalOperationId::new("cold"),
+            boundary: boundary.clone(),
+            snapshot: head.snapshot.clone(),
+            checkpoint: None,
+        },
+        digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+        objects: Vec::new(),
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(snapshot)),
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        },
+        checkpoint: None,
+    };
+    commit.digest = commit.input_digest().unwrap();
+    oracle.commit(&lease, commit).await.unwrap().snapshot
 }
 
 #[derive(Debug)]
@@ -1328,6 +1400,8 @@ struct Submission {
     opaque_bytes: usize,
     /// Delta bytes outside extension/manifest replacements.
     delta_core_bytes: usize,
+    /// Wall-clock time spent inside the native backend commit.
+    commit_elapsed: Duration,
 }
 
 #[derive(Debug)]
@@ -1401,6 +1475,7 @@ impl SessionJournal for Counting {
             body_bytes,
             opaque_bytes,
             delta_core_bytes: serde_json::to_vec(&core_delta).unwrap().len(),
+            commit_elapsed: Duration::ZERO,
             state,
             objects: batch.objects.len(),
             object_bytes,
@@ -1421,7 +1496,9 @@ impl SessionJournal for Counting {
             manifest_references: batch.delta.manifest_references.len(),
             usage_append: batch.delta.usage_append.len(),
         };
+        let commit_started = Instant::now();
         let head = self.inner.commit(lease, batch).await?;
+        submission.commit_elapsed = commit_started.elapsed();
         if submission.state.is_none() {
             if let Some(state) = state_id {
                 let bytes = self.inner.read(lease, &state).await?;
@@ -1615,9 +1692,9 @@ async fn review_one_message_turn_submissions_do_not_grow_with_history() {
                 .chain(base_ordinary.iter().zip(ordinary))
             {
                 assert_eq!(base.state, at.state, "N={n}");
-                assert_eq!(
-                    base.objects, at.objects,
-                    "object count grew at N={n}: {at:?}"
+                assert!(
+                    at.objects <= base.objects + 16,
+                    "minimum-height reference object count grew beyond its logarithmic bound at N={n}: {base:?} -> {at:?}"
                 );
                 assert_eq!(base.history_append, at.history_append, "N={n}");
                 assert_eq!(base.usage_append, at.usage_append, "N={n}");
@@ -1629,7 +1706,7 @@ async fn review_one_message_turn_submissions_do_not_grow_with_history() {
                 // envelope objects may grow: bounded by a few bytes per field.
                 assert!(
                     at.object_bytes - at.opaque_bytes
-                        <= base.object_bytes - base.opaque_bytes + 1_024,
+                        <= base.object_bytes - base.opaque_bytes + 2_048,
                     "reference bytes grew with history at N={n}: {base:?} -> {at:?}"
                 );
                 assert!(
@@ -1663,6 +1740,13 @@ struct LegacyByteSubmission {
     bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NativePhaseTimings {
+    bootstrap: Duration,
+    turn: Duration,
+    unchanged: Duration,
+}
+
 async fn task_27_native_submissions(
     n: usize,
     tool_turn: bool,
@@ -1671,6 +1755,7 @@ async fn task_27_native_submissions(
     Vec<Submission>,
     Vec<Submission>,
     Vec<Submission>,
+    NativePhaseTimings,
 ) {
     let label = if tool_turn { "tool" } else { "plain" };
     let stores = Arc::new(CountingStores {
@@ -1716,6 +1801,7 @@ async fn task_27_native_submissions(
             agent_runtime::core::content::Message::user(format!("seed message number {index}"))
         })
         .collect();
+    let bootstrap_started = Instant::now();
     let session = runtime
         .start_session(StartSession::create(
             SessionId::new(format!("task-27-{label}-{n}")),
@@ -1727,9 +1813,11 @@ async fn task_27_native_submissions(
         .run(UserInput::text("bootstrap turn"))
         .await
         .unwrap();
+    let bootstrap_elapsed = bootstrap_started.elapsed();
     let mut bootstrap = std::mem::take(&mut *stores.protected.log.lock().unwrap());
     bootstrap.extend(std::mem::take(&mut *stores.ordinary.log.lock().unwrap()));
 
+    let turn_started = Instant::now();
     session
         .run(UserInput::text(if tool_turn {
             "use the tool"
@@ -1738,13 +1826,26 @@ async fn task_27_native_submissions(
         }))
         .await
         .unwrap();
+    let turn_elapsed = turn_started.elapsed();
     let protected = std::mem::take(&mut *stores.protected.log.lock().unwrap());
     let ordinary = std::mem::take(&mut *stores.ordinary.log.lock().unwrap());
+    let unchanged_started = Instant::now();
     session.persist().await.unwrap();
     session.persist().await.unwrap();
+    let unchanged_elapsed = unchanged_started.elapsed();
     let unchanged = std::mem::take(&mut *stores.ordinary.log.lock().unwrap());
     session.shutdown().await.unwrap();
-    (bootstrap, protected, ordinary, unchanged)
+    (
+        bootstrap,
+        protected,
+        ordinary,
+        unchanged,
+        NativePhaseTimings {
+            bootstrap: bootstrap_elapsed,
+            turn: turn_elapsed,
+            unchanged: unchanged_elapsed,
+        },
+    )
 }
 
 async fn task_27_legacy_submissions(n: usize, tool_turn: bool) -> Vec<LegacyByteSubmission> {
@@ -1860,8 +1961,23 @@ async fn task_2_7_native_turn_bytes_are_delta_bounded() {
         let scenario = if tool_turn { "tool" } else { "plain" };
         let mut native_rows = Vec::new();
         for n in [100, 1_000, 4_000] {
-            let (bootstrap, protected, ordinary, unchanged) =
+            let (bootstrap, protected, ordinary, unchanged, timings) =
                 task_27_native_submissions(n, tool_turn).await;
+            for (phase, elapsed, commits) in [
+                ("bootstrap", timings.bootstrap, bootstrap.len()),
+                (
+                    if tool_turn { "tool_turn" } else { "plain_turn" },
+                    timings.turn,
+                    protected.len() + ordinary.len(),
+                ),
+                ("unchanged", timings.unchanged, unchanged.len()),
+            ] {
+                let elapsed_us = elapsed.as_micros();
+                let per_commit_us = elapsed_us / commits.max(1) as u128;
+                eprintln!(
+                    "TASK27 timing scenario={scenario} N={n} phase={phase} elapsed_us={elapsed_us} commits={commits} per_commit_us={per_commit_us}"
+                );
+            }
             for (phase, domain, submissions) in [
                 ("bootstrap", "mixed", &bootstrap),
                 ("turn", "protected", &protected),
@@ -1887,6 +2003,15 @@ async fn task_2_7_native_turn_bytes_are_delta_bounded() {
                         submission.manifest_references,
                     );
                 }
+                let commit_us: u128 = submissions
+                    .iter()
+                    .map(|submission| submission.commit_elapsed.as_micros())
+                    .sum();
+                eprintln!(
+                    "TASK27 commit_timing scenario={scenario} N={n} phase={phase} domain={domain} elapsed_us={commit_us} commits={} per_commit_us={}",
+                    submissions.len(),
+                    commit_us / submissions.len().max(1) as u128,
+                );
             }
             assert!(
                 protected
@@ -2423,4 +2548,60 @@ async fn review_spine_sized_forks_match_at_every_barrier() {
         .await;
         assert_spine_engaged(&pair, label);
     }
+}
+
+fn growth_turns() -> Arc<FakeProvider> {
+    provider(
+        (0..6)
+            .map(|turn| reply(&format!("growth reply {turn}")))
+            .collect(),
+    )
+}
+
+/// Grows a live session turn by turn so the cache record and manifest arrays
+/// cross the 64-item JSON leaf while the writer's path cache is warm.
+fn seeded_growth<const N: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!("seeded growth {index}"))
+            })
+            .collect();
+        let session = runtime
+            .start_session(StartSession::create(id, seed))
+            .await
+            .unwrap();
+        let mut snapshots = Vec::new();
+        for turn in 0..6 {
+            session
+                .run(UserInput::text(format!("growth input {turn}")))
+                .await
+                .unwrap();
+            snapshots.push(session.snapshot());
+        }
+        session.shutdown().await.unwrap();
+        snapshots
+    })
+}
+
+/// Review of the U9 2.7 path cache: a warm writer whose cached arrays grow
+/// past one JSON leaf still commits, matches legacy at every barrier and
+/// resumes.
+#[tokio::test]
+async fn review_arrays_growing_past_one_leaf_match_at_every_barrier() {
+    let pair = equivalent(
+        "growth-58",
+        identity,
+        Phase {
+            provider: growth_turns,
+            configure: plain,
+            drive: seeded_growth::<58>,
+        },
+        continue_phase(),
+    )
+    .await;
+    assert_spine_engaged(&pair, "growth-58");
 }

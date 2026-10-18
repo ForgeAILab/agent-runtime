@@ -5,7 +5,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{JOURNAL_SCHEMA_VERSION, JournalCommit, conflict};
+use super::{
+    JOURNAL_FANOUT, JOURNAL_INLINE_JSON_MAX_BYTES, JOURNAL_MAX_TREE_HEIGHT, JOURNAL_SCHEMA_VERSION,
+    JournalCommit, conflict,
+};
 use crate::error::RuntimeError;
 
 #[path = "ordering.rs"]
@@ -109,8 +112,14 @@ pub enum JournalObjectKind {
     JsonValue,
     /// One ordered object entry in a persistent JSON value.
     JsonObjectEntry,
+    /// One compact JSON array element.
+    #[serde(rename = "i")]
+    JsonInline,
     /// Bounded persistent sequence node.
     Sequence,
+    /// Compact internal branch for a persistent JSON array.
+    #[serde(rename = "b")]
+    JsonBranch,
     /// Bounded persistent map node.
     Map,
     /// Final planned request with ordered references.
@@ -145,7 +154,9 @@ impl JournalObjectKind {
             Self::ManifestReference => "manifest_reference",
             Self::JsonValue => "json_value",
             Self::JsonObjectEntry => "json_object_entry",
+            Self::JsonInline => "json_inline",
             Self::Sequence => "sequence",
+            Self::JsonBranch => "json_branch",
             Self::Map => "map",
             Self::Request => "request",
             Self::RequestSettings => "request_settings",
@@ -168,6 +179,99 @@ pub fn canonical_journal_json<T: Serialize>(value: &T) -> Result<Vec<u8>, Runtim
     let mut bytes = Vec::new();
     write_value(&value, &mut bytes)?;
     Ok(bytes)
+}
+
+/// Whether a JSON value fits the explicitly tagged inline representation.
+///
+/// The byte threshold bounds envelope amplification, while the fanout/depth
+/// checks keep inline containers inside the same reader limits as referenced
+/// persistent nodes. Callers still account for the value's surrounding depth.
+pub fn journal_json_can_inline(value: &Value) -> Result<bool, RuntimeError> {
+    let mut pending = vec![(value, 0u32)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > JOURNAL_MAX_TREE_HEIGHT {
+            return Ok(false);
+        }
+        match value {
+            Value::Array(values) => {
+                if values.len() > JOURNAL_FANOUT {
+                    return Ok(false);
+                }
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(values) => {
+                if values.len() > JOURNAL_FANOUT {
+                    return Ok(false);
+                }
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    Ok(canonical_journal_json(value)?.len() <= JOURNAL_INLINE_JSON_MAX_BYTES)
+}
+
+/// Whether two JSON values have the same journal encoding.
+///
+/// `serde_json::Value` equality treats `0.0` and `-0.0` as equal (and, with
+/// `preserve_order`, ignores object key order), while their canonical journal
+/// objects differ. Encoding caches must use this exact identity so a cache hit
+/// never commits another value's spelling.
+pub fn journal_json_identical(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            left == right
+                && (!left.is_f64()
+                    || left.as_f64().map(f64::to_bits) == right.as_f64().map(f64::to_bits))
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| journal_json_identical(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|((lk, lv), (rk, rv))| lk == rk && journal_json_identical(lv, rv))
+        }
+        _ => left == right,
+    }
+}
+
+pub(crate) fn validate_inline_json(
+    value: &Value,
+    depth: u32,
+    entries: u64,
+) -> Result<(), RuntimeError> {
+    if !journal_json_can_inline(value)? {
+        return Err(conflict());
+    }
+    let mut pending = vec![(value, depth)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > JOURNAL_MAX_TREE_HEIGHT {
+            return Err(conflict());
+        }
+        match value {
+            Value::Array(values) => {
+                if values.len() as u64 > entries {
+                    return Err(conflict());
+                }
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(values) => {
+                if values.len() as u64 > entries {
+                    return Err(conflict());
+                }
+                pending.extend(values.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn write_value(value: &Value, bytes: &mut Vec<u8>) -> Result<(), RuntimeError> {

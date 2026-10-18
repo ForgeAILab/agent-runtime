@@ -21,7 +21,29 @@ pub(super) struct ObjectOrder {
 fn roots(kind: JournalObjectKind, value: &Value) -> Vec<Vec<PathPart>> {
     use PathPart::{Index, Key};
     match kind {
-        JournalObjectKind::StateValue => vec![Vec::new()],
+        JournalObjectKind::Sequence
+            if matches!(value.get("node").and_then(Value::as_str), Some("jl" | "jv")) =>
+        {
+            value
+                .get("i")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, item)| item.get("storage").and_then(Value::as_str) == Some("inline"))
+                .map(|(index, _)| vec![Key("i".to_owned()), Index(index), Key("value".to_owned())])
+                .collect()
+        }
+        JournalObjectKind::JsonObjectEntry
+            if value
+                .get("value")
+                .and_then(|item| item.get("storage"))
+                .and_then(Value::as_str)
+                == Some("inline") =>
+        {
+            vec![vec![Key("value".to_owned()), Key("value".to_owned())]]
+        }
+        JournalObjectKind::StateValue | JournalObjectKind::JsonInline => vec![Vec::new()],
         JournalObjectKind::Extension => vec![vec![Key("value".to_owned())]],
         JournalObjectKind::RequestSettings => vec![
             vec![Key("vendor_extensions".to_owned())],

@@ -327,6 +327,9 @@ async fn bounded_multilevel_sequences_maps_and_legacy_absent_defaults_materializ
         if let Ok(node) = object.decode::<JournalSequenceNode>(JournalObjectKind::Sequence) {
             let count = match node {
                 JournalSequenceNode::Leaf { items } => items.len(),
+                JournalSequenceNode::JsonLeaf { items } => items.len(),
+                JournalSequenceNode::JsonValueBranch { items } => items.len(),
+                JournalSequenceNode::JsonBranch { children } => children.len(),
                 JournalSequenceNode::Branch { children } => children.len(),
             };
             assert!(count <= 64);

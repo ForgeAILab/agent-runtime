@@ -13,14 +13,16 @@ use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::journal::{
     JOURNAL_FANOUT, JOURNAL_MAX_TREE_HEIGHT, JOURNAL_SCHEMA_VERSION, JournalBatch, JournalBoundary,
-    JournalCommit, JournalDigest, JournalHead, JournalJsonObjectEntry, JournalJsonValue,
-    JournalLease, JournalMap, JournalMapChild, JournalMapEntry, JournalMapNode, JournalObject,
-    JournalObjectId, JournalObjectKind, JournalOpen, JournalOpenIntent, JournalOperationId,
-    JournalPinId, JournalReadLimits, JournalReader, JournalRole, JournalRootSelection,
-    JournalSequence, JournalSequenceNode, JournalSnapshotRoots, JournalStateValue,
-    JournalTransitionDelta, RUNTIME_PREVIOUS_CACHE_NAMESPACE, ReferencedProviderRequest,
-    ReferencedSessionState, ReferencedTurnCheckpoint, ReferencedTurnManifest, ReferencedTurnState,
-    SessionJournal, journal_history_chain,
+    JournalCommit, JournalCompactObjectId, JournalDigest, JournalHead, JournalJsonArray,
+    JournalJsonBranch, JournalJsonInline, JournalJsonItem, JournalJsonObjectEntry,
+    JournalJsonValue, JournalLease, JournalMap, JournalMapChild, JournalMapEntry, JournalMapNode,
+    JournalObject, JournalObjectId, JournalObjectKind, JournalOpen, JournalOpenIntent,
+    JournalOperationId, JournalPinId, JournalReadLimits, JournalReader, JournalRole,
+    JournalRootSelection, JournalSequence, JournalSequenceNode, JournalSnapshotRoots,
+    JournalStateValue, JournalTransitionDelta, RUNTIME_PREVIOUS_CACHE_NAMESPACE,
+    ReferencedProviderRequest, ReferencedSessionState, ReferencedTurnCheckpoint,
+    ReferencedTurnManifest, ReferencedTurnState, SessionJournal, journal_history_chain,
+    journal_json_can_inline, journal_json_identical,
 };
 use agent_runtime_core::provider::ProviderRequest;
 use agent_runtime_core::store::{SessionSnapshot, SessionStore, TurnManifest};
@@ -90,6 +92,10 @@ struct NativeDomain {
     /// without any protected head means the exact domain lost its data.
     follows_protected: bool,
     checkpoint: Option<TurnCheckpoint>,
+    /// Typed object IDs and roots for the preceding candidate. Unchanged
+    /// records reuse these directly instead of serializing/hash-walking the
+    /// complete materialized snapshot again.
+    encoding: Option<SnapshotEncodingCache>,
     /// Candidate objects already submitted in this writer lineage. A backend
     /// may store projected IDs in the ordinary domain; this set intentionally
     /// tracks input drafts so an unchanged body is not submitted again.
@@ -569,9 +575,15 @@ async fn open_domain(
         };
 
         let mut known_candidates = BTreeSet::new();
+        let mut encoding = None;
         if let (Some(head), Some(snapshot)) = (&head, &candidate) {
             let mut assembler = ObjectAssembler::default();
-            let roots = assembler.snapshot(snapshot, head.snapshot.planned_step_count)?;
+            let (roots, cache) = assembler.snapshot_cached(
+                snapshot,
+                head.snapshot.planned_step_count,
+                None,
+                None,
+            )?;
             // The protected domain stores this writer's exact candidates, so
             // a root it cannot re-derive is foreign or corrupt and fails
             // closed (no released runtime wrote another representation). An
@@ -593,6 +605,7 @@ async fn open_domain(
             if representation_matches {
                 known_candidates.extend(assembler.objects.keys().cloned());
             }
+            encoding = Some(cache);
         }
         let follows_protected = match (&head, role) {
             (Some(head), JournalRole::Ordinary) => {
@@ -606,10 +619,16 @@ async fn open_domain(
             }
             _ => false,
         };
-        Ok::<_, RuntimeError>((candidate, checkpoint, known_candidates, follows_protected))
+        Ok::<_, RuntimeError>((
+            candidate,
+            checkpoint,
+            encoding,
+            known_candidates,
+            follows_protected,
+        ))
     }
     .await;
-    let (candidate, checkpoint, known_candidates, follows_protected) = match loaded {
+    let (candidate, checkpoint, encoding, known_candidates, follows_protected) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
             let _ = journal.close(lease).await;
@@ -625,6 +644,7 @@ async fn open_domain(
         candidate_submitted: false,
         follows_protected,
         checkpoint,
+        encoding,
         known_candidates,
     })
 }
@@ -650,7 +670,12 @@ async fn commit_domain(
         .ok_or_else(|| RuntimeError::conflict("native journal writer is not fenced"))?;
     let planned_step_count = crate::runtime::manifests::snapshot_planned_steps(snapshot)?;
     let mut assembler = ObjectAssembler::default();
-    let roots = assembler.snapshot(snapshot, planned_step_count)?;
+    let (roots, encoding) = assembler.snapshot_cached(
+        snapshot,
+        planned_step_count,
+        domain.candidate.as_ref(),
+        domain.encoding.as_ref(),
+    )?;
     let referenced_checkpoint = if domain.role == JournalRole::Protected {
         Some(assembler.checkpoint(checkpoint.expect("protected checked above"), roots.clone())?)
     } else {
@@ -676,7 +701,7 @@ async fn commit_domain(
         domain.candidate_submitted,
         snapshot,
         boundary.clone(),
-        &mut assembler,
+        &encoding,
     )?;
     let mut objects = if domain.role == JournalRole::Ordinary {
         if delta.bootstrap.is_some() {
@@ -766,6 +791,7 @@ async fn commit_domain(
     domain.head = Some(head);
     domain.candidate = Some(snapshot.clone());
     domain.candidate_submitted = true;
+    domain.encoding = Some(encoding);
     if domain.role == JournalRole::Protected {
         domain.checkpoint = checkpoint.cloned();
     }
@@ -799,7 +825,7 @@ fn transition_delta(
     previous_submitted: bool,
     next: &SessionSnapshot,
     boundary: JournalBoundary,
-    assembler: &mut ObjectAssembler,
+    encoding: &SnapshotEncodingCache,
 ) -> Result<JournalTransitionDelta, RuntimeError> {
     let Some(previous) = previous else {
         return Ok(JournalTransitionDelta {
@@ -849,12 +875,21 @@ fn transition_delta(
         .keys()
         .chain(next.extension_state.keys())
     {
-        if previous.extension_state.get(key) != next.extension_state.get(key) {
+        if !state_identical(
+            previous.extension_state.get(key),
+            next.extension_state.get(key),
+        ) {
             if key == RUNTIME_PREVIOUS_CACHE_NAMESPACE {
                 let value = next
                     .extension_state
                     .get(key)
-                    .map(|value| assembler.extension(key, value))
+                    .map(|_| {
+                        encoding.extension_ids.get(key).cloned().ok_or_else(|| {
+                            RuntimeError::conflict(
+                                "native journal extension encoding cache is incomplete",
+                            )
+                        })
+                    })
                     .transpose()?;
                 extension_references.insert(key.clone(), value);
             } else {
@@ -863,10 +898,7 @@ fn transition_delta(
         }
     }
     let overlap = retained_overlap(&previous.manifests, &next.manifests);
-    let manifest_references = next.manifests[overlap..]
-        .iter()
-        .map(|manifest| assembler.manifest(manifest))
-        .collect::<Result<Vec<_>, _>>()?;
+    let manifest_references = encoding.manifest_ids[overlap..].to_vec();
     Ok(JournalTransitionDelta {
         boundary,
         bootstrap: None,
@@ -877,6 +909,35 @@ fn transition_delta(
         manifests_append: Vec::new(),
         manifest_references,
     })
+}
+
+/// Exact extension-record identity: `VersionedSessionState` equality would
+/// treat a value rewritten from `0.0` to `-0.0` as unchanged and keep the
+/// stale encoding (and send no update).
+fn state_identical(
+    left: Option<&agent_runtime_core::store::VersionedSessionState>,
+    right: Option<&agent_runtime_core::store::VersionedSessionState>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.revision == right.revision
+                && left.sensitivity == right.sensitivity
+                && journal_json_identical(&left.value, &right.value)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn states_identical(
+    left: &BTreeMap<String, agent_runtime_core::store::VersionedSessionState>,
+    right: &BTreeMap<String, agent_runtime_core::store::VersionedSessionState>,
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((lk, lv), (rk, rv))| lk == rk && state_identical(Some(lv), Some(rv)))
 }
 
 fn retained_overlap(previous: &[TurnManifest], next: &[TurnManifest]) -> usize {
@@ -891,6 +952,54 @@ fn incompatible_store() -> RuntimeError {
     RuntimeError::conflict(
         "native session journal exists but the configured store set no longer exposes a compatible journal capability",
     )
+}
+
+#[derive(Clone)]
+struct SnapshotEncodingCache {
+    roots: JournalSnapshotRoots,
+    history_ids: Vec<JournalObjectId>,
+    usage_ids: Vec<JournalObjectId>,
+    manifest_ids: Vec<JournalObjectId>,
+    extension_ids: BTreeMap<String, JournalObjectId>,
+    manifest_json: Vec<JsonEncodingCache>,
+    extension_json: BTreeMap<String, JsonEncodingCache>,
+}
+
+#[derive(Clone)]
+struct JsonEncodingCache {
+    root: JournalObjectId,
+    node: JsonEncodingNode,
+}
+
+#[derive(Clone)]
+enum JsonEncodingNode {
+    Inline,
+    Scalar,
+    Array(JsonArrayEncodingCache),
+    Object {
+        entries: Vec<JsonObjectEntryEncodingCache>,
+        sequence: JournalSequence,
+    },
+}
+
+#[derive(Clone)]
+struct JsonArrayEncodingCache {
+    items: Vec<JsonItemEncodingCache>,
+    levels: Vec<Vec<JournalSequence>>,
+    root: JournalJsonArray,
+}
+
+#[derive(Clone)]
+struct JsonObjectEntryEncodingCache {
+    key: String,
+    item: JsonItemEncodingCache,
+    object: JournalObjectId,
+}
+
+#[derive(Clone)]
+enum JsonItemEncodingCache {
+    Inline,
+    Reference(Box<JsonEncodingCache>),
 }
 
 #[derive(Default)]
@@ -948,10 +1057,6 @@ impl ObjectAssembler {
                 height: 0,
             });
         }
-        // Fixed-height sparse binary levels keep an append's submitted path
-        // bounded independently of the unchanged prefix length. Building the
-        // full candidate is CPU-only; `known_candidates` filters every old
-        // body and old branch before the commit crosses the store boundary.
         for _ in 0..JOURNAL_MAX_TREE_HEIGHT {
             let mut parents = Vec::new();
             for children in trees.chunks(2) {
@@ -981,69 +1086,195 @@ impl ObjectAssembler {
             .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))
     }
 
-    fn structured_sequence(
+    fn structured_sequence_cached(
         &mut self,
-        items: Vec<JournalObjectId>,
-    ) -> Result<JournalSequence, RuntimeError> {
-        if items.is_empty() {
-            return Ok(JournalSequence::default());
-        }
-        if items.len() <= JOURNAL_FANOUT {
-            let len = items.len() as u64;
-            let root = self.add_structured(
-                JournalObjectKind::Sequence,
-                &JournalSequenceNode::Leaf { items },
-            )?;
-            return Ok(JournalSequence {
-                root: Some(root),
-                len,
+        values: &[Value],
+        previous: Option<(&[Value], &JsonArrayEncodingCache)>,
+    ) -> Result<(JournalJsonArray, JsonArrayEncodingCache, bool), RuntimeError> {
+        let previous = previous.filter(|(values, cache)| values.len() == cache.items.len());
+        if values.is_empty() {
+            let root = JournalJsonArray {
+                len: 0,
                 height: 0,
-            });
-        }
-        let mut trees = Vec::new();
-        // One reference per leaf keeps the changed path's byte size stable;
-        // a partially filled fanout leaf would oscillate by O(fanout) bytes
-        // as N changes even though only one logical item was appended.
-        for items in items.chunks(1) {
-            let root = self.add_structured(
-                JournalObjectKind::Sequence,
-                &JournalSequenceNode::Leaf {
-                    items: items.to_vec(),
+                node: JournalSequenceNode::JsonLeaf { items: Vec::new() },
+            };
+            let unchanged =
+                previous.is_some_and(|(values, cache)| values.is_empty() && cache.root == root);
+            return Ok((
+                root.clone(),
+                JsonArrayEncodingCache {
+                    items: Vec::new(),
+                    levels: Vec::new(),
+                    root,
                 },
-            )?;
-            trees.push(JournalSequence {
-                root: Some(root),
-                len: items.len() as u64,
-                height: 0,
-            });
-        }
-        for _ in 0..JOURNAL_MAX_TREE_HEIGHT {
-            let mut parents = Vec::new();
-            for children in trees.chunks(2) {
-                let root = self.add_structured(
-                    JournalObjectKind::Sequence,
-                    &JournalSequenceNode::Branch {
-                        children: children.to_vec(),
-                    },
-                )?;
-                parents.push(JournalSequence {
-                    root: Some(root),
-                    len: children.iter().map(|child| child.len).sum(),
-                    height: children[0].height.checked_add(1).ok_or_else(|| {
-                        RuntimeError::conflict("journal sequence height overflow")
-                    })?,
-                });
-            }
-            trees = parents;
-        }
-        if trees.len() != 1 {
-            return Err(RuntimeError::conflict(
-                "structured journal sequence exceeds the supported persistent index",
+                unchanged,
             ));
         }
-        trees
-            .pop()
-            .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))
+
+        let mut item_caches = Vec::with_capacity(values.len());
+        if values.len() <= JOURNAL_FANOUT {
+            let mut items = Vec::with_capacity(values.len());
+            let mut unchanged =
+                previous.is_some_and(|(prior_values, _)| prior_values.len() == values.len());
+            for (index, value) in values.iter().enumerate() {
+                let prior = previous.and_then(|(prior_values, cache)| {
+                    Some((prior_values.get(index)?, cache.items.get(index)?))
+                });
+                let (item, cache, same) = self.json_array_item_cached(value, prior)?;
+                items.push(item);
+                item_caches.push(cache);
+                unchanged &= same;
+            }
+            let root = JournalJsonArray {
+                len: values.len() as u64,
+                height: 0,
+                node: JournalSequenceNode::JsonLeaf { items },
+            };
+            unchanged &= previous.is_some_and(|(_, cache)| cache.root == root);
+            return Ok((
+                root.clone(),
+                JsonArrayEncodingCache {
+                    items: item_caches,
+                    levels: Vec::new(),
+                    root,
+                },
+                unchanged,
+            ));
+        }
+
+        let mut bottom = Vec::with_capacity(values.len().div_ceil(2));
+        for (chunk_index, chunk) in values.chunks(2).enumerate() {
+            let mut items = Vec::with_capacity(chunk.len());
+            let mut unchanged = previous.is_some();
+            for (offset, value) in chunk.iter().enumerate() {
+                let index = chunk_index * 2 + offset;
+                let prior = previous.and_then(|(prior_values, cache)| {
+                    Some((prior_values.get(index)?, cache.items.get(index)?))
+                });
+                let (item, cache, same) = self.json_array_item_cached(value, prior)?;
+                items.push(item);
+                item_caches.push(cache);
+                unchanged &= same;
+            }
+            // Reuse only a cached bottom node of exactly this width: a prior
+            // array that was a single leaf has no bottom level, and a tail
+            // chunk that shrank from two items to one must not keep both.
+            let cached = previous
+                .filter(|_| unchanged)
+                .and_then(|(_, cache)| cache.levels.first()?.get(chunk_index))
+                .filter(|tree| tree.len == chunk.len() as u64)
+                .cloned();
+            let tree = match cached {
+                Some(tree) => tree,
+                None => {
+                    let root = self.add_structured(
+                        JournalObjectKind::Sequence,
+                        &JournalSequenceNode::JsonValueBranch { items },
+                    )?;
+                    JournalSequence {
+                        root: Some(root),
+                        len: chunk.len() as u64,
+                        height: 1,
+                    }
+                }
+            };
+            bottom.push(tree);
+        }
+
+        let mut levels = vec![bottom];
+        while levels.last().is_some_and(|level| level.len() > 2) {
+            let level_index = levels.len() - 1;
+            let current = levels.last().expect("level exists");
+            if current[0].height >= JOURNAL_MAX_TREE_HEIGHT {
+                return Err(RuntimeError::conflict(
+                    "structured journal sequence exceeds the supported persistent index",
+                ));
+            }
+            let mut parents = Vec::with_capacity(current.len().div_ceil(2));
+            for (group, children) in current.chunks(2).enumerate() {
+                // A cached parent is reusable only when it was built from
+                // exactly these children: the prior group at this position
+                // must have the same width, not merely a matching prefix.
+                let cached = previous.and_then(|(_, cache)| {
+                    let level = cache.levels.get(level_index)?;
+                    let start = group * 2;
+                    let prior = level.get(start..level.len().min(start + 2))?;
+                    if prior != children {
+                        return None;
+                    }
+                    cache.levels.get(level_index + 1)?.get(group).cloned()
+                });
+                let tree = if let Some(tree) = cached {
+                    tree
+                } else {
+                    let child_roots = children
+                        .iter()
+                        .map(|child| {
+                            child
+                                .root
+                                .as_ref()
+                                .map(JournalCompactObjectId::from_object)
+                                .ok_or_else(|| {
+                                    RuntimeError::conflict(
+                                        "structured journal branch has an empty child",
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let root = self.add_structured(
+                        JournalObjectKind::JsonBranch,
+                        &JournalJsonBranch(child_roots),
+                    )?;
+                    JournalSequence {
+                        root: Some(root),
+                        len: children.iter().map(|child| child.len).sum(),
+                        height: children[0].height.checked_add(1).ok_or_else(|| {
+                            RuntimeError::conflict("journal sequence height overflow")
+                        })?,
+                    }
+                };
+                parents.push(tree);
+            }
+            levels.push(parents);
+        }
+        let children = levels
+            .last()
+            .filter(|level| !level.is_empty())
+            .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))?;
+        let child_roots = children
+            .iter()
+            .map(|child| {
+                child
+                    .root
+                    .as_ref()
+                    .map(JournalCompactObjectId::from_object)
+                    .ok_or_else(|| {
+                        RuntimeError::conflict("structured journal branch has an empty child")
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let root = JournalJsonArray {
+            len: values.len() as u64,
+            height: children[0]
+                .height
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::conflict("journal sequence height overflow"))?,
+            node: JournalSequenceNode::JsonBranch {
+                children: child_roots,
+            },
+        };
+        let unchanged = previous.is_some_and(|(prior_values, cache)| {
+            prior_values.len() == values.len() && cache.root == root
+        });
+        Ok((
+            root.clone(),
+            JsonArrayEncodingCache {
+                items: item_caches,
+                levels,
+                root,
+            },
+            unchanged,
+        ))
     }
 
     fn structured_object_sequence(
@@ -1091,68 +1322,274 @@ impl ObjectAssembler {
             .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))
     }
 
-    fn json_value(&mut self, value: &Value) -> Result<JournalObjectId, RuntimeError> {
-        let node = match value {
+    fn json_value_cached(
+        &mut self,
+        value: &Value,
+        previous: Option<(&Value, &JsonEncodingCache)>,
+    ) -> Result<JsonEncodingCache, RuntimeError> {
+        match value {
             Value::Array(values) => {
-                let items = values
-                    .iter()
-                    .map(|value| self.json_value(value))
-                    .collect::<Result<Vec<_>, _>>()?;
-                JournalJsonValue::Array {
-                    items: self.structured_sequence(items)?,
-                }
+                let prior = previous.and_then(|(value, cache)| {
+                    let Value::Array(values) = value else {
+                        return None;
+                    };
+                    let JsonEncodingNode::Array(array) = &cache.node else {
+                        return None;
+                    };
+                    Some((values.as_slice(), array))
+                });
+                let (items, cache, unchanged) = self.structured_sequence_cached(values, prior)?;
+                let root = if unchanged {
+                    previous
+                        .map(|(_, cache)| cache.root.clone())
+                        .ok_or_else(|| RuntimeError::conflict("JSON value cache is incomplete"))?
+                } else {
+                    self.add_structured(
+                        JournalObjectKind::JsonValue,
+                        &JournalJsonValue::Array { items },
+                    )?
+                };
+                Ok(JsonEncodingCache {
+                    root,
+                    node: JsonEncodingNode::Array(cache),
+                })
             }
             Value::Object(values) => {
-                let entries = values
-                    .iter()
-                    .map(|(key, value)| {
-                        let value = self.json_value(value)?;
+                let prior = previous.and_then(|(value, cache)| {
+                    let Value::Object(values) = value else {
+                        return None;
+                    };
+                    let JsonEncodingNode::Object { entries, sequence } = &cache.node else {
+                        return None;
+                    };
+                    Some((values, entries.as_slice(), sequence))
+                });
+                let mut entries = Vec::with_capacity(values.len());
+                let mut entry_ids = Vec::with_capacity(values.len());
+                let mut unchanged = prior.is_some_and(|(prior_values, entries, _)| {
+                    prior_values.len() == values.len() && entries.len() == values.len()
+                });
+                // Index the prior map once; `iter().nth(index)` per entry made
+                // a wide object quadratic.
+                let prior_pairs =
+                    prior.map(|(prior_values, _, _)| prior_values.iter().collect::<Vec<_>>());
+                for (index, (key, value)) in values.iter().enumerate() {
+                    let prior_entry = prior.and_then(|(_, entries, _)| {
+                        let (prior_key, prior_value) = *prior_pairs.as_ref()?.get(index)?;
+                        let entry = entries.get(index)?;
+                        (prior_key == key && entry.key == *key).then_some((
+                            prior_value,
+                            &entry.item,
+                            entry,
+                        ))
+                    });
+                    let (item, item_cache, same) = self.json_item_cached(
+                        value,
+                        prior_entry.map(|(value, cache, _)| (value, cache)),
+                    )?;
+                    let object = if same {
+                        prior_entry
+                            .map(|(_, _, entry)| entry.object.clone())
+                            .ok_or_else(|| {
+                                RuntimeError::conflict("JSON object cache is incomplete")
+                            })?
+                    } else {
                         self.add_structured(
                             JournalObjectKind::JsonObjectEntry,
                             &JournalJsonObjectEntry {
                                 key: key.clone(),
-                                value,
+                                value: item,
                             },
-                        )
-                    })
-                    .collect::<Result<Vec<_>, RuntimeError>>()?;
-                JournalJsonValue::Object {
-                    entries: self.structured_object_sequence(entries)?,
+                        )?
+                    };
+                    unchanged &= same;
+                    entry_ids.push(object.clone());
+                    entries.push(JsonObjectEntryEncodingCache {
+                        key: key.clone(),
+                        item: item_cache,
+                        object,
+                    });
                 }
+                let sequence = if unchanged {
+                    prior
+                        .map(|(_, _, sequence)| sequence.clone())
+                        .ok_or_else(|| RuntimeError::conflict("JSON object cache is incomplete"))?
+                } else {
+                    self.structured_object_sequence(entry_ids)?
+                };
+                let root = if unchanged {
+                    previous
+                        .map(|(_, cache)| cache.root.clone())
+                        .ok_or_else(|| RuntimeError::conflict("JSON value cache is incomplete"))?
+                } else {
+                    self.add_structured(
+                        JournalObjectKind::JsonValue,
+                        &JournalJsonValue::Object {
+                            entries: sequence.clone(),
+                        },
+                    )?
+                };
+                Ok(JsonEncodingCache {
+                    root,
+                    node: JsonEncodingNode::Object { entries, sequence },
+                })
             }
-            scalar => JournalJsonValue::Scalar {
-                scalar: scalar.clone(),
-            },
-        };
-        self.add_structured(JournalObjectKind::JsonValue, &node)
+            scalar => {
+                let unchanged = previous.is_some_and(|(value, cache)| {
+                    matches!(cache.node, JsonEncodingNode::Scalar)
+                        && journal_json_identical(value, scalar)
+                });
+                let root = if unchanged {
+                    previous
+                        .map(|(_, cache)| cache.root.clone())
+                        .ok_or_else(|| RuntimeError::conflict("JSON value cache is incomplete"))?
+                } else {
+                    self.add_structured(
+                        JournalObjectKind::JsonValue,
+                        &JournalJsonValue::Scalar {
+                            scalar: scalar.clone(),
+                        },
+                    )?
+                };
+                Ok(JsonEncodingCache {
+                    root,
+                    node: JsonEncodingNode::Scalar,
+                })
+            }
+        }
     }
 
-    fn extension(
+    fn json_item_cached(
+        &mut self,
+        value: &Value,
+        previous: Option<(&Value, &JsonItemEncodingCache)>,
+    ) -> Result<(JournalJsonItem, JsonItemEncodingCache, bool), RuntimeError> {
+        if journal_json_can_inline(value)? {
+            let unchanged = previous.is_some_and(|(prior, cache)| {
+                matches!(cache, JsonItemEncodingCache::Inline)
+                    && journal_json_identical(prior, value)
+            });
+            return Ok((
+                JournalJsonItem::Inline {
+                    value: value.clone(),
+                },
+                JsonItemEncodingCache::Inline,
+                unchanged,
+            ));
+        }
+        let prior = previous.and_then(|(value, cache)| {
+            let JsonItemEncodingCache::Reference(cache) = cache else {
+                return None;
+            };
+            Some((value, cache.as_ref()))
+        });
+        let cache = self.json_value_cached(value, prior)?;
+        let unchanged = prior.is_some_and(|(_, prior)| prior.root == cache.root);
+        Ok((
+            JournalJsonItem::Reference {
+                object: cache.root.clone(),
+            },
+            JsonItemEncodingCache::Reference(Box::new(cache)),
+            unchanged,
+        ))
+    }
+
+    fn json_array_item_cached(
+        &mut self,
+        value: &Value,
+        previous: Option<(&Value, &JsonItemEncodingCache)>,
+    ) -> Result<(JournalJsonItem, JsonItemEncodingCache, bool), RuntimeError> {
+        if !journal_json_can_inline(value)? {
+            return self.json_item_cached(value, previous);
+        }
+        let prior = previous.and_then(|(value, cache)| {
+            let JsonItemEncodingCache::Reference(cache) = cache else {
+                return None;
+            };
+            matches!(&cache.node, JsonEncodingNode::Inline).then_some((value, cache.as_ref()))
+        });
+        let unchanged = prior.is_some_and(|(prior, _)| journal_json_identical(prior, value));
+        let cache = if unchanged {
+            prior
+                .map(|(_, cache)| cache.clone())
+                .ok_or_else(|| RuntimeError::conflict("JSON value cache is incomplete"))?
+        } else {
+            let root = self.add_structured(
+                JournalObjectKind::JsonInline,
+                &JournalJsonInline(value.clone()),
+            )?;
+            JsonEncodingCache {
+                root,
+                node: JsonEncodingNode::Inline,
+            }
+        };
+        Ok((
+            JournalJsonItem::Reference {
+                object: cache.root.clone(),
+            },
+            JsonItemEncodingCache::Reference(Box::new(cache)),
+            unchanged,
+        ))
+    }
+
+    fn extension_cached(
         &mut self,
         namespace: &str,
         value: &agent_runtime_core::store::VersionedSessionState,
-    ) -> Result<JournalObjectId, RuntimeError> {
+        previous: Option<(
+            &agent_runtime_core::store::VersionedSessionState,
+            &JsonEncodingCache,
+        )>,
+    ) -> Result<(JournalObjectId, Option<JsonEncodingCache>), RuntimeError> {
         if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE {
-            return self.add(JournalObjectKind::Extension, value);
+            return Ok((self.add(JournalObjectKind::Extension, value)?, None));
         }
         if value.sensitivity != agent_runtime_core::store::SessionStateSensitivity::RedactionSafe {
             return Err(RuntimeError::conflict(
                 "runtime previous-cache state is not redaction-safe",
             ));
         }
-        let value = self.json_value(&serde_json::to_value(value)?)?;
-        self.add_structured(
+        let value_json = serde_json::to_value(value)?;
+        let previous_json = match previous {
+            Some((value, cache)) => Some((serde_json::to_value(value)?, cache)),
+            None => None,
+        };
+        let cache = self.json_value_cached(
+            &value_json,
+            previous_json.as_ref().map(|(value, cache)| (value, *cache)),
+        )?;
+        let id = self.add_structured(
             JournalObjectKind::ExtensionReference,
-            &ReferencedSessionState { value },
-        )
+            &ReferencedSessionState {
+                value: cache.root.clone(),
+            },
+        )?;
+        Ok((id, Some(cache)))
     }
 
-    fn manifest(&mut self, manifest: &TurnManifest) -> Result<JournalObjectId, RuntimeError> {
-        let value = self.json_value(&serde_json::to_value(manifest)?)?;
-        self.add_structured(
+    fn manifest_cached(
+        &mut self,
+        manifest: &TurnManifest,
+        previous: Option<(&TurnManifest, &JsonEncodingCache)>,
+    ) -> Result<(JournalObjectId, JsonEncodingCache), RuntimeError> {
+        let value = serde_json::to_value(manifest)?;
+        let previous_value = match previous {
+            Some((manifest, cache)) => Some((serde_json::to_value(manifest)?, cache)),
+            None => None,
+        };
+        let cache = self.json_value_cached(
+            &value,
+            previous_value
+                .as_ref()
+                .map(|(value, cache)| (value, *cache)),
+        )?;
+        let id = self.add_structured(
             JournalObjectKind::ManifestReference,
-            &ReferencedTurnManifest { value },
-        )
+            &ReferencedTurnManifest {
+                value: cache.root.clone(),
+            },
+        )?;
+        Ok((id, cache))
     }
 
     fn map(&mut self, entries: Vec<JournalMapEntry>) -> Result<JournalMap, RuntimeError> {
@@ -1206,56 +1643,202 @@ impl ObjectAssembler {
             .ok_or_else(|| RuntimeError::conflict("journal map is empty"))
     }
 
+    #[cfg(test)]
     fn snapshot(
         &mut self,
         snapshot: &SessionSnapshot,
         planned_step_count: u64,
     ) -> Result<JournalSnapshotRoots, RuntimeError> {
-        let history_ids = snapshot
-            .history
-            .iter()
-            .map(|message| self.add(JournalObjectKind::Message, message))
-            .collect::<Result<Vec<_>, _>>()?;
-        let history_chain = journal_history_chain(&history_ids);
-        let history = self.sequence(history_ids)?;
-        let usage_ids = snapshot
-            .usage
-            .records()
-            .iter()
-            .map(|record| self.add(JournalObjectKind::UsageRecord, record))
-            .collect::<Result<Vec<_>, _>>()?;
-        let usage = self.sequence(usage_ids)?;
-        let manifest_ids = snapshot
-            .manifests
-            .iter()
-            .map(|manifest| self.manifest(manifest))
-            .collect::<Result<Vec<_>, _>>()?;
-        let manifests = self.sequence(manifest_ids)?;
+        self.snapshot_cached(snapshot, planned_step_count, None, None)
+            .map(|(roots, _)| roots)
+    }
+
+    fn snapshot_cached(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        planned_step_count: u64,
+        previous: Option<&SessionSnapshot>,
+        previous_encoding: Option<&SnapshotEncodingCache>,
+    ) -> Result<(JournalSnapshotRoots, SnapshotEncodingCache), RuntimeError> {
+        let previous = previous
+            .zip(previous_encoding)
+            .filter(|(previous, encoding)| {
+                previous.id == snapshot.id
+                    && encoding.history_ids.len() == previous.history.len()
+                    && encoding.usage_ids.len() == previous.usage.records().len()
+                    && encoding.manifest_ids.len() == previous.manifests.len()
+                    && encoding.manifest_json.len() == previous.manifests.len()
+                    && encoding.extension_ids.len() == previous.extension_state.len()
+            });
+
+        let (history_ids, history, history_chain) = match previous {
+            Some((previous, encoding)) if previous.history == snapshot.history => (
+                encoding.history_ids.clone(),
+                encoding.roots.history.clone(),
+                encoding.roots.history_chain.clone(),
+            ),
+            Some((previous, encoding))
+                if previous.history.len() <= snapshot.history.len()
+                    && previous.history == snapshot.history[..previous.history.len()] =>
+            {
+                let mut ids = encoding.history_ids.clone();
+                ids.extend(
+                    snapshot.history[previous.history.len()..]
+                        .iter()
+                        .map(|message| self.add(JournalObjectKind::Message, message))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let tree = self.sequence(ids.clone())?;
+                let chain = journal_history_chain(&ids);
+                (ids, tree, chain)
+            }
+            _ => {
+                let ids = snapshot
+                    .history
+                    .iter()
+                    .map(|message| self.add(JournalObjectKind::Message, message))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let tree = self.sequence(ids.clone())?;
+                let chain = journal_history_chain(&ids);
+                (ids, tree, chain)
+            }
+        };
+
+        let records = snapshot.usage.records();
+        let (usage_ids, usage) = match previous {
+            Some((previous, encoding)) if previous.usage.records() == records => {
+                (encoding.usage_ids.clone(), encoding.roots.usage.clone())
+            }
+            Some((previous, encoding))
+                if previous.usage.records().len() <= records.len()
+                    && previous.usage.records() == &records[..previous.usage.records().len()] =>
+            {
+                let mut ids = encoding.usage_ids.clone();
+                ids.extend(
+                    records[previous.usage.records().len()..]
+                        .iter()
+                        .map(|record| self.add(JournalObjectKind::UsageRecord, record))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let tree = self.sequence(ids.clone())?;
+                (ids, tree)
+            }
+            _ => {
+                let ids = records
+                    .iter()
+                    .map(|record| self.add(JournalObjectKind::UsageRecord, record))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let tree = self.sequence(ids.clone())?;
+                (ids, tree)
+            }
+        };
+
+        let overlap = previous.map_or(0, |(previous, _)| {
+            retained_overlap(&previous.manifests, &snapshot.manifests)
+        });
+        let mut manifest_ids = previous.map_or_else(Vec::new, |(previous, encoding)| {
+            encoding.manifest_ids[previous.manifests.len() - overlap..].to_vec()
+        });
+        let mut manifest_json = previous.map_or_else(Vec::new, |(previous, encoding)| {
+            encoding.manifest_json[previous.manifests.len() - overlap..].to_vec()
+        });
+        for (index, manifest) in snapshot.manifests[overlap..].iter().enumerate() {
+            let absolute = overlap + index;
+            let prior = if absolute > 0 {
+                Some((
+                    &snapshot.manifests[absolute - 1],
+                    &manifest_json[absolute - 1],
+                ))
+            } else {
+                previous.and_then(|(previous, encoding)| {
+                    Some((previous.manifests.last()?, encoding.manifest_json.last()?))
+                })
+            };
+            let (id, cache) = self.manifest_cached(manifest, prior)?;
+            manifest_ids.push(id);
+            manifest_json.push(cache);
+        }
+        let manifests = previous
+            .filter(|(previous, _)| previous.manifests == snapshot.manifests)
+            .map_or_else(
+                || self.sequence(manifest_ids.clone()),
+                |(_, encoding)| Ok(encoding.roots.manifests.clone()),
+            )?;
         if planned_step_count < manifests.len {
             return Err(RuntimeError::conflict(
                 "journal planned-step counter trails its retained window",
             ));
         }
-        let entries = snapshot
-            .extension_state
+
+        let mut extension_ids = BTreeMap::new();
+        let mut extension_json = BTreeMap::new();
+        for (key, value) in &snapshot.extension_state {
+            let (id, json) = match previous {
+                Some((previous, encoding))
+                    if state_identical(previous.extension_state.get(key), Some(value)) =>
+                {
+                    (
+                        encoding.extension_ids.get(key).cloned().ok_or_else(|| {
+                            RuntimeError::conflict(
+                                "native journal extension encoding cache is incomplete",
+                            )
+                        })?,
+                        encoding.extension_json.get(key).cloned(),
+                    )
+                }
+                _ => self.extension_cached(
+                    key,
+                    value,
+                    previous.and_then(|(previous, encoding)| {
+                        Some((
+                            previous.extension_state.get(key)?,
+                            encoding.extension_json.get(key)?,
+                        ))
+                    }),
+                )?,
+            };
+            if let Some(json) = json {
+                extension_json.insert(key.clone(), json);
+            }
+            extension_ids.insert(key.clone(), id);
+        }
+        let extension_entries = extension_ids
             .iter()
-            .map(|(key, value)| {
-                Ok(JournalMapEntry {
-                    key: key.clone(),
-                    value: self.extension(key, value)?,
-                })
+            .map(|(key, value)| JournalMapEntry {
+                key: key.clone(),
+                value: value.clone(),
             })
-            .collect::<Result<Vec<_>, RuntimeError>>()?;
-        Ok(JournalSnapshotRoots {
+            .collect();
+        let extensions = previous
+            .filter(|(previous, _)| {
+                states_identical(&previous.extension_state, &snapshot.extension_state)
+            })
+            .map_or_else(
+                || self.map(extension_entries),
+                |(_, encoding)| Ok(encoding.roots.extensions.clone()),
+            )?;
+        let roots = JournalSnapshotRoots {
             history,
             history_chain,
             usage,
-            extensions: self.map(entries)?,
+            extensions,
             manifests,
             planned_step_count,
             identity: snapshot.identity.clone(),
             updated: snapshot.updated,
-        })
+        };
+        Ok((
+            roots.clone(),
+            SnapshotEncodingCache {
+                roots,
+                history_ids,
+                usage_ids,
+                manifest_ids,
+                extension_ids,
+                manifest_json,
+                extension_json,
+            },
+        ))
     }
 
     fn request(&mut self, request: &ProviderRequest) -> Result<JournalObjectId, RuntimeError> {
@@ -1358,6 +1941,7 @@ impl ObjectAssembler {
 mod tests {
     use agent_runtime_core::clock::Timestamp;
     use agent_runtime_core::content::{ContentPart, Message};
+    use serde_json::json;
 
     use super::*;
 
@@ -1476,14 +2060,8 @@ mod tests {
             assistant("secret reply"),
             Message::user("next"),
         ]);
-        let delta = transition_delta(
-            Some(&loaded),
-            false,
-            &live,
-            boundary(),
-            &mut ObjectAssembler::default(),
-        )
-        .unwrap();
+        let delta =
+            transition_delta(Some(&loaded), false, &live, boundary(), &encoding(&live)).unwrap();
         assert_eq!(delta.history_append, vec![Message::user("next")]);
         assert!(delta.bootstrap.is_none());
     }
@@ -1504,7 +2082,7 @@ mod tests {
             true,
             &replaced,
             boundary(),
-            &mut ObjectAssembler::default(),
+            &encoding(&replaced),
         )
         .unwrap_err();
         assert!(error.message.contains("rewritten"), "{error:?}");
@@ -1519,7 +2097,7 @@ mod tests {
                 true,
                 &appended,
                 boundary(),
-                &mut ObjectAssembler::default(),
+                &encoding(&appended),
             )
             .unwrap()
             .history_append,
@@ -1532,14 +2110,362 @@ mod tests {
         let loaded = snapshot(vec![Message::user("[redacted]"), assistant("[redacted]")]);
         let live = snapshot(vec![assistant("a"), Message::user("b"), Message::user("c")]);
         assert!(
-            transition_delta(
-                Some(&loaded),
-                false,
-                &live,
-                boundary(),
-                &mut ObjectAssembler::default(),
+            transition_delta(Some(&loaded), false, &live, boundary(), &encoding(&live),).is_err()
+        );
+    }
+
+    fn encoding(snapshot: &SessionSnapshot) -> SnapshotEncodingCache {
+        ObjectAssembler::default()
+            .snapshot_cached(snapshot, 0, None, None)
+            .unwrap()
+            .1
+    }
+
+    /// A warm path cache must commit exactly what a cold encoding of the same
+    /// value commits, whatever the previous value's shape: arrays growing past
+    /// one JSON leaf, shrinking by one item at an odd width, or shrinking back
+    /// below one leaf.
+    #[test]
+    fn a_warm_json_cache_encodes_reshaped_arrays_like_a_cold_one() {
+        let entries = |len: usize| {
+            serde_json::json!({
+                "entries": (0..len)
+                    .map(|index| serde_json::json!(format!("stable-history-entry-{index:032}")))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        let mut previous: Option<(Value, JsonEncodingCache)> = None;
+        for len in [
+            0usize, 1, 2, 60, 64, 65, 66, 70, 69, 68, 64, 63, 130, 129, 128, 127, 260, 259, 3, 0,
+        ] {
+            let value = entries(len);
+            let cold = ObjectAssembler::default()
+                .json_value_cached(&value, None)
+                .unwrap();
+            let mut assembler = ObjectAssembler::default();
+            let warm = assembler
+                .json_value_cached(
+                    &value,
+                    previous.as_ref().map(|(value, cache)| (value, cache)),
+                )
+                .unwrap_or_else(|error| panic!("warm encoding of {len} items failed: {error:?}"));
+            assert!(warm.root == cold.root, "warm root differs for {len} items");
+            previous = Some((value, warm));
+        }
+    }
+
+    /// Wide objects keep warm == cold through key insertion in the middle,
+    /// removal, value changes and a value crossing the compact threshold.
+    #[test]
+    fn a_warm_json_cache_encodes_reshaped_objects_like_a_cold_one() {
+        let object = |keys: &[usize], big: usize| {
+            Value::Object(
+                keys.iter()
+                    .map(|key| {
+                        let value = if *key == big {
+                            json!("x".repeat(2_000))
+                        } else {
+                            json!(format!("value-{key:032}"))
+                        };
+                        (format!("k{key:03}"), value)
+                    })
+                    .collect(),
             )
-            .is_err()
+        };
+        let all = (0..130).collect::<Vec<_>>();
+        let without_middle = (0..130).filter(|key| *key != 64).collect::<Vec<_>>();
+        let shapes = [
+            object(&all, usize::MAX),
+            object(&without_middle, usize::MAX),
+            object(&all, usize::MAX),
+            object(&all, 7),
+            object(&all[..65], 7),
+            object(&all[..64], usize::MAX),
+            object(&all, usize::MAX),
+        ];
+        let mut previous: Option<(Value, JsonEncodingCache)> = None;
+        for (step, value) in shapes.into_iter().enumerate() {
+            let cold = ObjectAssembler::default()
+                .json_value_cached(&value, None)
+                .unwrap();
+            let warm = ObjectAssembler::default()
+                .json_value_cached(
+                    &value,
+                    previous.as_ref().map(|(value, cache)| (value, cache)),
+                )
+                .unwrap();
+            assert!(
+                warm.root == cold.root,
+                "warm object root differs at step {step}"
+            );
+            previous = Some((value, warm));
+        }
+    }
+
+    /// Values at the compact-encoding boundaries: canonical sizes 1,023 /
+    /// 1,024 / 1,025 (ASCII, escaped, two- and four-byte UTF-8), signed zero
+    /// and extreme numbers, arrays of 64/65/66/130 items, a small array wider
+    /// than one leaf, an object wider than one leaf, an empty key and values
+    /// shaped like the encoding's own tags. Mirrored in the testkit's
+    /// cross-encoder check.
+    fn boundary_value() -> Value {
+        let ascii = |bytes: usize| Value::String("x".repeat(bytes - 2));
+        let mut map = serde_json::Map::new();
+        for bytes in [1_023, 1_024, 1_025] {
+            map.insert(format!("ascii-{bytes}"), ascii(bytes));
+        }
+        map.insert(
+            "escaped-1024".into(),
+            json!(format!("{}ab", "\"\\\n".repeat(170))),
+        );
+        map.insert(
+            "escaped-1026".into(),
+            json!(format!("{}abcd", "\"\\\n".repeat(170))),
+        );
+        map.insert("utf8-1024".into(), json!("é".repeat(511)));
+        map.insert("utf8-1026".into(), json!("é".repeat(512)));
+        map.insert("emoji-1023".into(), json!(format!("{}a", "😀".repeat(255))));
+        map.insert(
+            "emoji-1025".into(),
+            json!(format!("{}abc", "😀".repeat(255))),
+        );
+        map.insert("negative-zero".into(), json!(-0.0));
+        map.insert("zero".into(), json!(0.0));
+        map.insert("large".into(), json!(1e300));
+        map.insert("fraction".into(), json!(0.1));
+        map.insert("u64".into(), json!(u64::MAX));
+        map.insert("i64".into(), json!(i64::MIN));
+        for len in [64usize, 65, 66, 130] {
+            map.insert(
+                format!("array-{len}"),
+                Value::Array(
+                    (0..len)
+                        .map(|index| json!(format!("item-{index:024}")))
+                        .collect(),
+                ),
+            );
+        }
+        map.insert(
+            "boundary-array".into(),
+            json!([ascii(1_023), ascii(1_024), ascii(1_025), -0.0, {"": [0.0, -0.0]}]),
+        );
+        map.insert(
+            "small-wide-array".into(),
+            Value::Array((0..65).map(|index| json!(index)).collect()),
+        );
+        map.insert(
+            "wide-object".into(),
+            Value::Object(
+                (0..65)
+                    .map(|index| (format!("k{index:02}"), json!(index)))
+                    .collect(),
+            ),
+        );
+        map.insert("".into(), json!("empty key"));
+        map.insert(
+            "tag-shaped".into(),
+            json!({"storage": "inline", "value": {"storage": "reference", "object": "0".repeat(64)}}),
+        );
+        map.insert(
+            "node-shaped".into(),
+            json!({"node": "jl", "i": [{"storage": "inline", "value": 1}], "c": ["0".repeat(40)]}),
+        );
+        Value::Object(map)
+    }
+
+    /// The runtime writer and the reference ordinary backend (which encodes a
+    /// bootstrap itself) must produce byte-identical objects for the same
+    /// value, and the value must materialize exactly.
+    #[tokio::test]
+    async fn the_writer_and_reference_backend_encode_boundary_values_identically() {
+        use agent_runtime_core::journal::{
+            IdentityJournalProjection, InMemorySessionJournal, JournalStorageId,
+        };
+        use agent_runtime_core::store::VersionedSessionState;
+        use agent_runtime_registry::RegistryRevision;
+
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("boundary-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let session = SessionId::new("delta");
+        let mut live = snapshot(vec![Message::user("one")]);
+        let value = boundary_value();
+        for bytes in [1_023usize, 1_024, 1_025] {
+            assert_eq!(
+                serde_json::to_vec(&value[format!("ascii-{bytes}")])
+                    .unwrap()
+                    .len(),
+                bytes
+            );
+        }
+        for (key, bytes) in [
+            ("escaped-1024", 1_024usize),
+            ("escaped-1026", 1_026),
+            ("utf8-1024", 1_024),
+            ("utf8-1026", 1_026),
+            ("emoji-1023", 1_023),
+            ("emoji-1025", 1_025),
+        ] {
+            assert_eq!(
+                serde_json::to_vec(&value[key]).unwrap().len(),
+                bytes,
+                "{key}"
+            );
+        }
+        live.extension_state.insert(
+            RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+            VersionedSessionState::new(
+                RegistryRevision::new("previous-cache-state-1"),
+                value.clone(),
+            )
+            .redaction_safe(),
+        );
+        let roots = ObjectAssembler::default().snapshot(&live, 0).unwrap();
+        let lease = journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("boundary-open"),
+                    pin: JournalPinId::new("boundary-pin"),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap();
+        let mut commit = JournalCommit {
+            batch: JournalBatch {
+                session: session.clone(),
+                sequence: 1,
+                predecessor: None,
+                expected_revision: None,
+                writer_epoch: lease.writer_epoch().unwrap(),
+                operation: JournalOperationId::new("boundary"),
+                boundary: boundary(),
+                snapshot: roots.clone(),
+                checkpoint: None,
+            },
+            digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+            objects: Vec::new(),
+            delta: JournalTransitionDelta {
+                boundary: boundary(),
+                bootstrap: Some(Box::new(live.clone())),
+                history_append: Vec::new(),
+                usage_append: Vec::new(),
+                extension_updates: BTreeMap::new(),
+                extension_references: BTreeMap::new(),
+                manifests_append: Vec::new(),
+                manifest_references: Vec::new(),
+            },
+            checkpoint: None,
+        };
+        commit.digest = commit.input_digest().unwrap();
+        let head = journal.commit(&lease, commit).await.unwrap();
+        assert!(head.snapshot == roots, "the two encoders disagree");
+        let lease = journal.renew(&lease).await.unwrap();
+        let read = JournalReader::new(&journal, &lease, NATIVE_READ_LIMITS)
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(journal_json_identical(
+            &read.extension_state[RUNTIME_PREVIOUS_CACHE_NAMESPACE].value,
+            &value
+        ));
+    }
+
+    /// Numerically equal JSON values with different canonical bytes (`0.0`
+    /// and `-0.0`) are different journal values; the cache must not reuse the
+    /// other spelling's object.
+    #[test]
+    fn a_warm_json_cache_distinguishes_negative_zero() {
+        let positive = serde_json::json!({"value": 0.0, "nested": {"value": 0.0}});
+        let negative = serde_json::json!({"value": -0.0, "nested": {"value": -0.0}});
+        let prior = ObjectAssembler::default()
+            .json_value_cached(&positive, None)
+            .unwrap();
+        let cold = ObjectAssembler::default()
+            .json_value_cached(&negative, None)
+            .unwrap();
+        let warm = ObjectAssembler::default()
+            .json_value_cached(&negative, Some((&positive, &prior)))
+            .unwrap();
+        assert!(
+            cold.root != prior.root,
+            "the spellings must encode differently"
+        );
+        assert!(
+            warm.root == cold.root,
+            "the warm cache reused the 0.0 encoding"
+        );
+    }
+
+    /// The same holds for compact array elements and for whole extension
+    /// records: a record rewritten from `0.0` to `-0.0` is a change the
+    /// writer must encode and send, not a cache hit.
+    #[test]
+    fn negative_zero_records_are_encoded_and_sent_like_any_change() {
+        use agent_runtime_core::store::VersionedSessionState;
+        use agent_runtime_registry::RegistryRevision;
+
+        let array = |zero: f64| {
+            let mut items = (0..70)
+                .map(|index| serde_json::json!(format!("entry-{index:040}")))
+                .collect::<Vec<_>>();
+            items[3] = serde_json::json!(zero);
+            Value::Array(items)
+        };
+        let prior = ObjectAssembler::default()
+            .json_value_cached(&array(0.0), None)
+            .unwrap();
+        let cold = ObjectAssembler::default()
+            .json_value_cached(&array(-0.0), None)
+            .unwrap();
+        let warm = ObjectAssembler::default()
+            .json_value_cached(&array(-0.0), Some((&array(0.0), &prior)))
+            .unwrap();
+        assert!(warm.root == cold.root, "a compact array element kept 0.0");
+
+        let with_state = |zero: f64| {
+            let mut snapshot = snapshot(vec![Message::user("one")]);
+            for namespace in ["host.counter", RUNTIME_PREVIOUS_CACHE_NAMESPACE] {
+                let mut state = VersionedSessionState::new(
+                    RegistryRevision::new("state-1"),
+                    serde_json::json!({"value": zero}),
+                );
+                if namespace == RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+                    state = state.redaction_safe();
+                }
+                snapshot.extension_state.insert(namespace.to_owned(), state);
+            }
+            snapshot
+        };
+        let (positive, negative) = (with_state(0.0), with_state(-0.0));
+        let previous = encoding(&positive);
+        let (warm, warm_cache) = ObjectAssembler::default()
+            .snapshot_cached(&negative, 0, Some(&positive), Some(&previous))
+            .unwrap();
+        let (cold, _) = ObjectAssembler::default()
+            .snapshot_cached(&negative, 0, None, None)
+            .unwrap();
+        assert!(
+            warm == cold,
+            "a -0.0 extension record kept its 0.0 encoding"
+        );
+        let delta =
+            transition_delta(Some(&positive), true, &negative, boundary(), &warm_cache).unwrap();
+        assert!(
+            delta.extension_updates.contains_key("host.counter"),
+            "a -0.0 host record was not sent"
+        );
+        assert!(
+            delta
+                .extension_references
+                .contains_key(RUNTIME_PREVIOUS_CACHE_NAMESPACE),
+            "a -0.0 cache record was not referenced"
         );
     }
 }

@@ -1920,42 +1920,108 @@ impl Assembler {
         }
     }
 
-    /// Independent oracle of the native persistent JSON encoding: up to
-    /// `JOURNAL_FANOUT` array items in one leaf, otherwise single-reference
-    /// leaves under a fixed-height binary spine; object entries in fanout
-    /// leaves. Adapters must store these exact IDs for shared prefixes.
-    fn structured_array(&mut self, items: Vec<JournalObjectId>) -> JournalSequence {
-        if items.len() <= JOURNAL_FANOUT {
-            return self.sequence(items);
-        }
-        let mut trees = items
-            .into_iter()
-            .map(|item| JournalSequence {
-                root: Some(self.add(
-                    JournalObjectKind::Sequence,
-                    &JournalSequenceNode::Leaf { items: vec![item] },
-                )),
-                len: 1,
+    /// Independent oracle of the native persistent JSON encoding: compact
+    /// values are explicit inline data; larger values are typed references.
+    /// Arrays up to `JOURNAL_FANOUT` use one JSON leaf, while larger arrays use
+    /// two-item bottom nodes under the minimum-height binary spine.
+    fn structured_array(&mut self, values: &[serde_json::Value]) -> JournalJsonArray {
+        if values.is_empty() {
+            return JournalJsonArray {
+                len: 0,
                 height: 0,
+                node: JournalSequenceNode::JsonLeaf { items: Vec::new() },
+            };
+        }
+        if values.len() <= JOURNAL_FANOUT {
+            let items = values
+                .iter()
+                .map(|value| self.structured_array_item(value))
+                .collect();
+            let len = values.len() as u64;
+            return JournalJsonArray {
+                len,
+                height: 0,
+                node: JournalSequenceNode::JsonLeaf { items },
+            };
+        }
+        let mut trees = values
+            .chunks(2)
+            .map(|values| {
+                let items = values
+                    .iter()
+                    .map(|value| self.structured_array_item(value))
+                    .collect::<Vec<_>>();
+                JournalSequence {
+                    root: Some(self.add(
+                        JournalObjectKind::Sequence,
+                        &JournalSequenceNode::JsonValueBranch { items },
+                    )),
+                    len: values.len() as u64,
+                    height: 1,
+                }
             })
             .collect::<Vec<_>>();
-        for _ in 0..JOURNAL_MAX_TREE_HEIGHT {
+        while trees.len() > 2 {
+            assert!(trees[0].height < JOURNAL_MAX_TREE_HEIGHT);
             trees = trees
                 .chunks(2)
                 .map(|children| JournalSequence {
-                    root: Some(self.add(
-                        JournalObjectKind::Sequence,
-                        &JournalSequenceNode::Branch {
-                            children: children.to_vec(),
-                        },
-                    )),
+                    root: Some(
+                        self.add(
+                            JournalObjectKind::JsonBranch,
+                            &JournalJsonBranch(
+                                children
+                                    .iter()
+                                    .map(|child| {
+                                        JournalCompactObjectId::from_object(
+                                            child.root.as_ref().unwrap(),
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ),
                     len: children.iter().map(|child| child.len).sum(),
                     height: children[0].height + 1,
                 })
                 .collect();
         }
-        assert_eq!(trees.len(), 1);
-        trees.pop().unwrap()
+        let children = trees;
+        JournalJsonArray {
+            len: values.len() as u64,
+            height: children[0].height + 1,
+            node: JournalSequenceNode::JsonBranch {
+                children: children
+                    .iter()
+                    .map(|child| JournalCompactObjectId::from_object(child.root.as_ref().unwrap()))
+                    .collect(),
+            },
+        }
+    }
+
+    fn structured_item(&mut self, value: &serde_json::Value) -> JournalJsonItem {
+        if journal_json_can_inline(value).unwrap() {
+            JournalJsonItem::Inline {
+                value: value.clone(),
+            }
+        } else {
+            JournalJsonItem::Reference {
+                object: self.structured_json(value),
+            }
+        }
+    }
+
+    fn structured_array_item(&mut self, value: &serde_json::Value) -> JournalJsonItem {
+        if journal_json_can_inline(value).unwrap() {
+            JournalJsonItem::Reference {
+                object: self.add(
+                    JournalObjectKind::JsonInline,
+                    &JournalJsonInline(value.clone()),
+                ),
+            }
+        } else {
+            self.structured_item(value)
+        }
     }
 
     fn structured_entries(&mut self, items: Vec<JournalObjectId>) -> JournalSequence {
@@ -1983,20 +2049,14 @@ impl Assembler {
 
     fn structured_json(&mut self, value: &serde_json::Value) -> JournalObjectId {
         let node = match value {
-            serde_json::Value::Array(values) => {
-                let items = values
-                    .iter()
-                    .map(|value| self.structured_json(value))
-                    .collect();
-                JournalJsonValue::Array {
-                    items: self.structured_array(items),
-                }
-            }
+            serde_json::Value::Array(values) => JournalJsonValue::Array {
+                items: self.structured_array(values),
+            },
             serde_json::Value::Object(values) => {
                 let entries = values
                     .iter()
                     .map(|(key, value)| {
-                        let value = self.structured_json(value);
+                        let value = self.structured_item(value);
                         self.add(
                             JournalObjectKind::JsonObjectEntry,
                             &JournalJsonObjectEntry {
@@ -2296,5 +2356,167 @@ mod tests {
         );
         assert!(fixture.journal.read(&lease, &message).await.is_ok());
         fixture.journal.close(lease).await.unwrap();
+    }
+
+    /// Mirrors the runtime writer's boundary values: canonical sizes around
+    /// the 1,024-byte compact threshold, signed zero, arrays of 64/65/66/130
+    /// items, wide objects and tag-shaped data.
+    fn boundary_value() -> serde_json::Value {
+        use serde_json::{Value, json};
+        let ascii = |bytes: usize| Value::String("x".repeat(bytes - 2));
+        let mut map = serde_json::Map::new();
+        for bytes in [1_023, 1_024, 1_025] {
+            map.insert(format!("ascii-{bytes}"), ascii(bytes));
+        }
+        map.insert(
+            "escaped-1024".into(),
+            json!(format!("{}ab", "\"\\\n".repeat(170))),
+        );
+        map.insert("utf8-1024".into(), json!("é".repeat(511)));
+        map.insert("utf8-1026".into(), json!("é".repeat(512)));
+        map.insert("emoji-1023".into(), json!(format!("{}a", "😀".repeat(255))));
+        map.insert(
+            "emoji-1025".into(),
+            json!(format!("{}abc", "😀".repeat(255))),
+        );
+        map.insert("negative-zero".into(), json!(-0.0));
+        map.insert("zero".into(), json!(0.0));
+        map.insert("u64".into(), json!(u64::MAX));
+        map.insert("i64".into(), json!(i64::MIN));
+        for len in [64usize, 65, 66, 130] {
+            map.insert(
+                format!("array-{len}"),
+                Value::Array(
+                    (0..len)
+                        .map(|index| json!(format!("item-{index:024}")))
+                        .collect(),
+                ),
+            );
+        }
+        map.insert(
+            "boundary-array".into(),
+            json!([ascii(1_023), ascii(1_024), ascii(1_025), -0.0, {"": [0.0, -0.0]}]),
+        );
+        map.insert(
+            "small-wide-array".into(),
+            Value::Array((0..65).map(|index| json!(index)).collect()),
+        );
+        map.insert(
+            "wide-object".into(),
+            Value::Object(
+                (0..65)
+                    .map(|index| (format!("k{index:02}"), json!(index)))
+                    .collect(),
+            ),
+        );
+        map.insert("".into(), json!("empty key"));
+        map.insert(
+            "tag-shaped".into(),
+            json!({"storage": "inline", "value": {"storage": "reference", "object": "0".repeat(64)}}),
+        );
+        Value::Object(map)
+    }
+
+    /// The independent testkit assembler and the reference ordinary backend
+    /// (which encodes a bootstrap itself) store the Runtime-owned record
+    /// under the same object ID for boundary values.
+    #[tokio::test]
+    async fn the_testkit_and_reference_backend_encode_boundary_values_identically() {
+        use agent_runtime_core::journal::*;
+        use agent_runtime_core::store::{SessionSnapshot, VersionedSessionState};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("boundary-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let session = SessionId::new("boundary");
+        let state = VersionedSessionState::new(
+            super::RegistryRevision::new("previous-cache-state-1"),
+            boundary_value(),
+        )
+        .redaction_safe();
+        let snapshot = SessionSnapshot {
+            id: session.clone(),
+            history: Vec::new(),
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: Vec::new(),
+            extension_state: BTreeMap::from([(
+                RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                state.clone(),
+            )]),
+            updated: super::Timestamp(1),
+        };
+        let mut assembler = super::Assembler::default();
+        let expected = assembler.structured_cache(&state);
+        let mut roots = assembler.snapshot(&snapshot, 0);
+        roots.extensions = JournalMap {
+            root: Some(assembler.add(
+                JournalObjectKind::Map,
+                &JournalMapNode::Leaf {
+                    entries: vec![JournalMapEntry {
+                        key: RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                        value: expected.clone(),
+                    }],
+                },
+            )),
+            len: 1,
+            height: 0,
+        };
+        let lease = journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("boundary-open"),
+                    pin: JournalPinId::new("boundary-pin"),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap();
+        let boundary = JournalBoundary {
+            version: 1,
+            session: session.clone(),
+            turn: None,
+            checkpoint_sequence: 0,
+            planned_step_count: 0,
+        };
+        let mut commit = JournalCommit {
+            batch: JournalBatch {
+                session: session.clone(),
+                sequence: 1,
+                predecessor: None,
+                expected_revision: None,
+                writer_epoch: lease.writer_epoch().unwrap(),
+                operation: JournalOperationId::new("boundary"),
+                boundary: boundary.clone(),
+                snapshot: roots.clone(),
+                checkpoint: None,
+            },
+            digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+            objects: Vec::new(),
+            delta: JournalTransitionDelta {
+                boundary,
+                bootstrap: Some(Box::new(snapshot)),
+                history_append: Vec::new(),
+                usage_append: Vec::new(),
+                extension_updates: BTreeMap::new(),
+                extension_references: BTreeMap::new(),
+                manifests_append: Vec::new(),
+                manifest_references: Vec::new(),
+            },
+            checkpoint: None,
+        };
+        commit.digest = commit.input_digest().unwrap();
+        let head = journal.commit(&lease, commit).await.unwrap();
+        assert!(
+            head.snapshot.extensions == roots.extensions,
+            "the testkit and reference encoders disagree"
+        );
+        journal.close(lease).await.unwrap();
     }
 }

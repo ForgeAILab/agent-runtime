@@ -11,7 +11,10 @@ contain breaking changes and are coordinated with consumer proposals.
 
 - **Breaking:** the schema-4 journal vocabulary released in 0.5.0 grows so a
   native turn costs O(delta). `JournalObjectKind` gains `ExtensionReference`,
-  `ManifestReference`, `JsonValue` and `JsonObjectEntry`, and
+  `ManifestReference`, `JsonValue`, `JsonInline`, `JsonBranch` and
+  `JsonObjectEntry`, `JournalSequenceNode` gains `JsonLeaf`,
+  `JsonValueBranch` and `JsonBranch` (valid only below a persistent JSON
+  array; generic sequences reject them), and
   `JournalTransitionDelta` gains `extension_references` and
   `manifest_references`, so exhaustive matches and struct literals must add
   them. The native writer now sends the Runtime-owned
@@ -21,14 +24,20 @@ contain breaking changes and are coordinated with consumer proposals.
   under the same object IDs (`assert_ordinary_session_journal_conformance`
   now checks this; `assert_session_journal_conformance` checks that protected
   adapters admit and keep shared structured prefixes), and a
-  `JournalProjectionPolicy` that changes or omits
-  those records on a commit that references them rejects the commit.
+  `JournalProjectionPolicy` that changes or omits those records on a commit
+  that references them rejects the commit. Persistent JSON now uses
+  minimum-height arrays, typed compact values with a 1,024-byte threshold and
+  cached path/root encodings; this directly replaces the unreleased native
+  writer shape and adds no compatibility reader for it.
 
 ### Added
 
-- `RUNTIME_PREVIOUS_CACHE_NAMESPACE`, `JournalJsonValue`,
-  `JournalJsonObjectEntry`, `ReferencedSessionState`, `ReferencedTurnManifest`
-  and `InMemorySessionJournal::object_bytes`.
+- `RUNTIME_PREVIOUS_CACHE_NAMESPACE`, `JOURNAL_INLINE_JSON_MAX_BYTES`,
+  `journal_json_can_inline`, `JournalCompactObjectId`, `JournalJsonValue`,
+  `JournalJsonArray`, `JournalJsonBranch`, `JournalJsonInline`, `JournalJsonItem`,
+  `JournalJsonObjectEntry`, `ReferencedSessionState`, `ReferencedTurnManifest`,
+  `InMemorySessionJournal::object_bytes` and `journal_json_identical` (exact
+  JSON identity that distinguishes `0.0` from `-0.0`, for encoding caches).
 
 ### Fixed
 
