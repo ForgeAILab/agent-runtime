@@ -2223,3 +2223,132 @@ async fn review_crash_at_calling_model_resumes_the_frozen_request_like_legacy() 
         })
     }));
 }
+
+/// Review of U9 task 2.7: the persistent JSON spine only engages above
+/// `JOURNAL_FANOUT` (64) array items, so the empty-history scenarios above
+/// never decode it. These seed histories across the 64/128/256 boundaries.
+fn seeded_two_turns<const N: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!(
+                    "seeded secret message {index}"
+                ))
+            })
+            .collect();
+        let session = runtime
+            .start_session(StartSession::create(id, seed))
+            .await
+            .unwrap();
+        session
+            .run(UserInput::text("first secret input"))
+            .await
+            .unwrap();
+        let first = session.snapshot();
+        session.run(UserInput::text("second input")).await.unwrap();
+        let second = session.snapshot();
+        session.shutdown().await.unwrap();
+        vec![first, second]
+    })
+}
+
+fn seeded_tools<const N: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!("seeded tool message {index}"))
+            })
+            .collect();
+        let session = runtime
+            .start_session(StartSession::create(id, seed))
+            .await
+            .unwrap();
+        session.run(UserInput::text("use the tool")).await.unwrap();
+        let tool = session.snapshot();
+        session
+            .run_local_tool("echo", json!({"text": "local action"}), 5_000)
+            .await
+            .unwrap();
+        let local = session.snapshot();
+        session.shutdown().await.unwrap();
+        vec![tool, local]
+    })
+}
+
+fn longest_array(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(longest_array)
+            .max()
+            .unwrap_or(0)
+            .max(items.len()),
+        Value::Object(entries) => entries.values().map(longest_array).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Every ordinary barrier carried a cache record (and the last one a
+/// manifest) whose arrays are long enough to use the binary spine.
+#[track_caller]
+fn assert_spine_engaged(pair: &Pair, label: &str) {
+    let log = pair.native.ordinary.log.lock().unwrap();
+    let Some(Materialized::Snapshot(last)) = log.last() else {
+        panic!("{label}: no ordinary barrier");
+    };
+    let cache = &last.extension_state["runtime.core.previous_cache"];
+    assert!(
+        longest_array(&cache.value) > 64,
+        "{label}: cache record never reached the spine"
+    );
+    assert!(
+        last.manifests
+            .iter()
+            .any(|manifest| longest_array(&serde_json::to_value(manifest).unwrap()) > 64),
+        "{label}: no manifest reached the spine"
+    );
+}
+
+#[tokio::test]
+async fn review_spine_sized_histories_match_at_every_barrier_and_after_fresh_resume() {
+    // 70 crosses the 64-item leaf limit, 130 and 260 the 2^7 and 2^8 spine
+    // boundaries; every run compares each barrier and a fresh resume.
+    let runs: [(&str, Drive, Projection); 4] = [
+        ("seeded-70-identity", seeded_two_turns::<70>, identity),
+        ("seeded-70-redacted", seeded_two_turns::<70>, redact),
+        ("seeded-130-identity", seeded_two_turns::<130>, identity),
+        ("seeded-260-redacted", seeded_two_turns::<260>, redact),
+    ];
+    for (label, drive, projection) in runs {
+        let pair = equivalent(
+            label,
+            projection,
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive,
+            },
+            continue_phase(),
+        )
+        .await;
+        assert_spine_engaged(&pair, label);
+    }
+    let pair = equivalent(
+        "seeded-tools-130",
+        identity,
+        Phase {
+            provider: tool_provider,
+            configure: tools,
+            drive: seeded_tools::<130>,
+        },
+        continue_phase(),
+    )
+    .await;
+    assert_spine_engaged(&pair, "seeded-tools-130");
+}
