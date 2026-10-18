@@ -164,6 +164,15 @@ where
 
         let replay = fixture.journal.commit(&lease, commit).await.unwrap();
         assert_eq!(replay.revision, JournalRevision(1));
+        // The retry must have published, not merely answered from an
+        // idempotency record that outlived the failed transaction.
+        let observer = open_reader(&*fixture.journal, &session, None, "atomic-retry").await;
+        assert_eq!(observer.head(), Some(&replay), "retry did not publish");
+        assert!(
+            fixture.journal.read(&observer, &raw_message).await.is_ok(),
+            "retried commit's objects are not readable from its head"
+        );
+        fixture.journal.close(observer).await.unwrap();
         fixture.journal.close(lease).await.unwrap();
     }
 }
@@ -286,6 +295,14 @@ where
             .await
             .unwrap_err(),
     );
+    // Objects the later commit supplied are outside the old pin as well.
+    assert_conflict(
+        fixture
+            .journal
+            .read(&pinned, &second_message)
+            .await
+            .unwrap_err(),
+    );
 
     let first_root = JournalObject::encode(JournalObjectKind::Head, &first_head)
         .unwrap()
@@ -317,6 +334,49 @@ where
         fixture
             .journal
             .read(&retained, &second_head.batch)
+            .await
+            .unwrap_err(),
+    );
+    assert_conflict(
+        fixture
+            .journal
+            .read(&retained, &second_message)
+            .await
+            .unwrap_err(),
+    );
+    // A retained root is a read pin, never a fenced writer selection.
+    assert_conflict(
+        fixture
+            .journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Retained {
+                        root: first_root.clone(),
+                    },
+                    expected_revision: Some(first_head.revision),
+                    operation: JournalOperationId::new("retained-writer-open"),
+                    pin: JournalPinId::new("retained-writer-pin"),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap_err(),
+    );
+    // Open refuses a revision the selected root does not have.
+    assert_conflict(
+        fixture
+            .journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: Some(first_head.revision),
+                    operation: JournalOperationId::new("stale-expected-open"),
+                    pin: JournalPinId::new("stale-expected-pin"),
+                    intent: JournalOpenIntent::ReadOnly,
+                },
+            )
             .await
             .unwrap_err(),
     );
@@ -358,6 +418,11 @@ where
     fixture.journal.close(retained).await.unwrap();
     fixture.journal.close(pinned).await.unwrap();
     fixture.journal.close(writer).await.unwrap();
+
+    // Close releases the pin identity; the same pin can be opened again.
+    let reopened = open_reader(&*fixture.journal, &session, None, "old-root").await;
+    assert_eq!(reopened.head(), Some(&second_head));
+    fixture.journal.close(reopened).await.unwrap();
 }
 
 async fn assert_writer_fences<F, Fut>(factory: &F)
@@ -567,6 +632,46 @@ where
             .await
             .unwrap_err(),
     );
+    let mut ahead = candidate.clone();
+    ahead.batch.expected_revision = Some(JournalRevision(head.revision.0 + 1));
+    ahead.digest = ahead.input_digest().unwrap();
+    assert_conflict(
+        stale_fixture
+            .journal
+            .commit(&lease, ahead)
+            .await
+            .unwrap_err(),
+    );
+    let mut forked = candidate.clone();
+    forked.batch.predecessor = Some(zero_digest());
+    forked.digest = forked.input_digest().unwrap();
+    assert_conflict(
+        stale_fixture
+            .journal
+            .commit(&lease, forked)
+            .await
+            .unwrap_err(),
+    );
+    // A different payload offered under an ID the store already holds.
+    let one = JournalObject::encode(JournalObjectKind::Message, &Message::user("one"))
+        .unwrap()
+        .id;
+    let two = JournalObject::encode(JournalObjectKind::Message, &Message::user("two")).unwrap();
+    let mut reused = candidate.clone();
+    reused
+        .objects
+        .iter_mut()
+        .find(|object| object.id == one)
+        .unwrap()
+        .bytes = two.bytes.clone();
+    reused.digest = reused.input_digest().unwrap();
+    assert_conflict(
+        stale_fixture
+            .journal
+            .commit(&lease, reused)
+            .await
+            .unwrap_err(),
+    );
     let mut backwards = candidate;
     backwards.batch.sequence = head.batch_sequence;
     backwards.digest = backwards.input_digest().unwrap();
@@ -658,6 +763,71 @@ where
             .unwrap_err(),
     );
     checkpoint_fixture.journal.close(lease).await.unwrap();
+
+    // Knowing another session's object ID is not a reference grant: a commit
+    // that names it without supplying its bytes publishes a missing object.
+    let foreign_fixture = factory().await;
+    let owner = SessionId::new("foreign-owner");
+    let lease = open_writer(&*foreign_fixture.journal, &owner, None, "foreign-owner").await;
+    let (owned, secret) = bootstrap_commit(
+        owner.clone(),
+        lease.writer_epoch().unwrap(),
+        "foreign-owner-create",
+        "owner secret",
+    );
+    foreign_fixture.journal.commit(&lease, owned).await.unwrap();
+    foreign_fixture.journal.close(lease).await.unwrap();
+    let thief = SessionId::new("foreign-thief");
+    let lease = open_writer(&*foreign_fixture.journal, &thief, None, "foreign-thief").await;
+    let (mut stolen, stolen_id) = bootstrap_commit(
+        thief.clone(),
+        lease.writer_epoch().unwrap(),
+        "foreign-thief-create",
+        "owner secret",
+    );
+    assert_eq!(stolen_id, secret);
+    stolen.objects.retain(|object| object.id != secret);
+    stolen.digest = stolen.input_digest().unwrap();
+    assert_conflict(
+        foreign_fixture
+            .journal
+            .commit(&lease, stolen)
+            .await
+            .unwrap_err(),
+    );
+    assert_conflict(
+        foreign_fixture
+            .journal
+            .read(&lease, &secret)
+            .await
+            .unwrap_err(),
+    );
+    foreign_fixture.journal.close(lease).await.unwrap();
+
+    // Missing objects below the referenced checkpoint are refused too.
+    let closure_fixture = factory().await;
+    let session = SessionId::new("checkpoint-closure");
+    let lease = open_writer(&*closure_fixture.journal, &session, None, "closure").await;
+    let mut partial = checkpoint_commit(
+        session.clone(),
+        lease.writer_epoch().unwrap(),
+        None,
+        "checkpoint-closure",
+        1,
+        1,
+    );
+    partial
+        .objects
+        .retain(|object| object.kind().ok() != Some(JournalObjectKind::StateValue));
+    partial.digest = partial.input_digest().unwrap();
+    assert_conflict(
+        closure_fixture
+            .journal
+            .commit(&lease, partial)
+            .await
+            .unwrap_err(),
+    );
+    closure_fixture.journal.close(lease).await.unwrap();
 
     // The checkpoint sequence is monotonic for the whole session, not just
     // relative to the current head: a checkpoint-less protected boundary in
@@ -1382,6 +1552,10 @@ impl Assembler {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "journal_broken.rs"]
+mod broken_backends;
 
 #[cfg(test)]
 mod tests {

@@ -17,6 +17,8 @@ use super::SessionJournalConformanceFixture;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Break {
+    /// Control: breaks nothing, so the wrapper itself is shown transparent.
+    Transparent,
     /// Physical steps are not atomic: every injected cut leaves the head,
     /// pins and idempotency record visible, as if published before failing.
     PublishBeforeCut,
@@ -92,7 +94,11 @@ impl Broken {
     }
 
     fn resolve_foreign(&self, commit: &mut JournalCommit) {
-        let supplied: BTreeSet<_> = commit.objects.iter().map(|object| object.id.clone()).collect();
+        let supplied: BTreeSet<_> = commit
+            .objects
+            .iter()
+            .map(|object| object.id.clone())
+            .collect();
         let known = self.objects.lock().unwrap().clone();
         let mut referenced = Vec::new();
         for object in &commit.objects {
@@ -251,7 +257,10 @@ fn fabricated_head(storage_id: &JournalStorageId, commit: &JournalCommit) -> Jou
 
 async fn suite_rejects<Fut: std::future::Future<Output = ()>>(scenario: Fut) {
     let outcome = AssertUnwindSafe(scenario).catch_unwind().await;
-    assert!(outcome.is_err(), "the conformance suite accepted a broken backend");
+    assert!(
+        outcome.is_err(),
+        "the conformance suite accepted a broken backend"
+    );
 }
 
 #[tokio::test]
@@ -311,8 +320,9 @@ async fn suite_rejects_unverified_object_reuse() {
 }
 
 #[tokio::test]
-async fn suite_accepts_the_reference_through_the_same_wrapper() {
-    // Control: the wrapper itself is transparent when nothing is broken in
-    // the paths each scenario exercises, so a rejection above is the defect.
-    super::assert_session_journal_conformance(|| async { super::reference_fixture() }).await;
+async fn suite_accepts_the_transparent_wrapper() {
+    // Control: the wrapper breaking nothing passes, so each rejection above
+    // is caused by its one defect and not by the wrapper.
+    super::assert_session_journal_conformance(|| async { Broken::fixture(Break::Transparent) })
+        .await;
 }
