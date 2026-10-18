@@ -1012,7 +1012,23 @@ async fn supervise_attempt(
     // more before publishing the terminal so normal completion cannot orphan
     // adapter-owned work.
     terminate_group(&mut child, limits.cleanup_timeout).await;
-    finish_drain(&mut stderr_drain, limits.cleanup_timeout).await;
+    // A drain that cannot finish within the cleanup bound (e.g. a leaked
+    // descendant still holds stderr) leaves overflow unknown; keep the
+    // terminal as before rather than failing a completed attempt.
+    let stderr_outcome = finish_drain_outcome(&mut stderr_drain, limits.cleanup_timeout)
+        .await
+        .unwrap_or(StderrDrainOutcome::WithinLimit);
+    if stderr_outcome == StderrDrainOutcome::LimitExceeded {
+        send_error(
+            &events,
+            provider_error(
+                ProviderErrorKind::MalformedStream,
+                "command provider stderr exceeded its configured bound",
+            ),
+        )
+        .await;
+        return;
+    }
     match terminal {
         ProviderStreamEvent::Error { error } => send_error(&events, error).await,
         terminal if status.success() => {
@@ -1157,27 +1173,49 @@ fn is_terminal(event: &ProviderStreamEvent) -> bool {
     )
 }
 
-async fn drain_stderr(mut stderr: ChildStderr, bound: usize, exceeded: Arc<Notify>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StderrDrainOutcome {
+    WithinLimit,
+    LimitExceeded,
+}
+
+async fn drain_stderr(
+    mut stderr: ChildStderr,
+    bound: usize,
+    limit_signal: Arc<Notify>,
+) -> StderrDrainOutcome {
     let mut chunk = [0_u8; 8192];
     let mut total = 0_usize;
-    let mut notified = false;
+    let mut outcome = StderrDrainOutcome::WithinLimit;
     loop {
         match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return outcome,
             Ok(read) => {
                 total = total.saturating_add(read);
-                if total > bound && !notified {
-                    notified = true;
-                    exceeded.notify_one();
+                if total > bound && outcome == StderrDrainOutcome::WithinLimit {
+                    outcome = StderrDrainOutcome::LimitExceeded;
+                    limit_signal.notify_one();
                 }
             }
         }
     }
 }
 
-async fn finish_drain(task: &mut tokio::task::JoinHandle<()>, timeout: Duration) {
-    if tokio::time::timeout(timeout, &mut *task).await.is_err() {
-        task.abort();
+async fn finish_drain(task: &mut tokio::task::JoinHandle<StderrDrainOutcome>, timeout: Duration) {
+    let _ = finish_drain_outcome(task, timeout).await;
+}
+
+async fn finish_drain_outcome(
+    task: &mut tokio::task::JoinHandle<StderrDrainOutcome>,
+    timeout: Duration,
+) -> Option<StderrDrainOutcome> {
+    match tokio::time::timeout(timeout, &mut *task).await {
+        Ok(Ok(outcome)) => Some(outcome),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            task.abort();
+            None
+        }
     }
 }
 
@@ -1286,7 +1324,12 @@ async fn run_probe(
         }
     };
     terminate_group(&mut child, process.limits.cleanup_timeout).await;
-    finish_drain(&mut stderr_drain, process.limits.cleanup_timeout).await;
+    let stderr_outcome = finish_drain_outcome(&mut stderr_drain, process.limits.cleanup_timeout)
+        .await
+        .unwrap_or(StderrDrainOutcome::WithinLimit);
+    if stderr_outcome == StderrDrainOutcome::LimitExceeded {
+        return Err(CommandPreflightError::OutputLimit);
+    }
     if !status.success() {
         return Err(CommandPreflightError::UnsuccessfulExit);
     }

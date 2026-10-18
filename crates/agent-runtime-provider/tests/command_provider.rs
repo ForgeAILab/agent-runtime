@@ -42,12 +42,44 @@ impl CommandOutputDecoder for JsonLinesDecoder {
 }
 
 #[derive(Debug)]
+struct CoordinatedJsonLinesDecoder {
+    release_child: PathBuf,
+    child_wrote_stderr: PathBuf,
+}
+
+impl CommandOutputDecoder for CoordinatedJsonLinesDecoder {
+    fn decode_frame(&mut self, frame: &[u8]) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+        let events = JsonLinesDecoder.decode_frame(frame)?;
+        std::fs::write(&self.release_child, b"ready").map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Server,
+                "fixture could not release the command child",
+            )
+        })?;
+        for _ in 0..200 {
+            if self.child_wrote_stderr.exists() {
+                // Keep the single-thread runtime occupied until the child has
+                // exited, leaving the stderr drain runnable but unpolled.
+                std::thread::sleep(Duration::from_millis(100));
+                return Ok(events);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Err(ProviderError::new(
+            ProviderErrorKind::Server,
+            "fixture child did not publish its stderr write",
+        ))
+    }
+}
+
+#[derive(Debug)]
 struct FixtureAdapter {
     capabilities: Capabilities,
     stdin: Vec<u8>,
     prepares: Arc<AtomicUsize>,
     probe: bool,
     vendor_extensions: bool,
+    decoder_coordination: Option<(PathBuf, PathBuf)>,
 }
 
 impl FixtureAdapter {
@@ -58,6 +90,7 @@ impl FixtureAdapter {
             prepares: Arc::new(AtomicUsize::new(0)),
             probe: false,
             vendor_extensions: false,
+            decoder_coordination: None,
         }
     }
 
@@ -68,6 +101,15 @@ impl FixtureAdapter {
 
     fn with_probe(mut self) -> Self {
         self.probe = true;
+        self
+    }
+
+    fn with_decoder_coordination(
+        mut self,
+        release_child: PathBuf,
+        child_wrote_stderr: PathBuf,
+    ) -> Self {
+        self.decoder_coordination = Some((release_child, child_wrote_stderr));
         self
     }
 }
@@ -88,11 +130,16 @@ impl CommandAdapter for FixtureAdapter {
         _context: &ProviderCallContext,
     ) -> Result<CommandAttempt, ProviderError> {
         self.prepares.fetch_add(1, Ordering::SeqCst);
-        Ok(CommandAttempt::new(
-            Vec::new(),
-            self.stdin.clone(),
-            Box::new(JsonLinesDecoder),
-        ))
+        let decoder: Box<dyn CommandOutputDecoder> =
+            if let Some((release_child, child_wrote_stderr)) = &self.decoder_coordination {
+                Box::new(CoordinatedJsonLinesDecoder {
+                    release_child: release_child.clone(),
+                    child_wrote_stderr: child_wrote_stderr.clone(),
+                })
+            } else {
+                Box::new(JsonLinesDecoder)
+            };
+        Ok(CommandAttempt::new(Vec::new(), self.stdin.clone(), decoder))
     }
 
     fn accepts_vendor_extensions(&self) -> bool {
@@ -446,6 +493,42 @@ async fn output_bounds_nonzero_exit_and_stderr_are_safe() {
         Some(ProviderStreamEvent::Error { error })
             if error.kind == ProviderErrorKind::RateLimited && error.retryable
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stderr_overflow_after_stdout_completion_is_terminal() {
+    let release_child = temporary_path("release-stderr-writer");
+    let child_wrote_stderr = temporary_path("stderr-write-complete");
+    let script = format!(
+        "{}; exec 1>&-; i=0; while [ ! -f '{}' ] && [ \"$i\" -lt 200 ]; do i=$((i + 1)); /bin/sleep 0.01; done; test -f '{}' || exit 9; printf '%s' '{}' >&2; printf done > '{}'; exit 7",
+        shell_script(&[r#"{"type":"finish","reason":"stop"}"#]),
+        release_child.display(),
+        release_child.display(),
+        "stderr-secret".repeat(16),
+        child_wrote_stderr.display(),
+    );
+    let provider = command_provider(
+        script,
+        Arc::new(
+            FixtureAdapter::new(capabilities(false))
+                .with_decoder_coordination(release_child.clone(), child_wrote_stderr.clone()),
+        ),
+        CommandLimits::default()
+            .with_max_stderr_bytes(16)
+            .expect("valid stderr bound"),
+    );
+
+    let events = collect(&provider, request()).await;
+    let debug = format!("{events:?}");
+    let _ = std::fs::remove_file(release_child);
+    let _ = std::fs::remove_file(child_wrote_stderr);
+
+    assert!(matches!(
+        events.last(),
+        Some(ProviderStreamEvent::Error { error })
+            if error.kind == ProviderErrorKind::MalformedStream
+    ));
+    assert!(!debug.contains("stderr-secret"));
 }
 
 #[tokio::test]

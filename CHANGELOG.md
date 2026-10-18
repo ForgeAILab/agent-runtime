@@ -7,6 +7,10 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- Command providers now report stderr overflow deterministically even when stdout and the child process finish first.
+
 ## [0.5.0] - 2026-10-16
 
 ### Added
