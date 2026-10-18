@@ -13,6 +13,7 @@ pub(crate) mod fork;
 pub mod goal;
 pub(crate) mod history;
 pub mod inject;
+pub(crate) mod journal;
 pub(crate) mod manifests;
 pub mod session;
 pub mod state;

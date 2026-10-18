@@ -20,6 +20,10 @@ use agent_runtime::core::content::{ContentPart, Message, UserInput};
 use agent_runtime::core::error::RuntimeError;
 use agent_runtime::core::event::TurnFinish;
 use agent_runtime::core::ids::{SessionId, TurnId};
+use agent_runtime::core::journal::{
+    IdentityJournalProjection, InMemorySessionJournal, JournalCommitFailurePoint, JournalStorageId,
+    SessionJournal,
+};
 use agent_runtime::core::manifest::LosslessSummaryProducer;
 use agent_runtime::core::store::{
     SessionSnapshot, SessionStateSensitivity, SessionStore, VersionedSessionState,
@@ -57,6 +61,28 @@ struct SessionFixtureStore {
     save_attempts: AtomicUsize,
     fail_on_save_attempt: AtomicUsize,
     fail_next_save: AtomicBool,
+}
+
+#[derive(Debug)]
+struct NativeSessionFixtureStore {
+    journal: Arc<InMemorySessionJournal>,
+    legacy_saves: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionStore for NativeSessionFixtureStore {
+    fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
+        Some(self.journal.clone())
+    }
+
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        Ok(None)
+    }
+
+    async fn save(&self, _: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.legacy_saves.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl SessionFixtureStore {
@@ -1111,6 +1137,26 @@ fn runtime(
     builder.build().expect("runtime builds")
 }
 
+fn runtime_with_session_store(
+    provider: Arc<FakeProvider>,
+    sessions: Arc<dyn SessionStore>,
+    coordinator: Arc<LcmCoordinator>,
+) -> Runtime {
+    RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+        .provider(provider)
+        .model_profile(
+            agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                "fake",
+                agent_runtime::core::provider::ModelId::new("fake"),
+                agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+            ),
+        )
+        .session_store(sessions)
+        .lcm(coordinator)
+        .build()
+        .expect("runtime builds")
+}
+
 fn runtime_with_checkpoints(
     provider: Arc<FakeProvider>,
     sessions: Arc<SessionFixtureStore>,
@@ -1788,6 +1834,92 @@ async fn idle_compaction_saves_pending_before_one_model_and_one_cas() {
 }
 
 #[tokio::test]
+async fn native_idle_compaction_preserves_two_pass_barriers_and_resumes() {
+    let session_id = SessionId::new("native-idle-compaction-two-pass");
+    let journal = Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new("native-idle-compaction"),
+        Arc::new(IdentityJournalProjection),
+    ));
+    let sessions = Arc::new(NativeSessionFixtureStore {
+        journal,
+        legacy_saves: AtomicUsize::new(0),
+    });
+    let lcm_store = Arc::new(LcmFixtureStore::new(LcmTimelineId::new(TIMELINE_ID)));
+    let model = Arc::new(CountingSummaryModel::new());
+    let coordinator = hard_pressure_coordinator(&session_id, lcm_store.clone(), model.clone());
+    let provider = Arc::new(FakeProvider::text_reply("must not run"));
+    let runtime =
+        runtime_with_session_store(provider.clone(), sessions.clone(), coordinator.clone());
+    let history = idle_history();
+    let session = runtime
+        .start_session(StartSession::create(session_id.clone(), history.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.try_idle_compaction().await.unwrap(),
+        agent_runtime::runtime::IdleCompactionAdmission::Accepted { .. }
+    ));
+    assert_eq!(model.calls(), 1);
+    assert_eq!(lcm_store.node_count(), 1);
+    assert!(provider.requests().is_empty());
+    assert_eq!(session.history(), history);
+    let expected = session.snapshot();
+    session.shutdown().await.unwrap();
+    drop(runtime);
+
+    let restarted = runtime_with_session_store(provider, sessions.clone(), coordinator);
+    let resumed = restarted
+        .start_session(StartSession::resume(session_id))
+        .await
+        .unwrap();
+    assert_eq!(resumed.history(), expected.history);
+    assert_eq!(resumed.snapshot().usage, expected.usage);
+    assert_eq!(model.calls(), 1, "idle recovery repeated summary work");
+    assert_eq!(lcm_store.node_count(), 1);
+    resumed.shutdown().await.unwrap();
+    assert_eq!(sessions.legacy_saves.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn native_idle_stage_failure_precedes_cas_and_rolls_back_memory() {
+    let session_id = SessionId::new("native-idle-compaction-failure");
+    let journal = Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new("native-idle-compaction-failure"),
+        Arc::new(IdentityJournalProjection),
+    ));
+    let sessions = Arc::new(NativeSessionFixtureStore {
+        journal: journal.clone(),
+        legacy_saves: AtomicUsize::new(0),
+    });
+    let lcm_store = Arc::new(LcmFixtureStore::new(LcmTimelineId::new(TIMELINE_ID)));
+    let model = Arc::new(CountingSummaryModel::new());
+    let coordinator = hard_pressure_coordinator(&session_id, lcm_store.clone(), model.clone());
+    let runtime = runtime_with_session_store(
+        Arc::new(FakeProvider::text_reply("must not run")),
+        sessions.clone(),
+        coordinator,
+    );
+    let session = runtime
+        .start_session(StartSession::create(session_id, idle_history()))
+        .await
+        .unwrap();
+    journal
+        .fail_next_commit_at(JournalCommitFailurePoint::AfterObjects)
+        .unwrap();
+    assert!(session.try_idle_compaction().await.is_err());
+    assert_eq!(model.calls(), 1);
+    assert_eq!(lcm_store.node_count(), 0);
+    assert!(
+        !session
+            .snapshot()
+            .extension_state
+            .contains_key(LCM_COMPONENT_ID)
+    );
+    assert_eq!(sessions.legacy_saves.load(Ordering::Relaxed), 0);
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn idle_save_failure_before_cas_leaves_no_node_or_pending_memory() {
     let session_id = SessionId::new("idle-compaction-save-before-cas");
     let sessions = Arc::new(SessionFixtureStore::default());
@@ -2072,5 +2204,92 @@ async fn audit_idle_checkpoint_failure_rolls_back_pending_memory() {
     assert!(
         snapshot.usage.records().is_empty(),
         "unsaved usage must roll back"
+    );
+}
+
+/// Idle compaction with BOTH stores configured crosses the exact idle
+/// checkpoint pass and then the ordinary pass. Native and legacy must publish
+/// the same materialized boundaries, and a fresh runtime must resume the
+/// compacted session without repeating summary work.
+#[tokio::test]
+async fn review_native_two_store_idle_compaction_matches_legacy_barriers() {
+    use crate::session_journal_equivalence::{Pair, identity};
+    let session_id = SessionId::new("review-idle-two-stores");
+    let pair = Pair::new(identity);
+    let mut snapshots = Vec::new();
+    for native in [false, true] {
+        let (sessions, checkpoints): (Arc<dyn SessionStore>, Arc<dyn CheckpointStore>) = if native {
+            (pair.native.clone(), pair.native.clone())
+        } else {
+            (
+                pair.legacy_sessions.clone(),
+                pair.legacy_checkpoints.clone(),
+            )
+        };
+        let lcm_store = Arc::new(LcmFixtureStore::new(LcmTimelineId::new(TIMELINE_ID)));
+        let model = Arc::new(CountingSummaryModel::new());
+        let coordinator = hard_pressure_coordinator(&session_id, lcm_store.clone(), model.clone());
+        let build = |coordinator: Arc<LcmCoordinator>| {
+            RuntimeBuilder::new(agent_runtime::core::provider::ModelId::new("fake"))
+                .provider(Arc::new(FakeProvider::text_reply("turn answer")))
+                .model_profile(
+                    agent_runtime::core::catalog::ResolvedModelProfile::explicit(
+                        "fake",
+                        agent_runtime::core::provider::ModelId::new("fake"),
+                        agent_runtime::core::catalog::ModelLimits::new(128_000, 128_000, 4_096),
+                    ),
+                )
+                .clock(Arc::new(crate::session_journal_equivalence::FixedClock))
+                .session_store(sessions.clone())
+                .checkpoint_store(checkpoints.clone())
+                .lcm(coordinator)
+                .build()
+                .expect("runtime builds")
+        };
+        let runtime = build(coordinator.clone());
+        let session = runtime
+            .start_session(StartSession::create(session_id.clone(), idle_history()))
+            .await
+            .unwrap();
+        session
+            .run(UserInput::text("one turn first"))
+            .await
+            .unwrap();
+        let admission = session.try_idle_compaction().await.unwrap();
+        let calls = model.calls();
+        let nodes = lcm_store.node_count();
+        let live = session.snapshot();
+        session.shutdown().await.unwrap();
+        drop(runtime);
+        if native {
+            pair.crash(&session_id);
+        }
+
+        let restarted = build(coordinator);
+        let resumed = restarted
+            .start_session(StartSession::resume(session_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(model.calls(), calls, "resume repeated summary work");
+        assert_eq!(lcm_store.node_count(), nodes);
+        snapshots.push((format!("{admission:?}"), live, resumed.snapshot()));
+        resumed.shutdown().await.unwrap();
+    }
+    pair.assert_barriers_match("idle-two-stores");
+    let native = snapshots.pop().unwrap();
+    let legacy = snapshots.pop().unwrap();
+    assert_eq!(native.0, legacy.0);
+    crate::session_journal_equivalence::assert_same(&native.1, &legacy.1, "idle live");
+    crate::session_journal_equivalence::assert_same(&native.2, &legacy.2, "idle resumed");
+    assert!(
+        pair.legacy_checkpoints
+            .log
+            .lock()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair[0].turn == pair[1].turn
+                && pair[0].state.is_terminal()
+                && pair[1].state_revision > pair[0].state_revision),
+        "the exact idle pass never ran"
     );
 }

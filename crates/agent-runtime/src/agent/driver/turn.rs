@@ -245,8 +245,8 @@ impl<'a> TurnMachine<'a> {
                 "accepted checkpoint already exists for this turn",
             ));
         }
-        let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
-            match store.load_latest(self.emitter.session()).await? {
+        let checkpoint_sequence = if self.execution.persistence.has_checkpoint_store() {
+            match self.execution.persistence.latest_checkpoint().await? {
                 None => 1,
                 Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
                     previous.watermark.checkpoint_sequence.saturating_add(1)
@@ -270,8 +270,11 @@ impl<'a> TurnMachine<'a> {
             self.emitter.next_sequence(),
             self.driver.clock.now(),
         )?;
-        if let Some(store) = &self.driver.checkpoint_store {
-            store.save(&checkpoint).await?;
+        if self.execution.persistence.has_checkpoint_store() {
+            self.execution
+                .persistence
+                .save_checkpoint(&checkpoint)
+                .await?;
         }
         self.checkpoint = Some(checkpoint);
         Ok(())
@@ -288,8 +291,8 @@ impl<'a> TurnMachine<'a> {
                 "accepted checkpoint already exists for this turn",
             ));
         }
-        let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
-            match store.load_latest(self.emitter.session()).await? {
+        let checkpoint_sequence = if self.execution.persistence.has_checkpoint_store() {
+            match self.execution.persistence.latest_checkpoint().await? {
                 None => 1,
                 Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
                     previous.watermark.checkpoint_sequence.saturating_add(1)
@@ -313,8 +316,11 @@ impl<'a> TurnMachine<'a> {
             self.emitter.next_sequence(),
             self.driver.clock.now(),
         )?;
-        if let Some(store) = &self.driver.checkpoint_store {
-            store.save(&checkpoint).await?;
+        if self.execution.persistence.has_checkpoint_store() {
+            self.execution
+                .persistence
+                .save_checkpoint(&checkpoint)
+                .await?;
         }
         self.checkpoint = Some(checkpoint);
         Ok(())
@@ -331,8 +337,8 @@ impl<'a> TurnMachine<'a> {
                 "local-action checkpoint already exists for this turn",
             ));
         }
-        let checkpoint_sequence = if let Some(store) = &self.driver.checkpoint_store {
-            match store.load_latest(self.emitter.session()).await? {
+        let checkpoint_sequence = if self.execution.persistence.has_checkpoint_store() {
+            match self.execution.persistence.latest_checkpoint().await? {
                 None => 1,
                 Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
                     previous.watermark.checkpoint_sequence.saturating_add(1)
@@ -356,8 +362,11 @@ impl<'a> TurnMachine<'a> {
             self.emitter.next_sequence(),
             self.driver.clock.now(),
         )?;
-        if let Some(store) = &self.driver.checkpoint_store {
-            store.save(&checkpoint).await?;
+        if self.execution.persistence.has_checkpoint_store() {
+            self.execution
+                .persistence
+                .save_checkpoint(&checkpoint)
+                .await?;
         }
         self.checkpoint = Some(checkpoint);
         Ok(())
@@ -411,8 +420,8 @@ impl<'a> TurnMachine<'a> {
         if next.state_revision == current.state_revision {
             return Ok(());
         }
-        if let Some(store) = &self.driver.checkpoint_store {
-            store.save(&next).await?;
+        if self.execution.persistence.has_checkpoint_store() {
+            self.execution.persistence.save_checkpoint(&next).await?;
         }
         self.checkpoint = Some(next);
         Ok(())
@@ -446,14 +455,17 @@ impl<'a> TurnMachine<'a> {
         // the immutable store. Save its canonical source first, so a crash
         // after that append can use the existing exact append-successor proof
         // rather than losing a hard-admitted turn's response/history.
-        if self.ordinary_lcm_hard_admitted {
-            if let Some(store) = &self.driver.session_store {
-                let persist_gate = self.execution.persist_gate();
-                let _persist_gate = persist_gate.lock().await;
-                if let Err(error) = store.save(&self.snapshot()).await {
-                    self.emit_non_durable_failure(error, visible_output);
-                    return;
-                }
+        if self.ordinary_lcm_hard_admitted && self.execution.persistence.has_session_store() {
+            let persist_gate = self.execution.persist_gate();
+            let _persist_gate = persist_gate.lock().await;
+            if let Err(error) = self
+                .execution
+                .persistence
+                .save_snapshot(&self.snapshot())
+                .await
+            {
+                self.emit_non_durable_failure(error, visible_output);
+                return;
             }
         }
 
@@ -494,8 +506,13 @@ impl<'a> TurnMachine<'a> {
         let persist_gate = self.execution.persist_gate();
         let _persist_gate = persist_gate.lock().await;
         let terminal_snapshot = self.snapshot();
-        if let Some(store) = &self.driver.session_store {
-            if let Err(error) = store.save(&terminal_snapshot).await {
+        if self.execution.persistence.has_session_store() {
+            if let Err(error) = self
+                .execution
+                .persistence
+                .save_snapshot(&terminal_snapshot)
+                .await
+            {
                 // TurnCompleted was published exactly once in this process.
                 // Keep PublishingTerminal recoverable and report the failed
                 // durability barrier without emitting a second terminal.
@@ -676,20 +693,22 @@ impl<'a> TurnMachine<'a> {
             self.emitter
                 .emit(Some(self.turn_id.clone()), event.into_runtime_event());
         }
-        if self.driver.checkpoint_store.is_none()
+        if !self.execution.persistence.has_checkpoint_store()
             && (retry_admission || self.ordinary_lcm_intent_saved)
+            && self.execution.persistence.has_session_store()
         {
-            if let Some(store) = &self.driver.session_store {
-                // Publish each Sensitive intent before its CAS, and its
-                // finalized successor before provider admission. Until the
-                // save succeeds, the preceding saved intent remains exact
-                // crash-recovery proof for any already committed mutation.
-                let persist_gate = self.execution.persist_gate();
-                let _persist_gate = persist_gate.lock().await;
-                store.save(&self.snapshot()).await?;
-                self.ordinary_lcm_intent_saved = retry_admission;
-                self.ordinary_lcm_hard_admitted = true;
-            }
+            // Publish each Sensitive intent before its CAS, and its
+            // finalized successor before provider admission. Until the
+            // save succeeds, the preceding saved intent remains exact
+            // crash-recovery proof for any already committed mutation.
+            let persist_gate = self.execution.persist_gate();
+            let _persist_gate = persist_gate.lock().await;
+            self.execution
+                .persistence
+                .save_snapshot(&self.snapshot())
+                .await?;
+            self.ordinary_lcm_intent_saved = retry_admission;
+            self.ordinary_lcm_hard_admitted = true;
         }
         if let Some(error) = blocked {
             // A blocked admission must cross the protected Planning
@@ -1555,7 +1574,7 @@ impl<'a> TurnMachine<'a> {
                         // persists an exchange every later turn is rejected
                         // for. A checkpointed host closes them when it
                         // finalizes or recovers the interrupted checkpoint.
-                        if self.driver.checkpoint_store.is_none() {
+                        if !self.execution.persistence.has_checkpoint_store() {
                             if let Some(checkpoint) = self.checkpoint.clone() {
                                 self.close_unanswered_tool_calls(
                                     &checkpoint,

@@ -327,10 +327,11 @@ impl SessionHandle {
     /// gate. Cache dispatch uses this to keep reservation, result reduction,
     /// and protected checkpoint publication in one serialized interval.
     pub(crate) async fn persist_locked(&self) -> Result<(), RuntimeError> {
-        match &self.inner.shared.session_store {
-            Some(store) => store.save(&self.snapshot()).await,
-            None => Ok(()),
-        }
+        self.inner
+            .execution
+            .persistence
+            .save_snapshot(&self.snapshot())
+            .await
     }
 
     /// Applies runtime-owned extension updates and persists one snapshot as a
@@ -343,9 +344,9 @@ impl SessionHandle {
         updates: impl IntoIterator<Item = (String, VersionedSessionState)>,
     ) -> Result<(), RuntimeError> {
         let _persist_gate = self.inner.persist_gate.lock().await;
-        let Some(store) = self.inner.shared.session_store.as_ref() else {
+        if !self.inner.execution.persistence.has_session_store() {
             return Ok(());
-        };
+        }
         let updates = updates.into_iter().collect::<Vec<_>>();
         let previous = {
             let mut extensions = self
@@ -363,7 +364,12 @@ impl SessionHandle {
             }
             previous
         };
-        let result = store.save(&self.snapshot()).await;
+        let result = self
+            .inner
+            .execution
+            .persistence
+            .save_snapshot(&self.snapshot())
+            .await;
         if result.is_err() {
             let mut extensions = self
                 .inner
@@ -471,12 +477,15 @@ impl SessionHandle {
 
         self.inner.emitter.emit(None, RuntimeEvent::SessionShutdown);
         let _persist_gate = self.inner.persist_gate.lock().await;
-        let save_result = match &self.inner.shared.session_store {
-            Some(store) => store.save(&self.snapshot()).await,
-            None => Ok(()),
-        };
+        let save_result = self
+            .inner
+            .execution
+            .persistence
+            .save_snapshot(&self.snapshot())
+            .await;
+        let close_result = self.inner.execution.persistence.close().await;
         *shutdown_complete = true;
         self.inner.active_session_lease.release();
-        save_result
+        save_result.and(close_result)
     }
 }

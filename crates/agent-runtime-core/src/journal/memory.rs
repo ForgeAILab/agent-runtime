@@ -417,6 +417,13 @@ impl InMemorySessionJournal {
                 snapshot
                     .manifests
                     .extend(commit.delta.manifests_append.iter().cloned());
+                let retained =
+                    usize::try_from(commit.batch.snapshot.manifests.len).map_err(|_| conflict())?;
+                if snapshot.manifests.len() < retained {
+                    return Err(conflict());
+                }
+                let evicted = snapshot.manifests.len() - retained;
+                snapshot.manifests.drain(..evicted);
                 snapshot
             }
             _ => return Err(conflict()),

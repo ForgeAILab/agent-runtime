@@ -69,6 +69,7 @@ use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::command::CheckpointRecoveryPolicy;
 use crate::runtime::emitter::RuntimeEventStream;
 use crate::runtime::engine::Runtime;
+use crate::runtime::journal::SessionPersistence;
 use crate::runtime::session::{InternalTurnAdmission, SessionHandle, TurnHandle};
 use crate::runtime::state::{artifact_references_for_turn, returned_interaction_from_state};
 use crate::tool::SecurityConfig;

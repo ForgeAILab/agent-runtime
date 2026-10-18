@@ -159,7 +159,7 @@ impl DelegationCoordinator {
         };
 
         for (child, session, expected_watermark) in candidates {
-            let checkpoint = store.load_latest(&session).await?;
+            let checkpoint = SessionPersistence::load_checkpoint_view(&store, &session).await?;
             let (watermark, resumable, incompatibility, terminal_checkpoint) = match checkpoint {
                 Some(checkpoint) => {
                     checkpoint.validate()?;
@@ -559,7 +559,9 @@ impl DelegationCoordinator {
         };
         let mut publications = Vec::new();
         for (child, session, expected_watermark) in candidates {
-            let Some(checkpoint) = store.load_latest(&session).await? else {
+            let Some(checkpoint) =
+                SessionPersistence::load_checkpoint_view(&store, &session).await?
+            else {
                 continue;
             };
             if checkpoint.session != session {
@@ -634,7 +636,8 @@ impl DelegationCoordinator {
             }
             entry.status.borrow().session.clone()
         };
-        if let Some(checkpoint) = store.load_latest(&session).await? {
+        if let Some(checkpoint) = SessionPersistence::load_checkpoint_view(&store, &session).await?
+        {
             let mut children = self
                 .inner
                 .children

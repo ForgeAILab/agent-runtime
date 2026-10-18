@@ -361,10 +361,10 @@ impl SessionInner {
     /// still serving) and cache-operation checkpoints are never finalized
     /// here; admission over those keeps failing closed exactly as before.
     pub(crate) async fn reconcile_interrupted_checkpoint(&self) {
-        let Some(store) = self.shared.checkpoint_store.clone() else {
+        if !self.execution.persistence.has_checkpoint_store() {
             return;
-        };
-        let checkpoint = match store.load_latest(&self.id).await {
+        }
+        let checkpoint = match self.execution.persistence.latest_checkpoint().await {
             Ok(Some(checkpoint)) => checkpoint,
             Ok(None) => return,
             Err(error) => {

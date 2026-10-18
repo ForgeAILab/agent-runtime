@@ -626,6 +626,7 @@ impl Driver {
         parent: Option<agent_runtime_core::ids::SessionId>,
         defer_pending_interaction: bool,
         rebase_completed_activation: bool,
+        persistence: Arc<crate::runtime::journal::SessionPersistence>,
         mut extension_state: std::collections::BTreeMap<
             String,
             agent_runtime_core::store::VersionedSessionState,
@@ -681,12 +682,13 @@ impl Driver {
                 }
             }
         }
-        SessionExecutionContext::new(
+        SessionExecutionContext::new_with_persistence(
             &session,
             planner,
             interaction_disposition,
             extension_state,
             abilities,
+            persistence,
         )
     }
 
