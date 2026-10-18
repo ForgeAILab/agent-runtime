@@ -161,8 +161,9 @@ successor. `assert_session_journal_reference_conformance` runs both against the
 reference. The testkit's unit tests also run the suite against deliberately
 broken backends (non-atomic commit, idempotency outside the transaction or
 keyed by operation only, reads that skip the lease, foreign-object resolution,
-unverified object reuse, an ordinary adapter ignoring policy or dropping exact
-roots) and require each to be rejected.
+unverified object reuse, a revocation that keeps the writer, an ordinary
+adapter ignoring policy or dropping exact roots) and require each to be
+rejected.
 
 ## Quality gates
 

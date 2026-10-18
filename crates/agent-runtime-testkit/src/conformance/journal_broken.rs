@@ -34,6 +34,8 @@ enum Break {
     ResolveForeignObjects,
     /// An already known object ID is deduplicated without comparing payloads.
     UnverifiedObjectReuse,
+    /// Host lease revocation reports success but leaves the writer in place.
+    IgnoresRevocation,
 }
 
 #[derive(Debug)]
@@ -61,13 +63,20 @@ impl Broken {
         });
         let control = Arc::clone(&broken);
         let revoke = Arc::clone(&inner);
+        let revocation_works = defect != Break::IgnoresRevocation;
         SessionJournalConformanceFixture::new(
             broken,
             move |point| {
                 *control.armed.lock().unwrap() = Some(point);
                 Ok(())
             },
-            move |session| revoke.revoke_writer(session),
+            move |session| {
+                if revocation_works {
+                    revoke.revoke_writer(session)
+                } else {
+                    Ok(())
+                }
+            },
         )
     }
 
@@ -315,6 +324,14 @@ async fn suite_rejects_commits_that_resolve_foreign_objects() {
 async fn suite_rejects_unverified_object_reuse() {
     suite_rejects(super::assert_session_journal_conformance(|| async {
         Broken::fixture(Break::UnverifiedObjectReuse)
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn suite_rejects_a_revocation_that_keeps_the_writer() {
+    suite_rejects(super::assert_writer_fences(&|| async {
+        Broken::fixture(Break::IgnoresRevocation)
     }))
     .await;
 }
