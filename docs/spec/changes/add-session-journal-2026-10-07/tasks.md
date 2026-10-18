@@ -81,6 +81,24 @@ all applicable gates, not merely contract merge.
   consumer fixtures, agent-runtime-lcm passes 62 tests, and the requested Rust
   1.86 build of agent-runtime-core plus agent-runtime succeeds. Logs are under
   `/Volumes/Data/tmp/refactor/u9b-3/`.
+  Review (2026-10-18): the byte tables reproduce exactly. The empty-history
+  equivalence scenarios never decoded the >64-item binary spine, so
+  `review_spine_sized_histories_match_at_every_barrier_and_after_fresh_resume`
+  now seeds 70/130/260 messages (identity and redacting policies, plus tools
+  and a local action) and compares every barrier and a fresh resume. Core
+  unit tests round-trip the persistent JSON at every 2^k/2^k±1 boundary up to
+  4,097 items and for node-shaped values, and prove draft references never
+  resolve across sessions, from unpinned objects, for host namespaces or a
+  fenced writer. The ordinary adapter conformance suite now requires adapters
+  to resolve structured references across N commits sharing a prefix, a
+  collection attempt and a fresh writer. A protected head the writer cannot
+  re-derive fails closed instead of being migrated (no release wrote one).
+  The ~20 MB N=4,000 bootstrap (vs a 1.77 MB legacy snapshot) is the
+  per-element cost of the JSON-node form: each small cache/manifest entry
+  becomes ~8 objects with their own envelopes, single-reference leaves and
+  spine branches; the fixed 32-level spine also adds ~20–25 unary branch
+  nodes to every changed array. Both are representation choices, not
+  unchanged-prefix writes.
 - [ ] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)
