@@ -2357,4 +2357,160 @@ mod tests {
         assert!(fixture.journal.read(&lease, &message).await.is_ok());
         fixture.journal.close(lease).await.unwrap();
     }
+
+    /// Mirrors the runtime writer's boundary values: canonical sizes around
+    /// the 1,024-byte compact threshold, signed zero, arrays of 64/65/66/130
+    /// items, wide objects and tag-shaped data.
+    fn boundary_value() -> serde_json::Value {
+        use serde_json::{Value, json};
+        let ascii = |bytes: usize| Value::String("x".repeat(bytes - 2));
+        let mut map = serde_json::Map::new();
+        for bytes in [1_023, 1_024, 1_025] {
+            map.insert(format!("ascii-{bytes}"), ascii(bytes));
+        }
+        map.insert("escaped-1024".into(), json!(format!("{}ab", "\"\\\n".repeat(170))));
+        map.insert("utf8-1024".into(), json!("é".repeat(511)));
+        map.insert("utf8-1026".into(), json!("é".repeat(512)));
+        map.insert("emoji-1023".into(), json!(format!("{}a", "😀".repeat(255))));
+        map.insert("emoji-1025".into(), json!(format!("{}abc", "😀".repeat(255))));
+        map.insert("negative-zero".into(), json!(-0.0));
+        map.insert("zero".into(), json!(0.0));
+        map.insert("u64".into(), json!(u64::MAX));
+        map.insert("i64".into(), json!(i64::MIN));
+        for len in [64usize, 65, 66, 130] {
+            map.insert(
+                format!("array-{len}"),
+                Value::Array(
+                    (0..len)
+                        .map(|index| json!(format!("item-{index:024}")))
+                        .collect(),
+                ),
+            );
+        }
+        map.insert(
+            "boundary-array".into(),
+            json!([ascii(1_023), ascii(1_024), ascii(1_025), -0.0, {"": [0.0, -0.0]}]),
+        );
+        map.insert(
+            "small-wide-array".into(),
+            Value::Array((0..65).map(|index| json!(index)).collect()),
+        );
+        map.insert(
+            "wide-object".into(),
+            Value::Object(
+                (0..65)
+                    .map(|index| (format!("k{index:02}"), json!(index)))
+                    .collect(),
+            ),
+        );
+        map.insert("".into(), json!("empty key"));
+        map.insert(
+            "tag-shaped".into(),
+            json!({"storage": "inline", "value": {"storage": "reference", "object": "0".repeat(64)}}),
+        );
+        Value::Object(map)
+    }
+
+    /// The independent testkit assembler and the reference ordinary backend
+    /// (which encodes a bootstrap itself) store the Runtime-owned record
+    /// under the same object ID for boundary values.
+    #[tokio::test]
+    async fn the_testkit_and_reference_backend_encode_boundary_values_identically() {
+        use agent_runtime_core::journal::*;
+        use agent_runtime_core::store::{SessionSnapshot, VersionedSessionState};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("boundary-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let session = SessionId::new("boundary");
+        let state = VersionedSessionState::new(
+            super::RegistryRevision::new("previous-cache-state-1"),
+            boundary_value(),
+        )
+        .redaction_safe();
+        let snapshot = SessionSnapshot {
+            id: session.clone(),
+            history: Vec::new(),
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: Vec::new(),
+            extension_state: BTreeMap::from([(
+                RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                state.clone(),
+            )]),
+            updated: super::Timestamp(1),
+        };
+        let mut assembler = super::Assembler::default();
+        let expected = assembler.structured_cache(&state);
+        let mut roots = assembler.snapshot(&snapshot, 0);
+        roots.extensions = JournalMap {
+            root: Some(assembler.add(
+                JournalObjectKind::Map,
+                &JournalMapNode::Leaf {
+                    entries: vec![JournalMapEntry {
+                        key: RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+                        value: expected.clone(),
+                    }],
+                },
+            )),
+            len: 1,
+            height: 0,
+        };
+        let lease = journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("boundary-open"),
+                    pin: JournalPinId::new("boundary-pin"),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap();
+        let boundary = JournalBoundary {
+            version: 1,
+            session: session.clone(),
+            turn: None,
+            checkpoint_sequence: 0,
+            planned_step_count: 0,
+        };
+        let mut commit = JournalCommit {
+            batch: JournalBatch {
+                session: session.clone(),
+                sequence: 1,
+                predecessor: None,
+                expected_revision: None,
+                writer_epoch: lease.writer_epoch().unwrap(),
+                operation: JournalOperationId::new("boundary"),
+                boundary: boundary.clone(),
+                snapshot: roots.clone(),
+                checkpoint: None,
+            },
+            digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+            objects: Vec::new(),
+            delta: JournalTransitionDelta {
+                boundary,
+                bootstrap: Some(Box::new(snapshot)),
+                history_append: Vec::new(),
+                usage_append: Vec::new(),
+                extension_updates: BTreeMap::new(),
+                extension_references: BTreeMap::new(),
+                manifests_append: Vec::new(),
+                manifest_references: Vec::new(),
+            },
+            checkpoint: None,
+        };
+        commit.digest = commit.input_digest().unwrap();
+        let head = journal.commit(&lease, commit).await.unwrap();
+        assert!(
+            head.snapshot.extensions == roots.extensions,
+            "the testkit and reference encoders disagree"
+        );
+        journal.close(lease).await.unwrap();
+    }
 }

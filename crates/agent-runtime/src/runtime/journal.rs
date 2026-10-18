@@ -1937,6 +1937,7 @@ impl ObjectAssembler {
 mod tests {
     use agent_runtime_core::clock::Timestamp;
     use agent_runtime_core::content::{ContentPart, Message};
+    use serde_json::json;
 
     use super::*;
 
@@ -2147,6 +2148,163 @@ mod tests {
             assert!(warm.root == cold.root, "warm root differs for {len} items");
             previous = Some((value, warm));
         }
+    }
+
+    /// Values at the compact-encoding boundaries: canonical sizes 1,023 /
+    /// 1,024 / 1,025 (ASCII, escaped, two- and four-byte UTF-8), signed zero
+    /// and extreme numbers, arrays of 64/65/66/130 items, a small array wider
+    /// than one leaf, an object wider than one leaf, an empty key and values
+    /// shaped like the encoding's own tags. Mirrored in the testkit's
+    /// cross-encoder check.
+    fn boundary_value() -> Value {
+        let ascii = |bytes: usize| Value::String("x".repeat(bytes - 2));
+        let mut map = serde_json::Map::new();
+        for bytes in [1_023, 1_024, 1_025] {
+            map.insert(format!("ascii-{bytes}"), ascii(bytes));
+        }
+        map.insert("escaped-1024".into(), json!(format!("{}ab", "\"\\\n".repeat(170))));
+        map.insert("escaped-1026".into(), json!(format!("{}abcd", "\"\\\n".repeat(170))));
+        map.insert("utf8-1024".into(), json!("é".repeat(511)));
+        map.insert("utf8-1026".into(), json!("é".repeat(512)));
+        map.insert("emoji-1023".into(), json!(format!("{}a", "😀".repeat(255))));
+        map.insert("emoji-1025".into(), json!(format!("{}abc", "😀".repeat(255))));
+        map.insert("negative-zero".into(), json!(-0.0));
+        map.insert("zero".into(), json!(0.0));
+        map.insert("large".into(), json!(1e300));
+        map.insert("fraction".into(), json!(0.1));
+        map.insert("u64".into(), json!(u64::MAX));
+        map.insert("i64".into(), json!(i64::MIN));
+        for len in [64usize, 65, 66, 130] {
+            map.insert(
+                format!("array-{len}"),
+                Value::Array(
+                    (0..len)
+                        .map(|index| json!(format!("item-{index:024}")))
+                        .collect(),
+                ),
+            );
+        }
+        map.insert(
+            "boundary-array".into(),
+            json!([ascii(1_023), ascii(1_024), ascii(1_025), -0.0, {"": [0.0, -0.0]}]),
+        );
+        map.insert(
+            "small-wide-array".into(),
+            Value::Array((0..65).map(|index| json!(index)).collect()),
+        );
+        map.insert(
+            "wide-object".into(),
+            Value::Object(
+                (0..65)
+                    .map(|index| (format!("k{index:02}"), json!(index)))
+                    .collect(),
+            ),
+        );
+        map.insert("".into(), json!("empty key"));
+        map.insert(
+            "tag-shaped".into(),
+            json!({"storage": "inline", "value": {"storage": "reference", "object": "0".repeat(64)}}),
+        );
+        map.insert(
+            "node-shaped".into(),
+            json!({"node": "jl", "i": [{"storage": "inline", "value": 1}], "c": ["0".repeat(40)]}),
+        );
+        Value::Object(map)
+    }
+
+    /// The runtime writer and the reference ordinary backend (which encodes a
+    /// bootstrap itself) must produce byte-identical objects for the same
+    /// value, and the value must materialize exactly.
+    #[tokio::test]
+    async fn the_writer_and_reference_backend_encode_boundary_values_identically() {
+        use agent_runtime_core::journal::{
+            IdentityJournalProjection, InMemorySessionJournal, JournalStorageId,
+        };
+        use agent_runtime_core::store::VersionedSessionState;
+        use agent_runtime_registry::RegistryRevision;
+
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("boundary-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let session = SessionId::new("delta");
+        let mut live = snapshot(vec![Message::user("one")]);
+        let value = boundary_value();
+        for bytes in [1_023usize, 1_024, 1_025] {
+            assert_eq!(
+                serde_json::to_vec(&value[format!("ascii-{bytes}")]).unwrap().len(),
+                bytes
+            );
+        }
+        for (key, bytes) in [
+            ("escaped-1024", 1_024usize),
+            ("escaped-1026", 1_026),
+            ("utf8-1024", 1_024),
+            ("utf8-1026", 1_026),
+            ("emoji-1023", 1_023),
+            ("emoji-1025", 1_025),
+        ] {
+            assert_eq!(serde_json::to_vec(&value[key]).unwrap().len(), bytes, "{key}");
+        }
+        live.extension_state.insert(
+            RUNTIME_PREVIOUS_CACHE_NAMESPACE.to_owned(),
+            VersionedSessionState::new(RegistryRevision::new("previous-cache-state-1"), value.clone())
+                .redaction_safe(),
+        );
+        let roots = ObjectAssembler::default().snapshot(&live, 0).unwrap();
+        let lease = journal
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("boundary-open"),
+                    pin: JournalPinId::new("boundary-pin"),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await
+            .unwrap();
+        let mut commit = JournalCommit {
+            batch: JournalBatch {
+                session: session.clone(),
+                sequence: 1,
+                predecessor: None,
+                expected_revision: None,
+                writer_epoch: lease.writer_epoch().unwrap(),
+                operation: JournalOperationId::new("boundary"),
+                boundary: boundary(),
+                snapshot: roots.clone(),
+                checkpoint: None,
+            },
+            digest: JournalDigest::parse("0".repeat(64)).unwrap(),
+            objects: Vec::new(),
+            delta: JournalTransitionDelta {
+                boundary: boundary(),
+                bootstrap: Some(Box::new(live.clone())),
+                history_append: Vec::new(),
+                usage_append: Vec::new(),
+                extension_updates: BTreeMap::new(),
+                extension_references: BTreeMap::new(),
+                manifests_append: Vec::new(),
+                manifest_references: Vec::new(),
+            },
+            checkpoint: None,
+        };
+        commit.digest = commit.input_digest().unwrap();
+        let head = journal.commit(&lease, commit).await.unwrap();
+        assert!(head.snapshot == roots, "the two encoders disagree");
+        let lease = journal.renew(&lease).await.unwrap();
+        let read = JournalReader::new(&journal, &lease, NATIVE_READ_LIMITS)
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(journal_json_identical(
+            &read.extension_state[RUNTIME_PREVIOUS_CACHE_NAMESPACE].value,
+            &value
+        ));
     }
 
     /// Numerically equal JSON values with different canonical bytes (`0.0`
