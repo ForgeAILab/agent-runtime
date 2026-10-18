@@ -83,8 +83,9 @@ pub enum JournalCommitFailurePoint {
 }
 
 impl JournalCommitFailurePoint {
-    /// All supported cuts in visibility order.
-    pub const ALL: [Self; 7] = [
+    /// All supported cuts in visibility order. A slice, so adding a cut to
+    /// this non-exhaustive enum does not change the constant's type.
+    pub const ALL: &'static [Self] = &[
         Self::AfterObjects,
         Self::AfterCheckpoint,
         Self::AfterBatch,

@@ -273,7 +273,7 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = SessionJournalConformanceFixture>,
 {
-    for point in JournalCommitFailurePoint::ALL {
+    for &point in JournalCommitFailurePoint::ALL {
         let fixture = factory().await;
         let session = SessionId::new(format!("atomic-{point:?}"));
         let lease = open_writer(&*fixture.journal, &session, None, "atomic").await;
