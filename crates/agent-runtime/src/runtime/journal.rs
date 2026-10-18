@@ -1124,20 +1124,26 @@ impl ObjectAssembler {
                 item_caches.push(cache);
                 unchanged &= same;
             }
-            let tree = if unchanged {
-                previous
-                    .and_then(|(_, cache)| cache.levels.first()?.get(chunk_index))
-                    .cloned()
-                    .ok_or_else(|| RuntimeError::conflict("JSON sequence cache is incomplete"))?
-            } else {
-                let root = self.add_structured(
-                    JournalObjectKind::Sequence,
-                    &JournalSequenceNode::JsonValueBranch { items },
-                )?;
-                JournalSequence {
-                    root: Some(root),
-                    len: chunk.len() as u64,
-                    height: 1,
+            // Reuse only a cached bottom node of exactly this width: a prior
+            // array that was a single leaf has no bottom level, and a tail
+            // chunk that shrank from two items to one must not keep both.
+            let cached = previous
+                .filter(|_| unchanged)
+                .and_then(|(_, cache)| cache.levels.first()?.get(chunk_index))
+                .filter(|tree| tree.len == chunk.len() as u64)
+                .cloned();
+            let tree = match cached {
+                Some(tree) => tree,
+                None => {
+                    let root = self.add_structured(
+                        JournalObjectKind::Sequence,
+                        &JournalSequenceNode::JsonValueBranch { items },
+                    )?;
+                    JournalSequence {
+                        root: Some(root),
+                        len: chunk.len() as u64,
+                        height: 1,
+                    }
                 }
             };
             bottom.push(tree);
@@ -1154,19 +1160,20 @@ impl ObjectAssembler {
             }
             let mut parents = Vec::with_capacity(current.len().div_ceil(2));
             for (group, children) in current.chunks(2).enumerate() {
-                let reusable = previous.is_some_and(|(_, cache)| {
-                    cache.levels.get(level_index).and_then(|level| {
-                        let start = group * 2;
-                        level.get(start..start + children.len())
-                    }) == Some(children)
+                // A cached parent is reusable only when it was built from
+                // exactly these children: the prior group at this position
+                // must have the same width, not merely a matching prefix.
+                let cached = previous.and_then(|(_, cache)| {
+                    let level = cache.levels.get(level_index)?;
+                    let start = group * 2;
+                    let prior = level.get(start..level.len().min(start + 2))?;
+                    if prior != children {
+                        return None;
+                    }
+                    cache.levels.get(level_index + 1)?.get(group).cloned()
                 });
-                let tree = if reusable {
-                    previous
-                        .and_then(|(_, cache)| cache.levels.get(level_index + 1)?.get(group))
-                        .cloned()
-                        .ok_or_else(|| {
-                            RuntimeError::conflict("JSON sequence cache is incomplete")
-                        })?
+                let tree = if let Some(tree) = cached {
+                    tree
                 } else {
                     let child_roots = children
                         .iter()
@@ -2067,5 +2074,38 @@ mod tests {
             .snapshot_cached(snapshot, 0, None, None)
             .unwrap()
             .1
+    }
+
+    /// A warm path cache must commit exactly what a cold encoding of the same
+    /// value commits, whatever the previous value's shape: arrays growing past
+    /// one JSON leaf, shrinking by one item at an odd width, or shrinking back
+    /// below one leaf.
+    #[test]
+    fn a_warm_json_cache_encodes_reshaped_arrays_like_a_cold_one() {
+        let entries = |len: usize| {
+            serde_json::json!({
+                "entries": (0..len)
+                    .map(|index| serde_json::json!(format!("stable-history-entry-{index:032}")))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        let mut previous: Option<(Value, JsonEncodingCache)> = None;
+        for len in [
+            0usize, 1, 2, 60, 64, 65, 66, 70, 69, 68, 64, 63, 130, 129, 128, 127, 260, 259, 3, 0,
+        ] {
+            let value = entries(len);
+            let cold = ObjectAssembler::default()
+                .json_value_cached(&value, None)
+                .unwrap();
+            let mut assembler = ObjectAssembler::default();
+            let warm = assembler
+                .json_value_cached(
+                    &value,
+                    previous.as_ref().map(|(value, cache)| (value, cache)),
+                )
+                .unwrap_or_else(|error| panic!("warm encoding of {len} items failed: {error:?}"));
+            assert!(warm.root == cold.root, "warm root differs for {len} items");
+            previous = Some((value, warm));
+        }
     }
 }

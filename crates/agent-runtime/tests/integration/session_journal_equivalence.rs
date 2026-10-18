@@ -2478,3 +2478,59 @@ async fn review_spine_sized_forks_match_at_every_barrier() {
         assert_spine_engaged(&pair, label);
     }
 }
+
+fn growth_turns() -> Arc<FakeProvider> {
+    provider(
+        (0..6)
+            .map(|turn| reply(&format!("growth reply {turn}")))
+            .collect(),
+    )
+}
+
+/// Grows a live session turn by turn so the cache record and manifest arrays
+/// cross the 64-item JSON leaf while the writer's path cache is warm.
+fn seeded_growth<const N: usize>(
+    runtime: Runtime,
+    id: SessionId,
+) -> Pin<Box<dyn Future<Output = Vec<SessionSnapshot>>>> {
+    Box::pin(async move {
+        let seed = (0..N)
+            .map(|index| {
+                agent_runtime::core::content::Message::user(format!("seeded growth {index}"))
+            })
+            .collect();
+        let session = runtime
+            .start_session(StartSession::create(id, seed))
+            .await
+            .unwrap();
+        let mut snapshots = Vec::new();
+        for turn in 0..6 {
+            session
+                .run(UserInput::text(format!("growth input {turn}")))
+                .await
+                .unwrap();
+            snapshots.push(session.snapshot());
+        }
+        session.shutdown().await.unwrap();
+        snapshots
+    })
+}
+
+/// Review of the U9 2.7 path cache: a warm writer whose cached arrays grow
+/// past one JSON leaf still commits, matches legacy at every barrier and
+/// resumes.
+#[tokio::test]
+async fn review_arrays_growing_past_one_leaf_match_at_every_barrier() {
+    let pair = equivalent(
+        "growth-58",
+        identity,
+        Phase {
+            provider: growth_turns,
+            configure: plain,
+            drive: seeded_growth::<58>,
+        },
+        continue_phase(),
+    )
+    .await;
+    assert_spine_engaged(&pair, "growth-58");
+}
