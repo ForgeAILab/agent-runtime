@@ -10,8 +10,10 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use agent_runtime::registry::{Fingerprint, RegistryRevision};
-use agent_runtime_core::checkpoint::{CheckpointWatermark, TURN_TRANSITION_REVISION, TurnState};
+use agent_runtime::registry::RegistryRevision;
+use agent_runtime_core::checkpoint::{
+    CheckpointWatermark, TURN_TRANSITION_REVISION, TurnCheckpoint, TurnState,
+};
 use agent_runtime_core::clock::{Deadline, Timestamp};
 use agent_runtime_core::content::{Message, UserInput};
 #[cfg(test)]
@@ -22,6 +24,8 @@ use agent_runtime_core::journal::*;
 use agent_runtime_core::store::{SessionIdentityState, SessionSnapshot, VersionedSessionState};
 use agent_runtime_core::usage::UsageLedger;
 use serde::Serialize;
+
+const CHECKPOINT_BODY: &str = "checkpoint body";
 
 const LIMITS: JournalReadLimits = JournalReadLimits {
     objects: 10_000,
@@ -168,6 +172,13 @@ where
     );
     let second_head = fixture.journal.commit(&lease, second).await.unwrap();
     assert_eq!(second_head.revision, JournalRevision(2));
+    assert_materializes(
+        &*fixture.journal,
+        &session,
+        second_head.revision,
+        "idempotency-materialize",
+    )
+    .await;
 
     let replay = fixture.journal.commit(&lease, first.clone()).await.unwrap();
     assert_eq!(replay, first_head, "replay must return its original result");
@@ -497,11 +508,52 @@ where
         1,
         1,
     );
+    let mut mismatched = first.clone();
+    let foreign = checkpoint_commit(
+        session.clone(),
+        lease.writer_epoch().unwrap(),
+        None,
+        "checkpoint-foreign",
+        0,
+        1,
+    );
+    retarget_checkpoint(&mut mismatched, |checkpoint| {
+        checkpoint.operation_fingerprint = foreign
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .operation_fingerprint
+            .clone();
+    });
+    assert_conflict(
+        checkpoint_fixture
+            .journal
+            .commit(&lease, mismatched)
+            .await
+            .unwrap_err(),
+    );
     let head = checkpoint_fixture
         .journal
         .commit(&lease, first)
         .await
         .unwrap();
+    let reader = open_reader(
+        &*checkpoint_fixture.journal,
+        &session,
+        Some(head.revision),
+        "checkpoint-materialize",
+    )
+    .await;
+    assert!(
+        JournalReader::new(&*checkpoint_fixture.journal, &reader, LIMITS)
+            .unwrap()
+            .checkpoint()
+            .await
+            .unwrap()
+            .is_some(),
+        "a published protected checkpoint must materialize"
+    );
+    checkpoint_fixture.journal.close(reader).await.unwrap();
     let backwards = checkpoint_commit(
         session,
         lease.writer_epoch().unwrap(),
@@ -805,7 +857,7 @@ fn checkpoint_commit(
 ) -> JournalCommit {
     let snapshot = basic_snapshot(
         session.clone(),
-        "checkpoint body",
+        CHECKPOINT_BODY,
         Timestamp(current.map_or(1, |head| head.updated.0 + 1)),
     );
     let mut assembler = Assembler::default();
@@ -856,6 +908,38 @@ fn checkpoint_commit(
     };
     commit.digest = commit.input_digest().unwrap();
     commit
+}
+
+async fn assert_materializes(
+    journal: &dyn SessionJournal,
+    session: &SessionId,
+    revision: JournalRevision,
+    label: &str,
+) {
+    let reader = open_reader(journal, session, Some(revision), label).await;
+    let snapshot = JournalReader::new(journal, &reader, LIMITS)
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap();
+    assert!(snapshot.is_some(), "a published head must materialize");
+    journal.close(reader).await.unwrap();
+}
+
+/// Edits a candidate checkpoint and rebinds the batch reference and digest, so
+/// only the edited semantic content can be the reason for a refusal.
+fn retarget_checkpoint(
+    commit: &mut JournalCommit,
+    edit: impl FnOnce(&mut ReferencedTurnCheckpoint),
+) {
+    let checkpoint = commit.checkpoint.as_mut().unwrap();
+    edit(checkpoint);
+    commit.batch.checkpoint = Some(
+        JournalObject::encode(JournalObjectKind::Checkpoint, checkpoint)
+            .unwrap()
+            .id,
+    );
+    commit.digest = commit.input_digest().unwrap();
 }
 
 fn zero_digest() -> JournalDigest {
@@ -966,6 +1050,42 @@ impl Assembler {
         }
     }
 
+    fn state(&mut self, state: &TurnState) -> JournalObjectId {
+        let serde_json::Value::Object(mut fields) = serde_json::to_value(state).unwrap() else {
+            unreachable!("turn states serialize as tagged objects")
+        };
+        let tag = fields
+            .remove("state")
+            .and_then(|tag| tag.as_str().map(str::to_owned))
+            .unwrap();
+        let mut references = BTreeMap::new();
+        for (name, value) in fields {
+            let reference = if let serde_json::Value::Array(values) = value {
+                let items = values
+                    .iter()
+                    .map(|value| self.add(JournalObjectKind::StateValue, value))
+                    .collect();
+                JournalStateValue::Sequence {
+                    sequence: self.sequence(items),
+                }
+            } else {
+                JournalStateValue::Object {
+                    object: self.add(JournalObjectKind::StateValue, &value),
+                }
+            };
+            references.insert(name, reference);
+        }
+        self.add(
+            JournalObjectKind::TurnState,
+            &ReferencedTurnState {
+                tag,
+                fields: references,
+            },
+        )
+    }
+
+    /// References a valid materialized checkpoint whose operation fingerprint
+    /// matches its state, at an explicit checkpoint sequence.
     fn referenced_checkpoint(
         &mut self,
         snapshot: &SessionSnapshot,
@@ -973,53 +1093,48 @@ impl Assembler {
         state_revision: u64,
         checkpoint_sequence: u64,
     ) -> ReferencedTurnCheckpoint {
-        let (state, tag, field, value) = if state_revision == 0 {
-            (
-                TurnState::Accepted {
-                    input: UserInput::text("accepted"),
-                },
-                "accepted",
-                "input",
-                serde_json::to_value(UserInput::text("accepted")).unwrap(),
-            )
+        let accepted = TurnCheckpoint::accepted(
+            TurnId::new("checkpoint-turn"),
+            UserInput::text(CHECKPOINT_BODY),
+            snapshot.clone(),
+            0,
+            Deadline::never(),
+            checkpoint_sequence,
+            checkpoint_sequence,
+            snapshot.updated,
+        )
+        .unwrap();
+        let mut checkpoint = if state_revision == 0 {
+            accepted
         } else {
-            (
-                TurnState::Planning { step: 0 },
-                "planning",
-                "step",
-                serde_json::json!(0),
-            )
+            accepted
+                .transition(
+                    TurnState::Planning { step: 0 },
+                    snapshot.clone(),
+                    checkpoint_sequence,
+                    snapshot.updated,
+                )
+                .unwrap()
         };
-        let value = self.add(JournalObjectKind::StateValue, &value);
-        let state_object = self.add(
-            JournalObjectKind::TurnState,
-            &ReferencedTurnState {
-                tag: tag.to_owned(),
-                fields: [(
-                    field.to_owned(),
-                    JournalStateValue::Object { object: value },
-                )]
-                .into(),
-            },
-        );
+        assert_eq!(checkpoint.state_revision, state_revision);
+        checkpoint.watermark = CheckpointWatermark::new(checkpoint_sequence, checkpoint_sequence);
+        checkpoint.validate().unwrap();
+        let state = self.state(&checkpoint.state);
         ReferencedTurnCheckpoint {
             schema_version: JOURNAL_SCHEMA_VERSION,
             transition_revision: TURN_TRANSITION_REVISION,
-            session: snapshot.id.clone(),
-            turn: TurnId::new("checkpoint-turn"),
-            state_revision,
-            operation_fingerprint: Fingerprint::of_fields([
-                b"journal-conformance".as_slice(),
-                state.operation_fingerprint().to_string().as_bytes(),
-            ]),
-            active_history_start: 0,
+            session: checkpoint.session,
+            turn: checkpoint.turn,
+            state_revision: checkpoint.state_revision,
+            operation_fingerprint: checkpoint.operation_fingerprint,
+            active_history_start: checkpoint.active_history_start,
             internal_input: None,
-            visible_output: false,
-            state: state_object,
+            visible_output: checkpoint.visible_output,
+            state,
             snapshot: roots,
-            deadline: Deadline::never(),
-            watermark: CheckpointWatermark::new(checkpoint_sequence, checkpoint_sequence),
-            updated: snapshot.updated,
+            deadline: checkpoint.deadline,
+            watermark: checkpoint.watermark,
+            updated: checkpoint.updated,
         }
     }
 }
@@ -1059,6 +1174,30 @@ mod tests {
     #[tokio::test]
     async fn ordinary_projection_precedes_object_hashing() {
         super::assert_ordinary_projection_conformance().await;
+    }
+
+    #[tokio::test]
+    async fn reference_refuses_heads_that_would_not_materialize() {
+        let reference = std::sync::Arc::new(super::InMemorySessionJournal::protected(
+            super::JournalStorageId::new("reference-malformed"),
+        ));
+        let journal: std::sync::Arc<dyn super::SessionJournal> = reference.clone();
+        let session = SessionId::new("malformed-roots");
+        let lease = super::open_writer(&*journal, &session, None, "malformed").await;
+        let epoch = lease.writer_epoch().unwrap();
+        let (mut chain, _) = super::bootstrap_commit(session.clone(), epoch, "bad-chain", "body");
+        chain.batch.snapshot.history_chain = super::zero_digest();
+        chain.digest = chain.input_digest().unwrap();
+        super::assert_conflict(journal.commit(&lease, chain).await.unwrap_err());
+        let (mut count, _) = super::bootstrap_commit(session.clone(), epoch, "bad-count", "body");
+        count.batch.snapshot.history.len = 5;
+        count.digest = count.input_digest().unwrap();
+        super::assert_conflict(journal.commit(&lease, count).await.unwrap_err());
+        assert_eq!(reference.object_count().unwrap(), 0);
+        let (valid, _) = super::bootstrap_commit(session.clone(), epoch, "valid", "body");
+        let head = journal.commit(&lease, valid).await.unwrap();
+        journal.close(lease).await.unwrap();
+        super::assert_materializes(&*journal, &session, head.revision, "valid-reader").await;
     }
 
     #[tokio::test]
