@@ -42,6 +42,8 @@ mod replay_and_persistence;
 mod safe_boundary_injection;
 #[path = "integration/session_journal.rs"]
 mod session_journal;
+#[path = "integration/session_journal_equivalence.rs"]
+mod session_journal_equivalence;
 #[path = "integration/structured_output.rs"]
 mod structured_output;
 #[path = "integration/tool_argument_redaction.rs"]

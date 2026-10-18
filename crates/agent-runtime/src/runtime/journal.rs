@@ -609,12 +609,7 @@ async fn commit_domain(
     // Canonical map order already gives stable commit digests; make the order
     // explicit for adapters that retain the submitted vector verbatim.
     objects.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    let delta = transition_delta(
-        domain.candidate.as_ref(),
-        snapshot,
-        boundary.clone(),
-        domain.role,
-    )?;
+    let delta = transition_delta(domain.candidate.as_ref(), snapshot, boundary.clone())?;
     let operation_payload = serde_json::to_vec(&(
         domain.role,
         current.map(|head| head.revision),
@@ -696,7 +691,6 @@ fn transition_delta(
     previous: Option<&SessionSnapshot>,
     next: &SessionSnapshot,
     boundary: JournalBoundary,
-    role: JournalRole,
 ) -> Result<JournalTransitionDelta, RuntimeError> {
     let Some(previous) = previous else {
         return Ok(JournalTransitionDelta {
@@ -713,12 +707,13 @@ fn transition_delta(
             "native journal history did not advance by append",
         ));
     }
-    if role == JournalRole::Protected && previous.history != next.history[..previous.history.len()]
-    {
-        return Err(RuntimeError::conflict(
-            "protected native journal history prefix changed",
-        ));
-    }
+    // History deltas are by cardinality in both domains. After a terminal
+    // resume the host-redacted ordinary history is canonical (see
+    // `merge_terminal_checkpoint_snapshot`), so the next exact checkpoint
+    // legitimately carries that redacted prefix, exactly as a legacy
+    // CheckpointStore receives it. Protected roots and candidate objects
+    // describe the complete exact history; the backend verifies them rather
+    // than replaying this delta.
     let previous_usage = previous.usage.records();
     let next_usage = next.usage.records();
     if previous_usage.len() > next_usage.len()
