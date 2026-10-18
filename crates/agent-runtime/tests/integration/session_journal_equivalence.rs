@@ -5361,6 +5361,117 @@ async fn task_2_6_runtime_resolves_ambiguous_commits_fork() {
     run_live_ambiguity_scenario("fork").await;
 }
 
+/// Task 2.8 evidence: a checkpoint materialized from a native head is the
+/// same *bytes* a legacy `CheckpointStore` receives for that boundary, not
+/// only an equal value (`PartialEq` would accept `0.0` for `-0.0`). Every
+/// protected and ordinary barrier of several scenarios is compared as
+/// serialized JSON, and each native checkpoint is schema 3 and re-serializes
+/// to the same bytes after a typed round trip.
+#[tokio::test]
+async fn task_2_8_materialized_checkpoint_bytes_equal_legacy_at_every_barrier() {
+    let scenarios: Vec<(&str, Phase, Phase)> = vec![
+        (
+            "bytes-plain",
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: two_turns,
+            },
+            continue_phase(),
+        ),
+        (
+            "bytes-tools",
+            Phase {
+                provider: tool_provider,
+                configure: tools,
+                drive: tools_and_local,
+            },
+            continue_phase(),
+        ),
+        (
+            "bytes-interaction",
+            Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: answered_interaction_turn,
+            },
+            Phase {
+                provider: answered_interaction_provider,
+                configure: answering_interaction_tools,
+                drive: resume_and_continue,
+            },
+        ),
+        (
+            "bytes-cache",
+            Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: cache_turns,
+            },
+            Phase {
+                provider: cache_provider,
+                configure: cache_config,
+                drive: resume_and_continue,
+            },
+        ),
+        (
+            "bytes-fork",
+            Phase {
+                provider: text_turns,
+                configure: plain,
+                drive: fork_summary,
+            },
+            Phase {
+                provider: continuation,
+                configure: plain,
+                drive: resume_child,
+            },
+        ),
+    ];
+    let mut compared = 0usize;
+    let mut states = BTreeSet::new();
+    for (label, first, second) in scenarios {
+        let pair = equivalent(label, identity, first, second).await;
+        let legacy = pair.legacy_checkpoints.log.lock().unwrap().clone();
+        let native = materialized_checkpoint_log(&pair.native.protected);
+        assert_eq!(native.len(), legacy.len(), "{label}");
+        for (index, (native, legacy)) in native.iter().zip(&legacy).enumerate() {
+            let native_bytes = serde_json::to_vec(native).unwrap();
+            assert_eq!(
+                native_bytes,
+                serde_json::to_vec(legacy).unwrap(),
+                "{label}: checkpoint {index} ({}) bytes",
+                state_tag(native)
+            );
+            assert_eq!(native.schema_version, 3, "{label}: checkpoint {index}");
+            let decoded: TurnCheckpoint = serde_json::from_slice(&native_bytes).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&decoded).unwrap(),
+                native_bytes,
+                "{label}: checkpoint {index} round trip"
+            );
+            states.insert(state_tag(native));
+            compared += 1;
+        }
+        let legacy = pair.legacy_sessions.log.lock().unwrap().clone();
+        let native = materialized_snapshot_log(&pair.native.ordinary);
+        assert_eq!(native.len(), legacy.len(), "{label}");
+        for (index, (native, legacy)) in native.iter().zip(&legacy).enumerate() {
+            assert_eq!(
+                serde_json::to_vec(native).unwrap(),
+                serde_json::to_vec(legacy).unwrap(),
+                "{label}: ordinary snapshot {index} bytes"
+            );
+            compared += 1;
+        }
+    }
+    println!(
+        "TASK 2.8 BYTES records={compared} checkpoint_states={} states={states:?}",
+        states.len()
+    );
+}
+
 #[derive(Debug, Clone)]
 enum JournalReadFault {
     Missing(JournalObjectId),
