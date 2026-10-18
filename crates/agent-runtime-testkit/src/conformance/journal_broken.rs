@@ -326,3 +326,89 @@ async fn suite_accepts_the_transparent_wrapper() {
     super::assert_session_journal_conformance(|| async { Broken::fixture(Break::Transparent) })
         .await;
 }
+
+/// Ordinary adapter that silently drops an exact checkpoint root instead of
+/// refusing the commit.
+#[derive(Debug)]
+struct StripsCheckpoint(Arc<dyn SessionJournal>);
+
+#[async_trait]
+impl SessionJournal for StripsCheckpoint {
+    fn storage_id(&self) -> JournalStorageId {
+        self.0.storage_id()
+    }
+
+    async fn open(
+        &self,
+        session: &SessionId,
+        request: JournalOpen,
+    ) -> Result<JournalLease, RuntimeError> {
+        self.0.open(session, request).await
+    }
+
+    async fn read(
+        &self,
+        lease: &JournalLease,
+        object: &JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.0.read(lease, object).await
+    }
+
+    async fn commit(
+        &self,
+        lease: &JournalLease,
+        mut batch: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        if batch.checkpoint.take().is_some() {
+            batch.batch.checkpoint = None;
+            batch.digest = batch.input_digest()?;
+        }
+        self.0.commit(lease, batch).await
+    }
+
+    async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        self.0.renew(lease).await
+    }
+
+    async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+        self.0.close(lease).await
+    }
+
+    async fn retire(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        self.0.retire(session, expected).await
+    }
+
+    async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        self.0.collect(request).await
+    }
+}
+
+#[tokio::test]
+async fn ordinary_suite_rejects_an_adapter_that_ignores_host_policy() {
+    suite_rejects(super::assert_ordinary_session_journal_conformance(
+        |_policy: Arc<dyn JournalProjectionPolicy>| async {
+            let journal: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::ordinary(
+                JournalStorageId::new("broken-ordinary"),
+                Arc::new(IdentityJournalProjection),
+            ));
+            journal
+        },
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn ordinary_suite_rejects_an_adapter_that_drops_exact_roots() {
+    suite_rejects(super::assert_ordinary_session_journal_conformance(
+        |policy: Arc<dyn JournalProjectionPolicy>| async move {
+            let journal: Arc<dyn SessionJournal> =
+                Arc::new(StripsCheckpoint(super::reference_ordinary(policy).await));
+            journal
+        },
+    ))
+    .await;
+}

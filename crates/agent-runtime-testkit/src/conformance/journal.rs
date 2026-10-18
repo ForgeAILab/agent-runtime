@@ -103,7 +103,156 @@ where
 pub async fn assert_session_journal_reference_conformance() {
     assert_session_journal_conformance(|| async { reference_fixture() }).await;
     assert_ordinary_projection_conformance().await;
-    assert_ordinary_append_after_omission().await;
+    assert_ordinary_session_journal_conformance(reference_ordinary).await;
+}
+
+/// Runs the ordinary-role contract against a caller-supplied ordinary
+/// [`SessionJournal`]. The factory receives the host projection policy the
+/// scenario needs and returns a fresh ordinary journal enforcing it, so
+/// redacting database/file adapters run the same checks as the reference:
+/// policy before hashing, raw drafts unreadable, appends after a Sensitive
+/// omission, rejected projections storing nothing, exact checkpoint roots
+/// refused, and the private idempotency digest absent from stored records.
+pub async fn assert_ordinary_session_journal_conformance<F, Fut>(factory: F)
+where
+    F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
+    Fut: Future<Output = Arc<dyn SessionJournal>>,
+{
+    assert_ordinary_projection_contract(&factory).await;
+    assert_ordinary_append_after_omission(&factory).await;
+    assert_ordinary_refusals(&factory).await;
+}
+
+async fn reference_ordinary(policy: Arc<dyn JournalProjectionPolicy>) -> Arc<dyn SessionJournal> {
+    Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new("reference-ordinary"),
+        policy,
+    ))
+}
+
+fn redacting_policy() -> Arc<dyn JournalProjectionPolicy> {
+    Arc::new(|mut snapshot: SessionSnapshot| {
+        for message in &mut snapshot.history {
+            *message = Message::user("[redacted]");
+        }
+        snapshot.extension_state.remove("sensitive.fixture");
+        Ok(snapshot)
+    })
+}
+
+fn sensitive_snapshot(session: SessionId, body: &str) -> SessionSnapshot {
+    let mut snapshot = basic_snapshot(session, body, Timestamp(1));
+    snapshot.extension_state.insert(
+        "sensitive.fixture".to_owned(),
+        VersionedSessionState::new(
+            RegistryRevision::new("sensitive-v1"),
+            serde_json::json!({"secret":"do not persist raw"}),
+        ),
+    );
+    snapshot
+}
+
+async fn assert_ordinary_projection_contract<F, Fut>(factory: &F)
+where
+    F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
+    Fut: Future<Output = Arc<dyn SessionJournal>>,
+{
+    let journal = factory(redacting_policy()).await;
+    let session = SessionId::new("ordinary-contract-session");
+    let lease = open_writer(&*journal, &session, None, "ordinary-contract").await;
+    let raw = sensitive_snapshot(session.clone(), "raw contract secret");
+    let (commit, raw_ids) = bootstrap_from_snapshot(
+        raw,
+        lease.writer_epoch().unwrap(),
+        "ordinary-contract",
+        None,
+    );
+    let head = journal.commit(&lease, commit.clone()).await.unwrap();
+    assert_eq!(head.role, JournalRole::Ordinary);
+    assert!(head.checkpoint.is_none());
+    assert_ne!(
+        head.batch,
+        JournalObject::encode(JournalObjectKind::Batch, &commit.batch)
+            .unwrap()
+            .id,
+        "ordinary batch must be recomputed from projected roots"
+    );
+    assert_eq!(journal.commit(&lease, commit.clone()).await.unwrap(), head);
+    journal.close(lease).await.unwrap();
+
+    let reader = open_reader(
+        &*journal,
+        &session,
+        Some(head.revision),
+        "ordinary-contract",
+    )
+    .await;
+    for (id, kind) in &raw_ids {
+        if matches!(
+            kind,
+            JournalObjectKind::Message | JournalObjectKind::Extension
+        ) {
+            assert_conflict(journal.read(&reader, id).await.unwrap_err());
+        }
+    }
+    let batch = journal.read(&reader, &head.batch).await.unwrap();
+    let digest = commit.digest.as_str().as_bytes();
+    assert!(
+        !batch.windows(digest.len()).any(|window| window == digest),
+        "the private idempotency digest must not be stored as projected evidence"
+    );
+    let materialized = JournalReader::new(&*journal, &reader, LIMITS)
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(materialized.history, vec![Message::user("[redacted]")]);
+    assert!(materialized.extension_state.is_empty());
+    journal.close(reader).await.unwrap();
+}
+
+async fn assert_ordinary_refusals<F, Fut>(factory: &F)
+where
+    F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
+    Fut: Future<Output = Arc<dyn SessionJournal>>,
+{
+    let rejecting = factory(Arc::new(|_: SessionSnapshot| {
+        Err(RuntimeError::approval("projection unavailable"))
+    }))
+    .await;
+    let session = SessionId::new("ordinary-rejecting-session");
+    let lease = open_writer(&*rejecting, &session, None, "ordinary-rejecting").await;
+    let (commit, raw_message) = bootstrap_commit(
+        session.clone(),
+        lease.writer_epoch().unwrap(),
+        "ordinary-rejecting",
+        "raw must not land",
+    );
+    assert!(rejecting.commit(&lease, commit).await.is_err());
+    assert_conflict(rejecting.read(&lease, &raw_message).await.unwrap_err());
+    let reader = open_reader(&*rejecting, &session, None, "ordinary-rejecting-reader").await;
+    assert!(reader.head().is_none());
+    rejecting.close(reader).await.unwrap();
+    rejecting.close(lease).await.unwrap();
+
+    // An ordinary commit can never carry an exact checkpoint root.
+    let journal = factory(redacting_policy()).await;
+    let session = SessionId::new("ordinary-checkpoint-session");
+    let lease = open_writer(&*journal, &session, None, "ordinary-checkpoint").await;
+    let exact = checkpoint_commit(
+        session.clone(),
+        lease.writer_epoch().unwrap(),
+        None,
+        "ordinary-checkpoint",
+        1,
+        1,
+    );
+    assert_conflict(journal.commit(&lease, exact).await.unwrap_err());
+    let reader = open_reader(&*journal, &session, None, "ordinary-checkpoint-reader").await;
+    assert!(reader.head().is_none());
+    journal.close(reader).await.unwrap();
+    journal.close(lease).await.unwrap();
 }
 
 fn reference_fixture() -> SessionJournalConformanceFixture {
@@ -956,29 +1105,16 @@ async fn assert_ordinary_projection_conformance() {
 /// A redacting policy may omit a Sensitive extension namespace. Later raw
 /// candidates still carry that namespace in their exact roots, so ordinary
 /// appends must keep working after the omission.
-async fn assert_ordinary_append_after_omission() {
-    let policy = |mut snapshot: SessionSnapshot| {
-        for message in &mut snapshot.history {
-            *message = Message::user("[redacted]");
-        }
-        snapshot.extension_state.remove("sensitive.fixture");
-        Ok(snapshot)
-    };
-    let journal: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::ordinary(
-        JournalStorageId::new("reference-ordinary-append"),
-        Arc::new(policy),
-    ));
+async fn assert_ordinary_append_after_omission<F, Fut>(factory: &F)
+where
+    F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
+    Fut: Future<Output = Arc<dyn SessionJournal>>,
+{
+    let journal = factory(redacting_policy()).await;
     let session = SessionId::new("ordinary-append-session");
     let lease = open_writer(&*journal, &session, None, "ordinary-append").await;
     let epoch = lease.writer_epoch().unwrap();
-    let mut raw = basic_snapshot(session.clone(), "first raw body", Timestamp(1));
-    raw.extension_state.insert(
-        "sensitive.fixture".to_owned(),
-        VersionedSessionState::new(
-            RegistryRevision::new("sensitive-v1"),
-            serde_json::json!({"secret":"do not persist raw"}),
-        ),
-    );
+    let mut raw = sensitive_snapshot(session.clone(), "first raw body");
     let (bootstrap, _) = bootstrap_from_snapshot(raw.clone(), epoch, "ordinary-append-1", None);
     let first = journal.commit(&lease, bootstrap).await.unwrap();
     assert_eq!(first.snapshot.extensions.len, 0);
@@ -1596,7 +1732,12 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_appends_continue_after_policy_omits_an_extension() {
-        super::assert_ordinary_append_after_omission().await;
+        super::assert_ordinary_append_after_omission(&super::reference_ordinary).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_contract_runs_against_any_adapter() {
+        super::assert_ordinary_session_journal_conformance(super::reference_ordinary).await;
     }
 
     #[tokio::test]
