@@ -32,8 +32,9 @@ contain breaking changes and are coordinated with consumer proposals.
 
 - `RUNTIME_PREVIOUS_CACHE_NAMESPACE`, `JournalJsonValue`, `JournalJsonArray`,
   `JournalJsonBranch`, `JournalJsonInline`, `JournalJsonItem`,
-  `JournalJsonObjectEntry`, `ReferencedSessionState`, `ReferencedTurnManifest`
-  and `InMemorySessionJournal::object_bytes`.
+  `JournalJsonObjectEntry`, `ReferencedSessionState`, `ReferencedTurnManifest`,
+  `InMemorySessionJournal::object_bytes` and `journal_json_identical` (exact
+  JSON identity that distinguishes `0.0` from `-0.0`, for encoding caches).
 
 ### Fixed
 

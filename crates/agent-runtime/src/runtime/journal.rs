@@ -22,7 +22,7 @@ use agent_runtime_core::journal::{
     JournalStateValue, JournalTransitionDelta, RUNTIME_PREVIOUS_CACHE_NAMESPACE,
     ReferencedProviderRequest, ReferencedSessionState, ReferencedTurnCheckpoint,
     ReferencedTurnManifest, ReferencedTurnState, SessionJournal, journal_history_chain,
-    journal_json_can_inline,
+    journal_json_can_inline, journal_json_identical,
 };
 use agent_runtime_core::provider::ProviderRequest;
 use agent_runtime_core::store::{SessionSnapshot, SessionStore, TurnManifest};
@@ -875,7 +875,10 @@ fn transition_delta(
         .keys()
         .chain(next.extension_state.keys())
     {
-        if previous.extension_state.get(key) != next.extension_state.get(key) {
+        if !state_identical(
+            previous.extension_state.get(key),
+            next.extension_state.get(key),
+        ) {
             if key == RUNTIME_PREVIOUS_CACHE_NAMESPACE {
                 let value = next
                     .extension_state
@@ -906,6 +909,35 @@ fn transition_delta(
         manifests_append: Vec::new(),
         manifest_references,
     })
+}
+
+/// Exact extension-record identity: `VersionedSessionState` equality would
+/// treat a value rewritten from `0.0` to `-0.0` as unchanged and keep the
+/// stale encoding (and send no update).
+fn state_identical(
+    left: Option<&agent_runtime_core::store::VersionedSessionState>,
+    right: Option<&agent_runtime_core::store::VersionedSessionState>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.revision == right.revision
+                && left.sensitivity == right.sensitivity
+                && journal_json_identical(&left.value, &right.value)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn states_identical(
+    left: &BTreeMap<String, agent_runtime_core::store::VersionedSessionState>,
+    right: &BTreeMap<String, agent_runtime_core::store::VersionedSessionState>,
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((lk, lv), (rk, rv))| lk == rk && state_identical(Some(lv), Some(rv)))
 }
 
 fn retained_overlap(previous: &[TurnManifest], next: &[TurnManifest]) -> usize {
@@ -1400,7 +1432,8 @@ impl ObjectAssembler {
             }
             scalar => {
                 let unchanged = previous.is_some_and(|(value, cache)| {
-                    matches!(cache.node, JsonEncodingNode::Scalar) && value == scalar
+                    matches!(cache.node, JsonEncodingNode::Scalar)
+                        && journal_json_identical(value, scalar)
                 });
                 let root = if unchanged {
                     previous
@@ -1429,7 +1462,8 @@ impl ObjectAssembler {
     ) -> Result<(JournalJsonItem, JsonItemEncodingCache, bool), RuntimeError> {
         if journal_json_can_inline(value)? {
             let unchanged = previous.is_some_and(|(prior, cache)| {
-                matches!(cache, JsonItemEncodingCache::Inline) && prior == value
+                matches!(cache, JsonItemEncodingCache::Inline)
+                    && journal_json_identical(prior, value)
             });
             return Ok((
                 JournalJsonItem::Inline {
@@ -1470,7 +1504,7 @@ impl ObjectAssembler {
             };
             matches!(&cache.node, JsonEncodingNode::Inline).then_some((value, cache.as_ref()))
         });
-        let unchanged = prior.is_some_and(|(prior, _)| prior == value);
+        let unchanged = prior.is_some_and(|(prior, _)| journal_json_identical(prior, value));
         let cache = if unchanged {
             prior
                 .map(|(_, cache)| cache.clone())
@@ -1736,14 +1770,18 @@ impl ObjectAssembler {
         let mut extension_json = BTreeMap::new();
         for (key, value) in &snapshot.extension_state {
             let (id, json) = match previous {
-                Some((previous, encoding)) if previous.extension_state.get(key) == Some(value) => (
-                    encoding.extension_ids.get(key).cloned().ok_or_else(|| {
-                        RuntimeError::conflict(
-                            "native journal extension encoding cache is incomplete",
-                        )
-                    })?,
-                    encoding.extension_json.get(key).cloned(),
-                ),
+                Some((previous, encoding))
+                    if state_identical(previous.extension_state.get(key), Some(value)) =>
+                {
+                    (
+                        encoding.extension_ids.get(key).cloned().ok_or_else(|| {
+                            RuntimeError::conflict(
+                                "native journal extension encoding cache is incomplete",
+                            )
+                        })?,
+                        encoding.extension_json.get(key).cloned(),
+                    )
+                }
                 _ => self.extension_cached(
                     key,
                     value,
@@ -1768,7 +1806,9 @@ impl ObjectAssembler {
             })
             .collect();
         let extensions = previous
-            .filter(|(previous, _)| previous.extension_state == snapshot.extension_state)
+            .filter(|(previous, _)| {
+                states_identical(&previous.extension_state, &snapshot.extension_state)
+            })
             .map_or_else(
                 || self.map(extension_entries),
                 |(_, encoding)| Ok(encoding.roots.extensions.clone()),
@@ -2107,5 +2147,97 @@ mod tests {
             assert!(warm.root == cold.root, "warm root differs for {len} items");
             previous = Some((value, warm));
         }
+    }
+
+    /// Numerically equal JSON values with different canonical bytes (`0.0`
+    /// and `-0.0`) are different journal values; the cache must not reuse the
+    /// other spelling's object.
+    #[test]
+    fn a_warm_json_cache_distinguishes_negative_zero() {
+        let positive = serde_json::json!({"value": 0.0, "nested": {"value": 0.0}});
+        let negative = serde_json::json!({"value": -0.0, "nested": {"value": -0.0}});
+        let prior = ObjectAssembler::default()
+            .json_value_cached(&positive, None)
+            .unwrap();
+        let cold = ObjectAssembler::default()
+            .json_value_cached(&negative, None)
+            .unwrap();
+        let warm = ObjectAssembler::default()
+            .json_value_cached(&negative, Some((&positive, &prior)))
+            .unwrap();
+        assert!(
+            cold.root != prior.root,
+            "the spellings must encode differently"
+        );
+        assert!(
+            warm.root == cold.root,
+            "the warm cache reused the 0.0 encoding"
+        );
+    }
+
+    /// The same holds for compact array elements and for whole extension
+    /// records: a record rewritten from `0.0` to `-0.0` is a change the
+    /// writer must encode and send, not a cache hit.
+    #[test]
+    fn negative_zero_records_are_encoded_and_sent_like_any_change() {
+        use agent_runtime_core::store::VersionedSessionState;
+        use agent_runtime_registry::RegistryRevision;
+
+        let array = |zero: f64| {
+            let mut items = (0..70)
+                .map(|index| serde_json::json!(format!("entry-{index:040}")))
+                .collect::<Vec<_>>();
+            items[3] = serde_json::json!(zero);
+            Value::Array(items)
+        };
+        let prior = ObjectAssembler::default()
+            .json_value_cached(&array(0.0), None)
+            .unwrap();
+        let cold = ObjectAssembler::default()
+            .json_value_cached(&array(-0.0), None)
+            .unwrap();
+        let warm = ObjectAssembler::default()
+            .json_value_cached(&array(-0.0), Some((&array(0.0), &prior)))
+            .unwrap();
+        assert!(warm.root == cold.root, "a compact array element kept 0.0");
+
+        let with_state = |zero: f64| {
+            let mut snapshot = snapshot(vec![Message::user("one")]);
+            for namespace in ["host.counter", RUNTIME_PREVIOUS_CACHE_NAMESPACE] {
+                let mut state = VersionedSessionState::new(
+                    RegistryRevision::new("state-1"),
+                    serde_json::json!({"value": zero}),
+                );
+                if namespace == RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+                    state = state.redaction_safe();
+                }
+                snapshot.extension_state.insert(namespace.to_owned(), state);
+            }
+            snapshot
+        };
+        let (positive, negative) = (with_state(0.0), with_state(-0.0));
+        let previous = encoding(&positive);
+        let (warm, warm_cache) = ObjectAssembler::default()
+            .snapshot_cached(&negative, 0, Some(&positive), Some(&previous))
+            .unwrap();
+        let (cold, _) = ObjectAssembler::default()
+            .snapshot_cached(&negative, 0, None, None)
+            .unwrap();
+        assert!(
+            warm == cold,
+            "a -0.0 extension record kept its 0.0 encoding"
+        );
+        let delta =
+            transition_delta(Some(&positive), true, &negative, boundary(), &warm_cache).unwrap();
+        assert!(
+            delta.extension_updates.contains_key("host.counter"),
+            "a -0.0 host record was not sent"
+        );
+        assert!(
+            delta
+                .extension_references
+                .contains_key(RUNTIME_PREVIOUS_CACHE_NAMESPACE),
+            "a -0.0 cache record was not referenced"
+        );
     }
 }

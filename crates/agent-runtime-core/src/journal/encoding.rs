@@ -211,6 +211,37 @@ pub fn journal_json_can_inline(value: &Value) -> Result<bool, RuntimeError> {
     Ok(canonical_journal_json(value)?.len() <= JOURNAL_INLINE_JSON_MAX_BYTES)
 }
 
+/// Whether two JSON values have the same journal encoding.
+///
+/// `serde_json::Value` equality treats `0.0` and `-0.0` as equal (and, with
+/// `preserve_order`, ignores object key order), while their canonical journal
+/// objects differ. Encoding caches must use this exact identity so a cache hit
+/// never commits another value's spelling.
+pub fn journal_json_identical(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            left == right
+                && (!left.is_f64()
+                    || left.as_f64().map(f64::to_bits) == right.as_f64().map(f64::to_bits))
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| journal_json_identical(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|((lk, lv), (rk, rv))| lk == rk && journal_json_identical(lv, rv))
+        }
+        _ => left == right,
+    }
+}
+
 pub(crate) fn validate_inline_json(
     value: &Value,
     depth: u32,

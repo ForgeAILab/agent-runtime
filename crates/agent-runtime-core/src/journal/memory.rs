@@ -1534,7 +1534,12 @@ impl ObjectAssembler {
         let mut extension_ids = BTreeMap::new();
         for (key, value) in &snapshot.extension_state {
             let id = match previous {
-                Some((previous, encoding)) if previous.extension_state.get(key) == Some(value) => {
+                Some((previous, encoding))
+                    if previous
+                        .extension_state
+                        .get(key)
+                        .is_some_and(|previous| state_identical(previous, value)) =>
+                {
                     encoding
                         .extension_ids
                         .get(key)
@@ -1564,7 +1569,14 @@ impl ObjectAssembler {
             })
             .collect();
         let extensions = previous
-            .filter(|(previous, _)| previous.extension_state == snapshot.extension_state)
+            .filter(|(previous, _)| {
+                previous.extension_state.len() == snapshot.extension_state.len()
+                    && previous
+                        .extension_state
+                        .iter()
+                        .zip(&snapshot.extension_state)
+                        .all(|((lk, lv), (rk, rv))| lk == rk && state_identical(lv, rv))
+            })
             .map_or_else(
                 || self.map(entries),
                 |(_, encoding)| Ok(encoding.roots.extensions.clone()),
@@ -2046,6 +2058,17 @@ fn materialize_staged_snapshot(
         Poll::Ready(result) => result.map_err(|_| conflict()),
         Poll::Pending => Err(conflict()),
     }
+}
+
+/// Exact extension-record identity for the encoding cache; derived equality
+/// would keep a `0.0` encoding for a value rewritten to `-0.0`.
+fn state_identical(
+    left: &crate::store::VersionedSessionState,
+    right: &crate::store::VersionedSessionState,
+) -> bool {
+    left.revision == right.revision
+        && left.sensitivity == right.sensitivity
+        && journal_json_identical(&left.value, &right.value)
 }
 
 fn stored_object(state: &State, id: &JournalObjectId) -> Result<JournalObject, RuntimeError> {
@@ -2858,6 +2881,67 @@ mod structured_json_tests {
             .extension_state
             .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
             .cloned()
+    }
+
+    /// The ordinary backend's encoding cache must not keep a host record's
+    /// `0.0` object when the projected value became `-0.0`: derived equality
+    /// treats them as equal although their canonical objects differ.
+    #[tokio::test]
+    async fn a_negative_zero_rewrite_is_stored_like_a_cold_encoding() {
+        let journal = InMemorySessionJournal::ordinary(
+            JournalStorageId::new("negative-zero-ordinary"),
+            Arc::new(IdentityJournalProjection),
+        );
+        let session = SessionId::new("negative-zero");
+        let lease = writer(&journal, &session, "w0").await;
+        let with_value = |zero: f64| {
+            let mut snapshot = snapshot(&session, 3);
+            snapshot.extension_state.insert(
+                "host.counter".to_owned(),
+                VersionedSessionState::new(
+                    RegistryRevision::new("counter-1"),
+                    serde_json::json!({"value": zero}),
+                ),
+            );
+            snapshot
+        };
+        let first = with_value(0.0);
+        let head = journal
+            .commit(
+                &lease,
+                commit(
+                    &first,
+                    None,
+                    lease.writer_epoch().unwrap(),
+                    "bootstrap",
+                    Vec::new(),
+                    true,
+                    BTreeMap::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        let next = with_value(-0.0);
+        let mut update = commit(
+            &next,
+            Some(&head),
+            lease.writer_epoch().unwrap(),
+            "rewrite",
+            Vec::new(),
+            false,
+            BTreeMap::new(),
+        );
+        update.delta.extension_updates = BTreeMap::from([(
+            "host.counter".to_owned(),
+            Some(next.extension_state["host.counter"].clone()),
+        )]);
+        update.digest = update.input_digest().unwrap();
+        let head = journal.commit(&lease, update).await.unwrap();
+        let cold = ObjectAssembler::default().snapshot(&next, 0).unwrap();
+        assert!(
+            head.snapshot.extensions == cold.extensions,
+            "the warm ordinary cache kept the 0.0 record"
+        );
     }
 
     /// N reference commits share the unchanged spine; each adds O(log N)
