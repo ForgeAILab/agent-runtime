@@ -1920,42 +1920,108 @@ impl Assembler {
         }
     }
 
-    /// Independent oracle of the native persistent JSON encoding: up to
-    /// `JOURNAL_FANOUT` array items in one leaf, otherwise single-reference
-    /// leaves under a fixed-height binary spine; object entries in fanout
-    /// leaves. Adapters must store these exact IDs for shared prefixes.
-    fn structured_array(&mut self, items: Vec<JournalObjectId>) -> JournalSequence {
-        if items.len() <= JOURNAL_FANOUT {
-            return self.sequence(items);
-        }
-        let mut trees = items
-            .into_iter()
-            .map(|item| JournalSequence {
-                root: Some(self.add(
-                    JournalObjectKind::Sequence,
-                    &JournalSequenceNode::Leaf { items: vec![item] },
-                )),
-                len: 1,
+    /// Independent oracle of the native persistent JSON encoding: compact
+    /// values are explicit inline data; larger values are typed references.
+    /// Arrays up to `JOURNAL_FANOUT` use one JSON leaf, while larger arrays use
+    /// single-item leaves under the minimum-height binary spine.
+    fn structured_array(&mut self, values: &[serde_json::Value]) -> JournalJsonArray {
+        if values.is_empty() {
+            return JournalJsonArray {
+                len: 0,
                 height: 0,
+                node: JournalSequenceNode::JsonLeaf { items: Vec::new() },
+            };
+        }
+        if values.len() <= JOURNAL_FANOUT {
+            let items = values
+                .iter()
+                .map(|value| self.structured_array_item(value))
+                .collect();
+            let len = values.len() as u64;
+            return JournalJsonArray {
+                len,
+                height: 0,
+                node: JournalSequenceNode::JsonLeaf { items },
+            };
+        }
+        let mut trees = values
+            .chunks(2)
+            .map(|values| {
+                let items = values
+                    .iter()
+                    .map(|value| self.structured_array_item(value))
+                    .collect::<Vec<_>>();
+                JournalSequence {
+                    root: Some(self.add(
+                        JournalObjectKind::Sequence,
+                        &JournalSequenceNode::JsonValueBranch { items },
+                    )),
+                    len: values.len() as u64,
+                    height: 1,
+                }
             })
             .collect::<Vec<_>>();
-        for _ in 0..JOURNAL_MAX_TREE_HEIGHT {
+        while trees.len() > 2 {
+            assert!(trees[0].height < JOURNAL_MAX_TREE_HEIGHT);
             trees = trees
                 .chunks(2)
                 .map(|children| JournalSequence {
-                    root: Some(self.add(
-                        JournalObjectKind::Sequence,
-                        &JournalSequenceNode::Branch {
-                            children: children.to_vec(),
-                        },
-                    )),
+                    root: Some(
+                        self.add(
+                            JournalObjectKind::JsonBranch,
+                            &JournalJsonBranch(
+                                children
+                                    .iter()
+                                    .map(|child| {
+                                        JournalCompactObjectId::from_object(
+                                            child.root.as_ref().unwrap(),
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                    ),
                     len: children.iter().map(|child| child.len).sum(),
                     height: children[0].height + 1,
                 })
                 .collect();
         }
-        assert_eq!(trees.len(), 1);
-        trees.pop().unwrap()
+        let children = trees;
+        JournalJsonArray {
+            len: values.len() as u64,
+            height: children[0].height + 1,
+            node: JournalSequenceNode::JsonBranch {
+                children: children
+                    .iter()
+                    .map(|child| JournalCompactObjectId::from_object(child.root.as_ref().unwrap()))
+                    .collect(),
+            },
+        }
+    }
+
+    fn structured_item(&mut self, value: &serde_json::Value) -> JournalJsonItem {
+        if journal_json_can_inline(value).unwrap() {
+            JournalJsonItem::Inline {
+                value: value.clone(),
+            }
+        } else {
+            JournalJsonItem::Reference {
+                object: self.structured_json(value),
+            }
+        }
+    }
+
+    fn structured_array_item(&mut self, value: &serde_json::Value) -> JournalJsonItem {
+        if journal_json_can_inline(value).unwrap() {
+            JournalJsonItem::Reference {
+                object: self.add(
+                    JournalObjectKind::JsonInline,
+                    &JournalJsonInline(value.clone()),
+                ),
+            }
+        } else {
+            self.structured_item(value)
+        }
     }
 
     fn structured_entries(&mut self, items: Vec<JournalObjectId>) -> JournalSequence {
@@ -1983,20 +2049,14 @@ impl Assembler {
 
     fn structured_json(&mut self, value: &serde_json::Value) -> JournalObjectId {
         let node = match value {
-            serde_json::Value::Array(values) => {
-                let items = values
-                    .iter()
-                    .map(|value| self.structured_json(value))
-                    .collect();
-                JournalJsonValue::Array {
-                    items: self.structured_array(items),
-                }
-            }
+            serde_json::Value::Array(values) => JournalJsonValue::Array {
+                items: self.structured_array(values),
+            },
             serde_json::Value::Object(values) => {
                 let entries = values
                     .iter()
                     .map(|(key, value)| {
-                        let value = self.structured_json(value);
+                        let value = self.structured_item(value);
                         self.add(
                             JournalObjectKind::JsonObjectEntry,
                             &JournalJsonObjectEntry {

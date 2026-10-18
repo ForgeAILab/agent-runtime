@@ -11,7 +11,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 - **Breaking:** the schema-4 journal vocabulary released in 0.5.0 grows so a
   native turn costs O(delta). `JournalObjectKind` gains `ExtensionReference`,
-  `ManifestReference`, `JsonValue` and `JsonObjectEntry`, and
+  `ManifestReference`, `JsonValue`, `JsonInline`, `JsonBranch` and
+  `JsonObjectEntry`, and
   `JournalTransitionDelta` gains `extension_references` and
   `manifest_references`, so exhaustive matches and struct literals must add
   them. The native writer now sends the Runtime-owned
@@ -21,12 +22,16 @@ contain breaking changes and are coordinated with consumer proposals.
   under the same object IDs (`assert_ordinary_session_journal_conformance`
   now checks this; `assert_session_journal_conformance` checks that protected
   adapters admit and keep shared structured prefixes), and a
-  `JournalProjectionPolicy` that changes or omits
-  those records on a commit that references them rejects the commit.
+  `JournalProjectionPolicy` that changes or omits those records on a commit
+  that references them rejects the commit. Persistent JSON now uses
+  minimum-height arrays, typed compact values with a 1,024-byte threshold and
+  cached path/root encodings; this directly replaces the unreleased native
+  writer shape and adds no compatibility reader for it.
 
 ### Added
 
-- `RUNTIME_PREVIOUS_CACHE_NAMESPACE`, `JournalJsonValue`,
+- `RUNTIME_PREVIOUS_CACHE_NAMESPACE`, `JournalJsonValue`, `JournalJsonArray`,
+  `JournalJsonBranch`, `JournalJsonInline`, `JournalJsonItem`,
   `JournalJsonObjectEntry`, `ReferencedSessionState`, `ReferencedTurnManifest`
   and `InMemorySessionJournal::object_bytes`.
 

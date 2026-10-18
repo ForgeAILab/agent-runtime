@@ -101,6 +101,49 @@ all applicable gates, not merely contract merge.
   spine branches; the fixed 32-level spine also adds ~20–25 unary branch
   nodes to every changed array. Both are representation choices, not
   unchanged-prefix writes.
+  Refinement evidence (2026-10-18): persistent arrays now use their minimum
+  height, compact JSON values use a 1,024-byte canonical threshold with typed
+  inline/reference nodes, and cached record/path encodings are reused across
+  commits in the runtime writer and ordinary reference backend. Exact `S/N`
+  totals before/after this refinement are:
+
+  | Path | N=100 before / after | N=1000 before / after | N=4000 before / after |
+  | --- | ---: | ---: | ---: |
+  | Plain bootstrap | 285,872/607,811 / 146,814/239,857 | 2,318,762/5,107,642 / 1,062,815/1,742,270 | 9,114,257/20,124,203 / 4,133,607/6,767,016 |
+  | Plain protected turn | 52,327/58,337 / 42,041/48,051 | 53,871/59,895 / 43,740/49,764 | 52,998/59,022 / 43,088/49,112 |
+  | Plain ordinary terminal | 29,620/34,177 / 10,867/28,134 | 30,259/36,430 / 11,815/29,671 | 30,265/40,412 / 12,263/29,681 |
+  | Tool bootstrap | 294,745/619,525 / 154,239/247,610 | 2,327,637/5,119,362 / 1,070,240/1,750,023 | 9,123,130/20,135,917 / 4,141,032/6,774,769 |
+  | Tool protected turn | 127,974/139,853 / 108,028/119,907 | 131,154/143,061 / 111,468/123,375 | 129,408/141,315 / 110,164/122,071 |
+  | Tool ordinary terminal | 46,492/51,328 / 16,496/34,042 | 47,341/53,791 / 17,848/35,983 | 47,350/57,776 / 18,520/36,217 |
+
+  N=4,000 plain bootstrap is 3.82× the 1,772,321-byte legacy snapshot and
+  clears the ≤4× target. Each unchanged boundary remains zero drafts/zero body
+  bytes at 1,183/2,015, 1,187/2,021 and 1,187/2,021 (plain) and
+  1,180/2,011, 1,184/2,017 and 1,184/2,017 (tool).
+
+  Debug wall time per native commit, measured as complete API-phase elapsed
+  time divided by the phase's commit count, changed as follows (milliseconds):
+
+  | Phase | N=100 before / after | N=1000 before / after | N=4000 before / after |
+  | --- | ---: | ---: | ---: |
+  | Plain bootstrap | 217.0 / 42.5 | 1,857.6 / 316.6 | 7,421.0 / 1,302.0 |
+  | Plain turn | 310.2 / 27.9 | 2,693.7 / 159.3 | 10,761.8 / 593.6 |
+  | Plain unchanged | 644.9 / 2.5 | 5,842.1 / 9.4 | 23,261.0 / 31.6 |
+  | Tool bootstrap | 211.5 / 44.5 | 1,866.9 / 319.8 | 7,419.3 / 1,257.6 |
+  | Tool turn | 295.9 / 28.9 | 2,510.6 / 129.9 | 10,004.4 / 469.1 |
+  | Tool unchanged | 813.0 / 2.5 | 7,072.3 / 9.4 | 28,134.2 / 32.9 |
+
+  The optimized after run measured N=100/1000/4000 plain turns at
+  2.3/11.6/44.6 ms per commit and tool turns at 2.1/10.0/37.3 ms per commit;
+  its raw log is `/Volumes/Data/tmp/refactor/u9b-4/task-2.7-current-final-release.log`.
+
+  This is an 18–22× N=4,000 turn improvement, but complete phase time remains
+  N-dependent because full snapshot construction and host-policy materialization
+  are still O(N). The requested “roughly flat” end-to-end CPU target is therefore
+  recorded as NOT MET; the encoding/commit work itself is delta-reused. Detailed
+  commit-kind bytes are in `docs/development.md`; raw before/after logs are
+  `/Volumes/Data/tmp/refactor/u9b-4/task-2.7-before.log` and
+  `/Volumes/Data/tmp/refactor/u9b-4/task-2.7-current-final.log`.
 - [ ] 2.8 Decide whether materialized checkpoints need a new schema tag once the native writer exists. Group A keeps CHECKPOINT_SCHEMA_VERSION at 3 and writes unchanged bytes; if a new tag is needed, ship its reader one release before any writer and state the rollback limit in CHANGELOG.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)

@@ -177,92 +177,109 @@ rejected.
 
 ### Native turn byte-cost evidence (U9 task 2.7)
 
-The native writer structurally encodes retained manifests and the Runtime-owned
-redaction-safe `runtime.core.previous_cache` value. Arrays use bounded
-single-reference leaves plus a fixed-height binary spine, so unchanged prefixes
-are referenced rather than submitted. Host-owned opaque extensions remain
-whole-value replacements. Ordinary commits carry a changed record either as a
-structured draft plus a delta reference, or directly in the semantic delta,
-never both.
+The native writer uses minimum-height persistent arrays and a 1,024-byte
+canonical-JSON inline threshold. Compact array values are one typed object,
+two values share a bottom node, internal branch IDs use canonical Z85, and the
+array root is inline in its `JsonValue` parent. User JSON is never interpreted
+by shape: inline/reference selection is an explicit schema tag and object kind.
+Host-owned opaque extensions remain whole-value replacements.
 
-The deterministic measurement below uses an identity ordinary policy, one
+The deterministic debug measurement uses an identity ordinary policy, one
 bootstrap turn, then either a one-message turn or a tool-call/result/final
-turn. `S/N` means logical serialized submission bytes / newly retained
-immutable-object bytes. Submission bytes use the same component accounting as
-the 2.2–2.4 review: candidate object envelopes + serialized semantic delta +
-batch/checkpoint envelopes. New-object bytes are the before/after encoded-byte
-delta in `InMemorySessionJournal`, including projected nodes, batch and head.
+turn. `S/N` is serialized submission bytes / newly retained immutable-object
+bytes. “Before” is main before this refinement; “after” is this representation.
 
-| Plain-turn commit kind | N=100 S/N | N=1000 S/N | N=4000 S/N |
+| Aggregate path | N=100 before | N=100 after | N=1000 before | N=1000 after | N=4000 before | N=4000 after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Plain bootstrap | 285,872 / 607,811 | 146,814 / 239,857 | 2,318,762 / 5,107,642 | 1,062,815 / 1,742,270 | 9,114,257 / 20,124,203 | 4,133,607 / 6,767,016 |
+| Plain protected turn | 52,327 / 58,337 | 42,041 / 48,051 | 53,871 / 59,895 | 43,740 / 49,764 | 52,998 / 59,022 | 43,088 / 49,112 |
+| Plain ordinary terminal | 29,620 / 34,177 | 10,867 / 28,134 | 30,259 / 36,430 | 11,815 / 29,671 | 30,265 / 40,412 | 12,263 / 29,681 |
+| Tool bootstrap | 294,745 / 619,525 | 154,239 / 247,610 | 2,327,637 / 5,119,362 | 1,070,240 / 1,750,023 | 9,123,130 / 20,135,917 | 4,141,032 / 6,774,769 |
+| Tool protected turn | 127,974 / 139,853 | 108,028 / 119,907 | 131,154 / 143,061 | 111,468 / 123,375 | 129,408 / 141,315 | 110,164 / 122,071 |
+| Tool ordinary terminal | 46,492 / 51,328 | 16,496 / 34,042 | 47,341 / 53,791 | 17,848 / 35,983 | 47,350 / 57,776 | 18,520 / 36,217 |
+| Plain unchanged boundary | 1,183 / 2,011 | 1,183 / 2,015 | 1,187 / 2,017 | 1,187 / 2,021 | 1,187 / 2,017 | 1,187 / 2,021 |
+| Tool unchanged boundary | 1,180 / 2,007 | 1,180 / 2,011 | 1,184 / 2,013 | 1,184 / 2,017 | 1,184 / 2,013 | 1,184 / 2,017 |
+
+N=4000 plain bootstrap is 3.82× one 1,772,321-byte legacy snapshot. Plain and
+tool turn submissions are lower than main at every N; unchanged commits still
+submit zero drafts and zero body bytes.
+
+| Plain-turn commit kind (after) | N=100 S/N | N=1000 S/N | N=4000 S/N |
 | --- | ---: | ---: | ---: |
 | Protected Accepted | 11,968 / 12,814 | 12,562 / 13,410 | 12,124 / 12,972 |
 | Protected Planning | 2,118 / 3,033 | 2,125 / 3,042 | 2,125 / 3,042 |
 | Protected CallingModel | 3,959 / 4,735 | 3,968 / 4,746 | 3,968 / 4,746 |
-| Protected ModelResponseReady | 18,343 / 19,137 | 18,669 / 19,465 | 18,672 / 19,468 |
+| Protected ModelResponseReady | 8,057 / 8,851 | 8,538 / 9,334 | 8,762 / 9,558 |
 | Protected Completing | 11,695 / 12,542 | 12,289 / 13,138 | 11,851 / 12,700 |
 | Protected PublishingTerminal | 2,122 / 3,038 | 2,129 / 3,047 | 2,129 / 3,047 |
 | Protected Terminal | 2,122 / 3,038 | 2,129 / 3,047 | 2,129 / 3,047 |
-| Ordinary terminal | 29,620 / 34,177 | 30,259 / 36,430 | 30,265 / 40,412 |
-| Ordinary unchanged (each) | 1,183 / 2,011 | 1,187 / 2,017 | 1,187 / 2,017 |
+| Ordinary terminal | 10,867 / 28,134 | 11,815 / 29,671 | 12,263 / 29,681 |
+| Ordinary unchanged (each) | 1,183 / 2,015 | 1,187 / 2,021 | 1,187 / 2,021 |
 
-| Tool-turn commit kind | N=100 S/N | N=1000 S/N | N=4000 S/N |
+| Tool-turn commit kind (after) | N=100 S/N | N=1000 S/N | N=4000 S/N |
 | --- | ---: | ---: | ---: |
 | Protected Accepted | 11,952 / 12,801 | 12,546 / 13,397 | 12,108 / 12,959 |
-| Protected Planning (first request) | 2,114 / 3,028 | 2,121 / 3,037 | 2,121 / 3,037 |
-| Protected CallingModel (tool request) | 4,018 / 4,793 | 4,027 / 4,804 | 4,027 / 4,804 |
-| Protected ModelResponseReady (tool call) | 18,524 / 19,317 | 18,850 / 19,645 | 18,853 / 19,648 |
+| Protected Planning (first) | 2,114 / 3,028 | 2,121 / 3,037 | 2,121 / 3,037 |
+| Protected CallingModel (tool) | 4,018 / 4,793 | 4,027 / 4,804 | 4,027 / 4,804 |
+| Protected ModelResponseReady (tool) | 8,243 / 9,036 | 8,724 / 9,519 | 8,948 / 9,743 |
 | Protected AwaitingApproval | 26,147 / 26,944 | 26,741 / 27,540 | 26,303 / 27,102 |
 | Protected ExecutingTools (admission) | 2,818 / 3,733 | 2,825 / 3,742 | 2,825 / 3,742 |
 | Protected ToolOutcomeReady | 3,204 / 4,119 | 3,211 / 4,128 | 3,211 / 4,128 |
-| Protected ExecutingTools (committed result) | 19,454 / 20,218 | 20,048 / 20,814 | 19,610 / 20,376 |
-| Protected Planning (final request) | 2,410 / 3,325 | 2,417 / 3,334 | 2,417 / 3,334 |
-| Protected CallingModel (final request) | 3,773 / 4,548 | 3,781 / 4,558 | 3,781 / 4,558 |
-| Protected ModelResponseReady (final response) | 17,492 / 18,285 | 17,911 / 18,706 | 17,914 / 18,709 |
+| Protected ExecutingTools (result) | 19,454 / 20,218 | 20,048 / 20,814 | 19,610 / 20,376 |
+| Protected Planning (final) | 2,410 / 3,325 | 2,417 / 3,334 | 2,417 / 3,334 |
+| Protected CallingModel (final) | 3,773 / 4,548 | 3,781 / 4,558 | 3,781 / 4,558 |
+| Protected ModelResponseReady (final) | 7,827 / 8,620 | 8,351 / 9,146 | 8,575 / 9,370 |
 | Protected Completing | 11,830 / 12,674 | 12,424 / 13,270 | 11,986 / 12,832 |
 | Protected PublishingTerminal | 2,119 / 3,034 | 2,126 / 3,043 | 2,126 / 3,043 |
 | Protected Terminal | 2,119 / 3,034 | 2,126 / 3,043 | 2,126 / 3,043 |
-| Ordinary terminal | 46,492 / 51,328 | 47,341 / 53,791 | 47,350 / 57,776 |
-| Ordinary unchanged (each) | 1,180 / 2,007 | 1,184 / 2,013 | 1,184 / 2,013 |
+| Ordinary terminal | 16,496 / 34,042 | 17,848 / 35,983 | 18,520 / 36,217 |
+| Ordinary unchanged (each) | 1,180 / 2,011 | 1,184 / 2,017 | 1,184 / 2,017 |
 
-The complete second-turn totals are constant in N within bounded reference
-metadata: plain protected 52,327/58,337, 53,871/59,895, 52,998/59,022;
-plain ordinary 29,620/34,177, 30,259/36,430, 30,265/40,412; tool protected
-127,974/139,853, 131,154/143,061, 129,408/141,315; and tool ordinary
-46,492/51,328, 47,341/53,791, 47,350/57,776. Every second-turn commit submits
-at most 512 bytes of new Message/Usage bodies. An unchanged ordinary boundary
-submits zero drafts and zero body bytes; the ~1.18 KB submission and ~2.01 KB
-new-object cost are only revisioned delta/batch/head metadata.
+Wall-clock rows are complete API-phase elapsed time divided by that phase's
+native commit count (debug build, milliseconds/commit), so they conservatively
+include planning and snapshot construction outside the journal backend.
 
-The changed previous-cache record is one structured reference at
-ModelResponseReady. Its submission/new-object bytes are 18,343/19,137,
-18,669/19,465 and 18,672/19,468 instead of the review's O(N) draft bytes
-13,362, 114,171 and 453,171. The ordinary terminal carries one cache reference
-and one plain (or two tool) manifest references. The changed opaque
-`runtime.manifest_boundary` replacement contributes 140 serialized delta bytes
-at every N. Any other opaque extension still costs its full replacement once
-in an ordinary submission; native encoding does not reinterpret its value.
-
-Bootstrap is deliberately O(N), and the generic persistent JSON representation
-trades extra first-write objects for bounded later writes:
-
-| Bootstrap/control | N=100 | N=1000 | N=4000 |
+| Phase | N=100 before / after | N=1000 before / after | N=4000 before / after |
 | --- | ---: | ---: | ---: |
-| Native plain bootstrap S/N | 285,872 / 607,811 | 2,318,762 / 5,107,642 | 9,114,257 / 20,124,203 |
-| Native tool bootstrap S/N | 294,745 / 619,525 | 2,327,637 / 5,119,362 | 9,123,130 / 20,135,917 |
-| Legacy plain protected turn / ordinary terminal | 154,348 / 48,207 | 1,414,421 / 443,321 | 5,659,421 / 1,772,321 |
-| Legacy tool protected turn / ordinary terminal | 316,555 / 63,352 | 2,836,721 / 570,973 | 11,326,721 / 2,277,973 |
+| Plain bootstrap | 217.0 / 42.5 | 1,857.6 / 316.6 | 7,421.0 / 1,302.0 |
+| Plain turn | 310.2 / 27.9 | 2,693.7 / 159.3 | 10,761.8 / 593.6 |
+| Plain unchanged | 644.9 / 2.5 | 5,842.1 / 9.4 | 23,261.0 / 31.6 |
+| Tool bootstrap | 211.5 / 44.5 | 1,866.9 / 319.8 | 7,419.3 / 1,257.6 |
+| Tool turn | 295.9 / 28.9 | 2,510.6 / 129.9 | 10,004.4 / 469.1 |
+| Tool unchanged | 813.0 / 2.5 | 7,072.3 / 9.4 | 28,134.2 / 32.9 |
 
-Legacy materialized stores and bytes are unchanged; their turn, terminal and
-unchanged-save costs remain O(N). N=10,000 is not comparable because the
-existing cache-identity contract caps stable-history entries at 4,096, causing
-both paths to fail planning before provider I/O. The largest successful case is
-N=4,000. Reproduce the table with:
+The optional optimized-build after measurement (milliseconds/commit) was:
+
+| Phase | N=100 | N=1000 | N=4000 |
+| --- | ---: | ---: | ---: |
+| Plain bootstrap | 5.4 | 21.7 | 86.3 |
+| Plain turn | 2.3 | 11.6 | 44.6 |
+| Plain unchanged | 0.4 | 1.9 | 6.0 |
+| Tool bootstrap | 3.0 | 22.0 | 87.4 |
+| Tool turn | 2.1 | 10.0 | 37.3 |
+| Tool unchanged | 0.3 | 1.7 | 7.2 |
+
+The writer and reference backend reuse per-record and per-JSON-path encodings;
+the reference backend also keeps immutable objects/reachability in append-only
+copy-on-write layers. End-to-end turn time is 18–22× lower at N=4000, but it is
+not flat in N because full `SessionSnapshot` construction and host-policy
+materialization still scale with retained state; this remains explicit evidence,
+not a constant-time claim.
+
+Legacy materialized bytes remain unchanged. N=10,000 is inapplicable because
+the pre-existing cache-identity contract rejects more than 4,096 stable-history
+entries before provider I/O. Reproduce the table with:
 
 ```sh
 cargo test -p agent-runtime --all-features --test integration \
   session_journal_equivalence::task_2_7_native_turn_bytes_are_delta_bounded \
   -- --exact --nocapture
 ```
+
+Raw before/after output is in
+`/Volumes/Data/tmp/refactor/u9b-4/task-2.7-before.log` and
+`/Volumes/Data/tmp/refactor/u9b-4/task-2.7-current-final.log`; the optimized
+after run is `task-2.7-current-final-release.log` in the same directory.
 
 ## Quality gates
 

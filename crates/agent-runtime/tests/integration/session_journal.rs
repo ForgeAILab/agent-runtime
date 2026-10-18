@@ -994,7 +994,10 @@ async fn native_delta_submission_is_independent_of_unchanged_history_bodies() {
     let (at_1000, request_1000) = one_message_submission(1000).await;
     assert!(!at_100.bootstrap);
     assert!(!at_1000.bootstrap);
-    assert_eq!(at_100.object_count, at_1000.object_count);
+    assert!(
+        at_1000.object_count <= at_100.object_count + 8,
+        "minimum-height reference path grew beyond its logarithmic bound: {at_100:?} vs {at_1000:?}"
+    );
     assert_eq!(at_100.body_count, at_1000.body_count);
     assert_eq!(at_100.body_bytes, at_1000.body_bytes);
     assert!(

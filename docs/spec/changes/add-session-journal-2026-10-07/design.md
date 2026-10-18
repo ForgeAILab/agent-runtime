@@ -127,6 +127,38 @@ cannot exercise a turn: the cache identity's 4,096-entry stable-history limit
 rejects both legacy and native planning before provider I/O. N=4,000 is the
 largest comparable successful case.
 
+### Task 2.7 representation refinement (2026-10-18)
+
+The unreleased native-writer shape is replaced directly; there is no reader or
+migration path for the PR #39 representation. Schema-4 readers retain the
+released v0.5.0 acceptance of inline `Manifest` and `Extension` object kinds.
+
+Persistent JSON uses a 1,024-byte canonical payload threshold. Compact values
+are stored as typed `JsonInline` objects (or as explicitly tagged inline object
+fields), never inferred from user JSON shape. Arrays of at most 64 items keep
+their typed root inline in the parent `JsonValue`; wider arrays use two compact
+values per bottom node, minimum-height binary paths, an inline array root, and
+dedicated compact `JsonBranch` objects. Branch child IDs use canonical Z85
+internally but expand to the same 32-byte/64-hex `JournalObjectId`; hashes and
+authorization remain unchanged. Readers still reject logical heights above 32.
+
+Each live writer domain caches the preceding history, usage, manifest and
+extension object IDs plus the persistent-JSON path encoding. Equal records
+reuse their roots; changed structured records rebuild only changed paths.
+`InMemorySessionJournal` mirrors that cache after ordinary projection, stores
+immutable objects and pin reachability in append-only copy-on-write layers, and
+short-circuits already validated pinned subtrees during commit reachability.
+All cached IDs are derived by the same canonical encoders: caching changes work,
+not committed roots. Ordinary referenced drafts are admitted only when every
+supplied object is reachable from the current structured delta and host policy
+preserves the Runtime-owned values exactly.
+
+The detailed byte/time evidence is in `tasks.md` and `docs/development.md`.
+Bootstrap clears the ≤4× legacy-snapshot target and later serialized turns are
+smaller than the prior shape. Complete debug phase time is much lower but not
+flat in N because public `SessionSnapshot` construction and full host-policy
+materialization remain O(N); that CPU target is explicitly NOT MET.
+
 ## Exact Trait Diff and Mode Selection
 
 Illustrative Rust signatures below fix names, arguments, return types and
