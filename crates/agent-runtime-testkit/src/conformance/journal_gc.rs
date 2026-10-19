@@ -6,8 +6,10 @@
 
 use std::collections::BTreeSet;
 
-use agent_runtime_core::ids::RequestId;
-use agent_runtime_core::provider::{ModelId, ProviderRequest};
+use agent_runtime_core::content::{InternalTurnInput, InternalTurnSensitivity, InternalTurnSource};
+use agent_runtime_core::ids::{AttemptId, RequestId};
+use agent_runtime_core::provider::{ModelId, ProviderRequest, ToolSchema};
+use agent_runtime_core::usage::{CounterKind, Provenance, UsageDelta, UsageRecord, UsageSource};
 use async_trait::async_trait;
 
 use super::*;
@@ -390,6 +392,7 @@ where
     assert_journal_unknown_dependency_conformance(&factory).await;
     assert_journal_backend_compaction_conformance(&factory).await;
     assert_journal_gc_reclamation_conformance(&factory).await;
+    assert_journal_gc_object_kind_closure_conformance(&factory).await;
     for operation in JournalGcInterleaving::ALL {
         assert_journal_gc_interleaving_conformance(&factory, *operation).await;
     }
@@ -1375,6 +1378,420 @@ async fn assert_closure(
     }
 }
 
+/// Every journal object kind a released v0.6.x or current native writer can
+/// publish survives collection under a live root and under an explicit
+/// historical retention pin: compact/inline JSON spines, structured and
+/// legacy manifests, usage records, multi-level sequences, provider requests
+/// with tool schemas, internal turn input and checkpoint state. A collector
+/// that fails to trace any one kind leaves a published root with a missing
+/// object; a fresh open after collection must still read every object and
+/// materialize the identical snapshot and checkpoint.
+pub async fn assert_journal_gc_object_kind_closure_conformance<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = SessionJournalCollectionFixture>,
+{
+    let fixture = factory().await;
+    let journal = &*fixture.backend.journal;
+    let session = SessionId::new("gc-object-kinds");
+    let writer = open_writer(journal, &session, None, "object-kinds").await;
+    let first_snapshot = kinds_snapshot(&session, 0);
+    let first_checkpoint = kinds_checkpoint(&first_snapshot, 0);
+    let first = kinds_commit(
+        &first_snapshot,
+        writer.writer_epoch().unwrap(),
+        None,
+        "kinds-0",
+        &first_checkpoint,
+    );
+    let mut kinds = BTreeSet::new();
+    for object in &first.objects {
+        kinds.insert(object.kind().unwrap().as_str());
+    }
+    for kind in [
+        JournalObjectKind::Checkpoint,
+        JournalObjectKind::Batch,
+        JournalObjectKind::Head,
+    ] {
+        kinds.insert(kind.as_str());
+    }
+    let every_kind: BTreeSet<_> = [
+        JournalObjectKind::Message,
+        JournalObjectKind::UsageRecord,
+        JournalObjectKind::Extension,
+        JournalObjectKind::Manifest,
+        JournalObjectKind::ExtensionReference,
+        JournalObjectKind::ManifestReference,
+        JournalObjectKind::JsonValue,
+        JournalObjectKind::JsonObjectEntry,
+        JournalObjectKind::JsonInline,
+        JournalObjectKind::Sequence,
+        JournalObjectKind::JsonBranch,
+        JournalObjectKind::Map,
+        JournalObjectKind::Request,
+        JournalObjectKind::RequestSettings,
+        JournalObjectKind::ToolSchema,
+        JournalObjectKind::TurnState,
+        JournalObjectKind::StateValue,
+        JournalObjectKind::InternalInput,
+        JournalObjectKind::Checkpoint,
+        JournalObjectKind::Head,
+        JournalObjectKind::Batch,
+    ]
+    .into_iter()
+    .map(JournalObjectKind::as_str)
+    .collect();
+    assert_eq!(
+        kinds, every_kind,
+        "the fixture must publish every object kind"
+    );
+    let first_head = journal.commit(&writer, first.clone()).await.unwrap();
+    let selected = open_retained(journal, &first_head, "kinds-retention")
+        .await
+        .unwrap();
+    fixture.host.retain_root(&selected).await.unwrap();
+    journal.close(selected).await.unwrap();
+    let second_snapshot = kinds_snapshot(&session, 1);
+    let second_checkpoint = kinds_checkpoint(&second_snapshot, 1);
+    let mut second = kinds_commit(
+        &second_snapshot,
+        writer.writer_epoch().unwrap(),
+        Some(&first_head),
+        "kinds-1",
+        &second_checkpoint,
+    );
+    let known: BTreeSet<_> = first
+        .objects
+        .iter()
+        .map(|object| object.id.clone())
+        .collect();
+    second.objects.retain(|object| !known.contains(&object.id));
+    second.digest = second.input_digest().unwrap();
+    let second_head = journal.commit(&writer, second.clone()).await.unwrap();
+    journal.close(writer).await.unwrap();
+    // Only the live root protects the latest closure; only the durable
+    // historical pin protects the exclusive objects of the first root.
+    fixture.collect().await;
+    let second_full = kinds_commit(
+        &second_snapshot,
+        second_head.writer_epoch,
+        Some(&first_head),
+        "kinds-1",
+        &second_checkpoint,
+    );
+    let reader = open_reader(journal, &session, Some(second_head.revision), "kinds-live").await;
+    assert_closure(journal, &reader, &second_full, &second_head).await;
+    let mut materialized = JournalReader::new(journal, &reader, KIND_LIMITS).unwrap();
+    assert_eq!(
+        materialized.snapshot().await.unwrap(),
+        Some(second_snapshot.clone())
+    );
+    assert_eq!(
+        materialized.checkpoint().await.unwrap(),
+        Some(second_checkpoint.clone())
+    );
+    journal.close(reader).await.unwrap();
+    let historical = open_retained(journal, &first_head, "kinds-historical")
+        .await
+        .unwrap();
+    assert_closure(journal, &historical, &first, &first_head).await;
+    let mut materialized = JournalReader::new(journal, &historical, KIND_LIMITS).unwrap();
+    assert_eq!(materialized.snapshot().await.unwrap(), Some(first_snapshot));
+    assert_eq!(
+        materialized.checkpoint().await.unwrap(),
+        Some(first_checkpoint)
+    );
+    journal.close(historical).await.unwrap();
+    fixture.release(&session, "kinds-retention").await;
+    assert!(fixture.collect().await.deleted > 0);
+    assert_conflict(
+        open_retained(journal, &first_head, "kinds-historical-gone")
+            .await
+            .unwrap_err(),
+    );
+    let reader = open_reader(journal, &session, Some(second_head.revision), "kinds-final").await;
+    let mut materialized = JournalReader::new(journal, &reader, KIND_LIMITS).unwrap();
+    assert_eq!(
+        materialized.snapshot().await.unwrap(),
+        Some(second_snapshot)
+    );
+    assert_eq!(
+        materialized.checkpoint().await.unwrap(),
+        Some(second_checkpoint)
+    );
+    journal.close(reader).await.unwrap();
+}
+
+const KIND_LIMITS: JournalReadLimits = JournalReadLimits {
+    objects: 100_000,
+    encoded_bytes: 64_000_000,
+    entries: 100_000,
+};
+
+/// A snapshot whose every variant-dependent object differs between variants.
+fn kinds_snapshot(session: &SessionId, variant: u64) -> SessionSnapshot {
+    let mut snapshot = structured_snapshot(session, 100 + variant as usize, 2);
+    snapshot.history = (0..(JOURNAL_FANOUT as u64 + 6))
+        .map(|index| Message::user(format!("kinds {variant} history {index}")))
+        .collect();
+    for attempt in 0..2 {
+        snapshot.usage.record(UsageRecord {
+            source: UsageSource::ProviderAttempt,
+            provenance: Provenance {
+                attempt: Some(AttemptId::new(format!("kinds-{variant}-{attempt}"))),
+                failed: attempt == 0,
+                ..Default::default()
+            },
+            delta: UsageDelta::new().with(CounterKind::Output, 10 + variant + attempt),
+        });
+    }
+    snapshot.extension_state.insert(
+        "host.opaque".into(),
+        VersionedSessionState::new(
+            RegistryRevision::new(format!("opaque-{variant}")),
+            serde_json::json!({"variant": variant}),
+        ),
+    );
+    snapshot.updated = Timestamp(10 + variant);
+    snapshot
+}
+
+fn kinds_checkpoint(snapshot: &SessionSnapshot, variant: u64) -> TurnCheckpoint {
+    let input = InternalTurnInput::new(
+        format!("continue the goal, variant {variant}"),
+        InternalTurnSource {
+            kind: "goal".into(),
+            id: "gc.object-kinds".into(),
+            revision: RegistryRevision::new(format!("gc-kinds-{variant}")),
+            sensitivity: InternalTurnSensitivity::Public,
+            goal: None,
+        },
+    )
+    .unwrap();
+    let accepted = TurnCheckpoint::internal_accepted(
+        TurnId::new(format!("kinds-turn-{variant}")),
+        input,
+        snapshot.clone(),
+        snapshot.history.len(),
+        Deadline::never(),
+        variant * 3 + 1,
+        variant * 3 + 1,
+        snapshot.updated,
+    )
+    .unwrap();
+    let planning = accepted
+        .transition(
+            TurnState::Planning { step: 0 },
+            snapshot.clone(),
+            variant * 3 + 2,
+            snapshot.updated,
+        )
+        .unwrap();
+    let mut request = ProviderRequest::new(
+        ModelId::new("gc-model"),
+        vec![Message::user(format!("kinds request {variant}"))],
+    );
+    request.tools = vec![ToolSchema {
+        name: format!("kinds_tool_{variant}"),
+        description: "collected tool schema".into(),
+        input_schema: serde_json::json!({"type": "object", "variant": variant}),
+    }];
+    planning
+        .transition(
+            TurnState::CallingModel {
+                request_id: RequestId::new(format!("kinds-request-{variant}")),
+                request,
+                step: 0,
+            },
+            snapshot.clone(),
+            variant * 3 + 3,
+            snapshot.updated,
+        )
+        .unwrap()
+}
+
+/// Exact protected bootstrap/replacement whose closure has every object kind:
+/// the first manifest stays a legacy leaf, later ones are structured references,
+/// and the Runtime cache namespace is a persistent JSON spine.
+fn kinds_commit(
+    snapshot: &SessionSnapshot,
+    epoch: u64,
+    current: Option<&JournalHead>,
+    operation: &str,
+    checkpoint: &TurnCheckpoint,
+) -> JournalCommit {
+    let mut assembler = Assembler::default();
+    let ids: Vec<_> = snapshot
+        .history
+        .iter()
+        .map(|message| assembler.add(JournalObjectKind::Message, message))
+        .collect();
+    let chain = journal_history_chain(&ids);
+    let history = bounded_sequence(&mut assembler, ids);
+    let usage_ids: Vec<_> = snapshot
+        .usage
+        .records()
+        .iter()
+        .map(|record| assembler.add(JournalObjectKind::UsageRecord, record))
+        .collect();
+    let usage = bounded_sequence(&mut assembler, usage_ids);
+    let manifest_ids: Vec<_> = snapshot
+        .manifests
+        .iter()
+        .enumerate()
+        .map(|(index, manifest)| {
+            if index == 0 {
+                assembler.add(JournalObjectKind::Manifest, manifest)
+            } else {
+                assembler.structured_manifest(manifest)
+            }
+        })
+        .collect();
+    let manifests = bounded_sequence(&mut assembler, manifest_ids);
+    let entries: Vec<_> = snapshot
+        .extension_state
+        .iter()
+        .map(|(key, value)| JournalMapEntry {
+            key: key.clone(),
+            value: if key == RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+                assembler.structured_cache(value)
+            } else {
+                assembler.add(JournalObjectKind::Extension, value)
+            },
+        })
+        .collect();
+    let extensions = JournalMap {
+        len: entries.len() as u64,
+        height: 0,
+        root: Some(assembler.add(JournalObjectKind::Map, &JournalMapNode::Leaf { entries })),
+    };
+    let roots = JournalSnapshotRoots {
+        history,
+        history_chain: chain,
+        usage,
+        extensions,
+        manifests,
+        planned_step_count: snapshot.manifests.len() as u64,
+        identity: snapshot.identity.clone(),
+        updated: snapshot.updated,
+    };
+    let TurnState::CallingModel {
+        request_id,
+        request,
+        step,
+    } = &checkpoint.state
+    else {
+        unreachable!()
+    };
+    let messages: Vec<_> = request
+        .messages
+        .iter()
+        .map(|message| assembler.add(JournalObjectKind::Message, message))
+        .collect();
+    let tools: Vec<_> = request
+        .tools
+        .iter()
+        .map(|tool| assembler.add(JournalObjectKind::ToolSchema, tool))
+        .collect();
+    let mut settings = request.clone();
+    settings.messages.clear();
+    settings.tools.clear();
+    let request = ReferencedProviderRequest {
+        messages: bounded_sequence(&mut assembler, messages),
+        tools: bounded_sequence(&mut assembler, tools),
+        settings: assembler.add(JournalObjectKind::RequestSettings, &settings),
+    };
+    let request = assembler.add(JournalObjectKind::Request, &request);
+    let fields = [
+        (
+            "request_id".into(),
+            JournalStateValue::Object {
+                object: assembler.add(JournalObjectKind::StateValue, request_id),
+            },
+        ),
+        (
+            "request".into(),
+            JournalStateValue::Request { object: request },
+        ),
+        (
+            "step".into(),
+            JournalStateValue::Object {
+                object: assembler.add(JournalObjectKind::StateValue, step),
+            },
+        ),
+    ]
+    .into();
+    let state = assembler.add(
+        JournalObjectKind::TurnState,
+        &ReferencedTurnState {
+            tag: "calling_model".into(),
+            fields,
+        },
+    );
+    let internal_input = checkpoint
+        .internal_input
+        .as_ref()
+        .map(|input| assembler.add(JournalObjectKind::InternalInput, input));
+    let referenced = ReferencedTurnCheckpoint {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        transition_revision: TURN_TRANSITION_REVISION,
+        session: checkpoint.session.clone(),
+        turn: checkpoint.turn.clone(),
+        state_revision: checkpoint.state_revision,
+        operation_fingerprint: checkpoint.operation_fingerprint.clone(),
+        active_history_start: checkpoint.active_history_start,
+        internal_input,
+        visible_output: checkpoint.visible_output,
+        state,
+        snapshot: roots.clone(),
+        deadline: checkpoint.deadline,
+        watermark: checkpoint.watermark.clone(),
+        updated: checkpoint.updated,
+    };
+    let checkpoint_id = JournalObject::encode(JournalObjectKind::Checkpoint, &referenced)
+        .unwrap()
+        .id;
+    let boundary = JournalBoundary {
+        version: 1,
+        session: snapshot.id.clone(),
+        turn: Some(checkpoint.turn.clone()),
+        checkpoint_sequence: referenced.watermark.checkpoint_sequence,
+        planned_step_count: roots.planned_step_count,
+    };
+    let mut commit = JournalCommit {
+        batch: JournalBatch {
+            session: snapshot.id.clone(),
+            sequence: current.map_or(1, |head| head.batch_sequence + 1),
+            predecessor: current.map(|head| JournalDigest::parse(head.batch.as_str()).unwrap()),
+            expected_revision: current.map(|head| head.revision),
+            writer_epoch: epoch,
+            operation: JournalOperationId::new(operation),
+            boundary: boundary.clone(),
+            snapshot: roots,
+            checkpoint: Some(checkpoint_id),
+        },
+        digest: zero_digest(),
+        objects: assembler
+            .objects
+            .into_iter()
+            .map(|(id, (_, bytes))| JournalObject { id, bytes })
+            .collect(),
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(snapshot.clone())),
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        },
+        checkpoint: Some(referenced),
+    };
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
 /// Long-session immutable-object byte evidence, separate from backend files,
 /// compression/compaction and the small durable replay/retirement indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1769,6 +2186,10 @@ mod tests {
             SessionJournalCollectionFixture::reference_ordinary(policy)
         })
         .await;
+    }
+    #[tokio::test]
+    async fn every_object_kind_survives_live_and_retained_collection() {
+        assert_journal_gc_object_kind_closure_conformance(&reference).await;
     }
     #[tokio::test]
     async fn long_session_collection_byte_evidence() {
