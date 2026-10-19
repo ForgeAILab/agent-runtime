@@ -17,6 +17,9 @@ contain breaking changes and are coordinated with consumer proposals.
   `provider.detail`, with the HTTP status as `http.status`. The reqwest
   transport reads it too, including from Gemini's SSE-framed error bodies.
   `agent-runtime-provider` now depends on `url` unconditionally.
+- A provider `BadRequest` converts to `ErrorKind::Provider` rather than
+  `ErrorKind::Config`, so a rejected request no longer displays as
+  `Config: ...`. `Unsupported` stays `Config`; failure classes are unchanged.
 
 ### Fixed
 
