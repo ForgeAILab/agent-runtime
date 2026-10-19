@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-18T00:00:00Z
+updated_at: 2026-10-19T00:00:00Z
 ---
 
 # Design: Delta persistence without changing storage authority
@@ -732,13 +732,26 @@ or validation diff from tag `v0.5.0` through `v0.6.0`, `v0.6.1` and this
 decision; those releases require schema 3 and deserialize the same state,
 snapshot, watermark, identity and operation fields. The native writer released
 in 0.6.x therefore produces no new materialized byte interpretation for an
-older reader. The Smith, Nyx and Open Forge consumer fixtures apply
-hypothetical strict guards (not the consumers' own code) to JSON materialized
-from a native schema-4 head: all require schema 3, Smith/Forge the inline
-`snapshot`, Forge the absence of `snapshot_roots`; the bytes round-trip and
-validate as `TurnCheckpoint`. Open Forge's real adapter deserializes the typed
-checkpoint of a pinned pre-`v0.2.0` runtime revision; that is the same
-question for legacy writes and is not changed by the native writer.
+older reader. The original task-2.8 consumer fixtures applied hypothetical strict JSON guards;
+group D replaces them with evidenced boundaries. In read-only Forge checkout
+`78702e7c4821d788ba05b7b484e80abc5c5c068e` (`next/v0.14`),
+`crates/agent-host/src/protected_store.rs:1942` uses typed
+`serde_json::from_slice::<TurnCheckpoint>` after opening the payload. Its exact
+runtime pin is now `82f5aac57a3b1012b4e96c1903f0ab4a0f00a625`
+(`Cargo.toml:37`, `Cargo.lock:24`); the checkpoint DTO/validation has no diff
+between that revision and this work's base. The neutral model also mirrors
+nullable payload/nonce handling, ordinary snapshot fallback to the checkpoint,
+and same-turn revision/fingerprint checks. It does not reproduce encryption,
+compression, tenant mapping, SQL transactions or competing-process CAS.
+
+Nyx checkout `585939d0d518e8a243c458016ed11f274d283f6d` has no
+checkpoint-store schema guard. `shared/agent.rs:339-358` selects ephemeral
+rebuilt history (with a stable owner) outside its optional LCM path and
+subscribes before send. `shared/session_store.rs:42-74` stores complete typed
+snapshot JSON, including Sensitive state; the neutral gate mirrors its
+round-trip and corrupt-input refusal. Smith has no local checkout: only the
+existing fixtures' typed checkpoint contract can be asserted, not an invented
+product schema guard or the source compatibility of its three actual stores.
 
 Consequently no reader-first schema-4 materialized-checkpoint plan and no new
 CHANGELOG rollback limit are needed. The existing native-adoption downgrade
@@ -779,3 +792,70 @@ is required and no group may weaken the protected barriers.
 - Decide release granularity for the v3 reader sunset. Recommendation: at least
   one full released U9 version plus the first U10 adoption release; removal only
   after Forge/Smith owners report stored mid-turn migration coverage.
+
+## Group D consumer evidence and release eligibility (2026-10-19)
+
+The named consumer targets include the additive journal assertions automatically;
+`.github/workflows/ci.yml` already runs each target without a test-name filter.
+The neutral chunk adapter delegates atomicity/fences to `InMemorySessionJournal`,
+stores bounded immutable chunks on reads, checks authorization before cached
+access, and counts each stored object's bytes once per protection domain. It
+materializes every acknowledged native publication; it is not a durable Forge
+chunk/SQL adapter. Its recovery suite imports real v3 CallingModel, pending
+approval and model-result checkpoints across seven commit cuts in each domain
+(42 import cases), checks exact signatures/requests/preparations, projected
+ordinary content, one-time chunk writes, and fresh-runtime continuation. The
+Forge target additionally includes the unchanged real LCM hard-admission suite
+and native 18-row write matrix. Five fork/resume operations each run at all
+three reference GC steps (15 schedules).
+
+Smith's new file/capsule migration fixture uses two existing v3 golden pairs
+through neutral file, capsule and in-memory CheckpointStore implementations,
+with unchanged default `journal()` discovery and unsupported capability errors.
+It checks direct manifest vectors, source-file preservation, signed pending
+approval/request imports, unchanged-body deduplication and staged-versus-published
+file JSON. It does not establish power-loss safety or implement a native file
+journal. Existing instruction/failing contributors, steering, event matching,
+held history, normalization and manifest-window checks remain in the named
+suite. Paired native idle compaction starts from a valid protected idle seed
+and preserves canonical history, usage, LCM state and manifest reads on resume.
+No Smith source checkout or product PTY/CLI tests are available.
+
+Nyx's ephemeral assertion configures both native stores, seeds history with a
+stable owner, subscribes before send, and requires zero store discovery,
+legacy operations and journal operations through persist/shutdown/drop. Optional
+durability uses neutral paired journals plus Nyx's actual complete-snapshot JSON
+boundary. No Nyx channel or product crate enters the runtime/testkit graph.
+Captured Cargo dependency-table fixtures also exercise immutable shared-tag/rev
+adoption and reject skew, local paths and moving branches. Forge's current pin
+is immutable but older than the candidate. Nyx `Cargo.toml:76-80` still uses
+`branch = "main"` for facade/core/testkit; its lockfile commit
+`22e41fa9a8e78f6ff0101af7743806a1d7867c5c` does not satisfy immutable manifest
+adoption. That is a release blocker, not a claim that this checkout adopted the
+candidate. The test explicitly detects the ineligible reference; green neutral
+tests alone do not grant release eligibility.
+
+Normal `SessionPersistence::open` still reads the legacy pair once even when
+both native heads exist, then selects native materializations. The new tests
+record that behavior and require no second import/chunk writes. Retired-root
+refusal remains the stricter zero-legacy-load contract proven in group C.
+
+Group D authorizes documentation only for 4.5. No version bump, tag, publication
+or release PR is made; task 4.5 stays open. Actual coordinated product adoption
+and its immutable landed runtime revision remain release prerequisites.
+
+Final group-D local verification (2026-10-19): core **277**, runtime **676**,
+testkit **434**, LCM **62** pass (per-command totals including doc tests).
+The default named targets pass Forge **25**, Smith **11**, Nyx **10**;
+workspace all-features passes **2,116** with **4** pre-existing ignored cases,
+and the separate default-feature doc run passes **8** with **1** ignored
+example. No failures remain. Final formatting and warnings-denied Clippy pass,
+as do Rust 1.86 core/runtime and eight-package all-feature builds, Rust 1.88
+MCP/CLI, the 14-test command-provider target, dependency boundaries, and strict
+change validation. Offline cargo deny passes all four checks using a writable
+copy of existing advisory DB `999ec89d` (2026-10-17), after its original
+read-only cache lock failed; only the temporary db-path is changed. Full logs
+and qualifications are in `/Volumes/Data/tmp/refactor/u9d-1/report.md`.
+Tasks 4.2/4.3 remain open for unavailable Smith implementation evidence and
+immutable Nyx adoption, and 4.5 stays open for release. No product repository,
+version, tag or release PR was changed.

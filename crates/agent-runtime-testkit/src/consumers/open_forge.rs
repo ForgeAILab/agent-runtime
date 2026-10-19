@@ -77,3 +77,72 @@ pub fn topic_rotation(from: SessionId, new_id: SessionId, summary: String) -> Fo
         lcm: ForkLcm::NewTimeline,
     }
 }
+
+/// Plaintext boundary model of Forge's protected row loader at
+/// `crates/agent-host/src/protected_store.rs:1925-1961` (78702e7c checkout).
+/// Decryption/decompression is outside this neutral fixture. Forge deserializes
+/// the typed checkpoint; it does not inspect a JSON schema number first.
+/// Its pinned runtime 82f5aac has the same checkpoint DTO/validation as 0.7.0.
+pub fn decode_checkpoint_row(
+    payload: Option<&[u8]>,
+    nonce_present: bool,
+) -> Result<Option<agent_runtime_core::checkpoint::TurnCheckpoint>, RuntimeError> {
+    match (payload, nonce_present) {
+        (Some(bytes), true) => serde_json::from_slice(bytes).map(Some).map_err(|_| {
+            RuntimeError::new(
+                ErrorKind::Serialization,
+                "protected checkpoint contains invalid checkpoint JSON",
+            )
+        }),
+        (None, false) => Ok(None),
+        _ => Err(RuntimeError::new(
+            ErrorKind::Serialization,
+            "incomplete encrypted payload",
+        )),
+    }
+}
+
+/// Forge's ordinary loader uses typed snapshot JSON when both columns exist,
+/// otherwise it returns the snapshot owned by the latest checkpoint
+/// (`protected_store.rs:1801-1812`), including a half-present snapshot row.
+pub fn decode_snapshot_row(
+    payload: Option<&[u8]>,
+    nonce_present: bool,
+    checkpoint: Option<agent_runtime_core::checkpoint::TurnCheckpoint>,
+) -> Result<Option<agent_runtime_core::store::SessionSnapshot>, RuntimeError> {
+    match (payload, nonce_present) {
+        (Some(bytes), true) => serde_json::from_slice(bytes).map(Some).map_err(Into::into),
+        _ => Ok(checkpoint.map(|checkpoint| checkpoint.snapshot)),
+    }
+}
+
+/// Plaintext row revision checks from Forge's `save_checkpoint_once:1660-1712`.
+/// Returns false for its idempotent same-turn revision (it compares fingerprint,
+/// not complete JSON equality). A competing turn is refused on the retry pass.
+pub fn checkpoint_row_needs_write(
+    stored: &agent_runtime_core::checkpoint::TurnCheckpoint,
+    candidate: &agent_runtime_core::checkpoint::TurnCheckpoint,
+    retry: bool,
+) -> Result<bool, RuntimeError> {
+    if retry && stored.turn != candidate.turn {
+        return Err(RuntimeError::conflict(
+            "checkpoint turn changed during retry",
+        ));
+    }
+    if stored.turn == candidate.turn {
+        let stored_revision = i64::try_from(stored.state_revision).unwrap_or(i64::MAX);
+        let revision = i64::try_from(candidate.state_revision).unwrap_or(i64::MAX);
+        if revision < stored_revision
+            || (revision == stored_revision
+                && stored.operation_fingerprint != candidate.operation_fingerprint)
+        {
+            return Err(RuntimeError::conflict(
+                "checkpoint revision moved backwards or changed fingerprint",
+            ));
+        }
+        if revision == stored_revision {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}

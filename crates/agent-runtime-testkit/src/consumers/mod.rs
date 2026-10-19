@@ -10,3 +10,5 @@
 pub mod nyx;
 pub mod open_forge;
 pub mod smith;
+
+pub mod pinning;

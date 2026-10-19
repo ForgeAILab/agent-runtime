@@ -449,6 +449,24 @@ tag notes. A sibling path override is acceptable for local verification but
 must remain uncommitted; the released consumer manifest must resolve an exact
 version, tag, or Git revision.
 
+The U9 consumer journal helpers live in
+`agent_runtime_testkit::conformance::journal`: `assert_chunked_journal_recovery`,
+`assert_file_journal_migration`, `assert_ephemeral_journal_isolation`,
+`assert_optional_durable_journal` and `assert_native_idle_compaction`. Their
+calls are inside the three existing named targets, so CI's consumer job picks
+them up automatically. Forge also runs the existing ordinary hard-admission
+suite and native physical-write matrix in that target. These are neutral
+models, not product binaries or native durable file/SQL implementations.
+
+The Forge schema boundary mirrors its typed checkpoint row decoder and
+revision/fingerprint checks; Nyx has a complete-snapshot JSON loader and no
+checkpoint guard. Smith's actual store implementations are unavailable here.
+Captured dependency declarations under `tests/fixtures/consumers` document
+Forge's old exact revision and Nyx's currently moving main pin. The Nyx test
+checks that moving pin is rejected; a passing neutral target does not mark
+that product release-eligible. Coordinated product checks and adoption of the
+same immutable landed runtime revision remain required.
+
 ### Schema and MSRV matrix
 
 ```sh

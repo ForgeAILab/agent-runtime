@@ -57,3 +57,22 @@ pub fn build(
 pub fn start_request(history: Vec<Message>) -> StartSession {
     StartSession::ephemeral(history)
 }
+
+/// Nyx's optional durable adapter uses complete typed SessionSnapshot JSON,
+/// including Sensitive state (`shared/session_store.rs:42-74`, 585939d0).
+/// It has no CheckpointStore or custom checkpoint schema guard.
+pub fn decode_snapshot_json(
+    json: &str,
+) -> Result<agent_runtime_core::store::SessionSnapshot, RuntimeError> {
+    serde_json::from_str(json)
+        .map_err(|_| RuntimeError::internal("session snapshot is not readable"))
+}
+
+/// Runs the actual durable JSON encode/decode boundary without NyxDb or a Nyx
+/// dependency. Unknown/corrupt input must fail rather than yield empty history.
+pub fn assert_snapshot_json_roundtrip(snapshot: &agent_runtime_core::store::SessionSnapshot) {
+    let json = serde_json::to_string(snapshot).unwrap();
+    assert_eq!(&decode_snapshot_json(&json).unwrap(), snapshot);
+    assert!(decode_snapshot_json("{not json").is_err());
+    assert!(decode_snapshot_json("{}").is_err());
+}

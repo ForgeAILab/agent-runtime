@@ -48,12 +48,11 @@ async fn smith_adapter_passes_shared_conformance() {
 async fn smith_schema_guard_accepts_a_checkpoint_materialized_from_a_native_head() {
     agent_runtime_testkit::conformance::journal::assert_native_materialized_checkpoint_schema_guard(
         |bytes| {
-            let value: serde_json::Value =
+            // No Smith checkout: only the typed contract encoded by the existing
+            // fixtures is asserted. No product-specific schema guard is known.
+            let checkpoint: agent_runtime_core::checkpoint::TurnCheckpoint =
                 serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-            match value.get("schema_version").and_then(serde_json::Value::as_u64) {
-                Some(3) if value.get("snapshot").is_some() => Ok(()),
-                other => Err(format!("Smith accepts only materialized schema 3, got {other:?}")),
-            }
+            checkpoint.validate().map_err(|error| error.to_string())
         },
     )
     .await;
@@ -345,4 +344,14 @@ async fn smith_instruction_contributors_report_the_first_changed_prefix_id() {
             .contains("private instructions")
     );
     event_schema::assert_versioned_and_roundtrips(&observer.events());
+}
+
+#[tokio::test]
+async fn smith_file_journal_migration_gate() {
+    agent_runtime_testkit::conformance::journal::assert_file_journal_migration().await;
+}
+
+#[tokio::test]
+async fn smith_idle_compaction_with_native_journals() {
+    agent_runtime_testkit::conformance::journal::assert_native_idle_compaction().await;
 }

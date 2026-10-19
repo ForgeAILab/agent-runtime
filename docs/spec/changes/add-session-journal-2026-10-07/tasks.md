@@ -7,7 +7,9 @@ updated_at: 2026-10-19T00:00:00Z
 
 The owner approved merge group A on 2026-10-08 (local date); group B has since
 landed with the released native writer. The 2026-10-18 implementation request
-authorizes group C (3.1–3.4). Group D and U10 remain outside this authorization.
+authorizes group C (3.1–3.4). The 2026-10-19 implementation request authorizes
+4.1–4.4 and the documentation half of 4.5 only. Version changes, tagging,
+publishing and a release PR remain unauthorized; U10 is separate.
 Groups can merge independently; release requires all applicable gates, not
 merely contract merge.
 
@@ -276,14 +278,15 @@ merely contract merge.
   trip. The checkpoint DTO/validation has no persisted-contract diff between
   released `v0.5.0`, `v0.6.0`, `v0.6.1` and this decision, so no released
   reader sees a byte it could not already receive from the legacy path. The
-  Smith, Nyx and Open Forge consumer rows apply *hypothetical* strict JSON
-  guards (schema 3, inline `snapshot`, no `snapshot_roots`); they are not the
-  consumers' code. Open Forge's actual adapter deserializes the typed
-  `TurnCheckpoint` of a pinned pre-`v0.2.0` runtime revision, which predates
-  this release window; that compatibility question is the same for legacy
-  writes and is unaffected by the native writer. The existing warning
-  against downgrading a migrated native store remains, but no reader-first
-  materialized schema or additional CHANGELOG rollback limit is required.
+  original Smith, Nyx and Open Forge rows used hypothetical JSON guards;
+  group D replaces those guards with Forge's typed row decoder/revision checks,
+  Nyx's complete-snapshot loader and ephemeral/durable usage, and the typed
+  contract known from Smith's fixtures. Forge's current read-only reference
+  pins runtime `82f5aac` (checkpoint DTO/validation unchanged from this base),
+  not the pre-0.2 pin cited in the earlier review. Product encryption/SQL,
+  three actual Smith stores and full consumer adoption cannot be inferred from
+  neutral models; group D records those limits. Existing native-store downgrade
+  restrictions remain; no reader-first materialized schema bump is needed.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)
 
@@ -354,8 +357,79 @@ merely contract merge.
 
 ## 4. Merge group D — Coordinated consumers and release eligibility
 
-- [ ] 4.1 Extend consumer_open_forge with assert_chunked_journal_recovery over separate redacting/exact neutral chunk stores, actual Forge row-3.7 adapter/schema checks and shared-tag adoption.
+- [x] 4.1 Extend consumer_open_forge with assert_chunked_journal_recovery over separate redacting/exact neutral chunk stores, actual Forge row-3.7 adapter/schema checks and shared-tag adoption.
+  Neutral gate implemented: 42 v3 import cuts (three real pending states ×
+  two domains × seven commit cuts), exact continuation/no-replay, Sensitive
+  omission and cross-domain refusal, counted unique chunk insertions and
+  one-time import, plus 15 fork/resume/GC schedules. The named Forge target
+  also includes the unchanged LCM hard-admission suite and 18-row native
+  write matrix. The row model mirrors protected_store.rs:1660-1712,
+  :1801-1812 and :1925-1961 at Forge 78702e7c; its 82f5aac pin has identical
+  checkpoint DTO/validation. Captured exact-pin and synthetic shared-tag/skew
+  checks pass. No real Forge native adapter/adoption or SQL/encryption claim.
 - [ ] 4.2 Extend consumer_smith with assert_file_journal_migration and check all actual file/capsule checkpoint implementations, direct manifests reads, contributors, idle compaction and event matches.
+  Fixture extension complete: existing absent/unbounded v3 JSON through
+  neutral file/capsule slots and in-memory checkpoints, unchanged legacy
+  trait implementations, repeated loads/saves, direct manifests, signed
+  pending request/approval import, staged-file publication and committed JSON
+  corruption refusal, native body deduplication, and paired native idle
+  compaction/restart from a protected idle seed. Existing contributors,
+  steering, normalization and event expectations are unchanged. NOT MET:
+  checking Smith's three actual file/capsule implementations or real guards
+  is impossible from the supplied fixtures alone; no Smith checkout was
+  available. The capsule slot uses only the existing typed checkpoint JSON,
+  not an invented product container schema. This checkbox stays open for
+  actual implementation evidence; no product check is claimed.
 - [ ] 4.3 Extend consumer_nyx with assert_ephemeral_journal_isolation and assert_optional_durable_journal; verify zero durable activity for ephemeral starts and immutable dependency pinning.
-- [ ] 4.4 Run three existing named consumer targets, workspace/schema/conformance/doc checks, formatting, Clippy, dependency/license/neutrality and MSRV gates during implementation; a failing consumer blocks compatible release.
+  Both assertions are implemented. Stable-owner seeded ephemeral starts
+  subscribe before send and make zero discovery, legacy or journal calls
+  through persist/shutdown/drop. Optional neutral paired journals recover;
+  Nyx's actual complete-snapshot loader preserves Sensitive values and
+  rejects corrupt JSON. NOT MET: Nyx 585939d0 Cargo.toml:76-80 still uses
+  branch = "main" for facade/core/testkit (lock 22e41fa9). The captured
+  declaration is explicitly rejected by the immutable-pin checker; matching
+  immutable revision/tag and skew/path cases exercise adoption rules. No
+  product manifest was edited, so this checkbox remains open for immutable
+  consumer adoption, despite passing neutral assertions.
+- [x] 4.4 Run three existing named consumer targets, workspace/schema/conformance/doc checks, formatting, Clippy, dependency/license/neutrality and MSRV gates during implementation; a failing consumer blocks compatible release.
+  Local gates pass through timeout-bounded c.sh commands with offline Cargo:
+  core 277, runtime 676, testkit 434, LCM 62 (including their doc tests);
+  default-feature named consumers Forge 25 / Smith 11 / Nyx 10;
+  workspace all-features 2,116 passed / 0 failed / 4 existing ignored;
+  workspace default doc tests 8 passed / 1 existing ignored. Included testkit
+  subsets: 16 event-schema, 17 manifest, 53 journal and 3 replay unit cases.
+  Final fmt check and all-target/all-feature Clippy with warnings denied pass.
+  Rust 1.86 builds core/runtime and all eight embeddable production packages
+  with all features; Rust 1.88 builds MCP/CLI with all features. The separate
+  command-provider target passes 14 tests. Registry/ability normal graphs have
+  1/2 entries; default LCM has no forbidden provider/database/consumer match,
+  and context/LCM default builds plus LCM package inventory pass.
+  cargo deny's first offline attempt could not lock the read-only advisory
+  directory. Its second attempt passes advisories/bans/licenses/sources with
+  an unchanged policy and only db-path redirected to a writable local copy of
+  cached advisory DB 999ec89d (2026-10-17); nothing was fetched. Strict change
+  validation is Valid. CI consumer-compat already discovers every added test
+  in the existing targets, so no workflow edit is needed. Counts overlap
+  between commands and are not a unique-test total. Logs, exact commands,
+  timeouts, cache configuration and report: /Volumes/Data/tmp/refactor/u9d-1/.
+  These green neutral gates do not close the product limitations in 4.2/4.3
+  or authorize 4.5 release actions.
 - [ ] 4.5 Publish migration/downgrade/retention limitations and actual byte counts in CHANGELOG, coordinate pre-1.0 break, and release only an immutable landed revision. Do not remove v3 readers or legacy methods in this change.
+
+### 4.5 documentation scope and outstanding release action
+
+- [x] Documentation half of 4.5: write the requested CHANGELOG evidence and
+  pre-1.0 coordination note without performing any release action.
+
+The CHANGELOG Unreleased migration/downgrade/retention text and task-2.7 final
+submission/new-object byte table are written, including the representation
+follow-up, unchanged-body metadata cost, the N=4000 bootstrap ratio, legacy
+costs, the N=10000 cache-identity limit and the unmet flat-CPU target. The
+retention measurement distinguishes live collection from retirement.
+
+**The 4.5 release checkbox above remains open.** Version bumps, tags, publishing
+and opening a release PR were explicitly excluded. Release also awaits actual
+product checks/adoption against one immutable landed runtime revision: Nyx's
+read-only manifest still tracks main, Forge pins an older revision, and Smith
+source/adoption evidence is unavailable. No consumer repository was edited,
+built or run.

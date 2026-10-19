@@ -38,6 +38,10 @@ const LIMITS: JournalReadLimits = JournalReadLimits {
 mod collection;
 pub use collection::*;
 
+#[path = "journal_consumers/mod.rs"]
+mod consumers;
+pub use consumers::*;
+
 type FailureInjector =
     dyn Fn(JournalCommitFailurePoint) -> Result<(), RuntimeError> + Send + Sync + 'static;
 type WriterRevoker = dyn Fn(&SessionId) -> Result<(), RuntimeError> + Send + Sync + 'static;
