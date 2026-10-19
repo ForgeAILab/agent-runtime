@@ -237,6 +237,7 @@ impl ObjectStore {
             .collect()
     }
 
+    #[cfg(test)]
     pub(in crate::journal) fn replace_entries(
         &mut self,
         entries: BTreeMap<JournalObjectId, Arc<Vec<u8>>>,
@@ -1417,6 +1418,7 @@ impl Transition {
         Ok(retirement)
     }
 
+    #[cfg(test)]
     pub(in crate::journal) fn collect(
         &self,
         request: JournalGcRequest,
