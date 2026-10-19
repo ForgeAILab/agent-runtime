@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T18:26:00Z
+updated_at: 2026-10-19T19:46:26Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -52,19 +52,19 @@ this measurement job.
 
 ## 2. Engine extraction (no behavior change; all existing suites unchanged)
 
-- [ ] 2.1 Move the private engine pieces out of `memory.rs` into
+- [x] 2.1 Move the private engine pieces out of `memory.rs` into
   `journal/engine/` modules (assembler, draft reader and staged closure,
   object links and closures, dependency roots, encoding cache, projection
   policy). Pure moves; public paths unchanged. Tests: core journal unit
   tests, testkit `journal` and `journal_gc` suites.
-- [ ] 2.2 Add `journal::storage` (`JournalStorage` and the D2 DTOs) and
+- [x] 2.2 Add `journal::storage` (`JournalStorage` and the D2 DTOs) and
   `VolatileJournalStorage` (copy-on-write object layers, records, operation
   records, pins, catalog, per-(domain, session) membership, `inject`
   handling, `dirty_sessions`). Engine not yet using it. Tests: storage unit
   tests for all-or-nothing `apply` at each `inject` point, `expect` fences,
   membership-restricted reads, deletion only at last membership across
   domains and sessions.
-- [ ] 2.3 Add `JournalEngine<S>` with the D3 registry and write gate; port
+- [x] 2.3 Add `JournalEngine<S>` with the D3 registry and write gate; port
   `open`, `read`, `commit`, `renew`, `close` and `revoke_writer` to storage
   reads plus one `apply` per write, with the same root-epoch points. Make
   `InMemorySessionJournal` a newtype over `JournalEngine<VolatileJournalStorage>`.
@@ -72,7 +72,7 @@ this measurement job.
   crash matrices, testkit `assert_session_journal_reference_conformance`, a
   new test that `close` completes under `now_or_never` while another task
   holds the write gate.
-- [ ] 2.4 Port `retire`, `authorize_retirement`, `pin_transfer`,
+- [x] 2.4 Port `retire`, `authorize_retirement`, `pin_transfer`,
   `retain_root`, `release_pin`, `stage_leaves` and `compact`, keeping the
   newtype's synchronous signatures (D3). Tests: every testkit collection suite
   and `journal_gc_runtime`, unchanged.

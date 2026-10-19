@@ -1,0 +1,737 @@
+use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, MutexGuard};
+
+// Bodies live in immutable COW layers, shared by all domains and sessions.
+type Bodies = BTreeMap<JournalObjectId, Arc<[u8]>>;
+type DomainKey = (String, u8);
+type SessionKey = (DomainKey, SessionId);
+
+fn domain_key(domain: &JournalDomain) -> DomainKey {
+    (domain.storage_id.as_str().to_owned(), domain.role as u8)
+}
+fn session_key(domain: &JournalDomain, session: &SessionId) -> SessionKey {
+    (domain_key(domain), session.clone())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StoredState {
+    layers: Vec<Arc<Bodies>>,
+    records: BTreeMap<SessionKey, JournalSessionRecord>,
+    members: BTreeMap<SessionKey, Arc<BTreeSet<JournalObjectId>>>,
+    references: Arc<BTreeMap<JournalObjectId, usize>>,
+    operations: BTreeMap<(SessionKey, JournalOperationId), JournalOperationRecord>,
+    pins: BTreeMap<(SessionKey, JournalPinId), JournalPinRecord>,
+    catalog: BTreeMap<(SessionKey, JournalObjectId), JournalCatalogEntry>,
+    #[cfg(feature = "journal-measurement")]
+    batches: BTreeMap<DomainKey, Vec<Arc<Vec<JournalObjectId>>>>,
+}
+impl StoredState {
+    fn object(&self, id: &JournalObjectId) -> Option<&Arc<[u8]>> {
+        self.layers.iter().rev().find_map(|layer| layer.get(id))
+    }
+    fn entries(&self) -> Bodies {
+        self.layers
+            .iter()
+            .flat_map(|l| l.iter().map(|(id, b)| (id.clone(), b.clone())))
+            .collect()
+    }
+    fn add_layer(&mut self, objects: Bodies) {
+        if objects.is_empty() {
+            return;
+        }
+        self.layers.push(Arc::new(objects));
+        while self.layers.len() >= 2 {
+            let top = self.layers.len() - 1;
+            if self.layers[top].len() < self.layers[top - 1].len() {
+                break;
+            }
+            let newer = self.layers.pop().expect("two layers");
+            let older = Arc::make_mut(self.layers.last_mut().expect("two layers"));
+            match Arc::try_unwrap(newer) {
+                Ok(newer) => older.extend(newer),
+                Err(newer) => older.extend(newer.iter().map(|(id, b)| (id.clone(), b.clone()))),
+            }
+        }
+    }
+}
+
+/// Volatile, transactional reference storage. Clones share the same storage;
+/// every async method completes without suspension. No crash durability claim.
+#[derive(Clone, Default)]
+pub struct VolatileJournalStorage {
+    state: Arc<Mutex<StoredState>>,
+}
+impl fmt::Debug for VolatileJournalStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VolatileJournalStorage")
+            .finish_non_exhaustive()
+    }
+}
+impl VolatileJournalStorage {
+    fn admit(
+        staged: &mut StoredState,
+        key: &SessionKey,
+        object: &JournalStoredObject,
+        added: &mut Bodies,
+        _first: &mut Vec<JournalObjectId>,
+    ) -> Result<(), RuntimeError> {
+        let encoded = JournalObject {
+            id: object.id.clone(),
+            bytes: object.bytes.to_vec(),
+        };
+        if encoded.kind()? != object.kind {
+            return Err(conflict());
+        }
+        if let Some(bytes) = staged.object(&object.id) {
+            if bytes.as_ref() != object.bytes.as_ref() {
+                return Err(conflict());
+            }
+        } else {
+            added.insert(object.id.clone(), object.bytes.clone());
+        }
+        #[cfg(feature = "journal-measurement")]
+        let first_in_domain = !staged
+            .members
+            .iter()
+            .any(|((domain, _), members)| domain == &key.0 && members.contains(&object.id));
+        if Arc::make_mut(staged.members.entry(key.clone()).or_default()).insert(object.id.clone()) {
+            *Arc::make_mut(&mut staged.references)
+                .entry(object.id.clone())
+                .or_default() += 1;
+            #[cfg(feature = "journal-measurement")]
+            if first_in_domain {
+                _first.push(object.id.clone());
+            }
+        }
+        Ok(())
+    }
+    fn lock(&self) -> Result<MutexGuard<'_, StoredState>, RuntimeError> {
+        self.state
+            .lock()
+            .map_err(|_| super::super::engine::host_failure())
+    }
+    pub(in crate::journal) fn domain_objects(
+        &self,
+        domain: &JournalDomain,
+    ) -> Result<Bodies, RuntimeError> {
+        let state = self.lock()?;
+        let key = domain_key(domain);
+        let ids: BTreeSet<_> = state
+            .members
+            .iter()
+            .filter(|((d, _), _)| d == &key)
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect();
+        ids.into_iter()
+            .map(|id| {
+                let bytes = state.object(&id).cloned().ok_or_else(conflict)?;
+                Ok((id, bytes))
+            })
+            .collect()
+    }
+    // Preserve the physical layer view used by the original reference tests.
+    #[cfg(test)]
+    pub(in crate::journal) fn domain_object_store(
+        &self,
+        domain: &JournalDomain,
+    ) -> Result<super::super::engine::ObjectStore, RuntimeError> {
+        let state = self.lock()?;
+        let key = domain_key(domain);
+        let ids: BTreeSet<_> = state
+            .members
+            .iter()
+            .filter(|((d, _), _)| d == &key)
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect();
+        let bytes = ids
+            .iter()
+            .map(|id| state.object(id).ok_or_else(conflict).map(|b| b.len()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum();
+        let layers = state
+            .layers
+            .iter()
+            .map(|layer| {
+                Arc::new(
+                    layer
+                        .iter()
+                        .filter(|(id, _)| ids.contains(*id))
+                        .map(|(id, b)| (id.clone(), Arc::new(b.to_vec())))
+                        .collect(),
+                )
+            })
+            .collect();
+        Ok(super::super::engine::ObjectStore {
+            layers,
+            len: ids.len(),
+            bytes,
+        })
+    }
+    #[cfg(feature = "journal-measurement")]
+    pub(in crate::journal) fn measurement_export(
+        &self,
+        domain: &JournalDomain,
+    ) -> Result<JournalMeasurementExport, RuntimeError> {
+        let state = self.lock()?;
+        let key = domain_key(domain);
+        let ids: BTreeSet<_> = state
+            .members
+            .iter()
+            .filter(|((d, _), _)| d == &key)
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect();
+        let objects = ids
+            .into_iter()
+            .map(|id| {
+                let object = JournalObject {
+                    bytes: state.object(&id).ok_or_else(conflict)?.to_vec(),
+                    id,
+                };
+                Ok((object.kind()?, object))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let heads = state
+            .records
+            .iter()
+            .filter(|((d, _), _)| d == &key)
+            .filter_map(|((_, s), r)| r.head.as_ref().map(|h| (s, h)))
+            .map(|(s, h)| Ok((s.clone(), h.decode(JournalObjectKind::Head)?)))
+            .collect::<Result<BTreeMap<_, _>, RuntimeError>>()?;
+        let operations: Vec<_> = state
+            .operations
+            .iter()
+            .filter(|(((d, _), _), _)| d == &key)
+            .map(|(((_, s), _), o)| JournalMeasurementOperation {
+                session: s.clone(),
+                operation: o.operation.clone(),
+                digest: o.digest.clone(),
+                result: o.result.clone(),
+            })
+            .collect();
+        Ok(JournalMeasurementExport {
+            objects,
+            heads,
+            operation_count: operations.len(),
+            operations,
+            commit_batches: state.batches.get(&key).cloned().unwrap_or_default(),
+        })
+    }
+}
+
+#[async_trait]
+impl JournalStorage for VolatileJournalStorage {
+    async fn load(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+    ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
+        Ok(self
+            .lock()?
+            .records
+            .get(&session_key(domain, session))
+            .cloned())
+    }
+    async fn objects(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        ids: &[JournalObjectId],
+    ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
+        let state = self.lock()?;
+        let members = state.members.get(&session_key(domain, session));
+        Ok(ids
+            .iter()
+            .map(|id| {
+                members
+                    .filter(|m| m.contains(id))
+                    .and_then(|_| state.object(id))
+                    .cloned()
+            })
+            .collect())
+    }
+    async fn members(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+    ) -> Result<Vec<JournalObjectId>, RuntimeError> {
+        Ok(self
+            .lock()?
+            .members
+            .get(&session_key(domain, session))
+            .map(|m| m.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+    async fn operation(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        operation: &JournalOperationId,
+    ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
+        Ok(self
+            .lock()?
+            .operations
+            .get(&(session_key(domain, session), operation.clone()))
+            .cloned())
+    }
+    async fn pins(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+    ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
+        let key = session_key(domain, session);
+        Ok(self
+            .lock()?
+            .pins
+            .iter()
+            .filter(|((s, _), _)| s == &key)
+            .map(|(_, p)| p.clone())
+            .collect())
+    }
+    async fn catalog(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        head: &JournalObjectId,
+    ) -> Result<Option<JournalCatalogEntry>, RuntimeError> {
+        Ok(self
+            .lock()?
+            .catalog
+            .get(&(session_key(domain, session), head.clone()))
+            .cloned())
+    }
+    async fn dirty_sessions(
+        &self,
+        domain: &JournalDomain,
+        after: Option<&SessionId>,
+        limit: usize,
+    ) -> Result<Vec<SessionId>, RuntimeError> {
+        let key = domain_key(domain);
+        Ok(self
+            .lock()?
+            .records
+            .iter()
+            .filter(|((d, s), r)| d == &key && r.collection_dirty && after.is_none_or(|a| s > a))
+            .take(limit)
+            .map(|((_, s), _)| s.clone())
+            .collect())
+    }
+    async fn apply(&self, write: JournalWrite) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let key = session_key(&write.domain, &write.session);
+        let actual = state
+            .records
+            .get(&key)
+            .map_or((JournalRevision(0), 0), |r| (r.revision, r.writer_epoch));
+        if actual != write.expect {
+            return Err(conflict());
+        }
+        let mut staged = state.clone();
+        if write
+            .objects
+            .objects
+            .windows(2)
+            .any(|pair| pair[0].id >= pair[1].id)
+        {
+            return Err(conflict());
+        }
+        let fail = |point| {
+            if write.inject == Some(point) {
+                Err(super::super::engine::injected_failure())
+            } else {
+                Ok(())
+            }
+        };
+        let mut first = Vec::new();
+        // Execute the same ordered transaction steps as a durable adapter.
+        for (step, cut) in [
+            JournalCommitFailurePoint::AfterObjects,
+            JournalCommitFailurePoint::AfterCheckpoint,
+            JournalCommitFailurePoint::AfterBatch,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut added = Bodies::new();
+            for object in write
+                .objects
+                .objects
+                .iter()
+                .filter(|object| match object.kind {
+                    JournalObjectKind::Checkpoint => step == 1,
+                    JournalObjectKind::Batch => step == 2,
+                    JournalObjectKind::Head => false,
+                    _ => step == 0,
+                })
+            {
+                Self::admit(&mut staged, &key, object, &mut added, &mut first)?;
+            }
+            staged.add_layer(added);
+            fail(cut)?;
+        }
+        for pin in write.pins {
+            match pin {
+                JournalPinChange::Put(pin) => {
+                    staged.pins.insert((key.clone(), pin.pin.clone()), pin);
+                }
+                JournalPinChange::Remove(pin) => {
+                    staged.pins.remove(&(key.clone(), pin));
+                }
+            }
+        }
+        for entry in write.catalog {
+            match entry {
+                JournalCatalogChange::Put(entry) => {
+                    staged
+                        .catalog
+                        .insert((key.clone(), entry.head.clone()), entry);
+                }
+                JournalCatalogChange::Remove(head) => {
+                    staged.catalog.remove(&(key.clone(), head));
+                }
+            }
+        }
+        fail(JournalCommitFailurePoint::AfterPin)?;
+        let mut added = Bodies::new();
+        for object in write
+            .objects
+            .objects
+            .iter()
+            .filter(|object| object.kind == JournalObjectKind::Head)
+        {
+            Self::admit(&mut staged, &key, object, &mut added, &mut first)?;
+        }
+        staged.add_layer(added);
+        if let Some(record) = write.record {
+            staged.records.insert(key.clone(), record);
+        }
+        fail(JournalCommitFailurePoint::AfterHead)?;
+        if let Some(operation) = write.operation {
+            let op_key = (key.clone(), operation.operation.clone());
+            if staged
+                .operations
+                .get(&op_key)
+                .is_some_and(|old| old != &operation)
+            {
+                return Err(conflict());
+            }
+            staged.operations.insert(op_key, operation);
+        }
+        if let Some(before) = write.prune_operations_before {
+            staged.operations.retain(|(s, _), op| {
+                s != &key
+                    || op.revision >= before
+                    || op.result.writer_epoch == staged.records[&key].writer_epoch
+            });
+        }
+        fail(JournalCommitFailurePoint::AfterIdempotency)?;
+        let mut deleted = BTreeSet::new();
+        for id in write.release {
+            if staged
+                .members
+                .get_mut(&key)
+                .is_some_and(|m| Arc::make_mut(m).remove(&id))
+            {
+                let references = Arc::make_mut(&mut staged.references);
+                let count = references.get_mut(&id).ok_or_else(conflict)?;
+                *count -= 1;
+                if *count == 0 {
+                    references.remove(&id);
+                    deleted.insert(id);
+                }
+            }
+        }
+        if !deleted.is_empty() {
+            let mut entries = staged.entries();
+            entries.retain(|id, _| !deleted.contains(id));
+            staged.layers = vec![Arc::new(entries)];
+        }
+        #[cfg(feature = "journal-measurement")]
+        if write.kind == JournalWriteKind::Commit {
+            first.sort();
+            staged
+                .batches
+                .entry(domain_key(&write.domain))
+                .or_default()
+                .push(Arc::new(first));
+        }
+        *state = staged;
+        fail(JournalCommitFailurePoint::AfterCommit)
+    }
+    async fn compact(&self, _: &JournalDomain) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        state.layers = vec![Arc::new(state.entries())];
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::Timestamp;
+    use crate::journal::engine::ObjectAssembler;
+    use crate::store::SessionSnapshot;
+
+    fn domain(role: JournalRole) -> JournalDomain {
+        JournalDomain {
+            storage_id: JournalStorageId::new("shared"),
+            role,
+        }
+    }
+    fn state() -> JournalEngineState {
+        JournalEngineState {
+            version: 1,
+            bytes: vec![1, 2, 3],
+        }
+    }
+    fn write(session: &str) -> JournalWrite {
+        let session = SessionId::new(session);
+        let domain = domain(JournalRole::Protected);
+        let leaf =
+            JournalObject::encode(JournalObjectKind::JsonInline, &serde_json::json!("secret"))
+                .unwrap();
+        let snapshot = SessionSnapshot {
+            id: session.clone(),
+            history: vec![],
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: vec![],
+            extension_state: Default::default(),
+            updated: Timestamp(1),
+        };
+        let roots = ObjectAssembler::default().snapshot(&snapshot, 0).unwrap();
+        let head = JournalHead {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            storage_id: domain.storage_id.clone(),
+            role: domain.role,
+            session: session.clone(),
+            revision: JournalRevision(1),
+            writer_epoch: 1,
+            batch_sequence: 1,
+            batch: leaf.id.clone(),
+            snapshot: roots,
+            checkpoint: None,
+            superseded_by: None,
+            retirement: None,
+            created: Timestamp(1),
+            updated: Timestamp(1),
+        };
+        let head_object = JournalObject::encode(JournalObjectKind::Head, &head).unwrap();
+        JournalWrite {
+            domain,
+            session,
+            kind: JournalWriteKind::Commit,
+            expect: (JournalRevision(0), 0),
+            record: Some(JournalSessionRecord {
+                revision: JournalRevision(1),
+                writer_epoch: 1,
+                head: Some(head_object.clone()),
+                has_checkpoint: false,
+                retirement: None,
+                collection_dirty: true,
+                engine: state(),
+            }),
+            objects: JournalObjectBatch {
+                objects: vec![JournalStoredObject {
+                    id: leaf.id.clone(),
+                    kind: leaf.kind().unwrap(),
+                    bytes: leaf.bytes.into(),
+                }],
+            },
+            operation: Some(JournalOperationRecord {
+                operation: JournalOperationId::new("op"),
+                digest: journal_history_chain(std::iter::empty()),
+                revision: head.revision,
+                result: head,
+            }),
+            pins: vec![JournalPinChange::Put(JournalPinRecord {
+                pin: JournalPinId::new("pin"),
+                blocks_retirement: true,
+                roots: vec![leaf.id],
+                engine: state(),
+            })],
+            catalog: vec![JournalCatalogChange::Put(JournalCatalogEntry {
+                head: head_object.id,
+                engine: state(),
+            })],
+            release: vec![],
+            prune_operations_before: None,
+            inject: None,
+        }
+    }
+    #[tokio::test]
+    async fn every_injected_cut_is_atomic_including_a_lost_acknowledgement() {
+        for &cut in JournalCommitFailurePoint::ALL {
+            let storage = VolatileJournalStorage::default();
+            let before = storage.lock().unwrap().clone();
+            let mut transaction = write("s");
+            transaction.inject = Some(cut);
+            assert!(storage.apply(transaction.clone()).await.is_err());
+            if cut.is_after_commit() {
+                assert!(
+                    storage
+                        .load(&transaction.domain, &transaction.session)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    storage
+                        .operation(
+                            &transaction.domain,
+                            &transaction.session,
+                            &transaction.operation.unwrap().operation
+                        )
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(
+                    storage
+                        .pins(&transaction.domain, &transaction.session)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    storage
+                        .members(&transaction.domain, &transaction.session)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            } else {
+                assert_eq!(*storage.lock().unwrap(), before, "cut {cut:?}");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn both_fences_are_checked_inside_apply_without_side_effects() {
+        let storage = VolatileJournalStorage::default();
+        storage.apply(write("s")).await.unwrap();
+        let before = storage.lock().unwrap().clone();
+        for expect in [
+            (JournalRevision(0), 1),
+            (JournalRevision(1), 0),
+            (JournalRevision(0), 0),
+        ] {
+            let mut transaction = write("s");
+            transaction.expect = expect;
+            assert!(storage.apply(transaction).await.is_err());
+            assert_eq!(*storage.lock().unwrap(), before);
+        }
+    }
+    #[tokio::test]
+    async fn reads_require_membership_and_only_the_last_member_deletes_a_body() {
+        let storage = VolatileJournalStorage::default();
+        let protected = write("s");
+        let mut ordinary = write("s");
+        ordinary.domain.role = JournalRole::Ordinary;
+        let other = write("t");
+        let id = protected.objects.objects[0].id.clone();
+        assert_eq!(
+            storage
+                .objects(
+                    &protected.domain,
+                    &protected.session,
+                    std::slice::from_ref(&id)
+                )
+                .await
+                .unwrap(),
+            vec![None]
+        );
+        for transaction in [&protected, &ordinary, &other] {
+            storage.apply(transaction.clone()).await.unwrap();
+        }
+        let stranger = SessionId::new("stranger");
+        assert_eq!(
+            storage
+                .objects(&protected.domain, &stranger, std::slice::from_ref(&id))
+                .await
+                .unwrap(),
+            vec![None]
+        );
+        for (index, mut transaction) in [protected.clone(), ordinary.clone(), other.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            transaction.expect = (JournalRevision(1), 1);
+            transaction.objects.objects.clear();
+            transaction.operation = None;
+            transaction.record = None;
+            transaction.pins.clear();
+            transaction.catalog.clear();
+            transaction.release = vec![id.clone()];
+            storage.apply(transaction).await.unwrap();
+            assert_eq!(storage.lock().unwrap().object(&id).is_some(), index < 2);
+            if index < 2 {
+                assert!(
+                    storage
+                        .objects(&other.domain, &other.session, std::slice::from_ref(&id))
+                        .await
+                        .unwrap()[0]
+                        .is_some()
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn dirty_session_paging_is_ordered_and_domain_scoped() {
+        let storage = VolatileJournalStorage::default();
+        for name in ["c", "a", "b"] {
+            storage.apply(write(name)).await.unwrap();
+        }
+        let d = domain(JournalRole::Protected);
+        assert_eq!(
+            storage.dirty_sessions(&d, None, 2).await.unwrap(),
+            vec![SessionId::new("a"), SessionId::new("b")]
+        );
+        assert_eq!(
+            storage
+                .dirty_sessions(&d, Some(&SessionId::new("b")), 2)
+                .await
+                .unwrap(),
+            vec![SessionId::new("c")]
+        );
+        assert!(
+            storage
+                .dirty_sessions(&domain(JournalRole::Ordinary), None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .dirty_sessions(&d, None, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[cfg(feature = "journal-measurement")]
+    #[tokio::test]
+    async fn measurement_batches_do_not_readmit_a_body_shared_by_sessions() {
+        let storage = VolatileJournalStorage::default();
+        let first = write("s");
+        let id = first.objects.objects[0].id.clone();
+        storage.apply(first).await.unwrap();
+        storage.apply(write("t")).await.unwrap();
+        let export = storage
+            .measurement_export(&domain(JournalRole::Protected))
+            .unwrap();
+        assert_eq!(export.objects.len(), 1);
+        assert_eq!(export.commit_batches.len(), 2);
+        assert_eq!(export.commit_batches[0].as_ref(), &vec![id]);
+        assert!(export.commit_batches[1].is_empty());
+    }
+    #[test]
+    fn storage_debug_does_not_disclose_engine_or_object_bytes() {
+        let transaction = write("s");
+        let debug = format!("{:?}", transaction);
+        assert!(!debug.contains("secret"));
+        assert!(!format!("{:?}", state()).contains("1, 2, 3"));
+    }
+}

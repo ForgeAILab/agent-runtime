@@ -1,0 +1,307 @@
+use super::persistence::pin_record;
+use super::*;
+
+type DomainState = (
+    Transition,
+    BTreeMap<SessionId, Option<JournalSessionRecord>>,
+    BTreeMap<SessionId, Vec<JournalObjectId>>,
+);
+
+impl<S: JournalStorage> JournalEngine<S> {
+    /// Records host authorization for exactly this published revision.
+    pub async fn authorize_retirement(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+        retired_at: crate::clock::Timestamp,
+    ) -> Result<(), RuntimeError> {
+        self.control(session, JournalWriteKind::Authorize, None, |scratch| {
+            scratch.authorize_retirement(session, expected, retired_at)
+        })
+        .await
+    }
+    /// Persists the lease closure as unresolved transfer intent.
+    pub async fn pin_transfer(&self, lease: &JournalLease) -> Result<(), RuntimeError> {
+        self.control(lease.session(), JournalWriteKind::Pin, None, |scratch| {
+            scratch.pin_transfer(lease)
+        })
+        .await
+    }
+    /// Persists explicit historical retention under the lease's pin identity.
+    pub async fn retain_root(&self, lease: &JournalLease) -> Result<(), RuntimeError> {
+        self.control(lease.session(), JournalWriteKind::Pin, None, |scratch| {
+            scratch.retain_root(lease)
+        })
+        .await
+    }
+    /// Releases a durable pin after successful host repair or retention release.
+    pub async fn release_pin(
+        &self,
+        session: &SessionId,
+        pin: &JournalPinId,
+        expected_root_epoch: u64,
+    ) -> Result<(), RuntimeError> {
+        self.control(session, JournalWriteKind::ReleasePin, None, |scratch| {
+            scratch.release_pin(session, pin, expected_root_epoch)
+        })
+        .await
+    }
+    /// Stages validated protected immutable leaves without publishing a head.
+    pub async fn stage_leaves(
+        &self,
+        lease: &JournalLease,
+        pin: JournalPinId,
+        objects: Vec<JournalObject>,
+    ) -> Result<(), RuntimeError> {
+        let handle = self.local.token(lease)?.handle;
+        self.control(
+            lease.session(),
+            JournalWriteKind::Stage,
+            Some(handle),
+            move |scratch| scratch.stage_leaves(lease, pin, objects),
+        )
+        .await
+    }
+    async fn control<T>(
+        &self,
+        session: &SessionId,
+        kind: JournalWriteKind,
+        handle: Option<u64>,
+        action: impl FnOnce(&Transition) -> Result<T, RuntimeError>,
+    ) -> Result<T, RuntimeError> {
+        let _gate = self.gate.lock().await;
+        let (scratch, stored) = self.hydrate(session).await?;
+        self.control_prepared(session, kind, handle, action, scratch, stored)
+            .await
+    }
+    async fn control_prepared<T>(
+        &self,
+        session: &SessionId,
+        kind: JournalWriteKind,
+        handle: Option<u64>,
+        action: impl FnOnce(&Transition) -> Result<T, RuntimeError>,
+        scratch: Transition,
+        stored: Option<JournalSessionRecord>,
+    ) -> Result<T, RuntimeError> {
+        let (before_epoch, before_pins) = {
+            let state = scratch.lock()?;
+            (
+                state.root_epoch,
+                state
+                    .durable_pins
+                    .keys()
+                    .filter(|(s, _)| s == session)
+                    .map(|(_, p)| p.clone())
+                    .collect::<BTreeSet<_>>(),
+            )
+        };
+        let result = action(&scratch)?;
+        let mut write = self.write(&scratch, session, stored.as_ref(), kind)?;
+        let advance;
+        {
+            let state = scratch.lock()?;
+            advance = state.root_epoch != before_epoch;
+            for ((owner, pin), value) in &state.durable_pins {
+                if owner == session {
+                    write
+                        .pins
+                        .push(JournalPinChange::Put(pin_record(pin, value)?));
+                }
+            }
+            for pin in before_pins {
+                if !state
+                    .durable_pins
+                    .contains_key(&(session.clone(), pin.clone()))
+                {
+                    write.pins.push(JournalPinChange::Remove(pin));
+                }
+            }
+            if kind == JournalWriteKind::Stage {
+                write.objects.objects = state
+                    .objects
+                    .entries()
+                    .into_iter()
+                    .map(|(id, b)| {
+                        let object = JournalObject {
+                            id: id.clone(),
+                            bytes: b.as_ref().clone(),
+                        };
+                        Ok(JournalStoredObject {
+                            id,
+                            kind: object.kind()?,
+                            bytes: Arc::from(object.bytes),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+            }
+        }
+        self.apply(write, session).await?;
+        self.publish(&scratch, session, None, handle, advance)?;
+        self.publish_controls(&scratch, session)?;
+        self.mark_dirty(session)?;
+        Ok(result)
+    }
+    fn publish_controls(
+        &self,
+        scratch: &Transition,
+        session: &SessionId,
+    ) -> Result<(), RuntimeError> {
+        let prepared = scratch.lock()?;
+        let mut local = self.local.lock()?;
+        local.retirement_authorizations.remove(session);
+        if let Some(grant) = prepared.retirement_authorizations.get(session) {
+            local
+                .retirement_authorizations
+                .insert(session.clone(), *grant);
+        }
+        local.durable_pins.retain(|(s, _), _| s != session);
+        for (key, pin) in &prepared.durable_pins {
+            if &key.0 == session {
+                local.durable_pins.insert(key.clone(), pin.clone());
+            }
+        }
+        Ok(())
+    }
+    // The pre-incremental collector and retirement checks use the same complete
+    // dependency view as the original reference implementation.
+    async fn domain_state(&self, with_objects: bool) -> Result<DomainState, RuntimeError> {
+        let mut sessions: BTreeSet<_> = self.local.lock()?.sessions.keys().cloned().collect();
+        let mut after = None;
+        loop {
+            let page = self
+                .storage
+                .dirty_sessions(&self.domain, after.as_ref(), 128)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().cloned();
+            sessions.extend(page);
+        }
+        let mut state = self.local.lock()?.clone();
+        state.objects = ObjectStore::default();
+        let mut records = BTreeMap::new();
+        let mut memberships = BTreeMap::new();
+        let mut objects = BTreeMap::new();
+        for session in sessions {
+            let (scratch, stored) = self.hydrate(&session).await?;
+            {
+                let loaded = scratch.lock()?;
+                state
+                    .sessions
+                    .insert(session.clone(), loaded.sessions[&session].clone());
+                state.retirement_authorizations.remove(&session);
+                if let Some(grant) = loaded.retirement_authorizations.get(&session) {
+                    state
+                        .retirement_authorizations
+                        .insert(session.clone(), *grant);
+                }
+                state.durable_pins.retain(|(s, _), _| s != &session);
+                for (key, pin) in &loaded.durable_pins {
+                    if key.0 == session {
+                        state.durable_pins.insert(key.clone(), pin.clone());
+                    }
+                }
+            }
+            if with_objects {
+                let members = self.storage.members(&self.domain, &session).await?;
+                let bodies = self
+                    .storage
+                    .objects(&self.domain, &session, &members)
+                    .await?;
+                if bodies.len() != members.len() {
+                    return Err(conflict());
+                }
+                for (id, body) in members.iter().zip(bodies) {
+                    let body = body.ok_or_else(conflict)?.to_vec();
+                    if objects
+                        .insert(id.clone(), body.clone())
+                        .is_some_and(|previous| previous != body)
+                    {
+                        return Err(conflict());
+                    }
+                }
+                memberships.insert(session.clone(), members);
+            }
+            records.insert(session, stored);
+        }
+        state.objects = ObjectStore::from_map(objects);
+        let mut scratch = self.local.clone();
+        scratch.state = Arc::new(Mutex::new(state));
+        Ok((scratch, records, memberships))
+    }
+    pub(super) async fn retire_inner(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        let _gate = self.gate.lock().await;
+        if !self.local.lock()?.collection_enabled {
+            return Err(RuntimeError::unsupported_capability(
+                crate::error::UnsupportedCapability::JournalRetirement,
+            ));
+        }
+        let (scratch, records, _) = self.domain_state(false).await?;
+        self.control_prepared(
+            session,
+            JournalWriteKind::Retire,
+            None,
+            |scratch| scratch.retire(session, expected),
+            scratch,
+            records.get(session).cloned().flatten(),
+        )
+        .await
+    }
+    pub(super) async fn collect_inner(
+        &self,
+        request: JournalGcRequest,
+    ) -> Result<JournalGcReport, RuntimeError> {
+        let _gate = self.gate.lock().await;
+        {
+            let local = self.local.lock()?;
+            if !local.collection_enabled {
+                return Err(RuntimeError::unsupported_capability(
+                    crate::error::UnsupportedCapability::JournalCollection,
+                ));
+            }
+            if request.storage_id != self.domain.storage_id
+                || request.expected_root_epoch != local.root_epoch
+            {
+                return Err(conflict());
+            }
+        }
+        let (scratch, records, memberships) = self.domain_state(true).await?;
+        if self.root_epoch()? != request.expected_root_epoch {
+            return Err(conflict());
+        }
+        let report = scratch.collect(request)?;
+        if report.deleted != 0 {
+            let remaining: BTreeSet<_> = scratch.lock()?.objects.entries().into_keys().collect();
+            for (session, members) in memberships {
+                let release: Vec<_> = members
+                    .into_iter()
+                    .filter(|id| !remaining.contains(id))
+                    .collect();
+                if release.is_empty() {
+                    continue;
+                }
+                let mut write = self.write(
+                    &scratch,
+                    &session,
+                    records.get(&session).and_then(Option::as_ref),
+                    JournalWriteKind::Collect,
+                )?;
+                write.catalog = release
+                    .iter()
+                    .cloned()
+                    .map(JournalCatalogChange::Remove)
+                    .collect();
+                write.release = release;
+                self.apply(write, &session).await?;
+                self.publish(&scratch, &session, None, None, false)?;
+            }
+            self.local.lock()?.advance_root_epoch()?;
+        }
+        Ok(report)
+    }
+}

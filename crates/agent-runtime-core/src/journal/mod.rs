@@ -15,16 +15,23 @@
 //! pinned closure reads and durable idempotency. A digest is never a read grant.
 
 mod encoding;
+pub mod engine;
 mod memory;
 mod model;
 mod reader;
 mod snapshot;
+pub mod storage;
 
 pub use encoding::*;
+pub use engine::JournalCommitFailurePoint;
+pub use engine::{
+    IdentityJournalProjection, JournalEngine, JournalEngineConfig, JournalProjectionPolicy,
+};
 pub use memory::*;
 pub use model::*;
 pub use reader::*;
 pub use snapshot::*;
+pub use storage::*;
 
 use crate::error::RuntimeError;
 use crate::ids::SessionId;
