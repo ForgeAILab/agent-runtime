@@ -37,6 +37,7 @@ use agent_runtime_core::provider_credential::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::error_redaction::{self, RequestCredentials};
 use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
 
@@ -1059,7 +1060,7 @@ fn retry_seconds_ms(value: &str) -> Option<u64> {
     u64::try_from(duration.as_millis()).ok()
 }
 
-fn envelope_error(envelope: &Value) -> ProviderError {
+fn envelope_error(envelope: &Value, credentials: &RequestCredentials) -> ProviderError {
     let error = envelope.get("error").unwrap_or(envelope);
     let type_kind = error.get("type").and_then(envelope_error_kind);
     let code_kind = error.get("code").and_then(envelope_error_kind);
@@ -1103,10 +1104,17 @@ fn envelope_error(envelope: &Value) -> ProviderError {
             })
         });
     }
-    mapped
+    error_redaction::with_reason(
+        mapped,
+        error.get("message").and_then(Value::as_str),
+        credentials,
+    )
 }
 
-fn decode_stream_chunk(data: &str) -> Result<StreamChunk, ProviderError> {
+fn decode_stream_chunk(
+    data: &str,
+    credentials: &RequestCredentials,
+) -> Result<StreamChunk, ProviderError> {
     let malformed = || {
         ProviderError::new(
             ProviderErrorKind::MalformedStream,
@@ -1115,18 +1123,22 @@ fn decode_stream_chunk(data: &str) -> Result<StreamChunk, ProviderError> {
     };
     let value: Value = serde_json::from_str(data).map_err(|_| malformed())?;
     if value.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(envelope_error(&value));
+        return Err(envelope_error(&value, credentials));
     }
     serde_json::from_value(value).map_err(|_| malformed())
 }
 
-fn decode_stream_frame(data: &str, is_error: bool) -> Result<StreamChunk, ProviderError> {
+fn decode_stream_frame(
+    data: &str,
+    is_error: bool,
+    credentials: &RequestCredentials,
+) -> Result<StreamChunk, ProviderError> {
     if is_error {
         return Err(serde_json::from_str::<Value>(data)
-            .map(|value| envelope_error(&value))
+            .map(|value| envelope_error(&value, credentials))
             .unwrap_or_else(|_| stream_error()));
     }
-    decode_stream_chunk(data)
+    decode_stream_chunk(data, credentials)
 }
 
 /// Applies the same pre-output credential fence and rate-limit policy to
@@ -1361,6 +1373,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
         let clock = self.clock.clone();
+        let credentials = RequestCredentials::from_request(&http);
         let post = self.transport.post_response(http);
         tokio::pin!(post);
         let response = tokio::select! {
@@ -1377,7 +1390,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             result = &mut post => match result {
                 Ok(response) => response,
                 Err(error) => {
-                    let error = super::error_redaction::sanitize(error);
+                    let error = error_redaction::sanitize(error, &credentials);
                     return Err(classify_auth_rejection(
                         error,
                         credential_source,
@@ -1465,7 +1478,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(error) => {
-                        let error = super::error_redaction::sanitize(error);
+                        let error = error_redaction::sanitize(error, &credentials);
                         let error = if saw_semantic_event {
                             if error.kind == ProviderErrorKind::Auth {
                                 ProviderError::new(
@@ -1540,7 +1553,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         emitted_finish = true;
                         break 'outer;
                     }
-                    match decode_stream_frame(data, is_error) {
+                    match decode_stream_frame(data, is_error, &credentials) {
                         Ok(parsed) => {
                             saw_chunk = true;
                             let mut events = Vec::new();
@@ -1584,7 +1597,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
             }
 
             if let Some(body) = json_body {
-                let error = decode_stream_chunk(&body).err().unwrap_or_else(|| {
+                let error = decode_stream_chunk(&body, &credentials).err().unwrap_or_else(|| {
                     ProviderError::new(ProviderErrorKind::MalformedStream,
                         "OpenAI streaming response was not an SSE stream")
                 });
@@ -1608,7 +1621,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         };
                         emitted_finish = true;
                     } else if !data.is_empty() || is_error {
-                        match decode_stream_frame(data, is_error) {
+                        match decode_stream_frame(data, is_error, &credentials) {
                             Ok(parsed) => {
                                 saw_chunk = true;
                                 let mut events = Vec::new();
@@ -1651,6 +1664,56 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_stream_rejection_carries_only_a_checked_provider_reason() {
+        for (message, expected) in [
+            ("Invalid\nargument", Some("Invalid argument")),
+            ("Echoed openai-test-key", None),
+            ("Echoed Bearer openai-test-key", None),
+        ] {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"error":{"type":"invalid_request_error","message":message}})
+            );
+            let provider = OpenAiProvider::new(
+                ReplayTransport::new(vec![&frame]),
+                OpenAiConfig::new("http://x/v1", "gpt-test")
+                    .with_api_key(Secret::new("openai-test-key")),
+            );
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(ModelId::new("gpt-test"), vec![Message::user("hi")]),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let error = events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderStreamEvent::Error { error } => Some(error),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+            assert_eq!(
+                error.metadata.get("provider.detail"),
+                expected.map(Into::into).as_ref()
+            );
+            assert_eq!(
+                error.message,
+                expected
+                    .map(|reason| format!(
+                        "OpenAI-compatible provider rejected the request: {reason}"
+                    ))
+                    .unwrap_or_else(|| "OpenAI-compatible provider rejected the request".into())
+            );
+            assert!(!format!("{events:?}").contains("openai-test-key"));
+        }
+    }
     use super::*;
     use agent_runtime_core::cancel::Cancellation;
     use agent_runtime_core::clock::{Deadline, Timestamp};
@@ -2609,7 +2672,7 @@ mod tests {
         );
         let p = OpenAiProvider::new(
             ReplayTransport::new(vec![&sse]),
-            OpenAiConfig::new("http://x/v1", "gpt-x"),
+            OpenAiConfig::new("http://x/v1", "gpt-x").with_api_key(Secret::new(secret)),
         );
         let req = ProviderRequest::new(ModelId::new("gpt-x"), vec![]);
         let events = collect(p.stream(req, ctx()).await.unwrap()).await;
@@ -2736,7 +2799,7 @@ mod tests {
             json!("1e100"),
             json!({"seconds":1}),
         ] {
-            let error = decode_stream_chunk(&json!({"error":{"code":"new_code", "type":"rate_limit_error", "retry_after":hint}}).to_string()).unwrap_err();
+            let error = decode_stream_chunk(&json!({"error":{"code":"new_code", "type":"rate_limit_error", "retry_after":hint}}).to_string(), &RequestCredentials::default()).unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::RateLimited);
             assert_eq!(error.retry_after_ms, None);
         }
@@ -2784,7 +2847,11 @@ mod tests {
             json!({"code":"1261"}),
             json!({"status_code":422}),
         ] {
-            let error = decode_stream_chunk(&json!({"error":error}).to_string()).unwrap_err();
+            let error = decode_stream_chunk(
+                &json!({"error":error}).to_string(),
+                &RequestCredentials::default(),
+            )
+            .unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::BadRequest);
             assert!(!crate::retry::is_retryable(&error));
         }
@@ -2799,7 +2866,11 @@ mod tests {
             json!({"code":"1113"}),
             json!({"code":402}),
         ] {
-            let error = decode_stream_chunk(&json!({"error":error}).to_string()).unwrap_err();
+            let error = decode_stream_chunk(
+                &json!({"error":error}).to_string(),
+                &RequestCredentials::default(),
+            )
+            .unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::LimitExhausted);
             assert!(!crate::retry::is_retryable(&error));
         }
@@ -2813,7 +2884,15 @@ mod tests {
             json!({"code":9999}),
             json!({"type":"overloaded_error"}),
         ] {
-            let error = decode_stream_chunk(&json!({"error":error}).to_string()).unwrap_err();
+            let error = decode_stream_chunk(
+                &json!({"error":error}).to_string(),
+                &RequestCredentials::from_request(&HttpRequest {
+                    url: "https://test.invalid".into(),
+                    headers: vec![("authorization".into(), "Bearer secret-canary".into())],
+                    body: Vec::new(),
+                }),
+            )
+            .unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::Server);
             assert!(crate::retry::is_retryable(&error));
             assert!(!format!("{error:?}").contains("canary"));

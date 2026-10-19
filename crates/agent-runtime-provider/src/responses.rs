@@ -40,6 +40,7 @@ use agent_runtime_core::provider_credential::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::error_redaction::{self, RequestCredentials};
 use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
 
@@ -963,7 +964,10 @@ async fn classify_auth_rejection(
     }
 }
 
-fn sanitize_transport_error(error: ProviderError) -> ProviderError {
+fn sanitize_transport_error(
+    error: ProviderError,
+    credentials: &RequestCredentials,
+) -> ProviderError {
     let message = match error.kind {
         ProviderErrorKind::Network => "Responses provider network failure",
         ProviderErrorKind::Timeout => "Responses provider deadline elapsed",
@@ -977,10 +981,7 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::CacheExpired => "Responses provider cache identity expired",
         ProviderErrorKind::LimitExhausted => "Responses provider usage limit exhausted",
     };
-    let mut sanitized = ProviderError::new(error.kind, message);
-    sanitized.retryable = error.retryable;
-    sanitized.retry_after_ms = error.retry_after_ms;
-    sanitized
+    error_redaction::sanitize_with_message(error, message, credentials)
 }
 
 fn push_utf8(pending_bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<String>, ProviderError> {
@@ -1107,6 +1108,7 @@ enum PendingTerminal {
 
 #[derive(Debug, Default)]
 struct StreamState {
+    credentials: RequestCredentials,
     terminal_output: TerminalOutputPolicy,
     buffer_text: bool,
     tools: BTreeMap<u32, ToolSlot>,
@@ -1994,13 +1996,22 @@ fn event_to_events(
                     .or_else(|| optional_code(error, "type"))
                     .or_else(|| optional_code(error, "status"))
             });
-            state.pending_terminal =
-                Some(PendingTerminal::Error(map_response_error(code.as_deref())));
+            state.pending_terminal = Some(PendingTerminal::Error(error_redaction::with_reason(
+                map_response_error(code.as_deref()),
+                response
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str),
+                &state.credentials,
+            )));
         }
         "error" => {
             let code = optional_code(&event, "code").or_else(|| optional_code(&event, "status"));
-            state.pending_terminal =
-                Some(PendingTerminal::Error(map_response_error(code.as_deref())));
+            state.pending_terminal = Some(PendingTerminal::Error(error_redaction::with_reason(
+                map_response_error(code.as_deref()),
+                event.get("message").and_then(Value::as_str),
+                &state.credentials,
+            )));
         }
         // Unknown additive events carry no canonical content and are ignored.
         _ => {}
@@ -2094,6 +2105,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.as_ref().map(|lease| lease.revision().clone());
         let clock = self.clock.clone();
+        let credentials = RequestCredentials::from_request(&http);
         let post = self.transport.post_response(http);
         tokio::pin!(post);
         let response = tokio::select! {
@@ -2118,7 +2130,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
                         clock,
                     ).await);
                 }
-                Err(error) => return Err(sanitize_transport_error(error)),
+                Err(error) => return Err(sanitize_transport_error(error, &credentials)),
             },
         };
 
@@ -2144,6 +2156,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
             let mut state = StreamState {
+                credentials,
                 terminal_output,
                 buffer_text,
                 ..StreamState::default()
@@ -2187,7 +2200,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
                         return;
                     }
                     Err(error) => {
-                        yield ProviderStreamEvent::Error { error: sanitize_transport_error(error) };
+                        yield ProviderStreamEvent::Error { error: sanitize_transport_error(error, &state.credentials) };
                         return;
                     }
                 };
@@ -2308,6 +2321,59 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_stream_rejection_carries_only_a_checked_provider_reason() {
+        for kind in ["response.failed", "error"] {
+            for (message, expected) in [
+                ("Invalid\nargument", Some("Invalid argument")),
+                ("Echoed responses-test-key", None),
+                ("Echoed Bearer responses-test-key", None),
+            ] {
+                let error = json!({"code":"invalid_request_error","message":message});
+                let event = if kind == "response.failed" {
+                    json!({"type":kind,"response":{"error":error}})
+                } else {
+                    json!({"type":kind,"code":"invalid_request_error","message":message})
+                };
+                let frame = format!("data: {event}\n\ndata: [DONE]\n\n");
+                let provider = ResponsesProvider::new(
+                    ReplayTransport::new(&frame),
+                    ResponsesConfig::openai("gpt-test")
+                        .with_api_key(Secret::new("responses-test-key")),
+                )
+                .unwrap();
+                let events: Vec<_> = provider
+                    .stream(
+                        ProviderRequest::new(ModelId::new("gpt-test"), vec![Message::user("hi")]),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
+                let error = events
+                    .iter()
+                    .find_map(|event| match event {
+                        ProviderStreamEvent::Error { error } => Some(error),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+                assert_eq!(
+                    error.metadata.get("provider.detail"),
+                    expected.map(Into::into).as_ref()
+                );
+                assert_eq!(
+                    error.message,
+                    expected
+                        .map(|reason| format!("Responses provider rejected the request: {reason}"))
+                        .unwrap_or_else(|| "Responses provider rejected the request".into())
+                );
+                assert!(!format!("{events:?}").contains("responses-test-key"));
+            }
+        }
+    }
     use super::*;
     use agent_runtime_core::provider::ProviderAttemptPurpose;
     use futures_util::StreamExt;

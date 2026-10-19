@@ -7,6 +7,17 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Changed
+
+- A provider error now carries the reason the provider gave, such as Gemini's
+  `invalid_request: Request contains an invalid argument.`, instead of only
+  "provider rejected the request". Every adapter checks the reason against the
+  credentials it sent on that request and drops the whole reason if it repeats
+  any of them; a kept reason is bounded to 300 characters and kept as
+  `provider.detail`, with the HTTP status as `http.status`. The reqwest
+  transport reads it too, including from Gemini's SSE-framed error bodies.
+  `agent-runtime-provider` now depends on `url` unconditionally.
+
 ### Fixed
 
 - A native session no longer wedges after its terminal publication fails. When
