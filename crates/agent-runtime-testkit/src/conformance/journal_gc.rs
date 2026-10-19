@@ -551,6 +551,101 @@ where
             .unwrap_err(),
     );
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
+    assert_journal_superseded_transfer_pin_conformance(&fixture).await;
+}
+
+/// Transfer pins matter most when their own session supersedes the pinned root:
+/// a fork source selected at an older revision, or a migration/import writer
+/// that keeps publishing. Once the process lease is gone, the durable pin is
+/// the only protection of the old root's exclusive objects.
+async fn assert_journal_superseded_transfer_pin_conformance(
+    fixture: &SessionJournalCollectionFixture,
+) {
+    let journal = &*fixture.backend.journal;
+    for migration in [false, true] {
+        let session = SessionId::new(format!("gc-superseded-transfer-{migration}"));
+        let writer = open_writer(journal, &session, None, "superseded-writer").await;
+        if migration {
+            fixture.host.pin_transfer(&writer).await.unwrap();
+        }
+        let (first, _) = bootstrap_commit(
+            session.clone(),
+            writer.writer_epoch().unwrap(),
+            "first",
+            "pinned source",
+        );
+        let first_head = journal.commit(&writer, first.clone()).await.unwrap();
+        let pin = if migration {
+            "superseded-writer-pin"
+        } else {
+            let source = open_retained(journal, &first_head, "fork-source-pin")
+                .await
+                .unwrap();
+            fixture.host.pin_transfer(&source).await.unwrap();
+            journal.close(source).await.unwrap();
+            "fork-source-pin"
+        };
+        let next = append_commit(
+            session.clone(),
+            writer.writer_epoch().unwrap(),
+            &first_head,
+            "next",
+            &["pinned source", "successor"],
+            "successor",
+        );
+        let latest = journal.commit(&writer, next).await.unwrap();
+        fixture.backend.revoke_writer(&session).unwrap();
+        fixture.collect().await;
+        let selected = open_retained(journal, &first_head, "superseded-source")
+            .await
+            .expect("a transfer pin keeps its superseded root selectable");
+        assert_closure(journal, &selected, &first, &first_head).await;
+        journal.close(selected).await.unwrap();
+        fixture.authorize(&session, &latest).await;
+        assert_conflict(journal.retire(&session, latest.revision).await.unwrap_err());
+        fixture.release(&session, pin).await;
+        assert!(fixture.collect().await.deleted > 0);
+        assert_conflict(
+            open_retained(journal, &first_head, "superseded-released")
+                .await
+                .unwrap_err(),
+        );
+        assert_materializes(journal, &session, latest.revision, "superseded-latest").await;
+    }
+
+    // A renewed reader keeps protecting the root it selected, even after a
+    // successor supersedes it and no other pin remains.
+    let session = SessionId::new("gc-renewed-reader");
+    let writer = open_writer(journal, &session, None, "renewed-writer").await;
+    let (first, _) = bootstrap_commit(
+        session.clone(),
+        writer.writer_epoch().unwrap(),
+        "first",
+        "renewed body",
+    );
+    let first_head = journal.commit(&writer, first.clone()).await.unwrap();
+    let reader = open_reader(
+        journal,
+        &session,
+        Some(first_head.revision),
+        "renewed-reader",
+    )
+    .await;
+    let next = append_commit(
+        session.clone(),
+        writer.writer_epoch().unwrap(),
+        &first_head,
+        "next",
+        &["renewed body", "successor"],
+        "successor",
+    );
+    journal.commit(&writer, next).await.unwrap();
+    journal.close(writer).await.unwrap();
+    let reader = journal.renew(&reader).await.unwrap();
+    fixture.collect().await;
+    assert_closure(journal, &reader, &first, &first_head).await;
+    journal.close(reader).await.unwrap();
+    assert!(fixture.collect().await.deleted > 0);
 }
 
 /// Selecting a historical checkpoint retains its complete old state closure,
