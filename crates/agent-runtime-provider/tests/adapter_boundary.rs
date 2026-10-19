@@ -9,6 +9,7 @@ use agent_runtime_core::provider::{
     ModelId, Provider, ProviderAttemptPurpose, ProviderCallContext, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStreamEvent, ToolChoice, ToolSchema,
 };
+use agent_runtime_core::store::Secret;
 use agent_runtime_provider::anthropic::{AnthropicConfig, AnthropicProvider};
 use agent_runtime_provider::openai::{OpenAiConfig, OpenAiProvider};
 use agent_runtime_provider::responses::{ResponsesConfig, ResponsesProvider};
@@ -52,16 +53,19 @@ fn adapter(kind: &str, capture: Capture) -> Box<dyn Provider> {
     match kind {
         "anthropic" => Box::new(AnthropicProvider::new(
             capture,
-            AnthropicConfig::new("https://example.test/v1", "model"),
+            AnthropicConfig::new("https://example.test/v1", "model")
+                .with_api_key(Secret::new("sk-echoed-credential")),
         )),
         "openai" => Box::new(OpenAiProvider::new(
             capture,
-            OpenAiConfig::new("https://example.test/v1", "model"),
+            OpenAiConfig::new("https://example.test/v1", "model")
+                .with_api_key(Secret::new("sk-echoed-credential")),
         )),
         "responses" => Box::new(
             ResponsesProvider::new(
                 capture,
-                ResponsesConfig::new("https://example.test/v1", "model"),
+                ResponsesConfig::new("https://example.test/v1", "model")
+                    .with_api_key(Secret::new("sk-echoed-credential")),
             )
             .unwrap(),
         ),

@@ -615,7 +615,10 @@ async fn responses_adapter_redacts_auth_failure_details() {
                 error.kind,
                 agent_runtime_core::provider::ProviderErrorKind::Auth
             );
-            assert!(!error.message.contains("api-key-canary"));
+            // The provider echoed the key it was sent, so its whole reason
+            // is dropped.
+            assert!(!format!("{error:?}").contains("fixture-key"));
+            assert_eq!(error.message, "Responses provider authentication rejected");
         }
         other => panic!("expected redacted auth error, got {other:?}"),
     }

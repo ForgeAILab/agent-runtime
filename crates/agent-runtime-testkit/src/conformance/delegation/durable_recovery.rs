@@ -1129,3 +1129,118 @@ async fn child_inherits_the_parent_manifest_window_across_follow_up() {
     coordinator.flush().await.unwrap();
     parent.shutdown().await.unwrap();
 }
+
+/// A single unavailable host route blocks only that child during catalog restore.
+pub async fn assert_a_child_policy_failure_is_isolated_during_restore() {
+    let sessions = Arc::new(crate::InMemorySessionStore::new());
+    let checkpoints = Arc::new(crate::InMemoryCheckpointStore::new());
+    let factory = ScriptedChildFactory::new(Vec::new())
+        .with_durable_stores(sessions.clone(), checkpoints.clone());
+    let parent_id = agent_runtime_core::ids::SessionId::new("policy-failure-parent");
+    let spec = DurableChildSpec {
+        model: ChildModelSelection::Inherit,
+        limits: ChildLimits::turns(2),
+        tools: ToolViewScope::All,
+        workspace: WorkspacePolicy::SharedProject,
+    };
+    let fingerprint = factory.policy_fingerprint(&spec).unwrap();
+    let mut records = Vec::new();
+    for index in 1..=2 {
+        let child = agent_runtime_core::ids::ChildId::new(format!("child-{index}"));
+        let session = agent_runtime_core::ids::SessionId::new(format!("policy-child-{index}"));
+        let snapshot = SessionSnapshot {
+            id: session.clone(),
+            history: vec![agent_runtime_core::content::Message::user("resume task")],
+            usage: UsageLedger::new(),
+            identity: SessionIdentityState::default(),
+            manifests: Vec::new(),
+            extension_state: BTreeMap::new(),
+            updated: Timestamp::ZERO,
+        };
+        let checkpoint = TurnCheckpoint::accepted(
+            TurnId::new(format!("turn-{index}")),
+            UserInput::text("resume task"),
+            snapshot,
+            0,
+            Deadline::never(),
+            1,
+            0,
+            Timestamp::ZERO,
+        )
+        .unwrap();
+        checkpoints.seed(checkpoint.clone()).unwrap();
+        records.push(ChildSessionRecord {
+            schema_version: 1,
+            child: child.clone(),
+            child_session: session.clone(),
+            parent_session: parent_id.clone(),
+            spec: spec.clone(),
+            policy_fingerprint: fingerprint.clone(),
+            status: ChildStatus {
+                child,
+                parent: parent_id.clone(),
+                session,
+                durability: ChildDurability::Durable,
+                state: ChildState::Running,
+                workspace: WorkspacePolicy::SharedProject,
+                turns_used: 1,
+                max_turns: 2,
+                tokens_used: 0,
+                last_result: None,
+                last_artifacts: Vec::new(),
+                updated_at: Timestamp::ZERO,
+                incompatibility: None,
+                last_error: None,
+            },
+            checkpoint_watermark: Some(checkpoint.watermark),
+            checkpoint_resumable: true,
+            revision: 1,
+            deadline_at: None,
+        });
+    }
+    let mut extension_state = BTreeMap::new();
+    extension_state.insert(
+        CHILD_CATALOG_NAMESPACE.to_owned(),
+        VersionedSessionState::new(
+            DurableChildCatalog::revision(),
+            serde_json::to_value(DurableChildCatalog::new(2, records)).unwrap(),
+        )
+        .redaction_safe(),
+    );
+    sessions.seed(SessionSnapshot {
+        id: parent_id.clone(),
+        history: Vec::new(),
+        usage: UsageLedger::new(),
+        identity: SessionIdentityState::default(),
+        manifests: Vec::new(),
+        extension_state,
+        updated: Timestamp::ZERO,
+    });
+    let factory = Arc::new(factory.with_policy_fingerprint_failures(1));
+    let (_runtime, parent) =
+        durable_parent_session(parent_id.as_str(), sessions, checkpoints).await;
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory.clone(), DelegationConfig::default()).unwrap();
+    let blocked = agent_runtime_core::ids::ChildId::new("child-1");
+    let unaffected = agent_runtime_core::ids::ChildId::new("child-2");
+    for recovered in [false, true] {
+        if recovered {
+            coordinator.recover().await.unwrap();
+        }
+        let status = coordinator.status(&blocked).unwrap();
+        assert_eq!(status.state, ChildState::Interrupted { resumable: false });
+        assert!(!status.resumable());
+        assert_eq!(
+            status.incompatibility.as_deref(),
+            Some("child reconstruction unavailable: test policy fingerprint failure")
+        );
+        let status = coordinator.status(&unaffected).unwrap();
+        assert_eq!(status.state, ChildState::Interrupted { resumable: true });
+        assert!(status.resumable());
+        assert!(status.incompatibility.is_none());
+    }
+    assert_eq!(
+        factory.providers.lock().expect("providers poisoned").len(),
+        0
+    );
+}

@@ -1671,7 +1671,7 @@ impl From<ProviderError> for RuntimeError {
         let kind = match err.kind {
             ProviderErrorKind::Cancelled => ErrorKind::Cancelled,
             ProviderErrorKind::Timeout => ErrorKind::Timeout,
-            ProviderErrorKind::Unsupported | ProviderErrorKind::BadRequest => ErrorKind::Config,
+            ProviderErrorKind::Unsupported => ErrorKind::Config,
             ProviderErrorKind::LimitExhausted => ErrorKind::Limit,
             _ => ErrorKind::Provider,
         };

@@ -28,12 +28,22 @@ use crate::fragment::{ContextFragment, FragmentContent};
 
 /// This sizer's algorithm revision, bumped whenever its formula or default
 /// constants change so a changed sizer changes downstream fingerprints.
-pub const CHAR_RATIO_SIZER_REVISION: &str = "char-ratio-1";
+pub const CHAR_RATIO_SIZER_REVISION: &str = "char-ratio-2";
 
 /// Default characters-per-token ratio: a rough but stable approximation
 /// shared by most English/code tokenizers, matching the fallback used by the
 /// standalone prompt package this crate absorbs.
 pub const DEFAULT_CHARS_PER_TOKEN: u32 = 4;
+
+/// Default characters-per-token ratio for opaque reasoning signatures.
+///
+/// A provider bills the continuation state it hands back, not only the text a
+/// reader sees. Measured on Gemini Interactions (`gemini-4-argon`, 2026-10-18):
+/// one replayed Google Search call and result, 46,704 signature characters
+/// and 5,336 visible ones, cost 9,055 input tokens, about six signature
+/// characters per token. Base64-like signatures pack more characters into a
+/// token than prose does, so they get their own ratio.
+pub const DEFAULT_SIGNATURE_CHARS_PER_TOKEN: u32 = 6;
 
 /// Default per-message framing overhead in tokens: the role marker and
 /// wrapper structure every message on the wire carries beyond its content.
@@ -123,6 +133,8 @@ pub trait RequestSizer: Send + Sync + fmt::Debug {
 pub struct CharRatioSizer {
     /// Characters counted per estimated token.
     pub chars_per_token: u32,
+    /// Opaque reasoning-signature characters counted per estimated token.
+    pub signature_chars_per_token: u32,
     /// Per-message framing overhead in tokens.
     pub message_framing_tokens: u32,
     /// Per-tool-schema framing overhead in tokens.
@@ -137,6 +149,7 @@ impl Default for CharRatioSizer {
     fn default() -> Self {
         Self {
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+            signature_chars_per_token: DEFAULT_SIGNATURE_CHARS_PER_TOKEN,
             message_framing_tokens: DEFAULT_MESSAGE_FRAMING_TOKENS,
             tool_framing_tokens: DEFAULT_TOOL_FRAMING_TOKENS,
             tool_call_framing_tokens: DEFAULT_TOOL_CALL_FRAMING_TOKENS,
@@ -154,6 +167,12 @@ impl CharRatioSizer {
     /// Sets the characters-per-token ratio.
     pub fn with_chars_per_token(mut self, chars_per_token: u32) -> Self {
         self.chars_per_token = chars_per_token;
+        self
+    }
+
+    /// Sets the characters-per-token ratio for reasoning signatures.
+    pub fn with_signature_chars_per_token(mut self, chars_per_token: u32) -> Self {
+        self.signature_chars_per_token = chars_per_token;
         self
     }
 
@@ -188,10 +207,23 @@ impl CharRatioSizer {
         chars.div_ceil(self.chars_per_token.max(1))
     }
 
+    /// The estimated token cost of an opaque signature. A ratio of zero is
+    /// treated as one to keep the estimate finite.
+    fn signature_ratio(&self, signature: &str) -> u32 {
+        let chars = signature.chars().count() as u32;
+        chars.div_ceil(self.signature_chars_per_token.max(1))
+    }
+
     fn size_content_part(&self, part: &ContentPart) -> u32 {
         match part {
             ContentPart::Text { text } => self.ratio(text),
-            ContentPart::Reasoning { text, .. } => self.ratio(text),
+            ContentPart::Reasoning {
+                text, signature, ..
+            } => self.ratio(text).saturating_add(
+                signature
+                    .as_deref()
+                    .map_or(0, |signature| self.signature_ratio(signature)),
+            ),
             ContentPart::Image { .. } => self.image_tokens,
             ContentPart::ToolCall(call) => self
                 .tool_call_framing_tokens
@@ -311,6 +343,34 @@ mod tests {
         assert_eq!(
             sizer.size_content_part(&call),
             sizer.tool_call_framing_tokens + bare_ratio
+        );
+    }
+
+    #[test]
+    fn a_reasoning_signature_is_counted_at_its_own_ratio() {
+        let sizer = CharRatioSizer::default();
+        let signature = "s".repeat(46_704);
+        let signed = ContentPart::Reasoning {
+            text: String::new(),
+            redacted: true,
+            signature: Some(signature.clone()),
+            producer: None,
+        };
+        let unsigned = ContentPart::Reasoning {
+            text: "thought".into(),
+            redacted: false,
+            signature: None,
+            producer: None,
+        };
+        // A replayed Gemini search step: about six signature characters per
+        // billed token, not zero.
+        assert_eq!(sizer.size_content_part(&signed), 7_784);
+        assert_eq!(sizer.size_content_part(&unsigned), sizer.ratio("thought"));
+        assert_eq!(
+            sizer
+                .with_signature_chars_per_token(4)
+                .size_content_part(&signed),
+            11_676
         );
     }
 

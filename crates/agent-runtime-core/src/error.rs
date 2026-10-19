@@ -630,7 +630,7 @@ mod tests {
             ),
             (
                 ProviderErrorKind::BadRequest,
-                ErrorKind::Config,
+                ErrorKind::Provider,
                 FailureClass::RequestRejected { stage },
             ),
             (

@@ -7,6 +7,29 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Changed
+
+- A provider error now carries the reason the provider gave, such as Gemini's
+  `invalid_request: Request contains an invalid argument.`, instead of only
+  "provider rejected the request". Every adapter checks the reason against the
+  credentials it sent on that request and drops the whole reason if it repeats
+  any of them; a kept reason is bounded to 300 characters and kept as
+  `provider.detail`, with the HTTP status as `http.status`. The reqwest
+  transport reads it too, including from Gemini's SSE-framed error bodies.
+  Authentication rejections carry the reason as well, so a gateway's 403
+  "Insufficient quota" no longer reads as a rejected key.
+  `agent-runtime-provider` now depends on `url` unconditionally.
+- A provider `BadRequest` converts to `ErrorKind::Provider` rather than
+  `ErrorKind::Config`, so a rejected request no longer displays as
+  `Config: ...`. `Unsupported` stays `Config`; failure classes are unchanged.
+- `CharRatioSizer` counts a reasoning part's signature at its own ratio,
+  `signature_chars_per_token` (default 6, settable with
+  `with_signature_chars_per_token`). Gemini bills its replayed search steps,
+  which live in those signatures: one search call and result cost about
+  9,000 input tokens that the planner used to count as zero. The new public
+  field breaks struct-literal construction, and the sizer revision is now
+  `char-ratio-2`.
+
 ### Fixed
 
 - A native session no longer wedges after its terminal publication fails. When
@@ -20,6 +43,10 @@ contain breaking changes and are coordinated with consumer proposals.
   like a bootstrap. `assert_ordinary_session_journal_conformance` now requires
   ordinary journal adapters to accept the same replacement; one that still
   rejects it fails closed as before.
+- Restoring a parent no longer fails when the host cannot compute one child's
+  policy fingerprint, for example after that child's profile changed. That
+  child is marked incompatible (non-resumable if it was interrupted) and the
+  parent and its other children restore.
 
 ## [0.6.2] - 2026-10-18
 
