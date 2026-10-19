@@ -449,6 +449,109 @@ the child root. Logical supersession alone is not deletion permission. No defaul
 GC schedule or retention TTL is introduced. A backend unable to prove the fence
 returns unsupported and leaks safely rather than deleting live content.
 
+### Group C reference implementation and evidence (2026-10-18)
+
+Collection is explicit host opt-in on the volatile reference backend:
+`enable_collection` permits requests, and `authorize_retirement` binds host
+retention authorization and host time to one current revision. Default
+constructors retain their typed unsupported behavior. No required trait method,
+serialized object/head/checkpoint field, schema version or default expiry changes.
+The reference's retirement tombstone, replay fences, retained-head catalog,
+root/pin epoch and durable pin/dependency indexes are backend transaction metadata.
+File/database adapters must persist equivalent metadata and cross-process fences;
+the volatile implementation makes no disk-durability claim.
+
+`pin_transfer` persists a lease's closure, including an absent-head import/child
+reservation that publication extends atomically. `retain_root` preserves a
+selected historical checkpoint. Renew and process close/revocation cannot erase
+either durable pin; only explicit epoch-fenced `release_pin` after deterministic
+repair/abort or retention release can. Committed fork intents and child catalogs
+also index dependency roots at the same publication point. A matching
+supersession proof resolves a fork only with a published child seed. Ordinary
+projection may omit Sensitive intent/catalog bodies, but their non-content pin
+index survives until a semantic namespace update explicitly clears it. Historical
+roots retain their own dependency index. Unknown transfer-index revisions return
+typed unsupported and retain content rather than guessing their closure.
+
+When ordinary/protected domains are separate, hosts register transfer pins in
+each affected domain before publication; one store cannot infer another store's
+external roots. The runtime pending-child fixture reserves protected source/child
+pins at writer open, including absent-head reservations, because the real parent
+catalog is an ordinary publication and the parent may have no exact checkpoint.
+
+Every open/commit/renew/close, host revocation, durable pin change, staging change
+and retirement advances the root/pin epoch. `JournalGcRequest` captures that
+epoch; the reference checks it and recomputes all reachability while holding the
+same transaction lock through bounded deletion. A stale mark conflicts even if
+no object was deleted. Retained-head catalogs and batch predecessor digests are
+not automatic retention roots. Replay-fence metadata is never collected while
+its execution root is live (the reference keeps it after retirement as well).
+
+Named protected/ordinary collection conformance assertions and adapter-specific
+`JournalCollectionHost` fixture controls are exported from the testkit's journal
+module. The eight-operation matrix has three explicit steps each (24 rows):
+
+| Operation | Before mark | Between mark and deletion | After deletion |
+| --- | --- | --- | --- |
+| Read-only retained resume | Pin keeps full retired root readable | Pin invalidates mark; fresh sweep retains it | Open fails before dereference |
+| Writer resume | Canonical append and pinned history readable | Open/commit invalidate mark | Live root opens and appends |
+| Summary fork | Child seed survives parent retirement | Source/child intent pins invalidate mark | Source remains live until seed; unused parent objects reclaimed |
+| Empty fork | Empty child survives parent retirement | Source/child intent pins invalidate mark | Empty child retained; parent-only objects reclaimed |
+| FromIndex fork | Child suffix shares canonical message objects | Pins/child root invalidate mark | Shared suffix readable after parent retirement |
+| Continue ownership transfer | All canonical summary sources move with child | Both endpoint pins invalidate mark | Child retains every committed source |
+| Pending child | Source and child intent pins prevent retirement | Publication/expiry invalidate mark | Both closures readable after process loss |
+| Expired process lease | Revocation removes no committed root | Revocation invalidates mark | Stale handle fails; fresh reader sees committed root |
+
+`journal_gc_runtime` additionally runs real runtime Summary/Empty/FromIndex forks,
+fresh writer resume and read-only fork views, Continue with actual committed LCM
+leaf nodes, and a delegated child paused by an explicit notification at its
+CallingModel publication before provider I/O. Each runs at all three GC steps on
+normal two-worker Tokio runtimes. Every adapter matrix row includes aborted
+staging and asserts real reclamation at its first successful sweep. It expands
+the original summary sources after
+parent retirement, and rebinds the completed child after collection/process lease
+expiry without replaying its prior provider call. These tests have no sleeps or
+timing-selected interleavings. Every successful pinned closure is read back;
+the adapter matrix also checks every candidate object plus its head/batch/state.
+
+The N=1000 long-session conformance case publishes eight exact CallingModel
+checkpoints, unique projected requests/settings and 16 KB opaque extension
+replacements, plus aborted orphan staging. It retains **570,121 bytes before**
+collection, **404,529 bytes after** live collection (165,592 reclaimed), and
+**0 bytes after** authorized retirement and pin release. Canonical history and
+the latest exact request still materialize after the live sweep; obsolete
+checkpoint roots no longer open. Bytes exclude physical amplification and
+backend replay/tombstone indexes. Backend `compact` preserves even unreachable
+objects; only logical `collect` deletes. LCM compaction preserves its canonical
+sources and is a separate semantic operation.
+
+Three broken adapters fail named cases: making a pinned batch unreadable,
+ignoring the expected root/pin epoch, and clearing durable intent pins after a
+failed repair. A transparent wrapper passes the complete supported suite; an
+adapter returning typed unsupported retains its complete readable closure.
+Failed repair is exercised at every pre-visibility commit cut, and separately
+against a committed fork intent and retained dependency root. Existing test
+expectations and all released encoding fixtures remain unchanged.
+
+Review refinement (2026-10-18): scratch mutations of the reference showed the
+suite could not fail a collector that ignored transfer pins on a superseded
+root, stopped tracing a renewed lease, skipped any of ten object kinds (JSON
+spine/inline nodes, legacy and structured manifests, usage records, tool
+schemas, internal input; five were absent from every GC test and five were
+caught only by the in-repo runtime harness), honored another session's
+retirement grant, retired a fork parent on its supersession proof before the
+child seed published, deleted an ordinary FromIndex child's shared suffix, or
+opened a lease over a root that bounded deletion had only partly removed.
+`assert_journal_gc_object_kind_closure_conformance` now publishes all 21 object
+kinds under a live root and an explicit retention pin; the durable-pin,
+retirement, committed-transfer and ordinary cases and
+`assert_journal_gc_partial_collection_conformance` cover the rest. The 24 rows'
+steps are host-side sequencing at the trait boundary: `collect` re-traces under
+the same lock as deletion, so the reference has no internal mark/delete window,
+and a two-phase collector stays safe only because every root/pin change advances
+the epoch, which the epoch case checks operation by operation. The interleaving
+matrix stages protected leaves, so ordinary-only adapters cannot run it.
+
 ## v3 Upgrade, Including Mid-turn
 
 'v3 snapshot' means the v3-era storage pair: SessionSnapshot itself has no

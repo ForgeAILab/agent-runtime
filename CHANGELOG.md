@@ -7,6 +7,27 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- Explicit host-triggered retirement and logical collection in the volatile
+  `InMemorySessionJournal`, with revision-bound retention authorization, durable
+  migration/fork/child and historical pins, transactional root/pin epochs,
+  bounded deletion, protected orphan-staging reclamation and retirement
+  tombstones. Collection preserves live canonical history, LCM summary sources,
+  retained checkpoint closures and execution replay fences. Default constructors
+  still return typed unsupported until the host enables collection; no schedule,
+  TTL or automatic lease expiry is introduced. Existing object/head/checkpoint
+  formats and required `SessionJournal` methods are unchanged.
+- Named third-party protected/ordinary collection conformance suites, 24 explicit
+  operation/GC-step interleavings, real runtime fork/Continue/pending-child
+  schedules, retained-byte evidence, and broken adapters that lose pinned
+  objects, ignore epochs or clear a pending intent on failed repair. Backend
+  storage compaction is tested separately from logical GC and LCM compaction.
+  The suite requires every journal object kind to survive collection, transfer
+  pins and renewed leases to protect superseded roots, retirement grants to be
+  session-scoped, ordinary FromIndex suffixes to outlive their parent, and an
+  open of a partly collected root to fail before returning a lease.
+
 ### Fixed
 
 - Waiting for a user, internal, or resumed turn to complete now also waits for

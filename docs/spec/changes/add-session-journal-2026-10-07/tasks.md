@@ -5,9 +5,11 @@ updated_at: 2026-10-18T00:00:00Z
 
 # Tasks: SessionJournal and referenced checkpoints
 
-The owner approved merge group A only on 2026-10-08 (local date). Groups B, C,
-D and U10 remain unapproved. Groups can merge independently; release requires
-all applicable gates, not merely contract merge.
+The owner approved merge group A on 2026-10-08 (local date); group B has since
+landed with the released native writer. The 2026-10-18 implementation request
+authorizes group C (3.1–3.4). Group D and U10 remain outside this authorization.
+Groups can merge independently; release requires all applicable gates, not
+merely contract merge.
 
 ## 1. Merge group A — Contracts and dual readers (no native writer activation)
 
@@ -285,10 +287,53 @@ all applicable gates, not merely contract merge.
 
 ## 3. Merge group C — Retirement and safe collection (retention stays host-owned)
 
-- [ ] 3.1 Implement expected-revision retirement, durable migration/fork pins, pin renewal/close, retained-root closure and transactional root/pin epoch checks; no automatic expiry defaults.
-- [ ] 3.2 Interleave mark/delete with read-only resume, writer resume, Summary/Empty/FromIndex fork, Continue ownership transfer, pending child and expired process lease; demonstrate no dangling reachable reference.
-- [ ] 3.3 Reclaim orphan staging and superseded checkpoint/request/extension objects, then retired-session content; retain live canonical history and every committed source required by LCM summaries.
-- [ ] 3.4 Prove unsupported collection retains content safely and failed repair cannot clear pending intent pins; distinguish backend compaction from logical GC.
+- [x] 3.1 Implement expected-revision retirement, durable migration/fork pins, pin renewal/close, retained-root closure and transactional root/pin epoch checks; no automatic expiry defaults.
+  Evidence: `InMemorySessionJournal` requires explicit `enable_collection` and
+  revision-bound `authorize_retirement`. `pin_transfer`, `retain_root` and
+  epoch-fenced `release_pin` preserve whole historical closures across process
+  renew/close/revocation. All root/pin mutations serialize with mark/delete.
+  Publication also indexes existing fork intents and child catalogs, including
+  dependency metadata omitted by ordinary projection. Unknown index revisions
+  return typed unsupported. Tombstones and replay fences stay in backend indexes;
+  no released object/head/checkpoint format or required trait method changes.
+- [x] 3.2 Interleave mark/delete with read-only resume, writer resume, Summary/Empty/FromIndex fork, Continue ownership transfer, pending child and expired process lease; demonstrate no dangling reachable reference.
+  Evidence: eight named `JournalGcInterleaving` operations each run before mark,
+  after mark/before deletion and after deletion (24 deterministic rows), reading
+  every reachable candidate/head/batch/state object and materializing fresh
+  roots. Each row includes aborted staging and asserts actual deletion at the
+  first successful sweep. A retired retained-root open after deletion fails before dereference.
+  Nine `journal_gc_runtime` tests run actual fork/resume, Continue with LCM leaf
+  nodes, and a child explicitly paused before provider I/O under all three GC
+  schedules on normal Tokio workers; the child rebinds after process expiry and
+  GC without repeating its completed provider request. Design.md contains the
+  operation-by-step result matrix.
+- [x] 3.3 Reclaim orphan staging and superseded checkpoint/request/extension objects, then retired-session content; retain live canonical history and every committed source required by LCM summaries.
+  Evidence: `long_session_collection_byte_evidence` publishes eight exact
+  CallingModel checkpoints over N=1000 canonical messages with distinct
+  requests/settings and 16 KB opaque replacements. Retained immutable bytes are
+  570,121 before GC, 404,529 with the session live (165,592 reclaimed), and 0 after
+  authorized retirement/pin release. Every canonical source and latest exact
+  request materializes after sweeping; superseded checkpoints do not open.
+  Summary/Empty/FromIndex cases assert that only the child's complete closure
+  remains after parent retirement. Continue expands the actual committed LCM
+  sources after the original parent is retired.
+- [x] 3.4 Prove unsupported collection retains content safely and failed repair cannot clear pending intent pins; distinguish backend compaction from logical GC.
+  Evidence: named third-party supported, ordinary and unsupported collector
+  assertions; three broken adapters are rejected for losing a pinned object,
+  ignoring the epoch and clearing intent pins after a failed repair, while the
+  transparent wrapper passes. All six pre-visibility repair cuts retain durable
+  intent pins; a separate committed-intent case checks both endpoints and a
+  retained dependency root after failed repair. Physical backend `compact`
+  retains orphan bytes, unlike logical `collect`; LCM compaction keeps canonical
+  sources. Default unsupported tests and all earlier expectations remain intact.
+  Review (2026-10-18): mutation of the reference found seven collector defects the
+  suite accepted; each now fails a named case, including the all-object-kind
+  `assert_journal_gc_object_kind_closure_conformance` (see design.md).
+  Verification (2026-10-18): fmt and all-target/all-feature Clippy clean; core
+  276, runtime 656, testkit 407 (including 27 collection and 9 runtime GC tests),
+  LCM 62; Rust 1.86 core/runtime build and strict change validation pass. The
+  cross-domain host fixture registers protected child pins before publication,
+  since the parent's actual child catalog is an ordinary-store publication.
 
 ## 4. Merge group D — Coordinated consumers and release eligibility
 

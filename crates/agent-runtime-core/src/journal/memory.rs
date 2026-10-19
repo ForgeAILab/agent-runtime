@@ -116,7 +116,7 @@ struct SessionRecord {
     last_writer_epoch: u64,
     active_writer: Option<u64>,
     operations: BTreeMap<JournalOperationId, OperationRecord>,
-    retained_heads: BTreeSet<JournalObjectId>,
+    retained_heads: BTreeMap<JournalObjectId, DependencyRoots>,
     ordinary_snapshot: Option<Arc<SessionSnapshot>>,
     ordinary_encoding: Option<Arc<SnapshotEncodingCache>>,
     protected_snapshot: Option<Arc<SessionSnapshot>>,
@@ -124,6 +124,9 @@ struct SessionRecord {
     /// Latest published protected checkpoint, kept even when a later head
     /// carries none, so checkpoint progress stays monotonic per session.
     checkpoint_floor: Option<ReferencedTurnCheckpoint>,
+    /// Tombstone prevents a retired execution identity from being recreated.
+    retirement: Option<JournalRetirement>,
+    dependencies: DependencyRoots,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +136,166 @@ struct LeaseRecord {
     selected_head: Option<JournalHead>,
     writer_epoch: Option<u64>,
     reachable: ReachableSet,
+    dependencies: DependencyRoots,
+}
+
+#[derive(Debug, Clone)]
+struct DurablePin {
+    reachable: ReachableSet,
+    /// Migration/fork/staging intent must be resolved before retirement.
+    blocks_retirement: bool,
+    dependencies: DependencyRoots,
+}
+
+/// Logical session references in the existing runtime-owned intent/catalog
+/// extensions. These are index metadata, not new serialized object fields and
+/// never read authority for another session. Unknown intent shapes leak safely.
+#[derive(Debug, Clone, Default)]
+struct DependencyRoots {
+    sessions: BTreeSet<SessionId>,
+    pending: bool,
+    completed_fork: Option<SessionId>,
+    unresolved: bool,
+    fork_present: bool,
+    fork_child: Option<SessionId>,
+    fork_unknown: bool,
+    proof_child: Option<SessionId>,
+    catalog_sessions: BTreeSet<SessionId>,
+    catalog_pending: bool,
+    catalog_unknown: bool,
+}
+
+impl DependencyRoots {
+    fn snapshot(snapshot: &SessionSnapshot) -> Self {
+        let mut roots = Self::default();
+        if let Some(intent) = snapshot.extension_state.get("runtime.session.fork_pending") {
+            roots.fork_present = true;
+            roots.fork_unknown = intent.revision.as_str() != "session-fork-pending-1";
+            if let Some(child) = intent
+                .value
+                .get("new_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                roots.fork_child = Some(SessionId::new(child));
+            } else {
+                roots.fork_unknown = true;
+            }
+        }
+        roots.proof_child = snapshot
+            .extension_state
+            .get("runtime.session.superseded")
+            .filter(|proof| proof.revision.as_str() == "session-superseded-1")
+            .and_then(|proof| proof.value.as_str())
+            .map(SessionId::new);
+        if let Some(catalog) = snapshot
+            .extension_state
+            .get("agent-runtime.delegation.children")
+        {
+            roots.catalog_unknown = catalog.revision.as_str() != "resumable-child-catalog-1"
+                || catalog
+                    .value
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(1);
+            if let Some(children) = catalog
+                .value
+                .get("children")
+                .and_then(serde_json::Value::as_array)
+            {
+                for child in children {
+                    if let Some(session) = child
+                        .get("child_session")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        roots.catalog_sessions.insert(SessionId::new(session));
+                    } else {
+                        roots.catalog_unknown = true;
+                    }
+                    let terminal = child
+                        .get("status")
+                        .and_then(|status| status.get("state"))
+                        .and_then(|state| state.get("state"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|state| matches!(state, "stopped" | "failed" | "expired"));
+                    roots.catalog_pending |= !terminal;
+                }
+            } else {
+                roots.catalog_unknown = true;
+            }
+        }
+        roots.refresh();
+        roots
+    }
+
+    fn transition(
+        current: &Self,
+        delta: &JournalTransitionDelta,
+        snapshot: &SessionSnapshot,
+    ) -> Self {
+        let mut next = Self::snapshot(snapshot);
+        if delta.bootstrap.is_none() {
+            // Ordinary policy may omit Sensitive intent/catalog bodies. Preserve
+            // their non-content dependency index unless the semantic delta
+            // explicitly changes that namespace; never infer clearing from an
+            // omission in the previously projected snapshot.
+            if !delta
+                .extension_updates
+                .contains_key("runtime.session.fork_pending")
+            {
+                next.fork_present = current.fork_present;
+                next.fork_child = current.fork_child.clone();
+                next.fork_unknown = current.fork_unknown;
+            }
+            if !delta
+                .extension_updates
+                .contains_key("runtime.session.superseded")
+            {
+                next.proof_child = current.proof_child.clone();
+            }
+            if !delta
+                .extension_updates
+                .contains_key("agent-runtime.delegation.children")
+            {
+                next.catalog_sessions = current.catalog_sessions.clone();
+                next.catalog_pending = current.catalog_pending;
+                next.catalog_unknown = current.catalog_unknown;
+            }
+            next.refresh();
+        }
+        next
+    }
+
+    fn refresh(&mut self) {
+        self.sessions = self.catalog_sessions.clone();
+        self.sessions.extend(self.fork_child.iter().cloned());
+        self.completed_fork = self
+            .fork_child
+            .as_ref()
+            .filter(|child| self.proof_child.as_ref() == Some(child))
+            .cloned();
+        self.unresolved = self.fork_unknown || self.catalog_unknown;
+        self.pending = self.unresolved
+            || self.catalog_pending
+            || (self.fork_present && self.completed_fork.is_none());
+    }
+
+    fn extend(&mut self, roots: &Self) {
+        self.sessions.extend(roots.sessions.iter().cloned());
+        self.pending |= roots.pending;
+        self.unresolved |= roots.unresolved;
+    }
+
+    fn validate(&self, state: &State) -> Result<(), RuntimeError> {
+        if self.sessions.iter().any(|id| {
+            state
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.retirement.is_some())
+        }) {
+            return Err(conflict());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -224,6 +387,26 @@ struct State {
     leases: BTreeMap<u64, LeaseRecord>,
     active_pins: BTreeMap<(SessionId, JournalPinId), u64>,
     next_handle: u64,
+    root_epoch: u64,
+    collection_enabled: bool,
+    retirement_authorizations: BTreeMap<SessionId, (JournalRevision, crate::clock::Timestamp)>,
+    durable_pins: BTreeMap<(SessionId, JournalPinId), DurablePin>,
+}
+
+impl State {
+    fn unresolved_dependencies(&self) -> bool {
+        self.sessions
+            .values()
+            .filter(|session| session.current.is_some())
+            .map(|session| &session.dependencies)
+            .chain(self.leases.values().map(|lease| &lease.dependencies))
+            .chain(self.durable_pins.values().map(|pin| &pin.dependencies))
+            .any(|roots| roots.unresolved)
+    }
+    fn advance_root_epoch(&mut self) -> Result<(), RuntimeError> {
+        self.root_epoch = self.root_epoch.checked_add(1).ok_or_else(conflict)?;
+        Ok(())
+    }
 }
 
 /// Append-only copy-on-write layers keep an atomic commit clone proportional
@@ -236,6 +419,23 @@ struct ObjectStore {
 }
 
 impl ObjectStore {
+    fn entries(&self) -> BTreeMap<JournalObjectId, Arc<Vec<u8>>> {
+        self.layers
+            .iter()
+            .flat_map(|layer| {
+                layer
+                    .iter()
+                    .map(|(id, bytes)| (id.clone(), Arc::clone(bytes)))
+            })
+            .collect()
+    }
+
+    fn replace_entries(&mut self, entries: BTreeMap<JournalObjectId, Arc<Vec<u8>>>) {
+        self.len = entries.len();
+        self.bytes = entries.values().map(|bytes| bytes.len()).sum();
+        self.layers = vec![Arc::new(entries)];
+    }
+
     fn get(&self, id: &JournalObjectId) -> Option<&Vec<u8>> {
         self.layers
             .iter()
@@ -286,6 +486,7 @@ type ProjectedSnapshot = (
     JournalSnapshotRoots,
     SnapshotEncodingCache,
     BTreeMap<JournalObjectId, Vec<u8>>,
+    DependencyRoots,
 );
 
 #[derive(Debug, Clone)]
@@ -305,8 +506,9 @@ struct SnapshotEncodingCache {
 /// store records roots and traces their closures; it has no writer-maintained
 /// reference counts. A candidate head is materialized through
 /// [`JournalReader`] before that visibility point, so nothing the reader would
-/// reject is ever published. Collection and retirement intentionally return
-/// typed unsupported capability errors and retain every object until group C.
+/// reject is ever published. Collection requires explicit host opt-in through
+/// [`Self::enable_collection`]; retirement additionally requires revision-bound
+/// [`Self::authorize_retirement`]. There is no retention schedule or TTL.
 ///
 /// The lock is synchronous and never held across an `.await`; it is held while
 /// an ordinary projection policy runs, so a policy must not call back into the
@@ -388,6 +590,162 @@ impl InMemorySessionJournal {
         if let Some(lease) = state.leases.remove(&handle) {
             state.active_pins.remove(&(lease.session, lease.pin));
         }
+        state.advance_root_epoch()?;
+        Ok(())
+    }
+
+    /// Enables host-triggered logical collection. This does not run a collector,
+    /// authorize any retirement, expire a pin, or set a retention default.
+    /// Without this opt-in, `retire`/`collect` retain their typed unsupported result.
+    pub fn enable_collection(&self) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        if !state.collection_enabled {
+            state.advance_root_epoch()?;
+            state.collection_enabled = true;
+        }
+        Ok(())
+    }
+
+    /// Observes the root/pin epoch for a host's mark. `collect` rechecks this
+    /// exact epoch and traces reachability in the deletion transaction. It never
+    /// treats a stale mark as deletion authority.
+    pub fn root_epoch(&self) -> Result<u64, RuntimeError> {
+        Ok(self.lock()?.root_epoch)
+    }
+
+    /// Records explicit host retention authorization for one published revision.
+    /// A later commit invalidates it. This is a trusted host control, not a grant
+    /// inferred from a session ID, logical supersession or elapsed time.
+    pub fn authorize_retirement(
+        &self,
+        session: &SessionId,
+        expected: JournalRevision,
+        retired_at: crate::clock::Timestamp,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let record = state.sessions.get(session).ok_or_else(conflict)?;
+        if !state.collection_enabled
+            || record.current.as_ref().map(|(_, head)| head.revision) != Some(expected)
+            || record.retirement.is_some()
+        {
+            return Err(conflict());
+        }
+        state
+            .retirement_authorizations
+            .insert(session.clone(), (expected, retired_at));
+        Ok(())
+    }
+
+    /// Persists the live lease's entire closure under its existing pin identity
+    /// as a migration/fork/child-transfer intent. Process close or revocation
+    /// does not clear it. The same writer's subsequent commits extend it before
+    /// publication, including an initially absent-head child/import reservation.
+    pub fn pin_transfer(&self, lease: &JournalLease) -> Result<(), RuntimeError> {
+        self.pin_lease(lease, true)
+    }
+
+    /// Persists a selected retained root's closure under the lease's pin identity.
+    /// Unlike a pending transfer, explicit historical retention allows retirement
+    /// of the current session root while continuing to protect the selected root.
+    pub fn retain_root(&self, lease: &JournalLease) -> Result<(), RuntimeError> {
+        self.pin_lease(lease, false)
+    }
+
+    fn pin_lease(&self, lease: &JournalLease, blocks_retirement: bool) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let record = self.live_lease(&state, lease)?;
+        let key = (record.session, record.pin);
+        if let Some(existing) = state.durable_pins.get(&key) {
+            if existing.blocks_retirement != blocks_retirement {
+                return Err(conflict());
+            }
+        }
+        state.advance_root_epoch()?;
+        let existing = state.durable_pins.entry(key).or_insert_with(|| DurablePin {
+            reachable: ReachableSet::default(),
+            blocks_retirement,
+            dependencies: DependencyRoots::default(),
+        });
+        existing.dependencies.extend(&record.dependencies);
+        for layer in record.reachable.layers {
+            existing.reachable.extend(layer.as_ref().clone());
+        }
+        Ok(())
+    }
+
+    /// Explicit host repair/abort or retention release, fenced against concurrent
+    /// root changes. Call only after deterministic repair/abort succeeds. A failed
+    /// commit/repair, process lease expiry, renewal or close never calls this.
+    pub fn release_pin(
+        &self,
+        session: &SessionId,
+        pin: &JournalPinId,
+        expected_root_epoch: u64,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let key = (session.clone(), pin.clone());
+        if state.root_epoch != expected_root_epoch || !state.durable_pins.contains_key(&key) {
+            return Err(conflict());
+        }
+        state.advance_root_epoch()?;
+        state.durable_pins.remove(&key);
+        Ok(())
+    }
+
+    /// Stages validated immutable leaf bodies under a durable transaction pin.
+    /// Referencing objects are admitted only by the complete `commit` validator;
+    /// these unpublished leaves never become a discoverable recovery boundary.
+    /// Abort explicitly with `release_pin`, then close the process lease before
+    /// collecting its orphan bodies.
+    pub fn stage_leaves(
+        &self,
+        lease: &JournalLease,
+        pin: JournalPinId,
+        objects: Vec<JournalObject>,
+    ) -> Result<(), RuntimeError> {
+        if self.role != JournalRole::Protected {
+            return Err(conflict());
+        }
+        let mut state = self.lock()?;
+        self.live_lease(&state, lease)?;
+        let key = (lease.session().clone(), pin);
+        if key.1.as_str().is_empty() || state.durable_pins.contains_key(&key) {
+            return Err(conflict());
+        }
+        let mut staged = state.clone();
+        staged.objects.begin_layer();
+        let mut reachable = BTreeSet::new();
+        for object in objects {
+            validate_leaf(&object, object.kind()?)?;
+            reachable.insert(object.id.clone());
+            Self::add_object(&mut staged, object)?;
+        }
+        staged
+            .leases
+            .get_mut(&self.token(lease)?.handle)
+            .ok_or_else(conflict)?
+            .reachable
+            .extend(reachable.clone());
+        staged.durable_pins.insert(
+            key,
+            DurablePin {
+                reachable: ReachableSet::from_set(reachable),
+                blocks_retirement: true,
+                dependencies: DependencyRoots::default(),
+            },
+        );
+        staged.advance_root_epoch()?;
+        *state = staged;
+        Ok(())
+    }
+
+    /// Physical backend compaction only: merges storage layers while preserving
+    /// every object, root, pin and replay fence, including unreachable objects.
+    /// Logical reachability deletion is exclusively `collect`.
+    pub fn compact(&self) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let entries = state.objects.entries();
+        state.objects.replace_entries(entries);
         Ok(())
     }
 
@@ -665,6 +1023,8 @@ impl InMemorySessionJournal {
                     .cloned()
             })
             .flatten();
+        let dependencies =
+            DependencyRoots::transition(&current.dependencies, &commit.delta, &snapshot);
         let projected = match self.role {
             JournalRole::Ordinary => self
                 .projection
@@ -715,7 +1075,7 @@ impl InMemorySessionJournal {
                 }
             }
         }
-        Ok((projected, roots, encoding, objects))
+        Ok((projected, roots, encoding, objects, dependencies))
     }
 
     fn add_object(state: &mut State, object: JournalObject) -> Result<(), RuntimeError> {
@@ -747,6 +1107,14 @@ impl SessionJournal for InMemorySessionJournal {
             return Err(conflict());
         }
         let mut state = self.lock()?;
+        if request.intent == JournalOpenIntent::ExclusiveWriter
+            && state
+                .sessions
+                .get(session)
+                .is_some_and(|record| record.retirement.is_some())
+        {
+            return Err(conflict());
+        }
         let pin_key = (session.clone(), request.pin.clone());
         if state.active_pins.contains_key(&pin_key) {
             return Err(conflict());
@@ -770,7 +1138,7 @@ impl SessionJournal for InMemorySessionJournal {
                 let retained = state
                     .sessions
                     .get(session)
-                    .is_some_and(|record| record.retained_heads.contains(root));
+                    .is_some_and(|record| record.retained_heads.contains_key(root));
                 if !retained {
                     return Err(conflict());
                 }
@@ -787,6 +1155,19 @@ impl SessionJournal for InMemorySessionJournal {
         if let Some(root) = &root {
             reachable = reachable_closure(&state.objects, root, None, None)?;
         }
+        let dependencies = root
+            .as_ref()
+            .map(|root| {
+                state
+                    .sessions
+                    .get(session)
+                    .and_then(|record| record.retained_heads.get(root))
+                    .cloned()
+                    .ok_or_else(conflict)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        dependencies.validate(&state)?;
         state.next_handle = state.next_handle.checked_add(1).ok_or_else(conflict)?;
         let handle = state.next_handle;
         let writer_epoch = match request.intent {
@@ -815,9 +1196,11 @@ impl SessionJournal for InMemorySessionJournal {
                 selected_head: selected_head.clone(),
                 writer_epoch,
                 reachable: ReachableSet::from_set(reachable),
+                dependencies,
             },
         );
         state.active_pins.insert(pin_key, handle);
+        state.advance_root_epoch()?;
         drop(state);
         Ok(JournalLease::new(
             self.storage_id.clone(),
@@ -916,16 +1299,20 @@ impl SessionJournal for InMemorySessionJournal {
             }
         };
         let mut protected = None;
+        let mut dependencies = DependencyRoots::default();
         let ordinary = if self.role == JournalRole::Ordinary {
-            let (snapshot, candidate_roots, encoding, projected) = prepared.ok_or_else(conflict)?;
+            let (snapshot, candidate_roots, encoding, projected, indexed) =
+                prepared.ok_or_else(conflict)?;
+            dependencies = indexed;
             for (id, bytes) in projected {
                 admitted.insert(id.clone());
                 Self::add_object(&mut staged, JournalObject { id, bytes })?;
             }
             Some((snapshot, candidate_roots, encoding))
         } else {
-            if let Some((snapshot, candidate_roots, encoding, _)) = prepared {
+            if let Some((snapshot, candidate_roots, encoding, _, indexed)) = prepared {
                 if candidate_roots == commit.batch.snapshot {
+                    dependencies = indexed;
                     protected = Some((snapshot, encoding));
                 }
             }
@@ -1036,6 +1423,7 @@ impl SessionJournal for InMemorySessionJournal {
                 &closure,
                 &lease_record.reachable,
             )?;
+            dependencies = DependencyRoots::snapshot(&snapshot);
             // Re-seed the fast path from the fully validated head (after a
             // writer change, or a delta/representation the cache could not
             // follow) when its canonical encoding reproduces the head's roots;
@@ -1055,17 +1443,31 @@ impl SessionJournal for InMemorySessionJournal {
         }
 
         let token = self.token(lease)?;
+        dependencies.validate(&staged)?;
         let staged_lease = staged.leases.get_mut(&token.handle).ok_or_else(conflict)?;
         staged_lease.reachable.extend(closure);
+        staged_lease.dependencies.extend(&dependencies);
         staged_lease.selected_head = Some(head.clone());
+        if let Some(pin) = staged
+            .durable_pins
+            .get_mut(&(staged_lease.session.clone(), staged_lease.pin.clone()))
+        {
+            pin.dependencies.extend(&staged_lease.dependencies);
+            for layer in &staged_lease.reachable.layers {
+                pin.reachable.extend(layer.as_ref().clone());
+            }
+        }
         self.fail_if_armed(JournalCommitFailurePoint::AfterPin)?;
 
         let staged_session = staged
             .sessions
             .get_mut(lease.session())
             .ok_or_else(conflict)?;
-        staged_session.retained_heads.insert(head_object.id.clone());
+        staged_session
+            .retained_heads
+            .insert(head_object.id.clone(), dependencies.clone());
         staged_session.current = Some((head_object.id, head.clone()));
+        staged_session.dependencies = dependencies;
         if let Some((snapshot, _, encoding)) = ordinary {
             staged_session.ordinary_snapshot = Some(Arc::new(snapshot));
             staged_session.ordinary_encoding = Some(Arc::new(encoding));
@@ -1091,6 +1493,8 @@ impl SessionJournal for InMemorySessionJournal {
         );
         self.fail_if_armed(JournalCommitFailurePoint::AfterIdempotency)?;
 
+        staged.retirement_authorizations.remove(lease.session());
+        staged.advance_root_epoch()?;
         *state = staged;
         self.fail_if_armed(JournalCommitFailurePoint::AfterCommit)?;
         Ok(head)
@@ -1114,6 +1518,7 @@ impl SessionJournal for InMemorySessionJournal {
                 .ok_or_else(conflict)?
                 .active_writer = Some(next_handle);
         }
+        state.advance_root_epoch()?;
         drop(state);
         Ok(JournalLease::new(
             self.storage_id.clone(),
@@ -1142,23 +1547,155 @@ impl SessionJournal for InMemorySessionJournal {
                 .ok_or_else(conflict)?
                 .active_writer = None;
         }
+        state.advance_root_epoch()?;
         Ok(())
     }
 
     async fn retire(
         &self,
-        _session: &SessionId,
-        _expected: JournalRevision,
+        session: &SessionId,
+        expected: JournalRevision,
     ) -> Result<JournalRetirement, RuntimeError> {
-        Err(RuntimeError::unsupported_capability(
-            UnsupportedCapability::JournalRetirement,
-        ))
+        let mut state = self.lock()?;
+        if !state.collection_enabled {
+            return Err(RuntimeError::unsupported_capability(
+                UnsupportedCapability::JournalRetirement,
+            ));
+        }
+        if state.unresolved_dependencies() {
+            return Err(RuntimeError::unsupported_capability(
+                UnsupportedCapability::JournalRetirement,
+            ));
+        }
+        let record = state.sessions.get(session).ok_or_else(conflict)?;
+        if record.current.as_ref().map(|(_, head)| head.revision) != Some(expected)
+            || record.active_writer.is_some()
+            || record.dependencies.pending
+            || record
+                .dependencies
+                .completed_fork
+                .as_ref()
+                .is_some_and(|child| {
+                    state
+                        .sessions
+                        .get(child)
+                        .is_none_or(|record| record.current.is_none())
+                })
+            || state.sessions.values().any(|other| {
+                other.current.is_some() && other.dependencies.sessions.contains(session)
+            })
+            || state
+                .leases
+                .values()
+                .any(|lease| lease.dependencies.sessions.contains(session))
+            || state
+                .durable_pins
+                .values()
+                .any(|pin| pin.dependencies.sessions.contains(session))
+            || state
+                .durable_pins
+                .iter()
+                .any(|((owner, _), pin)| owner == session && pin.blocks_retirement)
+        {
+            return Err(conflict());
+        }
+        let (authorized_revision, retired_at) = state
+            .retirement_authorizations
+            .get(session)
+            .copied()
+            .ok_or_else(conflict)?;
+        if authorized_revision != expected {
+            return Err(conflict());
+        }
+        state.advance_root_epoch()?;
+        let retirement = JournalRetirement {
+            session: session.clone(),
+            revision: expected,
+            root_epoch: state.root_epoch,
+            retired_at,
+        };
+        let record = state.sessions.get_mut(session).ok_or_else(conflict)?;
+        record.current = None;
+        record.retirement = Some(retirement.clone());
+        record.ordinary_snapshot = None;
+        record.ordinary_encoding = None;
+        record.protected_snapshot = None;
+        record.protected_encoding = None;
+        state.retirement_authorizations.remove(session);
+        Ok(retirement)
     }
 
-    async fn collect(&self, _request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
-        Err(RuntimeError::unsupported_capability(
-            UnsupportedCapability::JournalCollection,
-        ))
+    async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        let mut state = self.lock()?;
+        if !state.collection_enabled {
+            return Err(RuntimeError::unsupported_capability(
+                UnsupportedCapability::JournalCollection,
+            ));
+        }
+        if request.storage_id != self.storage_id || request.expected_root_epoch != state.root_epoch
+        {
+            return Err(conflict());
+        }
+        if state.unresolved_dependencies() {
+            return Err(RuntimeError::unsupported_capability(
+                UnsupportedCapability::JournalCollection,
+            ));
+        }
+
+        // Selection/pinning, publication, expiry/revocation and retirement all
+        // share this lock and epoch with mark/delete. There is no unchecked
+        // interval between the last reachability check and deletion.
+        let mut reachable = BTreeSet::new();
+        for record in state.sessions.values() {
+            if let Some((root, _)) = &record.current {
+                reachable.extend(reachable_closure(&state.objects, root, None, None)?);
+            }
+        }
+        for pin in state
+            .leases
+            .values()
+            .map(|lease| &lease.reachable)
+            .chain(state.durable_pins.values().map(|pin| &pin.reachable))
+        {
+            for layer in &pin.layers {
+                for id in layer.iter() {
+                    if state.objects.get(id).is_none() {
+                        return Err(conflict());
+                    }
+                    reachable.insert(id.clone());
+                }
+            }
+        }
+        let mut entries = state.objects.entries();
+        let examined = entries.len() as u64;
+        let deleted: BTreeSet<_> = entries
+            .keys()
+            .filter(|id| !reachable.contains(*id))
+            .take(usize::try_from(request.max_objects).unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        let reclaimed_bytes = deleted
+            .iter()
+            .map(|id| entries.get(id).expect("selected object").len() as u64)
+            .sum();
+        if !deleted.is_empty() {
+            state.advance_root_epoch()?;
+            entries.retain(|id, _| !deleted.contains(id));
+            state.objects.replace_entries(entries);
+            for session in state.sessions.values_mut() {
+                // This is only a selectable-head catalog, not automatic audit
+                // retention. Explicit retained-root pins are traced above.
+                session.retained_heads.retain(|id, _| !deleted.contains(id));
+            }
+        }
+        // Replay fences are session metadata, not object reachability edges.
+        // They survive collection even when an old operation's objects do not.
+        Ok(JournalGcReport {
+            root_epoch: request.expected_root_epoch,
+            examined,
+            deleted: deleted.len() as u64,
+            reclaimed_bytes,
+        })
     }
 }
 
