@@ -289,8 +289,11 @@ module unchanged and stay re-exported at the same paths.
   `root_epoch`, `collection_enabled`. `close`, lease drop and `revoke_writer`
   touch only the registry, so they never await storage and
   `SessionPersistence::drop`'s `now_or_never` close always completes.
-- **Write gate** (`tokio::sync::Mutex<()>`, one per engine instance, i.e. per
-  domain): held from the first read that feeds a write until the registry is
+- **Write gate** (one async mutex per engine instance, i.e. per domain; it
+  never hands a released lock to a parked waiter, so `futures_util::lock::Mutex<()>`
+  and not `tokio::sync::Mutex`, whose handoff can leave the lock owned by a
+  task queued in the releasing worker's unstealable LIFO slot; each
+  acquisition first consumes one unit of Tokio's cooperative budget): held from the first read that feeds a write until the registry is
   updated after `apply`. Taken by writer open, commit, retire,
   `authorize_retirement`, pin changes, staging and collection. Read-only opens
   also take it briefly, so a collection cannot run between "select root" and
@@ -311,7 +314,8 @@ module unchanged and stay re-exported at the same paths.
   `VolatileJournalStorage` never suspends, so the newtype drives the engine's
   async controls to completion with `now_or_never`, retrying with
   `std::thread::yield_now` only while the write gate is held by another thread
-  (a holder never suspends inside the volatile storage).
+  (a holder never suspends inside the volatile storage, and the gate is only
+  ever owned by a task that is running).
 
 ### D4. Session-scoped incremental collection (R3)
 
