@@ -213,7 +213,9 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
     /// Sessions with `collection_dirty`, in session-id order after `after`.
     async fn dirty_sessions(&self, domain: &JournalDomain, after: Option<&SessionId>, limit: usize)
         -> Result<Vec<SessionId>, RuntimeError>;
-    async fn apply(&self, write: JournalWrite) -> Result<(), RuntimeError>;
+    /// Returns what this write physically deleted (bodies whose last
+    /// membership it dropped). Zero for writes that release nothing.
+    async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError>;
     /// Physical compaction only (repack, VACUUM). Never changes membership.
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError>;
 }
@@ -241,6 +243,12 @@ Rules the trait documents (and the storage suite in D11 checks):
    membership. An id already present with different bytes is `StateConflict`.
    Reads return only members. A body is deleted only when no membership in any
    domain or session remains, in the same transaction that drops the last one.
+   `apply` returns `JournalApplyReceipt { reclaimed_objects: u64,
+   reclaimed_bytes: u64 }` counting exactly the bodies that transaction
+   deleted (`reclaimed_bytes` = sum of their stored body lengths, the same
+   bytes the engine handed to storage). A body that another domain or session
+   still holds is not counted. Amended 2026-10-19 after task 2.5 found the
+   engine cannot derive D4's accounting through membership-scoped reads.
 5. **Consistent reads.** Each read method returns a state that some completed
    `apply` produced. Within one engine instance, every read that feeds a write
    happens under that engine's write gate (D3), and objects are immutable, so
@@ -337,7 +345,7 @@ module unchanged and stay re-exported at the same paths.
   keeps its own membership. Report fields keep their meaning; `examined` is
   the number of membership entries examined in swept sessions, and
   `reclaimed_bytes` counts only bodies physically deleted (last membership
-  dropped), so the single-session N=1000 evidence (570,121 / 404,529 / 0) is
+  dropped), summed from the `JournalApplyReceipt` of each `Collect` write, so the single-session N=1000 evidence (570,121 / 404,529 / 0) is
   unchanged.
 - Unknown dependency revisions and `unresolved` indexes keep returning typed
   unsupported (today's domain-wide check becomes a check over the dependency
