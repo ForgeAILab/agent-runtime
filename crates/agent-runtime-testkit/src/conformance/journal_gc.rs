@@ -1040,6 +1040,50 @@ where
     journal.retire(&child, child_head.revision).await.unwrap();
     fixture.collect().await;
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
+
+    // A supersession proof resolves the fork intent only once the child seed
+    // is published; until then the parent remains the child's only source.
+    let parent = SessionId::new("completed-fork-parent");
+    let child = SessionId::new("completed-fork-child");
+    let writer = open_writer(journal, &parent, None, "completed-parent").await;
+    let mut snapshot = basic_snapshot(parent.clone(), "completed source", Timestamp(1));
+    snapshot.extension_state.insert(
+        "runtime.session.fork_pending".into(),
+        VersionedSessionState::new(
+            RegistryRevision::new("session-fork-pending-1"),
+            serde_json::json!({"from":parent, "new_id":child, "seed":"empty", "lcm":"continue"}),
+        ),
+    );
+    snapshot.extension_state.insert(
+        "runtime.session.superseded".into(),
+        VersionedSessionState::new(
+            RegistryRevision::new("session-superseded-1"),
+            serde_json::json!(child),
+        ),
+    );
+    let (proof, _) =
+        bootstrap_from_snapshot(snapshot, writer.writer_epoch().unwrap(), "proof", None);
+    let head = journal.commit(&writer, proof.clone()).await.unwrap();
+    journal.close(writer).await.unwrap();
+    fixture.authorize(&parent, &head).await;
+    fixture.collect().await;
+    assert_conflict(journal.retire(&parent, head.revision).await.unwrap_err());
+    assert_materializes(journal, &parent, head.revision, "unpublished-child-source").await;
+    let seed = open_writer(journal, &child, None, "completed-child").await;
+    let (seed_commit, _) = bootstrap_commit(
+        child.clone(),
+        seed.writer_epoch().unwrap(),
+        "seed",
+        "completed seed",
+    );
+    let child_head = journal.commit(&seed, seed_commit).await.unwrap();
+    journal.close(seed).await.unwrap();
+    journal.retire(&parent, head.revision).await.unwrap();
+    fixture.collect().await;
+    fixture.authorize(&child, &child_head).await;
+    journal.retire(&child, child_head.revision).await.unwrap();
+    fixture.collect().await;
+    assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
 }
 
 /// A backend unable to interpret a future transfer-index revision cannot prove
