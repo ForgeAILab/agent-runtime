@@ -9,6 +9,11 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
+- Waiting for a user, internal, or resumed turn to complete now also waits for
+  its execution gate and active-turn admission to be released. Previously a
+  host waking from `TurnHandle::completed` or `SessionHandle::run` could have
+  an immediate local tool action refused as non-idle, or an explicit idle
+  compaction return `Busy`, even though that turn had completed.
 - Automatic child-completion delivery is no longer refused when its batch
   passes the 4,096-character internal-turn limit. Such a batch stayed ready,
   so one long child reply blocked every later delivery to that parent.
