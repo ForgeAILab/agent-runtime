@@ -275,6 +275,59 @@ where
     fixture.collect().await;
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
     assert_journal_gc_projected_intent_conformance(factory).await;
+    assert_ordinary_gc_shared_suffix_conformance(factory).await;
+}
+
+/// Ordinary adapters share projected objects across sessions as well: a
+/// FromIndex child's suffix, first published by its parent, survives the
+/// parent's retirement and collection, and goes only with the child.
+pub async fn assert_ordinary_gc_shared_suffix_conformance<F, Fut>(factory: &F)
+where
+    F: Fn(Arc<dyn JournalProjectionPolicy>) -> Fut,
+    Fut: Future<Output = SessionJournalCollectionFixture>,
+{
+    let fixture = factory(Arc::new(IdentityJournalProjection)).await;
+    let journal = &*fixture.backend.journal;
+    let parent = SessionId::new("ordinary-shared-parent");
+    let child = SessionId::new("ordinary-shared-child");
+    let mut source = basic_snapshot(parent.clone(), "shared-0", Timestamp(1));
+    source
+        .history
+        .extend((1..6).map(|index| Message::user(format!("shared-{index}"))));
+    let writer = open_writer(journal, &parent, None, "shared-parent").await;
+    let (commit, _) = bootstrap_from_snapshot(
+        source.clone(),
+        writer.writer_epoch().unwrap(),
+        "parent",
+        None,
+    );
+    let parent_head = journal.commit(&writer, commit).await.unwrap();
+    journal.close(writer).await.unwrap();
+    let mut seed = source.clone();
+    seed.id = child.clone();
+    seed.history = source.history[2..].to_vec();
+    let writer = open_writer(journal, &child, None, "shared-child").await;
+    let (commit, _) =
+        bootstrap_from_snapshot(seed.clone(), writer.writer_epoch().unwrap(), "child", None);
+    let child_head = journal.commit(&writer, commit).await.unwrap();
+    journal.close(writer).await.unwrap();
+    fixture.authorize(&parent, &parent_head).await;
+    journal.retire(&parent, parent_head.revision).await.unwrap();
+    assert!(fixture.collect().await.deleted > 0);
+    let reader = open_reader(journal, &child, Some(child_head.revision), "shared-read").await;
+    assert_eq!(
+        JournalReader::new(journal, &reader, LIMITS)
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap(),
+        Some(seed)
+    );
+    journal.close(reader).await.unwrap();
+    fixture.authorize(&child, &child_head).await;
+    journal.retire(&child, child_head.revision).await.unwrap();
+    fixture.collect().await;
+    assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
 }
 
 /// Omitting a Sensitive intent body from ordinary content is not intent repair.
