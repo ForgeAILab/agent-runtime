@@ -271,7 +271,9 @@ retirement, durable pins, retained checkpoints, epochs, replay fences, committed
 transfer roots, failed repair, reclamation, backend compaction and
 `assert_journal_gc_object_kind_closure_conformance`, which publishes every
 object kind (JSON spine/inline nodes, legacy and structured manifests, usage,
-tool schemas, internal input) and requires each to survive collection. The
+tool schemas, internal input) and requires each to survive collection, and
+`assert_journal_gc_partial_collection_conformance`, which requires an open of a
+partly collected root to fail before returning a lease. The
 interleaving matrix stages protected leaves, so ordinary-only adapters run the
 ordinary suite, which includes a FromIndex shared-suffix retirement case.
 `assert_journal_gc_interleaving_conformance` accepts each of the eight

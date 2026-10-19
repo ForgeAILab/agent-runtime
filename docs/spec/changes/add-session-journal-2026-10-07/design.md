@@ -540,10 +540,12 @@ spine/inline nodes, legacy and structured manifests, usage records, tool
 schemas, internal input; five were absent from every GC test and five were
 caught only by the in-repo runtime harness), honored another session's
 retirement grant, retired a fork parent on its supersession proof before the
-child seed published, or deleted an ordinary FromIndex child's shared suffix.
+child seed published, deleted an ordinary FromIndex child's shared suffix, or
+opened a lease over a root that bounded deletion had only partly removed.
 `assert_journal_gc_object_kind_closure_conformance` now publishes all 21 object
 kinds under a live root and an explicit retention pin; the durable-pin,
-retirement, committed-transfer and ordinary cases cover the rest. The 24 rows'
+retirement, committed-transfer and ordinary cases and
+`assert_journal_gc_partial_collection_conformance` cover the rest. The 24 rows'
 steps are host-side sequencing at the trait boundary: `collect` re-traces under
 the same lock as deletion, so the reference has no internal mark/delete window,
 and a two-phase collector stays safe only because every root/pin change advances

@@ -25,7 +25,8 @@ contain breaking changes and are coordinated with consumer proposals.
   storage compaction is tested separately from logical GC and LCM compaction.
   The suite requires every journal object kind to survive collection, transfer
   pins and renewed leases to protect superseded roots, retirement grants to be
-  session-scoped, and ordinary FromIndex suffixes to outlive their parent.
+  session-scoped, ordinary FromIndex suffixes to outlive their parent, and an
+  open of a partly collected root to fail before returning a lease.
 
 ### Fixed
 
