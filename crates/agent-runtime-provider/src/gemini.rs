@@ -34,6 +34,7 @@ use agent_runtime_core::provider_credential::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::error_redaction::{self, RequestCredentials};
 use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
 
@@ -973,7 +974,10 @@ async fn classify_auth_rejection(
     }
 }
 
-fn sanitize_transport_error(error: ProviderError) -> ProviderError {
+fn sanitize_transport_error(
+    error: ProviderError,
+    credentials: &RequestCredentials,
+) -> ProviderError {
     let message = match error.kind {
         ProviderErrorKind::Network => "Gemini provider network failure",
         ProviderErrorKind::Timeout => "Gemini provider deadline elapsed",
@@ -987,12 +991,7 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::CacheExpired => "Gemini provider cache identity expired",
         ProviderErrorKind::LimitExhausted => "Gemini provider usage limit exhausted",
     };
-    let mut sanitized = ProviderError::new(error.kind, message);
-    sanitized.retryable = error.retryable;
-    sanitized.retry_after_ms = error.retry_after_ms;
-    sanitized.limit_resets_at_ms = error.limit_resets_at_ms;
-    sanitized.credential_recovery = error.credential_recovery;
-    sanitized
+    error_redaction::sanitize_with_message(error, message, credentials)
 }
 
 fn push_utf8(pending_bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<String>, ProviderError> {
@@ -1175,6 +1174,10 @@ struct GroundingToolCount {
 #[derive(Debug, Default, Deserialize)]
 struct WireError {
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
     code: Value,
 }
 
@@ -1215,6 +1218,7 @@ struct SearchTextBlock {
 
 #[derive(Debug, Default)]
 struct StreamState {
+    credentials: RequestCredentials,
     buffer_text: bool,
     text: BTreeMap<u32, Vec<SearchTextBlock>>,
     grounding: BTreeMap<u32, Value>,
@@ -1789,7 +1793,10 @@ fn event_to_events(
             )));
         }
         WireEvent::Error { error } => {
-            state.pending_terminal = Some(PendingTerminal::Error(map_wire_error(error)));
+            state.pending_terminal = Some(PendingTerminal::Error(map_wire_error(
+                error,
+                &state.credentials,
+            )));
         }
         WireEvent::Unknown => return Err(malformed("unknown Gemini stream event type")),
     }
@@ -1845,13 +1852,18 @@ fn emit_usage(usage: WireUsage, out: &mut Vec<ProviderStreamEvent>) {
     }
 }
 
-fn map_wire_error(error: WireError) -> ProviderError {
-    let code = error
-        .code
-        .as_str()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| error.code.to_string());
-    match code.as_str() {
+fn map_wire_error(error: WireError, credentials: &RequestCredentials) -> ProviderError {
+    let code = if error.code.is_null() {
+        error.status.clone().unwrap_or_default()
+    } else {
+        error
+            .code
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.code.to_string())
+    }
+    .to_ascii_lowercase();
+    let mapped = match code.as_str() {
         "401" | "403" | "unauthenticated" | "permission_denied" => ProviderError::new(
             ProviderErrorKind::Auth,
             "Gemini provider authentication rejected",
@@ -1875,7 +1887,14 @@ fn map_wire_error(error: WireError) -> ProviderError {
         ),
         _ => ProviderError::new(ProviderErrorKind::Server, "Gemini provider service failure")
             .retryable(),
-    }
+    };
+    let reason = match (error.status.as_deref(), error.message.as_deref()) {
+        (Some(status), Some(message)) => Some(format!("{status}: {message}")),
+        (None, Some(message)) => Some(message.to_owned()),
+        (Some(status), None) => Some(status.to_owned()),
+        (None, None) => None,
+    };
+    error_redaction::with_reason(mapped, reason.as_deref(), credentials)
 }
 
 async fn take_terminal(
@@ -1892,16 +1911,11 @@ async fn take_terminal(
         Some(PendingTerminal::Error(error))
             if error.kind == ProviderErrorKind::Auth && !state.saw_semantic_event =>
         {
+            let rejected =
+                classify_auth_rejection(source, target, rejected_revision, cancel, deadline, clock)
+                    .await;
             Ok(ProviderStreamEvent::Error {
-                error: classify_auth_rejection(
-                    source,
-                    target,
-                    rejected_revision,
-                    cancel,
-                    deadline,
-                    clock,
-                )
-                .await,
+                error: error_redaction::carry_auth_reason(rejected, &error, &state.credentials),
             })
         }
         Some(PendingTerminal::Error(error)) => Ok(ProviderStreamEvent::Error { error }),
@@ -1949,6 +1963,7 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.revision().clone();
         let clock = self.clock.clone();
+        let credentials = RequestCredentials::from_request(&http);
         let post = self.transport.post_response(http);
         tokio::pin!(post);
         let response = tokio::select! {
@@ -1965,16 +1980,17 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
             result = &mut post => match result {
                 Ok(response) => response,
                 Err(error) if error.kind == ProviderErrorKind::Auth => {
-                    return Err(classify_auth_rejection(
+                    let rejected = classify_auth_rejection(
                         credential_source,
                         credential_target,
                         rejected_revision,
                         &ctx.cancel,
                         ctx.deadline,
                         clock,
-                    ).await);
+                    ).await;
+                    return Err(error_redaction::carry_auth_reason(rejected, &error, &credentials));
                 }
-                Err(error) => return Err(sanitize_transport_error(error)),
+                Err(error) => return Err(sanitize_transport_error(error, &credentials)),
             },
         };
 
@@ -1998,7 +2014,7 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
             }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
-            let mut state = StreamState { buffer_text, ..StreamState::default() };
+            let mut state = StreamState { credentials, buffer_text, ..StreamState::default() };
             let mut done = false;
 
             'outer: loop {
@@ -2030,21 +2046,26 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
                     Err(error) if error.kind == ProviderErrorKind::Auth
                         && !state.saw_semantic_event =>
                     {
+                        let rejected = classify_auth_rejection(
+                            credential_source.clone(),
+                            credential_target.clone(),
+                            rejected_revision.clone(),
+                            &cancel,
+                            deadline,
+                            clock.clone(),
+                        ).await;
                         yield ProviderStreamEvent::Error {
-                            error: classify_auth_rejection(
-                                credential_source.clone(),
-                                credential_target.clone(),
-                                rejected_revision.clone(),
-                                &cancel,
-                                deadline,
-                                clock.clone(),
-                            ).await,
+                            error: error_redaction::carry_auth_reason(
+                                rejected,
+                                &error,
+                                &state.credentials,
+                            ),
                         };
                         return;
                     }
                     Err(error) => {
                         yield ProviderStreamEvent::Error {
-                            error: sanitize_transport_error(error),
+                            error: sanitize_transport_error(error, &state.credentials),
                         };
                         return;
                     }
@@ -2167,13 +2188,71 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
 #[cfg(test)]
 mod tests {
 
+    #[tokio::test]
+    async fn a_stream_rejection_carries_only_a_checked_provider_reason() {
+        for (message, expected) in [
+            (
+                "Invalid\nargument",
+                Some("INVALID_ARGUMENT: Invalid argument"),
+            ),
+            ("Echoed gemini-test-key", None),
+        ] {
+            let frame = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"event_type":"error","error":{"code":400,"status":"INVALID_ARGUMENT","message":message}})
+            );
+            let mut config = config();
+            config.api_key = Some(Secret::new("gemini-test-key"));
+            let provider =
+                GeminiInteractionsProvider::new(ReplayTransport::new([frame.as_str()]), config)
+                    .unwrap();
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(
+                            ModelId::new("gemini-test"),
+                            vec![Message::user("hi")],
+                        ),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let error = events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderStreamEvent::Error { error } => Some(error),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+            assert_eq!(
+                error.metadata.get("provider.detail"),
+                expected.map(Into::into).as_ref()
+            );
+            assert_eq!(
+                error.message,
+                expected
+                    .map(|reason| format!("Gemini provider rejected the request: {reason}"))
+                    .unwrap_or_else(|| "Gemini provider rejected the request".into())
+            );
+            assert!(!format!("{events:?}").contains("gemini-test-key"));
+        }
+    }
+
     #[test]
     fn echoed_credential_in_transport_detail_is_redacted() {
+        let credentials = RequestCredentials::from_request(&HttpRequest {
+            url: "https://test.invalid".into(),
+            headers: vec![("x-goog-api-key".into(), "sk-echoed-credential".into())],
+            body: Vec::new(),
+        });
         let mut error = ProviderError::new(ProviderErrorKind::BadRequest, "sk-echoed-credential");
         error
             .metadata
             .insert("provider.detail", "sk-echoed-credential private prompt");
-        let sanitized = sanitize_transport_error(error);
+        let sanitized = sanitize_transport_error(error, &credentials);
         assert!(!format!("{sanitized:?} {sanitized}").contains("sk-echoed-credential"));
     }
 
@@ -2186,26 +2265,34 @@ mod tests {
     }
 
     #[test]
-    fn a_sanitized_rejection_discards_provider_owned_reason() {
+    fn a_sanitized_rejection_keeps_a_checked_provider_reason() {
+        let credentials = RequestCredentials::default();
         let mut error = ProviderError::new(ProviderErrorKind::BadRequest, "raw transport text");
         error
             .metadata
             .insert("provider.detail", "INVALID_ARGUMENT: Input blocked");
         error.metadata.insert("http.status", 400u64);
 
-        let sanitized = sanitize_transport_error(error);
+        let sanitized = sanitize_transport_error(error, &credentials);
 
         assert_eq!(sanitized.kind, ProviderErrorKind::BadRequest);
-        assert_eq!(sanitized.message, "Gemini provider rejected the request");
-        // Neither transport text nor untrusted provider metadata survives.
+        assert_eq!(
+            sanitized.message,
+            "Gemini provider rejected the request: INVALID_ARGUMENT: Input blocked"
+        );
         assert!(!sanitized.message.contains("raw transport text"));
-        assert!(sanitized.metadata.is_empty());
+        assert_eq!(
+            sanitized.metadata.get("provider.detail"),
+            Some(&"INVALID_ARGUMENT: Input blocked".into())
+        );
+        assert_eq!(sanitized.metadata.get("http.status"), Some(&400u64.into()));
     }
 
     #[test]
     fn a_sanitized_rejection_without_a_reason_keeps_the_fixed_message() {
+        let credentials = RequestCredentials::default();
         let error = ProviderError::new(ProviderErrorKind::BadRequest, "raw transport text");
-        let sanitized = sanitize_transport_error(error);
+        let sanitized = sanitize_transport_error(error, &credentials);
         assert_eq!(sanitized.message, "Gemini provider rejected the request");
     }
     use std::collections::VecDeque;
@@ -3436,7 +3523,14 @@ mod tests {
                 }
             }]
         ));
-        assert!(!format!("{events:?}").contains("secret-canary"));
+        // The provider's reason travels with the rejection; the key it was
+        // sent with does not.
+        let rendered = format!("{events:?}");
+        assert!(
+            rendered.contains("raw streamed secret-canary"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("renewable-api-key-canary"));
         assert_eq!(source.invalidated.lock().unwrap().len(), 1);
     }
 

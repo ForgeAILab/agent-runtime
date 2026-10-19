@@ -12,7 +12,7 @@ categories.workspace = true
 
 [features]
 default = []
-reqwest-transport = ["dep:reqwest", "dep:url", "tokio/net"]
+reqwest-transport = ["dep:reqwest", "tokio/net"]
 command-provider = [
     "dep:command-group",
     "dep:thiserror",
@@ -24,7 +24,7 @@ command-provider = [
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
-url = { version = "2", optional = true }
+url = "2"
 agent-runtime-core.workspace = true
 agent-runtime-registry.workspace = true
 serde.workspace = true

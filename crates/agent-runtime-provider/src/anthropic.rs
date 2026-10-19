@@ -46,6 +46,7 @@ use agent_runtime_core::provider::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::error_redaction::{self, RequestCredentials};
 use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
 
@@ -952,8 +953,7 @@ fn search_disabled_error() -> ProviderError {
 struct WireError {
     #[serde(default, rename = "type")]
     kind: Option<String>,
-    /// Read only to recognize an organization that has not enabled hosted
-    /// search; never copied into the mapped error.
+    /// Provider reason, checked against the request before it is exposed.
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
@@ -971,9 +971,7 @@ fn map_stop_reason(raw: &str) -> FinishReason {
     }
 }
 
-fn map_error(error: WireError) -> ProviderError {
-    // Only the organization-disabled check reads the provider's text; the
-    // mapped error below still carries a fixed message.
+fn map_error(error: WireError, credentials: &RequestCredentials) -> ProviderError {
     if error.message.as_deref().is_some_and(search_disabled) {
         return search_disabled_error();
     }
@@ -1028,7 +1026,7 @@ fn map_error(error: WireError) -> ProviderError {
         mapped.retryable = true;
         mapped.retry_after_ms = error.retry_after_ms;
     }
-    mapped
+    error_redaction::with_reason(mapped, error.message.as_deref(), credentials)
 }
 
 fn decode_event(data: &str) -> Result<WireEvent, ProviderError> {
@@ -1073,6 +1071,7 @@ fn text_citation(
 /// Per-stream state for mapping block-indexed events onto neutral events.
 #[derive(Default)]
 struct StreamState {
+    credentials: RequestCredentials,
     buffer_text: bool,
     text: BTreeMap<u32, SearchTextBlock>,
     search_inputs: BTreeMap<u32, (String, String)>,
@@ -1394,7 +1393,7 @@ fn event_to_events(
             }
             return Ok(true);
         }
-        WireEvent::Error { error } => return Err(map_error(error)),
+        WireEvent::Error { error } => return Err(map_error(error, &state.credentials)),
         WireEvent::Ping | WireEvent::Unknown => {}
     }
     Ok(false)
@@ -1449,6 +1448,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
             headers,
             body,
         };
+        let credentials = RequestCredentials::from_request(&http);
         let post = self.transport.post_response(http);
         tokio::pin!(post);
         let response = tokio::select! {
@@ -1466,7 +1466,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
                 if search_disabled(&error.message) {
                     search_disabled_error()
                 } else {
-                    super::error_redaction::sanitize(error)
+                    error_redaction::sanitize(error, &credentials)
                 }
             })?,
         };
@@ -1484,7 +1484,8 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
                 let Some(chunk) = chunk else {
                     break;
                 };
-                let chunk = chunk?;
+                let chunk =
+                    chunk.map_err(|error| error_redaction::sanitize(error, &credentials))?;
                 if bytes.len().saturating_add(chunk.len()) > 1_048_576 {
                     return Err(ProviderError::new(
                         ProviderErrorKind::BadRequest,
@@ -1498,7 +1499,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
                 .and_then(|value| value.get("error").cloned())
                 .and_then(|error| serde_json::from_value::<WireError>(error).ok())
             {
-                return Err(map_error(error));
+                return Err(map_error(error, &credentials));
             }
             return Err(ProviderError::new(
                 if status >= 500 {
@@ -1526,7 +1527,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
             }
             let mut parser = super::sse::SseFrameParser::new();
             let mut pending_bytes = Vec::new();
-            let mut state = StreamState { buffer_text, ..StreamState::default() };
+            let mut state = StreamState { credentials, buffer_text, ..StreamState::default() };
             let mut saw_event = false;
             let mut emitted_finish = false;
 
@@ -1556,7 +1557,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        yield ProviderStreamEvent::Error { error: super::error_redaction::sanitize(e) };
+                        yield ProviderStreamEvent::Error { error: error_redaction::sanitize(e, &state.credentials) };
                         return;
                     }
                 };
@@ -1678,6 +1679,53 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_stream_rejection_carries_only_a_checked_provider_reason() {
+        for (message, expected) in [
+            ("Invalid\nargument", Some("Invalid argument")),
+            ("Echoed anthropic-test-key", None),
+        ] {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"type":"error","error":{"type":"invalid_request_error","message":message}})
+            );
+            let provider = AnthropicProvider::new(
+                ReplayTransport::new(vec![&frame]),
+                AnthropicConfig::new("http://x/v1", "claude-test")
+                    .with_api_key(Secret::new("anthropic-test-key")),
+            );
+            let events = collect(
+                provider
+                    .stream(
+                        ProviderRequest::new(ModelId::new("claude-test"), vec![]),
+                        ctx(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let error = events
+                .iter()
+                .find_map(|event| match event {
+                    ProviderStreamEvent::Error { error } => Some(error),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+            assert_eq!(
+                error.metadata.get("provider.detail"),
+                expected.map(Into::into).as_ref()
+            );
+            assert_eq!(
+                error.message,
+                expected
+                    .map(|reason| format!("Anthropic provider rejected the request: {reason}"))
+                    .unwrap_or_else(|| "Anthropic provider rejected the request".into())
+            );
+            assert!(!format!("{events:?}").contains("anthropic-test-key"));
+        }
+    }
     use super::*;
     use agent_runtime_core::cancel::Cancellation;
     use agent_runtime_core::content::{ToolCall, ToolResultBlock};
@@ -1816,7 +1864,8 @@ mod tests {
             );
             let provider = AnthropicProvider::new(
                 ReplayTransport::new(vec![&frame]),
-                AnthropicConfig::new("http://x/v1", "claude-test"),
+                AnthropicConfig::new("http://x/v1", "claude-test")
+                    .with_api_key(Secret::new("sk-echoed-credential")),
             );
             let events = collect(
                 provider
@@ -3169,11 +3218,14 @@ mod tests {
             "web_search_20250305 is not available for this account",
             "web_search is disabled",
         ] {
-            let error = map_error(WireError {
-                kind: Some("invalid_request_error".into()),
-                message: Some(message.into()),
-                retry_after_ms: None,
-            });
+            let error = map_error(
+                WireError {
+                    kind: Some("invalid_request_error".into()),
+                    message: Some(message.into()),
+                    retry_after_ms: None,
+                },
+                &RequestCredentials::default(),
+            );
             assert_eq!(error.kind, ProviderErrorKind::Unsupported);
             assert_eq!(
                 error.message,

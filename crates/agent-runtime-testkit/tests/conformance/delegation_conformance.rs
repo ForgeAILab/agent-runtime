@@ -311,3 +311,8 @@ async fn an_uncommitted_tool_result_keeps_automatic_delivery() {
 async fn acknowledgement_requires_the_serving_turn() {
     delegation::assert_acknowledgement_requires_the_serving_turn().await;
 }
+
+#[tokio::test]
+async fn a_child_policy_failure_is_isolated_during_restore() {
+    delegation::assert_a_child_policy_failure_is_isolated_during_restore().await;
+}

@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::error_redaction::{self, HTTP_STATUS_KEY, PROVIDER_DETAIL_KEY, RequestCredentials};
 use crate::transport::{ByteStream, HttpRequest, HttpResponse, HttpTransport};
 use agent_runtime_core::provider::{ProviderError, ProviderErrorKind};
 use async_trait::async_trait;
@@ -227,6 +228,7 @@ impl ReqwestTransport {
     }
 
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
+        let credentials = RequestCredentials::from_request(&request);
         let (url, host, addresses) = self.validated_target(&request.url).await?;
         let client = reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
@@ -249,7 +251,7 @@ impl ReqwestTransport {
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             let excerpt = read_bounded_error_body(response).await;
-            return Err(classify_http_failure(status, &excerpt));
+            return Err(classify_http_failure(status, &excerpt, &credentials));
         }
 
         let headers = bounded_response_headers(response.headers());
@@ -379,8 +381,12 @@ fn append_bounded(body: &mut Vec<u8>, chunk: &[u8]) {
     body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
 }
 
-fn classify_http_failure(status: u16, body: &[u8]) -> ProviderError {
-    match status {
+fn classify_http_failure(
+    status: u16,
+    body: &[u8],
+    credentials: &RequestCredentials,
+) -> ProviderError {
+    let mut error = match status {
         300..=399 => ProviderError::new(ProviderErrorKind::Network, "provider redirect rejected"),
         401 | 403 => ProviderError::new(ProviderErrorKind::Auth, "provider authentication failed"),
         429 if usage_limit_reached(body) => ProviderError::new(
@@ -405,7 +411,12 @@ fn classify_http_failure(status: u16, body: &[u8]) -> ProviderError {
             ProviderErrorKind::Network,
             format!("provider returned unexpected HTTP {status}"),
         ),
+    };
+    error.metadata.insert(HTTP_STATUS_KEY, u64::from(status));
+    if let Some(reason) = error_redaction::detail_from_body(body, credentials) {
+        error.metadata.insert(PROVIDER_DETAIL_KEY, reason);
     }
+    error
 }
 
 fn usage_limit_reached(body: &[u8]) -> bool {
@@ -464,6 +475,57 @@ fn restricted_ipv6(address: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_http_rejection_keeps_only_a_checked_documented_reason() {
+        let credentials = RequestCredentials::from_request(&HttpRequest {
+            url: "https://example.test?key=query-secret".into(),
+            headers: vec![("authorization".into(), "Bearer bearer-token-secret".into())],
+            body: Vec::new(),
+        });
+        let body = br#"{"error":{"status":"INVALID_ARGUMENT","message":"Invalid\ninput","extra":"private prompt"},"message":"untrusted"}"#;
+        let error = classify_http_failure(400, body, &credentials);
+        assert_eq!(error.message, "provider rejected the request with HTTP 400");
+        assert_eq!(error.metadata.get(HTTP_STATUS_KEY), Some(&400u64.into()));
+        assert_eq!(
+            error.metadata.get(PROVIDER_DETAIL_KEY),
+            Some(&"INVALID_ARGUMENT: Invalid input".into())
+        );
+        assert_eq!(error.metadata.len(), 2);
+        for message in [
+            "Bearer bearer-token-secret",
+            "bearer-token-secret",
+            "query-secret",
+        ] {
+            let body =
+                serde_json::to_vec(&serde_json::json!({"error":{"message":message}})).unwrap();
+            let error = classify_http_failure(400, &body, &credentials);
+            assert!(error.metadata.get(PROVIDER_DETAIL_KEY).is_none());
+            assert!(!format!("{error:?}").contains(message));
+        }
+        for body in [
+            b"raw excerpt".as_slice(),
+            br#"{"message":"top level"}"#,
+            br#"{"error":{"code":400}}"#,
+        ] {
+            assert!(
+                classify_http_failure(400, body, &credentials)
+                    .metadata
+                    .get(PROVIDER_DETAIL_KEY)
+                    .is_none()
+            );
+        }
+        let body =
+            serde_json::to_vec(&serde_json::json!({"error":{"message":"é".repeat(301)}})).unwrap();
+        let error = classify_http_failure(400, &body, &credentials);
+        let Some(agent_runtime_core::metadata::MetaValue::Text(reason)) =
+            error.metadata.get(PROVIDER_DETAIL_KEY)
+        else {
+            panic!("expected reason")
+        };
+        assert_eq!(reason.chars().count(), 300);
+        assert!(reason.ends_with('…'));
+    }
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -587,23 +649,25 @@ mod tests {
 
     #[test]
     fn redirect_and_status_errors_are_typed_and_redacted() {
-        let redirect = classify_http_failure(302, b"Bearer very-secret");
+        let redirect =
+            classify_http_failure(302, b"Bearer very-secret", &RequestCredentials::default());
         assert_eq!(redirect.kind, ProviderErrorKind::Network);
         assert_eq!(redirect.message, "provider redirect rejected");
         assert!(!redirect.to_string().contains("very-secret"));
 
-        let auth = classify_http_failure(401, b"very-secret");
+        let auth = classify_http_failure(401, b"very-secret", &RequestCredentials::default());
         assert_eq!(auth.kind, ProviderErrorKind::Auth);
         assert!(!auth.to_string().contains("very-secret"));
 
         let exhausted = classify_http_failure(
             429,
             br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}"#,
+            &RequestCredentials::default(),
         );
         assert_eq!(exhausted.kind, ProviderErrorKind::LimitExhausted);
         assert!(!exhausted.retryable);
 
-        let server = classify_http_failure(503, b"unavailable");
+        let server = classify_http_failure(503, b"unavailable", &RequestCredentials::default());
         assert_eq!(server.kind, ProviderErrorKind::Server);
         assert!(server.retryable);
     }
