@@ -711,7 +711,7 @@ impl SessionHandle {
             let finish = inner.execution.take_turn_finish(&tid);
             let returned_interaction = inner.execution.returned_interaction_value();
             let completed = matches!(finish, Some(TurnFinish::Completed));
-            task_completion.finish(finish, returned_interaction);
+            task_completion.record_outcome(finish, returned_interaction);
             drop(_turn);
             drop(_active);
             if completed && inner.shared.soft_on_turn_boundary {
@@ -1094,7 +1094,7 @@ impl SessionHandle {
             let finish = inner.execution.take_turn_finish(&tid);
             let returned_interaction = inner.execution.returned_interaction_value();
             let completed = matches!(finish, Some(TurnFinish::Completed));
-            task_completion.finish(finish, returned_interaction);
+            task_completion.record_outcome(finish, returned_interaction);
             drop(_turn);
             drop(_active);
             if completed && inner.shared.soft_on_turn_boundary {
@@ -1209,7 +1209,7 @@ impl SessionHandle {
             let returned_interaction = inner.execution.returned_interaction_value();
             let finish = inner.execution.take_turn_finish(&completion_turn);
             let completed = matches!(finish, Some(TurnFinish::Completed));
-            task_completion.finish(finish, returned_interaction);
+            task_completion.record_outcome(finish, returned_interaction);
             drop(_turn);
             drop(_active);
             if completed && inner.shared.soft_on_turn_boundary {
@@ -1370,14 +1370,24 @@ impl TurnAcceptance {
 }
 
 impl TurnCompletion {
-    fn finish(&self, finish: Option<TurnFinish>, returned_interaction: Option<InteractionRequest>) {
+    /// Retain the outcome while the task still owns execution. Only the
+    /// active-turn guard publishes completion, after releasing admission.
+    fn record_outcome(
+        &self,
+        finish: Option<TurnFinish>,
+        returned_interaction: Option<InteractionRequest>,
+    ) {
+        let mut state = self.state.lock().expect("turn completion poisoned");
+        state.finish = finish;
+        state.returned_interaction = returned_interaction;
+    }
+
+    fn finish(&self) {
         let should_notify = {
             let mut state = self.state.lock().expect("turn completion poisoned");
             if state.done {
                 false
             } else {
-                state.finish = finish;
-                state.returned_interaction = returned_interaction;
                 state.done = true;
                 true
             }
@@ -1453,7 +1463,8 @@ impl TurnHandle {
         &self.id
     }
 
-    /// Waits until the turn task has reached a terminal boundary.
+    /// Waits until the turn has reached a terminal boundary and released its
+    /// execution gate and active-turn admission.
     pub async fn completed(&self) {
         self.completion.wait().await;
     }
@@ -1631,8 +1642,11 @@ impl Drop for ActiveTurnGuard {
         }
         drop(turns);
         self.inner.execution.clear_turn(&self.turn);
-        self.completion.finish(None, None);
+        self.completion.finish();
         self.inner.turn_ready.notify_waiters();
         self.inner.turns_changed.notify_waiters();
     }
 }
+
+#[cfg(test)]
+mod completion_tests;
