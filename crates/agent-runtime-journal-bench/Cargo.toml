@@ -1,0 +1,23 @@
+[package]
+name = "agent-runtime-journal-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Physical SQLite measurement harness; never a production dependency"
+
+[dependencies]
+agent-runtime-core = { workspace = true, features = ["journal-measurement"] }
+agent-runtime.workspace = true
+agent-runtime-testkit.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+sha2.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+zstd = { version = "0.13", default-features = false }
+
+[lints]
+workspace = true

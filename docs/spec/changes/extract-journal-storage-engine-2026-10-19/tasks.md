@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T00:00:00Z
+updated_at: 2026-10-19T18:26:00Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -13,12 +13,12 @@ may run in parallel.
 
 ## 1. Measurement harness (first; no lever is built before 1.4)
 
-- [ ] 1.1 Add the non-default core feature `journal-measurement` with
+- [x] 1.1 Add the non-default core feature `journal-measurement` with
   `InMemorySessionJournal::measurement_export()` (retained objects with kind
   and bytes, current heads per session, operation-record count). No default
   API change. Test: a two-commit protected and ordinary session exports
   exactly `object_count()` objects totaling `object_bytes()`.
-- [ ] 1.2 Create `crates/agent-runtime-journal-bench` (`publish = false`;
+- [x] 1.2 Create `crates/agent-runtime-journal-bench` (`publish = false`;
   core, runtime, testkit, `rusqlite` 0.32 `bundled`, `zstd`). Implement
   fixtures A (task-2.7 shape, plain and tool), B (same shape, seeded realistic
   content generator) and C (B grown by turns to N=1000), and the legacy layout
@@ -27,7 +27,7 @@ may run in parallel.
   `page_count × page_size` after `wal_checkpoint(TRUNCATE)` + `VACUUM` minus
   the empty-schema file. Report whether the idle row holds one or two blobs.
   Test: non-ignored N=100 smoke for A and B.
-- [ ] 1.3 Add layout simulators from the exported objects: Forge D4 per-object
+- [x] 1.3 Add layout simulators from the exported objects: Forge D4 per-object
   rows (its DDL), S1 commit packs, S1+S2 session repack with cross-domain
   sharing, S1+S2+S3 in-pack compact index. Per-kind breakdown (count,
   logical, compressed, row/index overhead), pre- and post-collection bytes,
@@ -35,10 +35,20 @@ may run in parallel.
   retained manifest seen at N=4000 (object kinds of each manifest's closure).
   Test: simulator byte totals for N=100 equal a direct sum of the rows it
   wrote (model validated against the real SQLite file).
-- [ ] 1.4 Run the `#[ignore]` release report for N=100/1000/4000 (A, B) and
+- [x] 1.4 Run the `#[ignore]` release report for N=100/1000/4000 (A, B) and
   N=1000 (C). Record the tables in `design.md` D8.4 (replacing the estimates)
   and the raw JSON under `/Volumes/Data/tmp/refactor/`. Apply the D8.5
   decision rule and record which levers groups 4–5 build.
+
+Measurement decision (1.4, 2026-10-19): B/N=4000 S1–S5 measures
+3.08750× L1 plain and 3.44375× tool, above the 2.0× gate.
+Group 4 builds S1–S4 plus owner-approved S5; task 4.5 still rechecks the real
+storage. Group 5 is gated in on current evidence: F1, re-measure, then F2,
+with F3 accompanying schema 5. A does not gate; the 1.5× aim adds no mandatory
+scope. Idle legacy fixtures use L2, while the comparison remains the stricter
+L1. Tables and scope limits are in design D8.4; raw JSON and verification logs
+are in `/Volumes/Data/tmp/refactor/rt-e1/`. No group-2–7 work is implemented by
+this measurement job.
 
 ## 2. Engine extraction (no behavior change; all existing suites unchanged)
 

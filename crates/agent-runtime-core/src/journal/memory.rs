@@ -389,6 +389,8 @@ struct State {
     next_handle: u64,
     root_epoch: u64,
     collection_enabled: bool,
+    #[cfg(feature = "journal-measurement")]
+    measurement_batches: Vec<Arc<Vec<JournalObjectId>>>,
     retirement_authorizations: BTreeMap<SessionId, (JournalRevision, crate::clock::Timestamp)>,
     durable_pins: BTreeMap<(SessionId, JournalPinId), DurablePin>,
 }
@@ -532,6 +534,37 @@ impl fmt::Debug for InMemorySessionJournal {
             .field("role", &self.role)
             .finish_non_exhaustive()
     }
+}
+
+/// Temporary measurement-only view of physically retained immutable content.
+/// Contains protected plaintext; callers must keep it inside their trusted host.
+#[cfg(feature = "journal-measurement")]
+#[derive(Debug, Clone)]
+pub struct JournalMeasurementExport {
+    /// All retained objects, including garbage until collection runs.
+    pub objects: Vec<(JournalObjectKind, JournalObject)>,
+    /// Current published head of each session (absent reservations omitted).
+    pub heads: BTreeMap<SessionId, JournalHead>,
+    /// Lifetime operation records, including their original results.
+    pub operations: Vec<JournalMeasurementOperation>,
+    /// Number of operation records in this domain.
+    pub operation_count: usize,
+    /// First-admission IDs per successful commit, in publication order.
+    pub commit_batches: Vec<Arc<Vec<JournalObjectId>>>,
+}
+
+/// One measurement-only replay record; no production storage API is implied.
+#[cfg(feature = "journal-measurement")]
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalMeasurementOperation {
+    /// Owning execution identity.
+    pub session: SessionId,
+    /// Retry identity.
+    pub operation: JournalOperationId,
+    /// Private input digest.
+    pub digest: JournalDigest,
+    /// Original published result.
+    pub result: JournalHead,
 }
 
 impl InMemorySessionJournal {
@@ -759,6 +792,57 @@ impl InMemorySessionJournal {
     /// Primarily useful for deterministic cost tests; it exposes no content or IDs.
     pub fn object_bytes(&self) -> Result<usize, RuntimeError> {
         Ok(self.lock()?.objects.bytes)
+    }
+
+    /// Exports a consistent measurement snapshot under the transaction lock.
+    /// Available only with the non-default `journal-measurement` feature.
+    #[cfg(feature = "journal-measurement")]
+    pub fn measurement_export(&self) -> Result<JournalMeasurementExport, RuntimeError> {
+        let state = self.lock()?;
+        let objects = state
+            .objects
+            .entries()
+            .into_iter()
+            .map(|(id, bytes)| {
+                let object = JournalObject {
+                    id,
+                    bytes: bytes.as_ref().clone(),
+                };
+                Ok((object.kind()?, object))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let heads = state
+            .sessions
+            .iter()
+            .filter_map(|(session, record)| {
+                record
+                    .current
+                    .as_ref()
+                    .map(|(_, head)| (session.clone(), head.clone()))
+            })
+            .collect();
+        let operations: Vec<_> = state
+            .sessions
+            .iter()
+            .flat_map(|(session, record)| {
+                record
+                    .operations
+                    .iter()
+                    .map(|(operation, record)| JournalMeasurementOperation {
+                        session: session.clone(),
+                        operation: operation.clone(),
+                        digest: record.digest.clone(),
+                        result: record.head.clone(),
+                    })
+            })
+            .collect();
+        Ok(JournalMeasurementExport {
+            objects,
+            heads,
+            operation_count: operations.len(),
+            operations,
+            commit_batches: state.measurement_batches.clone(),
+        })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, RuntimeError> {
@@ -1501,6 +1585,17 @@ impl SessionJournal for InMemorySessionJournal {
         );
         self.fail_if_armed(JournalCommitFailurePoint::AfterIdempotency)?;
 
+        #[cfg(feature = "journal-measurement")]
+        staged.measurement_batches.push(Arc::new(
+            staged
+                .objects
+                .layers
+                .last()
+                .expect("commit layer")
+                .keys()
+                .cloned()
+                .collect(),
+        ));
         staged.retirement_authorizations.remove(lease.session());
         staged.advance_root_epoch()?;
         *state = staged;

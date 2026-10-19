@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T00:00:00Z
+updated_at: 2026-10-19T18:26:00Z
 ---
 
 # Design: Storage-generic journal engine and physical disk reduction (R1–R7)
@@ -11,9 +11,9 @@ Forge's adoption design is
 `forge:docs/spec/changes/adopt-session-journal-2026-10-19/design.md`
 (written `Forge D<n>`). The U9 design is
 `docs/spec/changes/add-session-journal-2026-10-07/design.md` (written
-`U9 design:<line>`). No build, test or measurement was run for this document;
-every byte figure below that is not quoted from U9 evidence is an estimate,
-and the first implementation task replaces the estimates with measurements.
+`U9 design:<line>`). The original design used estimates; task 1 now replaces D8.4 with physical
+SQLite measurements. D8.2 retains the historical logical-byte decomposition;
+D8.4 is authoritative for physical size and manifest-sharing conclusions.
 
 ## Evidence on main
 
@@ -489,62 +489,155 @@ Format-level (journal schema 5; D9):
   or Z85 id already costs ~33 bytes, so it saves ~0 physical bytes for a
   format break.
 
-#### D8.4 Estimated physical bytes per lever
+#### D8.4 Measured physical bytes per lever
 
-Estimates from `/Volumes/Data/tmp/refactor/rt-engine-spec/model2.py`
-(per-message terms from D8.2; zstd-3 assumptions: synthetic text ~12×, real
-text ~3×, digests ~2×; 20 KB fixed native state per session; two retained
-manifests whose spines do not share, as measured). Levers are cumulative
-left to right. Ratios are to L1 (one blob); in brackets to L2 (two blobs).
-**Estimates, not measurements.**
+Measured on 2026-10-19 with the unpublished `agent-runtime-journal-bench`
+harness (bundled SQLite 3.46.0, 4096-byte pages, zstd 1.5.7 level 3). These replace the model2.py
+estimates. All table entries are **bytes**, with native columns showing
+**before / after collection**. Every native total includes operation records.
+Legacy L1/L2 are the final idle row, so collection does not change them.
 
-Fixture A (U9 task-2.7 shape: N seeded tiny synthetic messages, cache
-identity, 2 turns):
+Metric: `page_count × page_size` after `wal_checkpoint(TRUNCATE)`, `VACUUM`,
+and a final truncated checkpoint, minus that layout's empty schema. Every
+file's pragma product equals its file length and `dbstat` page sum; independent
+SQL sums equal the simulator's variable-column byte counters. The report
+covers 13 cases and 260 real SQLite files. Full counts, logical/compressed
+bytes, membership values, measured table/index pages and operation deltas are
+in `/Volumes/Data/tmp/refactor/rt-e1/measurements.json`; the companion
+`measurements.md` and logs are in the same directory.
 
-| N | L1 / L2 | D4 per-object rows (Forge plan) | S1 | +S2 | +S3 | +F1 | +F2 |
-| ---: | --- | --- | --- | --- | --- | --- | --- |
-| 100 | 11 KB / 19 KB | 425 KB (38×) | 91 KB (8.1×) | 66 KB (5.8×) | 50 KB (4.4× [2.7×]) | 29 KB (2.5× [1.6×]) | 25 KB (2.2× [1.3×]) |
-| 1000 | 49 KB / 94 KB | 4.1 MB (83×) | 730 KB (15×) | 477 KB (9.7×) | 322 KB (6.6× [3.4×]) | 106 KB (2.2× [1.1×]) | 69 KB (1.4× [0.7×]) |
-| 4000 | 175 KB / 346 KB | 16.2 MB (93×) | 2.86 MB (16×) | 1.85 MB (11×) | 1.23 MB (7.0× [3.6×]) | 365 KB (2.1× [1.05×]) | 215 KB (1.2× [0.6×]) |
+A preserves the task-2.7 seeded-user, bootstrap/plain-or-tool, two-turn shape.
+B uses that shape with explicit implicit-prefix provider caching, seeded
+100–800 B user text, 200–2000 B assistant replies and 500–8000 B echo JSON.
+C grows from zero to 1000 messages over 250 four-message tool turns, reopening
+the writer each turn; it also enables provider caching. B/C assert that the
+persisted provider cache identity exists. The fixed content generator is not
+tuned to the gate. See the bench README for seeds and exact layout framing.
 
-Fixture B (same shape, realistic content: 660 B average message JSON of
-English-like text and tool JSON, ~3× zstd):
+**Legacy evidence:** all 13 idle cases hold **two sealed blobs (L2)**.
+Forge `protected_store.rs:1721–1753` clears snapshot columns on checkpoint
+save, and `:1815–1850` skips an ordinary save when the canonical tuple's digest
+matches. `snapshot_digest` (`:220–234`) excludes timestamps/manifests but
+includes identity. Here `identity.event` and `identity.event_seq` advance after
+the terminal checkpoint (including shutdown), so the ordinary save differs
+and writes a second blob. L1 remains the owner's stricter checkpoint-only
+comparison. At A/N=100 L1 adds zero pages to the empty schema, so its ratio is
+undefined; the schema subtraction is preserved rather than padded.
 
-| N | L1 / L2 | D4 per-object rows | S1 | +S2 | +S3 | +F1 | +F2 |
-| ---: | --- | --- | --- | --- | --- | --- | --- |
-| 100 | 33 KB / 61 KB | 483 KB (15×) | 134 KB (4.1×) | 87 KB (2.7×) | 72 KB (2.2× [1.2×]) | 50 KB (1.5× [0.8×]) | 46 KB (1.4× [0.75×]) |
-| 1000 | 263 KB / 522 KB | 4.6 MB (18×) | 1.16 MB (4.4×) | 691 KB (2.6×) | 536 KB (2.0× [1.03×]) | 320 KB (1.2× [0.6×]) | 283 KB (1.1× [0.54×]) |
-| 4000 | 1.03 MB / 2.06 MB | 18.5 MB (18×) | 4.57 MB (4.4×) | 2.70 MB (2.6×) | 2.08 MB (2.0× [1.01×]) | 1.22 MB (1.2× [0.59×]) | 1.07 MB (1.04× [0.52×]) |
+| Fixture | N | Turn | L1 | L2 | D4 | S1 | S1+S2 | S1+S2+S3 | S1–S5 | S1–S5/L1 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 100 | plain | 0 | 8192 | 716800 / 528384 | 327680 / 258048 | 327680 / 188416 | 221184 / 139264 | 139264 / 57344 | undefined (L1=0) |
+| A | 100 | tool | 0 | 8192 | 933888 / 577536 | 421888 / 290816 | 421888 / 221184 | 282624 / 167936 | 172032 / 57344 | undefined (L1=0) |
+| A | 1000 | plain | 20480 | 53248 | 3751936 / 3559424 | 1384448 / 1310720 | 1384448 / 802816 | 663552 / 385024 | 581632 / 303104 | 14.800 |
+| A | 1000 | tool | 24576 | 53248 | 3973120 / 3604480 | 1470464 / 1347584 | 1470464 / 835584 | 733184 / 413696 | 622592 / 303104 | 12.333 |
+| A | 4000 | plain | 90112 | 204800 | 13877248 / 13672448 | 4927488 / 4857856 | 4927488 / 2850816 | 2129920 / 1163264 | 2048000 / 1081344 | 12.000 |
+| A | 4000 | tool | 94208 | 208896 | 14102528 / 13725696 | 5021696 / 4890624 | 5021696 / 2887680 | 2199552 / 1191936 | 2088960 / 1081344 | 11.478 |
+| B | 100 | plain | 20480 | 40960 | 950272 / 753664 | 434176 / 356352 | 434176 / 233472 | 290816 / 163840 | 208896 / 81920 | 4.000 |
+| B | 100 | tool | 20480 | 45056 | 1257472 / 880640 | 569344 / 430080 | 569344 / 282624 | 372736 / 200704 | 262144 / 90112 | 4.400 |
+| B | 1000 | plain | 159744 | 335872 | 5750784 / 5496832 | 2310144 / 2187264 | 2310144 / 1208320 | 1241088 / 622592 | 1159168 / 540672 | 3.385 |
+| B | 1000 | tool | 163840 | 339968 | 6750208 / 6316032 | 2686976 / 2514944 | 2686976 / 1380352 | 1429504 / 692224 | 1318912 / 581632 | 3.550 |
+| B | 4000 | plain | 655360 | 1359872 | 21733376 / 21352448 | 8658944 / 8409088 | 8658944 / 4464640 | 4472832 / 2105344 | 4390912 / 2023424 | 3.087 |
+| B | 4000 | tool | 655360 | 1392640 | 25042944 / 24502272 | 10055680 / 9744384 | 10055680 / 5062656 | 5140480 / 2367488 | 5029888 / 2256896 | 3.444 |
+| C | 1000 | tool | 454656 | 942080 | 109191168 / 25767936 | 54743040 / 23281664 | 54743040 / 20082688 | 42938368 / 19353600 | 25313280 / 933888 | 2.054 |
 
-The two retained manifests added about 4,000 objects each in the measured
-ordinary bootstrap although their fragments were shared; the harness must
-explain this. A live session retains up to 32 manifests (U3), so unshared
-manifest spines would grow S1–S3 by ~66 B per stable-history element per
-manifest, which only F1's shared chunks remove.
 
-Operation records (both fixtures; add to every column):
+S1–S3 preserve the exact D4 operation rows and sealing rules; only S4 changes
+operation storage. S1 uses commit packs and a full-ID SQL offset index. S2's post-collection base
+pack shares bodies between domains and orders them by kind. S3 replaces object
+SQL index rows with an in-pack four-byte prefix/varint directory. S4 packs
+complete operation records; S5 prunes only after collection, preserving the
+latest 64 revisions per domain plus the current writer epoch. Before collection
+the S1–S5 column uses lifetime S4 records. Pre-collection means the first sweep
+since fixture creation; eager terminal sweeps and geometric merge write
+amplification are future group-4 work. D4 uses Forge's exact DDL (copied from
+`open-forge-design`'s adoption design), sharing body rows and retaining separate
+memberships, head/fence and operation rows. Inactive dependency/catalog engine
+metadata uses a documented small placeholder; this is a layout simulator,
+not the future storage engine. Sealing models exact nonce/tag/envelope lengths.
 
-| Retention | Per commit | Seeded fixtures (~25 commits) | Per 1,000 turns (~10,000 commits) |
-| --- | ---: | ---: | ---: |
-| Lifetime, sealed row per record (Forge D4) | 0.6–1.2 KB | 15–30 KB | 6–12 MB |
-| Lifetime, packed (S4) | ~250 B | ~6 KB | ~2.5 MB |
-| S5 window K=64 per domain, packed | ~250 B | ~6 KB | ~32 KB constant |
+Operation records (body byte columns include sealing but exclude SQLite
+row/index/page overhead; physical row deltas are separately measured in JSON):
 
-Steady state between sweeps (pre-collection): S2 triggered after every
-terminal publication bounds garbage to about one turn (~30 KB packed per
-plain turn); without it garbage grows by ~80 KB logical per turn.
+| Fixture / N / turn | Commits | Commits/turn | Sealed rows, body bytes | S4 packed bytes | D4 physical B/commit | Packed B/commit | S5 records / packed bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A / 4000 / plain | 19 | 9.500 | 18,579 | 4,297 | 4742.7 | 226.2 | 19 / 4,297 |
+| A / 4000 / tool | 26 | 13.000 | 25,413 | 5,517 | 4568.6 | 212.2 | 26 / 5,517 |
+| B / 4000 / plain | 19 | 9.500 | 18,579 | 4,309 | 4742.7 | 226.8 | 19 / 4,309 |
+| B / 4000 / tool | 26 | 13.000 | 25,413 | 5,524 | 4568.6 | 212.5 | 26 / 5,524 |
+| C / 1000 / tool | 4,002 | 16.008 | 3,974,306 | 819,747 | 4608.8 | 204.8 | 128 / 23,769 |
 
-Reading the tables:
 
-- Per-object rows (Forge D4 as designed) miss the target by 15–93×. No format
-  lever fixes that; S1+S2+S3 are required regardless.
-- S1+S2+S3 reach ≈ 2.0× L1 on fixture B at N=4000 (at the gate with no
-  margin) and ≈ 1.0× L2. They miss it on fixture A (7.0× L1, 3.6× L2).
-- F1 brings fixture B to ≈ 1.2× and fixture A to ≈ 2.1× L1; F2 brings both to
-  ≈ 1.0–1.2×.
-- Without S5, a session that reached N=4000 over 1,000 turns adds ~2.5 MB of
-  operation records (~2.5× L1 of fixture B) after packing. The target is not
-  reachable for long-lived sessions with lifetime operation records.
+D4 operation rows cost about 4.6–4.7 KB physical per commit here, despite
+roughly 1 KB of sealed body bytes. S4 packing reduces encoded/sealed payload
+to about 205–227 B per commit, before SQLite overhead.
+
+C retains 32 manifests. Its immutable object set falls
+from 117,906 objects / 60,433,441
+logical bytes to 8,797 / 4,190,400
+after collection. S5 retains 128 of
+4,002 operation records; the current epoch accounts
+for 18 records. This bounded result is
+for the per-turn writer lifecycle; the approved current-epoch exception can
+retain more records if a host holds one writer epoch for a long time.
+
+Per-kind highlights (unique bodies across both domains). Group zstd compresses
+one kind's concatenated canonical bodies without pack framing/index. D4's
+common row/index/page residual is allocated proportionally to kind row values;
+it is not an independently observable per-kind page count. Full standalone
+compression and exact key/membership/ciphertext values are in JSON.
+
+| B / 4000 / plain, kind | Objects | Logical B | Kind-group zstd B | Allocated D4 row/index/page overhead B |
+| --- | ---: | ---: | ---: | ---: |
+| message | 4,004 | 2,298,732 | 538,849 | 1,625,009 |
+| json_inline | 12,009 | 2,019,062 | 196,603 | 2,396,161 |
+| sequence | 6,199 | 2,076,762 | 612,808 | 1,672,019 |
+| json_branch | 6,028 | 933,480 | 414,899 | 1,164,157 |
+| json_object_entry | 55 | 10,808 | 1,882 | 11,659 |
+| json_value | 13 | 2,805 | 870 | 2,755 |
+
+
+Manifest-closure evidence:
+
+| B / 4000 manifest (ID order) | Turn | JsonInline | Sequence | JsonBranch | Other | Shared with current cache | New vs cache + prior manifests |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | plain | 8,001 | 4,004 | 4,004 | 38 | 8,011 | 8,036 |
+| 1 | plain | 8,005 | 4,006 | 4,008 | 38 | 8,031 | 26 |
+| 0 | tool | 8,003 | 6,005 | 6,008 | 39 | 12,006 | 8,049 |
+| 1 | tool | 8,007 | 6,008 | 6,012 | 39 | 12,039 | 26 |
+| 2 | tool | 8,009 | 6,009 | 6,013 | 39 | 12,039 | 23 |
+
+
+A wide 4000-element JSON array stores about 2000 `Sequence` (`jv`) nodes and
+about 2000 `JsonBranch` (`jb`) nodes, in addition to `JsonInline` leaves and a
+small `JsonValue` / `JsonObjectEntry` / `ManifestReference` wrapper. That is the
+~4000 spine-object effect in the earlier bootstrap accounting. The audit
+`RunManifest.segments` rows (`id`, `kind`, `sensitivity`, `content_hash`,
+`tokens`) differ from `CachePlan.segments` (`fragment`, `cache_class`,
+`content_hash`, `tokens`): equal message hashes do not make those leaf objects
+equal. Provider cache-identity fragments can share separately: B/N=4000 manifests
+contain two distinct wide-array spines, and about 8000 objects overlap the current
+cache in the plain case. The tool case has a third spine: the cache identity
+serializes both `stable_prefix` and `stable_history`. With no tool those
+vectors coincide and share nodes; a tool schema prepended to `stable_prefix`
+shifts every `chunks(2)` pair relative to history-only `stable_history`.
+The same fragment leaves are shared, but about 2000 new `jv` plus 2000 new
+`jb` objects are needed for the shifted vector. That explains a ~4000-object
+spine increase without 4000 new fragment leaves. The separate audit array
+contributes about 4000 leaves and 4000
+spine nodes before sharing with other manifests. Complete closures
+are therefore different from their net added objects. The table reports both,
+using canonical manifest-ID order; it disproves a blanket assumption of 4000
+fresh spine objects for every additional retained manifest. Unchanged prefixes
+share existing nodes, including across C's 32-manifest window.
+
+**D8.5 decision:** B/N=4000 measures 3.08750× L1 (plain) and
+3.44375× (tool) with simulated S1–S5. Both exceed 2.0×.
+Build **S1, S2, S3, S4 and approved S5** in group 4; re-run through the real
+packed storage at 4.5. On this evidence **group 5 is gated in: F1 first,
+re-measure, then F2; F3 accompanies that schema-5 work**. Retain D9's one-release
+schema-4 reader window and explicit upgrade policy. A remains a reported worst
+case, and the 1.5× aim is not promoted to a separate hard gate. The simulator
+is not proof of the future engine's conformance or final disk size.
 
 #### D8.5 Decision rule
 
@@ -730,8 +823,10 @@ CHANGELOG `Unreleased` text (applied in the last task):
   (Forge D1 facts). Correctness is unchanged; the collection suite's
   shared-suffix cases still pass because each session's membership holds its
   closure.
-- **Estimates may be wrong by 2×.** The legacy baseline (one vs two blobs) and
-  fixture realism dominate. The decision rule (D8.5) is measurement-driven.
+- **Simulator versus engine.** The measured layouts still model storage.
+  Group 4 must replace them with the real packed adapter and re-run 4.5; the
+  current format gate is driven by the measured simulator, not a conformance
+  claim for a future adapter.
 - **Memo memory.** The R4 memo holds decoded snapshots; bounded by
   `validated_root_memo_bytes`.
 - **CPU stays O(N) per commit** for policy and checkpoint validation (U9
