@@ -72,6 +72,8 @@ pub struct JournalEngine<S: JournalStorage> {
     // gate is acquired only inside a poll, so over volatile storage (which
     // never suspends) it is only ever held by a running task.
     gate: Arc<futures_util::lock::Mutex<()>>,
+    // Collection consumes these hints for I/O-free close/revoke and read-only
+    // opens, whose root changes do not set storage's collection_dirty flag.
     dirty: Arc<Mutex<BTreeSet<SessionId>>>,
 }
 impl<S: JournalStorage> Clone for JournalEngine<S> {
@@ -226,6 +228,10 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                 .insert(root.clone(), deps);
         }
         let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
+        let before_pins = persistence::pin_records(&scratch, session)?;
+        if writer {
+            self.freeze_writer_pins(&scratch, session, stored.as_ref())?;
+        }
         let lease = scratch.open(session, request)?;
         let dependencies = scratch
             .lock()?
@@ -239,13 +245,15 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
             return Err(conflict());
         }
         if writer {
-            let write = self.write(
+            let mut write = self.write(
                 &scratch,
                 session,
                 stored.as_ref(),
                 JournalWriteKind::OpenWriter,
             )?;
+            write.pins = persistence::pin_changes(before_pins, &scratch, session)?;
             self.apply(write, session).await?;
+            self.publish_controls(&scratch, session)?;
         }
         self.publish(
             &scratch,
@@ -312,6 +320,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                     .get_mut(&self.local.token(lease)?.handle)
                     .ok_or_else(conflict)?;
                 record.reachable.extend(objects.into_keys().collect());
+                record.roots.extend([object.id.clone()].into());
                 record.dependencies.extend(&dependencies);
                 record.selected_head = Some(head);
             }

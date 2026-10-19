@@ -1,11 +1,5 @@
-use super::persistence::pin_record;
+use super::persistence::{pin_changes, pin_records};
 use super::*;
-
-type DomainState = (
-    Transition,
-    BTreeMap<SessionId, Option<JournalSessionRecord>>,
-    BTreeMap<SessionId, Vec<JournalObjectId>>,
-);
 
 impl<S: JournalStorage> JournalEngine<S> {
     /// Records host authorization for exactly this published revision.
@@ -83,39 +77,18 @@ impl<S: JournalStorage> JournalEngine<S> {
         scratch: Transition,
         stored: Option<JournalSessionRecord>,
     ) -> Result<T, RuntimeError> {
-        let (before_epoch, before_pins) = {
-            let state = scratch.lock()?;
-            (
-                state.root_epoch,
-                state
-                    .durable_pins
-                    .keys()
-                    .filter(|(s, _)| s == session)
-                    .map(|(_, p)| p.clone())
-                    .collect::<BTreeSet<_>>(),
-            )
-        };
+        let before_epoch = scratch.lock()?.root_epoch;
+        let before_pins = pin_records(&scratch, session)?;
         let result = action(&scratch)?;
+        if kind == JournalWriteKind::Retire {
+            self.freeze_writer_pins(&scratch, session, stored.as_ref())?;
+        }
         let mut write = self.write(&scratch, session, stored.as_ref(), kind)?;
+        write.pins = pin_changes(before_pins, &scratch, session)?;
         let advance;
         {
             let state = scratch.lock()?;
             advance = state.root_epoch != before_epoch;
-            for ((owner, pin), value) in &state.durable_pins {
-                if owner == session {
-                    write
-                        .pins
-                        .push(JournalPinChange::Put(pin_record(pin, value)?));
-                }
-            }
-            for pin in before_pins {
-                if !state
-                    .durable_pins
-                    .contains_key(&(session.clone(), pin.clone()))
-                {
-                    write.pins.push(JournalPinChange::Remove(pin));
-                }
-            }
             if kind == JournalWriteKind::Stage {
                 write.objects.objects = state
                     .objects
@@ -141,7 +114,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         self.mark_dirty(session)?;
         Ok(result)
     }
-    fn publish_controls(
+    pub(super) fn publish_controls(
         &self,
         scratch: &Transition,
         session: &SessionId,
@@ -168,14 +141,12 @@ impl<S: JournalStorage> JournalEngine<S> {
     /// the journal contract, and this is not a physical on-disk byte metric.
     pub async fn retained_bytes(&self) -> Result<u64, RuntimeError> {
         let _gate = self.gate.lock().await;
-        let (state, _, _) = self.domain_state(true).await?;
-        let bytes = state.lock()?.objects.bytes as u64;
+        let bytes = self.observed_objects().await?.bytes as u64;
         Ok(bytes)
     }
 
-    // Retirement uses the same complete dependency view as the original
-    // reference implementation; collection never calls this domain-wide path.
-    async fn domain_state(&self, with_objects: bool) -> Result<DomainState, RuntimeError> {
+    // Diagnostic only; collection and retirement do not scan this registry.
+    async fn observed_objects(&self) -> Result<ObjectStore, RuntimeError> {
         let mut sessions: BTreeSet<_> = self.local.lock()?.sessions.keys().cloned().collect();
         let mut after = None;
         loop {
@@ -189,57 +160,27 @@ impl<S: JournalStorage> JournalEngine<S> {
             after = page.last().cloned();
             sessions.extend(page);
         }
-        let mut state = self.local.lock()?.clone();
-        state.objects = ObjectStore::default();
-        let mut records = BTreeMap::new();
-        let mut memberships = BTreeMap::new();
         let mut objects = BTreeMap::new();
         for session in sessions {
-            let (scratch, stored) = self.hydrate(&session).await?;
-            {
-                let loaded = scratch.lock()?;
-                state
-                    .sessions
-                    .insert(session.clone(), loaded.sessions[&session].clone());
-                state.retirement_authorizations.remove(&session);
-                if let Some(grant) = loaded.retirement_authorizations.get(&session) {
-                    state
-                        .retirement_authorizations
-                        .insert(session.clone(), *grant);
-                }
-                state.durable_pins.retain(|(s, _), _| s != &session);
-                for (key, pin) in &loaded.durable_pins {
-                    if key.0 == session {
-                        state.durable_pins.insert(key.clone(), pin.clone());
-                    }
-                }
+            let members = self.storage.members(&self.domain, &session).await?;
+            let bodies = self
+                .storage
+                .objects(&self.domain, &session, &members)
+                .await?;
+            if bodies.len() != members.len() {
+                return Err(conflict());
             }
-            if with_objects {
-                let members = self.storage.members(&self.domain, &session).await?;
-                let bodies = self
-                    .storage
-                    .objects(&self.domain, &session, &members)
-                    .await?;
-                if bodies.len() != members.len() {
+            for (id, body) in members.iter().zip(bodies) {
+                let body = body.ok_or_else(conflict)?.to_vec();
+                if objects
+                    .insert(id.clone(), body.clone())
+                    .is_some_and(|previous| previous != body)
+                {
                     return Err(conflict());
                 }
-                for (id, body) in members.iter().zip(bodies) {
-                    let body = body.ok_or_else(conflict)?.to_vec();
-                    if objects
-                        .insert(id.clone(), body.clone())
-                        .is_some_and(|previous| previous != body)
-                    {
-                        return Err(conflict());
-                    }
-                }
-                memberships.insert(session.clone(), members);
             }
-            records.insert(session, stored);
         }
-        state.objects = ObjectStore::from_map(objects);
-        let mut scratch = self.local.clone();
-        scratch.state = Arc::new(Mutex::new(state));
-        Ok((scratch, records, memberships))
+        Ok(ObjectStore::from_map(objects))
     }
     pub(super) async fn retire_inner(
         &self,
@@ -252,14 +193,14 @@ impl<S: JournalStorage> JournalEngine<S> {
                 crate::error::UnsupportedCapability::JournalRetirement,
             ));
         }
-        let (scratch, records, _) = self.domain_state(false).await?;
+        let (scratch, stored) = Box::pin(self.retirement_view(session)).await?;
         self.control_prepared(
             session,
             JournalWriteKind::Retire,
             None,
             |scratch| scratch.retire(session, expected),
             scratch,
-            records.get(session).cloned().flatten(),
+            stored,
         )
         .await
     }
@@ -351,7 +292,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 }
                 local_pending.remove(&session);
                 let stored = self.storage.load(&self.domain, &session).await?;
-                let live = self.collection_live(&session, stored.as_ref()).await?;
+                let (live, dependencies) = self.collection_live(&session, stored.as_ref()).await?;
                 let members = self.storage.members(&self.domain, &session).await?;
                 let member_set: BTreeSet<_> = members.iter().cloned().collect();
                 if !live.is_subset(&member_set) {
@@ -360,6 +301,10 @@ impl<S: JournalStorage> JournalEngine<S> {
                 // Close/revocation remain I/O-free while storage reads await.
                 // Preserve the original collector's post-read mark check before
                 // the first write can change membership or clear dirty flags.
+                if released == 0 && self.root_epoch()? != request.expected_root_epoch {
+                    return Err(conflict());
+                }
+                Box::pin(self.index_retirement_dependencies(&session, dependencies)).await?;
                 if released == 0 && self.root_epoch()? != request.expected_root_epoch {
                     return Err(conflict());
                 }
@@ -373,6 +318,10 @@ impl<S: JournalStorage> JournalEngine<S> {
                 let release: Vec<_> = garbage.into_iter().take(limit).collect();
                 if let Some(mut record) = stored {
                     record.collection_dirty = !complete;
+                    // Inclusive edge: revision -64 survives, -65 may be
+                    // pruned. Storage also preserves this writer epoch's last
+                    // operation. Object retention does not retain replay rows.
+                    let replay_floor = JournalRevision(record.revision.0.saturating_sub(64));
                     let write = JournalWrite {
                         domain: self.domain.clone(),
                         session: session.clone(),
@@ -388,7 +337,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                             .map(JournalCatalogChange::Remove)
                             .collect(),
                         release: release.clone(),
-                        prune_operations_before: None,
+                        prune_operations_before: Some(replay_floor),
                         inject: None,
                     };
                     let receipt = self.apply(write, &session).await?;

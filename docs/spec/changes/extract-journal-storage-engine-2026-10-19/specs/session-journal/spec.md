@@ -123,10 +123,18 @@ The testkit SHALL export `assert_journal_storage_conformance`, which runs the ex
 
 ### Requirement: Replay results are kept for a bounded window
 
-Only if the owner approves design question Q1: a journal SHALL keep each operation's original result for at least the latest 64 published revisions of its domain and for every operation of the current writer epoch, and MAY prune older operation records during collection. An identical replay of a pruned operation MUST fail with `StateConflict` and MUST NOT apply.
+Only if the owner approves design question Q1: a journal SHALL keep each operation's original result for at least the latest 64 published revisions of its domain and for the current writer epoch's own last operation, and MAY prune older operation records during collection. The inclusive replay floor MUST be `current_revision.saturating_sub(64)`: revision −64 is retained and revision −65 may be pruned. An identical replay of a pruned operation MUST fail with `StateConflict` and MUST NOT apply.
 
 #### Scenario: A replay beyond the window
 
 - **WHEN** an operation committed 65 revisions ago is retried with the same digest after a collection
 - **THEN** the commit fails with `StateConflict`
 - **AND** the head and history are unchanged
+
+
+#### Scenario: The replay window edge is inclusive
+
+- **WHEN** a session reaches revision 70 and collection runs
+- **THEN** the operation that published revision 6 still returns its original result
+- **AND** the operation that published revision 5 fails with `StateConflict` without applying
+- **AND** the current writer epoch's last operation still returns its original result

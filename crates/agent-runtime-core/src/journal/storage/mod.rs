@@ -26,7 +26,7 @@ pub struct JournalDomain {
 }
 
 /// Versioned engine metadata the storage persists verbatim and never parses
-/// (checkpoint floor, dependency index, retirement grant, pin closures).
+/// (checkpoint floor, dependency index, retirement grant, pin root metadata).
 #[derive(Clone, PartialEq, Eq)] // Debug prints version + length only
 pub struct JournalEngineState {
     pub version: u32,
@@ -128,7 +128,9 @@ pub struct JournalWrite {
     /// body with no remaining membership in any domain or session is deleted
     /// in the same transaction.
     pub release: Vec<JournalObjectId>,
-    /// Replay-window pruning (D8.6). Only set when the owner approves Q1.
+    /// Collection replay floor (inclusive): remove operations below this
+    /// revision, except the last operation of the record's current writer
+    /// epoch. Never prunes another domain/session or immutable object bodies.
     pub prune_operations_before: Option<JournalRevision>,
     /// Test-only commit cut (see below). Production engines leave it None.
     pub inject: Option<JournalCommitFailurePoint>,

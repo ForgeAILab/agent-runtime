@@ -68,8 +68,10 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
         object: &JournalObjectId,
     ) -> Result<Vec<u8>, RuntimeError>;
     /// Atomically persists objects/batch and publishes head/checkpoint under CAS
-    /// and writer fence. Same operation/digest returns its original result even
-    /// after head advance; different-input reuse and backwards revisions conflict.
+    /// and writer fence. Same operation/digest returns its original result for
+    /// at least the latest 64 revisions and the current writer epoch's last
+    /// operation. After collection, an older replay may return `StateConflict`
+    /// without applying. Different-input reuse and backwards revisions conflict.
     /// Ordinary stores must project drafts, remap refs and recompute stored hashes
     /// before publication, or reject. They never store raw drafts on policy failure.
     async fn commit(

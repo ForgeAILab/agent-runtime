@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T20:31:24Z
+updated_at: 2026-10-19T21:18:57Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -83,6 +83,17 @@ this measurement job.
   session swept while ten clean sessions are never read (storage call count),
   and partial sweeps under `max_objects`.
 
+Review follow-ups (N3/N1/N5): retire reads stored dependency/pin records,
+including clean sources after restart, through candidate reverse references
+persisted before a source's dirty flag clears; completed-fork children are
+loaded directly. Domain diagnostics no longer repeatedly clone the registry.
+Pins contain head/leaf roots and minimal dependency/epoch metadata; catalog
+predecessors preserve pinned writer history without commit-time pin writes,
+and controls write only changed pins. `dirty` is live after 2.5: collection
+drains/restores local hints for I/O-free close/revoke and read-only opens, so
+N5 requires retaining it. Regression and byte-count evidence is recorded in
+`/Volumes/Data/tmp/refactor/rt-e5/report.md`.
+
 ## 3. Storage conformance
 
 - [x] 3.1 Add testkit `conformance::journal_storage` with
@@ -107,11 +118,18 @@ this measurement job.
 - [ ] 4.3 S4 packed operation records; run the harness end to end through
   the packed storage (A, B, C) and replace the 1.3 simulator numbers; delete
   the `journal-measurement` feature. Tests: report smoke at N=100.
-- [ ] 4.4 Only if the owner approves Q1: S5 replay window (prune in
-  collection, latest 64 revisions plus current writer epoch). Tests:
+- [x] 4.4 Only if the owner approves Q1: S5 replay window (prune in
+  collection, inclusive current −64 floor plus current writer epoch's own last
+  operation). Tests:
   `assert_journal_gc_replay_fence_conformance` unchanged; new window-edge case
   (revision −64 kept, −65 pruned and an identical replay conflicts without
   applying). CHANGELOG Breaking entry.
+
+  Verified in step 5: both domains keep revision −64, prune −65, and reject
+  an identical pruned replay without changing the stored head, membership or
+  root epoch. The unchanged replay-fence and storage/collection conformance
+  tests pass. D8.6 records the explicit inclusive-edge/last-operation owner
+  instruction; CHANGELOG has the owner-approved pre-1.0 Breaking entry.
 - [ ] 4.5 Gate: record native/L1 at N=4000 for B (and A, C). If B ≤ 2.0× and
   the owner did not require more (Q2), group 5 is skipped.
 

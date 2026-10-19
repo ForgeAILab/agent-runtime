@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T18:26:00Z
+updated_at: 2026-10-19T21:18:57Z
 ---
 
 # Design: Storage-generic journal engine and physical disk reduction (R1–R7)
@@ -112,7 +112,7 @@ documentation wording is implementation detail.
 pub struct JournalDomain { pub storage_id: JournalStorageId, pub role: JournalRole }
 
 /// Versioned engine metadata the storage persists verbatim and never parses
-/// (checkpoint floor, dependency index, retirement grant, pin closures).
+/// (checkpoint floor, dependency index, retirement grant, pin root metadata).
 #[derive(Clone, PartialEq, Eq)]           // Debug prints version + length only
 pub struct JournalEngineState { pub version: u32, pub bytes: Vec<u8> }
 
@@ -326,6 +326,32 @@ module unchanged and stay re-exported at the same paths.
   ever owned by a task that is running).
 
 ### D4. Session-scoped incremental collection (R3)
+
+Review follow-ups (N3/N1, 2026-10-19): before clearing a source session's
+dirty flag, collection adds its id to each dependency target's opaque session
+metadata (`retirement_dependents`). These are append-only candidates, not
+authoritative blockers. Retirement reads the target's candidates plus pending
+dirty sources from storage and checks their current heads and pins; stale
+candidates do not block. A failed/interrupted indexing write leaves the source
+dirty, so a restart still discovers it. Index writes preserve the target's
+dirty flag and use the existing fenced `JournalWrite`; no trait change or
+object/membership read of clean targets is needed. Completed-fork children
+are loaded by id. Retirement and diagnostics no longer hydrate every session
+through a clone of the whole process registry.
+
+Durable pins store head/leaf roots, session dependencies, an unresolved bit
+and pinned writer epochs. Each retained-head catalog entry adds its previous
+head id, writer epoch, and the delta of validated leaves staged since the
+writer's preceding commit (recorded once, including unreferenced staging in
+the writer's lease closure). Collection resolves a pinned writer's chain from
+its current head and memoizes catalog entries and closures per root for the
+sweep. The next writer open or retirement adds the prior writer's final root
+to affected pins before changing/removing that head; ordinary commits never
+write pins. Explicit pin controls compare old/new records and write only
+changes. Only a head published by the pinned writer epoch becomes its dynamic
+tip; retained reader pins do not follow later writer opens. These links are
+engine metadata, not new object-format fields, and
+preserve the original transfer/retention closure and epoch semantics.
 
 - The membership invariant: for every (domain, session), membership ⊇ the
   closure of the current head, of every durable pin's roots, of the session's
@@ -666,15 +692,20 @@ is not proof of the future engine's conformance or final disk size.
 #### D8.6 Replay window (S5)
 
 - Pruning runs in collection (`prune_operations_before`), never in commit.
-- The window is per domain: `revision > current − 64`, plus every record
-  whose `result.writer_epoch` equals the current writer epoch.
+- The window is per domain/session, with an inclusive floor:
+  `revision >= current.saturating_sub(64)` (current −64 kept, −65 pruned),
+  plus the current writer epoch's own last operation. This edge and
+  last-operation rule follow the explicit step-5 owner instruction; they
+  replace the earlier strict-floor/all-current-epoch wording. At a current
+  revision of 70 the floor is 6, retaining 65 records including the current
+  result. Storage never prunes another domain/session's records.
 - A pruned identical replay returns the same `StateConflict` as a stale CAS;
   it can never apply. A pruned different-digest replay also conflicts.
 - `assert_journal_gc_replay_fence_conformance` replays after one advance and
   one sweep and stays green; a new conformance case checks the window edge.
 - Released contract text ("returns its original result even after head
   advance", `mod.rs:63-65`) becomes "for at least the latest 64 revisions and
-  the current writer epoch". This is a pre-1.0 semantic break and needs owner
+  the current writer epoch's last operation". This is a pre-1.0 semantic break and needs owner
   approval (Q1).
 
 ### D9. Journal schema 5 (only if F1/F2 are gated in)

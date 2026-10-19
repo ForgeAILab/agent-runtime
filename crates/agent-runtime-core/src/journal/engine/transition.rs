@@ -35,7 +35,7 @@ pub enum JournalCommitFailurePoint {
     AfterPin,
     /// The new head and its retained root were staged.
     AfterHead,
-    /// The lifetime idempotency record was staged.
+    /// The operation's idempotency result was staged.
     AfterIdempotency,
     /// The transaction committed, but its acknowledgement is lost.
     AfterCommit,
@@ -92,12 +92,16 @@ pub(in crate::journal) struct LeaseRecord {
     pub(in crate::journal) selected_head: Option<JournalHead>,
     pub(in crate::journal) writer_epoch: Option<u64>,
     pub(in crate::journal) reachable: ReachableSet,
+    pub(in crate::journal) roots: ReachableSet,
+    pub(in crate::journal) staged_roots: BTreeSet<JournalObjectId>,
     pub(in crate::journal) dependencies: DependencyRoots,
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::journal) struct DurablePin {
     pub(in crate::journal) reachable: ReachableSet,
+    pub(in crate::journal) roots: BTreeSet<JournalObjectId>,
+    pub(in crate::journal) writer_epochs: BTreeSet<u64>,
     /// Migration/fork/staging intent must be resolved before retirement.
     pub(in crate::journal) blocks_retirement: bool,
     pub(in crate::journal) dependencies: DependencyRoots,
@@ -461,10 +465,16 @@ impl Transition {
         state.advance_root_epoch()?;
         let existing = state.durable_pins.entry(key).or_insert_with(|| DurablePin {
             reachable: ReachableSet::default(),
+            roots: BTreeSet::new(),
+            writer_epochs: record.writer_epoch.into_iter().collect(),
             blocks_retirement,
             dependencies: DependencyRoots::default(),
         });
+        existing.writer_epochs.extend(record.writer_epoch);
         existing.dependencies.extend(&record.dependencies);
+        for layer in record.roots.layers {
+            existing.roots.extend(layer.iter().cloned());
+        }
         for layer in record.reachable.layers {
             existing.reachable.extend(layer.as_ref().clone());
         }
@@ -518,16 +528,19 @@ impl Transition {
             reachable.insert(object.id.clone());
             Self::add_object(&mut staged, object)?;
         }
-        staged
+        let staged_lease = staged
             .leases
             .get_mut(&self.token(lease)?.handle)
-            .ok_or_else(conflict)?
-            .reachable
-            .extend(reachable.clone());
+            .ok_or_else(conflict)?;
+        staged_lease.reachable.extend(reachable.clone());
+        staged_lease.roots.extend(reachable.clone());
+        staged_lease.staged_roots.extend(reachable.clone());
         staged.durable_pins.insert(
             key,
             DurablePin {
-                reachable: ReachableSet::from_set(reachable),
+                reachable: ReachableSet::from_set(reachable.clone()),
+                roots: reachable,
+                writer_epochs: BTreeSet::new(),
                 blocks_retirement: true,
                 dependencies: DependencyRoots::default(),
             },
@@ -989,6 +1002,8 @@ impl Transition {
                 selected_head: selected_head.clone(),
                 writer_epoch,
                 reachable: ReachableSet::from_set(reachable),
+                roots: ReachableSet::from_set(root.into_iter().collect()),
+                staged_roots: BTreeSet::new(),
                 dependencies,
             },
         );
@@ -1226,6 +1241,8 @@ impl Transition {
         dependencies.validate(&staged)?;
         let staged_lease = staged.leases.get_mut(&token.handle).ok_or_else(conflict)?;
         staged_lease.reachable.extend(closure);
+        staged_lease.roots.extend([head_object.id.clone()].into());
+        staged_lease.staged_roots.clear();
         staged_lease.dependencies.extend(&dependencies);
         staged_lease.selected_head = Some(head.clone());
         if let Some(pin) = staged
@@ -1233,6 +1250,9 @@ impl Transition {
             .get_mut(&(staged_lease.session.clone(), staged_lease.pin.clone()))
         {
             pin.dependencies.extend(&staged_lease.dependencies);
+            for layer in &staged_lease.roots.layers {
+                pin.roots.extend(layer.iter().cloned());
+            }
             for layer in &staged_lease.reachable.layers {
                 pin.reachable.extend(layer.as_ref().clone());
             }

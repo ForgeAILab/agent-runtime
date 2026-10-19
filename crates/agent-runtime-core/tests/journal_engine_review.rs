@@ -296,6 +296,246 @@ async fn review_restart_keeps_retired_dependencies_unselectable() {
     }
 }
 
+/// Clean cross-session blockers must survive a restart, including a pin whose
+/// source session no longer has a dependent current head.
+#[tokio::test]
+async fn review_restart_retirement_checks_clean_stored_dependencies_and_pins() {
+    for (pin_only, transfer) in [(false, false), (true, false), (true, true)] {
+        let storage = std::sync::Arc::new(VolatileJournalStorage::default());
+        let first = restart_engine(&storage);
+        let child = SessionId::new("child");
+        let parent = SessionId::new("parent");
+        let writer = || open("writer", JournalOpenIntent::ExclusiveWriter);
+        let lease = first.open(&child, writer()).await.unwrap();
+        let head = first
+            .commit(&lease, catalog_commit(&child, 1, "c1", None, None))
+            .await
+            .unwrap();
+        first.close(lease).await.unwrap();
+        first
+            .authorize_retirement(&child, head.revision, Timestamp(9))
+            .await
+            .unwrap();
+        let lease = first.open(&parent, writer()).await.unwrap();
+        if transfer {
+            first.pin_transfer(&lease).await.unwrap();
+        }
+        let old = first
+            .commit(&lease, catalog_commit(&parent, 1, "p1", None, Some(&child)))
+            .await
+            .unwrap();
+        if pin_only && !transfer {
+            let reader = first
+                .open(&parent, open("retained", JournalOpenIntent::ReadOnly))
+                .await
+                .unwrap();
+            first.retain_root(&reader).await.unwrap();
+            first.close(reader).await.unwrap();
+        }
+        if pin_only {
+            first
+                .commit(&lease, catalog_commit(&parent, 1, "p2", Some(&old), None))
+                .await
+                .unwrap();
+        }
+        first.close(lease).await.unwrap();
+        first
+            .collect(JournalGcRequest {
+                storage_id: first.storage_id(),
+                expected_root_epoch: first.root_epoch().unwrap(),
+                max_objects: u64::MAX,
+            })
+            .await
+            .unwrap();
+        let domain = JournalDomain {
+            storage_id: first.storage_id(),
+            role: JournalRole::Ordinary,
+        };
+        assert!(
+            storage
+                .dirty_sessions(&domain, None, 128)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_conflict(first.retire(&child, head.revision).await);
+        let second = restart_engine(&storage);
+        let reader = second
+            .open(&child, open("reader", JournalOpenIntent::ReadOnly))
+            .await
+            .unwrap();
+        second.close(reader).await.unwrap();
+        assert_conflict(second.retire(&child, head.revision).await);
+        if pin_only {
+            second
+                .release_pin(
+                    &parent,
+                    &JournalPinId::new(if transfer { "writer" } else { "retained" }),
+                    second.root_epoch().unwrap(),
+                )
+                .await
+                .unwrap();
+            // A stale reverse-index entry must not become a permanent blocker.
+            second.retire(&child, head.revision).await.unwrap();
+        }
+    }
+}
+
+/// The completed-fork check loads a clean child even when neither execution
+/// identity has been seen by the restarted process.
+#[tokio::test]
+async fn review_restart_retirement_loads_a_clean_completed_fork_child() {
+    let storage = std::sync::Arc::new(VolatileJournalStorage::default());
+    let first = restart_engine(&storage);
+    let child = SessionId::new("child");
+    let parent = SessionId::new("parent");
+    let writer = || open("writer", JournalOpenIntent::ExclusiveWriter);
+    let lease = first.open(&child, writer()).await.unwrap();
+    first
+        .commit(&lease, catalog_commit(&child, 1, "c1", None, None))
+        .await
+        .unwrap();
+    first.close(lease).await.unwrap();
+    let lease = first.open(&parent, writer()).await.unwrap();
+    let mut commit = catalog_commit(&parent, 1, "p1", None, None);
+    let snapshot = commit.delta.bootstrap.as_mut().unwrap();
+    for (namespace, revision, value) in [
+        (
+            "runtime.session.fork_pending",
+            "session-fork-pending-1",
+            serde_json::json!({"new_id": child.as_str()}),
+        ),
+        (
+            "runtime.session.superseded",
+            "session-superseded-1",
+            serde_json::json!(child.as_str()),
+        ),
+    ] {
+        snapshot.extension_state.insert(
+            namespace.into(),
+            VersionedSessionState::new(
+                agent_runtime_registry::RegistryRevision::new(revision),
+                value,
+            ),
+        );
+    }
+    commit.batch.snapshot.extensions.len = 2;
+    commit.digest = commit.input_digest().unwrap();
+    let head = first.commit(&lease, commit).await.unwrap();
+    first.close(lease).await.unwrap();
+    first
+        .authorize_retirement(&parent, head.revision, Timestamp(9))
+        .await
+        .unwrap();
+    first
+        .collect(JournalGcRequest {
+            storage_id: first.storage_id(),
+            expected_root_epoch: first.root_epoch().unwrap(),
+            max_objects: u64::MAX,
+        })
+        .await
+        .unwrap();
+    let domain = JournalDomain {
+        storage_id: first.storage_id(),
+        role: JournalRole::Ordinary,
+    };
+    assert!(
+        storage
+            .dirty_sessions(&domain, None, 128)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let fresh = restart_engine(&storage);
+    assert_eq!(
+        fresh
+            .retire(&parent, head.revision)
+            .await
+            .unwrap()
+            .retired_at,
+        Timestamp(9)
+    );
+}
+
+/// A retained reader's transfer pin stays on its selected root when a latest
+/// writer closes without publishing and a successor later publishes.
+#[tokio::test]
+async fn review_uncommitted_writers_do_not_extend_a_retained_readers_transfer_pin() {
+    let storage = std::sync::Arc::new(VolatileJournalStorage::default());
+    let engine = restart_engine(&storage);
+    let session = SessionId::new("selected");
+    let lease = engine
+        .open(&session, open("first", JournalOpenIntent::ExclusiveWriter))
+        .await
+        .unwrap();
+    let first = engine
+        .commit(&lease, catalog_commit(&session, 1, "op1", None, None))
+        .await
+        .unwrap();
+    let second = engine
+        .commit(
+            &lease,
+            catalog_commit(&session, 1, "op2", Some(&first), None),
+        )
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    let selected = |head: &JournalHead, intent| JournalOpen {
+        root: JournalRootSelection::Retained {
+            root: JournalObject::encode(JournalObjectKind::Head, head)
+                .unwrap()
+                .id,
+        },
+        ..open("selected", intent)
+    };
+    let lease = engine
+        .open(&session, selected(&first, JournalOpenIntent::ReadOnly))
+        .await
+        .unwrap();
+    engine.pin_transfer(&lease).await.unwrap();
+    engine.close(lease).await.unwrap();
+    let lease = engine
+        .open(
+            &session,
+            open("uncommitted", JournalOpenIntent::ExclusiveWriter),
+        )
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    let lease = engine
+        .open(&session, open("third", JournalOpenIntent::ExclusiveWriter))
+        .await
+        .unwrap();
+    engine
+        .commit(
+            &lease,
+            catalog_commit(&session, 3, "op3", Some(&second), None),
+        )
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    let fresh = restart_engine(&storage);
+    fresh
+        .collect(JournalGcRequest {
+            storage_id: fresh.storage_id(),
+            expected_root_epoch: fresh.root_epoch().unwrap(),
+            max_objects: u64::MAX,
+        })
+        .await
+        .unwrap();
+    assert_conflict(
+        fresh
+            .open(&session, selected(&second, JournalOpenIntent::ReadOnly))
+            .await,
+    );
+    let reader = fresh
+        .open(&session, selected(&first, JournalOpenIntent::ReadOnly))
+        .await
+        .unwrap();
+    assert_eq!(reader.head(), Some(&first));
+    fresh.close(reader).await.unwrap();
+}
+
 /// Everything a restarted process needs is durable: the writer fence, replay
 /// records, the retained-root catalog, transfer pins and retirement grants.
 #[tokio::test]
@@ -489,6 +729,109 @@ fn outcome<T>(result: Result<T, RuntimeError>) -> String {
             "{:?}/{:?}/{}/{}",
             error.kind, error.class, error.retryable, error.message
         ),
+    }
+}
+
+/// The replay boundary is inclusive: current - 64 survives, current - 65
+/// does not. A long-lived writer must not turn the window into lifetime
+/// retention. Protected and ordinary domains prune independently.
+#[tokio::test]
+async fn review_collection_replay_window_edges_conflict_without_applying() {
+    let storage = std::sync::Arc::new(VolatileJournalStorage::default());
+    let session = SessionId::new("window");
+    let id = JournalStorageId::new("replay-window");
+    for role in [JournalRole::Protected, JournalRole::Ordinary] {
+        let config = JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        };
+        let engine = match role {
+            JournalRole::Protected => JournalEngine::protected(storage.clone(), id.clone(), config),
+            JournalRole::Ordinary => JournalEngine::ordinary(
+                storage.clone(),
+                id.clone(),
+                std::sync::Arc::new(IdentityJournalProjection),
+                config,
+            ),
+        };
+        let domain = JournalDomain {
+            storage_id: id.clone(),
+            role,
+        };
+        let lease = engine
+            .open(&session, open("writer", JournalOpenIntent::ExclusiveWriter))
+            .await
+            .unwrap();
+        let mut previous = None;
+        let mut commits = Vec::new();
+        let mut heads = Vec::new();
+        for revision in 1..=70 {
+            let commit = catalog_commit(
+                &session,
+                1,
+                &format!("op-{revision}"),
+                previous.as_ref(),
+                None,
+            );
+            let head = engine.commit(&lease, commit.clone()).await.unwrap();
+            previous = Some(head.clone());
+            heads.push(head);
+            commits.push(commit);
+        }
+        // Commits alone never prune, including the future -65 operation.
+        assert!(
+            storage
+                .operation(&domain, &session, &commits[4].batch.operation)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        engine
+            .collect(JournalGcRequest {
+                storage_id: id.clone(),
+                expected_root_epoch: engine.root_epoch().unwrap(),
+                max_objects: u64::MAX,
+            })
+            .await
+            .unwrap();
+        let before = storage.load(&domain, &session).await.unwrap();
+        let members = storage.members(&domain, &session).await.unwrap();
+        let epoch = engine.root_epoch().unwrap();
+        for (index, commit) in commits.iter().enumerate() {
+            let operation = storage
+                .operation(&domain, &session, &commit.batch.operation)
+                .await
+                .unwrap();
+            assert_eq!(
+                operation.is_some(),
+                index + 1 >= 6,
+                "{role:?} revision {}",
+                index + 1
+            );
+        }
+        assert_eq!(
+            engine.commit(&lease, commits[5].clone()).await.unwrap(),
+            heads[5]
+        );
+        assert_conflict(engine.commit(&lease, commits[4].clone()).await);
+        assert_eq!(
+            engine.commit(&lease, commits[69].clone()).await.unwrap(),
+            heads[69]
+        );
+        assert_eq!(storage.load(&domain, &session).await.unwrap(), before);
+        assert_eq!(storage.members(&domain, &session).await.unwrap(), members);
+        assert!(
+            storage
+                .operation(&domain, &session, &commits[4].batch.operation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(engine.root_epoch().unwrap(), epoch);
+        eprintln!(
+            "REPLAY WINDOW {role:?}: current=70 cutoff=6 kept=65; revision 6 replayed, revision 5 conflicted without applying"
+        );
+        engine.close(lease).await.unwrap();
     }
 }
 

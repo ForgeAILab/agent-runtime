@@ -6,11 +6,34 @@ struct Metadata {
     checkpoint_floor: Option<ReferencedTurnCheckpoint>,
     dependencies: DependencyRoots,
     authorization: Option<(JournalRevision, crate::clock::Timestamp)>,
+    // Append-only candidates; retirement verifies their current records/pins.
+    #[serde(default)]
+    retirement_dependents: BTreeSet<SessionId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PinMetadata {
+    dependencies: PinDependencies,
+    #[serde(default)]
+    writer_epochs: BTreeSet<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PinDependencies {
+    sessions: BTreeSet<SessionId>,
+    unresolved: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogMetadata {
+    #[serde(flatten)]
     dependencies: DependencyRoots,
-    reachable: BTreeSet<JournalObjectId>,
+    #[serde(default)]
+    previous: Option<JournalObjectId>,
+    #[serde(default)]
+    writer_epoch: Option<u64>,
+    // Staging admitted by this writer since its preceding commit. These
+    // leaves also entered the writer's lease closure, even if not referenced
+    // by the published head. Record each staging delta only once.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    staged_roots: BTreeSet<JournalObjectId>,
 }
 fn encode<T: Serialize>(value: &T) -> Result<JournalEngineState, RuntimeError> {
     Ok(JournalEngineState {
@@ -29,9 +52,42 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         session: &SessionId,
     ) -> Result<(Transition, Option<JournalSessionRecord>), RuntimeError> {
+        self.hydrate_state(session, false).await
+    }
+
+    async fn hydrate_state(
+        &self,
+        session: &SessionId,
+        retirement: bool,
+    ) -> Result<(Transition, Option<JournalSessionRecord>), RuntimeError> {
         let stored = self.storage.load(&self.domain, session).await?;
         let pins = self.storage.pins(&self.domain, session).await?;
-        let mut state = self.local.lock()?.clone();
+        let mut state = {
+            let local = self.local.lock()?;
+            if retirement {
+                // Cross-session durable state comes from the candidate index,
+                // not a clone of every cached session. All local leases must
+                // still participate in dependency/unresolved-intent checks.
+                let mut state = State {
+                    root_epoch: local.root_epoch,
+                    collection_enabled: local.collection_enabled,
+                    leases: local.leases.clone(),
+                    ..Default::default()
+                };
+                if let Some(record) = local.sessions.get(session) {
+                    state.sessions.insert(
+                        session.clone(),
+                        SessionRecord {
+                            active_writer: record.active_writer,
+                            ..Default::default()
+                        },
+                    );
+                }
+                state
+            } else {
+                local.clone()
+            }
+        };
         state.objects = ObjectStore::default();
         let previous = state.sessions.get(session).cloned().unwrap_or_default();
         let mut record = SessionRecord {
@@ -81,9 +137,15 @@ impl<S: JournalStorage> JournalEngine<S> {
             state.durable_pins.insert(
                 (session.clone(), pin.pin),
                 DurablePin {
-                    reachable: ReachableSet::from_set(metadata.reachable),
+                    reachable: ReachableSet::default(),
+                    roots: pin.roots.into_iter().collect(),
+                    writer_epochs: metadata.writer_epochs,
                     blocks_retirement: pin.blocks_retirement,
-                    dependencies: metadata.dependencies,
+                    dependencies: DependencyRoots {
+                        sessions: metadata.dependencies.sessions,
+                        unresolved: metadata.dependencies.unresolved,
+                        ..Default::default()
+                    },
                 },
             );
         }
@@ -147,34 +209,145 @@ impl<S: JournalStorage> JournalEngine<S> {
         Ok(false)
     }
 
-    // Durable pins persist their complete, already validated immutable closure,
-    // including staged leaves. Only the current head needs a closure walk.
+    // Resolve compact pin roots, including an active writer's published chain.
+    // A pin's epoch is frozen to a final root by the next writer open or retire.
+    async fn pin_roots(
+        &self,
+        session: &SessionId,
+        pin: &JournalPinRecord,
+        stored: Option<&JournalSessionRecord>,
+        catalog: &mut BTreeMap<JournalObjectId, Option<CatalogMetadata>>,
+    ) -> Result<(BTreeSet<JournalObjectId>, DependencyRoots), RuntimeError> {
+        let metadata: PinMetadata = decode(&pin.engine)?;
+        let mut dependencies = DependencyRoots {
+            sessions: metadata.dependencies.sessions,
+            unresolved: metadata.dependencies.unresolved,
+            ..Default::default()
+        };
+        let mut pending = pin.roots.clone();
+        if let Some(record) = stored {
+            if metadata.writer_epochs.contains(&record.writer_epoch) {
+                if let Some(head) = &record.head {
+                    // Issuing an epoch at open does not mean it published.
+                    // Only follow that epoch's own tip; selected roots are
+                    // already recorded in the pin.
+                    if head
+                        .decode::<JournalHead>(JournalObjectKind::Head)?
+                        .writer_epoch
+                        == record.writer_epoch
+                    {
+                        pending.push(head.id.clone());
+                    }
+                }
+            }
+        }
+        let mut roots = BTreeSet::new();
+        while let Some(root) = pending.pop() {
+            if !roots.insert(root.clone()) {
+                continue;
+            }
+            if !catalog.contains_key(&root) {
+                let entry = self.storage.catalog(&self.domain, session, &root).await?;
+                catalog.insert(
+                    root.clone(),
+                    entry.map(|entry| decode(&entry.engine)).transpose()?,
+                );
+            }
+            if let Some(entry) = &catalog[&root] {
+                dependencies.extend(&entry.dependencies);
+                if entry
+                    .writer_epoch
+                    .is_some_and(|epoch| metadata.writer_epochs.contains(&epoch))
+                {
+                    pending.extend(entry.previous.iter().cloned());
+                    pending.extend(entry.staged_roots.iter().cloned());
+                }
+            }
+        }
+        Ok((roots, dependencies))
+    }
+
+    async fn pin_closure(
+        &self,
+        session: &SessionId,
+        root: &JournalObjectId,
+        memo: &mut BTreeMap<JournalObjectId, BTreeSet<JournalObjectId>>,
+    ) -> Result<(), RuntimeError> {
+        if memo.contains_key(root) {
+            return Ok(());
+        }
+        let body = self
+            .storage
+            .objects(&self.domain, session, std::slice::from_ref(root))
+            .await?;
+        if body.len() != 1 {
+            return Err(conflict());
+        }
+        let object = JournalObject {
+            id: root.clone(),
+            bytes: body
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(conflict)?
+                .to_vec(),
+        };
+        let kind = object.kind()?;
+        let closure = if kind == JournalObjectKind::Head {
+            self.closure_objects(session, root)
+                .await?
+                .into_keys()
+                .collect()
+        } else {
+            validate_leaf(&object, kind)?;
+            [root.clone()].into()
+        };
+        memo.insert(root.clone(), closure);
+        Ok(())
+    }
+
     pub(super) async fn collection_live(
         &self,
         session: &SessionId,
         stored: Option<&JournalSessionRecord>,
-    ) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
+    ) -> Result<(BTreeSet<JournalObjectId>, BTreeSet<SessionId>), RuntimeError> {
         let unsupported = || {
             RuntimeError::unsupported_capability(
                 crate::error::UnsupportedCapability::JournalCollection,
             )
         };
         let mut live = BTreeSet::new();
+        let mut dependencies = BTreeSet::new();
+        let mut memo = BTreeMap::new();
+        let mut catalog = BTreeMap::new();
         if let Some(stored) = stored {
             let metadata: Metadata = decode(&stored.engine)?;
             if stored.head.is_some() && metadata.dependencies.unresolved {
                 return Err(unsupported());
             }
+            if stored.head.is_some() {
+                dependencies.extend(metadata.dependencies.sessions);
+            }
             if let Some(root) = &stored.head {
-                live.extend(self.closure_objects(session, &root.id).await?.into_keys());
+                let closure: BTreeSet<_> = self
+                    .closure_objects(session, &root.id)
+                    .await?
+                    .into_keys()
+                    .collect();
+                live.extend(closure.iter().cloned());
+                memo.insert(root.id.clone(), closure);
             }
         }
         for pin in self.storage.pins(&self.domain, session).await? {
-            let metadata: PinMetadata = decode(&pin.engine)?;
-            if metadata.dependencies.unresolved {
+            let (roots, indexed) = self.pin_roots(session, &pin, stored, &mut catalog).await?;
+            if indexed.unresolved {
                 return Err(unsupported());
             }
-            live.extend(metadata.reachable);
+            dependencies.extend(indexed.sessions);
+            for root in roots {
+                self.pin_closure(session, &root, &mut memo).await?;
+                live.extend(memo[&root].iter().cloned());
+            }
         }
         let local = self.local.lock()?;
         for lease in local
@@ -186,7 +359,190 @@ impl<S: JournalStorage> JournalEngine<S> {
                 live.extend(layer.iter().cloned());
             }
         }
-        Ok(live)
+        Ok((live, dependencies))
+    }
+
+    /// Before a source becomes clean, persist it as a candidate on every
+    /// referenced session. A crash can leave an extra candidate, never a
+    /// missing blocker: the source stays dirty until its own sweep applies.
+    pub(super) async fn index_retirement_dependencies(
+        &self,
+        source: &SessionId,
+        dependencies: BTreeSet<SessionId>,
+    ) -> Result<(), RuntimeError> {
+        for target in dependencies {
+            if &target == source {
+                continue;
+            }
+            let stored = self.storage.load(&self.domain, &target).await?;
+            let mut metadata = stored
+                .as_ref()
+                .map(|r| decode::<Metadata>(&r.engine))
+                .transpose()?
+                .unwrap_or_default();
+            if !metadata.retirement_dependents.insert(source.clone()) {
+                continue;
+            }
+            let mut record = stored.unwrap_or_else(|| JournalSessionRecord {
+                revision: JournalRevision(0),
+                writer_epoch: 0,
+                head: None,
+                has_checkpoint: false,
+                retirement: None,
+                collection_dirty: false,
+                engine: JournalEngineState {
+                    version: 1,
+                    bytes: vec![],
+                },
+            });
+            record.engine = encode(&metadata)?;
+            self.apply(
+                JournalWrite {
+                    domain: self.domain.clone(),
+                    session: target.clone(),
+                    kind: JournalWriteKind::Collect,
+                    expect: (record.revision, record.writer_epoch),
+                    record: Some(record),
+                    objects: JournalObjectBatch::default(),
+                    operation: None,
+                    pins: vec![],
+                    catalog: vec![],
+                    release: vec![],
+                    prune_operations_before: None,
+                    inject: None,
+                },
+                &target,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn retirement_view(
+        &self,
+        session: &SessionId,
+    ) -> Result<(Transition, Option<JournalSessionRecord>), RuntimeError> {
+        let (scratch, stored) = self.hydrate_state(session, true).await?;
+        let mut candidates = stored
+            .as_ref()
+            .map(|r| decode::<Metadata>(&r.engine))
+            .transpose()?
+            .unwrap_or_default()
+            .retirement_dependents;
+        let mut after = None;
+        loop {
+            let page = self
+                .storage
+                .dirty_sessions(&self.domain, after.as_ref(), 128)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().cloned();
+            candidates.extend(page);
+        }
+        let mut unresolved = false;
+        let mut blocked = false;
+        for candidate in candidates {
+            if &candidate == session {
+                continue;
+            }
+            let record = self.storage.load(&self.domain, &candidate).await?;
+            if let Some(record) = &record {
+                if record.head.is_some() {
+                    let metadata: Metadata = decode(&record.engine)?;
+                    unresolved |= metadata.dependencies.unresolved;
+                    blocked |= metadata.dependencies.sessions.contains(session);
+                }
+            }
+            let mut catalog = BTreeMap::new();
+            for pin in self.storage.pins(&self.domain, &candidate).await? {
+                let (_, dependencies) = self
+                    .pin_roots(&candidate, &pin, record.as_ref(), &mut catalog)
+                    .await?;
+                unresolved |= dependencies.unresolved;
+                blocked |= dependencies.sessions.contains(session);
+            }
+        }
+        let mut catalog = BTreeMap::new();
+        let mut own_dependencies = Vec::new();
+        for pin in self.storage.pins(&self.domain, session).await? {
+            let (_, dependencies) = self
+                .pin_roots(session, &pin, stored.as_ref(), &mut catalog)
+                .await?;
+            own_dependencies.push((pin.pin, dependencies));
+        }
+        {
+            let mut state = scratch.lock()?;
+            for (pin, dependencies) in own_dependencies {
+                state
+                    .durable_pins
+                    .get_mut(&(session.clone(), pin))
+                    .ok_or_else(conflict)?
+                    .dependencies = dependencies;
+            }
+            // Only storage is authoritative for other sessions' current roots
+            // and pins. Keep local leases, which are deliberately process-local.
+            state.sessions.retain(|owner, _| owner == session);
+            state.durable_pins.retain(|(owner, _), _| owner == session);
+            unresolved |= state.unresolved_dependencies();
+        }
+        if unresolved {
+            return Err(RuntimeError::unsupported_capability(
+                crate::error::UnsupportedCapability::JournalRetirement,
+            ));
+        }
+        if blocked {
+            return Err(conflict());
+        }
+        let child = scratch.lock()?.sessions[session]
+            .dependencies
+            .completed_fork
+            .clone();
+        if let Some(child) = child {
+            let record = self.storage.load(&self.domain, &child).await?;
+            let current = record
+                .and_then(|r| r.head)
+                .map(|head| {
+                    Ok::<_, RuntimeError>((head.id.clone(), head.decode(JournalObjectKind::Head)?))
+                })
+                .transpose()?;
+            scratch.lock()?.sessions.insert(
+                child,
+                SessionRecord {
+                    current,
+                    ..Default::default()
+                },
+            );
+        }
+        Ok((scratch, stored))
+    }
+
+    pub(super) fn freeze_writer_pins(
+        &self,
+        scratch: &Transition,
+        session: &SessionId,
+        stored: Option<&JournalSessionRecord>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(stored) = stored {
+            let Some(head) = &stored.head else {
+                return Ok(());
+            };
+            if head
+                .decode::<JournalHead>(JournalObjectKind::Head)?
+                .writer_epoch
+                != stored.writer_epoch
+            {
+                return Ok(());
+            }
+            let mut state = scratch.lock()?;
+            for ((owner, _), pin) in &mut state.durable_pins {
+                if owner == session && pin.writer_epochs.contains(&stored.writer_epoch) {
+                    pin.roots.insert(head.id.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn write(
@@ -202,6 +558,11 @@ impl<S: JournalStorage> JournalEngine<S> {
             checkpoint_floor: record.checkpoint_floor.clone(),
             dependencies: record.dependencies.clone(),
             authorization: state.retirement_authorizations.get(session).copied(),
+            retirement_dependents: stored
+                .map(|record| decode::<Metadata>(&record.engine))
+                .transpose()?
+                .unwrap_or_default()
+                .retirement_dependents,
         };
         let head = record
             .current
@@ -488,16 +849,16 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .catalog
                 .push(JournalCatalogChange::Put(JournalCatalogEntry {
                     head: root,
-                    engine: encode(deps)?,
+                    engine: encode(&CatalogMetadata {
+                        dependencies: deps.clone(),
+                        previous: stored
+                            .as_ref()
+                            .and_then(|record| record.head.as_ref())
+                            .map(|head| head.id.clone()),
+                        writer_epoch: Some(head.writer_epoch),
+                        staged_roots: lease_record.staged_roots.clone(),
+                    })?,
                 }));
-            if let Some(pin) = state
-                .durable_pins
-                .get(&(lease.session().clone(), lease_record.pin.clone()))
-            {
-                write
-                    .pins
-                    .push(JournalPinChange::Put(pin_record(&lease_record.pin, pin)?));
-            }
         }
         write.operation = Some(JournalOperationRecord {
             operation,
@@ -535,23 +896,53 @@ impl<S: JournalStorage> JournalEngine<S> {
         Ok(head)
     }
 }
+pub(super) fn pin_records(
+    scratch: &Transition,
+    session: &SessionId,
+) -> Result<BTreeMap<JournalPinId, JournalPinRecord>, RuntimeError> {
+    scratch
+        .lock()?
+        .durable_pins
+        .iter()
+        .filter(|((owner, _), _)| owner == session)
+        .map(|((_, id), pin)| Ok((id.clone(), pin_record(id, pin)?)))
+        .collect()
+}
+
+pub(super) fn pin_changes(
+    before: BTreeMap<JournalPinId, JournalPinRecord>,
+    scratch: &Transition,
+    session: &SessionId,
+) -> Result<Vec<JournalPinChange>, RuntimeError> {
+    let after = pin_records(scratch, session)?;
+    let mut changes = Vec::new();
+    for (id, pin) in &after {
+        if before.get(id) != Some(pin) {
+            changes.push(JournalPinChange::Put(pin.clone()));
+        }
+    }
+    for id in before.into_keys() {
+        if !after.contains_key(&id) {
+            changes.push(JournalPinChange::Remove(id));
+        }
+    }
+    Ok(changes)
+}
+
 pub(super) fn pin_record(
     id: &JournalPinId,
     pin: &DurablePin,
 ) -> Result<JournalPinRecord, RuntimeError> {
-    let reachable: BTreeSet<_> = pin
-        .reachable
-        .layers
-        .iter()
-        .flat_map(|l| l.iter().cloned())
-        .collect();
     Ok(JournalPinRecord {
         pin: id.clone(),
         blocks_retirement: pin.blocks_retirement,
-        roots: reachable.iter().cloned().collect(),
+        roots: pin.roots.iter().cloned().collect(),
         engine: encode(&PinMetadata {
-            dependencies: pin.dependencies.clone(),
-            reachable,
+            dependencies: PinDependencies {
+                sessions: pin.dependencies.sessions.clone(),
+                unresolved: pin.dependencies.unresolved,
+            },
+            writer_epochs: pin.writer_epochs.clone(),
         })?,
     })
 }

@@ -7,6 +7,12 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Breaking
+
+- Journal replays older than 64 revisions now return `StateConflict` instead
+  of the original result after collection. Collection preserves the current
+  writer epoch's last operation. A pruned operation never applies again.
+
 ### Added
 
 - `JournalApplyReceipt` reports the body count and encoded bytes physically

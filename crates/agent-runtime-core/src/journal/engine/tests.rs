@@ -51,6 +51,7 @@ struct LostAcknowledgement {
     lose: std::sync::atomic::AtomicBool,
     calls: Mutex<BTreeMap<(&'static str, SessionId), usize>>,
     pause_load: Mutex<Option<LoadPause>>,
+    pin_writes: Mutex<Vec<(JournalWriteKind, usize)>>,
 }
 impl LostAcknowledgement {
     fn count(&self, name: &'static str, session: &SessionId) {
@@ -134,6 +135,19 @@ impl JournalStorage for LostAcknowledgement {
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.count("apply", &write.session);
+        // Logical durable payload: raw ids, pin id, flag, metadata version and
+        // metadata bytes. Excludes host-specific row/framing overhead.
+        let bytes = write
+            .pins
+            .iter()
+            .map(|change| match change {
+                JournalPinChange::Put(pin) => {
+                    pin.roots.len() * 32 + pin.pin.as_str().len() + 5 + pin.engine.bytes.len()
+                }
+                JournalPinChange::Remove(pin) => pin.as_str().len(),
+            })
+            .sum();
+        self.pin_writes.lock().unwrap().push((write.kind, bytes));
         let commit = write.kind == JournalWriteKind::Commit;
         let receipt = self.inner.apply(write).await?;
         if commit && self.lose.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -142,6 +156,106 @@ impl JournalStorage for LostAcknowledgement {
             Ok(receipt)
         }
     }
+}
+
+#[tokio::test]
+async fn pinned_writer_commits_write_no_pin_bytes_as_history_grows() {
+    let storage = Arc::new(LostAcknowledgement::default());
+    let engine = JournalEngine::ordinary(
+        storage.clone(),
+        JournalStorageId::new("pin-bytes"),
+        Arc::new(IdentityJournalProjection),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    let session = SessionId::new("s");
+    let lease = engine.open(&session, writer("writer")).await.unwrap();
+    engine.pin_transfer(&lease).await.unwrap();
+    let mut previous: Option<JournalHead> = None;
+    let mut history = Vec::new();
+    for index in 0..200 {
+        history.push(crate::content::Message::user(format!("message {index}")));
+        let mut commit = empty_commit(&session, 1);
+        let snapshot = commit.delta.bootstrap.as_mut().unwrap();
+        snapshot.history = history.clone();
+        commit.batch.snapshot = ObjectAssembler::default().snapshot(snapshot, 0).unwrap();
+        commit.batch.operation = JournalOperationId::new(format!("op-{index}"));
+        if let Some(head) = &previous {
+            commit.batch.sequence = head.batch_sequence + 1;
+            commit.batch.expected_revision = Some(head.revision);
+            commit.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+        }
+        commit.digest = commit.input_digest().unwrap();
+        previous = Some(engine.commit(&lease, commit).await.unwrap());
+    }
+    let writes = storage.pin_writes.lock().unwrap().clone();
+    let bytes: Vec<_> = writes
+        .iter()
+        .filter(|(kind, _)| *kind == JournalWriteKind::Commit)
+        .map(|(_, bytes)| *bytes)
+        .collect();
+    eprintln!(
+        "PIN BYTES: commits={} total={} first={} last={} max={} control_total={}",
+        bytes.len(),
+        bytes.iter().sum::<usize>(),
+        bytes[0],
+        bytes[199],
+        bytes.iter().max().unwrap(),
+        writes
+            .iter()
+            .filter(|(kind, _)| *kind != JournalWriteKind::Commit)
+            .map(|(_, bytes)| bytes)
+            .sum::<usize>()
+    );
+    assert_eq!(bytes, vec![0; 200]);
+    engine
+        .authorize_retirement(
+            &session,
+            previous.as_ref().unwrap().revision,
+            crate::clock::Timestamp(9),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.pin_writes.lock().unwrap().last().unwrap(),
+        &(JournalWriteKind::Authorize, 0)
+    );
+    engine.close(lease).await.unwrap();
+    // Opening the next writer freezes the old epoch's final root. Its commits
+    // must not implicitly extend the old writer's transfer pin.
+    let successor = engine.open(&session, writer("successor")).await.unwrap();
+    let mut commit = empty_commit(&session, 2);
+    let old = previous.as_ref().unwrap();
+    commit.batch.sequence = old.batch_sequence + 1;
+    commit.batch.expected_revision = Some(old.revision);
+    commit.batch.predecessor = Some(JournalDigest::parse(old.batch.as_str()).unwrap());
+    commit.batch.operation = JournalOperationId::new("successor");
+    commit.digest = commit.input_digest().unwrap();
+    engine.commit(&successor, commit).await.unwrap();
+    engine.close(successor).await.unwrap();
+    // The absent-head transfer reservation still protects every published
+    // root after the writer disappears and a fresh process collects.
+    let fresh = JournalEngine::ordinary(
+        storage.clone(),
+        engine.storage_id(),
+        Arc::new(IdentityJournalProjection),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(sweep(&fresh, u64::MAX).await.deleted, 0);
+    fresh
+        .release_pin(
+            &session,
+            &JournalPinId::new("writer"),
+            fresh.root_epoch().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(sweep(&fresh, u64::MAX).await.deleted > 0);
 }
 fn empty_commit(session: &SessionId, epoch: u64) -> JournalCommit {
     let snapshot = SessionSnapshot {
@@ -189,6 +303,61 @@ fn empty_commit(session: &SessionId, epoch: u64) -> JournalCommit {
     };
     commit.digest = commit.input_digest().unwrap();
     commit
+}
+
+#[tokio::test]
+async fn a_pinned_writer_keeps_committed_staging_after_its_staging_pin_is_released() {
+    let storage = Arc::new(VolatileJournalStorage::default());
+    let id = JournalStorageId::new("staging-transfer");
+    let config = JournalEngineConfig {
+        collection_enabled: true,
+        ..Default::default()
+    };
+    let engine = JournalEngine::protected(storage.clone(), id.clone(), config.clone());
+    let session = SessionId::new("s");
+    let lease = engine.open(&session, writer("writer")).await.unwrap();
+    engine.pin_transfer(&lease).await.unwrap();
+    let orphan = JournalObject::encode(
+        JournalObjectKind::Message,
+        &crate::content::Message::user("staged orphan"),
+    )
+    .unwrap();
+    engine
+        .stage_leaves(&lease, JournalPinId::new("stage"), vec![orphan.clone()])
+        .await
+        .unwrap();
+    engine
+        .commit(&lease, empty_commit(&session, 1))
+        .await
+        .unwrap();
+    engine
+        .release_pin(
+            &session,
+            &JournalPinId::new("stage"),
+            engine.root_epoch().unwrap(),
+        )
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    let fresh = JournalEngine::protected(storage.clone(), id, config);
+    assert_eq!(sweep(&fresh, u64::MAX).await.deleted, 0);
+    assert_eq!(
+        storage
+            .objects(&fresh.domain, &session, std::slice::from_ref(&orphan.id))
+            .await
+            .unwrap()[0]
+            .as_deref(),
+        Some(orphan.bytes.as_slice())
+    );
+    fresh
+        .release_pin(
+            &session,
+            &JournalPinId::new("writer"),
+            fresh.root_epoch().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sweep(&fresh, u64::MAX).await.deleted, 1);
 }
 #[tokio::test]
 async fn storage_lost_acknowledgement_recovers_the_published_head_and_fence() {

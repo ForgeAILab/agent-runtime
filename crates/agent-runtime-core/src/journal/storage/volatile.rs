@@ -419,10 +419,17 @@ impl JournalStorage for VolatileJournalStorage {
             staged.operations.insert(op_key, operation);
         }
         if let Some(before) = write.prune_operations_before {
+            let epoch = staged.records[&key].writer_epoch;
+            let last = staged
+                .operations
+                .iter()
+                .filter(|((s, _), op)| s == &key && op.result.writer_epoch == epoch)
+                .map(|(_, op)| op.revision)
+                .max();
             staged.operations.retain(|(s, _), op| {
                 s != &key
                     || op.revision >= before
-                    || op.result.writer_epoch == staged.records[&key].writer_epoch
+                    || (op.result.writer_epoch == epoch && Some(op.revision) == last)
             });
         }
         fail(JournalCommitFailurePoint::AfterIdempotency)?;
