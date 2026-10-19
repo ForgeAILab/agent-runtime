@@ -1,0 +1,106 @@
+//! Public-API behaviour of the in-memory journal that must match the
+//! pre-extraction reference backend exactly. Each case also passes against the
+//! original `memory.rs` implementation.
+use agent_runtime_core::clock::Timestamp;
+use agent_runtime_core::error::{FailureClass, RuntimeError};
+use agent_runtime_core::ids::*;
+use agent_runtime_core::journal::*;
+use agent_runtime_core::store::*;
+use std::collections::BTreeMap;
+
+fn open(pin: &str, intent: JournalOpenIntent) -> JournalOpen {
+    JournalOpen {
+        root: JournalRootSelection::Latest,
+        expected_revision: None,
+        operation: JournalOperationId::new(pin),
+        pin: JournalPinId::new(pin),
+        intent,
+    }
+}
+
+fn empty_commit(session: &SessionId, epoch: u64, operation: &str) -> JournalCommit {
+    let snapshot = SessionSnapshot {
+        id: session.clone(),
+        history: vec![],
+        usage: Default::default(),
+        identity: Default::default(),
+        manifests: vec![],
+        extension_state: Default::default(),
+        updated: Timestamp(1),
+    };
+    let roots = JournalSnapshotRoots {
+        history: JournalSequence::default(),
+        history_chain: journal_history_chain(std::iter::empty()),
+        usage: JournalSequence::default(),
+        extensions: JournalMap::default(),
+        manifests: JournalSequence::default(),
+        planned_step_count: 0,
+        identity: snapshot.identity.clone(),
+        updated: snapshot.updated,
+    };
+    let boundary = JournalBoundary {
+        version: 1,
+        session: session.clone(),
+        turn: None,
+        checkpoint_sequence: 0,
+        planned_step_count: 0,
+    };
+    let mut commit = JournalCommit {
+        batch: JournalBatch {
+            session: session.clone(),
+            sequence: 1,
+            predecessor: None,
+            expected_revision: None,
+            writer_epoch: epoch,
+            operation: JournalOperationId::new(operation),
+            boundary: boundary.clone(),
+            snapshot: roots,
+            checkpoint: None,
+        },
+        digest: journal_history_chain(std::iter::empty()),
+        objects: vec![],
+        checkpoint: None,
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(snapshot)),
+            history_append: vec![],
+            usage_append: vec![],
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
+            manifests_append: vec![],
+            manifest_references: vec![],
+        },
+    };
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+fn assert_conflict(result: Result<impl std::fmt::Debug, RuntimeError>) {
+    let error = result.expect_err("expected a state conflict");
+    assert!(
+        matches!(error.class, FailureClass::StateConflict { .. }),
+        "{error:?}"
+    );
+}
+
+/// A read-only lease is never commit authority, not even for an identical
+/// replay of an operation the session's writer already published.
+#[tokio::test]
+async fn review_read_only_lease_cannot_replay_a_published_operation() {
+    let journal = InMemorySessionJournal::protected(JournalStorageId::new("replay"));
+    let session = SessionId::new("s");
+    let writer = journal
+        .open(&session, open("writer", JournalOpenIntent::ExclusiveWriter))
+        .await
+        .unwrap();
+    let commit = empty_commit(&session, writer.writer_epoch().unwrap(), "op");
+    journal.commit(&writer, commit.clone()).await.unwrap();
+    journal.close(writer).await.unwrap();
+    let reader = journal
+        .open(&session, open("reader", JournalOpenIntent::ReadOnly))
+        .await
+        .unwrap();
+    let before = journal.root_epoch().unwrap();
+    assert_conflict(journal.commit(&reader, commit).await);
+    assert_eq!(journal.root_epoch().unwrap(), before);
+}
