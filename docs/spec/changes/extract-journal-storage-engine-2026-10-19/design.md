@@ -869,3 +869,19 @@ All four open questions were decided as recommended:
   schema-5 writer. Schema-4 sessions upgrade only on an explicit host request.
 - **Q4: per-session copies accepted.** Identical bodies are not shared
   physically across sessions.
+
+### Owner decision after measurement (2026-10-19)
+
+Measurement (task 1.4) showed that an idle Forge legacy session holds two
+sealed blobs (L2), not one. The owner chose to gate R7 against today's real
+on-disk bytes: fixture B at N=4000 after collection must be at most 2.0× L2,
+aiming for 1.5×.
+
+| Lever | Plain | Tool |
+| --- | ---: | ---: |
+| S1–S5 (measured) | 1.49× L2 | 1.62× L2 |
+
+Group 4 builds S1–S5. The format levers F1 and F2 (journal schema 5) are not
+built, because storage-only levers meet the gate. They stay documented as the
+path if a later gate tightens. Fixture A and the L1 ratios remain reported,
+but they do not gate.

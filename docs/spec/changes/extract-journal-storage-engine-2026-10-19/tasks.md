@@ -117,7 +117,7 @@ this measurement job.
 
 ## 5. R7 format levers (gate: only if 4.5 fails or Q2 requires them)
 
-- [ ] 5.1 Journal schema 5 readers for chunked JSON leaves (F1), with frozen
+- [ ] 5.1 (not built: owner gated on L2, storage levers meet it) Journal schema 5 readers for chunked JSON leaves (F1), with frozen
   golden fixtures; schema-4 readers unchanged. Tests: core fixture and
   round-trip tests at chunk boundaries (63/64/65, 8 KiB ±1).
 - [ ] 5.2 F1 writer and engine assembler behind `JournalEngineConfig::format`;
