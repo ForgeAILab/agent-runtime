@@ -22,6 +22,13 @@ contain breaking changes and are coordinated with consumer proposals.
 - A provider `BadRequest` converts to `ErrorKind::Provider` rather than
   `ErrorKind::Config`, so a rejected request no longer displays as
   `Config: ...`. `Unsupported` stays `Config`; failure classes are unchanged.
+- `CharRatioSizer` counts a reasoning part's signature at its own ratio,
+  `signature_chars_per_token` (default 6, settable with
+  `with_signature_chars_per_token`). Gemini bills its replayed search steps,
+  which live in those signatures: one search call and result cost about
+  9,000 input tokens that the planner used to count as zero. The new public
+  field breaks struct-literal construction, and the sizer revision is now
+  `char-ratio-2`.
 
 ### Fixed
 
