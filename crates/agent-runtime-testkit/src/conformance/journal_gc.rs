@@ -465,6 +465,42 @@ where
     journal.close(writer).await.unwrap();
     assert_conflict(journal.retire(&other, second.revision).await.unwrap_err());
     assert_materializes(journal, &other, second.revision, "revision-survives").await;
+
+    // Authorization names exactly one session: another session's grant at the
+    // same revision never authorizes this one.
+    let authorized = SessionId::new("gc-authorized-session");
+    let unauthorized = SessionId::new("gc-unauthorized-session");
+    let mut heads = Vec::new();
+    for (session, label) in [(&authorized, "authorized"), (&unauthorized, "unauthorized")] {
+        let writer = open_writer(journal, session, None, label).await;
+        let (commit, _) = bootstrap_commit(
+            session.clone(),
+            writer.writer_epoch().unwrap(),
+            "first",
+            "scoped body",
+        );
+        heads.push(journal.commit(&writer, commit).await.unwrap());
+        journal.close(writer).await.unwrap();
+    }
+    assert_eq!(heads[0].revision, heads[1].revision);
+    fixture.authorize(&authorized, &heads[0]).await;
+    assert_conflict(
+        journal
+            .retire(&unauthorized, heads[1].revision)
+            .await
+            .unwrap_err(),
+    );
+    assert_materializes(
+        journal,
+        &unauthorized,
+        heads[1].revision,
+        "unauthorized-live",
+    )
+    .await;
+    journal
+        .retire(&authorized, heads[0].revision)
+        .await
+        .unwrap();
 }
 
 /// Durable historical and migration/fork pins outlive process close, renewal,
