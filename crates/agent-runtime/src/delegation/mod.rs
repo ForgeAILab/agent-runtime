@@ -117,6 +117,8 @@ mod coordinator;
 mod lifecycle;
 mod monitor;
 mod persistence;
+#[cfg(test)]
+mod retirement_tests;
 mod types;
 
 use monitor::*;

@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-18T00:00:00Z
+updated_at: 2026-10-19T00:00:00Z
 ---
 
 # Tasks: SessionJournal and referenced checkpoints
@@ -334,6 +334,23 @@ merely contract merge.
   LCM 62; Rust 1.86 core/runtime build and strict change validation pass. The
   cross-domain host fixture registers protected child pins before publication,
   since the parent's actual child catalog is an ordinary-store publication.
+
+- [x] 3.5 Follow-up: distinguish retired latest roots from absent native heads using the released error contract; reject runtime views before legacy reads, add imported-v3 entry-point and third-party conformance regressions, and tighten each runtime GC schedule's expected result. Record verification evidence in design.md and CHANGELOG Unreleased/Fixed.
+  Evidence (2026-10-19): the reference returns an explicit retirement
+  `StateConflict` for latest read-only and writer opens, before and after GC;
+  runtime views open before any legacy load. Nine imported-v3 regression tests
+  cover 27 entry-point/capability rows with zero legacy loads. All nine fail
+  before the fix, as does the new exported retired-latest conformance case;
+  the protected and ordinary suites now run it, and reject an empty-lease
+  retirement adapter. All nine existing runtime GC schedules pass with each
+  fresh collection required to succeed at its expected epoch and each stale
+  mark required to conflict. No earlier expectation was weakened.
+  Verification: fmt check and all-target/all-feature Clippy with warnings denied
+  pass; core 276, runtime 669, testkit 410, LCM 62 (1,417 passed, zero failed or
+  ignored); Rust 1.86 core/runtime build and strict spec validation pass. Every
+  Cargo command used `/Volumes/Data/tmp/refactor/c.sh` with a timeout, offline
+  dependencies and the single worktree target directory. Logs and red/green
+  evidence: `/Volumes/Data/tmp/refactor/u9c-2/`. No unmet follow-up item.
 
 ## 4. Merge group D — Coordinated consumers and release eligibility
 

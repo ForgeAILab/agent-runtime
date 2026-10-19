@@ -276,6 +276,7 @@ where
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
     assert_journal_gc_projected_intent_conformance(factory).await;
     assert_ordinary_gc_shared_suffix_conformance(factory).await;
+    assert_journal_retired_latest_conformance(&|| factory(redacting_policy())).await;
 }
 
 /// Ordinary adapters share projected objects across sessions as well: a
@@ -436,6 +437,7 @@ where
     Fut: Future<Output = SessionJournalCollectionFixture>,
 {
     assert_journal_retirement_conformance(&factory).await;
+    assert_journal_retired_latest_conformance(&factory).await;
     assert_journal_durable_pin_conformance(&factory).await;
     assert_journal_gc_retained_checkpoint_conformance(&factory).await;
     assert_journal_gc_epoch_conformance(&factory).await;
@@ -555,6 +557,77 @@ where
         .retire(&authorized, heads[0].revision)
         .await
         .unwrap();
+}
+
+/// A retired execution identity is distinct from an absent native head, both
+/// before and after collection. Latest opens must conflict; retained roots and
+/// existing reader leases remain readable under their independent pins.
+pub async fn assert_journal_retired_latest_conformance<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = SessionJournalCollectionFixture>,
+{
+    let fixture = factory().await;
+    let journal = &*fixture.backend.journal;
+    let session = SessionId::new("gc-retired-latest");
+    let absent = open_reader(journal, &session, None, "absent").await;
+    assert!(absent.head().is_none());
+    journal.close(absent).await.unwrap();
+    let writer = open_writer(journal, &session, None, "seed-retirement").await;
+    let (commit, _) = bootstrap_commit(
+        session.clone(),
+        writer.writer_epoch().unwrap(),
+        "first",
+        "retired body",
+    );
+    let head = journal.commit(&writer, commit).await.unwrap();
+    journal.close(writer).await.unwrap();
+    let mut reader = Some(open_reader(journal, &session, None, "pinned-reader").await);
+    let snapshot = JournalReader::new(journal, reader.as_ref().unwrap(), LIMITS)
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap();
+    assert!(snapshot.is_some());
+    fixture.authorize(&session, &head).await;
+    journal.retire(&session, head.revision).await.unwrap();
+    for phase in ["before-gc", "pinned-gc", "deleted-gc"] {
+        for intent in [
+            JournalOpenIntent::ReadOnly,
+            JournalOpenIntent::ExclusiveWriter,
+        ] {
+            let mut request = writer_open(None, phase, phase);
+            request.intent = intent;
+            assert_conflict(journal.open(&session, request).await.unwrap_err());
+        }
+        if phase == "before-gc" {
+            let retained = open_retained(journal, &head, "retained-after-retirement")
+                .await
+                .unwrap();
+            assert_eq!(
+                JournalReader::new(journal, &retained, LIMITS)
+                    .unwrap()
+                    .snapshot()
+                    .await
+                    .unwrap(),
+                snapshot
+            );
+            journal.close(retained).await.unwrap();
+            fixture.collect().await;
+            assert_eq!(
+                JournalReader::new(journal, reader.as_ref().unwrap(), LIMITS)
+                    .unwrap()
+                    .snapshot()
+                    .await
+                    .unwrap(),
+                snapshot
+            );
+        } else if phase == "pinned-gc" {
+            journal.close(reader.take().unwrap()).await.unwrap();
+            assert!(fixture.collect().await.deleted > 0);
+            assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
+        }
+    }
 }
 
 /// Durable historical and migration/fork pins outlive process close, renewal,
@@ -2416,6 +2489,10 @@ mod tests {
     #[tokio::test]
     async fn retirement_requires_policy_revision_and_no_execution_or_transfer() {
         assert_journal_retirement_conformance(&reference).await;
+    }
+    #[tokio::test]
+    async fn retired_latest_is_distinct_from_absent_before_and_after_collection() {
+        assert_journal_retired_latest_conformance(&reference).await;
     }
     #[tokio::test]
     async fn durable_pins_outlive_renewal_close_expiry_and_retirement() {

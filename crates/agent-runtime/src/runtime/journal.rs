@@ -133,6 +133,8 @@ impl SessionPersistence {
     /// Read-only existence/recovery probe used before a live session acquires
     /// its writer fence (notably fork repair). A visible native head is always
     /// authoritative over a stale materialized record.
+    /// Open the native journal before any legacy load: retirement and other
+    /// native failures must propagate without even reading stale v3 records.
     ///
     /// `counterpart` is the other configured policy store's journal. An
     /// imported session keeps its v3 records, so when this store no longer
@@ -148,7 +150,6 @@ impl SessionPersistence {
             reject_lost_capability(counterpart, session).await?;
             return store.load(session).await;
         };
-        let legacy = store.load(session).await?;
         let nonce = uuid::Uuid::new_v4();
         let lease = journal
             .open(
@@ -168,7 +169,7 @@ impl SessionPersistence {
                     .snapshot()
                     .await
             } else {
-                Ok(legacy)
+                store.load(session).await
             }
         }
         .await;
@@ -192,7 +193,6 @@ impl SessionPersistence {
             reject_lost_capability(counterpart, session).await?;
             return store.load_latest(session).await;
         };
-        let legacy = store.load_latest(session).await?;
         let nonce = uuid::Uuid::new_v4();
         let lease = journal
             .open(
@@ -212,7 +212,7 @@ impl SessionPersistence {
                     .checkpoint()
                     .await
             } else {
-                Ok(legacy)
+                store.load_latest(session).await
             }
         }
         .await;

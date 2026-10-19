@@ -1107,13 +1107,21 @@ impl SessionJournal for InMemorySessionJournal {
             return Err(conflict());
         }
         let mut state = self.lock()?;
-        if request.intent == JournalOpenIntent::ExclusiveWriter
+        if (request.intent == JournalOpenIntent::ExclusiveWriter
+            || matches!(request.root, JournalRootSelection::Latest))
             && state
                 .sessions
                 .get(session)
                 .is_some_and(|record| record.retirement.is_some())
         {
-            return Err(conflict());
+            return Err(
+                RuntimeError::conflict("session journal is retired").with_class(
+                    FailureClass::StateConflict {
+                        stage: FailureStage::PreProvider,
+                        component: FailureComponent::Checkpoint,
+                    },
+                ),
+            );
         }
         let pin_key = (session.clone(), request.pin.clone());
         if state.active_pins.contains_key(&pin_key) {
