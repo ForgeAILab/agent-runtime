@@ -18,6 +18,12 @@ use crate::provider::ModelId;
 pub const MAX_INTERNAL_TURN_CHARS: usize = 4_096;
 /// Maximum stable internal source kind/id length.
 pub const MAX_INTERNAL_SOURCE_CHARS: usize = 128;
+/// Source kind of the internal turn that delivers delegated child outcomes.
+pub const CHILD_COMPLETION_SOURCE_KIND: &str = "delegation.child-completion";
+/// Ceiling for a child-completion internal turn. Its ordinary size is set by
+/// the delegation delivery budget; the builder degrades to a compact listing
+/// rather than exceed this.
+pub const MAX_CHILD_COMPLETION_TURN_CHARS: usize = 2 * 1024 * 1024;
 
 /// Who authored a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,12 +364,24 @@ impl InternalTurnInput {
     /// Validates content and source bounds.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         let chars = self.content.chars().count();
-        if self.content.trim().is_empty() || chars > MAX_INTERNAL_TURN_CHARS {
+        let max = self.max_content_chars();
+        if self.content.trim().is_empty() || chars > max {
             return Err(RuntimeError::config(format!(
-                "internal turn content must contain 1..={MAX_INTERNAL_TURN_CHARS} characters"
+                "internal turn content must contain 1..={max} characters"
             )));
         }
         self.source.validate()
+    }
+
+    /// The content bound for this input's source. Child-completion deliveries
+    /// carry whole child replies within the host's delivery budget; every
+    /// other source keeps the general bound.
+    pub fn max_content_chars(&self) -> usize {
+        if self.source.kind == CHILD_COMPLETION_SOURCE_KIND {
+            MAX_CHILD_COMPLETION_TURN_CHARS
+        } else {
+            MAX_INTERNAL_TURN_CHARS
+        }
     }
 }
 
@@ -714,5 +732,31 @@ mod tests {
         let encoded = serde_json::to_string(&input).unwrap();
         let decoded: InternalTurnInput = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn only_child_completion_turns_exceed_the_general_bound() {
+        let source = |kind: &str| InternalTurnSource {
+            kind: kind.into(),
+            id: "cursor-1".into(),
+            revision: RegistryRevision::new("source-v1"),
+            sensitivity: InternalTurnSensitivity::Sensitive,
+            goal: None,
+        };
+        let long = "a child's report\n".repeat(1_000);
+        assert!(long.chars().count() > MAX_INTERNAL_TURN_CHARS);
+
+        InternalTurnInput::new(long.clone(), source(CHILD_COMPLETION_SOURCE_KIND))
+            .expect("a delivery may carry a whole child reply");
+        let error = InternalTurnInput::new(long, source("watcher"))
+            .expect_err("other internal turns keep the general bound");
+        assert!(error.message.contains("1..=4096"), "{error}");
+        assert!(
+            InternalTurnInput::new(
+                "x".repeat(MAX_CHILD_COMPLETION_TURN_CHARS + 1),
+                source(CHILD_COMPLETION_SOURCE_KIND),
+            )
+            .is_err()
+        );
     }
 }
