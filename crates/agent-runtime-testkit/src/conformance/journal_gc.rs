@@ -439,6 +439,7 @@ where
     assert_journal_durable_pin_conformance(&factory).await;
     assert_journal_gc_retained_checkpoint_conformance(&factory).await;
     assert_journal_gc_epoch_conformance(&factory).await;
+    assert_journal_gc_partial_collection_conformance(&factory).await;
     assert_journal_gc_replay_fence_conformance(&factory).await;
     assert_journal_gc_failed_repair_conformance(&factory).await;
     assert_journal_committed_transfer_roots_conformance(&factory).await;
@@ -875,6 +876,50 @@ where
     assert_eq!(one.deleted, 1);
     assert!(one.reclaimed_bytes > 0);
     fixture.collect().await;
+    assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
+}
+
+/// Bounded deletion may stop part-way through a retired closure. Every later
+/// open of that root must fail before it returns a lease; it must never hand
+/// out a lease whose reads or materialization then fail part-way.
+pub async fn assert_journal_gc_partial_collection_conformance<F, Fut>(factory: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = SessionJournalCollectionFixture>,
+{
+    let fixture = factory().await;
+    let journal = &*fixture.backend.journal;
+    let session = SessionId::new("gc-partial-collection");
+    let writer = open_writer(journal, &session, None, "partial").await;
+    let commit = checkpoint_commit(
+        session.clone(),
+        writer.writer_epoch().unwrap(),
+        None,
+        "partial",
+        0,
+        1,
+    );
+    let head = journal.commit(&writer, commit.clone()).await.unwrap();
+    journal.close(writer).await.unwrap();
+    fixture.authorize(&session, &head).await;
+    journal.retire(&session, head.revision).await.unwrap();
+    let mut deletions = 0;
+    loop {
+        match open_retained(journal, &head, &format!("partial-open-{deletions}")).await {
+            Ok(lease) => {
+                assert_closure(journal, &lease, &commit, &head).await;
+                journal.close(lease).await.unwrap();
+            }
+            Err(error) => assert_conflict(error),
+        }
+        let report = journal.collect(fixture.mark(1).await).await.unwrap();
+        if report.deleted == 0 {
+            break;
+        }
+        assert_eq!(report.deleted, 1);
+        deletions += 1;
+    }
+    assert!(deletions > 1);
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
 }
 
@@ -2383,6 +2428,10 @@ mod tests {
     #[tokio::test]
     async fn collection_rechecks_every_root_and_pin_epoch() {
         assert_journal_gc_epoch_conformance(&reference).await;
+    }
+    #[tokio::test]
+    async fn partially_collected_root_fails_open_before_any_read() {
+        assert_journal_gc_partial_collection_conformance(&reference).await;
     }
     #[tokio::test]
     async fn live_execution_replay_fences_survive_collection() {
