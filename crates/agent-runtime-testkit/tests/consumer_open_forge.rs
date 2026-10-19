@@ -229,22 +229,83 @@ async fn forge_opt_in_normalization_keeps_canonical_schema_and_denial() {
 
 #[tokio::test]
 async fn forge_schema_guard_accepts_a_checkpoint_materialized_from_a_native_head() {
+    // Actual typed loader, no invented schema/snapshot_roots JSON predicates.
     agent_runtime_testkit::conformance::journal::assert_native_materialized_checkpoint_schema_guard(
-        |bytes| {
-            let value: serde_json::Value =
-                serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-            let schema = value
-                .get("schema_version")
-                .and_then(serde_json::Value::as_u64);
-            if schema == Some(3)
-                && value.get("snapshot").is_some()
-                && value.get("snapshot_roots").is_none()
-            {
-                Ok(())
-            } else {
-                Err(format!("Forge materialized guard rejected schema {schema:?}"))
-            }
-        },
-    )
-    .await;
+        |bytes| consumers::open_forge::decode_checkpoint_row(Some(bytes), true)
+            .map(|checkpoint| { checkpoint.expect("complete protected payload"); })
+            .map_err(|error| error.to_string()),
+    ).await;
 }
+
+#[tokio::test]
+async fn open_forge_chunked_journal_recovery_gate() {
+    agent_runtime_testkit::conformance::journal::assert_chunked_journal_recovery().await;
+}
+
+#[test]
+fn forge_pins_a_shared_immutable_runtime_revision() {
+    use consumers::pinning::check_shared_runtime_pin;
+    let captured: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/consumers/open-forge-dependencies.json"
+    ))
+    .unwrap();
+    assert!(
+        check_shared_runtime_pin(&captured["dependencies"])
+            .unwrap()
+            .ends_with("#rev:82f5aac")
+    );
+    let adopted = json!({
+        "agent-runtime": {"git":"fixture", "tag":"v0.7.0"},
+        "agent-runtime-core": {"git":"fixture", "tag":"v0.7.0"},
+        "agent-runtime-testkit": {"git":"fixture", "tag":"v0.7.0"}
+    });
+    assert!(check_shared_runtime_pin(&adopted).is_ok());
+    let mut skewed = adopted;
+    skewed["agent-runtime-core"]["tag"] = json!("v0.6.0");
+    assert!(check_shared_runtime_pin(&skewed).is_err());
+}
+
+#[tokio::test]
+async fn forge_row_loader_and_revision_checks_match_the_adapter() {
+    use consumers::open_forge::{
+        checkpoint_row_needs_write, decode_checkpoint_row, decode_snapshot_row,
+    };
+    agent_runtime_testkit::conformance::journal::assert_native_materialized_checkpoint_schema_guard(|bytes| {
+        let checkpoint = decode_checkpoint_row(Some(bytes), true).unwrap().unwrap();
+        assert_eq!(decode_checkpoint_row(None, false).unwrap(), None);
+        assert!(decode_checkpoint_row(None, true).is_err());
+        assert!(decode_checkpoint_row(Some(bytes), false).is_err());
+        assert!(decode_checkpoint_row(Some(b"{broken"), true).is_err());
+        assert!(decode_checkpoint_row(Some(b"{\"schema_version\":3}"), true).is_err());
+        assert_eq!(decode_snapshot_row(None, false, Some(checkpoint.clone())).unwrap(), Some(checkpoint.snapshot.clone()));
+        assert_eq!(decode_snapshot_row(Some(b"ignored"), false, Some(checkpoint.clone())).unwrap(), Some(checkpoint.snapshot.clone()));
+        assert_eq!(decode_snapshot_row(Some(&serde_json::to_vec(&checkpoint.snapshot).unwrap()), true, None).unwrap(), Some(checkpoint.snapshot.clone()));
+        // Forge's loader itself accepts a typed future tag; execution validation
+        // is the runtime's responsibility, not an invented JSON gate in Forge.
+        let mut future = checkpoint.clone();
+        future.schema_version = 4;
+        assert_eq!(decode_checkpoint_row(Some(&serde_json::to_vec(&future).unwrap()), true).unwrap(), Some(future.clone()));
+        assert!(future.validate().is_err());
+        assert!(!checkpoint_row_needs_write(&checkpoint, &checkpoint, false).unwrap());
+        let mut alias = checkpoint.clone();
+        alias.updated = agent_runtime_core::clock::Timestamp(999);
+        assert!(!checkpoint_row_needs_write(&checkpoint, &alias, false).unwrap());
+        alias.operation_fingerprint = agent_runtime::registry::Fingerprint::of("changed");
+        assert!(checkpoint_row_needs_write(&checkpoint, &alias, false).is_err());
+        alias = checkpoint.clone();
+        alias.state_revision = checkpoint.state_revision.saturating_sub(1);
+        assert!(checkpoint_row_needs_write(&checkpoint, &alias, false).is_err());
+        alias.state_revision = checkpoint.state_revision + 1;
+        assert!(checkpoint_row_needs_write(&checkpoint, &alias, false).unwrap());
+        alias.turn = TurnId::new("competing-turn");
+        assert!(checkpoint_row_needs_write(&checkpoint, &alias, true).is_err());
+        assert!(checkpoint_row_needs_write(&checkpoint, &alias, false).unwrap());
+        Ok(())
+    }).await;
+}
+
+// Keep the existing real LCM hard-admission and native pending-summary crash
+// matrix in Forge's named consumer release gate, rather than inventing a
+// synthetic summary transaction here. No consumer SDK/dependency is imported.
+#[path = "conformance/lcm_durable_hard_admission.rs"]
+mod hard_admission;

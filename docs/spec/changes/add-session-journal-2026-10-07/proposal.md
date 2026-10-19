@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-09T00:00:00Z
+updated_at: 2026-10-19T00:00:00Z
 ---
 
 # Proposal: SessionJournal with referenced checkpoints (U9)
@@ -99,3 +99,8 @@ nothing, so custom persisted-schema guards need no change and rollback to
 v0.2.1 works. Schema 4 applies to journal heads and reference checkpoints,
 which only a native backend (group B) writes.
 Groups B/C/D, U10 and release eligibility are not approved by this decision.
+
+The 2026-10-19 group-D request explicitly authorizes tasks 4.1–4.4 and the
+CHANGELOG/documentation half of 4.5. It does not authorize a version bump,
+tag, publication or release PR. Product references are read-only; Smith has
+no local checkout and its existing neutral fixtures are the only evidence.

@@ -60,6 +60,81 @@ contain breaking changes and are coordinated with consumer proposals.
   and `DelegationConfig` gains `delivery_inline_bytes`. Struct literals must
   set them; `ChildTaskResult::reply` deserializes as `None` from older state.
 
+### Session journal migration and retention limits
+
+- Native adoption is opt-in through `journal()` on every configured store.
+  Existing store implementations, methods and v0.6.x/v0.7.0 materialized
+  formats remain unchanged: `SessionSnapshot` is unversioned and
+  `TurnCheckpoint` stays schema 3 / transition revision 4. Schema 4 identifies
+  journal objects, heads and referenced checkpoints only. Valid v3 checkpoints
+  and v3-era snapshots, including unfinished turns, remain readable throughout
+  the entire first native-writer release; removing readers needs a separate
+  coordinated change.
+- A capable ordinary/protected pair imports v3 once under writer fences,
+  publishing the exact protected head before its independently projected
+  ordinary head. Import freezes requests, signatures, prepared actions and
+  committed outcomes without provider/tool I/O. A crash before exact publication
+  leaves v3 authoritative; after it, native discovery repairs only the supported
+  partial import. Original v3 records remain unchanged. Mixed pairs stay legacy
+  before any native head; detectable native data with a lost capability fails
+  closed. Ephemeral starts bypass all durable discovery and operations.
+- **Downgrade:** stop all old legacy writers before native adoption; they hold
+  no journal fence. An old binary must never execute a migrated session from
+  the stale v3 records it can still see. Downgrade requires an explicit idle
+  export with verified semantics, or restoring a host backup with writers
+  stopped. A separately materialized schema-3 checkpoint remains schema 3;
+  readable JSON does not establish old-binary execution compatibility.
+- Retention is explicit host policy: no automatic GC, TTL or lease expiry.
+  Collection keeps live canonical history, LCM summary sources, retained roots,
+  staged work and migration/fork/child pins. Logical supersession alone permits
+  no deletion. Unsupported collection retains content; physical backend
+  compaction and LCM context compaction do not delete canonical history.
+  Published corruption fails closed and needs verified host repair; only an
+  unpublished torn tail may be quarantined under the writer fence. The neutral
+  reference is volatile; production adapters must supply their own durable
+  framing, fsync/transaction and cross-process fences.
+- **Pre-1.0 coordination:** native persisted-store adoption is a coordinated
+  compatibility boundary. A failing Smith, Nyx or Open Forge gate blocks a
+  compatible release. Record product and runtime commits, run product store
+  checks, and adopt one shared immutable landed tag or exact revision across
+  runtime packages; local overrides and moving `main` pins do not qualify.
+  The read-only Nyx reference currently tracks `main`, so its release adoption
+  remains blocked. No release/version/tag is created by this documentation.
+
+Measured task-2.7 totals after the representation refinement are below. Each
+cell is **serialized submission bytes / newly retained immutable-object bytes**,
+not physical disk, encryption, compression, WAL or index amplification. A turn
+is the second turn after bootstrap under an identity ordinary projection.
+
+| Path | N=100 | N=1000 | N=4000 |
+| --- | ---: | ---: | ---: |
+| Plain bootstrap | 146,814 / 239,857 | 1,062,815 / 1,742,270 | 4,133,607 / 6,767,016 |
+| Plain protected turn | 42,041 / 48,051 | 43,740 / 49,764 | 43,088 / 49,112 |
+| Plain ordinary terminal | 10,867 / 28,134 | 11,815 / 29,671 | 12,263 / 29,681 |
+| Tool bootstrap | 154,239 / 247,610 | 1,070,240 / 1,750,023 | 4,141,032 / 6,774,769 |
+| Tool protected turn | 108,028 / 119,907 | 111,468 / 123,375 | 110,164 / 122,071 |
+| Tool ordinary terminal | 16,496 / 34,042 | 17,848 / 35,983 | 18,520 / 36,217 |
+| Plain unchanged boundary | 1,183 / 2,015 | 1,187 / 2,021 | 1,187 / 2,021 |
+| Tool unchanged boundary | 1,180 / 2,011 | 1,184 / 2,017 | 1,184 / 2,017 |
+
+Unchanged boundaries submit zero drafts and zero body bytes; their nonzero
+totals are revisioned metadata. At N=4000, plain bootstrap fell from
+9,114,257 / 20,124,203 bytes to 4,133,607 / 6,767,016; the latter retained
+size is 3.82× one 1,772,321-byte legacy snapshot. Legacy complete-turn
+protected / ordinary-terminal bytes remain 5,659,421 / 1,772,321 (plain) and
+11,326,721 / 2,277,973 (tool). Opaque host extensions still cost whole-value
+replacement bytes. Bootstrap, legacy writes, full materialization and policy
+validation remain history-dependent; the roughly-flat end-to-end CPU target
+was **not met**. N=10,000 cannot exercise a successful turn because the existing
+4,096-entry stable-history identity limit rejects planning before provider I/O.
+
+The separate N=1000 retention measurement keeps 570,121 encoded immutable bytes
+before collection, 404,529 with the canonical session still live (165,592
+reclaimed), and 0 after authorized retirement and pin release. It excludes the
+small replay/tombstone indexes and physical amplification. Detailed task-2.7
+and follow-up evidence, including per-commit rows and reproduction commands,
+is in [development.md](docs/development.md#native-turn-byte-cost-evidence-u9-task-27).
+
 ## [0.7.0] - 2026-10-18
 
 ### Changed

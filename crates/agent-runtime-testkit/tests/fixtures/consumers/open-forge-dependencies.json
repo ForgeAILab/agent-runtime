@@ -1,0 +1,7 @@
+{
+  "consumer_commit": "78702e7c4821d788ba05b7b484e80abc5c5c068e",
+  "source": "Cargo.toml:37 (next/v0.14), captured read-only 2026-10-19",
+  "dependencies": {
+    "agent-runtime": {"git": "https://github.com/ForgeAILab/agent-runtime.git", "rev": "82f5aac", "features": ["provider-summary"], "version": "0.5.0"}
+  }
+}

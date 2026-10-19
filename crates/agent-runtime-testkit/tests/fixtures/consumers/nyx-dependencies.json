@@ -1,0 +1,9 @@
+{
+  "consumer_commit": "585939d0d518e8a243c458016ed11f274d283f6d",
+  "source": "Cargo.toml:76-80, captured read-only 2026-10-19; this is NOT release eligible",
+  "dependencies": {
+    "agent-runtime": {"git": "https://github.com/ForgeAILab/agent-runtime.git", "branch": "main", "version": "0.2"},
+    "agent-runtime-core": {"git": "https://github.com/ForgeAILab/agent-runtime.git", "branch": "main", "version": "0.2"},
+    "agent-runtime-testkit": {"git": "https://github.com/ForgeAILab/agent-runtime.git", "branch": "main", "version": "0.2"}
+  }
+}

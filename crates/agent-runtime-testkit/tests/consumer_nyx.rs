@@ -165,17 +165,59 @@ async fn nyx_legacy_identity_rejects_envelopes_with_seeded_subscription() {
 }
 
 #[tokio::test]
-async fn nyx_schema_guard_accepts_a_checkpoint_materialized_from_a_native_head() {
+async fn nyx_snapshot_loader_accepts_native_materialized_checkpoints() {
     agent_runtime_testkit::conformance::journal::assert_native_materialized_checkpoint_schema_guard(
         |bytes| {
-            let value: serde_json::Value =
+            // Nyx has a SessionStore JSON loader, no CheckpointStore guard.
+            let checkpoint: agent_runtime_core::checkpoint::TurnCheckpoint =
                 serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-            if value.get("schema_version").and_then(serde_json::Value::as_u64) == Some(3) {
-                Ok(())
-            } else {
-                Err("Nyx optional durability accepts only materialized schema 3".to_owned())
-            }
+            let mut snapshot = checkpoint.snapshot;
+            snapshot.extension_state.insert("fixture.sensitive".into(),
+                agent_runtime_core::store::VersionedSessionState::new(
+                    RegistryRevision::new("1"), json!({"pending":"private durable state"})));
+            consumers::nyx::assert_snapshot_json_roundtrip(&snapshot);
+            Ok(())
         },
-    )
-    .await;
+    ).await;
+}
+
+#[tokio::test]
+async fn nyx_ephemeral_journal_isolation_gate() {
+    agent_runtime_testkit::conformance::journal::assert_ephemeral_journal_isolation().await;
+}
+
+#[tokio::test]
+async fn nyx_optional_durable_journal_gate() {
+    agent_runtime_testkit::conformance::journal::assert_optional_durable_journal().await;
+}
+
+#[test]
+fn nyx_moving_manifest_pins_block_release_adoption() {
+    use consumers::pinning::check_shared_runtime_pin;
+    let captured: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/consumers/nyx-dependencies.json")).unwrap();
+    // Read-only checkout currently tracks main. A lockfile revision does not
+    // satisfy the immutable-manifest release gate; keep this evidence visible.
+    assert!(
+        check_shared_runtime_pin(&captured["dependencies"])
+            .unwrap_err()
+            .contains("moving branch")
+    );
+    for dependency in [
+        "agent-runtime",
+        "agent-runtime-core",
+        "agent-runtime-testkit",
+    ] {
+        assert_eq!(captured["dependencies"][dependency]["branch"], "main");
+    }
+    let adopted = json!({
+        "agent-runtime": {"git":"fixture", "rev":"0123456789abcdef0123456789abcdef01234567"},
+        "agent-runtime-core": {"git":"fixture", "rev":"0123456789abcdef0123456789abcdef01234567"},
+        "agent-runtime-testkit": {"git":"fixture", "rev":"0123456789abcdef0123456789abcdef01234567"}
+    });
+    assert!(check_shared_runtime_pin(&adopted).is_ok());
+    assert!(
+        check_shared_runtime_pin(&json!({"agent-runtime":{"path":"../agent-runtime"}})).is_err()
+    );
+    assert!(check_shared_runtime_pin(&json!({"agent-runtime":{"version":"0.7"}})).is_err());
 }
