@@ -145,9 +145,14 @@ host policy: `InMemorySessionJournal::revoke_writer` is that host control, and a
 writer lease dropped without `close` keeps the session's writer slot until the
 host revokes it. The single transaction lock is held while the ordinary
 projection policy runs, so a policy must not call back into the same journal.
-`retire` and `collect` deliberately return the typed
-`JournalRetirement`/`JournalCollection` unsupported capabilities and retain all
-content until U9 group C. The runtime selects native mode for a fresh session
+`retire` and `collect` return typed unsupported and retain all content until the
+host explicitly calls `enable_collection`. Retirement additionally requires
+`authorize_retirement(session, revision, host_timestamp)` for that exact current
+revision, no writer, and no unresolved migration/fork/child dependency. A later
+commit invalidates the authorization. Retirement records a tombstone in the
+backend index, preventing recreation of the same execution identity; it does
+not change the released object, head or checkpoint format. The runtime selects
+native mode for a fresh session
 when every configured store exposes `journal()` (or for a session with a native
 head). On explicit resume, an existing v3 pair whose ordinary and protected
 stores both expose the capability is imported once: the runtime reserves both
@@ -192,6 +197,99 @@ keyed by operation only, reads that skip the lease, foreign-object resolution,
 unverified object reuse, a revocation that keeps the writer, an ordinary
 adapter ignoring policy or dropping exact roots) and require each to be
 rejected.
+
+### Explicit retirement, pins and collection (U9 group C)
+
+Collection is a host action with no library schedule, lease duration, retention
+TTL or automatic expiry. The reference's default constructors remain safe
+unsupported adapters. After explicit `enable_collection`, a host can mark an
+epoch and request bounded deletion:
+
+```rust
+let request = JournalGcRequest {
+    storage_id: journal.storage_id(),
+    expected_root_epoch: journal.root_epoch()?,
+    max_objects: 1_000,
+};
+let report = journal.collect(request).await?;
+```
+
+An intervening open, commit, renewal, close, host writer revocation, durable pin
+change, staging change or retirement invalidates that mark. A `StateConflict`
+requires a fresh mark; an epoch of zero is not a wildcard. The reference traces
+current roots and all process, retained, migration, transfer and staging pins
+under the same lock as deletion. A retained-root open either pins its complete
+closure before deletion or fails before returning a lease. Batch predecessor
+digests and idempotency results attest history; they do not root every obsolete
+request/checkpoint. Replay-fence metadata survives collection while execution
+roots are live, and the reference conservatively keeps it even after retirement.
+
+The reference's trusted host controls are `pin_transfer(&lease)` for durable
+migration/fork/child intent, `retain_root(&lease)` for explicit historical
+retention, and `release_pin(session, pin, expected_epoch)` after successful
+deterministic repair/abort or retention release. Pin an absent-head reservation
+before import/child publication: its committed closure is added atomically.
+Renewal preserves these pins; process close/revocation releases only the process
+handle. A failed repair never clears durable pins. `stage_leaves` illustrates
+protected immutable staging; ordinary drafts must first cross host projection
+and cannot use that bypass. Abort staging explicitly before reclaiming orphans.
+
+Separate ordinary/protected domains cannot infer each other's external roots.
+The host must reserve corresponding transfer pins in every affected domain
+before publication/ownership transfer. For example, a parent's ordinary child
+catalog requires a protected child pin even when the parent has no exact
+checkpoint. The runtime collection tests register those pins at writer open,
+including the absent-head reservation, and leave them intact through restart.
+
+Existing `runtime.session.fork_pending` and
+`agent-runtime.delegation.children` extensions also index dependencies without
+new wire fields. An unfinished fork blocks retirement of both endpoints; its
+matching committed supersession proof and published child seed resolve the
+transfer. Sensitive-body omission by ordinary policy preserves the non-content
+dependency index until an explicit semantic update; unknown index revisions
+return typed unsupported. Child catalog references and references in retained
+roots keep child
+content protected after process expiry. These indexes grant no cross-session
+read authority. Logical supersession alone never authorizes retirement.
+
+`InMemorySessionJournal::compact` only merges physical storage layers: all
+logical objects, even orphans, remain. `collect` deletes unreachable objects.
+LCM context compaction is another separate operation: it creates summary DAG
+nodes and preserves canonical history/source entries. Journal GC retains those
+canonical roots; Continue transfers retain all source messages in the successor.
+An adapter unable to prove its deletion fence must return typed
+`UnsupportedCapability::JournalCollection` and retain content.
+
+Third-party adapters can run
+`assert_session_journal_collection_conformance` with a fresh
+`SessionJournalCollectionFixture` per case; implement the test-only
+`JournalCollectionHost` controls using the adapter's real durable transactions.
+The companion `assert_ordinary_journal_collection_conformance` receives the
+scenario's projection policy and checks projected roots and raw-draft isolation.
+Every guarantee is also exported as an individual named assertion, including
+retirement, durable pins, retained checkpoints, epochs, replay fences, committed
+transfer roots, failed repair, reclamation and backend compaction.
+`assert_journal_gc_interleaving_conformance` accepts each of the eight
+`JournalGcInterleaving` operations and executes it before mark, between mark and
+deletion, and after deletion. Unsupported adapters run
+`assert_journal_unsupported_collection_conformance` instead. These collection
+suites complement the existing native commit/recovery suites; they do not
+replace them or add required methods to `SessionJournal`.
+
+The deterministic N=1000 protected session measurement uses eight exact
+CallingModel checkpoints, distinct projected summary/request settings, 16 KB
+opaque extension replacements and aborted staging. Retained immutable bytes are
+570,121 before collection, 404,529 with the current session live (165,592
+reclaimed), and 0 after authorized retirement and pin release. Every canonical
+message and the latest exact request still materialize after the first sweep.
+These are logical encoded bytes, excluding physical amplification and the small
+durable replay/retirement indexes. Reproduce with:
+
+```sh
+cargo test -p agent-runtime-testkit --all-features --lib \
+  long_session_collection_byte_evidence -- --nocapture
+cargo test -p agent-runtime-testkit --all-features --test journal_gc_runtime
+```
 
 ### Native turn byte-cost evidence (U9 task 2.7)
 
