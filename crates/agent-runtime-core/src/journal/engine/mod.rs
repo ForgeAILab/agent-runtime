@@ -222,6 +222,17 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         }
         let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
         let lease = scratch.open(session, request)?;
+        let dependencies = scratch
+            .lock()?
+            .leases
+            .get(&self.local.token(&lease)?.handle)
+            .ok_or_else(conflict)?
+            .dependencies
+            .sessions
+            .clone();
+        if self.retired_dependency(&dependencies).await? {
+            return Err(conflict());
+        }
         if writer {
             let write = self.write(
                 &scratch,

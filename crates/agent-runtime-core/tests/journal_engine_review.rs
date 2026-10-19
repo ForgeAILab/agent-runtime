@@ -155,3 +155,143 @@ fn review_sync_control_after_a_gate_handoff_does_not_stall_its_worker() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("a synchronous journal control stalled its runtime worker");
 }
+
+// ---- Restart over shared storage: a durable host's process comes back. ----
+
+fn restart_engine(
+    storage: &std::sync::Arc<VolatileJournalStorage>,
+) -> JournalEngine<VolatileJournalStorage> {
+    JournalEngine::ordinary(
+        storage.clone(),
+        JournalStorageId::new("restart"),
+        std::sync::Arc::new(IdentityJournalProjection),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Ordinary commit replacing the whole snapshot. With `child`, the snapshot's
+/// delegation catalog makes the head depend on that child session.
+fn catalog_commit(
+    session: &SessionId,
+    epoch: u64,
+    operation: &str,
+    previous: Option<&JournalHead>,
+    child: Option<&SessionId>,
+) -> JournalCommit {
+    let mut commit = empty_commit(session, epoch, operation);
+    if let Some(child) = child {
+        let mut snapshot = commit.delta.bootstrap.take().unwrap();
+        snapshot.extension_state.insert(
+            "agent-runtime.delegation.children".into(),
+            VersionedSessionState {
+                revision: agent_runtime_registry::RegistryRevision::new(
+                    "resumable-child-catalog-1",
+                ),
+                sensitivity: Default::default(),
+                value: serde_json::json!({
+                    "schema_version": 1,
+                    "children": [{
+                        "child_session": child.as_str(),
+                        "status": {"state": {"state": "stopped"}},
+                    }],
+                }),
+            },
+        );
+        commit.delta.bootstrap = Some(snapshot);
+        commit.batch.snapshot.extensions.len = 1;
+    }
+    if let Some(previous) = previous {
+        commit.batch.sequence = previous.batch_sequence + 1;
+        commit.batch.expected_revision = Some(previous.revision);
+        commit.batch.predecessor = Some(JournalDigest::parse(previous.batch.as_str()).unwrap());
+    }
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+/// Retirement tombstones are durable, so a restarted engine must refuse a
+/// head or a retained-root open that depends on a retired session exactly as
+/// the engine that retired it does.
+#[tokio::test]
+async fn review_restart_keeps_retired_dependencies_unselectable() {
+    let storage = std::sync::Arc::new(VolatileJournalStorage::default());
+    let (child, parent) = (SessionId::new("child"), SessionId::new("parent"));
+    let writer = || open("writer", JournalOpenIntent::ExclusiveWriter);
+    let first = restart_engine(&storage);
+    // The parent's first head depends on the child; its second does not.
+    let lease = first.open(&parent, writer()).await.unwrap();
+    let epoch = lease.writer_epoch().unwrap();
+    let old = first
+        .commit(
+            &lease,
+            catalog_commit(&parent, epoch, "p1", None, Some(&child)),
+        )
+        .await
+        .unwrap();
+    let new = first
+        .commit(
+            &lease,
+            catalog_commit(&parent, epoch, "p2", Some(&old), None),
+        )
+        .await
+        .unwrap();
+    first.close(lease).await.unwrap();
+    // Publish, then retire, the child.
+    let lease = first.open(&child, writer()).await.unwrap();
+    let head = first
+        .commit(
+            &lease,
+            catalog_commit(&child, lease.writer_epoch().unwrap(), "c1", None, None),
+        )
+        .await
+        .unwrap();
+    first.close(lease).await.unwrap();
+    first
+        .authorize_retirement(&child, head.revision, Timestamp(5))
+        .await
+        .unwrap();
+    first.retire(&child, head.revision).await.unwrap();
+    let old_root = JournalObject::encode(JournalObjectKind::Head, &old)
+        .unwrap()
+        .id;
+    let retained = || JournalOpen {
+        root: JournalRootSelection::Retained {
+            root: old_root.clone(),
+        },
+        intent: JournalOpenIntent::ReadOnly,
+        ..open("retained", JournalOpenIntent::ReadOnly)
+    };
+    for engine in [first, restart_engine(&storage)] {
+        assert_conflict(engine.open(&parent, retained()).await);
+        let lease = engine.open(&parent, writer()).await.unwrap();
+        let dependent = || {
+            catalog_commit(
+                &parent,
+                lease.writer_epoch().unwrap(),
+                "p3",
+                Some(&new),
+                Some(&child),
+            )
+        };
+        assert_conflict(engine.commit(&lease, dependent()).await);
+        // Dependencies are validated after the batch cut and before the pin
+        // cut: an earlier armed cut wins, a later one is never reached.
+        engine
+            .fail_next_commit_at(JournalCommitFailurePoint::AfterBatch)
+            .unwrap();
+        let error = engine.commit(&lease, dependent()).await.unwrap_err();
+        assert!(
+            error.retryable && matches!(error.class, FailureClass::HostComponent { .. }),
+            "{error:?}"
+        );
+        engine
+            .fail_next_commit_at(JournalCommitFailurePoint::AfterPin)
+            .unwrap();
+        assert_conflict(engine.commit(&lease, dependent()).await);
+        assert_conflict(engine.fail_next_commit_at(JournalCommitFailurePoint::AfterHead));
+        engine.close(lease).await.unwrap();
+    }
+}

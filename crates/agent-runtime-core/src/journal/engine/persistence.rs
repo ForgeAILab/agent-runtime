@@ -130,6 +130,22 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         Ok(objects)
     }
+    /// `DependencyRoots::validate` sees only sessions this process has
+    /// loaded. Retirement tombstones are durable, so a restarted engine must
+    /// also consult storage before it selects or publishes a root that
+    /// depends on another session.
+    pub(super) async fn retired_dependency(
+        &self,
+        sessions: &BTreeSet<SessionId>,
+    ) -> Result<bool, RuntimeError> {
+        for session in sessions {
+            let stored = self.storage.load(&self.domain, session).await?;
+            if stored.is_some_and(|record| record.retirement.is_some()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     pub(super) fn write(
         &self,
         scratch: &Transition,
@@ -366,6 +382,34 @@ impl<S: JournalStorage> JournalEngine<S> {
                 return Err(error);
             }
         };
+        let dependencies = scratch
+            .lock()?
+            .sessions
+            .get(lease.session())
+            .ok_or_else(conflict)?
+            .dependencies
+            .sessions
+            .clone();
+        if self.retired_dependency(&dependencies).await? {
+            // The reference validates dependencies after the batch cut and
+            // before the pin cut: an earlier cut wins, a later one stays armed.
+            let cut = scratch.cut.lock().map_err(|_| host_failure())?.take();
+            return match cut {
+                Some(
+                    JournalCommitFailurePoint::AfterObjects
+                    | JournalCommitFailurePoint::AfterCheckpoint
+                    | JournalCommitFailurePoint::AfterBatch,
+                ) => Err(injected_failure()),
+                Some(later) => {
+                    let mut armed = self.local.failure.lock().map_err(|_| host_failure())?;
+                    if armed.is_none() {
+                        *armed = Some(later);
+                    }
+                    Err(conflict())
+                }
+                None => Err(conflict()),
+            };
+        }
         let mut write = self.write(
             &scratch,
             lease.session(),
