@@ -533,6 +533,23 @@ Failed repair is exercised at every pre-visibility commit cut, and separately
 against a committed fork intent and retained dependency root. Existing test
 expectations and all released encoding fixtures remain unchanged.
 
+Review refinement (2026-10-18): scratch mutations of the reference showed the
+suite could not fail a collector that ignored transfer pins on a superseded
+root, stopped tracing a renewed lease, skipped any of ten object kinds (JSON
+spine/inline nodes, legacy and structured manifests, usage records, tool
+schemas, internal input; five were absent from every GC test and five were
+caught only by the in-repo runtime harness), honored another session's
+retirement grant, retired a fork parent on its supersession proof before the
+child seed published, or deleted an ordinary FromIndex child's shared suffix.
+`assert_journal_gc_object_kind_closure_conformance` now publishes all 21 object
+kinds under a live root and an explicit retention pin; the durable-pin,
+retirement, committed-transfer and ordinary cases cover the rest. The 24 rows'
+steps are host-side sequencing at the trait boundary: `collect` re-traces under
+the same lock as deletion, so the reference has no internal mark/delete window,
+and a two-phase collector stays safe only because every root/pin change advances
+the epoch, which the epoch case checks operation by operation. The interleaving
+matrix stages protected leaves, so ordinary-only adapters cannot run it.
+
 ## v3 Upgrade, Including Mid-turn
 
 'v3 snapshot' means the v3-era storage pair: SessionSnapshot itself has no

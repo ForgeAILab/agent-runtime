@@ -326,8 +326,11 @@ merely contract merge.
   retained dependency root after failed repair. Physical backend `compact`
   retains orphan bytes, unlike logical `collect`; LCM compaction keeps canonical
   sources. Default unsupported tests and all earlier expectations remain intact.
+  Review (2026-10-18): mutation of the reference found six collector defects the
+  suite accepted; each now fails a named case, including the all-object-kind
+  `assert_journal_gc_object_kind_closure_conformance` (see design.md).
   Verification (2026-10-18): fmt and all-target/all-feature Clippy clean; core
-  276, runtime 656, testkit 405 (including 25 collection and 9 runtime GC tests),
+  276, runtime 656, testkit 406 (including 26 collection and 9 runtime GC tests),
   LCM 62; Rust 1.86 core/runtime build and strict change validation pass. The
   cross-domain host fixture registers protected child pins before publication,
   since the parent's actual child catalog is an ordinary-store publication.

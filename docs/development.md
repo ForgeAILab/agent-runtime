@@ -268,7 +268,12 @@ The companion `assert_ordinary_journal_collection_conformance` receives the
 scenario's projection policy and checks projected roots and raw-draft isolation.
 Every guarantee is also exported as an individual named assertion, including
 retirement, durable pins, retained checkpoints, epochs, replay fences, committed
-transfer roots, failed repair, reclamation and backend compaction.
+transfer roots, failed repair, reclamation, backend compaction and
+`assert_journal_gc_object_kind_closure_conformance`, which publishes every
+object kind (JSON spine/inline nodes, legacy and structured manifests, usage,
+tool schemas, internal input) and requires each to survive collection. The
+interleaving matrix stages protected leaves, so ordinary-only adapters run the
+ordinary suite, which includes a FromIndex shared-suffix retirement case.
 `assert_journal_gc_interleaving_conformance` accepts each of the eight
 `JournalGcInterleaving` operations and executes it before mark, between mark and
 deletion, and after deletion. Unsupported adapters run
