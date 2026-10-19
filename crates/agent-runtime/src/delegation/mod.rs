@@ -39,7 +39,8 @@ use agent_runtime_core::approval::{
     ApprovalDecision, ApprovalOrigin, ApprovalPolicy, ApprovalRequest,
 };
 use agent_runtime_core::artifact::{
-    ArtifactLineage, ArtifactProvenance, ArtifactRef, ArtifactStore, ArtifactTransfer,
+    ArtifactLineage, ArtifactProvenance, ArtifactRef, ArtifactRetention, ArtifactSensitivity,
+    ArtifactStore, ArtifactTransfer, ArtifactWrite,
 };
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::checkpoint::{
@@ -47,8 +48,8 @@ use agent_runtime_core::checkpoint::{
 };
 use agent_runtime_core::clock::{Deadline, Timestamp};
 use agent_runtime_core::content::{
-    InternalTurnInput, InternalTurnSensitivity, InternalTurnSource, MAX_INTERNAL_TURN_CHARS,
-    Message, UserInput,
+    CHILD_COMPLETION_SOURCE_KIND, InternalTurnInput, InternalTurnSensitivity, InternalTurnSource,
+    MAX_CHILD_COMPLETION_TURN_CHARS, Message, UserInput,
 };
 use agent_runtime_core::delegation::{ChildSpec, ToolViewScope, WorkspacePolicy};
 use agent_runtime_core::error::{ErrorKind, RuntimeError};
@@ -97,6 +98,15 @@ const CHILD_OUTCOME_CURSOR_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_DELEGATION_WAIT: Duration = Duration::from_secs(5);
 /// Absolute runtime hard cap for one delegation wait.
 pub const HARD_MAX_DELEGATION_WAIT: Duration = Duration::from_secs(30);
+/// Default bytes of child replies one automatic delivery carries inline.
+pub const DEFAULT_CHILD_DELIVERY_INLINE_BYTES: usize = 4_096;
+/// Largest host-configurable inline delivery budget.
+pub const MAX_CHILD_DELIVERY_INLINE_BYTES: usize = 1024 * 1024;
+/// Bytes of a reply shown when the whole reply does not fit a delivery.
+/// Replies longer than this are also stored as parent-owned artifacts.
+pub const CHILD_REPLY_EXCERPT_BYTES: usize = 1_024;
+/// Artifact purpose of a stored child reply.
+pub const CHILD_REPLY_ARTIFACT_PURPOSE: &str = "delegation.child-reply";
 
 /// Builds the runtime a child session runs on.
 ///

@@ -20,6 +20,23 @@ contain breaking changes and are coordinated with consumer proposals.
   like a bootstrap. `assert_ordinary_session_journal_conformance` now requires
   ordinary journal adapters to accept the same replacement; one that still
   rejects it fails closed as before.
+- Automatic child-completion delivery is no longer refused when its batch
+  passes the 4,096-character internal-turn limit. Such a batch stayed ready,
+  so one long child reply blocked every later delivery to that parent.
+  Replies are now inlined while they fit `DelegationConfig::delivery_inline_bytes`
+  (default 4,096); a longer reply is delivered as its opening 1,024 bytes plus
+  a reference to a parent-owned copy (purpose `delegation.child-reply`), and
+  a `delegation.child-completion` turn is bounded by
+  `MAX_CHILD_COMPLETION_TURN_CHARS` instead of the general limit.
+- A delivered child outcome now lists the artifacts transferred to the parent
+  (parent id, child source id, media type, size); before, the model was never
+  told they existed.
+
+### Changed
+
+- **Breaking (pre-1.0):** `ChildTaskResult` gains `reply: Option<Box<ArtifactRef>>`
+  and `DelegationConfig` gains `delivery_inline_bytes`. Struct literals must
+  set them; `ChildTaskResult::reply` deserializes as `None` from older state.
 
 ## [0.6.2] - 2026-10-18
 

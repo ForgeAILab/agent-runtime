@@ -14,6 +14,7 @@ impl DelegationCoordinator {
             return Err(depth_violation());
         }
         config.validate_wait_options(DelegationWaitOptions::default())?;
+        config.validate_delivery_budget()?;
         if factory.durability() == ChildDurability::Durable
             && parent.inner().shared.session_store.is_none()
         {
@@ -929,16 +930,12 @@ impl DelegationCoordinator {
             // the synthetic model projection therefore remains Sensitive for
             // the entire batch, not only for questionnaire outcomes.
             let sensitivity = InternalTurnSensitivity::Sensitive;
-            let content = match child_completion_content(&available) {
-                Ok(content) => content,
-                Err(reason) => {
-                    return Ok(ChildCompletionAdmission::Conflict { reason });
-                }
-            };
+            let content =
+                child_completion_content(&available, self.inner.config.delivery_inline_bytes);
             let input = InternalTurnInput::new(
                 content,
                 InternalTurnSource {
-                    kind: "delegation.child-completion".to_owned(),
+                    kind: CHILD_COMPLETION_SOURCE_KIND.to_owned(),
                     id: format!("cursor-{}", next.revision()),
                     revision: RegistryRevision::new("delegation-child-completion-1"),
                     sensitivity,
@@ -1189,18 +1186,72 @@ impl Drop for PendingChildOutcomeAdmission {
     }
 }
 
+/// Transferred artifacts listed per outcome before the rest are summarized.
+const MAX_LISTED_CHILD_ARTIFACTS: usize = 32;
+
+/// Builds one delivery for a ready batch. Replies are inlined whole, in
+/// batch order, while they fit `inline_budget` bytes; a reply that does not
+/// fit is shown as an excerpt with a reference to its stored copy. Size
+/// never refuses a delivery: a batch that would still exceed the
+/// child-completion ceiling is rebuilt as one compact line per outcome.
 fn child_completion_content(
     outcomes: &[(ChildOutcomeKey, ChildTaskOutcome)],
-) -> Result<String, String> {
+    inline_budget: usize,
+) -> String {
+    let content = child_completion_lines(outcomes, inline_budget, false);
+    if content.chars().count() <= MAX_CHILD_COMPLETION_TURN_CHARS {
+        return content;
+    }
+    let compact = child_completion_lines(outcomes, 0, true);
+    if compact.chars().count() <= MAX_CHILD_COMPLETION_TURN_CHARS {
+        return compact;
+    }
+    let notice = "\n[delivery truncated: read each child's result for the remaining outcomes]\n";
+    let mut truncated = compact
+        .chars()
+        .take(MAX_CHILD_COMPLETION_TURN_CHARS - notice.chars().count())
+        .collect::<String>();
+    truncated.push_str(notice);
+    truncated
+}
+
+fn child_completion_lines(
+    outcomes: &[(ChildOutcomeKey, ChildTaskOutcome)],
+    inline_budget: usize,
+    compact: bool,
+) -> String {
     let mut content = String::from("Protected delegated child outcomes:\n");
+    let mut remaining = inline_budget;
     for (_, outcome) in outcomes {
         match outcome {
             ChildTaskOutcome::Completed { child, result } => {
-                content.push_str("- child ");
-                content.push_str(child.as_str());
-                content.push_str(" completed:\n");
-                content.push_str(&result.text);
-                content.push('\n');
+                let size = result.text.len();
+                if !compact && (size <= remaining || size <= CHILD_REPLY_EXCERPT_BYTES) {
+                    remaining = remaining.saturating_sub(size);
+                    content.push_str(&format!("- child {child} completed:\n"));
+                    content.push_str(&result.text);
+                    content.push('\n');
+                } else {
+                    let rest = match &result.reply {
+                        Some(reply) => format!(
+                            "is stored as artifact {} (read it with artifact.read)",
+                            reply.id
+                        ),
+                        None => "did not fit this delivery; read the child's result for the rest"
+                            .to_owned(),
+                    };
+                    content.push_str(&format!(
+                        "- child {child} completed; its {size}-byte reply {rest}"
+                    ));
+                    if compact {
+                        content.push('\n');
+                    } else {
+                        content.push_str(". It begins:\n");
+                        content.push_str(excerpt(&result.text, CHILD_REPLY_EXCERPT_BYTES));
+                        content.push_str("\n[…]\n");
+                    }
+                }
+                push_transferred_artifacts(&mut content, &result.artifacts, compact);
             }
             ChildTaskOutcome::NeedsInput { child, request } => {
                 content.push_str("- child ");
@@ -1223,12 +1274,52 @@ fn child_completion_content(
             }
         }
     }
-    if content.chars().count() > MAX_INTERNAL_TURN_CHARS {
-        return Err(format!(
-            "protected child outcome batch exceeds the bounded internal-turn limit of {MAX_INTERNAL_TURN_CHARS} characters"
+    content
+}
+
+fn push_transferred_artifacts(content: &mut String, artifacts: &[ArtifactRef], compact: bool) {
+    if artifacts.is_empty() {
+        return;
+    }
+    if compact {
+        content.push_str(&format!(
+            "  {} artifacts were copied to this session; read the child's result for their ids\n",
+            artifacts.len()
+        ));
+        return;
+    }
+    content.push_str("  artifacts copied to this session (read with artifact.read):\n");
+    for artifact in artifacts.iter().take(MAX_LISTED_CHILD_ARTIFACTS) {
+        let origin = artifact
+            .provenance
+            .derived_from
+            .as_ref()
+            .map(|source| format!("copy of child artifact {}, ", source.id))
+            .unwrap_or_default();
+        content.push_str(&format!(
+            "  - {} ({origin}{}, {} bytes)\n",
+            artifact.id, artifact.media_type, artifact.byte_length
         ));
     }
-    Ok(content)
+    if artifacts.len() > MAX_LISTED_CHILD_ARTIFACTS {
+        content.push_str(&format!(
+            "  - and {} more; read the child's result for the full list\n",
+            artifacts.len() - MAX_LISTED_CHILD_ARTIFACTS
+        ));
+    }
+}
+
+/// The longest prefix of `text` within `max_bytes` that ends on a character
+/// boundary.
+fn excerpt(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 #[cfg(test)]
@@ -1256,9 +1347,204 @@ mod tests {
                 turn: TurnId::new("turn-1"),
                 text: "completed".to_owned(),
                 artifacts: Vec::new(),
+                reply: None,
             },
         };
         let error = validate_outcome_key_value(&key, &outcome).unwrap_err();
         assert!(error.message.contains("variant"));
     }
+
+    fn artifact(id: &str, copied_from: Option<&str>) -> ArtifactRef {
+        use agent_runtime_core::artifact::{ArtifactDigest, ArtifactId};
+        let digest = ArtifactDigest::new("sha256", "0".repeat(64)).unwrap();
+        let mut provenance = ArtifactProvenance::new(SessionId::new("parent"), "test");
+        if let Some(source) = copied_from {
+            provenance = provenance.with_derived_from(ArtifactLineage {
+                session: SessionId::new("child-session"),
+                id: ArtifactId::new(source).unwrap(),
+                digest: digest.clone(),
+            });
+        }
+        ArtifactRef {
+            id: ArtifactId::new(id).unwrap(),
+            digest,
+            media_type: "text/plain".to_owned(),
+            byte_length: 200_000,
+            sensitivity: ArtifactSensitivity::Sensitive,
+            retention: ArtifactRetention::Session,
+            provenance,
+        }
+    }
+
+    fn completed(
+        child: &str,
+        text: String,
+        artifacts: Vec<ArtifactRef>,
+        reply: Option<Box<ArtifactRef>>,
+    ) -> (ChildOutcomeKey, ChildTaskOutcome) {
+        (
+            ChildOutcomeKey::new(
+                ChildId::new(child),
+                ChildOutcomeIdentity::Completed(TurnId::new("turn-1")),
+            ),
+            ChildTaskOutcome::Completed {
+                child: ChildId::new(child),
+                result: ChildTaskResult {
+                    turn: TurnId::new("turn-1"),
+                    text,
+                    artifacts,
+                    reply,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn a_short_reply_without_artifacts_keeps_the_existing_delivery_text() {
+        let content = child_completion_content(
+            &[completed(
+                "child-1",
+                "child result".to_owned(),
+                vec![],
+                None,
+            )],
+            DEFAULT_CHILD_DELIVERY_INLINE_BYTES,
+        );
+        assert_eq!(
+            content,
+            "Protected delegated child outcomes:\n- child child-1 completed:\nchild result\n"
+        );
+    }
+
+    #[test]
+    fn a_reply_within_the_budget_is_delivered_whole() {
+        let reply = "finding\n".repeat(900);
+        assert!(reply.len() > MAX_INTERNAL_TURN_CHARS_FOR_TESTS);
+        let content =
+            child_completion_content(&[completed("child-1", reply.clone(), vec![], None)], 8_192);
+        assert!(content.contains(&reply));
+        InternalTurnInput::new(
+            content,
+            InternalTurnSource {
+                kind: CHILD_COMPLETION_SOURCE_KIND.to_owned(),
+                id: "cursor-1".to_owned(),
+                revision: RegistryRevision::new("delegation-child-completion-1"),
+                sensitivity: InternalTurnSensitivity::Sensitive,
+                goal: None,
+            },
+        )
+        .expect("a delivery larger than the general internal-turn bound is accepted");
+    }
+
+    #[test]
+    fn a_reply_over_the_budget_becomes_an_excerpt_and_a_reference() {
+        let reply = format!("HEAD\n{}TAIL", "finding\n".repeat(2_000));
+        let content = child_completion_content(
+            &[completed(
+                "child-1",
+                reply.clone(),
+                vec![],
+                Some(Box::new(artifact("a-reply", None))),
+            )],
+            8_192,
+        );
+        assert!(content.contains("HEAD"), "{content}");
+        assert!(!content.contains("TAIL"), "{content}");
+        assert!(
+            content.contains(&format!(
+                "its {}-byte reply is stored as artifact a-reply",
+                reply.len()
+            )),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_reply_over_the_budget_without_a_stored_copy_points_at_the_result() {
+        let reply = "finding\n".repeat(2_000);
+        let content = child_completion_content(&[completed("child-1", reply, vec![], None)], 8_192);
+        assert!(
+            content.contains("did not fit this delivery; read the child's result for the rest"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn replies_are_inlined_in_order_while_they_fit_the_budget() {
+        let reply = |marker: &str| format!("{marker}\n{}", "finding\n".repeat(400));
+        let outcomes = [
+            completed(
+                "child-1",
+                reply("FIRST"),
+                vec![],
+                Some(Box::new(artifact("a-1", None))),
+            ),
+            completed(
+                "child-2",
+                reply("SECOND"),
+                vec![],
+                Some(Box::new(artifact("a-2", None))),
+            ),
+            completed(
+                "child-3",
+                reply("THIRD"),
+                vec![],
+                Some(Box::new(artifact("a-3", None))),
+            ),
+        ];
+        let content = child_completion_content(&outcomes, 7_000);
+        assert!(
+            content.contains("- child child-1 completed:\nFIRST"),
+            "{content}"
+        );
+        assert!(
+            content.contains("- child child-2 completed:\nSECOND"),
+            "{content}"
+        );
+        assert!(
+            content.contains("- child child-3 completed; its") && content.contains("a-3"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn transferred_artifacts_are_named_with_their_child_source() {
+        let content = child_completion_content(
+            &[completed(
+                "child-1",
+                "child artifact ready".to_owned(),
+                vec![artifact("a-parent", Some("a-child"))],
+                None,
+            )],
+            DEFAULT_CHILD_DELIVERY_INLINE_BYTES,
+        );
+        assert!(
+            content.contains(
+                "  - a-parent (copy of child artifact a-child, text/plain, 200000 bytes)\n"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_batch_over_the_ceiling_is_delivered_compactly() {
+        let reply = "x".repeat(MAX_CHILD_DELIVERY_INLINE_BYTES);
+        let outcomes = (0..4)
+            .map(|index| {
+                completed(
+                    &format!("child-{index}"),
+                    reply.clone(),
+                    vec![artifact("a-parent", Some("a-child"))],
+                    Some(Box::new(artifact(&format!("a-reply-{index}"), None))),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Four whole replies inline would pass the ceiling.
+        let content = child_completion_content(&outcomes, usize::MAX);
+        assert!(content.chars().count() <= MAX_CHILD_COMPLETION_TURN_CHARS);
+        assert!(content.contains("a-reply-3"), "{content}");
+    }
+
+    const MAX_INTERNAL_TURN_CHARS_FOR_TESTS: usize =
+        agent_runtime_core::content::MAX_INTERNAL_TURN_CHARS;
 }

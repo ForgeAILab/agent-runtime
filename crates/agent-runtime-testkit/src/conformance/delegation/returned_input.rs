@@ -514,6 +514,7 @@ pub async fn assert_child_completion_admission_is_atomic_and_user_prioritized() 
                 turn: TurnId::new("turn-1"),
                 text: "child completion".to_owned(),
                 artifacts: Vec::new(),
+                reply: None,
             },
         }),
         "automatic admission must not consume host inspection state"
@@ -1768,6 +1769,7 @@ pub async fn assert_follow_up_persists_ready_removal_before_send() {
                 turn: TurnId::new("turn-1"),
                 text: "before follow-up".to_owned(),
                 artifacts: Vec::new(),
+                reply: None,
             },
         }
     );
@@ -1968,6 +1970,7 @@ pub async fn assert_returned_input_pairs_and_is_lossless() {
                 turn: TurnId::new("turn-2"),
                 text: "continued after explicit follow-up".to_owned(),
                 artifacts: Vec::new(),
+                reply: None,
             },
         }],
         "explicit follow-up must clear stale input and deliver its own completion once"
@@ -1980,6 +1983,7 @@ pub async fn assert_returned_input_pairs_and_is_lossless() {
                 turn: TurnId::new("turn-2"),
                 text: "continued after explicit follow-up".to_owned(),
                 artifacts: Vec::new(),
+                reply: None,
             },
         }],
         "automatic delivery remains idempotent after explicit follow-up"
