@@ -481,3 +481,326 @@ async fn review_revocation_during_a_suspended_commit_is_fenced_at_the_next_open(
     assert_eq!(next.writer_epoch(), Some(2));
     assert_eq!(next.head(), Some(&head));
 }
+
+fn outcome<T>(result: Result<T, RuntimeError>) -> String {
+    match result {
+        Ok(_) => "ok".into(),
+        Err(error) => format!(
+            "{:?}/{:?}/{}/{}",
+            error.kind, error.class, error.retryable, error.message
+        ),
+    }
+}
+
+/// Error kinds, phases, retryability and messages of the public surface, in
+/// call order, including every armed commit cut and what each cut leaves
+/// visible. The expected transcript was recorded from the pre-extraction
+/// reference backend.
+#[tokio::test]
+async fn review_public_error_transcript() {
+    let id = JournalStorageId::new("errors");
+    let journal = InMemorySessionJournal::protected(id.clone());
+    let ordinary = InMemorySessionJournal::ordinary(
+        JournalStorageId::new("ordinary"),
+        std::sync::Arc::new(IdentityJournalProjection),
+    );
+    let session = SessionId::new("s");
+    let mut t = Vec::new();
+    let request = |epoch| JournalGcRequest {
+        storage_id: id.clone(),
+        expected_root_epoch: epoch,
+        max_objects: u64::MAX,
+    };
+    t.push(outcome(journal.retire(&session, JournalRevision(1)).await));
+    t.push(outcome(journal.collect(request(0)).await));
+    t.push(outcome(journal.authorize_retirement(
+        &session,
+        JournalRevision(1),
+        Timestamp(1),
+    )));
+    t.push(outcome(journal.revoke_writer(&session)));
+    let writer = journal
+        .open(&session, open("writer", JournalOpenIntent::ExclusiveWriter))
+        .await
+        .unwrap();
+    t.push(outcome(
+        journal
+            .open(&session, open("writer", JournalOpenIntent::ReadOnly))
+            .await,
+    ));
+    t.push(outcome(
+        journal
+            .open(&session, open("second", JournalOpenIntent::ExclusiveWriter))
+            .await,
+    ));
+    t.push(outcome(
+        journal
+            .read(&writer, &JournalObjectId::from_bytes([7; 32]))
+            .await,
+    ));
+    t.push(outcome(ordinary.stage_leaves(
+        &writer,
+        JournalPinId::new("stage"),
+        vec![],
+    )));
+    let first = JournalCommitFailurePoint::ALL[0];
+    journal.fail_next_commit_at(first).unwrap();
+    t.push(outcome(
+        journal.fail_next_commit_at(JournalCommitFailurePoint::AfterHead),
+    ));
+    for point in JournalCommitFailurePoint::ALL.iter().copied() {
+        let cut = SessionId::new(format!("cut-{point:?}"));
+        let lease = journal
+            .open(&cut, open("cut", JournalOpenIntent::ExclusiveWriter))
+            .await
+            .unwrap();
+        if point != first {
+            journal.fail_next_commit_at(point).unwrap();
+        }
+        let commit = empty_commit(&cut, lease.writer_epoch().unwrap(), "op");
+        let epoch = journal.root_epoch().unwrap();
+        t.push(format!(
+            "{point:?}: {} epoch+{}",
+            outcome(journal.commit(&lease, commit.clone()).await),
+            journal.root_epoch().unwrap() - epoch
+        ));
+        let lease = journal.renew(&lease).await.unwrap();
+        let visible = lease.head().cloned();
+        t.push(format!(
+            "{point:?} visible: {:?}",
+            visible.as_ref().map(|h| h.revision)
+        ));
+        let replay = journal.commit(&lease, commit).await;
+        t.push(format!(
+            "{point:?} replay: {} same: {}",
+            outcome(replay.as_ref().map(|_| ()).map_err(Clone::clone)),
+            visible.is_none() || replay.ok() == visible
+        ));
+        journal.close(lease).await.unwrap();
+    }
+    let head = journal
+        .commit(
+            &writer,
+            empty_commit(&session, writer.writer_epoch().unwrap(), "op"),
+        )
+        .await
+        .unwrap();
+    t.push(outcome(journal.retire(&session, head.revision).await));
+    journal.enable_collection().unwrap();
+    t.push(outcome(journal.collect(request(0)).await));
+    t.push(outcome(journal.release_pin(
+        &session,
+        &JournalPinId::new("writer"),
+        journal.root_epoch().unwrap(),
+    )));
+    journal.pin_transfer(&writer).unwrap();
+    t.push(outcome(journal.retain_root(&writer)));
+    t.push(outcome(journal.release_pin(
+        &session,
+        &JournalPinId::new("writer"),
+        0,
+    )));
+    t.push(outcome(journal.authorize_retirement(
+        &session,
+        JournalRevision(9),
+        Timestamp(1),
+    )));
+    journal
+        .authorize_retirement(&session, head.revision, Timestamp(1))
+        .unwrap();
+    t.push(outcome(journal.retire(&session, head.revision).await));
+    journal.close(writer).await.unwrap();
+    t.push(outcome(journal.retire(&session, head.revision).await));
+    journal
+        .release_pin(
+            &session,
+            &JournalPinId::new("writer"),
+            journal.root_epoch().unwrap(),
+        )
+        .unwrap();
+    t.push(outcome(journal.retire(&session, head.revision).await));
+    t.push(outcome(
+        journal
+            .open(&session, open("late", JournalOpenIntent::ReadOnly))
+            .await,
+    ));
+    t.push(outcome(
+        journal
+            .open(&session, open("late", JournalOpenIntent::ExclusiveWriter))
+            .await,
+    ));
+    t.push(outcome(journal.collect(request(0)).await));
+    let report = journal
+        .collect(request(journal.root_epoch().unwrap()))
+        .await
+        .unwrap();
+    t.push(format!("{report:?}"));
+    let conflict = "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/\
+                    invalid or incomplete published journal boundary"
+        .to_string();
+    let injected = "Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/\
+                    injected journal commit failure";
+    let expected = vec![
+        "Config/UnsupportedCapability { stage: PreProvider, capability: JournalRetirement }/false/unsupported persistence capability".to_string(),
+        "Config/UnsupportedCapability { stage: PreProvider, capability: JournalCollection }/false/unsupported persistence capability".to_string(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        "AfterObjects: Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/injected journal commit failure epoch+0".to_string(),
+        "AfterObjects visible: None".to_string(),
+        "AfterObjects replay: ok same: true".to_string(),
+        "AfterCheckpoint: Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/injected journal commit failure epoch+0".to_string(),
+        "AfterCheckpoint visible: None".to_string(),
+        "AfterCheckpoint replay: ok same: true".to_string(),
+        "AfterBatch: Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/injected journal commit failure epoch+0".to_string(),
+        "AfterBatch visible: None".to_string(),
+        "AfterBatch replay: ok same: true".to_string(),
+        "AfterPin: Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/injected journal commit failure epoch+0".to_string(),
+        "AfterPin visible: None".to_string(),
+        "AfterPin replay: ok same: true".to_string(),
+        "AfterHead: Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/injected journal commit failure epoch+0".to_string(),
+        "AfterHead visible: None".to_string(),
+        "AfterHead replay: ok same: true".to_string(),
+        "AfterIdempotency: Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/injected journal commit failure epoch+0".to_string(),
+        "AfterIdempotency visible: None".to_string(),
+        "AfterIdempotency replay: ok same: true".to_string(),
+        "AfterCommit: Internal/HostComponent { stage: PreProvider, component: Checkpoint }/true/injected journal commit failure epoch+1".to_string(),
+        "AfterCommit visible: Some(JournalRevision(1))".to_string(),
+        "AfterCommit replay: ok same: true".to_string(),
+        "Config/UnsupportedCapability { stage: PreProvider, capability: JournalRetirement }/false/unsupported persistence capability".to_string(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        conflict.clone(),
+        "ok".to_string(),
+        "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
+        "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
+        conflict.clone(),
+        "JournalGcReport { root_epoch: 35, examined: 16, deleted: 2, reclaimed_bytes: 1445 }".to_string(),
+    ];
+    assert_eq!(t, expected);
+}
+
+/// Root-epoch transcript and collection reports of the public host controls,
+/// as recorded from the pre-extraction reference backend.
+#[tokio::test]
+async fn review_public_epoch_transcript() {
+    let id = JournalStorageId::new("epochs");
+    let journal = InMemorySessionJournal::protected(id.clone());
+    let session = SessionId::new("s");
+    let mut transcript = vec![journal.root_epoch().unwrap()];
+    journal.enable_collection().unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let lease = journal
+        .open(&session, open("writer", JournalOpenIntent::ExclusiveWriter))
+        .await
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let head = journal
+        .commit(
+            &lease,
+            empty_commit(&session, lease.writer_epoch().unwrap(), "op"),
+        )
+        .await
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    journal.pin_transfer(&lease).unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let lease = journal.renew(&lease).await.unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let leaf = JournalObject::encode(
+        JournalObjectKind::Message,
+        &agent_runtime_core::content::Message::user("orphan"),
+    )
+    .unwrap();
+    journal
+        .stage_leaves(&lease, JournalPinId::new("stage"), vec![leaf])
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    journal.close(lease).await.unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let reader = journal
+        .open(&session, open("retained", JournalOpenIntent::ReadOnly))
+        .await
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    journal.retain_root(&reader).unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    journal.close(reader).await.unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    for pin in ["writer", "stage"] {
+        journal
+            .release_pin(
+                &session,
+                &JournalPinId::new(pin),
+                journal.root_epoch().unwrap(),
+            )
+            .unwrap();
+        transcript.push(journal.root_epoch().unwrap());
+    }
+    journal.compact().unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    journal
+        .authorize_retirement(&session, head.revision, Timestamp(9))
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let retirement = journal.retire(&session, head.revision).await.unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    assert_eq!(retirement.root_epoch, journal.root_epoch().unwrap());
+    let request = |epoch| JournalGcRequest {
+        storage_id: id.clone(),
+        expected_root_epoch: epoch,
+        max_objects: u64::MAX,
+    };
+    let first = journal
+        .collect(request(journal.root_epoch().unwrap()))
+        .await
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    journal
+        .release_pin(
+            &session,
+            &JournalPinId::new("retained"),
+            journal.root_epoch().unwrap(),
+        )
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let second = journal
+        .collect(request(journal.root_epoch().unwrap()))
+        .await
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let third = journal
+        .collect(request(journal.root_epoch().unwrap()))
+        .await
+        .unwrap();
+    transcript.push(journal.root_epoch().unwrap());
+    let reports: Vec<_> = [first, second, third]
+        .iter()
+        .map(|r| (r.root_epoch, r.examined, r.deleted, r.reclaimed_bytes))
+        .collect();
+    assert_eq!(
+        reports,
+        vec![(13, 3, 1, 133), (15, 2, 2, 1445), (16, 0, 0, 0)]
+    );
+    assert_eq!(
+        (
+            journal.object_count().unwrap(),
+            journal.object_bytes().unwrap()
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        transcript,
+        vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, 13, 14, 15, 16, 16
+        ]
+    );
+}
