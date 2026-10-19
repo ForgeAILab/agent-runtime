@@ -191,3 +191,76 @@ pub(crate) fn legacy(root: &Path, row: &super::fixture::LegacyRow, blobs: usize)
     db.account("protected_agent_session_state","length(session_id)+length(checkpoint_ciphertext)+length(checkpoint_nonce)+length(checkpoint_turn_id)+length(checkpoint_fingerprint)+coalesce(length(snapshot_ciphertext),0)+coalesce(length(snapshot_nonce),0)+length(snapshot_digest)+length(lcm_policy_revision)+length(checkpoint_lcm_policy_revision)+length(updated_at)",super::layouts::SESSION.len()+cp.len()+24+turn.len()+fp.len()+snapshot.as_ref().map_or(0,|s|s.len()+24)+64+policy.len()*2+DATE.len());
     db.finish()
 }
+
+pub(crate) fn empty_file_bytes(path: &Path) -> u64 {
+    let conn = Connection::open(path).unwrap();
+    Db::vacuum(&conn);
+    Db::physical(&conn)
+}
+// Measure the actual adapter file in place; do not synthesize/rewrite its rows.
+pub(crate) fn existing(path: &Path, empty: u64) -> Size {
+    let conn = Connection::open(path).unwrap();
+    Db::vacuum(&conn);
+    let page_count: u64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let file_bytes = std::fs::metadata(path).unwrap().len();
+    assert_eq!(file_bytes, page_count * page_size);
+    let mut table_bytes = BTreeMap::new();
+    let mut st = conn
+        .prepare("SELECT name,sum(pgsize) FROM dbstat GROUP BY name")
+        .unwrap();
+    for row in st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))
+        .unwrap()
+    {
+        let (table, size) = row.unwrap();
+        table_bytes.insert(table, size);
+    }
+    let dbstat_bytes = table_bytes.values().sum();
+    assert_eq!(file_bytes, dbstat_bytes);
+    let mut row_value_bytes = 0;
+    for (table, columns) in [
+        (
+            "session",
+            "length(storage)+length(session)+length(payload)+length(nonce)",
+        ),
+        ("pack", "length(owner)+length(payload)+length(nonce)"),
+        ("membership", "length(storage)+length(session)+length(bits)"),
+        (
+            "pin",
+            "length(storage)+length(session)+length(pin)+length(payload)+length(nonce)",
+        ),
+        (
+            "catalog",
+            "length(storage)+length(session)+length(head)+length(payload)+length(nonce)",
+        ),
+        (
+            "operation_pack",
+            "length(storage)+length(session)+length(payload)+length(nonce)",
+        ),
+    ] {
+        row_value_bytes += conn
+            .query_row(
+                &format!("SELECT coalesce(sum({columns}),0) FROM {table}"),
+                [],
+                |r| r.get::<_, u64>(0),
+            )
+            .unwrap();
+    }
+    let physical_bytes = file_bytes - empty;
+    Size {
+        page_count,
+        page_size,
+        empty_schema_bytes: empty,
+        file_bytes,
+        physical_bytes,
+        row_value_bytes,
+        dbstat_bytes,
+        row_index_page_overhead: physical_bytes as i64 - row_value_bytes as i64,
+        table_bytes,
+    }
+}

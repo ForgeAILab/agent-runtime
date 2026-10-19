@@ -88,36 +88,49 @@ async fn physical_disk_release_report() {
 fn markdown(reports: &[layouts::Report]) -> String {
     use std::fmt::Write;
     let mut out = String::from(
-        "Physical bytes, schema baseline subtracted; pre / post collection. Legacy columns show the idle row with one / two sealed blobs.\n\n| Fixture | N | Turn | L1 | L2 | D4 | S1 | S1+S2 | S1+S2+S3 | S1–S5 | S1–S5/L1 |\n| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "Real packed SQLite physical bytes; schema baseline subtracted. S1–S4 implemented; S5 projected from task-1.4 payload savings.\n\n| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 | Projected S5 after | Projected/L2 |\n| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in reports {
-        write!(
+        writeln!(
             out,
-            "| {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {:.5} | {:.5} | {} | {:.5} |",
             r.fixture,
             r.n,
             if r.tools { "tool" } else { "plain" },
             r.legacy_l1.physical_bytes,
-            r.legacy_l2.physical_bytes
-        )
-        .unwrap();
-        for layout in &r.layouts {
-            write!(
-                out,
-                " {} / {} |",
-                layout.before.physical_bytes, layout.after.physical_bytes
-            )
-            .unwrap();
-        }
-        writeln!(
-            out,
-            " {} / {} | {} |",
-            r.s123_s4_s5_before.physical_bytes,
-            r.s123_s4_s5_after.physical_bytes,
-            r.gate_ratio
-                .map_or_else(|| "undefined (L1=0)".into(), |r| format!("{r:.3}"))
+            r.legacy_l2.physical_bytes,
+            r.packed_before.physical_bytes,
+            r.packed_after.physical_bytes,
+            r.packed_before_l2_ratio,
+            r.packed_after_l2_ratio,
+            r.projected_after_s5_bytes,
+            r.projected_after_s5_l2_ratio
         )
         .unwrap();
     }
     out
+}
+
+#[tokio::test]
+async fn n100_actual_packed_physical_smoke() {
+    for name in ["A", "B"] {
+        let report = layouts::measure(&root(), fixture::build(name, 100, false).await);
+        assert!(report.packed_after.physical_bytes > 0);
+        assert!(report.packed_before.physical_bytes >= report.packed_after.physical_bytes);
+        assert_eq!(
+            report.packed_before.table_bytes["operation_pack"],
+            report.packed_after.table_bytes["operation_pack"]
+        );
+        assert_eq!(report.s5_simulator_payload_delta, 0);
+        assert_eq!(
+            report.packed_after.physical_bytes,
+            report.projected_after_s5_bytes
+        );
+        eprintln!(
+            "actual {name}/100: {} / {} bytes, {:.5}x L2 after",
+            report.packed_before.physical_bytes,
+            report.packed_after.physical_bytes,
+            report.packed_after_l2_ratio
+        );
+    }
 }

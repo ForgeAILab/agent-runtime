@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use super::{disk, fixture};
 use disk::{DATE, Db, Size};
+use fixture::JournalMeasurementExport;
 
 pub(crate) const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 const MAGIC: &[u8] = b"FORGE-JOURNAL\0";
@@ -76,6 +77,13 @@ pub(crate) struct Report {
     pub(crate) s123_s4_s5_before: Size,
     pub(crate) s123_s4_s5_after: Size,
     pub(crate) gate_ratio: Option<f64>,
+    pub(crate) packed_before: Size,
+    pub(crate) packed_after: Size,
+    pub(crate) packed_before_l2_ratio: f64,
+    pub(crate) packed_after_l2_ratio: f64,
+    pub(crate) s5_simulator_payload_delta: u64,
+    pub(crate) projected_after_s5_bytes: u64,
+    pub(crate) projected_after_s5_l2_ratio: f64,
 }
 fn head_rows(db: &mut Db, exports: &[(&str, JournalMeasurementExport)], d4: bool) {
     for (domain, export) in exports {
@@ -558,7 +566,21 @@ pub(crate) fn measure(root: &Path, fixture: fixture::Fixture) -> Report {
         .then(|| s123_s4_s5_after.physical_bytes as f64 / l1.physical_bytes as f64);
     let head = fixture.after[0].1.heads.values().next().unwrap();
     let provider_cache_enabled = fixture.name != "A";
+    // Task-1.4 archived simulator payload delta. All A/B records are in the
+    // replay window. C: 819747 lifetime - 23769 window = 795978 bytes.
+    // This is a projection, not an S5 implementation or a measured file size.
+    let s5_delta = if fixture.name == "C" { 795_978 } else { 0 };
+    let projected = fixture.packed_after.physical_bytes.saturating_sub(s5_delta);
     Report {
+        packed_before_l2_ratio: fixture.packed_before.physical_bytes as f64
+            / l2.physical_bytes as f64,
+        packed_after_l2_ratio: fixture.packed_after.physical_bytes as f64
+            / l2.physical_bytes as f64,
+        projected_after_s5_l2_ratio: projected as f64 / l2.physical_bytes as f64,
+        projected_after_s5_bytes: projected,
+        s5_simulator_payload_delta: s5_delta,
+        packed_before: fixture.packed_before,
+        packed_after: fixture.packed_after,
         provider_cache_enabled,
         fixture: fixture.name,
         n: fixture.n,

@@ -40,15 +40,14 @@ may run in parallel.
   and the raw JSON under `/Volumes/Data/tmp/refactor/`. Apply the D8.5
   decision rule and record which levers groups 4–5 build.
 
-Measurement decision (1.4, 2026-10-19): B/N=4000 S1–S5 measures
-3.08750× L1 plain and 3.44375× tool, above the 2.0× gate.
-Group 4 builds S1–S4 plus owner-approved S5; task 4.5 still rechecks the real
-storage. Group 5 is gated in on current evidence: F1, re-measure, then F2,
-with F3 accompanying schema 5. A does not gate; the 1.5× aim adds no mandatory
-scope. Idle legacy fixtures use L2, while the comparison remains the stricter
-L1. Tables and scope limits are in design D8.4; raw JSON and verification logs
-are in `/Volumes/Data/tmp/refactor/rt-e1/`. No group-2–7 work is implemented by
-this measurement job.
+Measurement decision (1.4, 2026-10-19): B/N=4000 simulated S1–S5
+measures 3.08750× L1 plain and 3.44375× L1 tool. The later Owner Decision
+in design.md supersedes that stricter baseline: the gate is **≤2.0× L2**,
+aiming at 1.5×. Simulated S1–S5 meets L2 (1.49× / 1.62×), so group 4
+builds storage levers and group 5 stays gated out. Task 4.5 still rechecks
+real storage after S5. Task 4.3 records measured S1–S4 and an explicitly
+projected S5 result; S5 itself remains task 4.4. Task-1 raw JSON and evidence
+remain in `/Volumes/Data/tmp/refactor/rt-e1/`.
 
 ## 2. Engine extraction (no behavior change; all existing suites unchanged)
 
@@ -108,14 +107,14 @@ N5 requires retaining it. Regression and byte-count evidence is recorded in
 
 ## 4. R7 storage-level levers (gate: after 1.4 and 3.1)
 
-- [ ] 4.1 Reference packed storage in the bench crate implementing
+- [x] 4.1 Reference packed storage in the bench crate implementing
   `JournalStorage` over `rusqlite`: S1 one sealed zstd pack per write, a pack
   directory per session, per-domain membership bitmaps, S3 in-pack prefix
   index with id verification on read. Tests: `assert_journal_storage_conformance`.
-- [ ] 4.2 S2 session repack on collection (kind-ordered base pack, geometric
+- [x] 4.2 S2 session repack on collection (kind-ordered base pack, geometric
   merge of small packs) and the post-terminal trigger hook. Tests: repack
   preserves every member's bytes and membership bits; storage suite again.
-- [ ] 4.3 S4 packed operation records; run the harness end to end through
+- [x] 4.3 S4 packed operation records; run the harness end to end through
   the packed storage (A, B, C) and replace the 1.3 simulator numbers; delete
   the `journal-measurement` feature. Tests: report smoke at N=100.
 - [x] 4.4 Only if the owner approves Q1: S5 replay window (prune in
@@ -130,7 +129,7 @@ N5 requires retaining it. Regression and byte-count evidence is recorded in
   root epoch. The unchanged replay-fence and storage/collection conformance
   tests pass. D8.6 records the explicit inclusive-edge/last-operation owner
   instruction; CHANGELOG has the owner-approved pre-1.0 Breaking entry.
-- [ ] 4.5 Gate: record native/L1 at N=4000 for B (and A, C). If B ≤ 2.0× and
+- [ ] 4.5 Gate: record native/L2 at N=4000 for B (and A, C). If B ≤ 2.0× and
   the owner did not require more (Q2), group 5 is skipped.
 
 ## 5. R7 format levers (gate: only if 4.5 fails or Q2 requires them)

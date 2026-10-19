@@ -197,8 +197,6 @@ pub(in crate::journal) struct State {
     pub(in crate::journal) active_pins: BTreeMap<(SessionId, JournalPinId), u64>,
     pub(in crate::journal) root_epoch: u64,
     pub(in crate::journal) collection_enabled: bool,
-    #[cfg(feature = "journal-measurement")]
-    pub(in crate::journal) measurement_batches: Vec<Arc<Vec<JournalObjectId>>>,
     pub(in crate::journal) retirement_authorizations:
         BTreeMap<SessionId, (JournalRevision, crate::clock::Timestamp)>,
     pub(in crate::journal) durable_pins: BTreeMap<(SessionId, JournalPinId), DurablePin>,
@@ -1293,17 +1291,6 @@ impl Transition {
         );
         self.fail_if_armed(JournalCommitFailurePoint::AfterIdempotency)?;
 
-        #[cfg(feature = "journal-measurement")]
-        staged.measurement_batches.push(Arc::new(
-            staged
-                .objects
-                .layers
-                .last()
-                .expect("commit layer")
-                .keys()
-                .cloned()
-                .collect(),
-        ));
         staged.retirement_authorizations.remove(lease.session());
         staged.advance_root_epoch()?;
         *state = staged;
