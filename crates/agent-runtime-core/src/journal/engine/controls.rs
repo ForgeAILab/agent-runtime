@@ -69,7 +69,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         handle: Option<u64>,
         action: impl FnOnce(&Transition) -> Result<T, RuntimeError>,
     ) -> Result<T, RuntimeError> {
-        let _gate = self.gate.lock().await;
+        let _gate = self.write_gate().await;
         let (scratch, stored) = self.hydrate(session).await?;
         self.control_prepared(session, kind, handle, action, scratch, stored)
             .await
@@ -235,7 +235,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         session: &SessionId,
         expected: JournalRevision,
     ) -> Result<JournalRetirement, RuntimeError> {
-        let _gate = self.gate.lock().await;
+        let _gate = self.write_gate().await;
         if !self.local.lock()?.collection_enabled {
             return Err(RuntimeError::unsupported_capability(
                 crate::error::UnsupportedCapability::JournalRetirement,
@@ -256,7 +256,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         request: JournalGcRequest,
     ) -> Result<JournalGcReport, RuntimeError> {
-        let _gate = self.gate.lock().await;
+        let _gate = self.write_gate().await;
         {
             let local = self.local.lock()?;
             if !local.collection_enabled {

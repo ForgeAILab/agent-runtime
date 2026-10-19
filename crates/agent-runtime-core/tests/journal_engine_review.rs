@@ -104,3 +104,54 @@ async fn review_read_only_lease_cannot_replay_a_published_operation() {
     assert_conflict(journal.commit(&reader, commit).await);
     assert_eq!(journal.root_epoch().unwrap(), before);
 }
+
+/// A synchronous host control runs on a Tokio worker right after its task
+/// released the engine gate to a queued task. Tokio hands the released permit
+/// to that waiter and schedules it in this worker's unstealable LIFO slot; the
+/// control must not spin on the gate while that waiter cannot run.
+#[test]
+fn review_sync_control_after_a_gate_handoff_does_not_stall_its_worker() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let journal = InMemorySessionJournal::protected(JournalStorageId::new("handoff"));
+            let session = SessionId::new("s");
+            let stop = Arc::new(AtomicBool::new(false));
+            let contender = {
+                let (journal, session, stop) = (journal.clone(), session.clone(), stop.clone());
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        let lease = journal
+                            .open(&session, open("contender", JournalOpenIntent::ReadOnly))
+                            .await
+                            .unwrap();
+                        journal.close(lease).await.unwrap();
+                    }
+                })
+            };
+            let driver = tokio::spawn(async move {
+                for _ in 0..20_000 {
+                    let lease = journal
+                        .open(&session, open("driver", JournalOpenIntent::ReadOnly))
+                        .await
+                        .unwrap();
+                    journal.compact().unwrap();
+                    journal.close(lease).await.unwrap();
+                }
+            });
+            driver.await.unwrap();
+            stop.store(true, Ordering::Relaxed);
+            contender.await.unwrap();
+        });
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("a synchronous journal control stalled its runtime worker");
+}

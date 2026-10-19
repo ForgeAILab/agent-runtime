@@ -65,7 +65,13 @@ pub struct JournalEngine<S: JournalStorage> {
     pub(in crate::journal) storage: Arc<S>,
     pub(in crate::journal) domain: JournalDomain,
     pub(in crate::journal) local: Transition,
-    gate: Arc<tokio::sync::Mutex<()>>,
+    // Deliberately not `tokio::sync::Mutex`: Tokio hands a released permit to
+    // the next queued task, which may sit unstealable in the releasing
+    // worker's LIFO slot. A synchronous volatile control polling the gate on
+    // that worker would then wait forever for a holder that cannot run. This
+    // gate is acquired only inside a poll, so over volatile storage (which
+    // never suspends) it is only ever held by a running task.
+    gate: Arc<futures_util::lock::Mutex<()>>,
     dirty: Arc<Mutex<BTreeSet<SessionId>>>,
 }
 impl<S: JournalStorage> Clone for JournalEngine<S> {
@@ -123,7 +129,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             storage,
             domain: JournalDomain { storage_id, role },
             local,
-            gate: Arc::new(tokio::sync::Mutex::new(())),
+            gate: Arc::new(futures_util::lock::Mutex::new(())),
             dirty: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -149,8 +155,15 @@ impl<S: JournalStorage> JournalEngine<S> {
     }
     /// Physical storage compaction; never changes logical membership or epochs.
     pub async fn compact(&self) -> Result<(), RuntimeError> {
-        let _gate = self.gate.lock().await;
+        let _gate = self.write_gate().await;
         self.storage.compact(&self.domain).await
+    }
+    /// Takes the write gate after one unit of Tokio's cooperative budget, so a
+    /// task looping over journal operations still yields to its executor and
+    /// cannot keep a woken gate waiter parked behind it on the same worker.
+    async fn write_gate(&self) -> futures_util::lock::MutexGuard<'_, ()> {
+        tokio::task::consume_budget().await;
+        self.gate.lock().await
     }
     fn mark_dirty(&self, session: &SessionId) -> Result<(), RuntimeError> {
         self.dirty
@@ -171,7 +184,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         session: &SessionId,
         request: JournalOpen,
     ) -> Result<JournalLease, RuntimeError> {
-        let _gate = self.gate.lock().await;
+        let _gate = self.write_gate().await;
         if request.intent == JournalOpenIntent::ExclusiveWriter
             && self
                 .local
@@ -267,7 +280,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
     }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
         if lease.writer_epoch().is_some() {
-            let _gate = self.gate.lock().await;
+            let _gate = self.write_gate().await;
             self.local.live_lease(&*self.local.lock()?, lease)?;
             let (scratch, stored) = self.hydrate(lease.session()).await?;
             if stored.as_ref().map(|r| r.writer_epoch) != lease.writer_epoch() {

@@ -169,9 +169,11 @@ fn drive<T>(
     future: impl std::future::Future<Output = Result<T, RuntimeError>>,
 ) -> Result<T, RuntimeError> {
     use std::task::{Context, Poll, Waker};
-    // A free Tokio mutex may still yield for cooperative scheduling. A
-    // synchronous volatile control cannot yield back to the task's executor,
-    // so disable that budget only while driving this non-suspending adapter.
+    // Volatile storage never suspends and the engine gate is acquired only
+    // inside a poll, so `Pending` means another running thread holds the
+    // gate for one bounded operation. No Tokio resource is awaited under the
+    // gate; the cooperative budget is still disabled so a future change that
+    // adds one cannot make a synchronous control yield to its own executor.
     let mut future = std::pin::pin!(tokio::task::unconstrained(future));
     loop {
         match future

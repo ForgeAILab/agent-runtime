@@ -270,7 +270,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         lease: &JournalLease,
         commit: Box<JournalCommit>,
     ) -> Result<JournalHead, RuntimeError> {
-        let _gate = self.gate.lock().await;
+        let _gate = self.write_gate().await;
         // Same order as the reference transition: only a live writer may reach
         // the idempotency index, even for an identical replay.
         if self
