@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-18
+
 ### Changed
 
 - A provider error now carries the reason the provider gave, such as Gemini's
