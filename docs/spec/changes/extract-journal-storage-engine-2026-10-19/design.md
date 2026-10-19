@@ -757,3 +757,20 @@ CHANGELOG `Unreleased` text (applied in the last task):
   as the price of packs? Recommendation: **yes** for Forge, which forks only
   with `ForkSeed::Summary`; a host that needs shared FromIndex suffixes can
   still deduplicate inside its own storage.
+
+## Owner Decisions (2026-10-19)
+
+All four open questions were decided as recommended:
+
+- **Q1: replay window adopted.** Operation results are kept for the latest
+  64 revisions plus the current writer epoch, not for the session's lifetime.
+  This is a pre-1.0 contract break; CHANGELOG records it as `Breaking`.
+  Task 4.4 is in scope.
+- **Q2: the realistic fixture gates.** The gate is fixture B at N=4000
+  against L1: at most 2.0×, aiming for 1.5×. Fixture A is reported as the
+  worst case and does not gate.
+- **Q3: schema-4 readers stay for one release.** If journal schema 5 is
+  needed, schema-4 readers ship for one full release after the first
+  schema-5 writer. Schema-4 sessions upgrade only on an explicit host request.
+- **Q4: per-session copies accepted.** Identical bodies are not shared
+  physically across sessions.
