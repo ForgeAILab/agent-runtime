@@ -401,3 +401,65 @@ async fn an_armed_cut_keeps_its_original_order_relative_to_validation_errors() {
         JournalRevision(1)
     );
 }
+
+/// Debug-build resume paths run near Tokio's 2 MiB worker stack. Every engine
+/// boundary future is boxed; keep each heap state machine small.
+#[tokio::test]
+async fn engine_future_sizes_stay_bounded() {
+    fn boxed<T>(future: &std::pin::Pin<Box<dyn Future<Output = T> + Send + '_>>) -> usize {
+        std::mem::size_of_val(&**future)
+    }
+    let engine = JournalEngine::protected(
+        Arc::new(VolatileJournalStorage::default()),
+        JournalStorageId::new("sizes"),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    let session = SessionId::new("s");
+    let journal: &dyn SessionJournal = &engine;
+    let lease = engine.open(&session, writer("w")).await.unwrap();
+    let commit = empty_commit(&session, 1);
+    let request = JournalGcRequest {
+        storage_id: engine.storage_id(),
+        expected_root_epoch: 0,
+        max_objects: 0,
+    };
+    let sizes = [
+        ("open", boxed(&journal.open(&session, writer("x")))),
+        (
+            "read",
+            boxed(&journal.read(&lease, &JournalObjectId::from_bytes([0; 32]))),
+        ),
+        ("commit", boxed(&journal.commit(&lease, commit.clone()))),
+        (
+            "commit_inner",
+            std::mem::size_of_val(&engine.commit_inner(&lease, Box::new(commit))),
+        ),
+        ("renew", boxed(&journal.renew(&lease))),
+        (
+            "retire",
+            boxed(&journal.retire(&session, JournalRevision(1))),
+        ),
+        (
+            "retire_inner",
+            std::mem::size_of_val(&engine.retire_inner(&session, JournalRevision(1))),
+        ),
+        ("collect", boxed(&journal.collect(request.clone()))),
+        (
+            "collect_inner",
+            std::mem::size_of_val(&engine.collect_inner(request)),
+        ),
+        (
+            "pin_transfer",
+            std::mem::size_of_val(&engine.pin_transfer(&lease)),
+        ),
+        ("hydrate", std::mem::size_of_val(&engine.hydrate(&session))),
+    ];
+    let sizes = [sizes.as_slice(), &[("close", boxed(&journal.close(lease)))]].concat();
+    eprintln!("ENGINE FUTURE SIZES: {sizes:?}");
+    for (name, size) in sizes {
+        assert!(size <= 16 * 1024, "{name} future is {size} bytes");
+    }
+}
