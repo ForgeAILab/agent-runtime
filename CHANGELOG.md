@@ -7,6 +7,24 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- `agent_runtime_core::provider::PROVIDER_ERROR_STATUS_KEY` (`http.status`) and
+  `PROVIDER_ERROR_REDACTED_REASON_KEY` (`provider.redacted_reason`) name the
+  two provider-error metadata entries a transport vouches for.
+
+### Fixed
+
+- A rejected provider request says why again. Adapters still replace transport
+  text with a fixed class message, but now keep an integer `http.status` and a
+  transport-redacted `provider.redacted_reason`, bounded to one line of at most
+  300 characters, and append them:
+  `provider rejected the request (HTTP 404): Model is not deployed or ready`.
+  Every other entry, `provider.detail` included, is still dropped. The bundled
+  reqwest transport records `http.status`, and the Responses adapter now also
+  keeps a transport error's usage-limit reset and credential-recovery evidence,
+  as the others already did.
+
 ## [0.6.2] - 2026-10-18
 
 ### Fixed

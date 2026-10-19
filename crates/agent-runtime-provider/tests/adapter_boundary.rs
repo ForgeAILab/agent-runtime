@@ -339,6 +339,90 @@ async fn responses_echoed_credential_in_transport_stream_error_is_absent_from_al
     echoed_credential_in_transport_stream_error_is_absent_from_all_renderings("responses").await;
 }
 
+/// A transport that refuses the request before any body streams, the way an
+/// HTTP 4xx surfaces from a host transport.
+#[derive(Clone, Debug)]
+struct Rejecting(ProviderError);
+
+#[async_trait]
+impl HttpTransport for Rejecting {
+    async fn post_stream(&self, _request: HttpRequest) -> Result<ByteStream, ProviderError> {
+        Err(self.0.clone())
+    }
+}
+
+async fn transport_vouched_rejection_names_its_status_and_reason(kind: &str) {
+    let mut error = ProviderError::new(
+        ProviderErrorKind::BadRequest,
+        "sk-echoed-credential private prompt",
+    );
+    error.metadata.insert("http.status", 404u64);
+    error
+        .metadata
+        .insert("provider.redacted_reason", "Model is not deployed or ready");
+    error
+        .metadata
+        .insert("provider.detail", "sk-echoed-credential");
+    let rejecting = Rejecting(error);
+    let provider: Box<dyn Provider> = match kind {
+        "anthropic" => Box::new(AnthropicProvider::new(
+            rejecting,
+            AnthropicConfig::new("https://example.test/v1", "model"),
+        )),
+        "openai" => Box::new(OpenAiProvider::new(
+            rejecting,
+            OpenAiConfig::new("https://example.test/v1", "model"),
+        )),
+        "responses" => Box::new(
+            ResponsesProvider::new(
+                rejecting,
+                ResponsesConfig::new("https://example.test/v1", "model"),
+            )
+            .unwrap(),
+        ),
+        _ => unreachable!(),
+    };
+    let error = match provider.stream(tool_request(&[]), context()).await {
+        Err(error) => error,
+        Ok(stream) => {
+            let events = stream.collect::<Vec<_>>().await;
+            let Some(ProviderStreamEvent::Error { error }) = events.into_iter().next() else {
+                panic!("{kind}: error expected")
+            };
+            error
+        }
+    };
+    assert_eq!(error.kind, ProviderErrorKind::BadRequest, "{kind}");
+    assert!(
+        error
+            .message
+            .ends_with("rejected the request (HTTP 404): Model is not deployed or ready"),
+        "{kind}: {}",
+        error.message
+    );
+    let rendering = format!("{error:?} {error}");
+    assert!(
+        !rendering.contains("sk-echoed-credential"),
+        "{kind}: {rendering}"
+    );
+    assert!(error.metadata.get("provider.detail").is_none(), "{kind}");
+}
+
+#[tokio::test]
+async fn openai_transport_vouched_rejection_names_its_status_and_reason() {
+    transport_vouched_rejection_names_its_status_and_reason("openai").await;
+}
+
+#[tokio::test]
+async fn anthropic_transport_vouched_rejection_names_its_status_and_reason() {
+    transport_vouched_rejection_names_its_status_and_reason("anthropic").await;
+}
+
+#[tokio::test]
+async fn responses_transport_vouched_rejection_names_its_status_and_reason() {
+    transport_vouched_rejection_names_its_status_and_reason("responses").await;
+}
+
 #[tokio::test]
 async fn openai_fragmented_wire_names_emit_only_complete_canonical_names() {
     let request = tool_request(&["memory.search".into()]);

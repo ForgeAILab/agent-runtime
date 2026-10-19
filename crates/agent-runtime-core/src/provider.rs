@@ -1562,6 +1562,22 @@ pub enum ProviderErrorKind {
     LimitExhausted,
 }
 
+/// The [`ProviderError::metadata`] key for the HTTP status of a rejected
+/// response.
+///
+/// A transport sets it from the status line. Adapters keep it when they
+/// replace an error's text, because a status cannot carry provider text.
+pub const PROVIDER_ERROR_STATUS_KEY: &str = "http.status";
+
+/// The [`ProviderError::metadata`] key for the provider's own reason for a
+/// rejection, already redacted.
+///
+/// Only a transport that has removed every credential and header value it sent
+/// from the reason may set it; adapters cannot check that, so they keep it
+/// through redaction on the transport's word. Raw provider text belongs under
+/// no key an adapter keeps.
+pub const PROVIDER_ERROR_REDACTED_REASON_KEY: &str = "provider.redacted_reason";
+
 /// A structured provider error, carried both out-of-band and as a stream event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderError {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::transport::{ByteStream, HttpRequest, HttpResponse, HttpTransport};
-use agent_runtime_core::provider::{ProviderError, ProviderErrorKind};
+use agent_runtime_core::provider::{PROVIDER_ERROR_STATUS_KEY, ProviderError, ProviderErrorKind};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use url::{Host, Url};
@@ -380,7 +380,7 @@ fn append_bounded(body: &mut Vec<u8>, chunk: &[u8]) {
 }
 
 fn classify_http_failure(status: u16, body: &[u8]) -> ProviderError {
-    match status {
+    let mut error = match status {
         300..=399 => ProviderError::new(ProviderErrorKind::Network, "provider redirect rejected"),
         401 | 403 => ProviderError::new(ProviderErrorKind::Auth, "provider authentication failed"),
         429 if usage_limit_reached(body) => ProviderError::new(
@@ -405,7 +405,13 @@ fn classify_http_failure(status: u16, body: &[u8]) -> ProviderError {
             ProviderErrorKind::Network,
             format!("provider returned unexpected HTTP {status}"),
         ),
-    }
+    };
+    // The message above is replaced at the adapter boundary; the status is
+    // what survives it.
+    error
+        .metadata
+        .insert(PROVIDER_ERROR_STATUS_KEY, i64::from(status));
+    error
 }
 
 fn usage_limit_reached(body: &[u8]) -> bool {
@@ -606,6 +612,10 @@ mod tests {
         let server = classify_http_failure(503, b"unavailable");
         assert_eq!(server.kind, ProviderErrorKind::Server);
         assert!(server.retryable);
+
+        for error in [redirect, auth, exhausted, server] {
+            assert!(error.metadata.get(PROVIDER_ERROR_STATUS_KEY).is_some());
+        }
     }
 
     #[test]

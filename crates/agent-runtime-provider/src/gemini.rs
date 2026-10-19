@@ -987,12 +987,7 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::CacheExpired => "Gemini provider cache identity expired",
         ProviderErrorKind::LimitExhausted => "Gemini provider usage limit exhausted",
     };
-    let mut sanitized = ProviderError::new(error.kind, message);
-    sanitized.retryable = error.retryable;
-    sanitized.retry_after_ms = error.retry_after_ms;
-    sanitized.limit_resets_at_ms = error.limit_resets_at_ms;
-    sanitized.credential_recovery = error.credential_recovery;
-    sanitized
+    super::error_redaction::rebuild(error, message)
 }
 
 fn push_utf8(pending_bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<String>, ProviderError> {
@@ -2196,10 +2191,33 @@ mod tests {
         let sanitized = sanitize_transport_error(error);
 
         assert_eq!(sanitized.kind, ProviderErrorKind::BadRequest);
-        assert_eq!(sanitized.message, "Gemini provider rejected the request");
-        // Neither transport text nor untrusted provider metadata survives.
+        assert_eq!(
+            sanitized.message,
+            "Gemini provider rejected the request (HTTP 400)"
+        );
+        // Neither transport text nor untrusted provider metadata survives;
+        // only the status the transport read from the status line does.
         assert!(!sanitized.message.contains("raw transport text"));
-        assert!(sanitized.metadata.is_empty());
+        assert!(!sanitized.message.contains("Input blocked"));
+        assert_eq!(sanitized.metadata.len(), 1);
+        assert!(sanitized.metadata.get("http.status").is_some());
+    }
+
+    #[test]
+    fn a_sanitized_rejection_keeps_a_transport_redacted_reason() {
+        let mut error = ProviderError::new(ProviderErrorKind::BadRequest, "raw transport text");
+        error.metadata.insert("http.status", 400u64);
+        error.metadata.insert(
+            "provider.redacted_reason",
+            "INVALID_ARGUMENT: Input blocked",
+        );
+
+        let sanitized = sanitize_transport_error(error);
+
+        assert_eq!(
+            sanitized.message,
+            "Gemini provider rejected the request (HTTP 400): INVALID_ARGUMENT: Input blocked"
+        );
     }
 
     #[test]

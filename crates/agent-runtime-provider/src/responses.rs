@@ -977,10 +977,7 @@ fn sanitize_transport_error(error: ProviderError) -> ProviderError {
         ProviderErrorKind::CacheExpired => "Responses provider cache identity expired",
         ProviderErrorKind::LimitExhausted => "Responses provider usage limit exhausted",
     };
-    let mut sanitized = ProviderError::new(error.kind, message);
-    sanitized.retryable = error.retryable;
-    sanitized.retry_after_ms = error.retry_after_ms;
-    sanitized
+    super::error_redaction::rebuild(error, message)
 }
 
 fn push_utf8(pending_bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<Option<String>, ProviderError> {
