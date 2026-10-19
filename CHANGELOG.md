@@ -34,6 +34,10 @@ contain breaking changes and are coordinated with consumer proposals.
   like a bootstrap. `assert_ordinary_session_journal_conformance` now requires
   ordinary journal adapters to accept the same replacement; one that still
   rejects it fails closed as before.
+- Restoring a parent no longer fails when the host cannot compute one child's
+  policy fingerprint, for example after that child's profile changed. That
+  child is marked incompatible (non-resumable if it was interrupted) and the
+  parent and its other children restore.
 
 ## [0.6.2] - 2026-10-18
 

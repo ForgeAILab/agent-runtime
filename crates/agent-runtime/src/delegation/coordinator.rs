@@ -98,16 +98,22 @@ impl DelegationCoordinator {
                     record.status.updated_at = now;
                 }
 
-                let current_fingerprint = factory.policy_fingerprint(&record.spec)?;
-                if factory.durability() != ChildDurability::Durable {
-                    record.status.incompatibility =
-                        Some("durable child stores are unavailable".to_owned());
-                    if matches!(record.status.state, ChildState::Interrupted { .. }) {
-                        record.status.state = ChildState::Interrupted { resumable: false };
+                let incompatibility = if factory.durability() != ChildDurability::Durable {
+                    Some("durable child stores are unavailable".to_owned())
+                } else {
+                    match factory.policy_fingerprint(&record.spec) {
+                        Ok(current) if current != record.policy_fingerprint => {
+                            Some("child reconstruction policy changed".to_owned())
+                        }
+                        Ok(_) => None,
+                        Err(error) => Some(format!(
+                            "child reconstruction unavailable: {}",
+                            error.message.chars().take(200).collect::<String>()
+                        )),
                     }
-                } else if current_fingerprint != record.policy_fingerprint {
-                    record.status.incompatibility =
-                        Some("child reconstruction policy changed".to_owned());
+                };
+                if let Some(reason) = incompatibility {
+                    record.status.incompatibility = Some(reason);
                     if matches!(record.status.state, ChildState::Interrupted { .. }) {
                         record.status.state = ChildState::Interrupted { resumable: false };
                     }
