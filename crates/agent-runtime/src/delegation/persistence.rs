@@ -404,7 +404,12 @@ impl DelegationCoordinator {
                         result.text = text.clone();
                         result
                     });
-                let result = if let Some(result) = persisted_result {
+                let result = if let Some(mut result) = persisted_result {
+                    // The stored copy must match the authoritative text; the
+                    // keyed put returns the existing copy when it does.
+                    result.reply =
+                        store_child_reply(&self.inner, child, session, &checkpoint.turn, &text)
+                            .await;
                     result
                 } else {
                     // The child checkpoint carries source references even if
@@ -424,10 +429,14 @@ impl DelegationCoordinator {
                         sources,
                     )
                     .await?;
+                    let reply =
+                        store_child_reply(&self.inner, child, session, &checkpoint.turn, &text)
+                            .await;
                     ChildTaskResult {
                         turn: checkpoint.turn.clone(),
                         text,
                         artifacts,
+                        reply,
                     }
                 };
                 let result_for_retry = result.clone();
@@ -1636,11 +1645,57 @@ pub(super) async fn transfer_completed_result(
     let sources = handle.artifacts_for_turn(turn);
     let artifacts =
         transfer_artifact_references(coordinator, child, handle.id(), turn, sources).await?;
+    let reply = store_child_reply(coordinator, child, handle.id(), turn, &text).await;
     Ok(ChildTaskResult {
         turn: turn.clone(),
         text,
         artifacts,
+        reply,
     })
+}
+
+/// Stores a reply longer than a delivery excerpt as a parent-owned artifact,
+/// so a delivery that cannot carry it whole hands over a reference instead.
+/// The key binds the exact parent, child, turn, and text, so a repeated call
+/// (recovery, a retried transfer) returns the same reference. A missing or
+/// failing store leaves no copy; the delivery then carries an excerpt and
+/// points at the child's result.
+pub(super) async fn store_child_reply(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    child_session: &SessionId,
+    turn: &TurnId,
+    text: &str,
+) -> Option<Box<ArtifactRef>> {
+    if text.len() <= CHILD_REPLY_EXCERPT_BYTES {
+        return None;
+    }
+    let store = coordinator.factory.artifact_store()?;
+    let idempotency_key = Fingerprint::of_fields([
+        b"delegation-child-reply".as_slice(),
+        coordinator.parent.id().as_str().as_bytes(),
+        child_session.as_str().as_bytes(),
+        child.as_str().as_bytes(),
+        turn.as_str().as_bytes(),
+        text.as_bytes(),
+    ]);
+    let write = ArtifactWrite {
+        bytes: text.as_bytes().to_vec(),
+        media_type: "text/plain; charset=utf-8".into(),
+        sensitivity: ArtifactSensitivity::Sensitive,
+        retention: ArtifactRetention::Session,
+        provenance: ArtifactProvenance::new(
+            coordinator.parent.id().clone(),
+            CHILD_REPLY_ARTIFACT_PURPOSE,
+        ),
+        idempotency_key: idempotency_key.as_str().to_owned(),
+    };
+    store
+        .put(write)
+        .await
+        .ok()
+        .filter(|reference| reference.validate().is_ok())
+        .map(Box::new)
 }
 
 async fn transfer_artifact_references(

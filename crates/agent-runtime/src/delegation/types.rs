@@ -418,6 +418,10 @@ pub struct DelegationConfig {
     pub wait_default: Duration,
     /// Host-narrowed maximum child wait, never above the runtime hard cap.
     pub wait_max: Duration,
+    /// Bytes of child replies one automatic delivery carries inline. A reply
+    /// that does not fit is delivered as an excerpt and a reference to its
+    /// stored copy; size never refuses a delivery.
+    pub delivery_inline_bytes: usize,
 }
 
 impl Default for DelegationConfig {
@@ -429,11 +433,23 @@ impl Default for DelegationConfig {
             delegation_tool_names: Vec::new(),
             wait_default: DEFAULT_DELEGATION_WAIT,
             wait_max: HARD_MAX_DELEGATION_WAIT,
+            delivery_inline_bytes: DEFAULT_CHILD_DELIVERY_INLINE_BYTES,
         }
     }
 }
 
 impl DelegationConfig {
+    pub(super) fn validate_delivery_budget(&self) -> Result<(), RuntimeError> {
+        if self.delivery_inline_bytes == 0
+            || self.delivery_inline_bytes > MAX_CHILD_DELIVERY_INLINE_BYTES
+        {
+            return Err(RuntimeError::config(format!(
+                "child delivery inline budget must be 1..={MAX_CHILD_DELIVERY_INLINE_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_wait_options(
         &self,
         options: DelegationWaitOptions,
@@ -684,6 +700,11 @@ pub struct ChildTaskResult {
     /// Parent-owned artifacts explicitly copied from this child turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactRef>,
+    /// Parent-owned exact copy of `text`, stored when the reply is longer
+    /// than a delivery excerpt so a delivery that cannot carry it whole can
+    /// hand over a reference instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<Box<ArtifactRef>>,
 }
 
 impl fmt::Debug for ChildTaskResult {
@@ -693,6 +714,7 @@ impl fmt::Debug for ChildTaskResult {
             .field("turn", &self.turn)
             .field("text_chars", &self.text.chars().count())
             .field("artifact_count", &self.artifacts.len())
+            .field("reply_stored", &self.reply.is_some())
             .finish()
     }
 }
