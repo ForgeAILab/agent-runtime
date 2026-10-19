@@ -7,6 +7,14 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- Waiting for a user, internal, or resumed turn to complete now also waits for
+  its execution gate and active-turn admission to be released. Previously a
+  host waking from `TurnHandle::completed` or `SessionHandle::run` could have
+  an immediate local tool action refused as non-idle, or an explicit idle
+  compaction return `Busy`, even though that turn had completed.
+
 ## [0.7.0] - 2026-10-18
 
 ### Changed
