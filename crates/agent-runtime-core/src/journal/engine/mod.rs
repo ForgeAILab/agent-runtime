@@ -141,6 +141,11 @@ impl<S: JournalStorage> JournalEngine<S> {
         self.local.fail_next_commit_at(point)
     }
     /// Revokes a local writer without storage I/O or waiting for the write gate.
+    ///
+    /// The durable writer fence advances at the next exclusive open, which
+    /// waits under the gate for a commit already in flight: such a commit may
+    /// still publish after this returns, while every later use of the revoked
+    /// lease fails.
     pub fn revoke_writer(&self, session: &SessionId) -> Result<(), RuntimeError> {
         self.local.revoke_writer(session)?;
         self.mark_dirty(session)

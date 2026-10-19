@@ -295,3 +295,189 @@ async fn review_restart_keeps_retired_dependencies_unselectable() {
         engine.close(lease).await.unwrap();
     }
 }
+
+/// Everything a restarted process needs is durable: the writer fence, replay
+/// records, the retained-root catalog, transfer pins and retirement grants.
+#[tokio::test]
+async fn review_restart_preserves_fences_replays_catalog_pins_and_grants() {
+    let storage = std::sync::Arc::new(VolatileJournalStorage::default());
+    let session = SessionId::new("s");
+    let writer = || open("writer", JournalOpenIntent::ExclusiveWriter);
+    let first = restart_engine(&storage);
+    let stale = first.open(&session, writer()).await.unwrap();
+    let replayed = catalog_commit(&session, 1, "o1", None, None);
+    let h1 = first.commit(&stale, replayed.clone()).await.unwrap();
+    let h2 = first
+        .commit(&stale, catalog_commit(&session, 1, "o2", Some(&h1), None))
+        .await
+        .unwrap();
+    first.pin_transfer(&stale).await.unwrap();
+    first
+        .authorize_retirement(&session, h2.revision, Timestamp(7))
+        .await
+        .unwrap();
+    // The first process never closes its writer; a second process starts.
+    let second = restart_engine(&storage);
+    let next = second.open(&session, writer()).await.unwrap();
+    assert_eq!(next.writer_epoch(), Some(2));
+    assert_eq!(next.head(), Some(&h2));
+    assert_conflict(
+        first
+            .commit(&stale, catalog_commit(&session, 1, "o3", Some(&h2), None))
+            .await,
+    );
+    assert_eq!(second.commit(&next, replayed).await.unwrap(), h1);
+    let reader = second
+        .open(
+            &session,
+            JournalOpen {
+                root: JournalRootSelection::Retained {
+                    root: JournalObject::encode(JournalObjectKind::Head, &h1)
+                        .unwrap()
+                        .id,
+                },
+                ..open("reader", JournalOpenIntent::ReadOnly)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.head(), Some(&h1));
+    second.close(reader).await.unwrap();
+    second.close(next).await.unwrap();
+    // The durable transfer pin still blocks retirement; the grant survived.
+    assert_conflict(second.retire(&session, h2.revision).await);
+    second
+        .release_pin(
+            &session,
+            &JournalPinId::new("writer"),
+            second.root_epoch().unwrap(),
+        )
+        .await
+        .unwrap();
+    let retirement = second.retire(&session, h2.revision).await.unwrap();
+    assert_eq!(retirement.retired_at, Timestamp(7));
+}
+
+/// An out-of-crate storage: every trait item and DTO is reachable and
+/// implementable from a host crate, and the trait is object safe.
+#[derive(Debug, Default)]
+struct ParkedApply {
+    inner: VolatileJournalStorage,
+    #[allow(clippy::type_complexity)]
+    park: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+#[async_trait::async_trait]
+impl JournalStorage for ParkedApply {
+    async fn load(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+    ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
+        self.inner.load(domain, session).await
+    }
+    async fn objects(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        ids: &[JournalObjectId],
+    ) -> Result<Vec<Option<std::sync::Arc<[u8]>>>, RuntimeError> {
+        self.inner.objects(domain, session, ids).await
+    }
+    async fn members(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+    ) -> Result<Vec<JournalObjectId>, RuntimeError> {
+        self.inner.members(domain, session).await
+    }
+    async fn operation(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        operation: &JournalOperationId,
+    ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
+        self.inner.operation(domain, session, operation).await
+    }
+    async fn pins(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+    ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
+        self.inner.pins(domain, session).await
+    }
+    async fn catalog(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        head: &JournalObjectId,
+    ) -> Result<Option<JournalCatalogEntry>, RuntimeError> {
+        self.inner.catalog(domain, session, head).await
+    }
+    async fn dirty_sessions(
+        &self,
+        domain: &JournalDomain,
+        after: Option<&SessionId>,
+        limit: usize,
+    ) -> Result<Vec<SessionId>, RuntimeError> {
+        self.inner.dirty_sessions(domain, after, limit).await
+    }
+    async fn apply(&self, write: JournalWrite) -> Result<(), RuntimeError> {
+        let parked = self.park.lock().unwrap().take();
+        if let Some((parked, release)) = parked {
+            parked.send(()).unwrap();
+            release.await.unwrap();
+        }
+        self.inner.apply(write).await
+    }
+    async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
+        self.inner.compact(domain).await
+    }
+}
+
+/// Revocation and close never wait for storage. A commit that already passed
+/// its lease check when the host revoked the writer still publishes (the
+/// durable fence is unchanged until the next writer opens, and that open
+/// waits for the commit under the gate); no later commit from it can.
+#[tokio::test]
+async fn review_revocation_during_a_suspended_commit_is_fenced_at_the_next_open() {
+    let _object_safe: Option<std::sync::Arc<dyn JournalStorage>> = None;
+    let storage = std::sync::Arc::new(ParkedApply::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("parked"),
+        JournalEngineConfig::default(),
+    );
+    let session = SessionId::new("s");
+    let lease = engine
+        .open(&session, open("writer", JournalOpenIntent::ExclusiveWriter))
+        .await
+        .unwrap();
+    let (parked, at_apply) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *storage.park.lock().unwrap() = Some((parked, released));
+    let committing = engine.commit(&lease, empty_commit(&session, 1, "op"));
+    let revoking = async {
+        at_apply.await.unwrap();
+        engine.revoke_writer(&session).unwrap();
+        release.send(()).unwrap();
+    };
+    let (head, ()) = tokio::join!(committing, revoking);
+    let head = head.unwrap();
+    assert_conflict(
+        engine
+            .commit(&lease, empty_commit(&session, 1, "again"))
+            .await,
+    );
+    let next = engine
+        .open(&session, open("next", JournalOpenIntent::ExclusiveWriter))
+        .await
+        .unwrap();
+    assert_eq!(next.writer_epoch(), Some(2));
+    assert_eq!(next.head(), Some(&head));
+}
