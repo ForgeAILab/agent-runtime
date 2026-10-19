@@ -31,7 +31,8 @@ session could not be resumed.
   reason is normalized, bounded to 300 characters, appended to the fixed
   class message, and kept as `provider.detail`; `http.status` survives as an
   unsigned integer; everything else is still dropped. Authentication
-  failures keep their fixed message.
+  rejections carry the checked reason too: a gateway out of credit answered
+  403 "Insufficient quota", and Smith showed only "authentication rejected".
 - The reqwest transport reads the same documented fields, including from an
   SSE-framed error body such as Gemini Interactions sends.
 - A converted provider `BadRequest` is `ErrorKind::Provider`. `Unsupported`

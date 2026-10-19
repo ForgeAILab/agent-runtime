@@ -597,8 +597,15 @@ async fn classify_auth_rejection(
     if error.kind != ProviderErrorKind::Auth {
         return error;
     }
+    // `error` is already sanitized, so its message and metadata hold only
+    // the fixed class text and a checked reason; keep them.
+    let rejected = || {
+        let mut rejected = ProviderError::new(ProviderErrorKind::Auth, error.message.clone());
+        rejected.metadata = error.metadata.clone();
+        rejected
+    };
     let (Some(source), Some(rejected_revision)) = (source, rejected_revision) else {
-        return ProviderError::new(ProviderErrorKind::Auth, "provider authentication rejected");
+        return rejected();
     };
     let invalidate = source.invalidate(
         &target,
@@ -621,7 +628,7 @@ async fn classify_auth_rejection(
             Err(error) => return credential_error(error),
         },
     };
-    let error = ProviderError::new(ProviderErrorKind::Auth, "provider authentication rejected");
+    let error = rejected();
     if outcome == CredentialInvalidation::ReplacementPossible {
         error.with_credential_recovery(ProviderCredentialRecovery::RetryWithRenewedCredential)
     } else {
@@ -1481,10 +1488,10 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                         let error = error_redaction::sanitize(error, &credentials);
                         let error = if saw_semantic_event {
                             if error.kind == ProviderErrorKind::Auth {
-                                ProviderError::new(
-                                    ProviderErrorKind::Auth,
-                                    "provider authentication rejected",
-                                )
+                                let mut rejected =
+                                    ProviderError::new(ProviderErrorKind::Auth, error.message.clone());
+                                rejected.metadata = error.metadata.clone();
+                                rejected
                             } else {
                                 error
                             }
@@ -2701,7 +2708,7 @@ mod tests {
             vec![
                 " \n",
                 "{\"error\":{\"code\":\"1003\",",
-                "\"message\":\"secret-canary\"}}",
+                "\"message\":\"rejected Bearer token-canary\"}}",
             ],
         ] {
             let source = Arc::new(ScriptedCredentialSource::new(
@@ -2737,7 +2744,11 @@ mod tests {
             );
             assert_eq!(source.acquire_calls.load(Ordering::SeqCst), 1);
             assert_eq!(provider.transport().requests().len(), 1);
-            assert!(!format!("{events:?}").contains("canary"));
+            // A checked reason may be carried; the credential and its
+            // revision never are, and a reason echoing the token is dropped.
+            let rendered = format!("{events:?}");
+            assert!(!rendered.contains("token-canary"), "{rendered}");
+            assert!(!rendered.contains("revision-canary"), "{rendered}");
         }
     }
 
@@ -2939,7 +2950,11 @@ mod tests {
                 assert!(!crate::retry::is_retryable(error));
                 assert!(source.invalidated.lock().unwrap().is_empty());
                 assert_eq!(provider.transport().requests().len(), 1);
-                assert!(!format!("{events:?}").contains("canary"));
+                assert!(
+                    error.message.ends_with(": secret-canary"),
+                    "{}",
+                    error.message
+                );
             }
         }
     }

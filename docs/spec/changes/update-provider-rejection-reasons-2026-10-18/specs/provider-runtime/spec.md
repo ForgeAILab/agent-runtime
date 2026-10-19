@@ -15,7 +15,8 @@ characters normalized, be bounded to 300 characters, be appended to the
 fixed class message as `"{message}: {reason}"`, and be kept as metadata
 `provider.detail`. Metadata `http.status` SHALL survive as an unsigned
 integer, and all other transport metadata and text MUST still be dropped.
-Authentication failures SHALL keep their fixed message. A converted provider
+Authentication failures SHALL carry a checked reason too, on the error their
+credential-rejection classification builds. A converted provider
 `BadRequest` SHALL be `ErrorKind::Provider`; `Unsupported` stays
 `ErrorKind::Config`, and failure classes are unchanged.
 
@@ -27,6 +28,14 @@ Authentication failures SHALL keep their fixed message. A converted provider
 - **THEN** the error reads `Gemini provider rejected the request:
   invalid_request: Request contains an invalid argument.`
 - **AND** its kind is `provider` and its class is request-rejected
+
+#### Scenario: A gateway out of credit answers 403
+
+- **GIVEN** a gateway answers 403 with "Insufficient quota. Please top up and
+  try again."
+- **WHEN** the adapter classifies the authentication rejection
+- **THEN** the error reads `provider authentication rejected: ... Insufficient
+  quota. Please top up and try again.`
 
 #### Scenario: A reason echoes the request's credential
 
@@ -53,7 +62,8 @@ carry a checked reason".
 - **GIVEN** the provider returns an authentication status and sensitive body
 - **WHEN** the adapter classifies the failure before semantic output
 - **THEN** it uses the shared authentication and credential-recovery contract
-- **AND** discards the raw body and all credential-shaped values
+- **AND** discards the raw body and every value the request sent as a
+  credential, keeping at most a checked reason
 
 ### Requirement: Bounded redaction-safe streaming transport
 

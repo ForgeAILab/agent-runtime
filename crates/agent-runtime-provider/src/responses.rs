@@ -2037,16 +2037,17 @@ async fn take_terminal(
                 && source.is_some()
                 && rejected_revision.is_some() =>
         {
+            let rejected = classify_auth_rejection(
+                source.expect("source checked"),
+                target,
+                rejected_revision.expect("revision checked"),
+                cancel,
+                deadline,
+                clock,
+            )
+            .await;
             Ok(ProviderStreamEvent::Error {
-                error: classify_auth_rejection(
-                    source.expect("source checked"),
-                    target,
-                    rejected_revision.expect("revision checked"),
-                    cancel,
-                    deadline,
-                    clock,
-                )
-                .await,
+                error: error_redaction::carry_auth_reason(rejected, &error, &state.credentials),
             })
         }
         Some(PendingTerminal::Error(error)) => Ok(ProviderStreamEvent::Error { error }),
@@ -2121,14 +2122,15 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
                 Err(error) if error.kind == ProviderErrorKind::Auth
                     && credential_source.is_some()
                     && rejected_revision.is_some() => {
-                    return Err(classify_auth_rejection(
+                    let rejected = classify_auth_rejection(
                         credential_source.expect("source checked"),
                         credential_target,
                         rejected_revision.expect("revision checked"),
                         &ctx.cancel,
                         ctx.deadline,
                         clock,
-                    ).await);
+                    ).await;
+                    return Err(error_redaction::carry_auth_reason(rejected, &error, &credentials));
                 }
                 Err(error) => return Err(sanitize_transport_error(error, &credentials)),
             },
@@ -2187,15 +2189,20 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
                         && !state.saw_semantic_event
                         && credential_source.is_some()
                         && rejected_revision.is_some() => {
+                        let rejected = classify_auth_rejection(
+                            credential_source.clone().expect("source checked"),
+                            credential_target.clone(),
+                            rejected_revision.clone().expect("revision checked"),
+                            &cancel,
+                            deadline,
+                            clock.clone(),
+                        ).await;
                         yield ProviderStreamEvent::Error {
-                            error: classify_auth_rejection(
-                                credential_source.clone().expect("source checked"),
-                                credential_target.clone(),
-                                rejected_revision.clone().expect("revision checked"),
-                                &cancel,
-                                deadline,
-                                clock.clone(),
-                            ).await,
+                            error: error_redaction::carry_auth_reason(
+                                rejected,
+                                &error,
+                                &state.credentials,
+                            ),
                         };
                         return;
                     }

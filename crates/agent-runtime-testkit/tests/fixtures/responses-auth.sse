@@ -1,3 +1,3 @@
-data: {"type":"error","code":"invalid_api_key","message":"api-key-canary"}
+data: {"type":"error","code":"invalid_api_key","message":"Incorrect API key provided: fixture-key"}
 
 data: [DONE]

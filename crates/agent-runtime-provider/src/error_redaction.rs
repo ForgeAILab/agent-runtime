@@ -104,19 +104,38 @@ impl RequestCredentials {
     }
 }
 
-/// Adds a checked provider reason while leaving authentication diagnostics fixed.
+/// Adds a checked provider reason to an error's fixed message.
+///
+/// Authentication rejections carry one too: a gateway that answers 403 with
+/// "Insufficient quota" has not judged the key, and only its reason says so.
 pub(crate) fn with_reason(
     mut error: ProviderError,
     raw: Option<&str>,
     credentials: &RequestCredentials,
 ) -> ProviderError {
-    if error.kind != ProviderErrorKind::Auth {
-        if let Some(reason) = raw.and_then(|raw| credentials.reason(raw)) {
-            error.message = format!("{}: {reason}", error.message);
-            error.metadata.insert(PROVIDER_DETAIL_KEY, reason);
-        }
+    if let Some(reason) = raw.and_then(|raw| credentials.reason(raw)) {
+        error.message = format!("{}: {reason}", error.message);
+        error.metadata.insert(PROVIDER_DETAIL_KEY, reason);
     }
     error
+}
+
+/// Carries `from`'s checked reason onto the authentication error that a
+/// credential-rejection classification built in its place. Any other kind,
+/// such as a cancelled invalidation, is returned unchanged.
+pub(crate) fn carry_auth_reason(
+    replacement: ProviderError,
+    from: &ProviderError,
+    credentials: &RequestCredentials,
+) -> ProviderError {
+    if replacement.kind != ProviderErrorKind::Auth {
+        return replacement;
+    }
+    let reason = match from.metadata.get(PROVIDER_DETAIL_KEY) {
+        Some(MetaValue::Text(text)) => Some(text.as_str()),
+        _ => None,
+    };
+    with_reason(replacement, reason, credentials)
 }
 
 /// Rebuilds a transport failure from its class and checked diagnostic metadata.
@@ -274,6 +293,32 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn an_authentication_rejection_carries_its_checked_reason() {
+        let credentials = credentials();
+        // A gateway that is out of credit answers 403; only its reason says
+        // the key itself is fine.
+        let mut error = ProviderError::new(ProviderErrorKind::Auth, "raw transport text");
+        error.metadata.insert(
+            PROVIDER_DETAIL_KEY,
+            "status_code=403, Insufficient quota. Please top up and try again.",
+        );
+        let sanitized = sanitize(error, &credentials);
+        assert_eq!(sanitized.kind, ProviderErrorKind::Auth);
+        assert_eq!(
+            sanitized.message,
+            "provider authentication rejected: status_code=403, Insufficient quota. Please top up and try again."
+        );
+
+        let mut echoed = ProviderError::new(ProviderErrorKind::Auth, "raw transport text");
+        echoed
+            .metadata
+            .insert(PROVIDER_DETAIL_KEY, "invalid key bearer-token-secret");
+        let sanitized = sanitize(echoed, &credentials);
+        assert_eq!(sanitized.message, "provider authentication rejected");
+        assert!(sanitized.metadata.get(PROVIDER_DETAIL_KEY).is_none());
     }
 
     #[test]

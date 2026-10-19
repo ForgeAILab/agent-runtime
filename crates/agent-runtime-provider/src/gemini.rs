@@ -1911,16 +1911,11 @@ async fn take_terminal(
         Some(PendingTerminal::Error(error))
             if error.kind == ProviderErrorKind::Auth && !state.saw_semantic_event =>
         {
+            let rejected =
+                classify_auth_rejection(source, target, rejected_revision, cancel, deadline, clock)
+                    .await;
             Ok(ProviderStreamEvent::Error {
-                error: classify_auth_rejection(
-                    source,
-                    target,
-                    rejected_revision,
-                    cancel,
-                    deadline,
-                    clock,
-                )
-                .await,
+                error: error_redaction::carry_auth_reason(rejected, &error, &state.credentials),
             })
         }
         Some(PendingTerminal::Error(error)) => Ok(ProviderStreamEvent::Error { error }),
@@ -1985,14 +1980,15 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
             result = &mut post => match result {
                 Ok(response) => response,
                 Err(error) if error.kind == ProviderErrorKind::Auth => {
-                    return Err(classify_auth_rejection(
+                    let rejected = classify_auth_rejection(
                         credential_source,
                         credential_target,
                         rejected_revision,
                         &ctx.cancel,
                         ctx.deadline,
                         clock,
-                    ).await);
+                    ).await;
+                    return Err(error_redaction::carry_auth_reason(rejected, &error, &credentials));
                 }
                 Err(error) => return Err(sanitize_transport_error(error, &credentials)),
             },
@@ -2050,15 +2046,20 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
                     Err(error) if error.kind == ProviderErrorKind::Auth
                         && !state.saw_semantic_event =>
                     {
+                        let rejected = classify_auth_rejection(
+                            credential_source.clone(),
+                            credential_target.clone(),
+                            rejected_revision.clone(),
+                            &cancel,
+                            deadline,
+                            clock.clone(),
+                        ).await;
                         yield ProviderStreamEvent::Error {
-                            error: classify_auth_rejection(
-                                credential_source.clone(),
-                                credential_target.clone(),
-                                rejected_revision.clone(),
-                                &cancel,
-                                deadline,
-                                clock.clone(),
-                            ).await,
+                            error: error_redaction::carry_auth_reason(
+                                rejected,
+                                &error,
+                                &state.credentials,
+                            ),
                         };
                         return;
                     }
@@ -3522,7 +3523,14 @@ mod tests {
                 }
             }]
         ));
-        assert!(!format!("{events:?}").contains("secret-canary"));
+        // The provider's reason travels with the rejection; the key it was
+        // sent with does not.
+        let rendered = format!("{events:?}");
+        assert!(
+            rendered.contains("raw streamed secret-canary"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("renewable-api-key-canary"));
         assert_eq!(source.invalidated.lock().unwrap().len(), 1);
     }
 

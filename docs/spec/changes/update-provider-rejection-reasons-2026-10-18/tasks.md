@@ -19,6 +19,8 @@ updated_at: 2026-10-18T23:40:00Z
   stream errors.
 - [x] 2.3 The reqwest transport extracts the documented reason, including
   from SSE-framed bodies.
+- [x] 2.4 Authentication rejections carry the checked reason onto the error
+  their credential classification builds.
 
 ## 3. Error kind and child restore
 

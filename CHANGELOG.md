@@ -16,6 +16,8 @@ contain breaking changes and are coordinated with consumer proposals.
   any of them; a kept reason is bounded to 300 characters and kept as
   `provider.detail`, with the HTTP status as `http.status`. The reqwest
   transport reads it too, including from Gemini's SSE-framed error bodies.
+  Authentication rejections carry the reason as well, so a gateway's 403
+  "Insufficient quota" no longer reads as a rejected key.
   `agent-runtime-provider` now depends on `url` unconditionally.
 - A provider `BadRequest` converts to `ErrorKind::Provider` rather than
   `ErrorKind::Config`, so a rejected request no longer displays as
