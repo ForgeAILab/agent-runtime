@@ -212,7 +212,10 @@ parent-scoped catalog and composed authorization path. Recovery MUST validate
 the parent session, security scope, child session, specification fingerprint,
 workspace identity, model/provider policy, tool-view upper bound, and relevant
 revisions. It MAY apply a strictly narrower compatible policy, but MUST fail
-closed rather than widen authority or silently change identity.
+closed rather than widen authority or silently change identity. A child whose
+policy the host cannot compute while the parent's catalog is restored SHALL
+be marked incompatible, and an interrupted one non-resumable, without
+failing the parent's restore.
 
 #### Scenario: Another parent knows the child ID
 
@@ -228,6 +231,15 @@ closed rather than widen authority or silently change identity.
 - **WHEN** recovery resolves a different or less-trusted workspace identity
 - **THEN** recovery fails closed as incompatible
 - **AND** does not rebuild the child with the new workspace
+
+#### Scenario: The host can no longer build a child's policy
+
+- **GIVEN** a parent's catalog records a child the host factory now fails to
+  fingerprint, for example because the child's profile route is gone
+- **WHEN** the parent session is restored
+- **THEN** the parent restores
+- **AND** that child reports the incompatibility and is not resumable
+- **AND** the other children are unaffected
 
 ### Requirement: Bounded child wait
 
