@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T19:46:26Z
+updated_at: 2026-10-19T20:31:24Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -76,7 +76,7 @@ this measurement job.
   `retain_root`, `release_pin`, `stage_leaves` and `compact`, keeping the
   newtype's synchronous signatures (D3). Tests: every testkit collection suite
   and `journal_gc_runtime`, unchanged.
-- [ ] 2.5 Replace the domain-wide trace with session-scoped incremental
+- [x] 2.5 Replace the domain-wide trace with session-scoped incremental
   collection (D4): `collection_dirty`, per-session live sets, membership
   release, catalog pruning. Tests: all collection suites unchanged; new tests
   for a shared object across two sessions and across both domains, a dirty
@@ -85,13 +85,13 @@ this measurement job.
 
 ## 3. Storage conformance
 
-- [ ] 3.1 Add testkit `conformance::journal_storage` with
+- [x] 3.1 Add testkit `conformance::journal_storage` with
   `assert_journal_storage_conformance(factory)`: the protected, ordinary and
   collection suites over `JournalEngine<S>`, the storage-level cases from 2.2,
   and a restart case (fresh engine, same storage, sees exactly acknowledged
   state). Add `JournalCollectionHost for JournalEngine<S>`. Run it on
   `VolatileJournalStorage`.
-- [ ] 3.2 Add the five broken storages (torn transaction, lost write,
+- [x] 3.2 Add the five broken storages (torn transaction, lost write,
   reordered commit, stale epoch, shared object deleted while referenced) and
   require each to fail a named case. Tests: one test per broken storage.
 

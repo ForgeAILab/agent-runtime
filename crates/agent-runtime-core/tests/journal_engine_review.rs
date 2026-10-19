@@ -427,7 +427,7 @@ impl JournalStorage for ParkedApply {
     ) -> Result<Vec<SessionId>, RuntimeError> {
         self.inner.dirty_sessions(domain, after, limit).await
     }
-    async fn apply(&self, write: JournalWrite) -> Result<(), RuntimeError> {
+    async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         let parked = self.park.lock().unwrap().take();
         if let Some((parked, release)) = parked {
             parked.send(()).unwrap();

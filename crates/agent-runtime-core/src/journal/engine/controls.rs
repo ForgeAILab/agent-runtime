@@ -162,8 +162,19 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         Ok(())
     }
-    // The pre-incremental collector and retirement checks use the same complete
-    // dependency view as the original reference implementation.
+    /// Logical immutable-object bytes in sessions observed by this engine or
+    /// still marked dirty by storage, deduplicated within this domain.
+    /// Diagnostic only: storage cannot enumerate unseen clean sessions through
+    /// the journal contract, and this is not a physical on-disk byte metric.
+    pub async fn retained_bytes(&self) -> Result<u64, RuntimeError> {
+        let _gate = self.gate.lock().await;
+        let (state, _, _) = self.domain_state(true).await?;
+        let bytes = state.lock()?.objects.bytes as u64;
+        Ok(bytes)
+    }
+
+    // Retirement uses the same complete dependency view as the original
+    // reference implementation; collection never calls this domain-wide path.
     async fn domain_state(&self, with_objects: bool) -> Result<DomainState, RuntimeError> {
         let mut sessions: BTreeSet<_> = self.local.lock()?.sessions.keys().cloned().collect();
         let mut after = None;
@@ -270,37 +281,144 @@ impl<S: JournalStorage> JournalEngine<S> {
                 return Err(conflict());
             }
         }
-        let (scratch, records, memberships) = self.domain_state(true).await?;
-        if self.root_epoch()? != request.expected_root_epoch {
-            return Err(conflict());
+        // Close and revocation do no I/O. Drain their local dirty hints under
+        // the registry lock order; concurrent changes insert fresh hints and
+        // therefore cannot be erased by this sweep.
+        let local_dirty = std::mem::take(&mut *self.dirty.lock().map_err(|_| host_failure())?);
+        let result = self.collect_sessions(&request, &local_dirty).await;
+        if result.is_err() {
+            self.dirty
+                .lock()
+                .map_err(|_| host_failure())?
+                .extend(local_dirty);
         }
-        let report = scratch.collect(request)?;
-        if report.deleted != 0 {
-            let remaining: BTreeSet<_> = scratch.lock()?.objects.entries().into_keys().collect();
-            for (session, members) in memberships {
-                let release: Vec<_> = members
-                    .into_iter()
-                    .filter(|id| !remaining.contains(id))
-                    .collect();
-                if release.is_empty() {
-                    continue;
-                }
-                let mut write = self.write(
-                    &scratch,
-                    &session,
-                    records.get(&session).and_then(Option::as_ref),
-                    JournalWriteKind::Collect,
-                )?;
-                write.catalog = release
-                    .iter()
-                    .cloned()
-                    .map(JournalCatalogChange::Remove)
-                    .collect();
-                write.release = release;
-                self.apply(write, &session).await?;
-                self.publish(&scratch, &session, None, None, false)?;
+        result
+    }
+
+    async fn collect_sessions(
+        &self,
+        request: &JournalGcRequest,
+        local_dirty: &BTreeSet<SessionId>,
+    ) -> Result<JournalGcReport, RuntimeError> {
+        if self
+            .local
+            .lock()?
+            .leases
+            .values()
+            .any(|lease| lease.dependencies.unresolved)
+        {
+            return Err(RuntimeError::unsupported_capability(
+                crate::error::UnsupportedCapability::JournalCollection,
+            ));
+        }
+        let mut report = JournalGcReport {
+            root_epoch: request.expected_root_epoch,
+            examined: 0,
+            deleted: 0,
+            reclaimed_bytes: 0,
+        };
+        // The work budget counts membership releases, including shared bodies
+        // whose physical deletion receipt is zero. Reports count body deletions.
+        let mut released = 0;
+        let mut after = None;
+        let mut local_pending = local_dirty.clone();
+        loop {
+            let page = self
+                .storage
+                .dirty_sessions(&self.domain, after.as_ref(), 128)
+                .await?;
+            let last = page.last().cloned();
+            let mut sessions: BTreeSet<_> = page.into_iter().collect();
+            // Merge process-local changes in the same session-id order as the
+            // persistent cursor. Local-only sessions beyond this page wait.
+            let hints: Vec<_> = local_pending
+                .iter()
+                .take_while(|session| last.as_ref().is_none_or(|end| *session <= end))
+                .cloned()
+                .collect();
+            for session in hints {
+                sessions.insert(session);
             }
-            self.local.lock()?.advance_root_epoch()?;
+            for session in sessions {
+                // Never read a later session once the membership-release budget
+                // has been spent. Its persistent/local dirty marker survives.
+                if released == request.max_objects && released != 0 {
+                    self.dirty
+                        .lock()
+                        .map_err(|_| host_failure())?
+                        .extend(local_pending);
+                    return Ok(report);
+                }
+                local_pending.remove(&session);
+                let stored = self.storage.load(&self.domain, &session).await?;
+                let live = self.collection_live(&session, stored.as_ref()).await?;
+                let members = self.storage.members(&self.domain, &session).await?;
+                let member_set: BTreeSet<_> = members.iter().cloned().collect();
+                if !live.is_subset(&member_set) {
+                    return Err(conflict());
+                }
+                // Close/revocation remain I/O-free while storage reads await.
+                // Preserve the original collector's post-read mark check before
+                // the first write can change membership or clear dirty flags.
+                if released == 0 && self.root_epoch()? != request.expected_root_epoch {
+                    return Err(conflict());
+                }
+                report.examined += members.len() as u64;
+                let garbage: Vec<_> = members
+                    .into_iter()
+                    .filter(|id| !live.contains(id))
+                    .collect();
+                let limit = usize::try_from(request.max_objects - released).unwrap_or(usize::MAX);
+                let complete = garbage.len() <= limit;
+                let release: Vec<_> = garbage.into_iter().take(limit).collect();
+                if let Some(mut record) = stored {
+                    record.collection_dirty = !complete;
+                    let write = JournalWrite {
+                        domain: self.domain.clone(),
+                        session: session.clone(),
+                        kind: JournalWriteKind::Collect,
+                        expect: (record.revision, record.writer_epoch),
+                        record: Some(record),
+                        objects: JournalObjectBatch::default(),
+                        operation: None,
+                        pins: vec![],
+                        catalog: release
+                            .iter()
+                            .cloned()
+                            .map(JournalCatalogChange::Remove)
+                            .collect(),
+                        release: release.clone(),
+                        prune_operations_before: None,
+                        inject: None,
+                    };
+                    let receipt = self.apply(write, &session).await?;
+                    report.deleted += receipt.reclaimed_objects;
+                    report.reclaimed_bytes += receipt.reclaimed_bytes;
+                } else if !release.is_empty() {
+                    return Err(conflict());
+                }
+                self.local
+                    .lock()?
+                    .sessions
+                    .entry(session.clone())
+                    .or_default();
+                if !release.is_empty() {
+                    let mut local = self.local.lock()?;
+                    if released == 0 {
+                        local.advance_root_epoch()?;
+                    }
+                    if let Some(record) = local.sessions.get_mut(&session) {
+                        for id in &release {
+                            record.retained_heads.remove(id);
+                        }
+                    }
+                    released += release.len() as u64;
+                }
+            }
+            match last {
+                Some(last) => after = Some(last),
+                None => break,
+            }
         }
         Ok(report)
     }

@@ -146,6 +146,49 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         Ok(false)
     }
+
+    // Durable pins persist their complete, already validated immutable closure,
+    // including staged leaves. Only the current head needs a closure walk.
+    pub(super) async fn collection_live(
+        &self,
+        session: &SessionId,
+        stored: Option<&JournalSessionRecord>,
+    ) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
+        let unsupported = || {
+            RuntimeError::unsupported_capability(
+                crate::error::UnsupportedCapability::JournalCollection,
+            )
+        };
+        let mut live = BTreeSet::new();
+        if let Some(stored) = stored {
+            let metadata: Metadata = decode(&stored.engine)?;
+            if stored.head.is_some() && metadata.dependencies.unresolved {
+                return Err(unsupported());
+            }
+            if let Some(root) = &stored.head {
+                live.extend(self.closure_objects(session, &root.id).await?.into_keys());
+            }
+        }
+        for pin in self.storage.pins(&self.domain, session).await? {
+            let metadata: PinMetadata = decode(&pin.engine)?;
+            if metadata.dependencies.unresolved {
+                return Err(unsupported());
+            }
+            live.extend(metadata.reachable);
+        }
+        let local = self.local.lock()?;
+        for lease in local
+            .leases
+            .values()
+            .filter(|lease| &lease.session == session)
+        {
+            for layer in &lease.reachable.layers {
+                live.extend(layer.iter().cloned());
+            }
+        }
+        Ok(live)
+    }
+
     pub(super) fn write(
         &self,
         scratch: &Transition,
@@ -204,9 +247,9 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         write: JournalWrite,
         session: &SessionId,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<JournalApplyReceipt, RuntimeError> {
         match self.storage.apply(write).await {
-            Ok(()) => Ok(()),
+            Ok(receipt) => Ok(receipt),
             Err(error) => {
                 self.invalidate(session)?;
                 Err(error)

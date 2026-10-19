@@ -317,7 +317,7 @@ impl JournalStorage for VolatileJournalStorage {
             .map(|((_, s), _)| s.clone())
             .collect())
     }
-    async fn apply(&self, write: JournalWrite) -> Result<(), RuntimeError> {
+    async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         let mut state = self.lock()?;
         let key = session_key(&write.domain, &write.session);
         let actual = state
@@ -442,6 +442,18 @@ impl JournalStorage for VolatileJournalStorage {
                 }
             }
         }
+        let receipt = JournalApplyReceipt {
+            reclaimed_objects: deleted.len() as u64,
+            reclaimed_bytes: deleted
+                .iter()
+                .map(|id| {
+                    staged
+                        .object(id)
+                        .map(|body| body.len() as u64)
+                        .ok_or_else(conflict)
+                })
+                .sum::<Result<u64, _>>()?,
+        };
         if !deleted.is_empty() {
             let mut entries = staged.entries();
             entries.retain(|id, _| !deleted.contains(id));
@@ -457,7 +469,8 @@ impl JournalStorage for VolatileJournalStorage {
                 .push(Arc::new(first));
         }
         *state = staged;
-        fail(JournalCommitFailurePoint::AfterCommit)
+        fail(JournalCommitFailurePoint::AfterCommit)?;
+        Ok(receipt)
     }
     async fn compact(&self, _: &JournalDomain) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
@@ -678,6 +691,47 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn receipts_count_shared_bodies_only_at_the_last_membership_once() {
+        let storage = VolatileJournalStorage::default();
+        let mut holders = vec![write("s"), write("t"), write("s"), write("t")];
+        holders[2].domain.role = JournalRole::Ordinary;
+        holders[3].domain.role = JournalRole::Ordinary;
+        let object = holders[0].objects.objects[0].clone();
+        for transaction in &holders {
+            assert_eq!(
+                storage.apply(transaction.clone()).await.unwrap(),
+                JournalApplyReceipt::default()
+            );
+        }
+        for (index, mut transaction) in holders.into_iter().enumerate() {
+            transaction.kind = JournalWriteKind::Collect;
+            transaction.expect = (JournalRevision(1), 1);
+            transaction.record = None;
+            transaction.objects.objects.clear();
+            transaction.operation = None;
+            transaction.pins.clear();
+            transaction.catalog.clear();
+            transaction.release = vec![object.id.clone(), object.id.clone()];
+            let receipt = storage.apply(transaction.clone()).await.unwrap();
+            assert_eq!(
+                receipt,
+                if index == 3 {
+                    JournalApplyReceipt {
+                        reclaimed_objects: 1,
+                        reclaimed_bytes: object.bytes.len() as u64,
+                    }
+                } else {
+                    JournalApplyReceipt::default()
+                }
+            );
+            assert_eq!(
+                storage.apply(transaction).await.unwrap(),
+                JournalApplyReceipt::default()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dirty_session_paging_is_ordered_and_domain_scoped() {
         let storage = VolatileJournalStorage::default();

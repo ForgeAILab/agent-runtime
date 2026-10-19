@@ -40,10 +40,27 @@ async fn close_is_ready_while_another_task_holds_the_write_gate() {
     assert_eq!(next.writer_epoch(), Some(2));
 }
 
+type LoadPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 #[derive(Debug, Default)]
 struct LostAcknowledgement {
     inner: VolatileJournalStorage,
     lose: std::sync::atomic::AtomicBool,
+    calls: Mutex<BTreeMap<(&'static str, SessionId), usize>>,
+    pause_load: Mutex<Option<LoadPause>>,
+}
+impl LostAcknowledgement {
+    fn count(&self, name: &'static str, session: &SessionId) {
+        *self
+            .calls
+            .lock()
+            .unwrap()
+            .entry((name, session.clone()))
+            .or_default() += 1;
+    }
 }
 #[async_trait]
 impl JournalStorage for LostAcknowledgement {
@@ -52,6 +69,12 @@ impl JournalStorage for LostAcknowledgement {
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
+        self.count("load", s);
+        let pause = self.pause_load.lock().unwrap().take();
+        if let Some((ready, resume)) = pause {
+            ready.send(()).unwrap();
+            resume.await.unwrap();
+        }
         self.inner.load(d, s).await
     }
     async fn objects(
@@ -60,6 +83,7 @@ impl JournalStorage for LostAcknowledgement {
         s: &SessionId,
         ids: &[JournalObjectId],
     ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
+        self.count("objects", s);
         self.inner.objects(d, s, ids).await
     }
     async fn members(
@@ -67,6 +91,7 @@ impl JournalStorage for LostAcknowledgement {
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Vec<JournalObjectId>, RuntimeError> {
+        self.count("members", s);
         self.inner.members(d, s).await
     }
     async fn operation(
@@ -75,6 +100,7 @@ impl JournalStorage for LostAcknowledgement {
         s: &SessionId,
         o: &JournalOperationId,
     ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
+        self.count("operation", s);
         self.inner.operation(d, s, o).await
     }
     async fn pins(
@@ -82,6 +108,7 @@ impl JournalStorage for LostAcknowledgement {
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
+        self.count("pins", s);
         self.inner.pins(d, s).await
     }
     async fn catalog(
@@ -90,6 +117,7 @@ impl JournalStorage for LostAcknowledgement {
         s: &SessionId,
         h: &JournalObjectId,
     ) -> Result<Option<JournalCatalogEntry>, RuntimeError> {
+        self.count("catalog", s);
         self.inner.catalog(d, s, h).await
     }
     async fn dirty_sessions(
@@ -98,18 +126,20 @@ impl JournalStorage for LostAcknowledgement {
         a: Option<&SessionId>,
         n: usize,
     ) -> Result<Vec<SessionId>, RuntimeError> {
+        self.count("dirty_sessions", &SessionId::new(""));
         self.inner.dirty_sessions(d, a, n).await
     }
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(d).await
     }
-    async fn apply(&self, write: JournalWrite) -> Result<(), RuntimeError> {
+    async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
+        self.count("apply", &write.session);
         let commit = write.kind == JournalWriteKind::Commit;
-        self.inner.apply(write).await?;
+        let receipt = self.inner.apply(write).await?;
         if commit && self.lose.swap(false, std::sync::atomic::Ordering::SeqCst) {
             Err(injected_failure())
         } else {
-            Ok(())
+            Ok(receipt)
         }
     }
 }
@@ -399,6 +429,355 @@ async fn an_armed_cut_keeps_its_original_order_relative_to_validation_errors() {
     assert_eq!(
         engine.commit(&lease, valid).await.unwrap().revision,
         JournalRevision(1)
+    );
+}
+
+async fn sweep<S: JournalStorage>(engine: &JournalEngine<S>, max_objects: u64) -> JournalGcReport {
+    engine
+        .collect(JournalGcRequest {
+            storage_id: engine.storage_id(),
+            expected_root_epoch: engine.root_epoch().unwrap(),
+            max_objects,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn incremental_sweep_never_reads_ten_clean_sessions() {
+    let storage = Arc::new(LostAcknowledgement::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("counted"),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    let dirty = SessionId::new("s00");
+    let mut first = None;
+    for index in 0..11 {
+        let session = SessionId::new(format!("s{index:02}"));
+        let lease = engine.open(&session, writer("first")).await.unwrap();
+        let head = engine
+            .commit(
+                &lease,
+                empty_commit(&session, lease.writer_epoch().unwrap()),
+            )
+            .await
+            .unwrap();
+        engine.close(lease).await.unwrap();
+        if index == 0 {
+            first = Some(head);
+        }
+    }
+    assert_eq!(sweep(&engine, u64::MAX).await.deleted, 0);
+    let lease = engine.open(&dirty, writer("next")).await.unwrap();
+    let first = first.unwrap();
+    let mut commit = empty_commit(&dirty, lease.writer_epoch().unwrap());
+    commit.batch.sequence = 2;
+    commit.batch.expected_revision = Some(first.revision);
+    commit.batch.predecessor = Some(JournalDigest::parse(first.batch.as_str()).unwrap());
+    commit.batch.operation = JournalOperationId::new("next");
+    commit.digest = commit.input_digest().unwrap();
+    engine.commit(&lease, commit).await.unwrap();
+    engine.close(lease).await.unwrap();
+    storage.calls.lock().unwrap().clear();
+    let report = sweep(&engine, u64::MAX).await;
+    assert_eq!((report.examined, report.deleted), (4, 2));
+    let calls = storage.calls.lock().unwrap().clone();
+    let expected: BTreeMap<_, _> = [
+        (("load", dirty.clone()), 1),
+        (("pins", dirty.clone()), 1),
+        (("members", dirty.clone()), 1),
+        (("objects", dirty.clone()), 2),
+        (("apply", dirty), 1),
+        (("dirty_sessions", SessionId::new("")), 2),
+    ]
+    .into();
+    assert_eq!(
+        calls, expected,
+        "clean sessions must receive no storage calls"
+    );
+    eprintln!("INCREMENTAL CALLS: {calls:?}; report: {report:?}");
+    storage.calls.lock().unwrap().clear();
+    let report = sweep(&engine, u64::MAX).await;
+    assert_eq!(
+        (report.examined, report.deleted, report.reclaimed_bytes),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        *storage.calls.lock().unwrap(),
+        [(("dirty_sessions", SessionId::new("")), 1)].into()
+    );
+}
+
+#[tokio::test]
+async fn incremental_shared_body_receipts_across_sessions_and_both_domains() {
+    let storage = Arc::new(VolatileJournalStorage::default());
+    let engines = [
+        JournalEngine::protected(
+            storage.clone(),
+            JournalStorageId::new("shared"),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        ),
+        JournalEngine::ordinary(
+            storage.clone(),
+            JournalStorageId::new("shared"),
+            Arc::new(IdentityJournalProjection),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    let object = JournalObject::encode(
+        JournalObjectKind::Message,
+        &crate::content::Message::user("shared body"),
+    )
+    .unwrap();
+    let mut holders = Vec::new();
+    for (role, engine) in engines.iter().enumerate() {
+        for name in ["s", "t"] {
+            let session = SessionId::new(name);
+            let lease = engine.open(&session, writer("hold")).await.unwrap();
+            if role == 0 {
+                engine
+                    .stage_leaves(&lease, JournalPinId::new("stage"), vec![object.clone()])
+                    .await
+                    .unwrap();
+            } else {
+                // Admit the identical leaf through an ordinary projected commit.
+                let mut commit = empty_commit(&session, lease.writer_epoch().unwrap());
+                let snapshot = commit.delta.bootstrap.as_mut().unwrap();
+                snapshot.history = vec![crate::content::Message::user("shared body")];
+                let mut assembler = ObjectAssembler::default();
+                commit.batch.snapshot = assembler.snapshot(snapshot, 0).unwrap();
+                commit.objects = assembler
+                    .objects
+                    .into_iter()
+                    .map(|(id, bytes)| JournalObject { id, bytes })
+                    .collect();
+                commit.digest = commit.input_digest().unwrap();
+                let head = engine.commit(&lease, commit).await.unwrap();
+                engine.close(lease).await.unwrap();
+                engine
+                    .authorize_retirement(&session, head.revision, crate::clock::Timestamp(2))
+                    .await
+                    .unwrap();
+                engine.retire(&session, head.revision).await.unwrap();
+                holders.push((role, session));
+                continue;
+            }
+            engine.close(lease).await.unwrap();
+            holders.push((role, session));
+        }
+    }
+    // The protected holders release only the shared leaf. Other-domain heads
+    // are collected separately; their receipt includes their own control bodies.
+    for (_, session) in &holders[..2] {
+        engines[0]
+            .release_pin(
+                session,
+                &JournalPinId::new("stage"),
+                engines[0].root_epoch().unwrap(),
+            )
+            .await
+            .unwrap();
+        let report = sweep(&engines[0], 1).await;
+        assert_eq!((report.deleted, report.reclaimed_bytes), (0, 0));
+        assert!(
+            storage
+                .objects(
+                    &engines[1].domain,
+                    &holders[3].1,
+                    std::slice::from_ref(&object.id)
+                )
+                .await
+                .unwrap()[0]
+                .is_some()
+        );
+    }
+    let bytes = object.bytes.len() as u64;
+    assert_eq!(bytes, 138);
+    let mut shared_receipts = Vec::new();
+    loop {
+        let mut before = 0;
+        for name in ["s", "t"] {
+            before += u64::from(
+                storage
+                    .objects(
+                        &engines[1].domain,
+                        &SessionId::new(name),
+                        std::slice::from_ref(&object.id),
+                    )
+                    .await
+                    .unwrap()[0]
+                    .is_some(),
+            );
+        }
+        let remaining: usize = storage
+            .members(&engines[1].domain, &SessionId::new("s"))
+            .await
+            .unwrap()
+            .len()
+            + storage
+                .members(&engines[1].domain, &SessionId::new("t"))
+                .await
+                .unwrap()
+                .len();
+        if remaining == 0 {
+            break;
+        }
+        let report = sweep(&engines[1], 1).await;
+        let mut after = 0;
+        for name in ["s", "t"] {
+            after += u64::from(
+                storage
+                    .objects(
+                        &engines[1].domain,
+                        &SessionId::new(name),
+                        std::slice::from_ref(&object.id),
+                    )
+                    .await
+                    .unwrap()[0]
+                    .is_some(),
+            );
+        }
+        if before != after {
+            assert_eq!(report.reclaimed_bytes, if after == 0 { bytes } else { 0 });
+            shared_receipts.push(report.reclaimed_bytes);
+        }
+    }
+    assert_eq!(shared_receipts, vec![0, 138]);
+    eprintln!("SHARED BODY RECEIPTS across four holders: [0, 0, 0, 138]");
+}
+
+#[tokio::test]
+async fn partial_sweeps_keep_dirty_until_every_membership_is_released() {
+    let storage = Arc::new(VolatileJournalStorage::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("partial"),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    let session = SessionId::new("s");
+    let lease = engine.open(&session, writer("stage")).await.unwrap();
+    let objects: Vec<_> = (0..5)
+        .map(|index| {
+            JournalObject::encode(
+                JournalObjectKind::Message,
+                &crate::content::Message::user(format!("orphan {index}")),
+            )
+            .unwrap()
+        })
+        .collect();
+    let bytes: u64 = objects.iter().map(|o| o.bytes.len() as u64).sum();
+    engine
+        .stage_leaves(&lease, JournalPinId::new("stage"), objects)
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    engine
+        .release_pin(
+            &session,
+            &JournalPinId::new("stage"),
+            engine.root_epoch().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sweep(&engine, 0).await.deleted, 0);
+    let mut reclaimed = 0;
+    for (limit, expected) in [(2, 2), (2, 2), (2, 1)] {
+        let report = sweep(&engine, limit).await;
+        assert_eq!(report.deleted, expected);
+        reclaimed += report.reclaimed_bytes;
+        let dirty = storage
+            .load(&engine.domain, &session)
+            .await
+            .unwrap()
+            .unwrap()
+            .collection_dirty;
+        assert_eq!(dirty, expected == limit);
+    }
+    assert_eq!(reclaimed, bytes);
+    assert_eq!(sweep(&engine, 2).await.examined, 0);
+}
+
+#[tokio::test]
+async fn collection_rechecks_the_mark_after_awaited_storage_reads() {
+    let storage = Arc::new(LostAcknowledgement::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("awaited-mark"),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    let session = SessionId::new("s");
+    let lease = engine.open(&session, writer("writer")).await.unwrap();
+    let leaf = JournalObject::encode(
+        JournalObjectKind::Message,
+        &crate::content::Message::user("epoch orphan"),
+    )
+    .unwrap();
+    engine
+        .stage_leaves(&lease, JournalPinId::new("stage"), vec![leaf.clone()])
+        .await
+        .unwrap();
+    engine
+        .release_pin(
+            &session,
+            &JournalPinId::new("stage"),
+            engine.root_epoch().unwrap(),
+        )
+        .await
+        .unwrap();
+    let request = JournalGcRequest {
+        storage_id: engine.storage_id(),
+        expected_root_epoch: engine.root_epoch().unwrap(),
+        max_objects: u64::MAX,
+    };
+    let (reached, ready) = tokio::sync::oneshot::channel();
+    let (resume, wait) = tokio::sync::oneshot::channel();
+    *storage.pause_load.lock().unwrap() = Some((reached, wait));
+    let collecting = engine.clone();
+    let task = tokio::spawn(async move { collecting.collect(request).await });
+    ready.await.unwrap();
+    // Close must remain I/O-free even while collection is suspended in storage.
+    engine
+        .close(lease)
+        .now_or_never()
+        .expect("close suspended")
+        .unwrap();
+    resume.send(()).unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(matches!(
+        error.class,
+        crate::error::FailureClass::StateConflict {
+            stage: crate::error::FailureStage::PreProvider,
+            component: crate::error::FailureComponent::Checkpoint
+        }
+    ));
+    assert!(
+        storage
+            .inner
+            .objects(&engine.domain, &session, std::slice::from_ref(&leaf.id))
+            .await
+            .unwrap()[0]
+            .is_some()
+    );
+    let retry = sweep(&engine, u64::MAX).await;
+    assert_eq!(
+        (retry.deleted, retry.reclaimed_bytes),
+        (1, leaf.bytes.len() as u64)
     );
 }
 

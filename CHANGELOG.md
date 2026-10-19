@@ -9,6 +9,16 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Added
 
+- `JournalApplyReceipt` reports the body count and encoded bytes physically
+  deleted by `JournalStorage::apply`, including shared-body last-membership
+  accounting. Collection now sweeps dirty sessions incrementally.
+  `JournalEngine::retained_bytes` provides a logical byte diagnostic for observed
+  sessions and storage's pending dirty sessions.
+- Testkit `conformance::journal_storage::assert_journal_storage_conformance`
+  checks storage transactions, restart recovery and the protected, ordinary and
+  collection engine suites. `JournalCollectionHost` is implemented for
+  `JournalEngine<S>`; five broken storages verify named failure cases.
+
 - Explicit host-triggered retirement and logical collection in the volatile
   `InMemorySessionJournal`, with revision-bound retention authorization, durable
   migration/fork/child and historical pins, transactional root/pin epochs,

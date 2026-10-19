@@ -134,6 +134,14 @@ pub struct JournalWrite {
     pub inject: Option<JournalCommitFailurePoint>,
 }
 
+/// Bodies physically deleted by one successfully acknowledged transaction.
+/// Shared bodies count only when their final membership is released.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalApplyReceipt {
+    pub reclaimed_objects: u64,
+    pub reclaimed_bytes: u64,
+}
+
 #[async_trait]
 pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
     async fn load(
@@ -179,7 +187,9 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
         after: Option<&SessionId>,
         limit: usize,
     ) -> Result<Vec<SessionId>, RuntimeError>;
-    async fn apply(&self, write: JournalWrite) -> Result<(), RuntimeError>;
+    /// Returns exactly the bodies this transaction physically deleted and the
+    /// sum of their stored body lengths. Writes without deletions return zero.
+    async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError>;
     /// Physical compaction only (repack, VACUUM). Never changes membership.
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError>;
 }
