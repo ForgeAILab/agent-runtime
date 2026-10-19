@@ -39,6 +39,11 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
     fn storage_id(&self) -> JournalStorageId;
     /// Atomically selects and pins a root. Writer opens also acquire a monotonic
     /// fence, including absent-head create/import. Read-only opens execute no turn.
+    /// A retired session's latest root MUST fail as `StateConflict` for either
+    /// intent, including after collection; it must never look like an absent
+    /// native head eligible for legacy fallback. Existing reader pins and
+    /// explicitly selected retained roots remain valid while their closure is
+    /// available. Retirement evidence must outlive collected content.
     async fn open(
         &self,
         session: &SessionId,

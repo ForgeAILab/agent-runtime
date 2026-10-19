@@ -26,7 +26,7 @@ use agent_runtime_testkit::conformance::delegation::{
 use agent_runtime_testkit::conformance::session_timeline::TimelineHost;
 use agent_runtime_testkit::scenarios;
 use async_trait::async_trait;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 const LIMITS: JournalReadLimits = JournalReadLimits {
     objects: 100_000,
@@ -56,6 +56,9 @@ struct Collecting {
     collections: AtomicUsize,
     serial: AtomicUsize,
     gate: Option<Arc<ChildGate>>,
+    // Serialize each test-selected mark/mutation/delete sequence, including
+    // inspection pins, so every collection has one prescribed outcome.
+    schedule: AsyncMutex<()>,
 }
 
 impl Collecting {
@@ -68,12 +71,20 @@ impl Collecting {
     }
 
     async fn collect_now(&self) {
-        match self.inner.collect(self.mark().await).await {
-            Ok(_) => {
-                self.collections.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(error) => assert!(matches!(error.class, FailureClass::StateConflict { .. })),
-        }
+        let _schedule = self.schedule.lock().await;
+        self.collect_current().await;
+    }
+
+    async fn collect_current(&self) {
+        let marked = self.mark().await;
+        let expected_epoch = marked.expected_root_epoch;
+        let report = self
+            .inner
+            .collect(marked)
+            .await
+            .expect("a fresh mark under the schedule lock must collect successfully");
+        assert_eq!(report.root_epoch, expected_epoch);
+        self.collections.fetch_add(1, Ordering::Relaxed);
     }
 
     async fn before(&self) -> Option<JournalGcRequest> {
@@ -81,7 +92,7 @@ impl Collecting {
             Step::BeforeMark => None,
             Step::AfterMark => Some(self.mark().await),
             Step::AfterDelete => {
-                self.collect_now().await;
+                self.collect_current().await;
                 None
             }
         }
@@ -89,21 +100,20 @@ impl Collecting {
 
     async fn after(&self, marked: Option<JournalGcRequest>) {
         if let Some(marked) = marked {
-            let stale = marked.expected_root_epoch != self.inner.root_epoch().unwrap();
-            let result = self.inner.collect(marked).await;
-            if stale {
-                assert!(matches!(
-                    result.unwrap_err().class,
-                    FailureClass::StateConflict { .. }
-                ));
-            } else {
-                // Another worker may acquire a child pin after this observation.
-                if let Err(error) = result {
-                    assert!(matches!(error.class, FailureClass::StateConflict { .. }));
-                }
-            }
+            assert!(matches!(self.step, Step::AfterMark));
+            assert_ne!(
+                marked.expected_root_epoch,
+                self.inner.root_epoch().unwrap(),
+                "the successful operation must invalidate the prior mark"
+            );
+            assert!(matches!(
+                self.inner.collect(marked).await.unwrap_err().class,
+                FailureClass::StateConflict { .. }
+            ));
+        } else {
+            assert!(matches!(self.step, Step::BeforeMark | Step::AfterDelete));
         }
-        self.collect_now().await;
+        self.collect_current().await;
     }
 
     async fn verify(&self, lease: &JournalLease) {
@@ -117,6 +127,14 @@ impl Collecting {
     }
 
     async fn latest(&self, session: &SessionId) -> (Option<JournalHead>, Option<SessionSnapshot>) {
+        let _schedule = self.schedule.lock().await;
+        self.latest_locked(session).await
+    }
+
+    async fn latest_locked(
+        &self,
+        session: &SessionId,
+    ) -> (Option<JournalHead>, Option<SessionSnapshot>) {
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         let lease = self
             .inner
@@ -154,6 +172,7 @@ impl SessionJournal for Collecting {
         session: &SessionId,
         request: JournalOpen,
     ) -> Result<JournalLease, RuntimeError> {
+        let _schedule = self.schedule.lock().await;
         // This test host's child catalog is committed in the ordinary domain.
         // Reserve source/child closures in the separate protected domain before
         // publication as well; that domain cannot infer another store's roots.
@@ -181,6 +200,7 @@ impl SessionJournal for Collecting {
         lease: &JournalLease,
         commit: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
+        let schedule = self.schedule.lock().await;
         let pause_child = self
             .gate
             .as_ref()
@@ -196,7 +216,8 @@ impl SessionJournal for Collecting {
         let mark = self.before().await;
         let head = self.inner.commit(lease, commit).await?;
         self.after(mark).await;
-        self.latest(lease.session()).await;
+        self.latest_locked(lease.session()).await;
+        drop(schedule);
         if pause_child {
             let gate = self.gate.as_ref().unwrap();
             if gate.armed.swap(false, Ordering::SeqCst) {
@@ -208,6 +229,7 @@ impl SessionJournal for Collecting {
         Ok(head)
     }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        let _schedule = self.schedule.lock().await;
         let mark = self.before().await;
         let lease = self.inner.renew(lease).await?;
         self.after(mark).await;
@@ -215,6 +237,7 @@ impl SessionJournal for Collecting {
         Ok(lease)
     }
     async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
+        let _schedule = self.schedule.lock().await;
         let mark = self.before().await;
         self.inner.close(lease).await?;
         self.after(mark).await;
@@ -225,9 +248,11 @@ impl SessionJournal for Collecting {
         session: &SessionId,
         revision: JournalRevision,
     ) -> Result<JournalRetirement, RuntimeError> {
+        let _schedule = self.schedule.lock().await;
         self.inner.retire(session, revision).await
     }
     async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        let _schedule = self.schedule.lock().await;
         self.inner.collect(request).await
     }
 }
@@ -256,6 +281,7 @@ impl Stores {
                 collections: AtomicUsize::new(0),
                 serial: AtomicUsize::new(0),
                 gate: None,
+                schedule: AsyncMutex::new(()),
             }),
             protected: Arc::new(Collecting {
                 inner: protected,
@@ -263,6 +289,7 @@ impl Stores {
                 collections: AtomicUsize::new(0),
                 serial: AtomicUsize::new(0),
                 gate,
+                schedule: AsyncMutex::new(()),
             }),
         })
     }

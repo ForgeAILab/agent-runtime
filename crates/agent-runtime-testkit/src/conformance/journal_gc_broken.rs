@@ -13,6 +13,7 @@ enum Defect {
     DeletePinnedObject,
     IgnoreEpoch,
     ClearIntentOnFailedRepair,
+    RetiredAsAbsent,
     Unsupported,
 }
 
@@ -24,6 +25,7 @@ struct Mutant {
     deleted: Mutex<BTreeSet<JournalObjectId>>,
     opened_pins: Mutex<BTreeMap<SessionId, JournalPinId>>,
     durable_pins: Mutex<BTreeSet<(SessionId, JournalPinId)>>,
+    retired: Mutex<BTreeSet<SessionId>>,
 }
 
 impl Mutant {
@@ -39,6 +41,7 @@ impl Mutant {
             deleted: Mutex::new(BTreeSet::new()),
             opened_pins: Mutex::new(BTreeMap::new()),
             durable_pins: Mutex::new(BTreeSet::new()),
+            retired: Mutex::new(BTreeSet::new()),
         });
         let failure = inner.clone();
         SessionJournalCollectionFixture {
@@ -62,6 +65,19 @@ impl SessionJournal for Mutant {
         session: &SessionId,
         request: JournalOpen,
     ) -> Result<JournalLease, RuntimeError> {
+        if self.defect == Defect::RetiredAsAbsent
+            && request.intent == JournalOpenIntent::ReadOnly
+            && matches!(request.root, JournalRootSelection::Latest)
+            && self.retired.lock().unwrap().contains(session)
+        {
+            return Ok(JournalLease::new(
+                self.storage_id(),
+                session.clone(),
+                None,
+                None,
+                Arc::new(()),
+            ));
+        }
         let pin = request.pin.clone();
         let lease = self.inner.open(session, request).await?;
         self.opened_pins
@@ -112,7 +128,9 @@ impl SessionJournal for Mutant {
         session: &SessionId,
         revision: JournalRevision,
     ) -> Result<JournalRetirement, RuntimeError> {
-        self.inner.retire(session, revision).await
+        let result = self.inner.retire(session, revision).await?;
+        self.retired.lock().unwrap().insert(session.clone());
+        Ok(result)
     }
     async fn collect(
         &self,
@@ -223,6 +241,14 @@ async fn collection_suite_rejects_ignoring_the_root_pin_epoch() {
 async fn collection_suite_rejects_clearing_a_pending_intent_pin() {
     rejects(assert_journal_gc_failed_repair_conformance(&|| async {
         Mutant::fixture(Defect::ClearIntentOnFailedRepair)
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn collection_suite_rejects_reporting_retirement_as_absence() {
+    rejects(assert_journal_retired_latest_conformance(&|| async {
+        Mutant::fixture(Defect::RetiredAsAbsent)
     }))
     .await;
 }

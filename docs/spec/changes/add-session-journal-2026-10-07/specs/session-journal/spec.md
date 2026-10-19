@@ -76,6 +76,13 @@ Readers MUST validate framing, object digests, sequence, predecessor evidence an
 
 Opening a root SHALL pin its transitive closure atomically; commits, retirement, durable transfer intents and collection SHALL share a root/pin epoch fence. Collection MUST recheck reachability before deletion and retain every live, retained, staged, migration, child or pending-fork root. Supersession alone MUST NOT authorize deletion and unsupported collection MUST retain content.
 
+#### Scenario: Retired native session retains stale v3 records
+
+- **WHEN** an imported session is retired with its original v3 records still present
+- **THEN** opening its latest root with either read-only or writer intent fails explicitly as StateConflict, before and after collection
+- **AND** resume, fork, read-only views, session-exists, child recovery/rebind and watermark refresh propagate that error without loading legacy records
+- **AND** existing pinned readers and explicitly retained historical roots remain readable while their complete closure is available
+
 #### Scenario: Fork or resume races with sweep
 
 - **WHEN** a collector marks an object and a resume or FromIndex fork acquires its root

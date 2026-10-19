@@ -30,6 +30,13 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
+- Retired native sessions now reject read-only latest-root opens as an explicit
+  conflict, including after collection. Runtime views check the journal before
+  loading legacy records, so imported sessions cannot fall back to their stale
+  v3 snapshots during fork, session-exists, child recovery/rebind or watermark
+  refresh. Writer refusal and pinned historical reads are preserved. Collection
+  conformance distinguishes retirement from absence, and runtime GC schedules
+  assert every expected success or stale-mark conflict.
 - Waiting for a user, internal, or resumed turn to complete now also waits for
   its execution gate and active-turn admission to be released. Previously a
   host waking from `TurnHandle::completed` or `SessionHandle::run` could have

@@ -437,7 +437,10 @@ identity lookup, never by a fresh request ID.
 
 Retire removes a session root only with expected revision, explicit host
 retention authorization, no live execution lease, and no pending fork/resume
-transfer that relies on it. Pins protect the entire object closure, including
+transfer that relies on it. Retirement evidence outlives collection: latest-root
+opens with either intent return StateConflict rather than an absent native head
+that could authorize legacy fallback. Existing pinned readers and available
+explicitly retained historical roots remain readable. Pins protect the entire object closure, including
 historical checkpoints selected by retained root. Collection traces all live
 session/checkpoint/retention roots, active reader/writer pins, migration roots,
 pending forks, child references and staged transactions across the protection
@@ -551,6 +554,57 @@ the same lock as deletion, so the reference has no internal mark/delete window,
 and a two-phase collector stays safe only because every root/pin change advances
 the epoch, which the epoch case checks operation by operation. The interleaving
 matrix stages protected leaves, so ordinary-only adapters cannot run it.
+
+### Retired latest-root follow-up (2026-10-19)
+
+The reference originally checked its retirement tombstone only for writer
+opens. Retirement removes `current`, so a read-only `Latest` open returned a
+successful absent-head lease. The runtime's view helpers then used the v3
+records left behind by import. They also loaded those records eagerly before
+opening the journal, even if the open would fail.
+
+The released `Result<JournalLease, RuntimeError>` already expresses refusal:
+`InMemorySessionJournal::open` now returns `StateConflict` at `PreProvider` /
+`Checkpoint`, with the message `session journal is retired`, for every retired
+latest-root open. Writer refusal remains; existing pinned readers and available
+explicitly retained historical roots remain readable. The backend tombstone
+survives collection. No trait signature, error variant, object/head/checkpoint
+format or schema changes. `SessionJournal::open` documents this requirement.
+`load_snapshot_view` and `load_checkpoint_view` open first and load legacy only
+after a successful absent-head result, propagating retirement from their own
+domain or from the remaining counterpart during lost-capability discovery.
+
+Nine `delegation::retirement_tests::retired_v3_*` tests create a real v3 pair,
+import it through `SessionPersistence::open`, verify both native
+materializations, authorize retirement and collect every immutable object,
+while keeping the v3 pair unchanged. Resume, fork, snapshot/checkpoint views,
+session-exists, child recovery, returned-interaction recovery, watermark refresh
+and exact child rebind each require the retirement error and zero legacy loads.
+Each runs with both capabilities and with either capability lost (27 rows),
+without provider work or child runtime construction. Before the fix all nine
+tests fail: eight read stale v3 records, while writer resume already refuses
+with generic boundary evidence.
+
+The exported `assert_journal_retired_latest_conformance` runs in both protected
+and ordinary collection suites. It distinguishes a genuinely absent head from
+retirement before collection, after a pinned sweep, and after all content is
+deleted; both read-only and writer opens must conflict. Independent retained
+reads and the pre-retirement reader still materialize their snapshots. A broken
+adapter that reports retirement as an empty lease fails the named case.
+
+The nine existing `journal_gc_runtime` schedules now serialize each
+mark/mutation/delete sequence and inspection pin. Fresh-mark collection must
+succeed and report the expected epoch; a mark taken before a successful
+mutation must be stale and conflict. No call silently accepts an incidental
+`StateConflict`, and all existing scenario assertions remain in force.
+
+Verification through the requested timeout-bounded `c.sh` commands: formatting
+check and all-target/all-feature Clippy with warnings denied pass; core **276**,
+runtime **669**, testkit **410**, LCM **62** — **1,417 passed, zero failed or
+ignored**. Rust **1.86.0** builds core and runtime, and strict change validation
+passes. The targeted collection suite passes **29** tests and the tightened
+runtime GC harness passes **9** (included in the full totals). Red/green evidence,
+individual gate logs and the report are in `/Volumes/Data/tmp/refactor/u9c-2/`.
 
 ## v3 Upgrade, Including Mid-turn
 
