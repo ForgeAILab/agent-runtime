@@ -99,7 +99,7 @@ The change SHALL provide a measurement harness that writes real SQLite files and
 #### Scenario: Gate evaluation
 
 - **WHEN** the harness runs the realistic fixture at N=4000 after the storage-level levers are built
-- **THEN** the report states native physical bytes as a multiple of the one-blob legacy baseline
+- **THEN** the report states native physical bytes as a multiple of the observed two-blob legacy baseline (L2)
 - **AND** a journal format change is built only if that multiple exceeds 2.0 or the owner requires more
 
 ### Requirement: Storage receives each write's objects as one batch

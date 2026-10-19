@@ -23,8 +23,6 @@ struct StoredState {
     operations: BTreeMap<(SessionKey, JournalOperationId), JournalOperationRecord>,
     pins: BTreeMap<(SessionKey, JournalPinId), JournalPinRecord>,
     catalog: BTreeMap<(SessionKey, JournalObjectId), JournalCatalogEntry>,
-    #[cfg(feature = "journal-measurement")]
-    batches: BTreeMap<DomainKey, Vec<Arc<Vec<JournalObjectId>>>>,
 }
 impl StoredState {
     fn object(&self, id: &JournalObjectId) -> Option<&Arc<[u8]>> {
@@ -74,7 +72,6 @@ impl VolatileJournalStorage {
         key: &SessionKey,
         object: &JournalStoredObject,
         added: &mut Bodies,
-        _first: &mut Vec<JournalObjectId>,
     ) -> Result<(), RuntimeError> {
         let encoded = JournalObject {
             id: object.id.clone(),
@@ -90,19 +87,10 @@ impl VolatileJournalStorage {
         } else {
             added.insert(object.id.clone(), object.bytes.clone());
         }
-        #[cfg(feature = "journal-measurement")]
-        let first_in_domain = !staged
-            .members
-            .iter()
-            .any(|((domain, _), members)| domain == &key.0 && members.contains(&object.id));
         if Arc::make_mut(staged.members.entry(key.clone()).or_default()).insert(object.id.clone()) {
             *Arc::make_mut(&mut staged.references)
                 .entry(object.id.clone())
                 .or_default() += 1;
-            #[cfg(feature = "journal-measurement")]
-            if first_in_domain {
-                _first.push(object.id.clone());
-            }
         }
         Ok(())
     }
@@ -167,55 +155,6 @@ impl VolatileJournalStorage {
             layers,
             len: ids.len(),
             bytes,
-        })
-    }
-    #[cfg(feature = "journal-measurement")]
-    pub(in crate::journal) fn measurement_export(
-        &self,
-        domain: &JournalDomain,
-    ) -> Result<JournalMeasurementExport, RuntimeError> {
-        let state = self.lock()?;
-        let key = domain_key(domain);
-        let ids: BTreeSet<_> = state
-            .members
-            .iter()
-            .filter(|((d, _), _)| d == &key)
-            .flat_map(|(_, ids)| ids.iter().cloned())
-            .collect();
-        let objects = ids
-            .into_iter()
-            .map(|id| {
-                let object = JournalObject {
-                    bytes: state.object(&id).ok_or_else(conflict)?.to_vec(),
-                    id,
-                };
-                Ok((object.kind()?, object))
-            })
-            .collect::<Result<Vec<_>, RuntimeError>>()?;
-        let heads = state
-            .records
-            .iter()
-            .filter(|((d, _), _)| d == &key)
-            .filter_map(|((_, s), r)| r.head.as_ref().map(|h| (s, h)))
-            .map(|(s, h)| Ok((s.clone(), h.decode(JournalObjectKind::Head)?)))
-            .collect::<Result<BTreeMap<_, _>, RuntimeError>>()?;
-        let operations: Vec<_> = state
-            .operations
-            .iter()
-            .filter(|(((d, _), _), _)| d == &key)
-            .map(|(((_, s), _), o)| JournalMeasurementOperation {
-                session: s.clone(),
-                operation: o.operation.clone(),
-                digest: o.digest.clone(),
-                result: o.result.clone(),
-            })
-            .collect();
-        Ok(JournalMeasurementExport {
-            objects,
-            heads,
-            operation_count: operations.len(),
-            operations,
-            commit_batches: state.batches.get(&key).cloned().unwrap_or_default(),
         })
     }
 }
@@ -343,7 +282,6 @@ impl JournalStorage for VolatileJournalStorage {
                 Ok(())
             }
         };
-        let mut first = Vec::new();
         // Execute the same ordered transaction steps as a durable adapter.
         for (step, cut) in [
             JournalCommitFailurePoint::AfterObjects,
@@ -365,7 +303,7 @@ impl JournalStorage for VolatileJournalStorage {
                     _ => step == 0,
                 })
             {
-                Self::admit(&mut staged, &key, object, &mut added, &mut first)?;
+                Self::admit(&mut staged, &key, object, &mut added)?;
             }
             staged.add_layer(added);
             fail(cut)?;
@@ -400,7 +338,7 @@ impl JournalStorage for VolatileJournalStorage {
             .iter()
             .filter(|object| object.kind == JournalObjectKind::Head)
         {
-            Self::admit(&mut staged, &key, object, &mut added, &mut first)?;
+            Self::admit(&mut staged, &key, object, &mut added)?;
         }
         staged.add_layer(added);
         if let Some(record) = write.record {
@@ -458,15 +396,6 @@ impl JournalStorage for VolatileJournalStorage {
             let mut entries = staged.entries();
             entries.retain(|id, _| !deleted.contains(id));
             staged.layers = vec![Arc::new(entries)];
-        }
-        #[cfg(feature = "journal-measurement")]
-        if write.kind == JournalWriteKind::Commit {
-            first.sort();
-            staged
-                .batches
-                .entry(domain_key(&write.domain))
-                .or_default()
-                .push(Arc::new(first));
         }
         *state = staged;
         fail(JournalCommitFailurePoint::AfterCommit)?;
@@ -764,22 +693,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-    #[cfg(feature = "journal-measurement")]
-    #[tokio::test]
-    async fn measurement_batches_do_not_readmit_a_body_shared_by_sessions() {
-        let storage = VolatileJournalStorage::default();
-        let first = write("s");
-        let id = first.objects.objects[0].id.clone();
-        storage.apply(first).await.unwrap();
-        storage.apply(write("t")).await.unwrap();
-        let export = storage
-            .measurement_export(&domain(JournalRole::Protected))
-            .unwrap();
-        assert_eq!(export.objects.len(), 1);
-        assert_eq!(export.commit_batches.len(), 2);
-        assert_eq!(export.commit_batches[0].as_ref(), &vec![id]);
-        assert!(export.commit_batches[1].is_empty());
     }
     #[test]
     fn storage_debug_does_not_disclose_engine_or_object_bytes() {

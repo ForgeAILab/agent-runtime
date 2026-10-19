@@ -6,44 +6,11 @@ use super::*;
 use crate::store::SessionSnapshot;
 use crate::{error::RuntimeError, ids::SessionId};
 use async_trait::async_trait;
-#[cfg(feature = "journal-measurement")]
-use serde::Serialize;
-#[cfg(any(test, feature = "journal-measurement"))]
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(test)]
 use std::{collections::BTreeSet, sync::atomic::Ordering};
-
-/// Temporary measurement-only view of physically retained immutable content.
-/// Contains protected plaintext; callers must keep it inside their trusted host.
-#[cfg(feature = "journal-measurement")]
-#[derive(Debug, Clone)]
-pub struct JournalMeasurementExport {
-    /// All retained objects, including garbage until collection runs.
-    pub objects: Vec<(JournalObjectKind, JournalObject)>,
-    /// Current published head of each session (absent reservations omitted).
-    pub heads: BTreeMap<SessionId, JournalHead>,
-    /// Lifetime operation records, including their original results.
-    pub operations: Vec<JournalMeasurementOperation>,
-    /// Number of operation records in this domain.
-    pub operation_count: usize,
-    /// First-admission IDs per successful commit, in publication order.
-    pub commit_batches: Vec<Arc<Vec<JournalObjectId>>>,
-}
-
-/// One measurement-only replay record; no production storage API is implied.
-#[cfg(feature = "journal-measurement")]
-#[derive(Debug, Clone, Serialize)]
-pub struct JournalMeasurementOperation {
-    /// Owning execution identity.
-    pub session: SessionId,
-    /// Retry identity.
-    pub operation: JournalOperationId,
-    /// Private input digest.
-    pub digest: JournalDigest,
-    /// Original published result.
-    pub result: JournalHead,
-}
 
 /// Volatile implementation of the complete journal engine.
 ///
@@ -152,11 +119,6 @@ impl InMemorySessionJournal {
             .values()
             .map(|b| b.len())
             .sum())
-    }
-    /// Consistent trusted-host measurement view.
-    #[cfg(feature = "journal-measurement")]
-    pub fn measurement_export(&self) -> Result<JournalMeasurementExport, RuntimeError> {
-        self.0.storage.measurement_export(&self.0.domain)
     }
     #[cfg(test)]
     fn lock(&self) -> Result<State, RuntimeError> {

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_runtime::context::ProviderCacheCapability;
@@ -20,8 +20,11 @@ use agent_runtime::prelude::AllowAll;
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, tool_call_fragments};
 use agent_runtime::registry::RegistryRevision;
 use agent_runtime::runtime::{RuntimeBuilder, StartSession};
+use agent_runtime_journal_bench::PackedSqliteJournalStorage;
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 #[derive(Debug)]
 struct FixedClock;
@@ -36,23 +39,213 @@ pub(crate) struct Batch {
     pub(crate) domain: &'static str,
     pub(crate) ids: Vec<JournalObjectId>,
 }
+#[derive(Debug, Clone)]
+pub(crate) struct JournalMeasurementExport {
+    pub(crate) objects: Vec<(JournalObjectKind, JournalObject)>,
+    pub(crate) heads: BTreeMap<SessionId, JournalHead>,
+    pub(crate) operations: Vec<JournalMeasurementOperation>,
+    pub(crate) operation_count: usize,
+    pub(crate) commit_batches: Vec<Arc<Vec<JournalObjectId>>>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct JournalMeasurementOperation {
+    session: SessionId,
+    pub(crate) operation: JournalOperationId,
+    pub(crate) digest: JournalDigest,
+    pub(crate) result: JournalHead,
+}
+#[derive(Debug, Default)]
+struct Trace {
+    seen: BTreeSet<JournalObjectId>,
+    batches: Vec<Arc<Vec<JournalObjectId>>>,
+    operations: Vec<JournalMeasurementOperation>,
+}
+#[derive(Debug)]
+struct TracingStorage {
+    inner: Arc<PackedSqliteJournalStorage>,
+    traces: Mutex<BTreeMap<String, Trace>>,
+}
+fn trace_key(d: &JournalDomain) -> String {
+    format!("{}:{:?}", d.storage_id.as_str(), d.role)
+}
+#[async_trait]
+impl JournalStorage for TracingStorage {
+    async fn load(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+    ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
+        self.inner.load(d, s).await
+    }
+    async fn objects(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        ids: &[JournalObjectId],
+    ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
+        self.inner.objects(d, s, ids).await
+    }
+    async fn members(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+    ) -> Result<Vec<JournalObjectId>, RuntimeError> {
+        self.inner.members(d, s).await
+    }
+    async fn operation(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        op: &JournalOperationId,
+    ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
+        self.inner.operation(d, s, op).await
+    }
+    async fn pins(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+    ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
+        self.inner.pins(d, s).await
+    }
+    async fn catalog(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        id: &JournalObjectId,
+    ) -> Result<Option<JournalCatalogEntry>, RuntimeError> {
+        self.inner.catalog(d, s, id).await
+    }
+    async fn dirty_sessions(
+        &self,
+        d: &JournalDomain,
+        after: Option<&SessionId>,
+        limit: usize,
+    ) -> Result<Vec<SessionId>, RuntimeError> {
+        self.inner.dirty_sessions(d, after, limit).await
+    }
+    async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
+        self.inner.compact(d).await
+    }
+    async fn apply(&self, w: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
+        let d = trace_key(&w.domain);
+        let session = w.session.clone();
+        let op = w.operation.clone();
+        let commit = w.kind == JournalWriteKind::Commit;
+        let ids: Vec<_> = w.objects.objects.iter().map(|o| o.id.clone()).collect();
+        let receipt = self.inner.apply(w).await?;
+        if commit {
+            let mut traces = self.traces.lock().unwrap();
+            let trace = traces.entry(d).or_default();
+            let first: Vec<_> = ids
+                .into_iter()
+                .filter(|id| trace.seen.insert(id.clone()))
+                .collect();
+            trace.batches.push(Arc::new(first));
+            if let Some(op) = op {
+                trace.operations.push(JournalMeasurementOperation {
+                    session,
+                    operation: op.operation,
+                    digest: op.digest,
+                    result: op.result,
+                });
+            }
+        }
+        Ok(receipt)
+    }
+}
 #[derive(Debug)]
 struct Measuring {
-    inner: InMemorySessionJournal,
+    inner: JournalEngine<TracingStorage>,
+    storage: Arc<TracingStorage>,
+    domain: JournalDomain,
     commits: AtomicUsize,
 }
 impl Measuring {
-    fn new(domain: &'static str) -> Self {
+    fn new(domain: &'static str, storage: Arc<TracingStorage>) -> Self {
         let id = JournalStorageId::new(format!("forge.session-journal.v1.{domain}"));
-        let inner = if domain == "protected" {
-            InMemorySessionJournal::protected(id)
+        let role = if domain == "protected" {
+            JournalRole::Protected
         } else {
-            InMemorySessionJournal::ordinary(id, Arc::new(IdentityJournalProjection))
+            JournalRole::Ordinary
+        };
+        let inner = if role == JournalRole::Protected {
+            JournalEngine::protected(storage.clone(), id.clone(), JournalEngineConfig::default())
+        } else {
+            JournalEngine::ordinary(
+                storage.clone(),
+                id.clone(),
+                Arc::new(IdentityJournalProjection),
+                JournalEngineConfig::default(),
+            )
         };
         Self {
             inner,
+            storage,
+            domain: JournalDomain {
+                storage_id: id,
+                role,
+            },
             commits: AtomicUsize::new(0),
         }
+    }
+    async fn export(&self, session: &SessionId) -> JournalMeasurementExport {
+        let ids = self.storage.members(&self.domain, session).await.unwrap();
+        let bytes = self
+            .storage
+            .objects(&self.domain, session, &ids)
+            .await
+            .unwrap();
+        let objects = ids
+            .into_iter()
+            .zip(bytes)
+            .map(|(id, bytes)| {
+                let object = JournalObject {
+                    id,
+                    bytes: bytes.unwrap().to_vec(),
+                };
+                (object.kind().unwrap(), object)
+            })
+            .collect();
+        let mut heads = BTreeMap::new();
+        if let Some(head) = self
+            .storage
+            .load(&self.domain, session)
+            .await
+            .unwrap()
+            .and_then(|r| r.head)
+        {
+            heads.insert(
+                session.clone(),
+                head.decode(JournalObjectKind::Head).unwrap(),
+            );
+        }
+        let traces = self.storage.traces.lock().unwrap();
+        let trace = &traces[&trace_key(&self.domain)];
+        // Export is bench-local inspection over the real storage contract.
+        JournalMeasurementExport {
+            objects,
+            heads,
+            operations: trace.operations.clone(),
+            operation_count: trace.operations.len(),
+            commit_batches: trace.batches.clone(),
+        }
+    }
+    async fn object_count(&self, session: &SessionId) -> usize {
+        self.storage
+            .members(&self.domain, session)
+            .await
+            .unwrap()
+            .len()
+    }
+    async fn object_bytes(&self, session: &SessionId) -> usize {
+        let ids = self.storage.members(&self.domain, session).await.unwrap();
+        self.storage
+            .objects(&self.domain, session, &ids)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.as_ref().unwrap().len())
+            .sum()
     }
 }
 #[async_trait]
@@ -77,15 +270,18 @@ impl SessionJournal for Measuring {
     ) -> Result<JournalHead, RuntimeError> {
         let head = self.inner.commit(lease, commit).await?;
         if self.commits.fetch_add(1, Ordering::Relaxed) == 1 {
-            let export = self.inner.measurement_export()?;
-            assert_eq!(export.objects.len(), self.inner.object_count()?);
+            let export = self.export(lease.session()).await;
+            assert_eq!(
+                export.objects.len(),
+                self.object_count(lease.session()).await
+            );
             assert_eq!(
                 export
                     .objects
                     .iter()
                     .map(|(_, object)| object.bytes.len())
                     .sum::<usize>(),
-                self.inner.object_bytes()?
+                self.object_bytes(lease.session()).await
             );
             assert_eq!(export.heads[lease.session()], head);
             assert_eq!(export.operations.len(), 2);
@@ -114,7 +310,32 @@ impl SessionJournal for Measuring {
 struct Native {
     ordinary: Arc<Measuring>,
     protected: Arc<Measuring>,
+    storage: Arc<PackedSqliteJournalStorage>,
 }
+#[derive(Debug)]
+struct SqliteFile {
+    path: PathBuf,
+    empty: u64,
+}
+impl Drop for SqliteFile {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+        }
+    }
+}
+trait TerminalMaintenance {
+    fn terminal(&self, session: &SessionId);
+}
+impl TerminalMaintenance for Native {
+    fn terminal(&self, session: &SessionId) {
+        self.storage.post_terminal(session).unwrap();
+    }
+}
+impl TerminalMaintenance for Legacy {
+    fn terminal(&self, _: &SessionId) {}
+}
+
 #[async_trait]
 impl SessionStore for Native {
     fn journal(&self) -> Option<Arc<dyn SessionJournal>> {
@@ -341,7 +562,7 @@ fn scripts(fixture: &str, tools: bool, turns: usize) -> Vec<ScriptedStream> {
     }
     all
 }
-async fn drive<S: SessionStore + CheckpointStore + 'static>(
+async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'static>(
     store: Arc<S>,
     fixture: &str,
     n: usize,
@@ -424,6 +645,7 @@ async fn drive<S: SessionStore + CheckpointStore + 'static>(
             text.prose(100, 800)
         };
         session.run(UserInput::text(input)).await.unwrap();
+        store.terminal(&id);
         if fixture == "C" && turn + 1 != turns {
             session.shutdown().await.unwrap();
         }
@@ -446,11 +668,30 @@ pub(crate) struct Fixture {
     pub(crate) after: Vec<(&'static str, JournalMeasurementExport)>,
     pub(crate) batches: Vec<Batch>,
     pub(crate) legacy: LegacyRow,
+    pub(crate) packed_before: super::disk::Size,
+    pub(crate) packed_after: super::disk::Size,
+    _file: Arc<SqliteFile>,
 }
 pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "packed-fixture-{}-{}.sqlite",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let storage = Arc::new(PackedSqliteJournalStorage::open(&path).unwrap());
+    let file = Arc::new(SqliteFile {
+        empty: super::disk::empty_file_bytes(&path),
+        path,
+    });
+    let tracing = Arc::new(TracingStorage {
+        inner: storage.clone(),
+        traces: Mutex::new(BTreeMap::new()),
+    });
     let native = Arc::new(Native {
-        ordinary: Arc::new(Measuring::new("ordinary")),
-        protected: Arc::new(Measuring::new("protected")),
+        ordinary: Arc::new(Measuring::new("ordinary", tracing.clone())),
+        protected: Arc::new(Measuring::new("protected", tracing)),
+        storage,
     });
     let snapshot = drive(native.clone(), name, n, tools).await;
     let legacy = Arc::new(Legacy::default());
@@ -467,14 +708,8 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
         );
     }
     let before = vec![
-        (
-            "ordinary",
-            native.ordinary.inner.measurement_export().unwrap(),
-        ),
-        (
-            "protected",
-            native.protected.inner.measurement_export().unwrap(),
-        ),
+        ("ordinary", native.ordinary.export(&snapshot.id).await),
+        ("protected", native.protected.export(&snapshot.id).await),
     ];
     let batches: Vec<_> = before
         .iter()
@@ -485,6 +720,7 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
             })
         })
         .collect();
+    let packed_before = super::disk::existing(&file.path, file.empty);
     for journal in [&native.ordinary.inner, &native.protected.inner] {
         journal.enable_collection().unwrap();
         journal
@@ -497,14 +733,8 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
             .unwrap();
     }
     let after = vec![
-        (
-            "ordinary",
-            native.ordinary.inner.measurement_export().unwrap(),
-        ),
-        (
-            "protected",
-            native.protected.inner.measurement_export().unwrap(),
-        ),
+        ("ordinary", native.ordinary.export(&snapshot.id).await),
+        ("protected", native.protected.export(&snapshot.id).await),
     ];
     // Every retained object occurs in exactly one first-admission batch per domain.
     for (domain, export) in &before {
@@ -515,6 +745,7 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
             .collect();
         assert_eq!(ids.len(), export.objects.len());
     }
+    let packed_after = super::disk::existing(&file.path, file.empty);
     let row = legacy.0.lock().unwrap().clone();
     Fixture {
         name: name.into(),
@@ -525,6 +756,9 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
         after,
         batches,
         legacy: row,
+        packed_before,
+        packed_after,
+        _file: file,
     }
 }
 

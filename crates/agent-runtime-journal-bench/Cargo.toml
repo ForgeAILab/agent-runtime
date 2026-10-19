@@ -8,7 +8,7 @@ publish = false
 description = "Physical SQLite measurement harness; never a production dependency"
 
 [dependencies]
-agent-runtime-core = { workspace = true, features = ["journal-measurement"] }
+agent-runtime-core.workspace = true
 agent-runtime.workspace = true
 agent-runtime-testkit.workspace = true
 async-trait.workspace = true
