@@ -1497,3 +1497,84 @@ async fn a_warm_writer_cannot_publish_a_head_over_a_body_another_engine_released
         assert!(read.snapshot().await.unwrap().is_some());
     }
 }
+
+#[tokio::test]
+async fn collection_evicts_released_history_and_trims_released_cache_bodies() {
+    let storage = Arc::new(VolatileJournalStorage::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("release"),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    let session = SessionId::new("release");
+    let mut known = BTreeSet::new();
+    let lease = engine.open(&session, writer("one")).await.unwrap();
+    let first = engine
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                None,
+                "one",
+                ext_snapshot(&session, "a"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    let second = engine
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                Some(&first),
+                "two",
+                ext_snapshot(&session, "b"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    let old = JournalObject::encode(JournalObjectKind::Head, &first)
+        .unwrap()
+        .id;
+    let current = JournalObject::encode(JournalObjectKind::Head, &second)
+        .unwrap()
+        .id;
+    assert!(engine.memoized_root(&session, &old).unwrap().is_some());
+    let before = engine.memoized_root(&session, &current).unwrap().unwrap();
+    let cached: Vec<_> = before
+        .objects
+        .entries()
+        .into_keys()
+        .filter(|id| !before.closure.contains(id))
+        .collect();
+    assert!(!cached.is_empty(), "precondition: cache-only bodies exist");
+    let bytes = engine.memo.lock().unwrap().bytes;
+    assert!(sweep(&engine, u64::MAX).await.deleted > 0);
+    assert!(
+        engine.memoized_root(&session, &old).unwrap().is_none(),
+        "a root whose closure lost membership stayed memoized"
+    );
+    let after = engine.memoized_root(&session, &current).unwrap().unwrap();
+    assert_eq!(after.closure, before.closure);
+    let domain = engine.domain.clone();
+    for (id, _) in after.objects.entries() {
+        assert!(
+            storage
+                .objects(&domain, &session, std::slice::from_ref(&id))
+                .await
+                .unwrap()[0]
+                .is_some(),
+            "released body {id:?} stayed cached"
+        );
+    }
+    assert!(after.objects.len < before.objects.len);
+    assert!(engine.memo.lock().unwrap().bytes < bytes);
+}
