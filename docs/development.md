@@ -186,8 +186,12 @@ Collection trims released cache-only bodies and evicts affected historical proof
 The existing live writer/session working caches are separate from this budget.
 Keep an engine per domain in the host store and return clones from `journal()`;
 new runtime instances then reuse the same registry and memo across turns.
-Cloning is a memo-hit/local-retention recommendation; independent engines'
-warm reads perform the same storage authority check. Commits drop unheld
+Running exactly one engine per storage and domain, and handing out clones of
+it, is required for correctness, not only for memo hits: a collector sees only
+its own engine's leases, and cross-session dependency and retirement checks
+read other sessions' records without a fence. The control-write generation
+fence and the warm-read authority check make a second engine fail closed on
+the same session record; they do not make independent engines safe. Commits drop unheld
 predecessor proofs. LRU touches are constant time. Memo sizing still computes
 the full link-index charge and serializes the snapshot; incremental sizing
 remains pending. The estimate is not a heap
