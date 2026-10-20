@@ -976,16 +976,22 @@ impl<S: JournalStorage> JournalEngine<S> {
         Ok(head)
     }
 }
+/// `fenced_head` is the stored head this write's `expect` fence observed.
+/// Control writes do not advance that fence, so a pin put by this write may
+/// carry a memo certificate only for that head: a carried certificate for any
+/// other root could revive a pin another engine released and collected after
+/// this write hydrated. Unchanged pins are not rewritten and keep theirs.
 pub(super) fn pin_records(
     scratch: &Transition,
     session: &SessionId,
+    fenced_head: Option<&JournalObjectId>,
 ) -> Result<BTreeMap<JournalPinId, JournalPinRecord>, RuntimeError> {
     scratch
         .lock()?
         .durable_pins
         .iter()
         .filter(|((owner, _), _)| owner == session)
-        .map(|((_, id), pin)| Ok((id.clone(), pin_record(id, pin)?)))
+        .map(|((_, id), pin)| Ok((id.clone(), pin_record(id, pin, fenced_head)?)))
         .collect()
 }
 
@@ -993,8 +999,9 @@ pub(super) fn pin_changes(
     before: BTreeMap<JournalPinId, JournalPinRecord>,
     scratch: &Transition,
     session: &SessionId,
+    fenced_head: Option<&JournalObjectId>,
 ) -> Result<Vec<JournalPinChange>, RuntimeError> {
-    let after = pin_records(scratch, session)?;
+    let after = pin_records(scratch, session, fenced_head)?;
     let mut changes = Vec::new();
     for (id, pin) in &after {
         if before.get(id) != Some(pin) {
@@ -1012,13 +1019,18 @@ pub(super) fn pin_changes(
 pub(super) fn pin_record(
     id: &JournalPinId,
     pin: &DurablePin,
+    fenced_head: Option<&JournalObjectId>,
 ) -> Result<JournalPinRecord, RuntimeError> {
     Ok(JournalPinRecord {
         pin: id.clone(),
         blocks_retirement: pin.blocks_retirement,
         roots: pin.roots.iter().cloned().collect(),
         engine: encode(&PinMetadata {
-            memo_roots: pin.memo_roots.intersection(&pin.roots).cloned().collect(),
+            memo_roots: fenced_head
+                .filter(|head| pin.memo_roots.contains(*head) && pin.roots.contains(*head))
+                .into_iter()
+                .cloned()
+                .collect(),
             dependencies: PinDependencies {
                 sessions: pin.dependencies.sessions.clone(),
                 unresolved: pin.dependencies.unresolved,

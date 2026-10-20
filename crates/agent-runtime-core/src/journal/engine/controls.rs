@@ -78,13 +78,17 @@ impl<S: JournalStorage> JournalEngine<S> {
         stored: Option<JournalSessionRecord>,
     ) -> Result<T, RuntimeError> {
         let before_epoch = scratch.lock()?.root_epoch;
-        let before_pins = pin_records(&scratch, session)?;
+        let fenced_head = stored
+            .as_ref()
+            .and_then(|record| record.head.as_ref())
+            .map(|head| head.id.clone());
+        let before_pins = pin_records(&scratch, session, fenced_head.as_ref())?;
         let result = action(&scratch)?;
         if kind == JournalWriteKind::Retire {
             self.freeze_writer_pins(&scratch, session, stored.as_ref())?;
         }
         let mut write = self.write(&scratch, session, stored.as_ref(), kind)?;
-        write.pins = pin_changes(before_pins, &scratch, session)?;
+        write.pins = pin_changes(before_pins, &scratch, session, fenced_head.as_ref())?;
         let advance;
         {
             let state = scratch.lock()?;

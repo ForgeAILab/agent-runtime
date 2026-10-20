@@ -242,7 +242,11 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
             });
         }
         let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
-        let before_pins = persistence::pin_records(&scratch, session)?;
+        let fenced_head = stored
+            .as_ref()
+            .and_then(|record| record.head.as_ref())
+            .map(|head| head.id.clone());
+        let before_pins = persistence::pin_records(&scratch, session, fenced_head.as_ref())?;
         if writer {
             self.freeze_writer_pins(&scratch, session, stored.as_ref())?;
         }
@@ -265,7 +269,8 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                 stored.as_ref(),
                 JournalWriteKind::OpenWriter,
             )?;
-            write.pins = persistence::pin_changes(before_pins, &scratch, session)?;
+            write.pins =
+                persistence::pin_changes(before_pins, &scratch, session, fenced_head.as_ref())?;
             self.apply(write, session).await?;
             self.publish_controls(&scratch, session)?;
         }

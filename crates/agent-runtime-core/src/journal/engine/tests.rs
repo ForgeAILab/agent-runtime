@@ -2220,3 +2220,246 @@ async fn a_busy_session_keeps_its_predecessor_from_evicting_another_current_root
         "busy session evicted an untouched session's current root"
     );
 }
+
+// Review (rt-e8): control writes (pin, release, authorize, retire, collect)
+// fence on (revision, writer_epoch). A second engine's control write that
+// hydrated before this engine's release/retire/collection can still land.
+// These storages pause one apply so the other engine can act in between.
+type ApplyPause = (
+    JournalWriteKind,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[derive(Debug, Default)]
+struct PausedApply {
+    inner: VolatileJournalStorage,
+    pause: Mutex<Option<ApplyPause>>,
+}
+impl PausedApply {
+    fn pause_next(&self, kind: JournalWriteKind) -> LoadPause {
+        let (ready, paused) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        *self.pause.lock().unwrap() = Some((kind, ready, resumed));
+        (resume, paused)
+    }
+}
+#[async_trait]
+impl JournalStorage for PausedApply {
+    fn sharing(&self) -> JournalBodySharing {
+        self.inner.sharing()
+    }
+    async fn retained_bytes(&self, d: &JournalDomain) -> Result<Option<u64>, RuntimeError> {
+        self.inner.retained_bytes(d).await
+    }
+    async fn load(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+    ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
+        self.inner.load(d, s).await
+    }
+    async fn objects(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        ids: &[JournalObjectId],
+    ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
+        self.inner.objects(d, s, ids).await
+    }
+    async fn members(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+    ) -> Result<Vec<JournalObjectId>, RuntimeError> {
+        self.inner.members(d, s).await
+    }
+    async fn operation(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        o: &JournalOperationId,
+    ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
+        self.inner.operation(d, s, o).await
+    }
+    async fn pins(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+    ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
+        self.inner.pins(d, s).await
+    }
+    async fn catalog(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        h: &JournalObjectId,
+    ) -> Result<Option<JournalCatalogEntry>, RuntimeError> {
+        self.inner.catalog(d, s, h).await
+    }
+    async fn dirty_sessions(
+        &self,
+        d: &JournalDomain,
+        a: Option<&SessionId>,
+        n: usize,
+    ) -> Result<Vec<SessionId>, RuntimeError> {
+        self.inner.dirty_sessions(d, a, n).await
+    }
+    async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
+        self.inner.compact(d).await
+    }
+    async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
+        let pause = {
+            let mut slot = self.pause.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|(kind, _, _)| *kind == write.kind)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, ready, resume)) = pause {
+            ready.send(()).unwrap();
+            resume.await.unwrap();
+        }
+        self.inner.apply(write).await
+    }
+}
+
+fn two_engines(
+    storage: &Arc<PausedApply>,
+    budget: usize,
+) -> (JournalEngine<PausedApply>, JournalEngine<PausedApply>) {
+    let id = JournalStorageId::new("stale-control");
+    let reading = JournalEngine::protected(
+        storage.clone(),
+        id.clone(),
+        JournalEngineConfig {
+            validated_root_memo_bytes: budget,
+            ..Default::default()
+        },
+    );
+    let collector = JournalEngine::protected(
+        storage.clone(),
+        id,
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    (reading, collector)
+}
+
+// A writer open freezes writer pins from the pins it hydrated. If another
+// engine released that pin and collected its historical bodies meanwhile, the
+// open re-puts the pin; it must not carry a memo certificate for a root that
+// is not the head its own fence observed.
+#[tokio::test]
+async fn a_stale_writer_open_cannot_recertify_a_pin_another_engine_released() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(PausedApply::default());
+        let (reading, collector) = two_engines(&storage, budget);
+        let session = SessionId::new("recertify");
+        let mut known = BTreeSet::new();
+        let lease = reading.open(&session, writer("zero")).await.unwrap();
+        let first = reading
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "zero",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        reading.close(lease).await.unwrap();
+        let first_root = JournalObject::encode(JournalObjectKind::Head, &first)
+            .unwrap()
+            .id;
+        // A writer pin certified while the first head is current.
+        let pinned = reading.open(&session, writer("pinned")).await.unwrap();
+        reading.retain_root(&pinned).await.unwrap();
+        reading
+            .commit(
+                &pinned,
+                full_commit(
+                    &session,
+                    2,
+                    Some(&first),
+                    "one",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        reading.close(pinned).await.unwrap();
+        let historical = reading
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Retained {
+                        root: first_root.clone(),
+                    },
+                    ..reader("historical")
+                },
+            )
+            .await
+            .unwrap();
+        let limits = JournalReadLimits {
+            objects: u64::MAX,
+            encoded_bytes: u64::MAX,
+            entries: u64::MAX,
+        };
+        assert_eq!(
+            JournalReader::new(&reading, &historical, limits)
+                .unwrap()
+                .snapshot()
+                .await
+                .unwrap(),
+            Some(ext_snapshot(&session, "a"))
+        );
+        let (resume, paused) = storage.pause_next(JournalWriteKind::OpenWriter);
+        let (opened, ()) = tokio::join!(reading.open(&session, writer("next")), async {
+            paused.await.unwrap();
+            collector
+                .release_pin(
+                    &session,
+                    &JournalPinId::new("pinned"),
+                    collector.root_epoch().unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(sweep(&collector, u64::MAX).await.deleted > 0);
+            resume.send(()).unwrap();
+        });
+        if let Ok(next) = opened {
+            reading.close(next).await.unwrap();
+        }
+        let domain = collector.domain.clone();
+        assert_eq!(
+            storage
+                .objects(&domain, &session, std::slice::from_ref(&first_root))
+                .await
+                .unwrap(),
+            vec![None],
+            "precondition: the first head lost its last membership"
+        );
+        assert!(
+            reading.read(&historical, &first_root).await.is_err(),
+            "budget {budget}: a stale re-put pin certified released bodies"
+        );
+        assert!(
+            JournalReader::new(&reading, &historical, limits)
+                .unwrap()
+                .snapshot()
+                .await
+                .is_err()
+        );
+    }
+}
