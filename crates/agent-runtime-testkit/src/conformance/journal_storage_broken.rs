@@ -430,3 +430,26 @@ async fn non_retryable_lost_acknowledgement_fails_atomic_apply_cuts() {
     let message = rejects::<NonRetryableLostAck>("atomic_apply_cuts").await;
     assert!(message.contains("a lost acknowledgement must be retryable"));
 }
+// body_cache_membership now runs first and catches DeadBodyServed. Keep the
+// original proof that membership_isolation_and_receipts also rejects it.
+#[tokio::test]
+async fn serving_dead_bytes_still_fails_membership_isolation_case() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        let factory =
+            move || async move { Arc::new(Broken::<DeadBodyServed>::with_sharing(sharing)) };
+        let result = AssertUnwindSafe(Box::pin(named(
+            "membership_isolation_and_receipts",
+            membership(&factory),
+        )))
+        .catch_unwind()
+        .await;
+        let payload = result.expect_err("dead bytes passed membership_isolation_and_receipts");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("named conformance failure");
+        assert!(
+            message.starts_with("journal_storage::membership_isolation_and_receipts:"),
+            "{sharing:?}: {message}"
+        );
+    }
+}
