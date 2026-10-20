@@ -1336,3 +1336,164 @@ async fn a_new_writer_keeps_only_the_selected_closure_in_its_body_and_link_memo(
     );
     engine.close(writer2).await.unwrap();
 }
+
+// Review (rt-e6): the memo is per engine. Another engine over the same storage
+// can release membership; a warm writer must not then rely on a cached body
+// that a cold engine would find missing.
+fn ext_snapshot(session: &SessionId, value: &str) -> SessionSnapshot {
+    let mut extension_state = BTreeMap::new();
+    extension_state.insert(
+        "review.toggle".to_owned(),
+        crate::store::VersionedSessionState::new(
+            agent_runtime_registry::RegistryRevision::new("toggle-1"),
+            serde_json::json!({ "value": value }),
+        )
+        .redaction_safe(),
+    );
+    SessionSnapshot {
+        id: session.clone(),
+        history: vec![crate::content::Message::user("body")],
+        usage: Default::default(),
+        identity: Default::default(),
+        manifests: vec![],
+        extension_state,
+        updated: crate::clock::Timestamp(1),
+    }
+}
+
+fn full_commit(
+    session: &SessionId,
+    epoch: u64,
+    previous: Option<&JournalHead>,
+    operation: &str,
+    snapshot: SessionSnapshot,
+    known: &mut BTreeSet<JournalObjectId>,
+) -> JournalCommit {
+    let mut commit = empty_commit(session, epoch);
+    let mut assembler = ObjectAssembler::default();
+    commit.batch.snapshot = assembler.snapshot(&snapshot, 0).unwrap();
+    commit.objects = assembler
+        .objects
+        .into_iter()
+        .filter(|(id, _)| known.insert(id.clone()))
+        .map(|(id, bytes)| JournalObject { id, bytes })
+        .collect();
+    commit.delta.bootstrap = Some(Box::new(snapshot));
+    if let Some(head) = previous {
+        commit.batch.sequence = head.batch_sequence + 1;
+        commit.batch.expected_revision = Some(head.revision);
+        commit.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+    }
+    commit.batch.operation = JournalOperationId::new(operation);
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+fn reader(pin: &str) -> JournalOpen {
+    JournalOpen {
+        intent: JournalOpenIntent::ReadOnly,
+        ..writer(pin)
+    }
+}
+
+#[tokio::test]
+async fn a_warm_writer_cannot_publish_a_head_over_a_body_another_engine_released() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(VolatileJournalStorage::default());
+        let id = JournalStorageId::new("two-engines");
+        let writing = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let collector = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("shared");
+        let mut known = BTreeSet::new();
+        let lease = writing.open(&session, writer("one")).await.unwrap();
+        let first = writing
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        let second = writing
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        // The other engine cannot see this engine's live lease.
+        assert!(sweep(&collector, u64::MAX).await.deleted > 0);
+        let result = writing
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&second),
+                    "three",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await;
+        // The cold path refuses: the lease's released body is no member.
+        assert!(
+            result.is_err(),
+            "budget {budget}: published over a released body"
+        );
+        // Storage stays self-consistent: a cold engine can open and fully
+        // read the latest published head.
+        let cold = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: 0,
+                ..Default::default()
+            },
+        );
+        let check = cold.open(&session, reader("check")).await;
+        assert!(
+            check.is_ok(),
+            "budget {budget}: a published head has a missing body"
+        );
+        let check = check.unwrap();
+        let mut read = JournalReader::new(
+            &cold,
+            &check,
+            JournalReadLimits {
+                objects: u64::MAX,
+                encoded_bytes: u64::MAX,
+                entries: u64::MAX,
+            },
+        )
+        .unwrap();
+        assert!(read.snapshot().await.unwrap().is_some());
+    }
+}

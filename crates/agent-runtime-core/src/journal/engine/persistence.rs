@@ -727,20 +727,29 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         let (scratch, stored) = self.hydrate(lease.session()).await?;
         let lease_record = self.local.live_lease(&*self.local.lock()?, lease)?;
-        let mut objects =
-            if let Some(root) = stored.as_ref().and_then(|record| record.head.as_ref()) {
-                self.memoized_root(lease.session(), &root.id)?
-                    .map(|entry| entry.objects.clone())
-                    .unwrap_or_default()
-            } else {
-                ObjectStore::default()
-            };
+        // Only the stored head's closure is guaranteed membership (D4). Any
+        // other lease-reachable body, even one cached here, is rechecked: a
+        // collection elsewhere may have released it, and a body already in
+        // `objects` is never rewritten, so trusting it would publish a head
+        // over a missing body.
+        let (mut objects, verified) = match stored.as_ref().and_then(|record| record.head.as_ref())
+        {
+            Some(root) => match self.memoized_root(lease.session(), &root.id)? {
+                Some(entry) => (entry.objects.clone(), Some(entry.closure.clone())),
+                None => (ObjectStore::default(), None),
+            },
+            None => (ObjectStore::default(), None),
+        };
         let ids: Vec<_> = lease_record
             .reachable
             .layers
             .iter()
             .flat_map(|layer| layer.iter().cloned())
-            .filter(|id| objects.get(id).is_none())
+            .filter(|id| {
+                !verified
+                    .as_ref()
+                    .is_some_and(|closure| closure.contains(id))
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -752,9 +761,18 @@ impl<S: JournalStorage> JournalEngine<S> {
             if bodies.len() != ids.len() {
                 return Err(conflict());
             }
-            objects.begin_layer();
+            let mut missing = Vec::new();
             for (id, body) in ids.into_iter().zip(bodies) {
-                objects.insert_new(id, body.ok_or_else(conflict)?.to_vec())?;
+                let body = body.ok_or_else(conflict)?;
+                if objects.get(&id).is_none() {
+                    missing.push((id, body));
+                }
+            }
+            if !missing.is_empty() {
+                objects.begin_layer();
+                for (id, body) in missing {
+                    objects.insert_new(id, body.to_vec())?;
+                }
             }
         }
         scratch.lock()?.objects = objects;
