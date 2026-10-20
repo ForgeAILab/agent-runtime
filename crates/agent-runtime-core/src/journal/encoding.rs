@@ -181,6 +181,28 @@ pub fn canonical_journal_json<T: Serialize>(value: &T) -> Result<Vec<u8>, Runtim
     Ok(bytes)
 }
 
+/// Exact length of [`canonical_journal_json`] without building or writing the
+/// canonical value. Object member order does not change a compact encoding's
+/// length, and serde_json writes keys, strings and numbers with the same
+/// formatter in both paths. Not valid for values containing `f32` fields or
+/// duplicate map keys (the value path widens/deduplicates them); memo sizing
+/// asserts equality with the full encoding in debug builds.
+pub(crate) fn canonical_journal_json_len<T: Serialize>(value: &T) -> Result<usize, RuntimeError> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_err(|_| conflict())?;
+    Ok(count.0)
+}
+
 /// Whether a JSON value fits the explicitly tagged inline representation.
 ///
 /// The byte threshold bounds envelope amplification, while the fanout/depth

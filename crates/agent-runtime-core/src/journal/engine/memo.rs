@@ -272,11 +272,19 @@ impl<S: JournalStorage> JournalEngine<S> {
         // each entry; live writer working sets are independent of this budget.
         let id_bytes =
             std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
+        // The canonical snapshot length, counted without allocating the
+        // canonical value tree (the dominant per-commit sizing cost).
+        let snapshot_bytes = crate::journal::encoding::canonical_journal_json_len(&*snapshot)?;
+        debug_assert_eq!(
+            snapshot_bytes,
+            canonical_journal_json(&*snapshot)?.len(),
+            "memo snapshot sizing diverged from its canonical encoding"
+        );
         let mut bytes = objects
             .bytes
             .saturating_add(objects.len.saturating_mul(id_bytes))
             .saturating_add(objects.link_bytes())
-            .saturating_add(canonical_journal_json(&*snapshot)?.len())
+            .saturating_add(snapshot_bytes)
             .saturating_add(closure.len().saturating_mul(id_bytes));
         if let Some(cache) = &encoding {
             let ids = cache
@@ -553,5 +561,56 @@ mod tests {
         assert_eq!(memo.bytes, 20);
         memo.remove_session(&s);
         assert_eq!(memo.bytes, 0);
+    }
+
+    #[test]
+    fn counted_snapshot_length_matches_the_canonical_encoding() {
+        let mut snapshot = crate::store::SessionSnapshot {
+            id: SessionId::new("s\u{e9}\"q"),
+            history: vec![
+                crate::content::Message::user("plain"),
+                crate::content::Message::user("esc \"\\ \n\t \u{1} \u{2028} \u{1f600}"),
+            ],
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: vec![],
+            extension_state: BTreeMap::new(),
+            updated: crate::clock::Timestamp(7),
+        };
+        snapshot.extension_state.insert(
+            "z.last".to_owned(),
+            crate::store::VersionedSessionState::new(
+                agent_runtime_registry::RegistryRevision::new("r"),
+                serde_json::json!({
+                    "b": [1, -2, 18446744073709551615u64, 0.5, 1e300, -0.0, null, true],
+                    "a": {"\u{e9}": "x", "": [], "nested": {"k": [{}]}},
+                }),
+            ),
+        );
+        snapshot.extension_state.insert(
+            "a.first".to_owned(),
+            crate::store::VersionedSessionState::new(
+                agent_runtime_registry::RegistryRevision::new("r2"),
+                serde_json::json!("s"),
+            )
+            .redaction_safe(),
+        );
+        let values = [
+            serde_json::to_value(&snapshot).unwrap(),
+            serde_json::json!({"b": 1, "a": [1.25, "x"], "c": {"y": null, "x": false}}),
+            serde_json::json!([]),
+            serde_json::json!(-12345678901234i64),
+        ];
+        assert_eq!(
+            crate::journal::encoding::canonical_journal_json_len(&snapshot).unwrap(),
+            canonical_journal_json(&snapshot).unwrap().len()
+        );
+        for value in values {
+            assert_eq!(
+                crate::journal::encoding::canonical_journal_json_len(&value).unwrap(),
+                canonical_journal_json(&value).unwrap().len(),
+                "{value}"
+            );
+        }
     }
 }
