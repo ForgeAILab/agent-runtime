@@ -419,6 +419,107 @@ pub struct CondensationPlan {
     pub group_plans: Vec<CondensationGroupPlan>,
 }
 
+/// Whether selection may use partial tiers to relieve admitted token pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondensationMode {
+    /// Condense only a full tier, preserving logarithmic depth without pressure.
+    Structural,
+    /// Also allow partial tiers after leaf compaction cannot relieve pressure.
+    Pressure,
+}
+
+/// Selects one contiguous slice of canonical active nodes for condensation.
+///
+/// A node's tier is `floor(log_fanout(covered entries))`. The newest full
+/// run contributes exactly `fanout` children, taken from its newest end.
+/// In [`CondensationMode::Pressure`], if no tier is full, the smallest tier
+/// with at least two adjacent members wins, preferring the newest run and
+/// taking up to `fanout` children. If all runs are singletons, the adjacent
+/// pair with the smallest combined size wins, preferring the newest on ties.
+///
+/// Returns `None` when no group is due in the supplied mode. Requires
+/// canonical range order and validates fanout, adjacency, active state, and
+/// timeline identity using the same rules as [`plan_condensations`].
+pub fn select_condensation_group(
+    children: &[LcmNode],
+    fanout: usize,
+    mode: CondensationMode,
+) -> Result<Option<&[LcmNode]>, LcmError> {
+    if fanout < 2 {
+        return Err(LcmError::Invalid {
+            reason: "condensation fanout must be at least two".to_string(),
+        });
+    }
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    validate_node_order(children)?;
+
+    let base = u64::try_from(fanout).unwrap_or(u64::MAX);
+    let tier = |node: &LcmNode| node.range.len().ilog(base);
+    let mut newest_full = None;
+    let mut best_run = None;
+    let mut start = 0;
+    while start < children.len() {
+        let current_tier = tier(&children[start]);
+        let mut end = start + 1;
+        while end < children.len() && tier(&children[end]) == current_tier {
+            end += 1;
+        }
+        if end - start >= fanout {
+            newest_full = Some(&children[end - fanout..end]);
+        }
+        if end - start >= 2 && best_run.is_none_or(|(best_tier, _, _)| current_tier <= best_tier) {
+            best_run = Some((current_tier, start, end));
+        }
+        start = end;
+    }
+    if newest_full.is_some() || mode == CondensationMode::Structural {
+        return Ok(newest_full);
+    }
+    if let Some((_, start, end)) = best_run {
+        return Ok(Some(&children[end - (end - start).min(fanout)..end]));
+    }
+
+    // Widen before adding: even valid ranges can jointly cover 2^64 entries.
+    Ok(children
+        .windows(2)
+        .enumerate()
+        .min_by_key(|(index, pair)| {
+            (
+                u128::from(pair[0].range.len()) + u128::from(pair[1].range.len()),
+                std::cmp::Reverse(*index),
+            )
+        })
+        .map(|(index, _)| &children[index..index + 2]))
+}
+
+/// Plans the next size-tiered frontier condensation as one independent CAS
+/// operation. Selection and metadata construction are shared by initial
+/// planning and pending-operation recovery.
+pub fn plan_next_condensation(
+    children: &[LcmNode],
+    fanout: usize,
+    mode: CondensationMode,
+    operation_id: &str,
+    policy_revision: &RegistryRevision,
+    algorithm_revision: &RegistryRevision,
+    sizer_revision: &RegistryRevision,
+) -> Result<Option<CondensationGroupPlan>, LcmError> {
+    let Some(group) = select_condensation_group(children, fanout, mode)? else {
+        return Ok(None);
+    };
+    condensation_group_plan(
+        group,
+        0,
+        operation_id,
+        policy_revision,
+        algorithm_revision,
+        sizer_revision,
+    )
+    .map(Some)
+}
+
 /// Groups canonical active nodes into deterministic bounded-fanout
 /// condensation operations.  Final groups are rebalanced so no one-child
 /// condensation is emitted.
@@ -478,49 +579,16 @@ pub fn plan_condensations(
 
     let mut plans = Vec::with_capacity(groups.len());
     let mut offset = 0_usize;
-    for (group_index, group) in groups.iter().cloned().enumerate() {
+    for (group_index, group) in groups.iter().enumerate() {
         let group_children = &children[offset..offset + group.len()];
-        let range = LcmRange::new(
-            group_children[0].range.start,
-            group_children.last().expect("non-empty group").range.end,
-        )
-        .map_err(|error| LcmError::Invalid {
-            reason: error.to_string(),
-        })?;
-        let source_fingerprint = source_fingerprint_nodes(group_children);
-        let source_token_count = group_children
-            .iter()
-            .try_fold(0_u64, |total, child| total.checked_add(child.token_count))
-            .ok_or_else(|| LcmError::Invalid {
-                reason: "condensation source token count overflowed".into(),
-            })?;
-        let classification = LcmClassification::join_all(
-            group_children
-                .iter()
-                .map(|child| child.classification.clone()),
-        );
-        let mut fields = vec![
-            "condensation".to_string(),
-            children[0].timeline_id.to_string(),
-            operation_id.to_string(),
-            group_index.to_string(),
-            range.start.get().to_string(),
-            range.end.get().to_string(),
-            source_fingerprint.to_string(),
-            policy_revision.to_string(),
-            algorithm_revision.to_string(),
-            sizer_revision.to_string(),
-            source_token_count.to_string(),
-        ];
-        fields.extend(group.iter().map(ToString::to_string));
-        plans.push(CondensationGroupPlan {
-            child_ids: group,
-            range,
-            source_fingerprint,
-            classification,
-            source_token_count,
-            operation_fingerprint: LcmOperationFingerprint::from_fields(fields),
-        });
+        plans.push(condensation_group_plan(
+            group_children,
+            group_index,
+            operation_id,
+            policy_revision,
+            algorithm_revision,
+            sizer_revision,
+        )?);
         offset += group_children.len();
     }
     if plans.is_empty() {
@@ -529,6 +597,58 @@ pub fn plan_condensations(
         });
     }
     Ok(Some(CondensationPlan { group_plans: plans }))
+}
+
+fn condensation_group_plan(
+    children: &[LcmNode],
+    group_index: usize,
+    operation_id: &str,
+    policy_revision: &RegistryRevision,
+    algorithm_revision: &RegistryRevision,
+    sizer_revision: &RegistryRevision,
+) -> Result<CondensationGroupPlan, LcmError> {
+    let range = LcmRange::new(
+        children[0].range.start,
+        children.last().expect("non-empty group").range.end,
+    )
+    .map_err(|error| LcmError::Invalid {
+        reason: error.to_string(),
+    })?;
+    let source_fingerprint = source_fingerprint_nodes(children);
+    let source_token_count = children
+        .iter()
+        .try_fold(0_u64, |total, child| total.checked_add(child.token_count))
+        .ok_or_else(|| LcmError::Invalid {
+            reason: "condensation source token count overflowed".into(),
+        })?;
+    let classification =
+        LcmClassification::join_all(children.iter().map(|child| child.classification.clone()));
+    let child_ids = children
+        .iter()
+        .map(|child| child.id.clone())
+        .collect::<Vec<_>>();
+    let mut fields = vec![
+        "condensation".to_string(),
+        children[0].timeline_id.to_string(),
+        operation_id.to_string(),
+        group_index.to_string(),
+        range.start.get().to_string(),
+        range.end.get().to_string(),
+        source_fingerprint.to_string(),
+        policy_revision.to_string(),
+        algorithm_revision.to_string(),
+        sizer_revision.to_string(),
+        source_token_count.to_string(),
+    ];
+    fields.extend(child_ids.iter().map(ToString::to_string));
+    Ok(CondensationGroupPlan {
+        child_ids,
+        range,
+        source_fingerprint,
+        classification,
+        source_token_count,
+        operation_fingerprint: LcmOperationFingerprint::from_fields(fields),
+    })
 }
 
 /// Fingerprints exact source identities and immutable content, never bodies.
@@ -828,6 +948,27 @@ mod tests {
         }
     }
 
+    fn children_with_sizes(sizes: &[u64]) -> Vec<LcmNode> {
+        let mut start = 0;
+        sizes
+            .iter()
+            .map(|&size| {
+                let mut node = child(start);
+                let end = start + size - 1;
+                node.range = LcmRange::new(LcmSequence::new(start), LcmSequence::new(end)).unwrap();
+                if size > 1 {
+                    node.kind = LcmNodeKind::Condensed;
+                    node.edges = vec![
+                        LcmEdge::Node(LcmNodeId::new(format!("older-{start}"))),
+                        LcmEdge::Node(LcmNodeId::new(format!("newer-{start}"))),
+                    ];
+                }
+                start = end + 1;
+                node
+            })
+            .collect()
+    }
+
     #[derive(Debug)]
     struct OverflowSizer;
 
@@ -967,6 +1108,385 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 2]
         );
+    }
+
+    #[test]
+    fn condensation_selection_leaves_large_old_node_out() {
+        let children = children_with_sizes(&[1_024, 1, 1, 1, 1]);
+        // Committing the oldest partition repeatedly wrapped the large node;
+        // frontier planning must instead select its small, newer peers.
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Pressure).unwrap(),
+            Some(&children[1..])
+        );
+        let binary = children_with_sizes(&[1_024, 1, 1]);
+        assert_eq!(
+            select_condensation_group(&binary, 2, CondensationMode::Pressure).unwrap(),
+            Some(&binary[1..])
+        );
+    }
+
+    #[test]
+    fn pressure_selection_prefers_smallest_tier_then_newest_run_and_end() {
+        let children = children_with_sizes(&[1, 3, 16, 4, 7]);
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Pressure).unwrap(),
+            Some(&children[..2])
+        );
+
+        let children = children_with_sizes(&[1, 1, 16, 1, 1, 1, 1, 1]);
+        // Both leaf runs are tier zero; use the newest four in the newer run.
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Pressure).unwrap(),
+            Some(&children[4..])
+        );
+    }
+
+    #[test]
+    fn structural_selection_requires_a_full_tier_and_prefers_the_newest() {
+        // Count alone is insufficient: no four adjacent nodes share a tier.
+        let children = children_with_sizes(&[64, 1, 16, 2, 64]);
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Structural).unwrap(),
+            None
+        );
+        let partial = children_with_sizes(&[1, 1, 1]);
+        assert_eq!(
+            select_condensation_group(&partial, 4, CondensationMode::Structural).unwrap(),
+            None
+        );
+        let full = children_with_sizes(&[1, 1, 1, 1]);
+        assert_eq!(
+            select_condensation_group(&full, 4, CondensationMode::Structural).unwrap(),
+            Some(full.as_slice())
+        );
+        // Structural carries prefer recency even when the newer tier is larger.
+        let children = children_with_sizes(&[1, 1, 1, 1, 16, 16, 16, 16, 16]);
+        for mode in [CondensationMode::Structural, CondensationMode::Pressure] {
+            assert_eq!(
+                select_condensation_group(&children, 4, mode).unwrap(),
+                Some(&children[5..])
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_without_a_full_tier_selects_smallest_tier_and_replans() {
+        let children = children_with_sizes(&[1, 3, 64, 1, 2, 16, 16]);
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Structural).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Pressure).unwrap(),
+            Some(&children[3..5])
+        );
+        let policy = RegistryRevision::from_content("policy");
+        let algorithm = RegistryRevision::from_content("algorithm");
+        let sizer = RegistryRevision::from_content("sizer");
+        let plan = plan_next_condensation(
+            &children,
+            4,
+            CondensationMode::Pressure,
+            "op",
+            &policy,
+            &algorithm,
+            &sizer,
+        )
+        .unwrap()
+        .unwrap();
+        let resumed: Vec<LcmNode> =
+            serde_json::from_slice(&serde_json::to_vec(&children).unwrap()).unwrap();
+        assert_eq!(
+            plan_next_condensation(
+                &resumed,
+                4,
+                CondensationMode::Pressure,
+                "op",
+                &policy,
+                &algorithm,
+                &sizer
+            )
+            .unwrap(),
+            Some(plan)
+        );
+    }
+
+    #[test]
+    fn condensation_selection_falls_back_to_smallest_adjacent_pair() {
+        let children = children_with_sizes(&[64, 1, 16, 2, 64]);
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Pressure).unwrap(),
+            Some(&children[1..3])
+        );
+        let tied = children_with_sizes(&[16, 1, 16, 1]);
+        assert_eq!(
+            select_condensation_group(&tied, 4, CondensationMode::Pressure).unwrap(),
+            Some(&tied[2..])
+        );
+    }
+
+    #[test]
+    fn condensation_selection_handles_full_sequence_space_without_size_overflow() {
+        let mut children = vec![child(0), child(u64::MAX - 1)];
+        children[0].range =
+            LcmRange::new(LcmSequence::new(0), LcmSequence::new(u64::MAX - 2)).unwrap();
+        children[1].range =
+            LcmRange::new(LcmSequence::new(u64::MAX - 1), LcmSequence::new(u64::MAX)).unwrap();
+        assert_eq!(
+            select_condensation_group(&children, 4, CondensationMode::Pressure).unwrap(),
+            Some(children.as_slice())
+        );
+    }
+
+    #[test]
+    fn condensation_selection_validates_fanout_and_frontier() {
+        let children = vec![child(0), child(1)];
+        for fanout in [0, 1] {
+            assert!(matches!(
+                select_condensation_group(&children, fanout, CondensationMode::Pressure),
+                Err(LcmError::Invalid { .. })
+            ));
+        }
+        assert_eq!(
+            select_condensation_group(&[], 4, CondensationMode::Pressure).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_condensation_group(&children[..1], 4, CondensationMode::Pressure).unwrap(),
+            None
+        );
+
+        let mut invalid = children.clone();
+        invalid[1].timeline_id = LcmTimelineId::new("other-timeline");
+        assert_eq!(
+            select_condensation_group(&invalid, 4, CondensationMode::Pressure),
+            Err(LcmError::CrossTimeline)
+        );
+        invalid = children.clone();
+        invalid[1].superseded_by = Some(LcmNodeId::new("parent"));
+        assert_eq!(
+            select_condensation_group(&invalid, 4, CondensationMode::Pressure),
+            Err(LcmError::InactiveChild)
+        );
+        invalid = children;
+        invalid[1].range = LcmRange::single(LcmSequence::new(2));
+        assert!(matches!(
+            select_condensation_group(&invalid, 4, CondensationMode::Pressure),
+            Err(LcmError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn next_condensation_is_deterministic_and_replans_after_serialization() {
+        let children = children_with_sizes(&[1_024, 1, 1, 1, 1]);
+        let policy = RegistryRevision::from_content("policy");
+        let algorithm = RegistryRevision::from_content("algorithm");
+        let sizer = RegistryRevision::from_content("sizer");
+        let plan = plan_next_condensation(
+            &children,
+            4,
+            CondensationMode::Structural,
+            "op",
+            &policy,
+            &algorithm,
+            &sizer,
+        )
+        .unwrap()
+        .unwrap();
+        for _ in 0..8 {
+            assert_eq!(
+                plan_next_condensation(
+                    &children,
+                    4,
+                    CondensationMode::Structural,
+                    "op",
+                    &policy,
+                    &algorithm,
+                    &sizer
+                )
+                .unwrap(),
+                Some(plan.clone())
+            );
+        }
+        let resumed: Vec<LcmNode> =
+            serde_json::from_slice(&serde_json::to_vec(&children).unwrap()).unwrap();
+        assert_eq!(
+            plan_next_condensation(
+                &resumed,
+                4,
+                CondensationMode::Structural,
+                "op",
+                &policy,
+                &algorithm,
+                &sizer
+            )
+            .unwrap(),
+            Some(plan.clone())
+        );
+        let explicit = plan_condensations(&children[1..], 4, "op", &policy, &algorithm, &sizer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(explicit.group_plans, vec![plan]);
+    }
+
+    #[test]
+    fn next_condensation_uses_only_selected_group_metadata() {
+        let mut children = children_with_sizes(&[1_024, 1, 1, 1, 1]);
+        children[0].classification.sensitivity = Sensitivity::Secret;
+        children[0].token_count = u64::MAX;
+        children[2].classification.sensitivity = Sensitivity::Sensitive;
+        children[3].classification.trust = TrustClass::UntrustedExtensionMetadata;
+        let policy = RegistryRevision::from_content("policy");
+        let algorithm = RegistryRevision::from_content("algorithm");
+        let sizer = RegistryRevision::from_content("sizer");
+        let plan = plan_next_condensation(
+            &children,
+            4,
+            CondensationMode::Structural,
+            "op",
+            &policy,
+            &algorithm,
+            &sizer,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.source_token_count, 4);
+        assert_eq!(
+            plan.source_fingerprint,
+            source_fingerprint_nodes(&children[1..])
+        );
+        assert_eq!(plan.range.start, children[1].range.start);
+        assert_eq!(plan.range.end, children[4].range.end);
+        assert_eq!(plan.classification.sensitivity, Sensitivity::Sensitive);
+        assert_eq!(
+            plan.classification.trust,
+            TrustClass::UntrustedExtensionMetadata
+        );
+        children[2].token_count = u64::MAX;
+        assert!(matches!(
+            plan_next_condensation(
+                &children,
+                4,
+                CondensationMode::Structural,
+                "op",
+                &policy,
+                &algorithm,
+                &sizer
+            ),
+            Err(LcmError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn streaming_condensation_depth_is_logarithmic_with_bounded_frontier() {
+        let policy = RegistryRevision::from_content("policy");
+        let algorithm = RegistryRevision::from_content("algorithm");
+        let sizer = RegistryRevision::from_content("sizer");
+        for fanout in [2_usize, 4, 8] {
+            let mut active = Vec::new();
+            let mut depths = std::collections::BTreeMap::new();
+            let mut condensation_count = 0;
+            for sequence in 0..4_096_u64 {
+                let leaf = child(sequence);
+                depths.insert(leaf.id.clone(), 0_usize);
+                active.push(leaf);
+                // No token pressure: carry only full tiers. Capping the
+                // frontier at fanout forced the old linear wrapping chain.
+                while let Some(plan) = plan_next_condensation(
+                    &active,
+                    fanout,
+                    CondensationMode::Structural,
+                    "stream",
+                    &policy,
+                    &algorithm,
+                    &sizer,
+                )
+                .unwrap()
+                {
+                    assert_eq!(plan.child_ids.len(), fanout);
+                    let tier = active
+                        .iter()
+                        .find(|node| node.id == plan.child_ids[0])
+                        .unwrap()
+                        .range
+                        .len()
+                        .ilog(fanout as u64);
+                    assert!(
+                        active
+                            .iter()
+                            .filter(|node| plan.child_ids.contains(&node.id))
+                            .all(|node| node.range.len().ilog(fanout as u64) == tier)
+                    );
+                    let start = active
+                        .iter()
+                        .position(|node| node.range.start == plan.range.start)
+                        .unwrap();
+                    let end = start + plan.child_ids.len();
+                    assert_eq!(
+                        plan.child_ids,
+                        active[start..end]
+                            .iter()
+                            .map(|node| node.id.clone())
+                            .collect::<Vec<_>>()
+                    );
+                    let depth = plan
+                        .child_ids
+                        .iter()
+                        .map(|id| depths.remove(id).unwrap())
+                        .max()
+                        .unwrap()
+                        + 1;
+                    condensation_count += 1;
+                    let mut parent = child(plan.range.start.get());
+                    parent.id = LcmNodeId::new(format!("parent-{condensation_count}"));
+                    parent.kind = LcmNodeKind::Condensed;
+                    parent.range = plan.range;
+                    parent.edges = plan.child_ids.into_iter().map(LcmEdge::Node).collect();
+                    parent.source_fingerprint = plan.source_fingerprint;
+                    parent.source_token_count = plan.source_token_count;
+                    parent.summary_revision = LcmNode::compute_summary_revision(
+                        &parent.source_fingerprint,
+                        &parent.provenance,
+                        &parent.summary,
+                    );
+                    parent.classification = plan.classification;
+                    parent.operation_fingerprint = plan.operation_fingerprint;
+                    depths.insert(parent.id.clone(), depth);
+                    active.splice(start..end, [parent]);
+                }
+                assert_eq!(active.len(), depths.len());
+                validate_node_order(&active).unwrap();
+                assert_eq!(active[0].range.start.get(), 0);
+                assert_eq!(active.last().unwrap().range.end.get(), sequence);
+                assert_eq!(
+                    active.iter().map(|node| node.range.len()).sum::<u64>(),
+                    sequence + 1
+                );
+
+                let mut capacity = 1_u64;
+                let mut levels = 0;
+                while capacity < sequence + 1 {
+                    capacity *= fanout as u64;
+                    levels += 1;
+                }
+                let tiers = (sequence + 1).ilog(fanout as u64) as usize;
+                let frontier_bound = (fanout - 1) * (tiers + 1) + 1;
+                assert!(
+                    active.len() <= frontier_bound,
+                    "fanout={fanout}, leaves={}, frontier={}, bound={frontier_bound}",
+                    sequence + 1,
+                    active.len()
+                );
+                let bound = levels + 2;
+                let max_depth = depths.values().copied().max().unwrap();
+                assert!(
+                    max_depth <= bound,
+                    "fanout={fanout}, leaves={}, depth={max_depth}, bound={bound}",
+                    sequence + 1,
+                );
+            }
+        }
     }
 
     #[test]

@@ -261,7 +261,13 @@ async fn committed_summary_reuses_source_totals_and_strict_projection_reads_sour
         .await
         .unwrap();
     let report = coordinator
-        .compact_once(&binding, history.len(), false, Some(2))
+        .compact_once(
+            &binding,
+            history.len(),
+            false,
+            Some(2),
+            CondensationMode::Pressure,
+        )
         .await
         .unwrap();
     let pending = report.pending_summary.expect("leaf operation");
@@ -592,7 +598,13 @@ async fn summarized_source_overflow_does_not_overflow_a_valid_raw_suffix() {
         .await
         .unwrap();
     let pending = coordinator
-        .compact_once(&binding, history.len(), false, Some(2))
+        .compact_once(
+            &binding,
+            history.len(),
+            false,
+            Some(2),
+            CondensationMode::Pressure,
+        )
         .await
         .unwrap()
         .pending_summary
@@ -706,7 +718,13 @@ async fn warm_leaf_and_condensation_deltas_match_reference_store_oracle() {
         .unwrap();
     for round in 0..4 {
         let pending = coordinator
-            .compact_once(&binding, history.len(), false, Some(6))
+            .compact_once(
+                &binding,
+                history.len(),
+                false,
+                Some(6),
+                CondensationMode::Pressure,
+            )
             .await
             .unwrap()
             .pending_summary
@@ -750,6 +768,15 @@ async fn warm_leaf_and_condensation_deltas_match_reference_store_oracle() {
         );
         assert!(sizer.entries.lock().unwrap().is_empty());
     }
-    assert_eq!(state.active_nodes.len(), 1);
-    assert_eq!(state.active_nodes[0].range.end.get(), 5);
+    // The old binary partition merged all three leaves at once. A full-tier
+    // carry now merges the newest pair and keeps the oldest leaf active.
+    assert_eq!(state.active_nodes.len(), 2);
+    assert_eq!(
+        state.active_nodes[0].range,
+        LcmRange::new(LcmSequence::new(0), LcmSequence::new(1)).unwrap()
+    );
+    assert_eq!(
+        state.active_nodes[1].range,
+        LcmRange::new(LcmSequence::new(2), LcmSequence::new(5)).unwrap()
+    );
 }
