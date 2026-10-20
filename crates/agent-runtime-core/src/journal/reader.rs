@@ -17,6 +17,8 @@ use crate::usage::{UsageLedger, UsageRecord};
 
 /// Explicit host resource limits for one materialization. Counts include
 /// repeated reads; no background policy/expiry or execution authority is added.
+/// When a speculative memo attempt loses storage authority, its counters are
+/// discarded and the cold retry starts at the operation's original counters.
 ///
 /// `objects` is checked before each backend read, and `entries` before a
 /// sequence or map is walked, against the count its descriptor declares. A
@@ -716,6 +718,35 @@ impl<'a> JournalReader<'a> {
         &mut self,
         namespace: &str,
     ) -> Result<Option<VersionedSessionState>, RuntimeError> {
+        let Some(operation) = self.journal.begin_read(self.lease)? else {
+            return Box::pin(self.extension_inner(namespace)).await;
+        };
+        let view = OperationJournal {
+            storage_id: self.journal.storage_id(),
+            operation: futures_util::lock::Mutex::new(operation),
+        };
+        let mut attempt = JournalReader {
+            journal: &view,
+            lease: self.lease,
+            limits: self.limits,
+            reads: self.reads,
+            bytes: self.bytes,
+        };
+        let result = Box::pin(attempt.extension_inner(namespace)).await;
+        let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
+        let result = if retry {
+            (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
+            Box::pin(attempt.extension_inner(namespace)).await
+        } else {
+            result
+        };
+        (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
+        result
+    }
+    async fn extension_inner(
+        &mut self,
+        namespace: &str,
+    ) -> Result<Option<VersionedSessionState>, RuntimeError> {
         let Some(selected) = self.lease.head().cloned() else {
             return Ok(None);
         };
@@ -812,6 +843,32 @@ impl<'a> JournalReader<'a> {
     /// Materializes the selected stored view, preserving ordinary redaction.
     /// `None` means an absent-head reservation; it never scans legacy records.
     pub async fn snapshot(&mut self) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        let Some(operation) = self.journal.begin_read(self.lease)? else {
+            return Box::pin(self.snapshot_inner()).await;
+        };
+        let view = OperationJournal {
+            storage_id: self.journal.storage_id(),
+            operation: futures_util::lock::Mutex::new(operation),
+        };
+        let mut attempt = JournalReader {
+            journal: &view,
+            lease: self.lease,
+            limits: self.limits,
+            reads: self.reads,
+            bytes: self.bytes,
+        };
+        let result = Box::pin(attempt.snapshot_inner()).await;
+        let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
+        let result = if retry {
+            (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
+            Box::pin(attempt.snapshot_inner()).await
+        } else {
+            result
+        };
+        (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
+        result
+    }
+    async fn snapshot_inner(&mut self) -> Result<Option<SessionSnapshot>, RuntimeError> {
         let Some(head) = self.lease.head().cloned() else {
             return Ok(None);
         };
@@ -830,6 +887,32 @@ impl<'a> JournalReader<'a> {
     /// The result carries [`CHECKPOINT_SCHEMA_VERSION`], like any other
     /// materialized checkpoint.
     pub async fn checkpoint(&mut self) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        let Some(operation) = self.journal.begin_read(self.lease)? else {
+            return Box::pin(self.checkpoint_inner()).await;
+        };
+        let view = OperationJournal {
+            storage_id: self.journal.storage_id(),
+            operation: futures_util::lock::Mutex::new(operation),
+        };
+        let mut attempt = JournalReader {
+            journal: &view,
+            lease: self.lease,
+            limits: self.limits,
+            reads: self.reads,
+            bytes: self.bytes,
+        };
+        let result = Box::pin(attempt.checkpoint_inner()).await;
+        let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
+        let result = if retry {
+            (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
+            Box::pin(attempt.checkpoint_inner()).await
+        } else {
+            result
+        };
+        (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
+        result
+    }
+    async fn checkpoint_inner(&mut self) -> Result<Option<TurnCheckpoint>, RuntimeError> {
         let Some(head) = self.lease.head().cloned() else {
             return Ok(None);
         };
@@ -908,5 +991,54 @@ impl<'a> JournalReader<'a> {
         };
         checkpoint.validate().map_err(|_| conflict())?;
         Ok(checkpoint)
+    }
+}
+
+struct OperationJournal<'a> {
+    storage_id: JournalStorageId,
+    operation: futures_util::lock::Mutex<Box<dyn JournalReadOperation + 'a>>,
+}
+impl std::fmt::Debug for OperationJournal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationJournal").finish_non_exhaustive()
+    }
+}
+#[async_trait::async_trait]
+impl SessionJournal for OperationJournal<'_> {
+    fn storage_id(&self) -> JournalStorageId {
+        self.storage_id.clone()
+    }
+    async fn read(
+        &self,
+        _: &JournalLease,
+        object: &JournalObjectId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.operation.lock().await.read(object).await
+    }
+    async fn open(&self, _: &SessionId, _: JournalOpen) -> Result<JournalLease, RuntimeError> {
+        Err(conflict())
+    }
+    async fn commit(
+        &self,
+        _: &JournalLease,
+        _: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        Err(conflict())
+    }
+    async fn renew(&self, _: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        Err(conflict())
+    }
+    async fn close(&self, _: JournalLease) -> Result<(), RuntimeError> {
+        Err(conflict())
+    }
+    async fn retire(
+        &self,
+        _: &SessionId,
+        _: JournalRevision,
+    ) -> Result<JournalRetirement, RuntimeError> {
+        Err(conflict())
+    }
+    async fn collect(&self, _: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        Err(conflict())
     }
 }

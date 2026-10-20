@@ -165,11 +165,23 @@ conservative encoded-byte estimate; zero disables retention and oversized
 entries are skipped. Eviction falls back to one full validation. A memoized
 writer open, renew and ordinary/protected commit can make zero storage-object
 reads, including after writer changes. Warm snapshot reads reuse admitted,
-immutable cached bodies; lease checks and hash verification remain in place. New writers trim prior cache-only bodies/links without changing membership.
+immutable cached bodies; lease checks and hash verification remain in place.
+Before returning a memo-served direct read, snapshot, checkpoint or extension,
+the engine checks storage once for that operation: the head must still be
+current, or the historical root must still have a durable pin. A mismatch
+retries through membership-scoped storage, preserving cold conflicts. Warm
+snapshot restoration adds one metadata call and still reads zero body objects. New writers trim prior cache-only bodies/links without changing membership.
 Collection trims released cache-only bodies and evicts affected historical proofs; a memo never acts as a GC pin.
 The existing live writer/session working caches are separate from this budget.
 Keep an engine per domain in the host store and return clones from `journal()`;
 new runtime instances then reuse the same registry and memo across turns.
+Cloning is a memo-hit/local-retention recommendation; independent engines'
+warm reads perform the same storage authority check. Commits drop unheld
+predecessor proofs. LRU touches are constant time. Memo sizing still computes
+the full link-index charge and serializes the snapshot; incremental sizing
+remains pending. The estimate is not a heap
+upper bound: the review measured 1.007–1.240 times the former charge; shared
+layers remain charged per entry.
 
 `JournalReader::extension(namespace)` reads a head, batch, one map node per
 level and one opaque value: 4 reads at 10 namespaces and 6 at 10,000, independent

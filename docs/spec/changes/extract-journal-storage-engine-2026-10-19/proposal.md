@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T03:38:23Z
+updated_at: 2026-10-20T04:41:05Z
 ---
 
 # Proposal: Storage-generic journal engine and physical disk reduction
@@ -66,7 +66,7 @@ collection never removes.
   `engine/` and `storage/`; `reader.rs`), `crates/agent-runtime/src/runtime/journal.rs`
   (R5), `crates/agent-runtime-testkit/src/conformance/` (storage suite), a new
   unpublished bench crate.
-- No change to `SessionJournal`, `SessionStore`, `CheckpointStore`, the
+- No new required `SessionJournal` methods (a defaulted reader transport is additive); no change to `SessionStore`, `CheckpointStore`, the
   journal object/head/checkpoint format (unless Q2/gate requires schema 5),
   materialized schema-3 checkpoints or v3 import.
 - Consumers: `InMemorySessionJournal` users and testkit consumers recompile

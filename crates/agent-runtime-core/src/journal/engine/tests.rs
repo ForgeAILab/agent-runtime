@@ -1005,7 +1005,39 @@ async fn engine_future_sizes_stay_bounded() {
         ),
         ("hydrate", std::mem::size_of_val(&engine.hydrate(&session))),
     ];
-    let sizes = [sizes.as_slice(), &[("close", boxed(&journal.close(lease)))]].concat();
+    let mut reader = JournalReader::new(
+        journal,
+        &lease,
+        JournalReadLimits {
+            objects: u64::MAX,
+            encoded_bytes: u64::MAX,
+            entries: u64::MAX,
+        },
+    )
+    .unwrap();
+    let snapshot_size = {
+        let future = reader.snapshot();
+        std::mem::size_of_val(&future)
+    };
+    let checkpoint_size = {
+        let future = reader.checkpoint();
+        std::mem::size_of_val(&future)
+    };
+    let extension_size = {
+        let future = reader.extension("sizing");
+        std::mem::size_of_val(&future)
+    };
+    let reader_sizes = [
+        ("reader_snapshot", snapshot_size),
+        ("reader_checkpoint", checkpoint_size),
+        ("reader_extension", extension_size),
+    ];
+    let sizes = [
+        sizes.as_slice(),
+        reader_sizes.as_slice(),
+        &[("close", boxed(&journal.close(lease)))],
+    ]
+    .concat();
     eprintln!("ENGINE FUTURE SIZES: {sizes:?}");
     for (name, size) in sizes {
         assert!(size <= 16 * 1024, "{name} future is {size} bytes");
@@ -1092,6 +1124,11 @@ async fn memoized_writer_open_renew_and_commit_read_no_storage_objects() {
             engine.local.full_validations.load(Ordering::Relaxed),
             validations
         );
+        eprintln!(
+            "D-1 {role:?} warm open: {:?}",
+            storage.calls.lock().unwrap()
+        );
+        storage.calls.lock().unwrap().clear();
         let mut reader = JournalReader::new(
             &engine,
             &second,
@@ -1112,7 +1149,17 @@ async fn memoized_writer_open_renew_and_commit_read_no_storage_objects() {
             None,
             "warm snapshot reloaded immutable bodies"
         );
+        assert_eq!(
+            *storage.calls.lock().unwrap(),
+            BTreeMap::from([(("load", session.clone()), 1)])
+        );
+        eprintln!(
+            "D-1 {role:?} warm snapshot: {:?}",
+            storage.calls.lock().unwrap()
+        );
+        storage.calls.lock().unwrap().clear();
         let renewed = engine.renew(&second).await.unwrap();
+        eprintln!("D-1 {role:?} renew: {:?}", storage.calls.lock().unwrap());
         assert_eq!(
             storage
                 .calls
@@ -1526,6 +1573,7 @@ async fn collection_evicts_released_history_and_trims_released_cache_bodies() {
         )
         .await
         .unwrap();
+    let historical = engine.open(&session, reader("historical")).await.unwrap();
     let second = engine
         .commit(
             &lease,
@@ -1557,6 +1605,7 @@ async fn collection_evicts_released_history_and_trims_released_cache_bodies() {
         .collect();
     assert!(!cached.is_empty(), "precondition: cache-only bodies exist");
     let bytes = engine.memo.lock().unwrap().bytes;
+    engine.close(historical).await.unwrap();
     assert!(sweep(&engine, u64::MAX).await.deleted > 0);
     assert!(
         engine.memoized_root(&session, &old).unwrap().is_none(),
@@ -1855,4 +1904,319 @@ async fn a_memoized_commit_may_re_reference_a_superseded_member() {
         .unwrap();
         assert_eq!(snapshot, ext_snapshot(&session, "a"));
     }
+}
+
+// Append to crates/agent-runtime-core/src/journal/engine/tests.rs (uses ext_snapshot/full_commit/reader helpers committed there).
+// Fails at ebdf2c6 and after the review fixes: budget 268435456 serves a body with no membership; budget 0 refuses.
+#[tokio::test]
+async fn a_warm_reader_never_serves_a_body_another_engine_collected() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(VolatileJournalStorage::default());
+        let id = JournalStorageId::new("two-engines");
+        let collector = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let reading = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("shared");
+        let mut known = BTreeSet::new();
+        let lease = collector.open(&session, writer("one")).await.unwrap();
+        let first = collector
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        collector.close(lease).await.unwrap();
+        let first_root = JournalObject::encode(JournalObjectKind::Head, &first)
+            .unwrap()
+            .id;
+        let held = reading.open(&session, reader("held")).await.unwrap();
+        assert!(reading.read(&held, &first_root).await.is_ok());
+        let lease = collector.open(&session, writer("two")).await.unwrap();
+        collector
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    2,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        collector.close(lease).await.unwrap();
+        // The head mismatch must retry successfully while the old membership
+        // still exists, without charging the discarded memo attempt twice.
+        let retry_limits = JournalReadLimits {
+            objects: 64,
+            encoded_bytes: u64::MAX,
+            entries: u64::MAX,
+        };
+        assert_eq!(
+            JournalReader::new(&reading, &held, retry_limits)
+                .unwrap()
+                .snapshot()
+                .await
+                .unwrap(),
+            Some(ext_snapshot(&session, "a"))
+        );
+        assert!(sweep(&collector, u64::MAX).await.deleted > 0);
+        let domain = collector.domain.clone();
+        assert_eq!(
+            storage
+                .objects(&domain, &session, std::slice::from_ref(&first_root))
+                .await
+                .unwrap(),
+            vec![None],
+            "precondition: the first head lost its last membership"
+        );
+        let limits = JournalReadLimits {
+            objects: u64::MAX,
+            encoded_bytes: u64::MAX,
+            entries: u64::MAX,
+        };
+        assert!(
+            JournalReader::new(&reading, &held, limits)
+                .unwrap()
+                .snapshot()
+                .await
+                .is_err()
+        );
+        assert!(
+            JournalReader::new(&reading, &held, limits)
+                .unwrap()
+                .extension("review.toggle")
+                .await
+                .is_err()
+        );
+        assert!(
+            reading.read(&held, &first_root).await.is_err(),
+            "budget {budget}: a body with no membership was served"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_warm_historical_reader_checks_its_durable_pin_once_per_operation() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(LostAcknowledgement::default());
+        let id = JournalStorageId::new("pinned-two-engines");
+        let collector = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let reading = JournalEngine::protected(
+            storage.clone(),
+            id,
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("pinned");
+        let mut known = BTreeSet::new();
+        let lease = collector.open(&session, writer("one")).await.unwrap();
+        let first = collector
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        collector.close(lease).await.unwrap();
+        let first_root = JournalObject::encode(JournalObjectKind::Head, &first)
+            .unwrap()
+            .id;
+        let initial = reading.open(&session, reader("retained")).await.unwrap();
+        reading.retain_root(&initial).await.unwrap();
+        reading.close(initial).await.unwrap();
+        let lease = collector.open(&session, writer("two")).await.unwrap();
+        collector
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    2,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        collector.close(lease).await.unwrap();
+        let historical = reading
+            .open(
+                &session,
+                JournalOpen {
+                    root: JournalRootSelection::Retained {
+                        root: first_root.clone(),
+                    },
+                    ..reader("historical")
+                },
+            )
+            .await
+            .unwrap();
+        let limits = JournalReadLimits {
+            objects: u64::MAX,
+            encoded_bytes: u64::MAX,
+            entries: u64::MAX,
+        };
+        storage.calls.lock().unwrap().clear();
+        let result = JournalReader::new(&reading, &historical, limits)
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(result, Some(ext_snapshot(&session, "a")));
+        if budget != 0 {
+            assert_eq!(
+                *storage.calls.lock().unwrap(),
+                BTreeMap::from([(("pins", session.clone()), 1)])
+            );
+        }
+        storage.calls.lock().unwrap().clear();
+        assert!(
+            JournalReader::new(&reading, &historical, limits)
+                .unwrap()
+                .extension("review.toggle")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        if budget != 0 {
+            assert_eq!(
+                *storage.calls.lock().unwrap(),
+                BTreeMap::from([(("pins", session.clone()), 1)])
+            );
+        }
+        collector
+            .release_pin(
+                &session,
+                &JournalPinId::new("retained"),
+                collector.root_epoch().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(sweep(&collector, u64::MAX).await.deleted > 0);
+        assert!(reading.read(&historical, &first_root).await.is_err());
+        assert!(
+            JournalReader::new(&reading, &historical, limits)
+                .unwrap()
+                .snapshot()
+                .await
+                .is_err()
+        );
+        assert!(
+            JournalReader::new(&reading, &historical, limits)
+                .unwrap()
+                .extension("review.toggle")
+                .await
+                .is_err()
+        );
+        // A pin recreated from a stale local lease cannot certify that bodies
+        // another engine collected are present again.
+        reading.retain_root(&historical).await.unwrap();
+        assert!(
+            reading.read(&historical, &first_root).await.is_err(),
+            "recreating a historical pin restored memo authority over a released body"
+        );
+        assert!(
+            JournalReader::new(&reading, &historical, limits)
+                .unwrap()
+                .snapshot()
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_busy_session_keeps_its_predecessor_from_evicting_another_current_root() {
+    let engine = JournalEngine::protected(
+        Arc::new(VolatileJournalStorage::default()),
+        JournalStorageId::new("fair-memo"),
+        JournalEngineConfig::default(),
+    );
+    let quiet = SessionId::new("quiet");
+    let busy = SessionId::new("busy");
+    let q = engine.open(&quiet, writer("quiet")).await.unwrap();
+    let head = engine.commit(&q, empty_commit(&quiet, 1)).await.unwrap();
+    let quiet_root = JournalObject::encode(JournalObjectKind::Head, &head)
+        .unwrap()
+        .id;
+    engine.close(q).await.unwrap();
+    let quiet_bytes = engine
+        .memoized_root(&quiet, &quiet_root)
+        .unwrap()
+        .unwrap()
+        .bytes_for_test();
+    let lease = engine.open(&busy, writer("busy")).await.unwrap();
+    let mut known = BTreeSet::new();
+    let mut previous = None;
+    for i in 0..40 {
+        let head = engine
+            .commit(
+                &lease,
+                full_commit(
+                    &busy,
+                    1,
+                    previous.as_ref(),
+                    &format!("busy-{i}"),
+                    ext_snapshot(&busy, "stable"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        previous = Some(head);
+        let current = JournalObject::encode(JournalObjectKind::Head, previous.as_ref().unwrap())
+            .unwrap()
+            .id;
+        let current_entry = engine.memoized_root(&busy, &current).unwrap().unwrap();
+        let mut memo = engine.memo.lock().unwrap();
+        // Enough for these two working sets and one superseded proof. Without
+        // predecessor removal, historical proofs eventually evict quiet.
+        memo.budget = (current_entry.bytes_for_test() + quiet_bytes) * 2;
+        assert_eq!(memo.entry_count_for_test(), 2);
+    }
+    assert!(
+        engine.memoized_root(&quiet, &quiet_root).unwrap().is_some(),
+        "busy session evicted an untouched session's current root"
+    );
 }

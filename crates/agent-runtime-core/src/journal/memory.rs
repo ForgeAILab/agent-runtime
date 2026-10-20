@@ -166,6 +166,12 @@ impl SessionJournal for InMemorySessionJournal {
     ) -> Result<Vec<u8>, RuntimeError> {
         self.0.read(lease, object).await
     }
+    fn begin_read<'a>(
+        &'a self,
+        lease: &'a JournalLease,
+    ) -> Result<Option<Box<dyn JournalReadOperation + 'a>>, RuntimeError> {
+        self.0.begin_read(lease)
+    }
     async fn commit(
         &self,
         lease: &JournalLease,

@@ -1,7 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T03:38:23Z
-completed_at: 2026-10-20T03:38:23Z
+updated_at: 2026-10-20T04:41:05Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -156,6 +155,17 @@ Supplemental C/N=4000, collection at the end (one release run):
 Its native/L2 ratio is 1.22863×. It is reported without gating.
 Raw JSON: `/Volumes/Data/tmp/refactor/rt-e7/measurements.json`.
 
+4.5 step-8 repeat status: **C/N=4000 NOT MET / not run** because incremental
+sizing was withdrawn after two runtime worker stack overflows. The step-7
+C/N=4000 row remains historical evidence; no step-8 native/L2 value is inferred.
+The remaining **18** release cases pass. All **4,032 size fields across
+252 size records** equal step 7; only pack-write meters/samples change.
+Current raw report: `rt-e8/measurements.json`; exhaustive comparison:
+`rt-e8/physical-comparison.json`. Every final requested verification gate
+passes (1,523 normal package tests, plus release reports and the future gate).
+The retained C/N=1000 release CPU is 18.351893 ms/commit versus 17.771257
+before; complete debug timing is NOT MET (900-second limits, epochs 120/111).
+
 ## 5. R7 format levers (gate: only if 4.5 fails or Q2 requires them)
 
 - [ ] 5.1 (not built: measured 4.5 B/N=4000 passes ≤2.0× L2) Journal schema 5 readers for chunked JSON leaves (F1), with frozen
@@ -223,3 +233,27 @@ Raw JSON: `/Volumes/Data/tmp/refactor/rt-e7/measurements.json`.
   cap packs at 1 MiB, bound base merges and enforce dead-byte threshold.
 - [x] 8.5 Measure collect-at-end and per-turn collection; record final bytes,
   L2 ratio, cumulative pack writes and largest collection write in D8.4/4.5.
+
+## 9. Memo review follow-ups (step 8 owner instruction)
+
+- [x] 9.1 D-1 storage authority check once per memo-served read/materialization;
+  cold fallback, current and historical repros, call counts, D5 decision.
+- [x] 9.2 Drop unheld predecessor proofs on successful commits; session fairness
+  regression; retain documented heap/charge calibration rather than claim an upper bound.
+- [ ] 9.3 Constant-time LRU touches and incremental exact memo sizing; compare
+  with full sizing and measure C/N=1000 commit CPU in debug/release.
+- [x] 9.4 Base SessionJournal conformance reads the pinned head itself.
+- [x] 9.5 S5 conformance covers AfterCommit RAM pruning, domain isolation and
+  last-writer persistence after Reopen; run/revert all three mutations.
+- [x] 9.6 Rewrite only changed operation packs; correct operation-pack comment.
+- [ ] 9.7 Re-measure C/N=4000 in release within the remaining budget (90-minute
+  maximum); record result or timeout epoch/time trend in D8.4 and 4.5.
+- [x] 9.8 Full requested verification, every physical size compared with step 7,
+  changed-expectation audit and final rt-e8 report.
+
+Step-8 sizing status: 9.3 is partial. Constant-time LRU touches pass; the
+incremental sizing attempt was withdrawn after two runtime worker stack
+overflows. Full sizing is restored. The debug C/N=1000 baseline timed out at
+900 seconds, writer epoch 120. Step 9.7's prerequisite (completed sizing/time
+work) is therefore NOT MET; no new C/N=4000 claim supersedes step 7's measured
+result. Detailed measurements, mutations and verification: `rt-e8/report.md`.

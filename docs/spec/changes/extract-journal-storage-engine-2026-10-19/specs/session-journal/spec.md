@@ -73,13 +73,25 @@ Collection SHALL examine only sessions whose roots, pins or staging changed sinc
 
 ### Requirement: A validated root is not validated again in the same process
 
-The engine SHALL memoize, per process and within a configured byte budget, each head it fully validated, keyed by session and head object id, together with its closure and decoded snapshot. A writer opening a memoized head MUST use the memoized closure without object reads and MUST commit on the fast path even after a writer change. A memo miss SHALL fall back to one full validation.
+The engine SHALL memoize, per process and within a configured byte budget, each head it fully validated, keyed by session and head object id, together with its closure and decoded snapshot. A writer opening a memoized head MUST use the memoized closure without object reads and MUST commit on the fast path even after a writer change. A memo miss SHALL fall back to one full validation. Before returning a memo-served reader operation, the engine MUST confirm through storage once for the operation that its exact root is still the stored current head or is still held by a durable historical pin. A mismatch MUST discard the speculative result and retry through membership-scoped storage with the same reader limits. Successful commits SHALL drop unheld predecessor proofs. LRU touches MUST NOT scan all entries; memo sizing MUST apply predecessor charge deltas using cached immutable subtree lengths and maintained index charges, equal to a full charge computation.
 
 #### Scenario: A new runtime per turn reuses the validated head
 
 - **WHEN** a host builds a new runtime for each turn of the same session in one process
 - **THEN** only the first writer open performs a full validation
 - **AND** every committed root still equals a cold encoding of its materialized state
+
+#### Scenario: Another engine releases a warm reader's membership
+
+- **WHEN** another engine advances the stored head or releases the durable historical pin and collects the selected closure
+- **THEN** a warm direct, snapshot or extension read falls back to storage and conflicts exactly as a cold reader does
+- **AND** an unchanged held root needs one metadata check per reader operation and zero body reads
+
+#### Scenario: A busy session does not retain every superseded proof
+
+- **WHEN** one session repeatedly commits while another session's current proof fits alongside its current proof
+- **THEN** unheld predecessor proofs are removed before admitting the new proof
+- **AND** the other session's current proof survives without being touched
 
 ### Requirement: Native-first open
 

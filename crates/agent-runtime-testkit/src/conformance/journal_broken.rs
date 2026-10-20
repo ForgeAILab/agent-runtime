@@ -19,6 +19,7 @@ use super::SessionJournalConformanceFixture;
 enum Break {
     /// Control: breaks nothing, so the wrapper itself is shown transparent.
     Transparent,
+    OmitsHead,
     /// Physical steps are not atomic: every injected cut leaves the head,
     /// pins and idempotency record visible, as if published before failing.
     PublishBeforeCut,
@@ -166,6 +167,19 @@ impl SessionJournal for Broken {
         lease: &JournalLease,
         object: &JournalObjectId,
     ) -> Result<Vec<u8>, RuntimeError> {
+        if self.defect == Break::OmitsHead {
+            let bytes = self.inner.read(lease, object).await?;
+            if (JournalObject {
+                id: object.clone(),
+                bytes: bytes.clone(),
+            })
+            .kind()?
+                == JournalObjectKind::Head
+            {
+                return Err(RuntimeError::conflict("head intentionally omitted"));
+            }
+            return Ok(bytes);
+        }
         match self.inner.read(lease, object).await {
             Ok(bytes) => Ok(bytes),
             Err(error) if self.defect == Break::ReadIgnoresLease => self
@@ -505,5 +519,13 @@ async fn ordinary_suite_rejects_an_adapter_that_drops_structured_references() {
             journal
         },
     ))
+    .await;
+}
+
+#[tokio::test]
+async fn suite_rejects_a_journal_that_omits_head_objects() {
+    suite_rejects(super::assert_session_journal_conformance(&|| async {
+        Broken::fixture(Break::OmitsHead)
+    }))
     .await;
 }

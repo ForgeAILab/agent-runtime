@@ -269,13 +269,53 @@ impl Measuring {
             .sum()
     }
 }
+#[cfg(unix)]
+fn thread_cpu_nanos() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the pointer names an initialized, writable timespec; the clock
+    // only observes this thread and retains no pointer after returning.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+    assert_eq!(result, 0, "thread CPU clock unavailable");
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}
+#[cfg(not(unix))]
+fn thread_cpu_nanos() -> u64 {
+    0
+}
+static COMMIT_CPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMMIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn commit_timing() -> (u64, u64, u64) {
+    (
+        COMMIT_COUNT.load(Ordering::Relaxed),
+        COMMIT_NS.load(Ordering::Relaxed),
+        COMMIT_CPU_NS.load(Ordering::Relaxed),
+    )
+}
 #[async_trait]
 impl SessionJournal for Measuring {
     fn storage_id(&self) -> JournalStorageId {
         self.inner.storage_id()
     }
     async fn open(&self, id: &SessionId, open: JournalOpen) -> Result<JournalLease, RuntimeError> {
-        self.inner.open(id, open).await
+        let lease = self.inner.open(id, open).await?;
+        if std::env::var_os("JOURNAL_COMMIT_PROGRESS").is_some() {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+            if let Some(epoch) = lease.writer_epoch().filter(|epoch| epoch % 25 == 0) {
+                let (count, _, cpu) = commit_timing();
+                eprintln!(
+                    "C progress role={:?} epoch={epoch} elapsed_seconds={:.3} commits={count} commit_cpu_seconds={:.6}",
+                    self.domain.role,
+                    elapsed.as_secs_f64(),
+                    cpu as f64 / 1e9
+                );
+            }
+        }
+        Ok(lease)
     }
     async fn read(
         &self,
@@ -284,12 +324,23 @@ impl SessionJournal for Measuring {
     ) -> Result<Vec<u8>, RuntimeError> {
         self.inner.read(lease, id).await
     }
+    fn begin_read<'a>(
+        &'a self,
+        lease: &'a JournalLease,
+    ) -> Result<Option<Box<dyn JournalReadOperation + 'a>>, RuntimeError> {
+        self.inner.begin_read(lease)
+    }
     async fn commit(
         &self,
         lease: &JournalLease,
         commit: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
+        let cpu = thread_cpu_nanos();
+        let start = std::time::Instant::now();
         let head = self.inner.commit(lease, commit).await?;
+        COMMIT_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        COMMIT_CPU_NS.fetch_add(thread_cpu_nanos().saturating_sub(cpu), Ordering::Relaxed);
+        COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         if self.commits.fetch_add(1, Ordering::Relaxed) == 1 {
             let export = self.export(lease.session()).await;
             assert_eq!(

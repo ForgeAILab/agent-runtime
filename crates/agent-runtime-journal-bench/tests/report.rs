@@ -220,3 +220,17 @@ async fn per_turn_collection_smoke() {
     );
     assert!(report.packed_after.physical_bytes > 0);
 }
+
+#[tokio::test]
+#[ignore = "C/N=1000 commit timing; run alone in debug and release"]
+async fn growing_commit_cpu_report() {
+    let _fixture = fixture::build("C", 1000, true).await;
+    let (count, nanos, cpu) = fixture::commit_timing();
+    eprintln!(
+        "COMMIT TIMING C N=1000 count={count} synchronous_seconds={:.6} ms_per_commit={:.6} cpu_seconds={:.6} cpu_ms_per_commit={:.6}",
+        nanos as f64 / 1e9,
+        nanos as f64 / 1e6 / count as f64,
+        cpu as f64 / 1e9,
+        cpu as f64 / 1e6 / count as f64
+    );
+}

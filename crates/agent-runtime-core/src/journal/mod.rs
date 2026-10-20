@@ -37,8 +37,8 @@ use crate::error::RuntimeError;
 use crate::ids::SessionId;
 use async_trait::async_trait;
 
-/// Host-owned native journal; every method is required, with no save-based
-/// blanket implementation. Implementations may reject collection explicitly,
+/// Host-owned native journal with eight required methods and no save-based
+/// blanket implementation. The optional reader transport defaults to `read`. Implementations may reject collection explicitly,
 /// retaining all content, but must satisfy native read/commit/pin conformance.
 #[async_trait]
 pub trait SessionJournal: Send + Sync + std::fmt::Debug {
@@ -67,6 +67,16 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
         lease: &JournalLease,
         object: &JournalObjectId,
     ) -> Result<Vec<u8>, RuntimeError>;
+    /// Optional transport for a single reader operation. Implementations that
+    /// cache bodies can validate their authority once after materialization.
+    /// The default keeps the ordinary per-object `read` contract.
+    #[doc(hidden)]
+    fn begin_read<'a>(
+        &'a self,
+        _lease: &'a JournalLease,
+    ) -> Result<Option<Box<dyn JournalReadOperation + 'a>>, RuntimeError> {
+        Ok(None)
+    }
     /// Atomically persists objects/batch and publishes head/checkpoint under CAS
     /// and writer fence. Same operation/digest returns its original result for
     /// at least the latest 64 revisions and the current writer epoch's last
@@ -104,4 +114,14 @@ pub(crate) fn conflict() -> RuntimeError {
             component: FailureComponent::Checkpoint,
         },
     )
+}
+
+/// Optional operation-scoped reader transport used by [`JournalReader`].
+/// A false `finish` discards the materialized result and retries through this
+/// transport, which must then read membership-scoped storage without its memo.
+#[doc(hidden)]
+#[async_trait]
+pub trait JournalReadOperation: Send {
+    async fn read(&mut self, object: &JournalObjectId) -> Result<Vec<u8>, RuntimeError>;
+    async fn finish(&mut self) -> Result<bool, RuntimeError>;
 }

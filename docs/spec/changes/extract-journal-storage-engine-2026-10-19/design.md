@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T03:38:23Z
+updated_at: 2026-10-20T04:41:05Z
 ---
 
 # Design: Storage-generic journal engine and physical disk reduction (R1–R7)
@@ -442,6 +442,19 @@ retention. This budget covers the memo, independently of live writer working
 sets and the pre-existing session state caches. No storage trait change is
 needed.
 
+Step 8 uses a hash-indexed doubly linked LRU: a hit touches only its own
+node and its two neighbors, with no entry-wide recency scan.
+
+**Incremental sizing: NOT MET in step 8.** An attempted immutable-subtree
+length cache and predecessor charge deltas passed focused/full core tests,
+but the runtime integration suite overflowed a Tokio worker stack twice.
+Boxing the reader attempt futures did not resolve that failure. Under the
+owner's two-attempt limit, the incremental sizing change was withdrawn and
+the original full link-index charge and canonical snapshot serialization were
+restored. Its experimental measurements are identified as withdrawn in the
+step-8 report; they do not describe the retained implementation. The new
+O(1) LRU, read authority checks and per-session predecessor removal remain.
+
 Exact-closure construction also caches parsed object links by object id and
 expected kind. New or differently typed edges run the original checks; reused
 immutable edges avoid JSON reparsing. Missing bodies still conflict. Parsed
@@ -474,21 +487,50 @@ Thus current-root validation survives ordinary collection, and a cached body
 can never suppress re-admission of an object whose membership was released.
 A failed storage apply clears the session's memo conservatively.
 
-**Open decision (review rt-e6): warm reads and another engine's collection.**
-The memo is per engine. Within one engine and its clones every membership
-release passes through collection's `release` and the new-writer trim, and
-collection keeps every local lease's reachable set, so served bodies stay
-members. A second engine over the same storage and domain (another process, or
-a host that builds a second engine instead of cloning) does not see this
-engine's leases. When it advances the head and collects, a cold `read` on an
-older lease here returns `StateConflict` for the released body, but a warm
-`read` serves it from the memo, against D2 rule 7. Commit, open, renew and
-retirement decisions already match the cold path. The options are: (a) require one
-engine, cloned, per storage and domain wherever collection runs, and document
-it for hosts; (b) always read public bodies through membership-scoped storage,
-giving up zero-I/O warm snapshot restoration; or (c) recheck the stored head
-once per reader before serving memo bodies. Reproduction:
-`rt-e6-review/two-engine-read-repro.rs`.
+**D-1 decision (step 8): check storage after every memo-served reader operation.**
+A direct `read`, snapshot, checkpoint or extension materialization confirms its
+served root once at the end: `load` must still name that head for a current
+lease, or `pins` must still hold the exact head for a historical lease. Memo
+reads are limited to that root's exact closure, never its cache-only bodies.
+On mismatch the speculative result is discarded and the operation retries
+through membership-scoped storage, with the same limits and cold conflicts.
+The optional defaulted `SessionJournal::begin_read` transport lets the reader
+batch this check; existing host journals keep their per-object read contract.
+
+Published head revisions strictly increase, and the head's content address
+includes its revision. A superseded head therefore cannot become current again;
+a matching final head proves its closure was continuously held. Pin identities
+alone are not monotonic: a stale local lease can recreate a historical pin
+after another engine collected its bodies. The added regression reproduced
+that gap even with a final pin-presence check. To close it, private pin metadata
+records `memo_roots` only for roots pinned while they equal the stored current
+head, under that pin write's revision/writer-epoch fence. Writer-pin freezing
+can certify the current head by the same rule. Removing a pin removes this
+certificate; recreating it from a historical lease cannot recreate the marker,
+since that content-addressed revision can never be current again. A historical
+memo read's single final `pins` call requires both the root and its certificate.
+Pins predating this metadata, historical-only pins and staging pins use the
+cold path. Empty certificates are omitted, preserving staging-pack bytes and
+the existing journal schema. The test covers release, collection and stale
+pin recreation, with warm/cold parity throughout.
+Every object still passes hash/kind and lease reachability/liveness checks,
+and lease liveness is checked again after the metadata await.
+
+Cost in both domains (body reads remain zero): warm writer open stays
+`load/pins/catalog/apply = 1/1/1/1`; warm snapshot changes from zero storage
+calls to one `load`; historical snapshot/extension use one `pins`; renew stays
+`load/pins = 1/1`; commit stays `load/pins/operation/apply = 1/1/1/1`.
+Hosts should clone one engine per storage/domain to share memo hits and local
+lease retention; this is a performance/retention recommendation, no longer a
+warm-read correctness requirement. The review repro and a historical-pin
+variant cover direct, snapshot and extension reads after another engine's GC.
+
+Successful commits remove the predecessor's memo proof unless a live lease
+selects that head or a durable pin roots it. A busy session keeps one current
+entry plus entries for held historical roots, rather than evicting other
+sessions with every superseded head. Shared-layer charging is unchanged: the
+review's measured 1.007–1.240× heap/charge factor above remains documented;
+this estimate is deliberately not advertised as a heap upper bound.
 
 The two named existing writer-change/advisory-delta tests have no full-count
 assertion requiring a change; all their assertions stay unchanged. New tests
@@ -497,7 +539,8 @@ following eviction, and zero storage object calls for open, renew and commit
 of a 100-message memoized head in both domains, after collection between writer
 epochs. Evidence: `rt-e6/r4-core-final.log`; each tested commit calls load, pins,
 operation and apply once, and objects zero times. The future-size gate remains
-16,384 bytes (largest observed: commit_inner, 4,944 bytes).
+16,384 bytes (step-8 largest: commit_inner, 5,080 bytes; snapshot/checkpoint/extension
+reader futures: 400 / 2,120 / 368 bytes).
 
 ### D6. Native-first open (R5)
 
@@ -722,6 +765,35 @@ meter delta for one engine collection call (one domain); final collection is
 included. Rollback restores the meter. The raw JSON retains every turn's
 cumulative sample and actual retained-operation counts. Simulator fields stay
 counterfactual diagnostics; former projected-after fields alias actual sizes.
+
+Step-8 C/N=4000 repeat: **NOT MET / not run**. The incremental-sizing
+prerequisite failed runtime verification and was withdrawn under the two-attempt
+limit. No new native/L2 measurement is claimed; the 4,886,528 / 3,977,216 =
+1.22863× row above remains the historical step-7 measurement, not a step-8 run.
+The step-8 primary release report passes all **18** remaining cases. All
+**4,032 size fields across 252 size records** (including every
+physical size and table/page allocation) equal step 7 exactly. Every changed
+report field is a pack-write meter/sample: unchanged operation packs now stay
+sealed rather than being recompressed and written with identical contents.
+The retained B/N=4000 gate stays 1.60542× plain / 1.79118× tool in both
+collection schedules. The optional 1.5× aim remains NOT MET.
+Current raw report: `/Volumes/Data/tmp/refactor/rt-e8/measurements.json`;
+full comparison: `/Volumes/Data/tmp/refactor/rt-e8/physical-comparison.json`.
+
+| Case | Schedule | Pack writes: step 7 → step 8 | Largest collection: step 7 → step 8 |
+| --- | --- | ---: | ---: |
+| B/1000 plain | every_turn | 845,627 → 831,035 | 33,297 → 29,166 |
+| B/1000 tool | every_turn | 1,491,335 → 1,474,464 | 288,771 → 283,493 |
+| B/4000 plain | every_turn | 3,057,083 → 3,042,469 | 313,815 → 309,669 |
+| B/4000 tool | every_turn | 3,540,392 → 3,523,509 | 323,123 → 317,847 |
+| C/1000 tool | every_turn | 144,922,993 → 141,248,730 | 368,800 → 360,616 |
+
+Release C/N=1000 engine-commit CPU, 4,002 commits: before 17.771257 ms/commit;
+retained source 18.351893 ms/commit. These are single-trial OS thread-CPU
+measurements; no CPU improvement is claimed. The withdrawn incremental-sizing
+trial measured 15.964051 ms/commit but failed runtime verification. Debug
+trials timed out at 900 seconds (epochs 120 and 111); a complete debug timing
+comparison is NOT MET. Raw CPU observations: `rt-e8/cpu-summary.json`.
 
 #### D8.5 Decision rule
 

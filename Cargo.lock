@@ -112,6 +112,7 @@ dependencies = [
  "agent-runtime-core",
  "agent-runtime-testkit",
  "async-trait",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

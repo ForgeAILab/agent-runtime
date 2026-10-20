@@ -49,6 +49,16 @@ where
         replay_prune_last_writer_operation(&factory),
     )
     .await;
+    named(
+        "replay_prune_after_commit",
+        replay_prune_after_commit(&factory),
+    )
+    .await;
+    named(
+        "replay_prune_domain_isolation",
+        replay_prune_domain_isolation(&factory),
+    )
+    .await;
     named("membership_isolation_and_receipts", membership(&factory)).await;
     named("bounded_deferred_deletion", deferred_deletion(&factory)).await;
     named("dirty_session_paging", dirty_paging(&factory)).await;
@@ -1142,6 +1152,7 @@ where
     );
     prune.inject = None;
     storage.apply(prune.clone()).await.unwrap();
+    storage.load(&second.domain, &second.session).await.unwrap();
     assert!(
         storage
             .operation(
@@ -1180,6 +1191,7 @@ where
     record.writer_epoch += 1;
     prune.record = Some(record);
     storage.apply(prune).await.unwrap();
+    storage.load(&second.domain, &second.session).await.unwrap();
     assert!(
         storage
             .operation(
@@ -1309,3 +1321,122 @@ mod tests {
 #[cfg(test)]
 #[path = "journal_storage_broken.rs"]
 mod broken;
+
+async fn replay_prune_after_commit<S, F, Fut>(factory: &F)
+where
+    S: JournalStorage,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<S>>,
+{
+    let storage = factory().await;
+    let first = raw_write("prune-cut", "first", None);
+    storage.apply(first.clone()).await.unwrap();
+    let second = raw_write(
+        "prune-cut",
+        "second",
+        Some(&first.operation.as_ref().unwrap().result),
+    );
+    storage.apply(second.clone()).await.unwrap();
+    let mut prune = edits(&second);
+    prune.prune_operations_before = Some(JournalRevision(100));
+    prune.inject = Some(JournalCommitFailurePoint::AfterCommit);
+    assert!(storage.apply(prune).await.is_err());
+    // Check the still-live RAM index before load can rebuild it from SQL.
+    assert!(
+        storage
+            .operation(
+                &first.domain,
+                &first.session,
+                &first.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "AfterCommit left a pruned operation in RAM"
+    );
+    assert_eq!(
+        storage
+            .operation(
+                &second.domain,
+                &second.session,
+                &second.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap(),
+        second.operation
+    );
+    storage.load(&second.domain, &second.session).await.unwrap();
+    assert!(
+        storage
+            .operation(
+                &first.domain,
+                &first.session,
+                &first.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+async fn replay_prune_domain_isolation<S, F, Fut>(factory: &F)
+where
+    S: JournalStorage,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<S>>,
+{
+    let storage = factory().await;
+    let first = raw_write("same-session", "first", None);
+    let second = raw_write(
+        "same-session",
+        "second",
+        Some(&first.operation.as_ref().unwrap().result),
+    );
+    let mut other_role = first.clone();
+    other_role.domain.role = JournalRole::Ordinary;
+    let mut other_storage = first.clone();
+    other_storage.domain.storage_id = JournalStorageId::new("other-storage");
+    for write in [&first, &second, &other_role, &other_storage] {
+        storage.apply(write.clone()).await.unwrap();
+    }
+    let mut prune = edits(&second);
+    prune.prune_operations_before = Some(JournalRevision(100));
+    storage.apply(prune).await.unwrap();
+    assert!(
+        storage
+            .operation(
+                &first.domain,
+                &first.session,
+                &first.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for other in [&other_role, &other_storage] {
+        assert_eq!(
+            storage
+                .operation(
+                    &other.domain,
+                    &other.session,
+                    &other.operation.as_ref().unwrap().operation
+                )
+                .await
+                .unwrap(),
+            other.operation,
+            "prune crossed a domain boundary in RAM"
+        );
+        storage.load(&other.domain, &other.session).await.unwrap();
+        assert_eq!(
+            storage
+                .operation(
+                    &other.domain,
+                    &other.session,
+                    &other.operation.as_ref().unwrap().operation
+                )
+                .await
+                .unwrap(),
+            other.operation,
+            "prune crossed a domain boundary on disk"
+        );
+    }
+}

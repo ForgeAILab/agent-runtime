@@ -284,47 +284,22 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         lease: &JournalLease,
         object: &JournalObjectId,
     ) -> Result<Vec<u8>, RuntimeError> {
-        let current = {
-            let state = self.local.lock()?;
-            if !self
-                .local
-                .checked_lease(&state, lease)?
-                .reachable
-                .contains(object)
-            {
-                return Err(conflict());
-            }
-            state
-                .sessions
-                .get(lease.session())
-                .and_then(|record| record.current.as_ref())
-                .map(|(root, _)| root.clone())
-        };
-        let cached = match current {
-            Some(root) => self
-                .memoized_root(lease.session(), &root)?
-                .and_then(|entry| entry.objects.get(object).cloned()),
-            None => None,
-        };
-        let bytes = if let Some(bytes) = cached {
-            bytes
+        let mut operation = memo::ReadOperation::new(self, lease)?;
+        let bytes = operation.read(object).await?;
+        if operation.finish().await? {
+            Ok(bytes)
         } else {
-            self.storage
-                .objects(&self.domain, lease.session(), std::slice::from_ref(object))
-                .await?
-                .into_iter()
-                .next()
-                .flatten()
-                .ok_or_else(conflict)?
-                .to_vec()
-        };
-        let encoded = JournalObject {
-            id: object.clone(),
-            bytes,
-        };
-        encoded.kind()?;
-        self.local.checked_lease(&*self.local.lock()?, lease)?;
-        Ok(encoded.bytes)
+            operation.read(object).await
+        }
+    }
+    fn begin_read<'a>(
+        &'a self,
+        lease: &'a JournalLease,
+    ) -> Result<Option<Box<dyn JournalReadOperation + 'a>>, RuntimeError> {
+        if lease.head().is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(memo::ReadOperation::new(self, lease)?)))
     }
     async fn commit(
         &self,

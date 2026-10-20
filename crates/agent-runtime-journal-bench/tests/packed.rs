@@ -649,3 +649,86 @@ async fn operation_segments_remain_capped_and_recover_original_results() {
         );
     }
 }
+
+#[tokio::test]
+async fn collection_does_not_rewrite_an_unchanged_operation_pack() {
+    use agent_runtime_core::clock::Timestamp;
+    let files = Files::new();
+    let storage = PackedSqliteJournalStorage::open_with_config(
+        files.path(),
+        PackedSqliteConfig {
+            repack_on_collection: false,
+        },
+    )
+    .unwrap();
+    let mut write = stage(domain(JournalRole::Protected), "stable-ops", &[]);
+    let id = JournalObject::encode(JournalObjectKind::JsonInline, &0)
+        .unwrap()
+        .id;
+    let revision = 1;
+    let operation = JournalOperationRecord {
+        operation: JournalOperationId::new("unchanged"),
+        digest: journal_history_chain(std::iter::empty()),
+        revision: JournalRevision(revision),
+        result: JournalHead {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            storage_id: write.domain.storage_id.clone(),
+            role: write.domain.role,
+            session: write.session.clone(),
+            revision: JournalRevision(revision),
+            writer_epoch: 1,
+            batch_sequence: revision,
+            batch: id.clone(),
+            snapshot: JournalSnapshotRoots {
+                history: Default::default(),
+                history_chain: journal_history_chain(std::iter::empty()),
+                usage: Default::default(),
+                extensions: Default::default(),
+                manifests: Default::default(),
+                planned_step_count: 0,
+                identity: Default::default(),
+                updated: Timestamp(1),
+            },
+            checkpoint: None,
+            superseded_by: None,
+            retirement: None,
+            created: Timestamp(1),
+            updated: Timestamp(1),
+        },
+    };
+    write.record = Some(JournalSessionRecord {
+        revision: JournalRevision(1),
+        writer_epoch: 1,
+        head: None,
+        has_checkpoint: false,
+        retirement: None,
+        collection_dirty: true,
+        engine: JournalEngineState {
+            version: 0,
+            bytes: vec![],
+        },
+    });
+    write.operation = Some(operation.clone());
+    storage.apply(write.clone()).await.unwrap();
+    let before = storage.pack_write_bytes().unwrap();
+    write.kind = JournalWriteKind::Collect;
+    write.expect = (JournalRevision(1), 1);
+    write.record = None;
+    write.operation = None;
+    for floor in [0, 100] {
+        write.prune_operations_before = Some(JournalRevision(floor));
+        storage.apply(write.clone()).await.unwrap();
+        assert_eq!(
+            storage.pack_write_bytes().unwrap(),
+            before,
+            "unchanged pack rewritten at floor {floor}"
+        );
+        assert_eq!(
+            storage
+                .operation(&write.domain, &write.session, &operation.operation)
+                .await
+                .unwrap(),
+            Some(operation.clone())
+        );
+    }
+}

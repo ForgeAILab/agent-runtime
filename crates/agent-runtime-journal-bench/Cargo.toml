@@ -19,5 +19,8 @@ sha2.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = { version = "0.13", default-features = false }
 
+[dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

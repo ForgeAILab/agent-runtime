@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::VecDeque;
+use std::collections::HashMap;
 
 type Key = (SessionId, JournalObjectId);
 
@@ -18,16 +18,33 @@ pub(super) struct ValidatedRoot {
 pub(super) struct RootMemo {
     pub(super) budget: usize,
     pub(super) bytes: usize,
-    entries: BTreeMap<Key, Arc<ValidatedRoot>>,
-    order: VecDeque<Key>,
+    entries: HashMap<Key, MemoNode>,
+    oldest: Option<Key>,
+    newest: Option<Key>,
+}
+#[cfg(test)]
+impl ValidatedRoot {
+    pub(super) fn bytes_for_test(&self) -> usize {
+        self.bytes
+    }
+}
+struct MemoNode {
+    entry: Arc<ValidatedRoot>,
+    older: Option<Key>,
+    newer: Option<Key>,
 }
 impl RootMemo {
+    #[cfg(test)]
+    pub(super) fn entry_count_for_test(&self) -> usize {
+        self.entries.len()
+    }
     pub(super) fn new(budget: usize) -> Self {
         Self {
             budget,
             bytes: 0,
-            entries: BTreeMap::new(),
-            order: VecDeque::new(),
+            entries: HashMap::new(),
+            oldest: None,
+            newest: None,
         }
     }
     pub(super) fn get(
@@ -36,9 +53,9 @@ impl RootMemo {
         root: &JournalObjectId,
     ) -> Option<Arc<ValidatedRoot>> {
         let key = (session.clone(), root.clone());
-        let entry = self.entries.get(&key)?.clone();
-        self.order.retain(|old| old != &key);
-        self.order.push_back(key);
+        let entry = self.entries.get(&key)?.entry.clone();
+        self.unlink(&key);
+        self.append(&key);
         Some(entry)
     }
     pub(super) fn insert(
@@ -53,20 +70,57 @@ impl RootMemo {
         let key = (session.clone(), root.clone());
         self.remove(&key);
         while entry.bytes > self.budget - self.bytes {
-            let Some(old) = self.order.front().cloned() else {
+            let Some(old) = self.oldest.clone() else {
                 break;
             };
             self.remove(&old);
         }
         self.bytes += entry.bytes;
-        self.entries.insert(key.clone(), entry);
-        self.order.push_back(key);
+        self.entries.insert(
+            key.clone(),
+            MemoNode {
+                entry,
+                older: None,
+                newer: None,
+            },
+        );
+        self.append(&key);
+    }
+    pub(super) fn remove_root(&mut self, session: &SessionId, root: &JournalObjectId) {
+        self.remove(&(session.clone(), root.clone()));
+    }
+    fn unlink(&mut self, key: &Key) {
+        let Some(node) = self.entries.get(key) else {
+            return;
+        };
+        let (older, newer) = (node.older.clone(), node.newer.clone());
+        if let Some(older) = &older {
+            self.entries.get_mut(older).expect("linked older").newer = newer.clone();
+        } else {
+            self.oldest = newer.clone();
+        }
+        if let Some(newer) = &newer {
+            self.entries.get_mut(newer).expect("linked newer").older = older;
+        } else {
+            self.newest = older;
+        }
+    }
+    fn append(&mut self, key: &Key) {
+        let node = self.entries.get_mut(key).expect("present node");
+        node.older = self.newest.clone();
+        node.newer = None;
+        if let Some(newest) = &self.newest {
+            self.entries.get_mut(newest).expect("linked newest").newer = Some(key.clone());
+        } else {
+            self.oldest = Some(key.clone());
+        }
+        self.newest = Some(key.clone());
     }
     fn remove(&mut self, key: &Key) {
+        self.unlink(key);
         if let Some(old) = self.entries.remove(key) {
-            self.bytes -= old.bytes;
+            self.bytes -= old.entry.bytes;
         }
-        self.order.retain(|old| old != key);
     }
     // Keep validation evidence for unaffected roots across a sweep. Historical
     // roots that lost a member are evicted; released cache-only bodies are
@@ -82,7 +136,7 @@ impl RootMemo {
         let id_bytes =
             std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
         for key in keys {
-            let old = self.entries[&key].clone();
+            let old = self.entries[&key].entry.clone();
             if old.closure.iter().any(|id| released.contains(id)) {
                 self.remove(&key);
                 continue;
@@ -101,7 +155,7 @@ impl RootMemo {
                 - next.objects.link_bytes();
             next.bytes = old.bytes.saturating_sub(saving);
             self.bytes -= old.bytes - next.bytes;
-            self.entries.insert(key, Arc::new(next));
+            self.entries.get_mut(&key).expect("present entry").entry = Arc::new(next);
         }
     }
     pub(super) fn remove_session(&mut self, session: &SessionId) {
@@ -330,6 +384,130 @@ impl<S: JournalStorage> JournalEngine<S> {
             .ok_or_else(conflict)?;
         let entry = self.memo_entry(scratch, session, &root, false)?;
         Ok((root, entry))
+    }
+}
+
+/// One immutable root per reader operation, with a storage authority check at
+/// its end. Bodies outside that root always use membership-scoped storage.
+pub(super) struct ReadOperation<'a, S: JournalStorage> {
+    engine: &'a JournalEngine<S>,
+    lease: &'a JournalLease,
+    root: Option<JournalObjectId>,
+    entry: Option<Arc<ValidatedRoot>>,
+    current: bool,
+    served: bool,
+}
+impl<'a, S: JournalStorage> ReadOperation<'a, S> {
+    pub(super) fn new(
+        engine: &'a JournalEngine<S>,
+        lease: &'a JournalLease,
+    ) -> Result<Self, RuntimeError> {
+        let state = engine.local.lock()?;
+        engine.local.checked_lease(&state, lease)?;
+        let root = lease
+            .head()
+            .map(|head| JournalObject::encode(JournalObjectKind::Head, head).map(|o| o.id))
+            .transpose()?;
+        let current = state
+            .sessions
+            .get(lease.session())
+            .and_then(|s| s.current.as_ref())
+            .map(|(id, _)| id)
+            == root.as_ref();
+        drop(state);
+        let entry = root
+            .as_ref()
+            .map(|root| engine.memoized_root(lease.session(), root))
+            .transpose()?
+            .flatten();
+        Ok(Self {
+            engine,
+            lease,
+            root,
+            entry,
+            current,
+            served: false,
+        })
+    }
+}
+#[async_trait]
+impl<S: JournalStorage> JournalReadOperation for ReadOperation<'_, S> {
+    async fn read(&mut self, object: &JournalObjectId) -> Result<Vec<u8>, RuntimeError> {
+        if !self
+            .engine
+            .local
+            .checked_lease(&*self.engine.local.lock()?, self.lease)?
+            .reachable
+            .contains(object)
+        {
+            return Err(conflict());
+        }
+        let cached = self
+            .entry
+            .as_ref()
+            .filter(|e| e.closure.contains(object))
+            .and_then(|e| e.objects.get(object))
+            .cloned();
+        let bytes = if let Some(bytes) = cached {
+            self.served = true;
+            bytes
+        } else {
+            self.engine
+                .storage
+                .objects(
+                    &self.engine.domain,
+                    self.lease.session(),
+                    std::slice::from_ref(object),
+                )
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(conflict)?
+                .to_vec()
+        };
+        let encoded = JournalObject {
+            id: object.clone(),
+            bytes,
+        };
+        encoded.kind()?;
+        self.engine
+            .local
+            .checked_lease(&*self.engine.local.lock()?, self.lease)?;
+        Ok(encoded.bytes)
+    }
+    async fn finish(&mut self) -> Result<bool, RuntimeError> {
+        let held = if !self.served {
+            true
+        } else if self.current {
+            self.engine
+                .storage
+                .load(&self.engine.domain, self.lease.session())
+                .await?
+                .and_then(|r| r.head)
+                .map(|h| h.id)
+                == self.root
+        } else {
+            let root = self.root.as_ref().ok_or_else(conflict)?;
+            let mut held = false;
+            for pin in self
+                .engine
+                .storage
+                .pins(&self.engine.domain, self.lease.session())
+                .await?
+            {
+                held |= persistence::pin_memo_holds(&pin, root)?;
+            }
+            held
+        };
+        self.engine
+            .local
+            .checked_lease(&*self.engine.local.lock()?, self.lease)?;
+        if !held {
+            self.entry = None;
+            self.served = false;
+        }
+        Ok(held)
     }
 }
 

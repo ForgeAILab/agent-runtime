@@ -487,6 +487,21 @@ where
         .clone();
     let second_head = fixture.journal.commit(&writer, second).await.unwrap();
 
+    let head_object = JournalObject::encode(JournalObjectKind::Head, &first_head).unwrap();
+    let bytes = fixture
+        .journal
+        .read(&pinned, &head_object.id)
+        .await
+        .expect("a pinned closure must include its head object");
+    assert_eq!(
+        JournalObject {
+            id: head_object.id,
+            bytes
+        }
+        .decode::<JournalHead>(JournalObjectKind::Head)
+        .unwrap(),
+        first_head
+    );
     assert!(
         fixture
             .journal

@@ -99,6 +99,9 @@ pub(in crate::journal) struct LeaseRecord {
 
 #[derive(Debug, Clone)]
 pub(in crate::journal) struct DurablePin {
+    // Roots certified while current under the durable record fence. Recreating
+    // a historical pin from a stale local lease must not revive memo authority.
+    pub(in crate::journal) memo_roots: BTreeSet<JournalObjectId>,
     pub(in crate::journal) reachable: ReachableSet,
     pub(in crate::journal) roots: BTreeSet<JournalObjectId>,
     pub(in crate::journal) writer_epochs: BTreeSet<u64>,
@@ -500,6 +503,11 @@ impl Transition {
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         let record = self.live_lease(&state, lease)?;
+        let current_root = state
+            .sessions
+            .get(&record.session)
+            .and_then(|session| session.current.as_ref())
+            .map(|(root, _)| root.clone());
         let key = (record.session, record.pin);
         if let Some(existing) = state.durable_pins.get(&key) {
             if existing.blocks_retirement != blocks_retirement {
@@ -508,6 +516,7 @@ impl Transition {
         }
         state.advance_root_epoch()?;
         let existing = state.durable_pins.entry(key).or_insert_with(|| DurablePin {
+            memo_roots: BTreeSet::new(),
             reachable: ReachableSet::default(),
             roots: BTreeSet::new(),
             writer_epochs: record.writer_epoch.into_iter().collect(),
@@ -521,6 +530,9 @@ impl Transition {
         }
         for layer in record.reachable.layers {
             existing.reachable.extend(layer.as_ref().clone());
+        }
+        if let Some(root) = current_root.filter(|root| existing.roots.contains(root)) {
+            existing.memo_roots.insert(root);
         }
         Ok(())
     }
@@ -582,6 +594,7 @@ impl Transition {
         staged.durable_pins.insert(
             key,
             DurablePin {
+                memo_roots: BTreeSet::new(),
                 reachable: ReachableSet::from_set(reachable.clone()),
                 roots: reachable,
                 writer_epochs: BTreeSet::new(),

@@ -12,6 +12,8 @@ struct Metadata {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PinMetadata {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    memo_roots: BTreeSet<JournalObjectId>,
     dependencies: PinDependencies,
     #[serde(default)]
     writer_epochs: BTreeSet<u64>,
@@ -137,6 +139,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             state.durable_pins.insert(
                 (session.clone(), pin.pin),
                 DurablePin {
+                    memo_roots: metadata.memo_roots,
                     reachable: ReachableSet::default(),
                     roots: pin.roots.into_iter().collect(),
                     writer_epochs: metadata.writer_epochs,
@@ -539,6 +542,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             for ((owner, _), pin) in &mut state.durable_pins {
                 if owner == session && pin.writer_epochs.contains(&stored.writer_epoch) {
                     pin.roots.insert(head.id.clone());
+                    pin.memo_roots.insert(head.id.clone());
                 }
             }
         }
@@ -943,6 +947,28 @@ impl<S: JournalStorage> JournalEngine<S> {
                 Some(self.local.token(lease)?.handle),
                 true,
             )?;
+            // A busy session retains its current proof plus proofs selected by
+            // live leases or durable pins, rather than every superseded head.
+            if let Some(previous) = stored.as_ref().and_then(|r| r.head.as_ref()) {
+                let state = self.local.lock()?;
+                let head: JournalHead = previous.decode(JournalObjectKind::Head)?;
+                let held = state.leases.values().any(|lease| {
+                    lease.session == head.session && lease.selected_head.as_ref() == Some(&head)
+                }) || scratch
+                    .lock()?
+                    .durable_pins
+                    .iter()
+                    .any(|((session, _), pin)| {
+                        session == &head.session && pin.roots.contains(&previous.id)
+                    });
+                drop(state);
+                if !held {
+                    self.memo
+                        .lock()
+                        .map_err(|_| host_failure())?
+                        .remove_root(lease.session(), &previous.id);
+                }
+            }
             self.remember_root(lease.session(), &root, entry)?;
             self.mark_dirty(lease.session())?;
         }
@@ -992,6 +1018,7 @@ pub(super) fn pin_record(
         blocks_retirement: pin.blocks_retirement,
         roots: pin.roots.iter().cloned().collect(),
         engine: encode(&PinMetadata {
+            memo_roots: pin.memo_roots.intersection(&pin.roots).cloned().collect(),
             dependencies: PinDependencies {
                 sessions: pin.dependencies.sessions.clone(),
                 unresolved: pin.dependencies.unresolved,
@@ -999,4 +1026,15 @@ pub(super) fn pin_record(
             writer_epochs: pin.writer_epochs.clone(),
         })?,
     })
+}
+
+pub(super) fn pin_memo_holds(
+    pin: &JournalPinRecord,
+    root: &JournalObjectId,
+) -> Result<bool, RuntimeError> {
+    if !pin.roots.contains(root) {
+        return Ok(false);
+    }
+    let metadata: PinMetadata = decode(&pin.engine)?;
+    Ok(metadata.memo_roots.contains(root))
 }

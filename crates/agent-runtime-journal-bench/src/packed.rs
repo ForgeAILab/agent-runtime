@@ -611,8 +611,10 @@ fn repack(
 }
 
 // Binary-carry operation packs contain 2^tier complete original results.
-// Appending merges equal counts, so each operation is recompressed O(log N)
-// times. Collection rewrites or drops packs below its inclusive replay floor.
+// Appending merges equal counts while a pack fits the logical byte cap;
+// capped segments stay sealed. Each operation is recompressed O(log N)
+// times. Collection changes only packs losing operations, preserving the
+// inclusive replay floor and the current writer epoch's last operation.
 fn append_operation(
     tx: &Transaction<'_>,
     d: &JournalDomain,
@@ -706,6 +708,7 @@ fn prune_operations(
         .max();
     let mut removed = BTreeSet::new();
     for (tier, mut ops) in packs {
+        let previous_len = ops.len();
         ops.retain(|op| {
             let keep = op.2 >= before || (op.3.writer_epoch == epoch && Some(op.2) == last);
             if !keep {
@@ -713,6 +716,10 @@ fn prune_operations(
             }
             keep
         });
+        // A stable pack's sealed payload and nonce do not change on GC.
+        if ops.len() == previous_len {
+            continue;
+        }
         if ops.is_empty() {
             tx.execute(
                 "DELETE FROM operation_pack WHERE storage=? AND role=? AND session=? AND tier=?",
