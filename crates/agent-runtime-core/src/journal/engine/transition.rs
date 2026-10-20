@@ -1605,6 +1605,9 @@ pub(in crate::journal) fn injected_failure() -> RuntimeError {
 }
 
 impl Transition {
+    // `fetch_update` is deprecated on newer toolchains; its replacement is not
+    // available at the declared MSRV (1.86).
+    #[allow(deprecated)]
     fn next_handle(&self) -> Result<u64, RuntimeError> {
         self.handles
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
