@@ -7,12 +7,17 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-20
+
 ### Breaking
 
 - After collection, journal replays older than 64 revisions can return
   `StateConflict` instead of the original result. Collection preserves the
   inclusive `current_revision - 64` boundary and the current writer epoch's
   last operation. A pruned operation never applies again.
+- `ChildTaskResult` gains `reply: Option<Box<ArtifactRef>>`
+  and `DelegationConfig` gains `delivery_inline_bytes`. Struct literals must
+  set them; `ChildTaskResult::reply` deserializes as `None` from older state.
 
 ### Added
 
@@ -71,54 +76,11 @@ contain breaking changes and are coordinated with consumer proposals.
   session-scoped, ordinary FromIndex suffixes to outlive their parent, and an
   open of a partly collected root to fail before returning a lease.
 
-### Fixed
-
-- LCM condensation now carries the newest full covered-entry size tier
-  instead of triggering on active-node count. Without token pressure, depth
-  stays logarithmic while the frontier can retain about `fanout - 1` summaries
-  per tier, using more context than a frontier capped at fanout. Existing
-  soft/hard pressure thresholds still bound context: after leaf compaction
-  cannot relieve pressure, condensation can merge a smaller tier or the
-  smallest adjacent pair. Pending operations reproduce the admitted pressure
-  mode on resume without a new persisted field; older algorithm responses
-  retain source-identity validation. Existing nodes and explicit-child-set
-  condensation planning retain their contracts.
-
-- Retired native sessions now reject read-only latest-root opens as an explicit
-  conflict, including after collection. Runtime views check the journal before
-  loading legacy records, so imported sessions cannot fall back to their stale
-  v3 snapshots during fork, session-exists, child recovery/rebind or watermark
-  refresh. Writer refusal and pinned historical reads are preserved. Collection
-  conformance distinguishes retirement from absence, and runtime GC schedules
-  assert every expected success or stale-mark conflict.
-- Waiting for a user, internal, or resumed turn to complete now also waits for
-  its execution gate and active-turn admission to be released. Previously a
-  host waking from `TurnHandle::completed` or `SessionHandle::run` could have
-  an immediate local tool action refused as non-idle, or an explicit idle
-  compaction return `Busy`, even though that turn had completed.
-- Automatic child-completion delivery is no longer refused when its batch
-  passes the 4,096-character internal-turn limit. Such a batch stayed ready,
-  so one long child reply blocked every later delivery to that parent.
-  Replies are now inlined while they fit `DelegationConfig::delivery_inline_bytes`
-  (default 4,096); a longer reply is delivered as its opening 1,024 bytes plus
-  a reference to a parent-owned copy (purpose `delegation.child-reply`), and
-  a `delegation.child-completion` turn is bounded by
-  `MAX_CHILD_COMPLETION_TURN_CHARS` instead of the general limit.
-- A delivered child outcome now lists the artifacts transferred to the parent
-  (parent id, child source id, media type, size); before, the model was never
-  told they existed.
-
 ### Changed
 
 - Opening a session whose ordinary and protected journals both have native
   heads skips legacy v3 loads. Absent native heads and supported partial-import
   repair still load the legacy records when needed.
-- **Breaking (pre-1.0):** `ChildTaskResult` gains `reply: Option<Box<ArtifactRef>>`
-  and `DelegationConfig` gains `delivery_inline_bytes`. Struct literals must
-  set them; `ChildTaskResult::reply` deserializes as `None` from older state.
-
-### Session journal migration and retention limits
-
 - Native adoption is opt-in through `journal()` on every configured store.
   Existing store implementations, methods and v0.6.x/v0.7.0 materialized
   formats remain unchanged: `SessionSnapshot` is unversioned and
@@ -156,41 +118,76 @@ contain breaking changes and are coordinated with consumer proposals.
   checks, and adopt one shared immutable landed tag or exact revision across
   runtime packages; local overrides and moving `main` pins do not qualify.
   The read-only Nyx reference currently tracks `main`, so its release adoption
-  remains blocked. No release/version/tag is created by this documentation.
+  remains blocked.
+- Measured native-journal byte totals after the representation refinement are
+  below. Each cell is **serialized submission bytes / newly retained immutable-object bytes**,
+  not physical disk, encryption, compression, WAL or index amplification. A turn
+  is the second turn after bootstrap under an identity ordinary projection.
 
-Measured task-2.7 totals after the representation refinement are below. Each
-cell is **serialized submission bytes / newly retained immutable-object bytes**,
-not physical disk, encryption, compression, WAL or index amplification. A turn
-is the second turn after bootstrap under an identity ordinary projection.
+  | Path | N=100 | N=1000 | N=4000 |
+  | --- | ---: | ---: | ---: |
+  | Plain bootstrap | 146,814 / 239,857 | 1,062,815 / 1,742,270 | 4,133,607 / 6,767,016 |
+  | Plain protected turn | 42,041 / 48,051 | 43,740 / 49,764 | 43,088 / 49,112 |
+  | Plain ordinary terminal | 10,867 / 28,134 | 11,815 / 29,671 | 12,263 / 29,681 |
+  | Tool bootstrap | 154,239 / 247,610 | 1,070,240 / 1,750,023 | 4,141,032 / 6,774,769 |
+  | Tool protected turn | 108,028 / 119,907 | 111,468 / 123,375 | 110,164 / 122,071 |
+  | Tool ordinary terminal | 16,496 / 34,042 | 17,848 / 35,983 | 18,520 / 36,217 |
+  | Plain unchanged boundary | 1,183 / 2,015 | 1,187 / 2,021 | 1,187 / 2,021 |
+  | Tool unchanged boundary | 1,180 / 2,011 | 1,184 / 2,017 | 1,184 / 2,017 |
 
-| Path | N=100 | N=1000 | N=4000 |
-| --- | ---: | ---: | ---: |
-| Plain bootstrap | 146,814 / 239,857 | 1,062,815 / 1,742,270 | 4,133,607 / 6,767,016 |
-| Plain protected turn | 42,041 / 48,051 | 43,740 / 49,764 | 43,088 / 49,112 |
-| Plain ordinary terminal | 10,867 / 28,134 | 11,815 / 29,671 | 12,263 / 29,681 |
-| Tool bootstrap | 154,239 / 247,610 | 1,070,240 / 1,750,023 | 4,141,032 / 6,774,769 |
-| Tool protected turn | 108,028 / 119,907 | 111,468 / 123,375 | 110,164 / 122,071 |
-| Tool ordinary terminal | 16,496 / 34,042 | 17,848 / 35,983 | 18,520 / 36,217 |
-| Plain unchanged boundary | 1,183 / 2,015 | 1,187 / 2,021 | 1,187 / 2,021 |
-| Tool unchanged boundary | 1,180 / 2,011 | 1,184 / 2,017 | 1,184 / 2,017 |
+  Unchanged boundaries submit zero drafts and zero body bytes; their nonzero
+  totals are revisioned metadata. At N=4000, plain bootstrap fell from
+  9,114,257 / 20,124,203 bytes to 4,133,607 / 6,767,016; the latter retained
+  size is 3.82× one 1,772,321-byte legacy snapshot. Legacy complete-turn
+  protected / ordinary-terminal bytes remain 5,659,421 / 1,772,321 (plain) and
+  11,326,721 / 2,277,973 (tool). Opaque host extensions still cost whole-value
+  replacement bytes. Bootstrap, legacy writes, full materialization and policy
+  validation remain history-dependent; the roughly-flat end-to-end CPU target
+  was **not met**. N=10,000 cannot exercise a successful turn because the existing
+  4,096-entry stable-history identity limit rejects planning before provider I/O.
 
-Unchanged boundaries submit zero drafts and zero body bytes; their nonzero
-totals are revisioned metadata. At N=4000, plain bootstrap fell from
-9,114,257 / 20,124,203 bytes to 4,133,607 / 6,767,016; the latter retained
-size is 3.82× one 1,772,321-byte legacy snapshot. Legacy complete-turn
-protected / ordinary-terminal bytes remain 5,659,421 / 1,772,321 (plain) and
-11,326,721 / 2,277,973 (tool). Opaque host extensions still cost whole-value
-replacement bytes. Bootstrap, legacy writes, full materialization and policy
-validation remain history-dependent; the roughly-flat end-to-end CPU target
-was **not met**. N=10,000 cannot exercise a successful turn because the existing
-4,096-entry stable-history identity limit rejects planning before provider I/O.
+  The separate N=1000 retention measurement keeps 570,121 encoded immutable bytes
+  before collection, 404,529 with the canonical session still live (165,592
+  reclaimed), and 0 after authorized retirement and pin release. It excludes the
+  small replay/tombstone indexes and physical amplification. Detailed measurement
+  and follow-up evidence, including per-commit rows and reproduction commands,
+  is in [development.md](docs/development.md).
 
-The separate N=1000 retention measurement keeps 570,121 encoded immutable bytes
-before collection, 404,529 with the canonical session still live (165,592
-reclaimed), and 0 after authorized retirement and pin release. It excludes the
-small replay/tombstone indexes and physical amplification. Detailed task-2.7
-and follow-up evidence, including per-commit rows and reproduction commands,
-is in [development.md](docs/development.md#native-turn-byte-cost-evidence-u9-task-27).
+### Fixed
+
+- LCM condensation now carries the newest full covered-entry size tier
+  instead of triggering on active-node count. Without token pressure, depth
+  stays logarithmic while the frontier can retain about `fanout - 1` summaries
+  per tier, using more context than a frontier capped at fanout. Existing
+  soft/hard pressure thresholds still bound context: after leaf compaction
+  cannot relieve pressure, condensation can merge a smaller tier or the
+  smallest adjacent pair. Pending operations reproduce the admitted pressure
+  mode on resume without a new persisted field; older algorithm responses
+  retain source-identity validation. Existing nodes and explicit-child-set
+  condensation planning retain their contracts.
+- Retired native sessions now reject read-only latest-root opens as an explicit
+  conflict, including after collection. Runtime views check the journal before
+  loading legacy records, so imported sessions cannot fall back to their stale
+  v3 snapshots during fork, session-exists, child recovery/rebind or watermark
+  refresh. Writer refusal and pinned historical reads are preserved. Collection
+  conformance distinguishes retirement from absence, and runtime GC schedules
+  assert every expected success or stale-mark conflict.
+- Waiting for a user, internal, or resumed turn to complete now also waits for
+  its execution gate and active-turn admission to be released. Previously a
+  host waking from `TurnHandle::completed` or `SessionHandle::run` could have
+  an immediate local tool action refused as non-idle, or an explicit idle
+  compaction return `Busy`, even though that turn had completed.
+- Automatic child-completion delivery is no longer refused when its batch
+  passes the 4,096-character internal-turn limit. Such a batch stayed ready,
+  so one long child reply blocked every later delivery to that parent.
+  Replies are now inlined while they fit `DelegationConfig::delivery_inline_bytes`
+  (default 4,096); a longer reply is delivered as its opening 1,024 bytes plus
+  a reference to a parent-owned copy (purpose `delegation.child-reply`), and
+  a `delegation.child-completion` turn is bounded by
+  `MAX_CHILD_COMPLETION_TURN_CHARS` instead of the general limit.
+- A delivered child outcome now lists the artifacts transferred to the parent
+  (parent id, child source id, media type, size); before, the model was never
+  told they existed.
 
 ## [0.7.0] - 2026-10-18
 
