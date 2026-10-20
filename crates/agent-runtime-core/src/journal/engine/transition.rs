@@ -1493,6 +1493,13 @@ impl Transition {
             retired_at,
         };
         let record = state.sessions.get_mut(session).ok_or_else(conflict)?;
+        // Retirement changes the head without a new revision, so it issues a
+        // writer fence: another engine's control write prepared against the
+        // retired head must fail instead of republishing it.
+        record.last_writer_epoch = record
+            .last_writer_epoch
+            .checked_add(1)
+            .ok_or_else(conflict)?;
         record.current = None;
         record.retirement = Some(retirement.clone());
         record.ordinary_snapshot = None;

@@ -2463,3 +2463,71 @@ async fn a_stale_writer_open_cannot_recertify_a_pin_another_engine_released() {
         );
     }
 }
+
+// Retirement must fence control writes that another engine prepared before
+// it: otherwise a stale pin write republishes the retired head over bodies
+// collection already released, and a warm current read trusts that head.
+#[tokio::test]
+async fn a_stale_control_write_cannot_unretire_a_session_another_engine_collected() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(PausedApply::default());
+        let (reading, collector) = two_engines(&storage, budget);
+        let session = SessionId::new("unretire");
+        let mut known = BTreeSet::new();
+        let lease = reading.open(&session, writer("one")).await.unwrap();
+        let first = reading
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        reading.close(lease).await.unwrap();
+        let first_root = JournalObject::encode(JournalObjectKind::Head, &first)
+            .unwrap()
+            .id;
+        let current = reading.open(&session, reader("current")).await.unwrap();
+        assert!(reading.read(&current, &first_root).await.is_ok());
+        let (resume, paused) = storage.pause_next(JournalWriteKind::Pin);
+        let (_, ()) = tokio::join!(reading.retain_root(&current), async {
+            paused.await.unwrap();
+            collector
+                .authorize_retirement(&session, first.revision, crate::clock::Timestamp(9))
+                .await
+                .unwrap();
+            collector.retire(&session, first.revision).await.unwrap();
+            assert!(sweep(&collector, u64::MAX).await.deleted > 0);
+            resume.send(()).unwrap();
+        });
+        let domain = collector.domain.clone();
+        assert!(
+            reading.read(&current, &first_root).await.is_err(),
+            "budget {budget}: a warm current read served a retired, collected body"
+        );
+        assert!(
+            storage
+                .load(&domain, &session)
+                .await
+                .unwrap()
+                .unwrap()
+                .retirement
+                .is_some(),
+            "budget {budget}: a stale control write lost the retirement"
+        );
+        assert_eq!(
+            storage
+                .objects(&domain, &session, std::slice::from_ref(&first_root))
+                .await
+                .unwrap(),
+            vec![None],
+            "precondition: the retired head lost its last membership"
+        );
+    }
+}
