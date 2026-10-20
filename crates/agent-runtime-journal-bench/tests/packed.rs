@@ -847,3 +847,47 @@ async fn control_generation_is_fenced_across_connections_and_restart() {
     );
     assert_eq!(restarted.pack_write_bytes().unwrap(), meter);
 }
+
+#[tokio::test]
+async fn generation_exhaustion_refuses_without_changes() {
+    let files = Files::new();
+    let path = files.path();
+    let storage = PackedSqliteJournalStorage::open(&path).unwrap();
+    let first = stage(domain(JournalRole::Protected), "s", &[30]);
+    storage.apply(first.clone()).await.unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE session SET generation=? WHERE session='s'",
+            [u64::MAX.to_le_bytes().as_slice()],
+        )
+        .unwrap();
+    let before = storage
+        .load(&first.domain, &first.session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.generation, u64::MAX);
+    let mut exhausted = stage(first.domain.clone(), "s", &[40]);
+    exhausted.expect = before.fence();
+    exhausted.record = before.clone();
+    exhausted.record.generation = 0;
+    let meter = storage.pack_write_bytes().unwrap();
+    assert!(matches!(
+        storage.apply(exhausted).await.unwrap_err().class,
+        agent_runtime_core::error::FailureClass::StateConflict { .. }
+    ));
+    assert_eq!(
+        storage.load(&first.domain, &first.session).await.unwrap(),
+        Some(before)
+    );
+    assert_eq!(
+        storage
+            .members(&first.domain, &first.session)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(storage.pack_write_bytes().unwrap(), meter);
+}
