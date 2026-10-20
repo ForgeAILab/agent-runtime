@@ -38,8 +38,8 @@ use agent_runtime::core::store::{SessionSnapshot, SessionStore};
 use agent_runtime::provider::fake::{FakeProvider, ScriptedStream, usage_event};
 use agent_runtime::registry::RegistryRevision;
 use agent_runtime::runtime::{
-    InjectedContent, InjectionRecovery, InternalTurnAdmission, Runtime, RuntimeBuilder,
-    SessionHandle, StartSession, TurnHandle,
+    InjectedContent, InternalTurnAdmission, Runtime, RuntimeBuilder, SessionHandle, StartSession,
+    TurnHandle,
 };
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -99,6 +99,22 @@ async fn complete(session: &SessionHandle, text: &str) -> Result<(), String> {
         Some(last) if history.len() > before && last.role == Role::Assistant => Ok(()),
         _ => Err(format!("turn `{text}` did not complete: {history:?}")),
     }
+}
+
+/// The fenced session hands back exactly the drained must-deliver item, once.
+fn assert_handed_back_once(session: &SessionHandle, label: &str) {
+    let unresolved = session
+        .take_unresolved_injections()
+        .unwrap_or_else(|| panic!("{label}: the fenced session handed nothing back"));
+    assert_eq!(
+        unresolved.items(),
+        [InjectedContent::text(INJECTION).must_deliver()],
+        "{label}"
+    );
+    assert!(
+        session.take_unresolved_injections().is_none(),
+        "{label}: handed back twice"
+    );
 }
 
 // ---- legacy stores ----
@@ -546,9 +562,7 @@ async fn an_unresolved_native_acceptance_fences_the_session_and_reopen_recovers_
             .unwrap();
         native.protected.arm(fault);
         session.run(UserInput::text("cut turn")).await.unwrap();
-        let unresolved = session
-            .take_unresolved_injections()
-            .expect("the fenced session holds the drained batch");
+        assert_handed_back_once(&session, &format!("{fault:?}"));
 
         assert_eq!(
             count(&session.history(), "cut turn"),
@@ -573,11 +587,6 @@ async fn an_unresolved_native_acceptance_fences_the_session_and_reopen_recovers_
             .start_session(StartSession::resume(id))
             .await
             .unwrap_or_else(|error| panic!("{fault:?}: {error:?}"));
-        assert_eq!(
-            resumed.restore_unresolved_injections(unresolved).unwrap(),
-            InjectionRecovery::AlreadyAccepted,
-            "{fault:?}"
-        );
         complete(&resumed, "after reopen")
             .await
             .unwrap_or_else(|error| panic!("{fault:?}: {error}"));
@@ -637,9 +646,7 @@ async fn lost_legacy_acceptance_acknowledgements_are_resolved_by_reading_back() 
         .unwrap();
     checkpoints.arm(LegacyFault::LostAckUnreadable);
     session.run(UserInput::text("cut turn")).await.unwrap();
-    let unresolved = session
-        .take_unresolved_injections()
-        .expect("the fenced session holds the drained batch");
+    assert_handed_back_once(&session, "legacy lost acknowledgement");
     assert_eq!(
         count(&session.history(), "cut turn"),
         1,
@@ -656,10 +663,6 @@ async fn lost_legacy_acceptance_acknowledgements_are_resolved_by_reading_back() 
         .start_session(StartSession::resume(id))
         .await
         .unwrap();
-    assert_eq!(
-        resumed.restore_unresolved_injections(unresolved).unwrap(),
-        InjectionRecovery::AlreadyAccepted
-    );
     complete(&resumed, "after reopen").await.unwrap();
     let history = resumed.history();
     assert_eq!(count(&history, "cut turn"), 1, "{history:?}");
@@ -830,7 +833,8 @@ async fn every_acceptance_site_rolls_back_a_proven_failure_and_requeues_must_del
         let before = session.history();
         checkpoints.arm(LegacyFault::Rejected);
         start_site_turn(site, &session).completed().await;
-        let rolled_back = session.history() == before;
+        let rolled_back =
+            session.history() == before && session.take_unresolved_injections().is_none();
         session.persist().await.unwrap();
         let heads_agree = checkpoints.stored().state.is_terminal()
             && sessions.history_len() == Some(checkpoints.stored().snapshot.history.len());
@@ -855,17 +859,17 @@ async fn every_acceptance_site_rolls_back_a_proven_failure_and_requeues_must_del
     assert!(failing.is_empty(), "failing sites {failing:?}");
 }
 
-// ---- an unresolved acceptance that did not commit keeps its injections ----
+// ---- an unresolved acceptance hands its drained injections back once ----
 
 /// The acceptance write never landed, but the store cannot prove it (native:
 /// rejected commit, then a failed renew; legacy: rejected save, then a failed
 /// read-back). The fenced session cannot deliver the drained must-deliver
-/// batch and a reopen loads the previous boundary with an empty queue, so
-/// the batch is handed to the host and restored on the reopened session,
-/// which requeues it because its protected head proves the acceptance
-/// absent. It is delivered exactly once, and survives another reopen once.
+/// item and the reopened session recovers the previous boundary without it.
+/// The runtime does not guess: it hands exactly the drained items back to
+/// the host once. Here the host re-injects them, which is right only because
+/// this test knows the acceptance did not land.
 #[tokio::test]
-async fn an_unresolved_acceptance_that_did_not_commit_restores_its_injections_once() {
+async fn an_unresolved_acceptance_hands_back_its_drained_injections_once() {
     // Native, direct user turn.
     let native = Native::new("reject-renew-fails");
     let id = SessionId::new("failed-acceptance-reject-renew-fails");
@@ -882,8 +886,12 @@ async fn an_unresolved_acceptance_that_did_not_commit_restores_its_injections_on
     session.run(UserInput::text("cut turn")).await.unwrap();
     let unresolved = session
         .take_unresolved_injections()
-        .expect("the fenced session holds the drained batch");
-    assert_eq!(unresolved.len(), 1);
+        .expect("the fenced session hands the drained items back");
+    assert_eq!(
+        unresolved.items(),
+        [InjectedContent::text(INJECTION).must_deliver()]
+    );
+    assert!(session.take_unresolved_injections().is_none());
     assert!(
         session.persist().await.is_err(),
         "a fenced session published"
@@ -896,21 +904,13 @@ async fn an_unresolved_acceptance_that_did_not_commit_restores_its_injections_on
         .await
         .unwrap();
     assert_eq!(count(&resumed.history(), INJECTION), 0);
-    assert_eq!(
-        resumed.restore_unresolved_injections(unresolved).unwrap(),
-        InjectionRecovery::Requeued { items: 1 }
-    );
+    for item in unresolved.into_items() {
+        resumed.inject(item).unwrap();
+    }
     complete(&resumed, "after reopen").await.unwrap();
     assert_eq!(count(&resumed.history(), INJECTION), 1);
     assert_eq!(count(&resumed.history(), "cut turn"), 0);
     resumed.shutdown().await.unwrap();
-    let again = native
-        .runtime(replies(1))
-        .start_session(StartSession::resume(id))
-        .await
-        .unwrap();
-    assert_eq!(count(&again.history(), INJECTION), 1);
-    again.shutdown().await.unwrap();
 
     // Legacy, every acceptance site.
     let mut failing = Vec::new();
@@ -928,25 +928,19 @@ async fn an_unresolved_acceptance_that_did_not_commit_restores_its_injections_on
             .unwrap();
         checkpoints.arm(LegacyFault::RejectedUnreadable);
         start_site_turn(site, &session).completed().await;
-        let unresolved = session.take_unresolved_injections();
+        let first = session.take_unresolved_injections();
+        let second = session.take_unresolved_injections();
         let fenced = session.persist().await.is_err();
         let _ = session.shutdown().await;
-        let resumed = site_runtime(site, &sessions, &checkpoints)
-            .start_session(StartSession::resume(id))
-            .await
-            .unwrap();
-        let recovery = unresolved.map(|batch| resumed.restore_unresolved_injections(batch));
-        let next = complete(&resumed, "after reopen").await;
-        let delivered = count(&resumed.history(), INJECTION);
-        resumed.shutdown().await.unwrap();
+        let handed_back = first.as_ref().map(|batch| batch.items().to_vec());
         println!(
-            "UNRESOLVED-NOT-COMMITTED {site:?} fenced={fenced} recovery={recovery:?} \
-             next={next:?} delivered={delivered}"
+            "UNRESOLVED-HAND-BACK {site:?} fenced={fenced} first={} second={}",
+            handed_back.as_ref().map_or(0, Vec::len),
+            second.is_some()
         );
         if !fenced
-            || !matches!(recovery, Some(Ok(InjectionRecovery::Requeued { items: 1 })))
-            || next.is_err()
-            || delivered != 1
+            || handed_back != Some(vec![InjectedContent::text(INJECTION).must_deliver()])
+            || second.is_some()
         {
             failing.push(format!("{site:?}"));
         }

@@ -88,50 +88,21 @@ impl SessionHandle {
             .push(content)
     }
 
-    /// Takes the injected content drained for a turn whose acceptance
-    /// checkpoint failed with an outcome the protected store could not prove.
+    /// Hands back, once, the injected content this session drained for a
+    /// turn whose acceptance checkpoint failed with an outcome the protected
+    /// store could not prove. Later calls return `None`, as does a session
+    /// with no such turn.
     ///
-    /// Such a session is fenced (it publishes nothing more), so it can never
-    /// deliver that batch. Reopen the session and pass the batch to
-    /// [`Self::restore_unresolved_injections`] on the reopened handle. The
-    /// queue is process-local: a batch not restored before the process exits
-    /// is lost, like any content still queued when its session ends.
+    /// Such a session is fenced: it publishes nothing more and cannot deliver
+    /// the items. What the host knows is only that the acceptance outcome is
+    /// unknown. If it committed, the reopened session's recovered history
+    /// already holds the items and re-injecting them delivers them twice; if
+    /// it did not, they are in no store and dropping them loses them. The
+    /// runtime makes no exactly-once promise across an unresolved acceptance,
+    /// as with content still queued when a process crashes; the returned turn
+    /// id is information only and decides nothing.
     pub fn take_unresolved_injections(&self) -> Option<UnresolvedInjections> {
         self.inner.execution.take_unresolved_injections()
-    }
-
-    /// Restores a batch taken from a fenced session with
-    /// [`Self::take_unresolved_injections`], exactly once.
-    ///
-    /// If this session opened over the batch's own turn, that acceptance
-    /// committed and the recovered history already holds the batch; nothing
-    /// is requeued. Otherwise the acceptance is absent and the batch goes back
-    /// to the front of the queue for the next turn. Call it on the reopened
-    /// session; a fenced session refuses it.
-    pub fn restore_unresolved_injections(
-        &self,
-        batch: UnresolvedInjections,
-    ) -> Result<InjectionRecovery, RuntimeError> {
-        if batch.session != self.inner.id {
-            return Err(RuntimeError::conflict(
-                "unresolved injections belong to another session",
-            ));
-        }
-        if self.inner.execution.persistence.is_fenced() {
-            return Err(RuntimeError::conflict(
-                "a fenced session cannot restore unresolved injections; reopen it first",
-            ));
-        }
-        if self.inner.opened_head_turn.as_ref() == Some(&batch.turn) {
-            return Ok(InjectionRecovery::AlreadyAccepted);
-        }
-        let items = batch.items.len();
-        self.inner
-            .inbox
-            .lock()
-            .expect("session inbox poisoned")
-            .restore_front(batch.items);
-        Ok(InjectionRecovery::Requeued { items })
     }
 
     /// Subscribes to events emitted after this call. Multiple concurrent

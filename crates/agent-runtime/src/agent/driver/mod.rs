@@ -858,9 +858,9 @@ impl Driver {
     /// the staged messages enter live history; session persistence is
     /// already fenced, and a reopen recovers whichever boundary the
     /// protected store holds. The drained injections cannot be delivered by
-    /// the fenced session, so they are held for the host
-    /// (`SessionHandle::take_unresolved_injections`), which restores them on
-    /// the reopened session exactly when that acceptance proves absent.
+    /// the fenced session; they are held and handed back to the host once
+    /// (`SessionHandle::take_unresolved_injections`), which alone decides
+    /// what to do with them because the acceptance outcome is unknown.
     #[allow(clippy::too_many_arguments)]
     fn settle_failed_acceptance(
         &self,
@@ -868,7 +868,6 @@ impl Driver {
         state: &Arc<Mutex<SessionState>>,
         inbox: &Arc<Mutex<InjectionQueue>>,
         execution: &SessionExecutionContext,
-        session: &agent_runtime_core::ids::SessionId,
         turn: &TurnId,
         staged: Vec<Message>,
         injected: Vec<InjectedContent>,
@@ -884,7 +883,6 @@ impl Driver {
             AcceptanceSaveError::Unresolved(error) => {
                 self.publish_accepted(state, staged);
                 execution.hold_unresolved_injections(UnresolvedInjections {
-                    session: session.clone(),
                     turn: turn.clone(),
                     items: injected,
                 });

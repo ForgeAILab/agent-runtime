@@ -42,9 +42,7 @@ use crate::harness::{
 use crate::ids::IdMinter;
 use crate::runtime::emitter::{CacheEventBatch, EventEmitter, RuntimeEventStream};
 use crate::runtime::engine::{ActiveSessionLease, RuntimeShared};
-use crate::runtime::inject::{
-    InjectedContent, InjectionQueue, InjectionRecovery, UnresolvedInjections,
-};
+use crate::runtime::inject::{InjectedContent, InjectionQueue, UnresolvedInjections};
 use crate::runtime::state::{SessionExecutionContext, SessionState};
 use crate::runtime::steer::SteerMailbox;
 
@@ -116,9 +114,6 @@ pub struct SessionInner {
     pub(crate) resumed: bool,
     /// Startup interrupted this turn after re-authorizing changed abilities.
     pub(crate) interrupted_on_resume: Option<TurnId>,
-    /// The turn of the protected head this session opened over. Restoring an
-    /// unresolved injection batch compares it with the batch's turn.
-    pub(crate) opened_head_turn: Option<TurnId>,
     /// Volatile LCM timeline of an ephemeral session, released on drop.
     pub(crate) _ephemeral_lcm: Option<crate::harness::EphemeralLcmGuard>,
 }

@@ -1448,10 +1448,6 @@ impl Runtime {
         ))
         .await?;
         let persistence = opened_persistence.persistence;
-        let opened_head_turn = opened_persistence
-            .checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.turn.clone());
         let startup_persistence = persistence.clone();
         // Boxed: this body is ~30 KB as a future, and every session start and
         // child spawn awaits it; inline, debug builds overflow 2 MiB stacks.
@@ -1802,7 +1798,6 @@ impl Runtime {
             recovery_deferred,
             resumed,
             interrupted_on_resume: interrupted_on_resume.clone(),
-            opened_head_turn,
             _ephemeral_lcm: ephemeral_lcm,
         });
 

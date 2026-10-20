@@ -548,11 +548,6 @@ impl SessionPersistence {
         }
     }
 
-    /// Whether an unresolved acceptance fenced this session's persistence.
-    pub(crate) fn is_fenced(&self) -> bool {
-        self.fenced.load(Ordering::Acquire)
-    }
-
     fn ensure_not_fenced(&self) -> Result<(), RuntimeError> {
         if self.fenced.load(Ordering::Acquire) {
             return Err(RuntimeError::conflict(

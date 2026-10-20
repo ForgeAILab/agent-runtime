@@ -7,62 +7,53 @@
 //! accepted and never dropped.
 //!
 //! The queue is process-local: content still queued when its session ends
-//! (shutdown, drop or a process crash) is not persisted. A turn drains the
-//! queue at its acceptance boundary; if that acceptance checkpoint's outcome
-//! cannot be proven, the session is fenced and the drained batch is handed to
-//! the host as [`UnresolvedInjections`] so a reopened session can restore it
-//! exactly once (see `SessionHandle::restore_unresolved_injections`).
+//! (shutdown, drop or a process crash) is not persisted.
+//!
+//! A turn drains the queue at its acceptance boundary. If that acceptance
+//! checkpoint fails and the protected store proves it absent, the drained
+//! content returns to the front of the queue. If the store cannot prove the
+//! outcome, the session is fenced and the drained content is handed back to
+//! the host once, as [`UnresolvedInjections`]
+//! (`SessionHandle::take_unresolved_injections`). The runtime does not know
+//! whether that acceptance landed, and neither does the host: re-injecting
+//! the items into the reopened session delivers them twice if it did, and
+//! dropping them loses them if it did not. The runtime makes no exactly-once
+//! promise across an unresolved acceptance, just as it makes none for
+//! content queued when a process crashes.
 
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::error::RuntimeError;
-use agent_runtime_core::ids::{SessionId, TurnId};
+use agent_runtime_core::ids::TurnId;
 
-/// Injected content drained for a turn whose acceptance checkpoint failed
-/// with an outcome the protected store could not prove. The session that
-/// owned it is fenced; restore it on the reopened session with
-/// `SessionHandle::restore_unresolved_injections`. It is deliberately not
-/// `Clone`: restoring consumes it, which keeps delivery exactly once.
-#[derive(Debug, PartialEq)]
+/// Injected content a fenced session drained for a turn whose acceptance
+/// checkpoint has an unknown outcome, handed back to the host once.
+///
+/// The acceptance may or may not have committed; the runtime cannot tell.
+/// Re-injecting the items into the reopened session delivers them twice if
+/// it did; dropping them loses them if it did not. What to do is the host's
+/// decision (see the module documentation).
+#[derive(Debug, Clone, PartialEq)]
 pub struct UnresolvedInjections {
-    pub(crate) session: SessionId,
     pub(crate) turn: TurnId,
     pub(crate) items: Vec<InjectedContent>,
 }
 
 impl UnresolvedInjections {
-    /// The session the batch was drained from.
-    pub fn session(&self) -> &SessionId {
-        &self.session
-    }
-
-    /// The turn whose acceptance outcome is unknown.
+    /// The turn the items were drained for, as information only: it does not
+    /// say whether that turn's acceptance committed.
     pub fn turn(&self) -> &TurnId {
         &self.turn
     }
 
-    /// The number of injected items in the batch.
-    pub fn len(&self) -> usize {
-        self.items.len()
+    /// The drained items, in drain order.
+    pub fn items(&self) -> &[InjectedContent] {
+        &self.items
     }
 
-    /// Whether the batch holds no items.
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+    /// Takes the drained items.
+    pub fn into_items(self) -> Vec<InjectedContent> {
+        self.items
     }
-}
-
-/// What restoring an [`UnresolvedInjections`] batch did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InjectionRecovery {
-    /// The reopened protected head is the batch's own turn: its acceptance
-    /// committed, and the recovered history already holds the batch.
-    AlreadyAccepted,
-    /// The acceptance is absent from the reopened protected head: the batch
-    /// went back to the front of the queue for the next turn.
-    Requeued {
-        /// The number of items requeued.
-        items: usize,
-    },
 }
 
 /// Host-enqueued content introduced at the next safe boundary.
