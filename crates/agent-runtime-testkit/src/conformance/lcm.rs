@@ -14,16 +14,16 @@ use agent_runtime_lcm::planning::{LcmSizer, source_fingerprint_entries, source_f
 use agent_runtime_lcm::projection::project_active_context_with_suffix;
 use agent_runtime_lcm::{
     AppendResult, CharRatioSizer, CommitResult, CompactionMode, CondensationCommit,
-    ContentGuardRevision, EscalationLevel, ExpansionItem, ExpansionRequest, Fingerprint,
-    InMemoryLcmStore, LcmAppendRequest, LcmCandidateContent, LcmClassification, LcmEntry,
-    LcmEntryId, LcmError, LcmEscalatingSummarizer, LcmEscalationPolicy, LcmNode, LcmNodeId,
-    LcmOperationFingerprint, LcmOperationId, LcmPointerAnnotation, LcmPressureDecision,
+    CondensationMode, ContentGuardRevision, EscalationLevel, ExpansionItem, ExpansionRequest,
+    Fingerprint, InMemoryLcmStore, LcmAppendRequest, LcmCandidateContent, LcmClassification,
+    LcmEntry, LcmEntryId, LcmError, LcmEscalatingSummarizer, LcmEscalationPolicy, LcmNode,
+    LcmNodeId, LcmOperationFingerprint, LcmOperationId, LcmPointerAnnotation, LcmPressureDecision,
     LcmPressurePolicy, LcmRange, LcmReader, LcmRevision, LcmSequence, LcmSourceMetadata,
     LcmSummaryError, LcmSummaryModel, LcmSummaryModelRequest, LcmSummaryModelResponse,
     LcmTimelineId, LcmView, LcmViewAuthority, LcmWriter, LeafCommit, ProjectionItem,
     RegistryRevision, Sensitivity, SummaryProvenance, TrustClass, decide_pressure,
-    plan_condensations, plan_leaf_with_frontier, project_active_context, select_tool_safe_blocks,
-    tool_exchange_blocks,
+    plan_condensations, plan_leaf_with_frontier, project_active_context, select_condensation_group,
+    select_tool_safe_blocks, tool_exchange_blocks,
 };
 
 /// A deterministic summary-model fake for consumer conformance tests.
@@ -1382,6 +1382,25 @@ pub async fn assert_planning_pressure_and_classification_conformance() {
         .await
         .expect("node b")
         .node;
+    // Explicit child sets retain their CAS planning contract regardless of
+    // runtime scheduling. Two peers are not a full tier at fanout four, but
+    // admitted pressure may compact them; host stores must support both.
+    let children = [node_a.clone(), node_b.clone()];
+    assert_eq!(
+        select_condensation_group(&children, 4, CondensationMode::Structural)
+            .expect("structural selection"),
+        None
+    );
+    assert_eq!(
+        select_condensation_group(&children, 4, CondensationMode::Pressure)
+            .expect("pressure selection"),
+        Some(children.as_slice())
+    );
+    assert_eq!(
+        select_condensation_group(&children, 2, CondensationMode::Structural)
+            .expect("full tier selection"),
+        Some(children.as_slice())
+    );
     let plan = plan_condensations(
         &[node_a.clone(), node_b.clone()],
         2,

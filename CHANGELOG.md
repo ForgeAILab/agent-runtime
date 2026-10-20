@@ -73,6 +73,17 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
+- LCM condensation now carries the newest full covered-entry size tier
+  instead of triggering on active-node count. Without token pressure, depth
+  stays logarithmic while the frontier can retain about `fanout - 1` summaries
+  per tier, using more context than a frontier capped at fanout. Existing
+  soft/hard pressure thresholds still bound context: after leaf compaction
+  cannot relieve pressure, condensation can merge a smaller tier or the
+  smallest adjacent pair. Pending operations reproduce the admitted pressure
+  mode on resume without a new persisted field; older algorithm responses
+  retain source-identity validation. Existing nodes and explicit-child-set
+  condensation planning retain their contracts.
+
 - Retired native sessions now reject read-only latest-root opens as an explicit
   conflict, including after collection. Runtime views check the journal before
   loading legacy records, so imported sessions cannot fall back to their stale
