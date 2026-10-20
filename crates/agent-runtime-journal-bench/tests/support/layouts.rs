@@ -58,6 +58,9 @@ pub(crate) struct ManifestClosure {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct Report {
+    pub(crate) collection_schedule: &'static str,
+    pub(crate) cumulative_pack_bytes_written: u64,
+    pub(crate) maintenance: fixture::Maintenance,
     pub(crate) fixture: String,
     pub(crate) n: usize,
     pub(crate) tools: bool,
@@ -589,6 +592,13 @@ pub(crate) fn measure(root: &Path, fixture: fixture::Fixture) -> Report {
     let s5_delta = if fixture.name == "C" { 795_978 } else { 0 };
     let projected = fixture.packed_after.physical_bytes;
     Report {
+        collection_schedule: if fixture.per_turn_collection {
+            "every_turn"
+        } else {
+            "end"
+        },
+        cumulative_pack_bytes_written: fixture.cumulative_pack_bytes_written,
+        maintenance: fixture.maintenance,
         retained_operations_before: fixture
             .before
             .iter()

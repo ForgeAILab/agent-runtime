@@ -1,6 +1,7 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T01:19:53Z
+updated_at: 2026-10-20T03:38:23Z
+completed_at: 2026-10-20T03:38:23Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -131,14 +132,29 @@ N5 requires retaining it. Regression and byte-count evidence is recorded in
   on, and connection restart), including transactional pruning of operation
   packs and preservation of the current writer epoch’s last operation. D8.6 records the explicit inclusive-edge/last-operation owner
   instruction; CHANGELOG has the owner-approved pre-1.0 Breaking entry.
-- [ ] 4.5 Gate: record native/L2 at N=4000 for B (and A, C). If B ≤ 2.0× and
+- [x] 4.5 Gate: record native/L2 at N=4000 for B (and A, C). If B ≤ 2.0× and
   the owner did not require more (Q2), group 5 is skipped.
 
-4.5 final-source evidence: A/N=4000 plain/tool = 5.32000× / 5.21569× L2;
-B/N=4000 = 1.49096× / 1.62353×. C/N=1000/tool = 1.02174×;
-4,002 → 130 operation results after collection. C/N=4000 remains NOT MET: supplement exceeded the reserved measurement time. All 13 primary cases pass.
-Raw JSON: `/Volumes/Data/tmp/refactor/rt-e6/measurements.json`. B passes
-≤2.0× L2, so 5.1–5.4 are not built. B/tool misses only the optional 1.5× aim.
+4.5 step-7 evidence (Q4-aligned source): B/N=4000 passes the required **≤2.0× L2** gate: collect-at-end = **1.60542× plain / 1.79118× tool**; per-turn = **1.60542× plain / 1.79118× tool**. All four miss the optional 1.5× aim. Group 5 stays unbuilt; journal schema 4 is unchanged.
+
+| Fixture | N | Turn | L2 bytes | Final bytes | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| B | 1000 | plain | 335872 | 577536 | 1.71951 | 845627 | 33297 |
+| B | 1000 | tool | 339968 | 622592 | 1.83133 | 1491335 | 288771 |
+| B | 4000 | plain | 1359872 | 2183168 | 1.60542 | 3057083 | 313815 |
+| B | 4000 | tool | 1392640 | 2494464 | 1.79118 | 3540392 | 323123 |
+| C | 1000 | tool | 942080 | 1204224 | 1.27826 | 144922993 | 368800 |
+
+Cumulative per-turn B pack writes grow **3.615× plain / 2.374× tool** when seeded N grows 4× (1000 → 4000). C/1000 contributes 250 turn samples in the raw JSON. **Write verdict: O(N) in admitted bytes for these bounded turn shapes; no O(N²) whole-history pack rewrites.** Fixed 1 MiB packs bound merge tiers; stable large packs stay sealed. At a 25% dead threshold, survivor rewrites are charged to at most three live bytes per dead byte. Replay-window maintenance is bounded. This verdict concerns pack payload/nonce writes; the chosen metric excludes metadata, SQLite page overhead and VACUUM.
+
+Supplemental C/N=4000, collection at the end (one release run):
+
+| Fixture | N | Turn | L2 bytes | Final bytes | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| C | 4000 | tool | 3977216 | 4886528 | 1.22863 | 487612606 | 9208323 |
+
+Its native/L2 ratio is 1.22863×. It is reported without gating.
+Raw JSON: `/Volumes/Data/tmp/refactor/rt-e7/measurements.json`.
 
 ## 5. R7 format levers (gate: only if 4.5 fails or Q2 requires them)
 
@@ -194,3 +210,16 @@ Raw JSON: `/Volumes/Data/tmp/refactor/rt-e6/measurements.json`. B passes
   conformance, harness commands, measured tables) and the CHANGELOG
   `Unreleased` entries from design D12. Record final verification evidence in
   `design.md`.
+
+## 8. Q4 alignment and bounded rewrites (step 7 owner instruction)
+
+- [x] 8.1 Declare additive Global/PerSession physical sharing; align D2,
+  storage docs and release notes with Q4. Default Global preserves adapters.
+- [x] 8.2 Allow bounded deferred deletion below a 25% dead-byte share; hide
+  released memberships immediately and account at physical removal.
+- [x] 8.3 Parameterize storage conformance by sharing; run volatile in both
+  modes and reject premature shared deletion and serving dead bytes.
+- [x] 8.4 Make packed admission/session indexes independent across sessions;
+  cap packs at 1 MiB, bound base merges and enforce dead-byte threshold.
+- [x] 8.5 Measure collect-at-end and per-turn collection; record final bytes,
+  L2 ratio, cumulative pack writes and largest collection write in D8.4/4.5.

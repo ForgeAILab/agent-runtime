@@ -2,8 +2,10 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
-// Bodies live in immutable COW layers, shared by all domains and sessions.
+// Bodies live in immutable COW layers, keyed by the configured sharing scope.
 type Bodies = BTreeMap<JournalObjectId, Arc<[u8]>>;
+type BodyKey = (Option<SessionId>, JournalObjectId);
+type ScopedBodies = BTreeMap<BodyKey, Arc<[u8]>>;
 type DomainKey = (String, u8);
 type SessionKey = (DomainKey, SessionId);
 
@@ -16,25 +18,25 @@ fn session_key(domain: &JournalDomain, session: &SessionId) -> SessionKey {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StoredState {
-    layers: Vec<Arc<Bodies>>,
+    layers: Vec<Arc<ScopedBodies>>,
     records: BTreeMap<SessionKey, JournalSessionRecord>,
     members: BTreeMap<SessionKey, Arc<BTreeSet<JournalObjectId>>>,
-    references: Arc<BTreeMap<JournalObjectId, usize>>,
+    references: Arc<BTreeMap<BodyKey, usize>>,
     operations: BTreeMap<(SessionKey, JournalOperationId), JournalOperationRecord>,
     pins: BTreeMap<(SessionKey, JournalPinId), JournalPinRecord>,
     catalog: BTreeMap<(SessionKey, JournalObjectId), JournalCatalogEntry>,
 }
 impl StoredState {
-    fn object(&self, id: &JournalObjectId) -> Option<&Arc<[u8]>> {
+    fn object(&self, id: &BodyKey) -> Option<&Arc<[u8]>> {
         self.layers.iter().rev().find_map(|layer| layer.get(id))
     }
-    fn entries(&self) -> Bodies {
+    fn entries(&self) -> ScopedBodies {
         self.layers
             .iter()
             .flat_map(|l| l.iter().map(|(id, b)| (id.clone(), b.clone())))
             .collect()
     }
-    fn add_layer(&mut self, objects: Bodies) {
+    fn add_layer(&mut self, objects: ScopedBodies) {
         if objects.is_empty() {
             return;
         }
@@ -59,6 +61,7 @@ impl StoredState {
 #[derive(Clone, Default)]
 pub struct VolatileJournalStorage {
     state: Arc<Mutex<StoredState>>,
+    sharing: JournalBodySharing,
 }
 impl fmt::Debug for VolatileJournalStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,11 +70,25 @@ impl fmt::Debug for VolatileJournalStorage {
     }
 }
 impl VolatileJournalStorage {
+    /// Choose physical sharing; the default remains Global for compatibility.
+    pub fn new(sharing: JournalBodySharing) -> Self {
+        Self {
+            sharing,
+            ..Default::default()
+        }
+    }
+    fn body_key(&self, session: &SessionId, id: &JournalObjectId) -> BodyKey {
+        (
+            (self.sharing == JournalBodySharing::PerSession).then(|| session.clone()),
+            id.clone(),
+        )
+    }
     fn admit(
+        &self,
         staged: &mut StoredState,
         key: &SessionKey,
         object: &JournalStoredObject,
-        added: &mut Bodies,
+        added: &mut ScopedBodies,
     ) -> Result<(), RuntimeError> {
         let encoded = JournalObject {
             id: object.id.clone(),
@@ -80,16 +97,21 @@ impl VolatileJournalStorage {
         if encoded.kind()? != object.kind {
             return Err(conflict());
         }
-        if let Some(bytes) = staged.object(&object.id) {
+        let body_key = self.body_key(&key.1, &object.id);
+        if let Some(bytes) = staged.object(&body_key) {
             if bytes.as_ref() != object.bytes.as_ref() {
                 return Err(conflict());
             }
         } else {
-            added.insert(object.id.clone(), object.bytes.clone());
+            let bytes = match self.sharing {
+                JournalBodySharing::Global => object.bytes.clone(),
+                JournalBodySharing::PerSession => Arc::from(object.bytes.as_ref()),
+            };
+            added.insert(body_key.clone(), bytes);
         }
         if Arc::make_mut(staged.members.entry(key.clone()).or_default()).insert(object.id.clone()) {
             *Arc::make_mut(&mut staged.references)
-                .entry(object.id.clone())
+                .entry(body_key)
                 .or_default() += 1;
         }
         Ok(())
@@ -105,19 +127,21 @@ impl VolatileJournalStorage {
     ) -> Result<Bodies, RuntimeError> {
         let state = self.lock()?;
         let key = domain_key(domain);
-        let ids: BTreeSet<_> = state
+        state
             .members
             .iter()
             .filter(|((d, _), _)| d == &key)
-            .flat_map(|(_, ids)| ids.iter().cloned())
-            .collect();
-        ids.into_iter()
-            .map(|id| {
-                let bytes = state.object(&id).cloned().ok_or_else(conflict)?;
-                Ok((id, bytes))
+            .flat_map(|((_, session), ids)| ids.iter().map(move |id| (session, id)))
+            .map(|(session, id)| {
+                let bytes = state
+                    .object(&self.body_key(session, id))
+                    .cloned()
+                    .ok_or_else(conflict)?;
+                Ok((id.clone(), bytes))
             })
             .collect()
     }
+
     // Preserve the physical layer view used by the original reference tests.
     #[cfg(test)]
     pub(in crate::journal) fn domain_object_store(
@@ -134,10 +158,20 @@ impl VolatileJournalStorage {
             .collect();
         let bytes = ids
             .iter()
-            .map(|id| state.object(id).ok_or_else(conflict).map(|b| b.len()))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .sum();
+            .map(|id| {
+                state
+                    .layers
+                    .iter()
+                    .rev()
+                    .find_map(|layer| {
+                        layer
+                            .iter()
+                            .find(|((_, candidate), _)| candidate == id)
+                            .map(|(_, body)| body.len())
+                    })
+                    .ok_or_else(conflict)
+            })
+            .sum::<Result<usize, _>>()?;
         let layers = state
             .layers
             .iter()
@@ -145,8 +179,8 @@ impl VolatileJournalStorage {
                 Arc::new(
                     layer
                         .iter()
-                        .filter(|(id, _)| ids.contains(*id))
-                        .map(|(id, b)| (id.clone(), Arc::new(b.to_vec())))
+                        .filter(|((_, id), _)| ids.contains(id))
+                        .map(|((_, id), b)| (id.clone(), Arc::new(b.to_vec())))
                         .collect(),
                 )
             })
@@ -162,6 +196,9 @@ impl VolatileJournalStorage {
 
 #[async_trait]
 impl JournalStorage for VolatileJournalStorage {
+    fn sharing(&self) -> JournalBodySharing {
+        self.sharing
+    }
     async fn load(
         &self,
         domain: &JournalDomain,
@@ -186,7 +223,7 @@ impl JournalStorage for VolatileJournalStorage {
             .map(|id| {
                 members
                     .filter(|m| m.contains(id))
-                    .and_then(|_| state.object(id))
+                    .and_then(|_| state.object(&self.body_key(session, id)))
                     .cloned()
             })
             .collect())
@@ -292,7 +329,7 @@ impl JournalStorage for VolatileJournalStorage {
         .into_iter()
         .enumerate()
         {
-            let mut added = Bodies::new();
+            let mut added = ScopedBodies::new();
             for object in write
                 .objects
                 .objects
@@ -304,7 +341,7 @@ impl JournalStorage for VolatileJournalStorage {
                     _ => step == 0,
                 })
             {
-                Self::admit(&mut staged, &key, object, &mut added)?;
+                self.admit(&mut staged, &key, object, &mut added)?;
             }
             staged.add_layer(added);
             fail(cut)?;
@@ -332,14 +369,14 @@ impl JournalStorage for VolatileJournalStorage {
             }
         }
         fail(JournalCommitFailurePoint::AfterPin)?;
-        let mut added = Bodies::new();
+        let mut added = ScopedBodies::new();
         for object in write
             .objects
             .objects
             .iter()
             .filter(|object| object.kind == JournalObjectKind::Head)
         {
-            Self::admit(&mut staged, &key, object, &mut added)?;
+            self.admit(&mut staged, &key, object, &mut added)?;
         }
         staged.add_layer(added);
         if let Some(record) = write.record {
@@ -379,12 +416,13 @@ impl JournalStorage for VolatileJournalStorage {
                 .get_mut(&key)
                 .is_some_and(|m| Arc::make_mut(m).remove(&id))
             {
+                let body_key = self.body_key(&write.session, &id);
                 let references = Arc::make_mut(&mut staged.references);
-                let count = references.get_mut(&id).ok_or_else(conflict)?;
+                let count = references.get_mut(&body_key).ok_or_else(conflict)?;
                 *count -= 1;
                 if *count == 0 {
-                    references.remove(&id);
-                    deleted.insert(id);
+                    references.remove(&body_key);
+                    deleted.insert(body_key);
                 }
             }
         }
@@ -616,7 +654,14 @@ mod tests {
             transaction.catalog.clear();
             transaction.release = vec![id.clone()];
             storage.apply(transaction).await.unwrap();
-            assert_eq!(storage.lock().unwrap().object(&id).is_some(), index < 2);
+            assert_eq!(
+                storage
+                    .lock()
+                    .unwrap()
+                    .object(&storage.body_key(&protected.session, &id))
+                    .is_some(),
+                index < 2
+            );
             if index < 2 {
                 assert!(
                     storage

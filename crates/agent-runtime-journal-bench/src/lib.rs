@@ -4,7 +4,7 @@ mod codec;
 mod metadata;
 mod packed;
 use agent_runtime_core::error::{FailureClass, FailureComponent, FailureStage, RuntimeError};
-pub use packed::{PackedSqliteConfig, PackedSqliteJournalStorage};
+pub use packed::{LOGICAL_PACK_CAP, PackedSqliteConfig, PackedSqliteJournalStorage};
 fn conflict() -> RuntimeError {
     RuntimeError::conflict("packed journal conflict").with_class(FailureClass::StateConflict {
         stage: FailureStage::PreProvider,

@@ -576,7 +576,8 @@ pub struct JournalGcRequest {
     pub storage_id: JournalStorageId,
     /// Mark/deletion root-and-pin epoch, rechecked transactionally.
     pub expected_root_epoch: u64,
-    /// Host-chosen upper bound on objects to delete during this operation.
+    /// Host-chosen upper bound on memberships released during this operation.
+    /// Pack rewrites may also remove bodies released by earlier collections.
     pub max_objects: u64,
 }
 
@@ -587,9 +588,10 @@ pub struct JournalGcReport {
     pub root_epoch: u64,
     /// Number of objects examined.
     pub examined: u64,
-    /// Number of unreachable objects deleted.
+    /// Number of physical body copies deleted, including deferred dead bodies.
     pub deleted: u64,
-    /// Logical encoded bytes reclaimed, not physical backend amplification.
+    /// Canonical encoded body bytes physically removed; excludes compression
+    /// and backend amplification. Deferred bodies count at physical removal.
     pub reclaimed_bytes: u64,
 }
 

@@ -43,7 +43,7 @@ physical bytes. Temporary SQLite files are removed when the fixture is dropped.
 
 - `session`: domain/session key, revision, writer epoch, dirty flag, sealed
   lossless record, including head, tombstone and opaque versioned engine bytes.
-- `pack`: one final sealed zstd object pack per nonempty write, a session owner
+- `pack`: bounded sealed zstd object packs per write, a session owner
   hint and a rowid. Bodies are globally deduplicated, including across sessions.
 - `membership`: the per-domain/session pack directory. Each row holds one
   bitmap indexed by that pack's prefix-directory slot; an index on `pack_id`
@@ -63,8 +63,10 @@ Object pack v1 is `JRPACK\0`, version byte, little-endian u32 count, a sorted
 four-byte prefix directory with varint body offsets/lengths, then canonical
 bodies ordered by kind and full id. Prefix collisions are resolved by hashing
 candidate bytes and comparing the complete content address. No shortened id
-is read authority. An in-memory full-id map is rebuilt from packs on restart;
-there is no per-object SQL row/index. Other connections' commits invalidate
+is read authority. Full-id maps are built lazily per requested session, using `pack.owner`;
+opening storage and metadata reads decode no body packs. Admission deduplicates
+within a session only (`JournalBodySharing::PerSession`); there is no global
+body index or per-object SQL row/index. Other connections' commits invalidate
 caches through SQLite's `data_version`; write fences are checked after
 `BEGIN IMMEDIATE`.
 
@@ -76,26 +78,39 @@ blob values, so replacing them with equal-length ciphertext would not change
 file sizes. Debug/errors redact stored data.
 
 Each apply executes ordinary objects, checkpoint, batch, pins/catalog, head
-and session record, operation record, and commit in order. It progressively
-updates the same transaction-local pack row to preserve the seven injected
-cut points. All pre-commit cuts roll back; `AfterCommit` loses only the
-acknowledgement. A duplicate id with different bytes conflicts.
+and session record, operation record, and commit in order. Admission splits
+at those cut points into sealed packs of at most **1 MiB canonical body bytes**,
+including imports; an individual object larger than that is rejected atomically.
+All pre-commit cuts roll back; `AfterCommit` loses only the acknowledgement.
+Duplicate ids with different bytes conflict within the session sharing scope.
+Operation packs also have a 1 MiB serialized-record cap; full segments stop
+participating in binary carry.
 
-Final membership release removes canonical bytes from the actual pack in the
-same transaction, rewriting a partially live pack or deleting an empty one.
-Receipts count each globally absent body once, with its original input byte
-length; dropping a shared membership returns zero. This immediate purge also
-runs when session repacking is disabled.
+Membership release immediately stops reads through that membership. Dead bytes
+may remain in sealed packs below **25% of canonical body bytes**; the apply
+reaching that threshold rewrites the pack and reports the bodies physically
+removed. This bound applies with repacking on or off. Retired-session collection
+forces a purge of all dead bytes; other sessions' copies remain independent.
+Receipts retain the canonical encoded-byte unit, before compression/sealing.
+The optional storage `retained_bytes(domain)` diagnostic includes deferred
+bodies, preserving the existing GC byte-evidence comparisons.
 
-Collection additionally merges the target session's packs into one
-kind-ordered base. `post_terminal(session)` is an explicit host hook: it
-geometrically merges packs of equal logical-byte size tiers (minimum 4 KiB),
-without guessing liveness or releasing membership. Both paths move all holders'
-bitmaps, including other sessions sharing a selected pack. Merge work is
-logarithmic as tiers grow; immediate physical purges may additionally rewrite
-survivors during partial collection. The harness calls the hook after terminal
-turns and performs its first full engine collection only after the before
-measurement. No production runtime hook was changed.
+Base repack merges only packs smaller than **64 KiB** and packs already purged
+by that collection, partitioning outputs under the 1 MiB cap. Stable large packs
+stay sealed. Packs with deferred dead bytes also stay sealed until purge,
+avoiding concentration of dead bytes during repartition. `post_terminal(session)` geometrically merges equal size tiers
+(minimum 4 KiB) only if the pair fits the cap; it preserves every domain bitmap.
+The fixed cap bounds the number of merge tiers independently of history length.
+No production runtime hook was changed.
+
+`pack_write_bytes()` counts committed pack payload + nonce bytes written to
+SQLite, including intermediate object/operation pack rewrites. TEMP triggers
+roll the meter back with the transaction. It excludes metadata, page overhead
+and VACUUM, and resets with a new connection. The report records cumulative
+writes and the maximum delta for one engine collection call, alongside final
+physical bytes after collection/VACUUM. The release report includes the original
+collect-at-end cases and B/1000, B/4000 (plain/tool), C/1000/tool with collection
+after each turn; raw per-turn cumulative samples are retained.
 
 ## Fixtures, legacy baseline and measured S5
 

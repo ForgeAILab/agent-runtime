@@ -85,26 +85,61 @@ async fn physical_disk_release_report() {
             }
         }
     }
+    for (name, n, tools) in [
+        ("B", 1000, false),
+        ("B", 1000, true),
+        ("B", 4000, false),
+        ("B", 4000, true),
+        ("C", 1000, true),
+    ] {
+        eprintln!("measuring per-turn collection {name} N={n} tools={tools}");
+        let report = layouts::measure(
+            &root,
+            fixture::build_with_collection(name, n, tools, true).await,
+        );
+        eprintln!(
+            "measured per-turn {name} N={n} tools={tools}: native/L2={:.5}, written={}, max collection={}",
+            report.packed_after_l2_ratio,
+            report.cumulative_pack_bytes_written,
+            report.maintenance.max_collection_pack_bytes_written
+        );
+        if name == "B" && n == 4000 {
+            assert!(
+                report.packed_after_l2_ratio <= 2.0,
+                "per-turn B/N=4000 L2 gate"
+            );
+        }
+        reports.push(report);
+        std::fs::write(
+            root.join("measurements.json"),
+            serde_json::to_vec_pretty(&reports).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("measurements.md"), markdown(&reports)).unwrap();
+    }
 }
 
 fn markdown(reports: &[layouts::Report]) -> String {
     use std::fmt::Write;
     let mut out = String::from(
-        "Real packed SQLite physical bytes; schema baseline subtracted. S1–S5 implemented; packed after includes real collection pruning.\n\n| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 |\n| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "Real packed SQLite physical bytes; schema baseline subtracted. S1–S5 implemented; packed after includes real collection pruning.\n\n| Fixture | N | Turn | Collection | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 | Cumulative pack writes | Largest collection write |\n| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in reports {
         writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {:.5} | {:.5} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.5} | {:.5} | {} | {} |",
             r.fixture,
             r.n,
             if r.tools { "tool" } else { "plain" },
+            r.collection_schedule,
             r.legacy_l1.physical_bytes,
             r.legacy_l2.physical_bytes,
             r.packed_before.physical_bytes,
             r.packed_after.physical_bytes,
             r.packed_before_l2_ratio,
-            r.packed_after_l2_ratio
+            r.packed_after_l2_ratio,
+            r.cumulative_pack_bytes_written,
+            r.maintenance.max_collection_pack_bytes_written
         )
         .unwrap();
     }
@@ -165,4 +200,23 @@ async fn physical_disk_grown_4000_report() {
     rows.retain(|old| !(old["fixture"] == "C" && old["n"] == 4000));
     rows.push(row);
     std::fs::write(path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn per_turn_collection_smoke() {
+    let report = layouts::measure(
+        &root(),
+        fixture::build_with_collection("B", 100, true, true).await,
+    );
+    assert_eq!(report.collection_schedule, "every_turn");
+    assert_eq!(report.maintenance.turn_pack_bytes_written.len(), 2);
+    assert_eq!(report.maintenance.collection_calls, 6);
+    assert!(
+        report.cumulative_pack_bytes_written >= report.maintenance.collection_pack_bytes_written
+    );
+    assert!(
+        report.maintenance.collection_pack_bytes_written
+            >= report.maintenance.max_collection_pack_bytes_written
+    );
+    assert!(report.packed_after.physical_bytes > 0);
 }

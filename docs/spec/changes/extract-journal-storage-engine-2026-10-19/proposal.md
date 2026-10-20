@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T00:00:00Z
+updated_at: 2026-10-20T03:38:23Z
 ---
 
 # Proposal: Storage-generic journal engine and physical disk reduction
@@ -36,7 +36,8 @@ collection never removes.
   operation records, durable pins, dependency index, retained-root catalog,
   staging and object membership.
 - Make collection incremental and session-scoped, with physical deletion only
-  when no domain or session membership remains (R3).
+  within the declared physical sharing scope after its last membership,
+  with bounded sealed-pack deferral (R3, owner Q4).
 - Add a validated-root memo so a new writer on an already validated head skips
   full validation (R4); make `SessionPersistence::open` skip the legacy load
   when native heads exist (R5); add `JournalReader::extension` for one opaque

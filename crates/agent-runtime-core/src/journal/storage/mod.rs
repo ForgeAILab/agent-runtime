@@ -6,7 +6,14 @@
 //! Other errors are ambiguous: engines discard cached records before retrying.
 //! Reads expose a completed transaction only; objects are immutable and reads
 //! are restricted to the requested domain and session. Physical compaction
-//! preserves membership. A body is removed only with its last membership.
+//! preserves membership. Physical sharing is declared by `sharing`; removal
+//! never invalidates a surviving membership in that scope.
+//!
+//! Dead bytes may remain in a sealed pack below a documented dead-byte share
+//! threshold, at most 25% of canonical body bytes. Reaching that threshold
+//! rewrites the pack in the releasing apply. An empty sharing scope and a
+//! retired session's collection always purge its dead bytes. Receipts count
+//! physical removals, including previously deferred bodies, exactly once.
 use super::*;
 use crate::error::RuntimeError;
 use crate::ids::SessionId;
@@ -15,6 +22,17 @@ use std::{fmt, sync::Arc};
 
 mod volatile;
 pub use volatile::VolatileJournalStorage;
+
+/// Physical deduplication scope, independent of membership read isolation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JournalBodySharing {
+    /// Separate copies across sessions; domains of one session may share a copy
+    /// or retain their own copies. No cross-session body index is required.
+    PerSession,
+    /// One physical copy across all domains and sessions in this storage.
+    #[default]
+    Global,
+}
 
 /// One protection domain served by a storage. A single storage instance MAY
 /// serve several domains (Forge serves ordinary and protected from one file)
@@ -125,8 +143,8 @@ pub struct JournalWrite {
     pub pins: Vec<JournalPinChange>,
     pub catalog: Vec<JournalCatalogChange>,
     /// Collection: drop these objects from (domain, session) membership. A
-    /// body with no remaining membership in any domain or session is deleted
-    /// in the same transaction.
+    /// body loses read authority immediately. Physical deletion follows the
+    /// storage's bounded pack-rewrite policy within its declared sharing scope.
     pub release: Vec<JournalObjectId>,
     /// Collection replay floor (inclusive): remove operations below this
     /// revision, except the last operation of the record's current writer
@@ -137,7 +155,8 @@ pub struct JournalWrite {
 }
 
 /// Bodies physically deleted by one successfully acknowledged transaction.
-/// Shared bodies count only when their final membership is released.
+/// Counts canonical encoded body lengths (before compression/sealing), once per
+/// physical copy removed, when removed rather than when membership is released.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JournalApplyReceipt {
     pub reclaimed_objects: u64,
@@ -146,6 +165,20 @@ pub struct JournalApplyReceipt {
 
 #[async_trait]
 pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
+    /// Physical body sharing scope. Global preserves existing adapters' behavior.
+    /// Every held membership must remain readable until released. Non-members
+    /// must never read a body, including dead bytes awaiting pack maintenance.
+    fn sharing(&self) -> JournalBodySharing {
+        JournalBodySharing::Global
+    }
+    /// Optional canonical retained-body byte diagnostic for the sharing scopes
+    /// containing this domain's sessions, including unserved deferred bodies.
+    /// Deferred adapters supply it so retained-byte differences match physical
+    /// receipts. None preserves the engine's live-membership diagnostic.
+    /// This is not compressed file size and is never used to decide liveness.
+    async fn retained_bytes(&self, _domain: &JournalDomain) -> Result<Option<u64>, RuntimeError> {
+        Ok(None)
+    }
     async fn load(
         &self,
         domain: &JournalDomain,
@@ -190,7 +223,8 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
         limit: usize,
     ) -> Result<Vec<SessionId>, RuntimeError>;
     /// Returns exactly the bodies this transaction physically deleted and the
-    /// sum of their stored body lengths. Writes without deletions return zero.
+    /// sum of their canonical encoded lengths. Deferred dead bodies count when
+    /// a later apply physically removes them; clearing bits alone counts zero.
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError>;
     /// Physical compaction only (repack, VACUUM). Never changes membership.
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError>;

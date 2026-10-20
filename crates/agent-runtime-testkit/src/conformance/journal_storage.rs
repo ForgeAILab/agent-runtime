@@ -50,6 +50,7 @@ where
     )
     .await;
     named("membership_isolation_and_receipts", membership(&factory)).await;
+    named("bounded_deferred_deletion", deferred_deletion(&factory)).await;
     named("dirty_session_paging", dirty_paging(&factory)).await;
     named(
         "opaque_metadata_and_body_conflicts",
@@ -561,18 +562,67 @@ where
             .unwrap(),
         vec![None]
     );
+    // Read isolation alone cannot distinguish a global index falsely declared
+    // PerSession. With one membership per session, receipt values are exact.
+    let isolated = factory().await;
+    for holder in &holders[..2] {
+        isolated.apply(holder.clone()).await.unwrap();
+    }
+    for (index, holder) in holders[..2].iter().enumerate() {
+        let mut release = edits(holder);
+        release.release = vec![leaf.id.clone()];
+        let deletes = isolated.sharing() == JournalBodySharing::PerSession || index == 1;
+        assert_eq!(
+            isolated.apply(release).await.unwrap(),
+            JournalApplyReceipt {
+                reclaimed_objects: u64::from(deletes),
+                reclaimed_bytes: u64::from(deletes) * leaf.bytes.len() as u64,
+            }
+        );
+        if index == 0 {
+            assert_eq!(
+                isolated
+                    .objects(
+                        &holders[1].domain,
+                        &holders[1].session,
+                        std::slice::from_ref(&leaf.id)
+                    )
+                    .await
+                    .unwrap(),
+                vec![Some(Arc::from(leaf.bytes.clone()))]
+            );
+        }
+    }
+    let mut session_counts = [0, 0];
     for (index, write) in holders.iter().enumerate() {
         let mut release = edits(write);
         release.release = vec![leaf.id.clone(), leaf.id.clone()];
-        let expected = if index == 3 {
-            JournalApplyReceipt {
-                reclaimed_objects: 1,
-                reclaimed_bytes: leaf.bytes.len() as u64,
+        let receipt = storage.apply(release.clone()).await.unwrap();
+        match storage.sharing() {
+            JournalBodySharing::Global => assert_eq!(
+                receipt,
+                if index == 3 {
+                    JournalApplyReceipt {
+                        reclaimed_objects: 1,
+                        reclaimed_bytes: leaf.bytes.len() as u64,
+                    }
+                } else {
+                    JournalApplyReceipt::default()
+                }
+            ),
+            JournalBodySharing::PerSession => {
+                // Domains may own separate copies or share the session's copy.
+                assert!(receipt.reclaimed_objects <= 1);
+                assert_eq!(
+                    receipt.reclaimed_bytes,
+                    receipt.reclaimed_objects * leaf.bytes.len() as u64
+                );
+                session_counts[index % 2] += receipt.reclaimed_objects;
+                if index >= 2 {
+                    assert!((1..=2).contains(&session_counts[index % 2]));
+                }
             }
-        } else {
-            JournalApplyReceipt::default()
-        };
-        assert_eq!(storage.apply(release.clone()).await.unwrap(), expected);
+        }
         assert_eq!(
             storage
                 .objects(
@@ -602,6 +652,99 @@ where
             );
         }
     }
+}
+
+// The first release is below 25% of this batch's bytes. Immediate deletion
+// and bounded deferral both conform; clearing read authority is never deferred.
+async fn deferred_deletion<S, F, Fut>(factory: &F)
+where
+    S: JournalStorage,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<S>>,
+{
+    let storage = factory().await;
+    let mut write = raw_write("deferred", "deferred", None);
+    write.objects.objects = (0..8)
+        .map(|i| {
+            let object = JournalObject::encode(
+                JournalObjectKind::JsonInline,
+                &format!("{i:04}{}", "x".repeat(1000)),
+            )
+            .unwrap();
+            JournalStoredObject {
+                id: object.id,
+                kind: JournalObjectKind::JsonInline,
+                bytes: object.bytes.into(),
+            }
+        })
+        .collect();
+    write.objects.objects.sort_by(|a, b| a.id.cmp(&b.id));
+    storage.apply(write.clone()).await.unwrap();
+    let ids: Vec<_> = write.objects.objects.iter().map(|o| o.id.clone()).collect();
+    let mut release = edits(&write);
+    release.release = vec![ids[0].clone()];
+    let first = storage.apply(release.clone()).await.unwrap();
+    assert!(first.reclaimed_objects <= 1);
+    assert_eq!(
+        first.reclaimed_bytes,
+        first.reclaimed_objects * write.objects.objects[0].bytes.len() as u64
+    );
+    assert_eq!(
+        storage
+            .objects(&write.domain, &write.session, &ids[..1])
+            .await
+            .unwrap(),
+        vec![None],
+        "dead body must never be served while awaiting rewrite"
+    );
+    assert!(
+        storage
+            .objects(&write.domain, &write.session, &ids[1..])
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_some)
+    );
+    let middle = storage.apply(release.clone()).await.unwrap();
+    assert!(first.reclaimed_objects + middle.reclaimed_objects <= 1);
+    assert_eq!(
+        middle.reclaimed_bytes,
+        middle.reclaimed_objects * write.objects.objects[0].bytes.len() as u64
+    );
+    release.release = ids;
+    let last = storage.apply(release.clone()).await.unwrap();
+    assert_eq!(
+        first.reclaimed_objects + middle.reclaimed_objects + last.reclaimed_objects,
+        8
+    );
+    assert_eq!(
+        first.reclaimed_bytes + middle.reclaimed_bytes + last.reclaimed_bytes,
+        write
+            .objects
+            .objects
+            .iter()
+            .map(|o| o.bytes.len() as u64)
+            .sum::<u64>()
+    );
+    assert!(
+        storage
+            .members(&write.domain, &write.session)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .objects(&write.domain, &write.session, &release.release)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none)
+    );
+    assert_eq!(
+        storage.apply(release).await.unwrap(),
+        JournalApplyReceipt::default()
+    );
 }
 
 async fn dirty_paging<S, F, Fut>(factory: &F)
@@ -1147,6 +1290,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn per_session_volatile_storage_passes_every_storage_and_engine_case() {
+        Box::pin(assert_journal_storage_conformance(|| async {
+            Arc::new(VolatileJournalStorage::new(JournalBodySharing::PerSession))
+        }))
+        .await;
+    }
     #[tokio::test]
     async fn volatile_storage_passes_every_storage_and_engine_case() {
         Box::pin(assert_journal_storage_conformance(|| async {

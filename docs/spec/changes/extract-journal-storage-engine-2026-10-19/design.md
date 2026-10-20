@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T01:19:53Z
+updated_at: 2026-10-20T03:38:23Z
 ---
 
 # Design: Storage-generic journal engine and physical disk reduction (R1–R7)
@@ -184,8 +184,7 @@ pub struct JournalWrite {
     pub pins: Vec<JournalPinChange>,
     pub catalog: Vec<JournalCatalogChange>,
     /// Collection: drop these objects from (domain, session) membership. A
-    /// body with no remaining membership in any domain or session is deleted
-    /// in the same transaction.
+    /// body loses read authority immediately; physical removal follows rule 4.
     pub release: Vec<JournalObjectId>,
     /// Replay-window pruning (D8.6). Only set when the owner approves Q1.
     pub prune_operations_before: Option<JournalRevision>,
@@ -193,8 +192,16 @@ pub struct JournalWrite {
     pub inject: Option<JournalCommitFailurePoint>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JournalBodySharing { PerSession, #[default] Global }
+
 #[async_trait]
 pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
+    fn sharing(&self) -> JournalBodySharing { JournalBodySharing::Global }
+    /// Optional canonical retained bytes in this domain's session sharing scopes,
+    /// including deferred dead bodies; None keeps the membership fallback.
+    async fn retained_bytes(&self, domain: &JournalDomain)
+        -> Result<Option<u64>, RuntimeError> { Ok(None) }
     async fn load(&self, domain: &JournalDomain, session: &SessionId)
         -> Result<Option<JournalSessionRecord>, RuntimeError>;
     /// Bodies by id, restricted to (domain, session) membership. `None` for a
@@ -213,8 +220,8 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
     /// Sessions with `collection_dirty`, in session-id order after `after`.
     async fn dirty_sessions(&self, domain: &JournalDomain, after: Option<&SessionId>, limit: usize)
         -> Result<Vec<SessionId>, RuntimeError>;
-    /// Returns what this write physically deleted (bodies whose last
-    /// membership it dropped). Zero for writes that release nothing.
+    /// Returns physical body copies removed by this write, including deferred
+    /// dead bodies; canonical encoded lengths, before compression/sealing.
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError>;
     /// Physical compaction only (repack, VACUUM). Never changes membership.
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError>;
@@ -239,16 +246,44 @@ Rules the trait documents (and the storage suite in D11 checks):
    storage transaction (`WHERE revision = ? AND writer_epoch = ?` in SQL), not
    only in the engine's registry. A write from a fenced-out writer cannot land
    even if the engine's cache is stale.
-4. **Membership and sharing.** Objects are added to `(domain, session)`
-   membership. An id already present with different bytes is `StateConflict`.
-   Reads return only members. A body is deleted only when no membership in any
-   domain or session remains, in the same transaction that drops the last one.
-   `apply` returns `JournalApplyReceipt { reclaimed_objects: u64,
-   reclaimed_bytes: u64 }` counting exactly the bodies that transaction
-   deleted (`reclaimed_bytes` = sum of their stored body lengths, the same
-   bytes the engine handed to storage). A body that another domain or session
-   still holds is not counted. Amended 2026-10-19 after task 2.5 found the
-   engine cannot derive D4's accounting through membership-scoped reads.
+4. **Membership and sharing (Q4 authoritative).** Objects are added to
+   `(domain, session)` membership. An id already present with different bytes
+   in the sharing scope is `StateConflict`. `JournalStorage::sharing()` declares
+   `JournalBodySharing::PerSession` or `Global`. `Global` stores one physical
+   copy across domains and sessions; `PerSession` stores independent copies
+   across sessions and may share across that session's domains or keep a copy
+   per domain. The additive default is `Global`, preserving existing adapters'
+   behavior. The packed reference declares `PerSession`; volatile defaults to
+   `Global` and also offers a per-session configuration.
+
+   Every body is readable through every membership holding it until that
+   membership is released. Non-members never read it, including after its last
+   membership in scope is released. Releasing A's last membership can reclaim
+   A's copy under `PerSession` even when B holds the same id; a `Global` copy
+   survives until its last holder releases it.
+
+   `apply` returns `JournalApplyReceipt { reclaimed_objects, reclaimed_bytes }`
+   counting exactly physical body copies removed by that transaction, with
+   bytes measured as their canonical encoded lengths before compression and
+   sealing (the existing receipt unit). Clearing membership bits alone counts
+   zero. Retained live bodies moved during a rewrite do not count as reclaimed.
+
+   Physical deletion may be deferred inside a sealed pack below a documented
+   dead-byte threshold of at most **25% of canonical body bytes**. The apply
+   reaching the threshold rewrites that pack; dead bytes are never served.
+   An empty sharing scope and collection of a retired/deleted session always
+   purge its dead bytes. Receipts count deferred bytes when physically removed,
+   including removals triggered by a later apply, not at membership release.
+   Immediate deletion is also conforming. The reference uses a 25% threshold;
+   it rewrites only the affected packs and bounded small-pack merges.
+   `JournalStorage::retained_bytes(domain)` is an additive optional diagnostic:
+   deferred adapters return canonical bytes physically retained in the sharing
+   scopes containing the domain's sessions, including dead bytes. The default
+   `None` keeps existing adapters' membership-based engine diagnostic. The
+   packed adapter supplies it so the unchanged GC byte-evidence assertions
+   still compare retained-byte differences with physical receipts. This
+   diagnostic never controls liveness and is not compressed SQLite file size.
+
 5. **Consistent reads.** Each read method returns a state that some completed
    `apply` produced. Within one engine instance, every read that feeds a write
    happens under that engine's write gate (D3), and objects are immutable, so
@@ -371,12 +406,14 @@ preserve the original transfer/retention closure and epoch semantics.
   current root, so only their pins survive.
 - Cost: proportional to the members of dirty sessions, never to the domain.
 - Shared objects stay correct because physical deletion is storage-level
-  ("no membership remains", D2 rule 4): a FromIndex child or the other domain
-  keeps its own membership. Report fields keep their meaning; `examined` is
-  the number of membership entries examined in swept sessions, and
-  `reclaimed_bytes` counts only bodies physically deleted (last membership
-  dropped), summed from the `JournalApplyReceipt` of each `Collect` write, so the single-session N=1000 evidence (570,121 / 404,529 / 0) is
-  unchanged.
+  within the declared sharing scope (D2 rule 4): a FromIndex child or the other
+  domain keeps its own membership. `examined` counts membership entries in
+  swept sessions; `max_objects` bounds membership releases, as the engine's
+  existing `released` counter does. `deleted` and `reclaimed_bytes` sum physical
+  copies/canonical bytes from `JournalApplyReceipt`, including earlier deferred
+  bodies removed by this collection. The volatile single-session N=1000 byte
+  evidence (570,121 / 404,529 / 0) is unchanged; deferred adapters include dead
+  copies in their retained-byte diagnostic until physical removal.
 - Unknown dependency revisions and `unresolved` indexes keep returning typed
   unsupported (today's domain-wide check becomes a check over the dependency
   records the sweep loads plus live leases).
@@ -546,16 +583,27 @@ message, ≈ 256 B per fixture-B message at L1).
 Storage-level (no format change):
 
 - **S1 Commit packs.** `apply` receives each write's new objects as one
-  `JournalObjectBatch`. The host compresses them together (zstd 3) and seals
-  them once: one row, one nonce, one tag, an in-pack offset index.
-- **S2 Session repack with cross-domain sharing** — the owner's "collect
-  eagerly after terminal boundaries". One pack set per session serves both
-  domains; per-domain membership is a bitmap per pack. Collection rewrites a
-  session's live objects into one base pack ordered by kind (messages, JSON
-  leaves, sequence nodes, control) so similar bytes are adjacent, and merges
-  small packs geometrically (rewrite a pack when its live ratio < 1/2 or when
-  more than one pack exists per size tier), so each byte is rewritten
-  O(log N) times. The host triggers it after terminal publication.
+  batch, then partitions admission at transaction cut points into sealed packs
+  capped at **1 MiB canonical body bytes**, including imports. Each immutable
+  object must fit that cap; oversized objects are rejected atomically. There
+  is no journal format change. Operation packs also stay within 1 MiB of their
+  serialized logical records; full segments leave binary carry and stay sealed.
+- **S2 Session repack with cross-domain sharing.** One independent pack set
+  per session serves both domains. Admission deduplicates within that session
+  only; no cross-session lookup or open-time decoding of all packs occurs.
+  Session indexes are loaded lazily by `owner`, with an SQLite owner index.
+  `data_version` invalidates caches after another connection commits.
+  Collection rewrites a pack once **at least 25% of its canonical body bytes
+  are dead**, even when optional repacking is off. Retired-session collection
+  purges every dead byte. Membership bits hide dead bodies immediately.
+  Base repack selects only packs smaller than **64 KiB** and packs that apply
+  already purged; stable larger packs stay sealed. Outputs respect the 1 MiB
+  cap. Packs containing deferred dead bodies stay sealed until purge, so
+  repartitioning cannot concentrate dead bytes above the bound. The explicit
+  terminal hook merges equal size tiers (minimum 4 KiB)
+  only when their combined logical bytes fit the cap. Each admitted byte has
+  a constant number of size tiers up to that fixed cap; threshold purges are
+  charged to the bytes that died, avoiding whole-history rewrites every turn.
 - **S3 Compact ids at the boundary.** The id → (pack, offset) index lives
   inside each sealed pack as sorted 4-byte id prefixes plus varint offsets;
   a read verifies the full id by hashing the bytes (the reader already
@@ -585,66 +633,69 @@ Format-level (journal schema 5; D9):
   or Z85 id already costs ~33 bytes, so it saves ~0 physical bytes for a
   format break.
 
-#### D8.4 Measured physical bytes through the reference adapter (task 4.5)
+#### D8.4 Measured physical bytes through the reference adapter (step 7 / task 4.5)
 
-Measured 2026-10-19 on the merged engine with root-only durable pins and real
-S1–S5 storage levers. Both domains use `JournalEngine<PackedSqliteJournalStorage>`
-in one SQLite file (bundled SQLite 3.46.0, 4096-byte pages, zstd 1.5.7 level 3).
-All fences, heads, tombstones, opaque metadata, pins, catalogs, memberships,
-object packs and retained operation packs are included.
+Measured 2026-10-20 UTC on the Q4-aligned PerSession reference with 1 MiB
+logical packs, 25% dead-byte purges and bounded small-pack merges. Both domains
+share within one session; separate sessions own independent copies. The
+explicit geometric terminal hook still runs after terminal publication.
 
 Physical bytes are `page_count × page_size` after truncated WAL checkpoints
-and VACUUM, minus the empty schema. File length and `dbstat` agree. Before and
-after refer to the same file, before and after its first full collection;
-the explicit geometric terminal hook runs after terminal publication. All 13
-idle legacy rows contain two sealed blobs (L2), since `identity.event` and
-`identity.event_seq` advance after the terminal checkpoint. Sealing models a
-24-byte nonce and 16-byte tag, rather than a real cipher.
+and VACUUM, minus the empty schema. File length and `dbstat` agree. All
+head/fence/engine metadata, pins, catalogs, memberships and object/operation
+packs are included. Idle legacy rows contain two sealed blobs (L2), because
+`identity.event` and `identity.event_seq` advance after the terminal checkpoint.
+Sealing models a 24-byte nonce and 16-byte tag over real zstd level-3 bytes.
 
-| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A | 100 | plain | 0 | 8192 | 90112 | 57344 | 11.00000 | 7.00000 |
-| A | 100 | tool | 0 | 8192 | 118784 | 61440 | 14.50000 | 7.50000 |
-| A | 1000 | plain | 20480 | 53248 | 348160 | 303104 | 6.53846 | 5.69231 |
-| A | 1000 | tool | 24576 | 53248 | 372736 | 307200 | 7.00000 | 5.76923 |
-| A | 4000 | plain | 90112 | 204800 | 1126400 | 1089536 | 5.50000 | 5.32000 |
-| A | 4000 | tool | 94208 | 208896 | 1155072 | 1089536 | 5.52941 | 5.21569 |
-| B | 100 | plain | 20480 | 40960 | 135168 | 86016 | 3.30000 | 2.10000 |
-| B | 100 | tool | 20480 | 45056 | 151552 | 94208 | 3.36364 | 2.09091 |
-| B | 1000 | plain | 159744 | 335872 | 606208 | 540672 | 1.80488 | 1.60976 |
-| B | 1000 | tool | 163840 | 339968 | 671744 | 589824 | 1.97590 | 1.73494 |
-| B | 4000 | plain | 655360 | 1359872 | 2248704 | 2027520 | 1.65361 | 1.49096 |
-| B | 4000 | tool | 655360 | 1392640 | 2469888 | 2260992 | 1.77353 | 1.62353 |
-| C | 1000 | tool | 454656 | 942080 | 11071488 | 962560 | 11.75217 | 1.02174 |
+Collection once at the end (the original 13 cases):
 
-Actual `packed_before`, `packed_after` and `packed_after_l2_ratio` fields in
-`/Volumes/Data/tmp/refactor/rt-e6/measurements.json` are authoritative. The
-`layouts`, `s123_s4_s5_*` and `gate_ratio` are counterfactual simulator
-diagnostics, not physical native estimates. Former `projected_after_s5_*`
-fields now alias the measured native after size, so S5 is not subtracted twice.
-The archived simulator payload delta remains a historical diagnostic only. The old
-projected tables are replaced by these measured S5 results. Task-1 and task-4
-raw evidence remains under `rt-e1` and `rt-e4`.
+| Fixture | N | Turn | L1 bytes | L2 bytes | Before bytes | Final bytes | Before/L2 | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 100 | plain | 0 | 8192 | 90112 | 57344 | 11.00000 | 7.00000 | 415555 | 86181 |
+| A | 100 | tool | 0 | 8192 | 118784 | 61440 | 14.50000 | 7.50000 | 541851 | 91181 |
+| A | 1000 | plain | 20480 | 53248 | 344064 | 311296 | 6.46154 | 5.84615 | 750200 | 27274 |
+| A | 1000 | tool | 24576 | 53248 | 356352 | 307200 | 6.69231 | 5.76923 | 1103115 | 129458 |
+| A | 4000 | plain | 90112 | 204800 | 1208320 | 1179648 | 5.90000 | 5.76000 | 1365409 | 27200 |
+| A | 4000 | tool | 94208 | 208896 | 1224704 | 1179648 | 5.86275 | 5.64706 | 1522276 | 32148 |
+| B | 100 | plain | 20480 | 40960 | 135168 | 102400 | 3.30000 | 2.50000 | 415920 | 61242 |
+| B | 100 | tool | 20480 | 45056 | 155648 | 94208 | 3.45455 | 2.09091 | 802616 | 161358 |
+| B | 1000 | plain | 159744 | 335872 | 622592 | 577536 | 1.85366 | 1.71951 | 842386 | 33636 |
+| B | 1000 | tool | 163840 | 339968 | 679936 | 622592 | 2.00000 | 1.83133 | 1494382 | 288266 |
+| B | 4000 | plain | 655360 | 1359872 | 2387968 | 2183168 | 1.75602 | 1.60542 | 3053696 | 314148 |
+| B | 4000 | tool | 655360 | 1392640 | 2719744 | 2494464 | 1.95294 | 1.79118 | 3533286 | 323123 |
+| C | 1000 | tool | 454656 | 942080 | 11993088 | 1228800 | 12.73043 | 1.30435 | 106631979 | 2257327 |
 
-B/N=4000 is **1.49096× L2 plain / 1.62353× L2 tool** after collection.
-Both pass the required ≤2.0× L2 gate; only plain meets the optional 1.5× aim.
-A/N=4000 is **5.32000× plain / 5.21569× tool** and is reported without gating.
-C is the requested growing N=1000/tool case (250 writer epochs), not N=4000:
-its measured native/L2 is **1.02174×** after real pruning. Group 5 (5.1–5.4)
-is not built because B meets the gate; schema 4 remains the format.
+Collection after every turn, plus a final sweep after shutdown:
 
-The adapter uses sealed object packs with four-byte prefixes and full-id
-verification, membership bitmaps, physical last-membership deletion, and
-kind-ordered collection repacks. Operation packs are pruned transactionally:
-empty packs are dropped and mixed packs rewritten, preserving revision −64
-and the current writer epoch’s last operation. The RAM replay index changes
-only after commit. Prefix-alignment and per-kind/manifest-closure diagnostics
-remain in the raw report: JSON array leaves can share while the binary spines
-of cache fragments and prepended tool-schema manifests differ.
+| Fixture | N | Turn | L2 bytes | Final bytes | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| B | 1000 | plain | 335872 | 577536 | 1.71951 | 845627 | 33297 |
+| B | 1000 | tool | 339968 | 622592 | 1.83133 | 1491335 | 288771 |
+| B | 4000 | plain | 1359872 | 2183168 | 1.60542 | 3057083 | 313815 |
+| B | 4000 | tool | 1392640 | 2494464 | 1.79118 | 3540392 | 323123 |
+| C | 1000 | tool | 942080 | 1204224 | 1.27826 | 144922993 | 368800 |
 
+B/N=4000 passes the required **≤2.0× L2** gate: collect-at-end = **1.60542× plain / 1.79118× tool**; per-turn = **1.60542× plain / 1.79118× tool**. All four miss the optional 1.5× aim. Group 5 stays unbuilt; journal schema 4 is unchanged.
 
+Cumulative per-turn B pack writes grow **3.615× plain / 2.374× tool** when seeded N grows 4× (1000 → 4000). C/1000 contributes 250 turn samples in the raw JSON. **Write verdict: O(N) in admitted bytes for these bounded turn shapes; no O(N²) whole-history pack rewrites.** Fixed 1 MiB packs bound merge tiers; stable large packs stay sealed. At a 25% dead threshold, survivor rewrites are charged to at most three live bytes per dead byte. Replay-window maintenance is bounded. This verdict concerns pack payload/nonce writes; the chosen metric excludes metadata, SQLite page overhead and VACUUM.
 
-NOT MET: the supplemental growing C/N=4000 report did not complete within its reserved wall-clock limit. The required primary C script is measured at N=1000; no N=4000 value is estimated.
+Supplemental C/N=4000, collection at the end (one release run):
+
+| Fixture | N | Turn | L2 bytes | Final bytes | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| C | 4000 | tool | 3977216 | 4886528 | 1.22863 | 487612606 | 9208323 |
+
+Its native/L2 ratio is 1.22863×. It is reported without gating.
+
+`/Volumes/Data/tmp/refactor/rt-e7/measurements.json` is authoritative. The
+`cumulative_pack_bytes_written` meter uses transactional TEMP triggers for
+object/operation pack INSERT/UPDATE payload + nonce lengths, including
+intermediate rewrites. `max_collection_pack_bytes_written` is the largest
+meter delta for one engine collection call (one domain); final collection is
+included. Rollback restores the meter. The raw JSON retains every turn's
+cumulative sample and actual retained-operation counts. Simulator fields stay
+counterfactual diagnostics; former projected-after fields alias actual sizes.
+
 #### D8.5 Decision rule
 
 1. Build the measurement harness first (task 1). It reports L1/L2, the D4
@@ -741,8 +792,9 @@ NOT MET: the supplemental growing C/N=4000 report did not complete within its re
     `Arc<S>`; the suite runs the existing protected, ordinary and collection
     suites over `JournalEngine<S>`, plus storage-level cases: atomic `apply`
     at every `inject` point, precondition fences, membership-restricted
-    reads, body sharing across domains and sessions, deletion only at last
-    membership, `dirty_sessions` paging, and a restart (a fresh engine over
+    reads, declared Global/PerSession copies, deletion only at scope-local last
+    membership within the declared scope, bounded deferred removal,
+    `dirty_sessions` paging, and a restart (a fresh engine over
     the same storage) that must see exactly the acknowledged state.
   - Broken storages that the suite MUST reject, each failing a named case:
     **torn transaction** (persists objects but drops the record at a cut),
@@ -750,14 +802,25 @@ NOT MET: the supplemental growing C/N=4000 report did not complete within its re
     **reordered commit** (makes write n+1 visible without write n; detected by
     predecessor/sequence on restart), **stale epoch** (ignores
     `expect.writer_epoch`; a revoked writer's commit lands),
-    **shared object deleted while referenced** (deletes a body when another
+    **shared object deleted while referenced**, exercised under both sharing
+    declarations (deletes a body when another
     domain's or session's membership still holds it; detected by the other
     session's open failing before a lease).
 - `JournalEngine` exposes the same `fail_next_commit_at`, `revoke_writer` and
   host controls, so `SessionJournalConformanceFixture::new` and a
   `JournalCollectionHost` impl for `JournalEngine<S>` (added in the testkit)
   cover any storage with one line.
-- The reference packed storage (task 4) passes the whole storage suite.
+- Sharing receipt cases branch on `storage.sharing()`: Global retains its
+  original zero-until-last-holder receipts; PerSession independently reclaims
+  session copies and permits either shared or independent domain copies.
+  Both modes check every remaining holder's readability and released-member
+  isolation. A low-dead-share case accepts immediate or deferred removal and
+  checks exact cumulative receipts when the scope empties. The sixth faulty
+  adapter serves released bodies; it fails membership isolation in both modes.
+- Volatile runs the complete suite in both modes via
+  `VolatileJournalStorage::new(JournalBodySharing::PerSession)` or the existing
+  Global default. The packed adapter passes with optional repacking off, on,
+  and a connection restart; all configurations declare PerSession.
 
 ### D12. Compatibility, migration and CHANGELOG
 
@@ -780,12 +843,15 @@ Added (all additive):
   `JournalObjectBatch`, `JournalOperationRecord`, `JournalPinRecord`,
   `JournalCatalogEntry`, `JournalPinChange`, `JournalCatalogChange`,
   `JournalWriteKind`, `JournalWrite`, `JournalApplyReceipt`,
-  `VolatileJournalStorage`.
+  `VolatileJournalStorage`, `JournalBodySharing`.
+- Q4 additions: `JournalStorage::sharing()` (default Global), optional
+  `JournalStorage::retained_bytes(domain)` (default None), and
+  `VolatileJournalStorage::new(sharing)`.
 - core `journal` re-exports: `JournalEngine<S>`, `JournalEngineConfig`, and
   `JournalEngine::retained_bytes`.
 - `JournalReader::extension`.
 - testkit `conformance::journal_storage`: `assert_journal_storage_conformance`,
-  `JournalCollectionHost for JournalEngine<S>`, the five broken storages
+  `JournalCollectionHost for JournalEngine<S>`, broken storages
   (test-only, not exported).
 - the bench crate (not published).
 
@@ -813,7 +879,12 @@ CHANGELOG `Unreleased` text (applied in the last task):
   A validated-root memo lets a new writer reuse a head this process already
   validated. `JournalReader::extension` reads one opaque extension in O(log n)
   objects. `assert_journal_storage_conformance` checks a storage, including
-  torn, lost, reordered and stale-fenced writes and shared-object deletion."
+  torn, lost, reordered and stale-fenced writes and shared-object deletion.
+  `JournalStorage::sharing()` declares Global or PerSession copies, defaulting
+  to Global for compatibility. Sealed packs may defer physical removal below
+  25% dead canonical bytes; membership reads stop immediately, and receipts
+  count copies/bytes at physical removal. The optional retained-byte storage
+  diagnostic includes deferred bodies; volatile offers both sharing modes."
 - `### Changed` — "Opening a session whose ordinary and protected journals
   both have a native head no longer loads the legacy v3 records."
 - `### Breaking` (pre-1.0) — "After collection a journal may reject replays
@@ -955,3 +1026,50 @@ capabilities and explicit cache endpoint; all 13 physical sizes remain identical
 No production data, schema, dependency or storage-trait signature changed.
 
 NOT MET: C/N=4000 physical ratio is unavailable within the reserved budget. The B gate and all 13 primary release cases pass; B/tool also misses the optional 1.5× aim.
+
+## Step 7 final verification evidence
+
+Q4 now governs D2 rule 4: the storage declares Global or PerSession body
+sharing (Global is the additive compatibility default). The packed reference
+uses PerSession copies and lazy owner-scoped indexes. Dead-body reads stop at
+membership release; pack bytes may remain below a 25% canonical dead-byte
+threshold until a bounded rewrite. Physical copy/encoded-byte receipts count
+actual removal. An optional storage retained-byte diagnostic preserves the
+existing GC byte-evidence assertions without changing them.
+
+All commands used `/Volumes/Data/tmp/refactor/c.sh`, individual timeouts and
+this worktree's single target directory. Implementation remained unchanged during final
+package verification and both release reports; later edits were documentation. No memo/R4–R6 paths were
+refactored; the only engine change selects the optional storage byte diagnostic.
+
+| Check | Result | Evidence under `rt-e7/` |
+| --- | --- | --- |
+| Formatting | PASS | `final-fmt.log` |
+| Clippy all targets/features, warnings denied | PASS | `final-clippy.log` |
+| Core all features | 314 passed | `final-core.log` |
+| Runtime all features | 677 passed | `final-runtime.log` |
+| Testkit all features | 444 passed | `final-testkit.log` |
+| Bench | 16 passed; two reports ignored in debug | `final-bench.log` |
+| Primary release report | PASS; 18 cases | `release-report.log` |
+| C/N=4000 release supplement | PASS; one attempt, 5,257.4 seconds including build | `release-c4000.log` |
+| Future-size gate | PASS; commit_inner 4,944 / 16,384 bytes | `final-future-sizes.log` |
+| Rust 1.86 core/runtime build | PASS | `final-msrv.log` |
+| Dependency boundaries | PASS; six commands and 13-package leaf check | `dependency-boundaries.json` |
+| Existing-expectation integrity | PASS; 31 checks, one Q4 parameterized site | `test-integrity.json` |
+| Strict spec validation | PASS; 2 deltas, 13 requirements | `strict-spec.log` |
+
+Final package commands total **1,451 passed, zero failed**; release reports add
+**two passing tests and 19 completed measured cases**. The supplemental
+C/N=4000 result is **1.22863× L2**, with 16,002 → 130 retained operation
+results. D8.4 and task 4.5 contain its physical bytes and write counters.
+The unchanged GC source and existing packed test bodies remain byte-identical.
+Only `journal_storage.rs:601` parameterizes the membership receipt expectation:
+Global keeps its old values; PerSession independently accounts for session
+copies and permits either domain-sharing policy. New tests reject premature
+shared deletion and serving dead bodies in both modes.
+
+NOT MET: the optional B/N=4000 1.5× L2 aim is missed under both collection
+schedules. The required 2.0× gate passes; group 5 remains intentionally unbuilt.
+The earlier Step-6 C/N=4000 timeout remains historical evidence; Step 7 now
+supplies the completed measurement. Full report and raw JSON are
+`/Volumes/Data/tmp/refactor/rt-e7/report.md` and `measurements.json`.

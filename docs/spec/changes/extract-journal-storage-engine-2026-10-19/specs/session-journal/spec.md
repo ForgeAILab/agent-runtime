@@ -50,7 +50,7 @@ Lease, reader-pin and writer-slot registries and the root/pin epoch SHALL live i
 
 ### Requirement: Collection is incremental and safe for shared objects
 
-Collection SHALL examine only sessions whose roots, pins or staging changed since their last complete sweep, and its cost MUST be proportional to those sessions' members. A session's live set SHALL be the closure of its current head, its durable pins, its live process leases and its staged leaves. Storage MUST delete an object body only when no membership in any domain or session still holds it, in the transaction that removes the last membership.
+Collection SHALL examine only sessions whose roots, pins or staging changed since their last complete sweep, and its cost MUST be proportional to those sessions' members. A session's live set SHALL be the closure of its current head, its durable pins, its live process leases and its staged leaves. Storage MUST declare `PerSession` or `Global` physical body sharing. It MUST preserve reads through every remaining membership and MUST never serve a non-member. `PerSession` copies MAY be reclaimed independently across sessions; a `Global` body MUST survive until its last membership is released. Apply receipts SHALL count canonical bytes of physical body copies removed, at physical removal time. Dead bytes MAY remain in sealed packs below a documented threshold of at most 25% of canonical body bytes; reaching the threshold, emptying a sharing scope, or collecting a retired session MUST purge the affected dead bytes.
 
 #### Scenario: Clean sessions are not read
 
@@ -62,6 +62,14 @@ Collection SHALL examine only sessions whose roots, pins or staging changed sinc
 - **WHEN** an object is a member of the protected and ordinary domains of a session, or of two sessions
 - **AND** collection releases it from one of them
 - **THEN** the other domain or session still reads it through a pinned lease
+
+
+#### Scenario: Deferred dead bodies are unreadable and eventually counted
+
+- **WHEN** a membership is released while its dead body remains below a pack's rewrite threshold
+- **THEN** reads through that membership return no body immediately
+- **AND** the receipt counts the body only when a later apply rewrites or deletes that pack
+- **AND** emptying its sharing scope removes and counts all remaining dead copies
 
 ### Requirement: A validated root is not validated again in the same process
 

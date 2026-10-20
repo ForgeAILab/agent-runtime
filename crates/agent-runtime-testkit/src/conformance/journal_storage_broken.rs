@@ -1,4 +1,4 @@
-//! Five faulty adapters. They share forwarding code, but each concrete storage
+//! Faulty adapters. They share forwarding code, but each concrete storage
 //! introduces exactly one persistence defect and must fail its named guarantee.
 
 use std::marker::PhantomData;
@@ -13,6 +13,7 @@ enum Defect {
     ReorderedCommit,
     StaleEpoch,
     SharedBodyDeleted,
+    DeadBodyServed,
 }
 trait Fault: std::fmt::Debug + Send + Sync + 'static {
     const DEFECT: Defect;
@@ -24,7 +25,7 @@ macro_rules! faults {
         impl Fault for $name { const DEFECT: Defect = Defect::$name; }
     )*};
 }
-faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; SharedBodyDeleted; }
+faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; SharedBodyDeleted; DeadBodyServed; }
 
 #[derive(Debug)]
 struct Broken<F: Fault> {
@@ -32,6 +33,7 @@ struct Broken<F: Fault> {
     // A global unlink table models a collector that destroys a shared body
     // while another membership still references it. Membership rows survive.
     unlinked: Mutex<BTreeSet<JournalObjectId>>,
+    dead: Mutex<BTreeMap<JournalObjectId, Arc<[u8]>>>,
     fault: PhantomData<F>,
 }
 impl<F: Fault> Default for Broken<F> {
@@ -39,17 +41,27 @@ impl<F: Fault> Default for Broken<F> {
         Self {
             inner: Mutex::new(Arc::new(VolatileJournalStorage::default())),
             unlinked: Mutex::new(BTreeSet::new()),
+            dead: Mutex::new(BTreeMap::new()),
             fault: PhantomData,
         }
     }
 }
 impl<F: Fault> Broken<F> {
+    fn with_sharing(sharing: JournalBodySharing) -> Self {
+        Self {
+            inner: Mutex::new(Arc::new(VolatileJournalStorage::new(sharing))),
+            ..Default::default()
+        }
+    }
     fn inner(&self) -> Arc<VolatileJournalStorage> {
         self.inner.lock().unwrap().clone()
     }
 }
 #[async_trait]
 impl<F: Fault> JournalStorage for Broken<F> {
+    fn sharing(&self) -> JournalBodySharing {
+        self.inner().sharing()
+    }
     async fn load(
         &self,
         d: &JournalDomain,
@@ -68,6 +80,9 @@ impl<F: Fault> JournalStorage for Broken<F> {
         for (id, body) in ids.iter().zip(&mut bodies) {
             if unlinked.contains(id) {
                 *body = None;
+            }
+            if F::DEFECT == Defect::DeadBodyServed && body.is_none() {
+                *body = self.dead.lock().unwrap().get(id).cloned();
             }
         }
         Ok(bodies)
@@ -199,6 +214,19 @@ impl<F: Fault> JournalStorage for Broken<F> {
             _ => {}
         }
         let release = write.release.clone();
+        if F::DEFECT == Defect::DeadBodyServed {
+            let bodies = self
+                .inner()
+                .objects(&write.domain, &write.session, &release)
+                .await?;
+            self.dead.lock().unwrap().extend(
+                release
+                    .iter()
+                    .cloned()
+                    .zip(bodies)
+                    .filter_map(|(id, body)| body.map(|body| (id, body))),
+            );
+        }
         let receipt = self.inner().apply(write).await?;
         if F::DEFECT == Defect::SharedBodyDeleted {
             self.unlinked.lock().unwrap().extend(release);
@@ -207,9 +235,9 @@ impl<F: Fault> JournalStorage for Broken<F> {
     }
 }
 
-async fn rejects<F: Fault>(case: &str) -> String {
+async fn rejects_with_sharing<F: Fault>(case: &str, sharing: JournalBodySharing) -> String {
     let result = AssertUnwindSafe(Box::pin(assert_journal_storage_conformance(|| async {
-        Arc::new(Broken::<F>::default())
+        Arc::new(Broken::<F>::with_sharing(sharing))
     })))
     .catch_unwind()
     .await;
@@ -224,6 +252,18 @@ async fn rejects<F: Fault>(case: &str) -> String {
     );
     eprintln!("BROKEN STORAGE {:?} -> journal_storage::{case}", F::DEFECT);
     message.clone()
+}
+async fn rejects<F: Fault>(case: &str) -> String {
+    rejects_with_sharing::<F>(case, JournalBodySharing::Global).await
+}
+#[tokio::test]
+async fn per_session_shared_body_deletion_fails_other_holder_open() {
+    let message = rejects_with_sharing::<SharedBodyDeleted>(
+        "shared_body_last_membership",
+        JournalBodySharing::PerSession,
+    )
+    .await;
+    assert!(message.contains("remaining holder must open before returning a lease"));
 }
 #[tokio::test]
 async fn torn_transaction_fails_atomic_apply_cuts() {
@@ -246,4 +286,11 @@ async fn stale_epoch_fails_writer_epoch_fence() {
 async fn shared_body_deletion_fails_other_holder_open() {
     let message = rejects::<SharedBodyDeleted>("shared_body_last_membership").await;
     assert!(message.contains("remaining holder must open before returning a lease"));
+}
+
+#[tokio::test]
+async fn serving_dead_bytes_fails_membership_isolation_in_both_scopes() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        rejects_with_sharing::<DeadBodyServed>("membership_isolation_and_receipts", sharing).await;
+    }
 }

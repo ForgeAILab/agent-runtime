@@ -28,14 +28,22 @@ contain breaking changes and are coordinated with consumer proposals.
   `JournalReader::extension` reads one opaque extension in O(log n) objects;
   structured runtime cache state remains subject to the reader's JSON limits.
 - `JournalApplyReceipt` reports the body count and encoded bytes physically
-  deleted by `JournalStorage::apply`, including shared-body last-membership
-  accounting. Collection now sweeps dirty sessions incrementally.
-  `JournalEngine::retained_bytes` provides a logical byte diagnostic for observed
-  sessions and storage's pending dirty sessions.
+  deleted by `JournalStorage::apply`, within the declared
+  `JournalBodySharing::{Global, PerSession}` scope. The additive
+  `JournalStorage::sharing()` defaults to `Global` to preserve existing
+  adapters; `VolatileJournalStorage::new(sharing)` selects either mode.
+  Per-session copies need no cross-session body index. Sealed packs
+  may defer deletion below a 25% dead-byte threshold while reads stop
+  immediately; receipts count bytes when a rewrite physically removes them.
+  Collection now sweeps dirty sessions incrementally.
+  Deferred adapters can supply `JournalStorage::retained_bytes(domain)` so
+  `JournalEngine::retained_bytes` includes unserved bytes until physical removal;
+  its default keeps the existing live-membership diagnostic.
 - Testkit `conformance::journal_storage::assert_journal_storage_conformance`
   checks storage transactions, restart recovery and the protected, ordinary and
   collection engine suites. `JournalCollectionHost` is implemented for
-  `JournalEngine<S>`; five broken storages verify named failure cases.
+  `JournalEngine<S>`; broken storages verify named failure cases, including
+  premature shared deletion and serving released bodies in both sharing modes.
 
 - Explicit host-triggered retirement and logical collection in the volatile
   `InMemorySessionJournal`, with revision-bound retention authorization, durable

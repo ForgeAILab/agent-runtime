@@ -12,13 +12,17 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+/// Maximum sum of canonical object body lengths in a sealed object pack.
+pub const LOGICAL_PACK_CAP: usize = 1024 * 1024;
+const SMALL_PACK_CAP: usize = 64 * 1024;
 type Directory = BTreeMap<i64, Vec<u8>>;
 type OperationKey = (String, u8, String, JournalOperationId);
 type Updates = BTreeMap<i64, Option<Arc<Pack>>>;
 struct State {
     conn: Connection,
     packs: BTreeMap<i64, Arc<Pack>>,
-    locations: HashMap<JournalObjectId, (i64, usize)>,
+    locations: HashMap<(String, JournalObjectId), (i64, usize)>,
+    loaded_sessions: BTreeSet<String>,
     version: i64,
     operations: BTreeMap<OperationKey, JournalOperationRecord>,
 }
@@ -31,54 +35,75 @@ impl State {
         if self.version == version {
             return Ok(());
         }
+        self.packs.clear();
+        self.locations.clear();
+        self.operations.clear();
+        self.loaded_sessions.clear();
+        self.version = version;
+        Ok(())
+    }
+    // A session's index is lazy and independent. Opening a storage or reading
+    // metadata never decodes body packs, and never builds a global body index.
+    fn session(&mut self, session: &SessionId) -> Result<(), RuntimeError> {
+        if self.loaded_sessions.contains(session.as_str()) {
+            return Ok(());
+        }
         let mut statement = self
             .conn
-            .prepare("SELECT pack_id,payload FROM pack ORDER BY pack_id")
+            .prepare("SELECT pack_id,payload FROM pack WHERE owner=? ORDER BY pack_id")
             .map_err(failure)?;
         let rows = statement
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .query_map([session.as_str()], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
             .map_err(failure)?;
-        let mut packs = BTreeMap::new();
-        let mut locations = HashMap::new();
         for row in rows {
-            let (id, bytes) = row.map_err(failure)?;
+            let (pid, bytes) = row.map_err(failure)?;
             let pack = Arc::new(Pack::decoded(&bytes)?);
             for (slot, object) in pack.objects.iter().enumerate() {
-                if locations.insert(object.id.clone(), (id, slot)).is_some() {
+                if self
+                    .locations
+                    .insert(
+                        (session.as_str().to_owned(), object.id.clone()),
+                        (pid, slot),
+                    )
+                    .is_some()
+                {
                     return Err(conflict());
                 }
             }
-            packs.insert(id, pack);
+            self.packs.insert(pid, pack);
         }
-        let mut operations = BTreeMap::new();
         let mut statement = self
             .conn
-            .prepare("SELECT storage,role,session,payload FROM operation_pack")
+            .prepare("SELECT storage,role,payload FROM operation_pack WHERE session=?")
             .map_err(failure)?;
         let rows = statement
-            .query_map([], |r| {
+            .query_map([session.as_str()], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, u8>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, Vec<u8>>(2)?,
                 ))
             })
             .map_err(failure)?;
         for row in rows {
-            let (storage, role, session, payload) = row.map_err(failure)?;
+            let (storage, role, payload) = row.map_err(failure)?;
             for op in codec::decode::<Vec<metadata::Operation>>(&payload)? {
                 let op: JournalOperationRecord = op.into();
-                let key = (storage.clone(), role, session.clone(), op.operation.clone());
-                if operations.insert(key, op).is_some() {
+                let key = (
+                    storage.clone(),
+                    role,
+                    session.as_str().to_owned(),
+                    op.operation.clone(),
+                );
+                if self.operations.insert(key, op).is_some() {
                     return Err(conflict());
                 }
             }
         }
-        self.operations = operations;
-        self.packs = packs;
-        self.locations = locations;
-        self.version = version;
+        self.consistent()?;
+        self.loaded_sessions.insert(session.as_str().to_owned());
         Ok(())
     }
     fn consistent(&self) -> Result<(), RuntimeError> {
@@ -91,18 +116,20 @@ impl State {
         }
         Ok(())
     }
-    fn update(&mut self, updates: Updates) {
+    fn update(&mut self, session: &SessionId, updates: Updates) {
         for id in updates.keys() {
             if let Some(old) = self.packs.remove(id) {
                 for object in &old.objects {
-                    self.locations.remove(&object.id);
+                    self.locations
+                        .remove(&(session.as_str().to_owned(), object.id.clone()));
                 }
             }
         }
         for (id, pack) in updates {
             if let Some(pack) = pack {
                 for (slot, object) in pack.objects.iter().enumerate() {
-                    self.locations.insert(object.id.clone(), (id, slot));
+                    self.locations
+                        .insert((session.as_str().to_owned(), object.id.clone()), (id, slot));
                 }
                 self.packs.insert(id, pack);
             }
@@ -110,7 +137,7 @@ impl State {
     }
 }
 /// Durable bench-only storage. Each apply uses BEGIN IMMEDIATE and rechecks both
-/// fences. The decoded full-id map is a rebuildable RAM cache, never a SQL index.
+/// fences. Full-id maps are rebuilt lazily per session, never across sessions.
 /// All diagnostics and errors redact stored bytes. Clones share one connection.
 #[derive(Clone)]
 pub struct PackedSqliteJournalStorage {
@@ -149,12 +176,25 @@ impl PackedSqliteJournalStorage {
         conn.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;").map_err(failure)?;
         conn.execute_batch(include_str!("schema.sql"))
             .map_err(failure)?;
+        conn.execute_batch(
+            "CREATE TEMP TABLE write_meter(bytes INTEGER NOT NULL);
+             INSERT INTO write_meter VALUES (0);
+             CREATE TEMP TRIGGER object_pack_insert AFTER INSERT ON main.pack BEGIN
+               UPDATE write_meter SET bytes=bytes+length(new.payload)+length(new.nonce); END;
+             CREATE TEMP TRIGGER object_pack_update AFTER UPDATE OF payload ON main.pack BEGIN
+               UPDATE write_meter SET bytes=bytes+length(new.payload)+length(new.nonce); END;
+             CREATE TEMP TRIGGER operation_pack_insert AFTER INSERT ON main.operation_pack BEGIN
+               UPDATE write_meter SET bytes=bytes+length(new.payload)+length(new.nonce); END;
+             CREATE TEMP TRIGGER operation_pack_update AFTER UPDATE OF payload ON main.operation_pack BEGIN
+               UPDATE write_meter SET bytes=bytes+length(new.payload)+length(new.nonce); END;",
+        ).map_err(failure)?;
         let storage = Self {
             config,
             state: Arc::new(Mutex::new(State {
                 conn,
                 packs: BTreeMap::new(),
                 locations: HashMap::new(),
+                loaded_sessions: BTreeSet::new(),
                 version: -1,
                 operations: BTreeMap::new(),
             })),
@@ -167,6 +207,7 @@ impl PackedSqliteJournalStorage {
     /// members. No hook is automatically wired into production runtime code.
     pub fn post_terminal(&self, session: &SessionId) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
+        state.session(session)?;
         let State {
             conn,
             packs,
@@ -185,8 +226,17 @@ impl PackedSqliteJournalStorage {
         let mut updates = Updates::new();
         repack(&tx, packs, &mut updates, session, false)?;
         tx.commit().map_err(failure)?;
-        state.update(updates);
+        state.update(session, updates);
         Ok(())
+    }
+    /// Cumulative committed object/operation pack payload + nonce bytes written
+    /// by this connection, including intermediate rewrites. Excludes metadata,
+    /// SQLite page overhead and VACUUM; rolled-back writes do not contribute.
+    pub fn pack_write_bytes(&self) -> Result<u64, RuntimeError> {
+        self.lock()?
+            .conn
+            .query_row("SELECT bytes FROM write_meter", [], |r| r.get(0))
+            .map_err(failure)
     }
     fn lock(&self) -> Result<MutexGuard<'_, State>, RuntimeError> {
         let mut state = self.state.lock().map_err(failure)?;
@@ -267,7 +317,33 @@ fn fail(write: &JournalWrite, cut: JournalCommitFailurePoint) -> Result<(), Runt
         Ok(())
     }
 }
+fn split_packs(objects: Vec<JournalStoredObject>) -> Result<Vec<Pack>, RuntimeError> {
+    let mut out = Vec::new();
+    let mut pack = Pack::default();
+    let mut bytes = 0;
+    for object in objects {
+        if object.bytes.len() > LOGICAL_PACK_CAP {
+            return Err(conflict());
+        }
+        if bytes + object.bytes.len() > LOGICAL_PACK_CAP {
+            out.push(std::mem::take(&mut pack));
+            bytes = 0;
+        }
+        bytes += object.bytes.len();
+        pack.objects.push(object);
+    }
+    if !pack.objects.is_empty() {
+        out.push(pack);
+    }
+    Ok(out)
+}
+fn pack_bytes(pack: &Pack) -> usize {
+    pack.objects.iter().map(|o| o.bytes.len()).sum()
+}
 fn save_pack(tx: &Connection, pid: i64, owner: &str, pack: &Pack) -> Result<(), RuntimeError> {
+    if pack_bytes(pack) > LOGICAL_PACK_CAP {
+        return Err(conflict());
+    }
     tx.execute(
         "INSERT OR REPLACE INTO pack(pack_id,owner,payload,nonce) VALUES (?,?,?,?)",
         params![pid, owner, pack.encoded()?, [0u8; 24].as_slice()],
@@ -277,6 +353,9 @@ fn save_pack(tx: &Connection, pid: i64, owner: &str, pack: &Pack) -> Result<(), 
 }
 // Replacing a pack uses UPDATE: REPLACE would cascade-delete other memberships.
 fn rewrite_pack(tx: &Connection, pid: i64, pack: &Pack) -> Result<(), RuntimeError> {
+    if pack_bytes(pack) > LOGICAL_PACK_CAP {
+        return Err(conflict());
+    }
     tx.execute(
         "UPDATE pack SET payload=? WHERE pack_id=?",
         params![pack.encoded()?, pid],
@@ -284,13 +363,14 @@ fn rewrite_pack(tx: &Connection, pid: i64, pack: &Pack) -> Result<(), RuntimeErr
     .map_err(failure)?;
     Ok(())
 }
-// Delete dead bodies immediately, even when S2 is off. Receipts must describe
-// bodies absent from the committed SQLite contents, not merely cleared bits.
+// Rewrite at 25% dead canonical bytes, even when S2 is off. Retired session
+// collection forces a purge. Membership bits hide deferred bytes immediately.
 fn purge(
     tx: &Transaction<'_>,
     packs: &BTreeMap<i64, Arc<Pack>>,
     updates: &mut Updates,
     touched: &BTreeSet<i64>,
+    force: bool,
 ) -> Result<JournalApplyReceipt, RuntimeError> {
     let mut receipt = JournalApplyReceipt::default();
     for &pid in touched {
@@ -312,6 +392,14 @@ fn purge(
             .filter(|&slot| holders.iter().any(|h| bit(&h.3, slot)))
             .collect();
         if kept.len() == pack.objects.len() {
+            continue;
+        }
+        let live_bytes: usize = kept
+            .iter()
+            .map(|&slot| pack.objects[slot].bytes.len())
+            .sum();
+        let dead_bytes = pack_bytes(pack) - live_bytes;
+        if !force && dead_bytes * 4 < pack_bytes(pack) {
             continue;
         }
         for (slot, object) in pack.objects.iter().enumerate() {
@@ -344,9 +432,8 @@ fn purge(
     }
     Ok(receipt)
 }
-// Every selected pack is moved together with ALL its membership holders,
-// including sessions other than the maintenance target. This permits physical
-// cross-session sharing while keeping collection safe and session scoped.
+// Move all domain bitmaps together within one session. No cross-session
+// lookup or body sharing participates in admission, purge or repacking.
 fn current_pack<'a>(
     packs: &'a BTreeMap<i64, Arc<Pack>>,
     updates: &'a Updates,
@@ -364,7 +451,7 @@ fn merge(
     updates: &mut Updates,
     session: &SessionId,
     selected: &[i64],
-) -> Result<i64, RuntimeError> {
+) -> Result<Vec<i64>, RuntimeError> {
     let mut objects = BTreeMap::new();
     let mut holders = BTreeMap::<(String, u8, String), BTreeSet<JournalObjectId>>::new();
     for &pid in selected {
@@ -397,30 +484,49 @@ fn merge(
             );
         }
     }
-    let pid = *selected.iter().min().ok_or_else(conflict)?;
+    let mut next_pid: i64 = tx
+        .query_row("SELECT coalesce(max(pack_id),0)+1 FROM pack", [], |r| {
+            r.get(0)
+        })
+        .map_err(failure)?;
     for old in selected {
         tx.execute("DELETE FROM pack WHERE pack_id=?", [old])
             .map_err(failure)?;
         updates.insert(*old, None);
     }
-    let pack = Pack {
-        objects: objects.into_values().collect(),
-    };
-    save_pack(tx, pid, session.as_str(), &pack)?;
-    for ((storage, role, session), ids) in holders {
-        let mut bits = vec![0; pack.objects.len().div_ceil(8)];
-        for (slot, o) in pack.objects.iter().enumerate() {
-            set(&mut bits, slot, ids.contains(&o.id));
+    let mut result = Vec::new();
+    for (index, pack) in split_packs(objects.into_values().collect())?
+        .into_iter()
+        .enumerate()
+    {
+        let pid = selected.get(index).copied().unwrap_or_else(|| {
+            let id = next_pid;
+            next_pid += 1;
+            id
+        });
+        save_pack(tx, pid, session.as_str(), &pack)?;
+        for ((storage, role, holder_session), ids) in &holders {
+            if holder_session != session.as_str() {
+                return Err(conflict());
+            }
+            let mut bits = vec![0; pack.objects.len().div_ceil(8)];
+            for (slot, o) in pack.objects.iter().enumerate() {
+                set(&mut bits, slot, ids.contains(&o.id));
+            }
+            if bits.iter().any(|b| *b != 0) {
+                tx.execute(
+                    "INSERT INTO membership VALUES (?,?,?,?,?)",
+                    params![storage, role, holder_session, pid, bits],
+                )
+                .map_err(failure)?;
+            }
         }
-        tx.execute(
-            "INSERT INTO membership VALUES (?,?,?,?,?)",
-            params![storage, role, session, pid, bits],
-        )
-        .map_err(failure)?;
+        updates.insert(pid, Some(Arc::new(pack)));
+        result.push(pid);
     }
-    updates.insert(pid, Some(Arc::new(pack)));
-    Ok(pid)
+    Ok(result)
 }
+
 fn repack(
     tx: &Transaction<'_>,
     packs: &BTreeMap<i64, Arc<Pack>>,
@@ -430,7 +536,7 @@ fn repack(
 ) -> Result<(), RuntimeError> {
     let mut ids: Vec<i64> = {
         let mut st = tx
-            .prepare("SELECT DISTINCT pack_id FROM membership WHERE session=? ORDER BY pack_id")
+            .prepare("SELECT pack_id FROM pack WHERE owner=? ORDER BY pack_id")
             .map_err(failure)?;
         st.query_map([session.as_str()], |r| r.get(0))
             .map_err(failure)?
@@ -440,9 +546,34 @@ fn repack(
     if ids.is_empty() {
         return Ok(());
     }
+    // Repartitioning deferred dead bodies could concentrate them above the
+    // bound in one output pack. Leave those packs sealed until purge rewrites
+    // them; all selected merge inputs must be fully live.
+    let mut live = Vec::new();
+    for pid in ids {
+        let mut st = tx
+            .prepare("SELECT bits FROM membership WHERE pack_id=?")
+            .map_err(failure)?;
+        let holders = st
+            .query_map([pid], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(failure)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(failure)?;
+        let pack = current_pack(packs, updates, pid)?;
+        if (0..pack.objects.len()).all(|slot| holders.iter().any(|bits| bit(bits, slot))) {
+            live.push(pid);
+        }
+    }
+    ids = live;
     if base {
-        // A singleton is already in kind order on disk; purge has removed all
-        // dead bodies. Multiple packs become one kind-ordered base.
+        // Stable large packs stay sealed. Only small packs and packs this
+        // transaction already purged participate in the bounded base rewrite.
+        ids.retain(|pid| {
+            updates.contains_key(pid)
+                || packs
+                    .get(pid)
+                    .is_some_and(|p| pack_bytes(p) < SMALL_PACK_CAP)
+        });
         if ids.len() > 1 {
             merge(tx, packs, updates, session, &ids)?;
         }
@@ -458,12 +589,22 @@ fn repack(
                     .max(4096);
                 tiers.entry(bytes.ilog2()).or_default().push(pid);
             }
-            let Some(pair) = tiers.values().find(|v| v.len() > 1).map(|v| [v[0], v[1]]) else {
+            let Some(pair) = tiers
+                .values()
+                .filter(|v| v.len() > 1)
+                .map(|v| [v[0], v[1]])
+                .find(|pair| {
+                    pair.iter()
+                        .map(|pid| current_pack(packs, updates, *pid).map(pack_bytes))
+                        .collect::<Result<Vec<_>, _>>()
+                        .is_ok_and(|sizes| sizes.iter().sum::<usize>() <= LOGICAL_PACK_CAP)
+                })
+            else {
                 break;
             };
-            let pid = merge(tx, packs, updates, session, &pair)?;
+            let merged = merge(tx, packs, updates, session, &pair)?;
             ids.retain(|id| !pair.contains(id));
-            ids.push(pid);
+            ids.extend(merged);
         }
     }
     Ok(())
@@ -480,32 +621,56 @@ fn append_operation(
 ) -> Result<(), RuntimeError> {
     let mut records = vec![metadata::Operation::from(op)];
     for tier in 0..64 {
-        let old:Option<Vec<u8>>=tx.query_row("SELECT payload FROM operation_pack WHERE storage=? AND role=? AND session=? AND tier=?",params![d.storage_id.as_str(),role(d),s.as_str(),tier],|r|r.get(0)).optional().map_err(failure)?;
+        let old: Option<Vec<u8>> = tx.query_row(
+            "SELECT payload FROM operation_pack WHERE storage=? AND role=? AND session=? AND tier=?",
+            params![d.storage_id.as_str(), role(d), s.as_str(), tier], |r| r.get(0)
+        ).optional().map_err(failure)?;
         if let Some(old) = old {
-            records.extend(codec::decode::<Vec<metadata::Operation>>(&old)?);
-            tx.execute(
-                "DELETE FROM operation_pack WHERE storage=? AND role=? AND session=? AND tier=?",
-                params![d.storage_id.as_str(), role(d), s.as_str(), tier],
-            )
-            .map_err(failure)?;
-        } else {
-            records.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)));
-            tx.execute(
-                "INSERT INTO operation_pack VALUES (?,?,?,?,?,?)",
-                params![
-                    d.storage_id.as_str(),
-                    role(d),
-                    s.as_str(),
-                    tier,
-                    codec::encode(&records)?,
-                    [0u8; 24].as_slice()
-                ],
-            )
-            .map_err(failure)?;
-            return Ok(());
+            let mut combined = records.clone();
+            combined.extend(codec::decode::<Vec<metadata::Operation>>(&old)?);
+            if serde_json::to_vec(&combined).map_err(failure)?.len() <= LOGICAL_PACK_CAP {
+                records = combined;
+                tx.execute("DELETE FROM operation_pack WHERE storage=? AND role=? AND session=? AND tier=?",
+                    params![d.storage_id.as_str(), role(d), s.as_str(), tier]).map_err(failure)?;
+                continue;
+            }
+            // A full bounded segment stays sealed. Overflow keys never take
+            // part in binary carry, so no operation pack can grow past the cap.
+            let segment: u32 = tx.query_row(
+                "SELECT max(64,coalesce(max(tier),63)+1) FROM operation_pack WHERE storage=? AND role=? AND session=?",
+                params![d.storage_id.as_str(), role(d), s.as_str()], |r| r.get(0)
+            ).map_err(failure)?;
+            return save_operations(tx, d, s, segment, records);
         }
+        return save_operations(tx, d, s, tier, records);
     }
     Err(conflict())
+}
+fn save_operations(
+    tx: &Transaction<'_>,
+    d: &JournalDomain,
+    s: &SessionId,
+    tier: u32,
+    mut records: Vec<metadata::Operation>,
+) -> Result<(), RuntimeError> {
+    records.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)));
+    let raw = serde_json::to_vec(&records).map_err(failure)?;
+    if raw.len() > LOGICAL_PACK_CAP {
+        return Err(conflict());
+    }
+    tx.execute(
+        "INSERT INTO operation_pack VALUES (?,?,?,?,?,?)",
+        params![
+            d.storage_id.as_str(),
+            role(d),
+            s.as_str(),
+            tier,
+            codec::seal(&raw)?,
+            [0u8; 24].as_slice()
+        ],
+    )
+    .map_err(failure)?;
+    Ok(())
 }
 
 // Prune the durable payloads in the same fenced transaction as collection.
@@ -563,6 +728,43 @@ fn prune_operations(
 
 #[async_trait]
 impl JournalStorage for PackedSqliteJournalStorage {
+    fn sharing(&self) -> JournalBodySharing {
+        JournalBodySharing::PerSession
+    }
+    async fn retained_bytes(&self, d: &JournalDomain) -> Result<Option<u64>, RuntimeError> {
+        let mut state = self.lock()?;
+        let sessions: Vec<SessionId> = {
+            let mut st = state
+                .conn
+                .prepare(
+                    "SELECT session FROM session WHERE storage=?1 AND role=?2
+                 UNION SELECT session FROM membership WHERE storage=?1 AND role=?2",
+                )
+                .map_err(failure)?;
+            st.query_map(params![d.storage_id.as_str(), role(d)], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(failure)?
+            .map(|r| r.map(SessionId::new).map_err(failure))
+            .collect::<Result<_, _>>()?
+        };
+        let mut bytes = 0;
+        for session in sessions {
+            state.session(&session)?;
+            let mut st = state
+                .conn
+                .prepare("SELECT pack_id FROM pack WHERE owner=?")
+                .map_err(failure)?;
+            for pid in st
+                .query_map([session.as_str()], |r| r.get::<_, i64>(0))
+                .map_err(failure)?
+            {
+                bytes += pack_bytes(&state.packs[&pid.map_err(failure)?]) as u64;
+            }
+        }
+        state.consistent()?;
+        Ok(Some(bytes))
+    }
     async fn load(
         &self,
         d: &JournalDomain,
@@ -576,12 +778,14 @@ impl JournalStorage for PackedSqliteJournalStorage {
         s: &SessionId,
         ids: &[JournalObjectId],
     ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        state.session(s)?;
         let members = directory(&state.conn, d, s)?;
         state.consistent()?;
         ids.iter()
             .map(|id| {
-                let Some(&(pid, _)) = state.locations.get(id) else {
+                let Some(&(pid, _)) = state.locations.get(&(s.as_str().to_owned(), id.clone()))
+                else {
                     return Ok(None);
                 };
                 let Some(bits) = members.get(&pid) else {
@@ -598,7 +802,8 @@ impl JournalStorage for PackedSqliteJournalStorage {
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Vec<JournalObjectId>, RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        state.session(s)?;
         let mut ids = Vec::new();
         let directory = directory(&state.conn, d, s)?;
         state.consistent()?;
@@ -621,7 +826,8 @@ impl JournalStorage for PackedSqliteJournalStorage {
         s: &SessionId,
         op: &JournalOperationId,
     ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        state.session(s)?;
         state.consistent()?;
         Ok(state
             .operations
@@ -704,12 +910,14 @@ impl JournalStorage for PackedSqliteJournalStorage {
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         let mut state = self.lock()?;
+        state.session(&write.session)?;
         let State {
             conn,
             packs,
             locations,
             version,
             operations,
+            ..
         } = &mut *state;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -731,6 +939,9 @@ impl JournalStorage for PackedSqliteJournalStorage {
         }
         // Validate identities and immutable duplicates before performing any SQL.
         for o in &write.objects.objects {
+            if o.bytes.len() > LOGICAL_PACK_CAP {
+                return Err(conflict());
+            }
             if (JournalObject {
                 id: o.id.clone(),
                 bytes: o.bytes.to_vec(),
@@ -740,7 +951,7 @@ impl JournalStorage for PackedSqliteJournalStorage {
             {
                 return Err(conflict());
             }
-            if let Some(&(pid, slot)) = locations.get(&o.id) {
+            if let Some(&(pid, slot)) = locations.get(&(s.as_str().to_owned(), o.id.clone())) {
                 if packs[&pid].objects[slot].bytes != o.bytes {
                     return Err(conflict());
                 }
@@ -748,12 +959,12 @@ impl JournalStorage for PackedSqliteJournalStorage {
         }
         let mut updates = Updates::new();
         let mut directory = directory(&tx, d, s)?;
-        let pid: i64 = tx
+        let mut next_pid: i64 = tx
             .query_row("SELECT coalesce(max(pack_id),0)+1 FROM pack", [], |r| {
                 r.get(0)
             })
             .map_err(failure)?;
-        let mut new = Pack::default();
+        let mut admitted = HashMap::new();
         for (step, cut) in [
             JournalCommitFailurePoint::AfterObjects,
             JournalCommitFailurePoint::AfterCheckpoint,
@@ -763,46 +974,41 @@ impl JournalStorage for PackedSqliteJournalStorage {
         .into_iter()
         .enumerate()
         {
+            let mut new = Vec::new();
+            let mut changed = BTreeSet::new();
             for o in write.objects.objects.iter().filter(|o| match o.kind {
                 JournalObjectKind::Checkpoint => step == 1,
                 JournalObjectKind::Batch => step == 2,
                 JournalObjectKind::Head => step == 3,
                 _ => step == 0,
             }) {
-                if let Some(&(existing, slot)) = locations.get(&o.id) {
+                if let Some(&(existing, slot)) =
+                    locations.get(&(s.as_str().to_owned(), o.id.clone()))
+                {
                     let bits = directory
                         .entry(existing)
                         .or_insert_with(|| vec![0; packs[&existing].objects.len().div_ceil(8)]);
                     set(bits, slot, true);
-                    put_bits(&tx, d, s, existing, bits)?;
+                    changed.insert(existing);
                 } else {
-                    new.objects.push(o.clone());
+                    new.push(o.clone());
                 }
             }
-            if !new.objects.is_empty() {
-                new.objects.sort_by(|a, b| a.id.cmp(&b.id));
-                if step == 0 {
-                    save_pack(&tx, pid, s.as_str(), &new)?;
-                } else {
-                    let exists: bool = tx
-                        .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM pack WHERE pack_id=?)",
-                            [pid],
-                            |r| r.get(0),
-                        )
-                        .map_err(failure)?;
-                    if exists {
-                        rewrite_pack(&tx, pid, &new)?;
-                    } else {
-                        save_pack(&tx, pid, s.as_str(), &new)?;
-                    }
-                }
-                let mut bits = vec![255; new.objects.len().div_ceil(8)];
-                if new.objects.len() % 8 != 0 {
-                    *bits.last_mut().expect("nonempty") = (1 << (new.objects.len() % 8)) - 1;
+            for pid in changed {
+                put_bits(&tx, d, s, pid, &directory[&pid])?;
+            }
+            for pack in split_packs(new)? {
+                let pid = next_pid;
+                next_pid += 1;
+                save_pack(&tx, pid, s.as_str(), &pack)?;
+                let mut bits = vec![0; pack.objects.len().div_ceil(8)];
+                for (slot, object) in pack.objects.iter().enumerate() {
+                    set(&mut bits, slot, true);
+                    admitted.insert(object.id.clone(), (pid, slot));
                 }
                 put_bits(&tx, d, s, pid, &bits)?;
                 directory.insert(pid, bits);
+                updates.insert(pid, Some(Arc::new(pack)));
             }
             if step == 2 {
                 fail(&write, cut)?;
@@ -871,9 +1077,6 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 fail(&write, cut)?;
             }
         }
-        if !new.objects.is_empty() {
-            updates.insert(pid, Some(Arc::new(new)));
-        }
         if let Some(op) = &write.operation {
             let key = (
                 d.storage_id.as_str().to_owned(),
@@ -895,14 +1098,10 @@ impl JournalStorage for PackedSqliteJournalStorage {
         fail(&write, JournalCommitFailurePoint::AfterIdempotency)?;
         let mut touched = BTreeSet::new();
         for id in &write.release {
-            let location = locations.get(id).copied().or_else(|| {
-                updates.get(&pid).and_then(|p| p.as_ref()).and_then(|p| {
-                    p.objects
-                        .binary_search_by(|o| o.id.cmp(id))
-                        .ok()
-                        .map(|slot| (pid, slot))
-                })
-            });
+            let location = locations
+                .get(&(s.as_str().to_owned(), id.clone()))
+                .copied()
+                .or_else(|| admitted.get(id).copied());
             if let Some((pid, slot)) = location {
                 if let Some(bits) = directory.get_mut(&pid) {
                     if bit(bits, slot) {
@@ -913,12 +1112,25 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 }
             }
         }
-        let receipt = purge(&tx, packs, &mut updates, &touched)?;
+        let retired = write.kind == JournalWriteKind::Collect
+            && load(&tx, d, s)?.is_some_and(|r| r.retirement.is_some());
+        if retired {
+            let mut st = tx
+                .prepare("SELECT pack_id FROM pack WHERE owner=?")
+                .map_err(failure)?;
+            touched.extend(
+                st.query_map([s.as_str()], |r| r.get::<_, i64>(0))
+                    .map_err(failure)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(failure)?,
+            );
+        }
+        let receipt = purge(&tx, packs, &mut updates, &touched, retired)?;
         if self.config.repack_on_collection && write.kind == JournalWriteKind::Collect {
             repack(&tx, packs, &mut updates, s, true)?;
         }
         tx.commit().map_err(failure)?;
-        state.update(updates);
+        state.update(s, updates);
         if let Some(op) = &write.operation {
             state.operations.insert(
                 (
@@ -943,6 +1155,18 @@ impl JournalStorage for PackedSqliteJournalStorage {
     }
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
+        let sessions: Vec<SessionId> = {
+            let mut st = state.conn.prepare("SELECT DISTINCT session FROM membership WHERE storage=? AND role=? ORDER BY session").map_err(failure)?;
+            st.query_map(params![domain.storage_id.as_str(), role(domain)], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(failure)?
+            .map(|r| r.map(SessionId::new).map_err(failure))
+            .collect::<Result<_, _>>()?
+        };
+        for session in &sessions {
+            state.session(session)?;
+        }
         let State {
             conn,
             packs,
@@ -958,21 +1182,16 @@ impl JournalStorage for PackedSqliteJournalStorage {
         if current != *version {
             return Err(conflict());
         }
-        let sessions: Vec<String> = {
-            let mut st=tx.prepare("SELECT DISTINCT session FROM membership WHERE storage=? AND role=? ORDER BY session").map_err(failure)?;
-            st.query_map(params![domain.storage_id.as_str(), role(domain)], |r| {
-                r.get(0)
-            })
-            .map_err(failure)?
-            .map(|r| r.map_err(failure))
-            .collect::<Result<_, _>>()?
-        };
-        let mut updates = Updates::new();
+        let mut changes = Vec::new();
         for session in sessions {
-            repack(&tx, packs, &mut updates, &SessionId::new(session), true)?;
+            let mut updates = Updates::new();
+            repack(&tx, packs, &mut updates, &session, true)?;
+            changes.push((session, updates));
         }
         tx.commit().map_err(failure)?;
-        state.update(updates);
+        for (session, updates) in changes {
+            state.update(&session, updates);
+        }
         state
             .conn
             .execute_batch(

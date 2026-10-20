@@ -135,12 +135,14 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         Ok(())
     }
-    /// Logical immutable-object bytes in sessions observed by this engine or
-    /// still marked dirty by storage, deduplicated within this domain.
-    /// Diagnostic only: storage cannot enumerate unseen clean sessions through
-    /// the journal contract, and this is not a physical on-disk byte metric.
+    /// Canonical retained-body bytes from storage when available (including
+    /// deferred dead copies); otherwise live bytes in observed/dirty sessions,
+    /// deduplicated within this domain. Diagnostic only, not on-disk file size.
     pub async fn retained_bytes(&self) -> Result<u64, RuntimeError> {
         let _gate = self.gate.lock().await;
+        if let Some(bytes) = self.storage.retained_bytes(&self.domain).await? {
+            return Ok(bytes);
+        }
         let bytes = self.observed_objects().await?.bytes as u64;
         Ok(bytes)
     }

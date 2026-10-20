@@ -70,6 +70,12 @@ fn trace_key(d: &JournalDomain) -> String {
 }
 #[async_trait]
 impl JournalStorage for TracingStorage {
+    fn sharing(&self) -> JournalBodySharing {
+        self.inner.sharing()
+    }
+    async fn retained_bytes(&self, d: &JournalDomain) -> Result<Option<u64>, RuntimeError> {
+        self.inner.retained_bytes(d).await
+    }
     async fn load(
         &self,
         d: &JournalDomain,
@@ -326,6 +332,8 @@ struct Native {
     ordinary: Arc<Measuring>,
     protected: Arc<Measuring>,
     storage: Arc<PackedSqliteJournalStorage>,
+    per_turn_collection: bool,
+    maintenance: Mutex<Maintenance>,
 }
 #[derive(Debug)]
 struct SqliteFile {
@@ -339,16 +347,56 @@ impl Drop for SqliteFile {
         }
     }
 }
-trait TerminalMaintenance {
-    fn terminal(&self, session: &SessionId);
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct Maintenance {
+    pub(crate) collection_calls: usize,
+    pub(crate) collection_pack_bytes_written: u64,
+    pub(crate) max_collection_pack_bytes_written: u64,
+    pub(crate) turn_pack_bytes_written: Vec<u64>,
 }
-impl TerminalMaintenance for Native {
-    fn terminal(&self, session: &SessionId) {
-        self.storage.post_terminal(session).unwrap();
+#[async_trait]
+trait TerminalMaintenance: Sync {
+    async fn terminal(&self, session: &SessionId);
+}
+impl Native {
+    async fn collect(&self) {
+        for journal in [&self.ordinary.inner, &self.protected.inner] {
+            journal.enable_collection().unwrap();
+            let before = self.storage.pack_write_bytes().unwrap();
+            journal
+                .collect(JournalGcRequest {
+                    storage_id: journal.storage_id(),
+                    expected_root_epoch: journal.root_epoch().unwrap(),
+                    max_objects: u64::MAX,
+                })
+                .await
+                .unwrap();
+            let written = self.storage.pack_write_bytes().unwrap() - before;
+            let mut stats = self.maintenance.lock().unwrap();
+            stats.collection_calls += 1;
+            stats.collection_pack_bytes_written += written;
+            stats.max_collection_pack_bytes_written =
+                stats.max_collection_pack_bytes_written.max(written);
+        }
     }
 }
+#[async_trait]
+impl TerminalMaintenance for Native {
+    async fn terminal(&self, session: &SessionId) {
+        self.storage.post_terminal(session).unwrap();
+        if self.per_turn_collection {
+            self.collect().await;
+        }
+        self.maintenance
+            .lock()
+            .unwrap()
+            .turn_pack_bytes_written
+            .push(self.storage.pack_write_bytes().unwrap());
+    }
+}
+#[async_trait]
 impl TerminalMaintenance for Legacy {
-    fn terminal(&self, _: &SessionId) {}
+    async fn terminal(&self, _: &SessionId) {}
 }
 
 #[async_trait]
@@ -669,7 +717,7 @@ async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'static
             text.prose(100, 800)
         };
         session.run(UserInput::text(input)).await.unwrap();
-        store.terminal(&id);
+        store.terminal(&id).await;
         if fixture == "C" && turn + 1 != turns {
             session.shutdown().await.unwrap();
         }
@@ -694,9 +742,20 @@ pub(crate) struct Fixture {
     pub(crate) legacy: LegacyRow,
     pub(crate) packed_before: super::disk::Size,
     pub(crate) packed_after: super::disk::Size,
+    pub(crate) per_turn_collection: bool,
+    pub(crate) cumulative_pack_bytes_written: u64,
+    pub(crate) maintenance: Maintenance,
     _file: Arc<SqliteFile>,
 }
 pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
+    build_with_collection(name, n, tools, false).await
+}
+pub(crate) async fn build_with_collection(
+    name: &str,
+    n: usize,
+    tools: bool,
+    per_turn_collection: bool,
+) -> Fixture {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "packed-fixture-{}-{}.sqlite",
@@ -716,6 +775,8 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
         ordinary: Arc::new(Measuring::new("ordinary", tracing.clone())),
         protected: Arc::new(Measuring::new("protected", tracing)),
         storage,
+        per_turn_collection,
+        maintenance: Mutex::new(Maintenance::default()),
     });
     let snapshot = drive(native.clone(), name, n, tools).await;
     let legacy = Arc::new(Legacy::default());
@@ -745,17 +806,7 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
         })
         .collect();
     let packed_before = super::disk::existing(&file.path, file.empty);
-    for journal in [&native.ordinary.inner, &native.protected.inner] {
-        journal.enable_collection().unwrap();
-        journal
-            .collect(JournalGcRequest {
-                storage_id: journal.storage_id(),
-                expected_root_epoch: journal.root_epoch().unwrap(),
-                max_objects: u64::MAX,
-            })
-            .await
-            .unwrap();
-    }
+    native.collect().await;
     let after = vec![
         ("ordinary", native.ordinary.export(&snapshot.id).await),
         ("protected", native.protected.export(&snapshot.id).await),
@@ -767,7 +818,16 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
             .filter(|batch| batch.domain == *domain)
             .flat_map(|b| b.ids.iter().cloned())
             .collect();
-        assert_eq!(ids.len(), export.objects.len());
+        if !per_turn_collection {
+            assert_eq!(ids.len(), export.objects.len());
+        } else {
+            assert!(
+                export
+                    .objects
+                    .iter()
+                    .all(|(_, object)| ids.contains(&object.id))
+            );
+        }
     }
     let packed_after = super::disk::existing(&file.path, file.empty);
     let row = legacy.0.lock().unwrap().clone();
@@ -782,6 +842,9 @@ pub(crate) async fn build(name: &str, n: usize, tools: bool) -> Fixture {
         legacy: row,
         packed_before,
         packed_after,
+        per_turn_collection,
+        cumulative_pack_bytes_written: native.storage.pack_write_bytes().unwrap(),
+        maintenance: std::mem::take(&mut *native.maintenance.lock().unwrap()),
         _file: file,
     }
 }

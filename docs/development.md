@@ -139,9 +139,18 @@ framing, encryption, flushes and process locking remain host responsibilities.
 
 The storage boundary supplies membership-scoped reads and one atomic fenced
 `JournalWrite` per write. `apply` rechecks `(revision, writer_epoch)` inside
-its transaction, persists engine metadata verbatim, and deletes bodies only
-at the last membership across every domain/session. `JournalApplyReceipt`
-counts canonical body bytes actually deleted. Session records, operation
+its transaction, persists engine metadata verbatim, and reclaims unreferenced copies
+within its declared `JournalBodySharing` scope: `Global` (the compatibility
+default) or `PerSession` (independent session copies, optionally shared across
+domains). Every surviving membership remains readable; non-members never are.
+`JournalApplyReceipt`
+counts canonical body bytes actually deleted, including previously deferred
+bodies. Packs may retain dead bytes below a documented threshold of at most
+25%; reaching it or collecting a retired session purges dead bytes. Reads stop
+at membership release, before any deferred physical rewrite. Deferred adapters
+supply the optional `JournalStorage::retained_bytes(domain)` canonical-byte
+diagnostic, so the engine includes unserved bytes until their physical removal;
+its default `None` preserves existing membership-based diagnostics. Session records, operation
 results, pins, retained-root catalogs and dirty flags are durable; leases,
 writer slots and the root/pin epoch remain process-local. An async engine
 write gate serializes preparation/publication without holding a storage
@@ -477,31 +486,49 @@ head/fence/engine metadata, pins, catalogs, membership, object packs and
 operation packs are included. The seal model adds a 24-byte nonce and 16-byte
 tag to real zstd-compressed bytes; it is not a production cipher.
 
-Measured on 2026-10-19 with root-only pins and S1–S5, including real collection
-pruning. Native after/L2 is the gate metric; L1 and layout simulators are
-separate diagnostics. All 13 primary cases pass. B/N=4000 is 1.49096× plain
-and 1.62353× tool, so the ≤2.0× L2 gate keeps format levers 5.1–5.4 unbuilt.
-Only plain meets the optional 1.5× aim; schema 4 is unchanged.
+Measured 2026-10-20 UTC after Q4 alignment. The reference declares
+`PerSession`, uses lazy session indexes, caps packs at 1 MiB and purges at
+25% dead canonical bytes. Base repack selects only small or already-purged
+packs; stable large packs stay sealed. Collection-at-end results:
 
-| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A | 100 | plain | 0 | 8192 | 90112 | 57344 | 11.00000 | 7.00000 |
-| A | 100 | tool | 0 | 8192 | 118784 | 61440 | 14.50000 | 7.50000 |
-| A | 1000 | plain | 20480 | 53248 | 348160 | 303104 | 6.53846 | 5.69231 |
-| A | 1000 | tool | 24576 | 53248 | 372736 | 307200 | 7.00000 | 5.76923 |
-| A | 4000 | plain | 90112 | 204800 | 1126400 | 1089536 | 5.50000 | 5.32000 |
-| A | 4000 | tool | 94208 | 208896 | 1155072 | 1089536 | 5.52941 | 5.21569 |
-| B | 100 | plain | 20480 | 40960 | 135168 | 86016 | 3.30000 | 2.10000 |
-| B | 100 | tool | 20480 | 45056 | 151552 | 94208 | 3.36364 | 2.09091 |
-| B | 1000 | plain | 159744 | 335872 | 606208 | 540672 | 1.80488 | 1.60976 |
-| B | 1000 | tool | 163840 | 339968 | 671744 | 589824 | 1.97590 | 1.73494 |
-| B | 4000 | plain | 655360 | 1359872 | 2248704 | 2027520 | 1.65361 | 1.49096 |
-| B | 4000 | tool | 655360 | 1392640 | 2469888 | 2260992 | 1.77353 | 1.62353 |
-| C | 1000 | tool | 454656 | 942080 | 11071488 | 962560 | 11.75217 | 1.02174 |
+| Fixture | N | Turn | L1 bytes | L2 bytes | Before bytes | Final bytes | Before/L2 | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 100 | plain | 0 | 8192 | 90112 | 57344 | 11.00000 | 7.00000 | 415555 | 86181 |
+| A | 100 | tool | 0 | 8192 | 118784 | 61440 | 14.50000 | 7.50000 | 541851 | 91181 |
+| A | 1000 | plain | 20480 | 53248 | 344064 | 311296 | 6.46154 | 5.84615 | 750200 | 27274 |
+| A | 1000 | tool | 24576 | 53248 | 356352 | 307200 | 6.69231 | 5.76923 | 1103115 | 129458 |
+| A | 4000 | plain | 90112 | 204800 | 1208320 | 1179648 | 5.90000 | 5.76000 | 1365409 | 27200 |
+| A | 4000 | tool | 94208 | 208896 | 1224704 | 1179648 | 5.86275 | 5.64706 | 1522276 | 32148 |
+| B | 100 | plain | 20480 | 40960 | 135168 | 102400 | 3.30000 | 2.50000 | 415920 | 61242 |
+| B | 100 | tool | 20480 | 45056 | 155648 | 94208 | 3.45455 | 2.09091 | 802616 | 161358 |
+| B | 1000 | plain | 159744 | 335872 | 622592 | 577536 | 1.85366 | 1.71951 | 842386 | 33636 |
+| B | 1000 | tool | 163840 | 339968 | 679936 | 622592 | 2.00000 | 1.83133 | 1494382 | 288266 |
+| B | 4000 | plain | 655360 | 1359872 | 2387968 | 2183168 | 1.75602 | 1.60542 | 3053696 | 314148 |
+| B | 4000 | tool | 655360 | 1392640 | 2719744 | 2494464 | 1.95294 | 1.79118 | 3533286 | 323123 |
+| C | 1000 | tool | 454656 | 942080 | 11993088 | 1228800 | 12.73043 | 1.30435 | 106631979 | 2257327 |
 
+Collection after each turn:
 
+| Fixture | N | Turn | L2 bytes | Final bytes | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| B | 1000 | plain | 335872 | 577536 | 1.71951 | 845627 | 33297 |
+| B | 1000 | tool | 339968 | 622592 | 1.83133 | 1491335 | 288771 |
+| B | 4000 | plain | 1359872 | 2183168 | 1.60542 | 3057083 | 313815 |
+| B | 4000 | tool | 1392640 | 2494464 | 1.79118 | 3540392 | 323123 |
+| C | 1000 | tool | 942080 | 1204224 | 1.27826 | 144922993 | 368800 |
 
-NOT MET: the supplemental growing C/N=4000 report did not complete within its reserved wall-clock limit. The required primary C script is measured at N=1000; no N=4000 value is estimated.
+B/N=4000 passes the required **≤2.0× L2** gate: collect-at-end = **1.60542× plain / 1.79118× tool**; per-turn = **1.60542× plain / 1.79118× tool**. All four miss the optional 1.5× aim. Group 5 stays unbuilt; journal schema 4 is unchanged.
+
+Cumulative per-turn B pack writes grow **3.615× plain / 2.374× tool** when seeded N grows 4× (1000 → 4000). C/1000 contributes 250 turn samples in the raw JSON. **Write verdict: O(N) in admitted bytes for these bounded turn shapes; no O(N²) whole-history pack rewrites.** Fixed 1 MiB packs bound merge tiers; stable large packs stay sealed. At a 25% dead threshold, survivor rewrites are charged to at most three live bytes per dead byte. Replay-window maintenance is bounded. This verdict concerns pack payload/nonce writes; the chosen metric excludes metadata, SQLite page overhead and VACUUM.
+
+Supplemental C/N=4000, collection at the end (one release run):
+
+| Fixture | N | Turn | L2 bytes | Final bytes | Final/L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| C | 4000 | tool | 3977216 | 4886528 | 1.22863 | 487612606 | 9208323 |
+
+Its native/L2 ratio is 1.22863×. It is reported without gating.
+
 Reproduce the smoke and release report (JSON/Markdown are written to the chosen
 directory). The supplemental command measures the growing C script at N=4000;
 the primary report measures it at N=1000.
