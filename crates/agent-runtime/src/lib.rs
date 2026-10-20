@@ -209,8 +209,9 @@ pub mod prelude {
     pub use crate::runtime::{
         CheckpointRecoveryPolicy, CurrentCacheIdentityLease, ForkLcm, ForkSeed, ForkSession,
         GoalAdmissionGate, GoalController, GoalControllerConfig, IdleCompactionAdmission,
-        InjectedContent, InternalTurnAdmission, Runtime, RuntimeBuilder, RuntimeEventStream,
-        SemanticIdleCompactionAdmission, SessionHandle, StartSession, StartSessionMode, TurnHandle,
+        InjectedContent, InjectionRecovery, InternalTurnAdmission, Runtime, RuntimeBuilder,
+        RuntimeEventStream, SemanticIdleCompactionAdmission, SessionHandle, StartSession,
+        StartSessionMode, TurnHandle, UnresolvedInjections,
     };
     pub use crate::tool::scheduler::ConflictPolicy;
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};

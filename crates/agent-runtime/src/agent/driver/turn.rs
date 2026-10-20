@@ -1079,8 +1079,16 @@ impl<'a> TurnMachine<'a> {
             Err(failure) => {
                 // No provider/tool work has begun. A protected store failure
                 // is observable and fails closed before external I/O.
-                let error =
-                    driver.settle_failed_acceptance(failure, &state, &inbox, staged, injected);
+                let error = driver.settle_failed_acceptance(
+                    failure,
+                    &state,
+                    &inbox,
+                    &self.execution,
+                    self.emitter.session(),
+                    &self.turn_id,
+                    staged,
+                    injected,
+                );
                 self.emit_non_durable_failure(error, false);
                 return;
             }
@@ -1142,8 +1150,16 @@ impl<'a> TurnMachine<'a> {
                 self.resolve_acceptance(Ok(()));
             }
             Err(failure) => {
-                let error =
-                    driver.settle_failed_acceptance(failure, &state, &inbox, staged, injected);
+                let error = driver.settle_failed_acceptance(
+                    failure,
+                    &state,
+                    &inbox,
+                    &self.execution,
+                    self.emitter.session(),
+                    &self.turn_id,
+                    staged,
+                    injected,
+                );
                 self.resolve_acceptance(Err(error.clone()));
                 self.emit_non_durable_failure(error, false);
                 return;

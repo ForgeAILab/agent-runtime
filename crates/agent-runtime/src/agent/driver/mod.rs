@@ -74,7 +74,7 @@ use crate::harness::{
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
 use crate::runtime::emitter::EventEmitter;
-use crate::runtime::inject::{InjectedContent, InjectionQueue};
+use crate::runtime::inject::{InjectedContent, InjectionQueue, UnresolvedInjections};
 use crate::runtime::journal::AcceptanceSaveError;
 use crate::runtime::session::TurnAcceptance;
 use crate::runtime::state::{SessionExecutionContext, SessionState};
@@ -857,12 +857,19 @@ impl Driver {
     /// When the outcome is unresolved, the input may be durably accepted, so
     /// the staged messages enter live history; session persistence is
     /// already fenced, and a reopen recovers whichever boundary the
-    /// protected store holds.
+    /// protected store holds. The drained injections cannot be delivered by
+    /// the fenced session, so they are held for the host
+    /// (`SessionHandle::take_unresolved_injections`), which restores them on
+    /// the reopened session exactly when that acceptance proves absent.
+    #[allow(clippy::too_many_arguments)]
     fn settle_failed_acceptance(
         &self,
         failure: AcceptanceSaveError,
         state: &Arc<Mutex<SessionState>>,
         inbox: &Arc<Mutex<InjectionQueue>>,
+        execution: &SessionExecutionContext,
+        session: &agent_runtime_core::ids::SessionId,
+        turn: &TurnId,
         staged: Vec<Message>,
         injected: Vec<InjectedContent>,
     ) -> RuntimeError {
@@ -876,6 +883,11 @@ impl Driver {
             }
             AcceptanceSaveError::Unresolved(error) => {
                 self.publish_accepted(state, staged);
+                execution.hold_unresolved_injections(UnresolvedInjections {
+                    session: session.clone(),
+                    turn: turn.clone(),
+                    items: injected,
+                });
                 error
             }
         }

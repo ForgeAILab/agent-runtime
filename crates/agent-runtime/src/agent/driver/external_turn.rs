@@ -133,8 +133,16 @@ impl<'a> ExternalTurnMachine<'a> {
             Err(failure) => {
                 // No backend work has begun. A protected store failure is
                 // observable and fails closed before external I/O.
-                let error =
-                    driver.settle_failed_acceptance(failure, &state, &inbox, staged, injected);
+                let error = driver.settle_failed_acceptance(
+                    failure,
+                    &state,
+                    &inbox,
+                    &self.machine.execution,
+                    self.machine.emitter.session(),
+                    &self.machine.turn_id,
+                    staged,
+                    injected,
+                );
                 self.machine.emit_non_durable_failure(error, false);
                 return;
             }
@@ -208,6 +216,9 @@ impl<'a> ExternalTurnMachine<'a> {
                     failure,
                     &self.machine.state,
                     &self.machine.inbox,
+                    &self.machine.execution,
+                    self.machine.emitter.session(),
+                    &self.machine.turn_id,
                     staged,
                     injected,
                 );

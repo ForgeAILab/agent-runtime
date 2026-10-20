@@ -20,6 +20,7 @@ use agent_runtime_registry::RegistryRevision;
 use crate::agent::planning::{PREVIOUS_CACHE_STATE_NAMESPACE, RunPlanner};
 use crate::capability::ActivationEpoch;
 use crate::harness::{ACTIVATION_STATE_NAMESPACE, SessionAbilities};
+use crate::runtime::inject::UnresolvedInjections;
 use crate::runtime::journal::SessionPersistence;
 
 /// Protected extension namespace for one child interaction returned to its
@@ -117,6 +118,9 @@ pub struct SessionExecutionContext {
     /// in-process registry prevents delegation from parsing model-facing
     /// marker text or lossy observability events.
     artifacts: Mutex<BTreeMap<TurnId, BTreeMap<ArtifactId, ArtifactRef>>>,
+    /// Injected content drained for an acceptance with an unresolved
+    /// outcome, held for the host to restore on a reopened session.
+    unresolved_injections: Mutex<Option<UnresolvedInjections>>,
 }
 
 impl SessionExecutionContext {
@@ -165,6 +169,7 @@ impl SessionExecutionContext {
             interaction_disposition,
             returned_interaction: Mutex::new(returned_interaction),
             artifacts: Mutex::new(artifacts),
+            unresolved_injections: Mutex::new(None),
         })
     }
 
@@ -184,6 +189,22 @@ impl SessionExecutionContext {
             generations.register_cleanup(session, lcm);
         }
         generation.history.clone()
+    }
+
+    /// Holds the batch drained for an acceptance whose outcome is unknown.
+    /// A fenced session admits no later acceptance, so there is at most one.
+    pub(crate) fn hold_unresolved_injections(&self, batch: UnresolvedInjections) {
+        *self
+            .unresolved_injections
+            .lock()
+            .expect("unresolved injections poisoned") = Some(batch);
+    }
+
+    pub(crate) fn take_unresolved_injections(&self) -> Option<UnresolvedInjections> {
+        self.unresolved_injections
+            .lock()
+            .expect("unresolved injections poisoned")
+            .take()
     }
 
     pub(crate) fn persist_gate(&self) -> Arc<AsyncMutex<()>> {

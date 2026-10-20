@@ -5,9 +5,65 @@
 //! provider stream. The queue is bounded for coalescable content; content
 //! marked `must_deliver` (for example a final child result) is always
 //! accepted and never dropped.
+//!
+//! The queue is process-local: content still queued when its session ends
+//! (shutdown, drop or a process crash) is not persisted. A turn drains the
+//! queue at its acceptance boundary; if that acceptance checkpoint's outcome
+//! cannot be proven, the session is fenced and the drained batch is handed to
+//! the host as [`UnresolvedInjections`] so a reopened session can restore it
+//! exactly once (see `SessionHandle::restore_unresolved_injections`).
 
 use agent_runtime_core::content::{ContentPart, Message, Role};
 use agent_runtime_core::error::RuntimeError;
+use agent_runtime_core::ids::{SessionId, TurnId};
+
+/// Injected content drained for a turn whose acceptance checkpoint failed
+/// with an outcome the protected store could not prove. The session that
+/// owned it is fenced; restore it on the reopened session with
+/// `SessionHandle::restore_unresolved_injections`. It is deliberately not
+/// `Clone`: restoring consumes it, which keeps delivery exactly once.
+#[derive(Debug, PartialEq)]
+pub struct UnresolvedInjections {
+    pub(crate) session: SessionId,
+    pub(crate) turn: TurnId,
+    pub(crate) items: Vec<InjectedContent>,
+}
+
+impl UnresolvedInjections {
+    /// The session the batch was drained from.
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// The turn whose acceptance outcome is unknown.
+    pub fn turn(&self) -> &TurnId {
+        &self.turn
+    }
+
+    /// The number of injected items in the batch.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether the batch holds no items.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// What restoring an [`UnresolvedInjections`] batch did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionRecovery {
+    /// The reopened protected head is the batch's own turn: its acceptance
+    /// committed, and the recovered history already holds the batch.
+    AlreadyAccepted,
+    /// The acceptance is absent from the reopened protected head: the batch
+    /// went back to the front of the queue for the next turn.
+    Requeued {
+        /// The number of items requeued.
+        items: usize,
+    },
+}
 
 /// Host-enqueued content introduced at the next safe boundary.
 #[derive(Debug, Clone, PartialEq)]

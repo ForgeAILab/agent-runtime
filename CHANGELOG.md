@@ -30,6 +30,16 @@ contain breaking changes and are coordinated with consumer proposals.
   Packed reference storage treats SQLite BUSY/LOCKED as retryable; I/O errors
   are retryable at ambiguous COMMIT boundaries, while proven no-effect failures
   remain non-retryable. Real writer-contention tests verify apply and collection.
+- `SessionHandle::take_unresolved_injections` and
+  `SessionHandle::restore_unresolved_injections` (with `UnresolvedInjections`
+  and `InjectionRecovery`): when a turn's acceptance checkpoint fails with an
+  outcome the protected store cannot prove, the fenced session holds the
+  injected content it drained for that turn. The host takes the batch and
+  restores it on the reopened session, which requeues it only if its
+  protected head shows the acceptance absent (otherwise the recovered history
+  already holds it), so must-deliver content is delivered exactly once. The
+  injection queue stays process-local: a batch not restored before the
+  process exits is lost, like any content still queued when its session ends.
 
 ### Fixed
 
