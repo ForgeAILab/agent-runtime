@@ -1,6 +1,6 @@
 ---
 created_at: 2026-09-22T04:50:37Z
-updated_at: 2026-09-22T05:18:57Z
+updated_at: 2026-10-20T01:02:12Z
 ---
 
 # Proposal: Expose provider retry decisions
