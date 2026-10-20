@@ -118,7 +118,7 @@ impl<'a> ExternalTurnMachine<'a> {
             history_start
         };
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
-        driver.drain_injected(&state, &inbox);
+        let injected = driver.drain_injected_for_acceptance(&state, &inbox);
 
         // An externally executed turn is still a turn: without its acceptance
         // checkpoint there is no state to transition, so every terminal --
@@ -130,7 +130,10 @@ impl<'a> ExternalTurnMachine<'a> {
             .await
         {
             // No backend work has begun. A protected store failure is
-            // observable and fails closed before external I/O.
+            // observable and fails closed before external I/O: the turn was
+            // never accepted, so the live session returns to its last
+            // committed boundary before the failure is published.
+            driver.rollback_unaccepted(&state, &inbox, active_history_start, injected);
             self.machine.emit_non_durable_failure(error, false);
             return;
         }
@@ -176,7 +179,8 @@ impl<'a> ExternalTurnMachine<'a> {
             driver.clock.now(),
             input.clone(),
         );
-        driver.drain_injected(&self.machine.state, &self.machine.inbox);
+        let injected =
+            driver.drain_injected_for_acceptance(&self.machine.state, &self.machine.inbox);
         // `kind` is the source category already serialized in attribution.
         // Keep its exact stable name, including host-defined categories.
         let delivery = UserInput::text(format!(
@@ -190,6 +194,12 @@ impl<'a> ExternalTurnMachine<'a> {
         {
             Ok(()) => self.machine.resolve_acceptance(Ok(())),
             Err(error) => {
+                driver.rollback_unaccepted(
+                    &self.machine.state,
+                    &self.machine.inbox,
+                    history_start,
+                    injected,
+                );
                 self.machine.resolve_acceptance(Err(error.clone()));
                 self.machine.emit_non_durable_failure(error, false);
                 return;

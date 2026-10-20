@@ -92,6 +92,34 @@ impl InjectionQueue {
     /// Drains every queued item into user-role messages. Unkeyed slots remain
     /// FIFO; keyed peers are canonicalized within their existing slots.
     pub(crate) fn drain_messages(&mut self) -> Vec<Message> {
+        Self::messages(&self.drain_items())
+    }
+
+    /// The user-role messages that drained `items` introduce to history.
+    pub(crate) fn messages(items: &[InjectedContent]) -> Vec<Message> {
+        items
+            .iter()
+            .map(|content| Message {
+                role: Role::User,
+                content: content.parts.clone(),
+            })
+            .collect()
+    }
+
+    /// Returns items drained for a turn whose acceptance checkpoint never
+    /// committed to the front of the queue, ahead of anything enqueued since.
+    /// They were admitted once, so the coalescable bound is not applied again
+    /// and must-deliver content is never dropped.
+    pub(crate) fn restore_front(&mut self, items: Vec<InjectedContent>) {
+        if items.is_empty() {
+            return;
+        }
+        let newer = std::mem::replace(&mut self.items, items);
+        self.items.extend(newer);
+    }
+
+    /// Drains every queued item in its canonical drain order.
+    pub(crate) fn drain_items(&mut self) -> Vec<InjectedContent> {
         let mut items = std::mem::take(&mut self.items);
         let mut keyed = items
             .iter()
@@ -108,12 +136,6 @@ impl InjectionQueue {
             }
         }
         items
-            .into_iter()
-            .map(|content| Message {
-                role: Role::User,
-                content: content.parts,
-            })
-            .collect()
     }
 }
 
@@ -145,6 +167,21 @@ mod tests {
         assert_eq!(drained[0].joined_text(), "first");
         assert_eq!(drained[1].joined_text(), "second");
         assert!(queue.drain_messages().is_empty());
+    }
+
+    #[test]
+    fn restored_items_precede_newer_ones_and_bypass_the_bound() {
+        let mut queue = InjectionQueue::new(1);
+        queue.push(InjectedContent::text("drained")).unwrap();
+        let drained = queue.drain_items();
+        queue.push(InjectedContent::text("newer")).unwrap();
+        queue.restore_front(drained);
+        let texts = queue
+            .drain_messages()
+            .into_iter()
+            .map(|message| message.joined_text())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["drained", "newer"]);
     }
 
     #[test]

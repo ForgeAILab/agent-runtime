@@ -7,6 +7,17 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- A turn whose protected acceptance checkpoint fails to commit (for example a
+  transient storage error) no longer leaves its input and the injected content
+  drained for it in the live session. A later `persist()` or `shutdown()`
+  published that history to the ordinary store past the protected terminal
+  checkpoint, and every later resume failed with "canonical session history
+  and terminal checkpoint are from different boundaries". The live session
+  now returns to its last committed boundary and the drained injected content
+  goes back to the front of the queue.
+
 ## [0.8.0] - 2026-10-20
 
 ### Breaking

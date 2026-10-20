@@ -74,7 +74,7 @@ use crate::harness::{
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
 use crate::runtime::emitter::EventEmitter;
-use crate::runtime::inject::InjectionQueue;
+use crate::runtime::inject::{InjectedContent, InjectionQueue};
 use crate::runtime::session::TurnAcceptance;
 use crate::runtime::state::{SessionExecutionContext, SessionState};
 use crate::runtime::steer::{DrainOrClose, SteerEntry, SteerMailbox};
@@ -817,6 +817,49 @@ impl Driver {
         }
         let mut guard = state.lock().expect("session state poisoned");
         guard.history.extend(messages);
+    }
+
+    /// [`Self::drain_injected`] at a turn's acceptance boundary. Returns the
+    /// drained items, so a failed acceptance checkpoint can hand them back
+    /// through [`Self::rollback_unaccepted`].
+    fn drain_injected_for_acceptance(
+        &self,
+        state: &Arc<Mutex<SessionState>>,
+        inbox: &Arc<Mutex<InjectionQueue>>,
+    ) -> Vec<InjectedContent> {
+        let items = inbox.lock().expect("session inbox poisoned").drain_items();
+        if !items.is_empty() {
+            let mut guard = state.lock().expect("session state poisoned");
+            guard.history.extend(InjectionQueue::messages(&items));
+        }
+        items
+    }
+
+    /// Returns the live session to its last committed boundary after a
+    /// turn's acceptance checkpoint failed: the turn's input and the injected
+    /// content drained for it leave history, and that content goes back to
+    /// the front of the queue for the next turn.
+    ///
+    /// Nothing of an unaccepted turn is durable. Leaving it in the live
+    /// history would let any later ordinary save (`persist`, `shutdown`, a
+    /// background component) publish history past the protected terminal
+    /// checkpoint, a pair no resume can reconcile.
+    fn rollback_unaccepted(
+        &self,
+        state: &Arc<Mutex<SessionState>>,
+        inbox: &Arc<Mutex<InjectionQueue>>,
+        history_start: usize,
+        injected: Vec<InjectedContent>,
+    ) {
+        state
+            .lock()
+            .expect("session state poisoned")
+            .history
+            .truncate(history_start);
+        inbox
+            .lock()
+            .expect("session inbox poisoned")
+            .restore_front(injected);
     }
 
     /// Runs one turn to completion, emitting all of its events.

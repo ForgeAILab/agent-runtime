@@ -1045,14 +1045,17 @@ impl<'a> TurnMachine<'a> {
             history_start
         };
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
-        driver.drain_injected(&state, &inbox);
+        let injected = driver.drain_injected_for_acceptance(&state, &inbox);
 
         if let Err(error) = self
             .checkpoint_accepted(accepted_input, active_history_start, turn_deadline)
             .await
         {
             // No provider/tool work has begun. A protected store failure is
-            // observable and fails closed before external I/O.
+            // observable and fails closed before external I/O: the turn was
+            // never accepted, so the live session returns to its last
+            // committed boundary before the failure is published.
+            driver.rollback_unaccepted(&state, &inbox, active_history_start, injected);
             self.emit_non_durable_failure(error, false);
             return;
         }
@@ -1102,7 +1105,7 @@ impl<'a> TurnMachine<'a> {
             driver.clock.now(),
             input.clone(),
         );
-        driver.drain_injected(&state, &inbox);
+        let injected = driver.drain_injected_for_acceptance(&state, &inbox);
 
         match self
             .checkpoint_internal_accepted(input, active_history_start, turn_deadline)
@@ -1110,6 +1113,7 @@ impl<'a> TurnMachine<'a> {
         {
             Ok(()) => self.resolve_acceptance(Ok(())),
             Err(error) => {
+                driver.rollback_unaccepted(&state, &inbox, active_history_start, injected);
                 self.resolve_acceptance(Err(error.clone()));
                 self.emit_non_durable_failure(error, false);
                 return;

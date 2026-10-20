@@ -2195,3 +2195,229 @@ async fn ordinary_repair_requires_the_exact_head_to_be_the_v3_import() {
     assert!(error.message.contains("no longer exposes"), "{error:?}");
     assert_eq!(sessions.saves.load(Ordering::Relaxed), 0);
 }
+
+/// What a host does with the live session after a turn whose protected
+/// acceptance commit failed.
+#[derive(Debug, Clone, Copy)]
+enum HostAfterFailedTurn {
+    /// `persist()` and keep serving turns on the same live session, as Forge
+    /// does after every turn.
+    PersistAndContinue,
+    /// `shutdown()`, which persists the live session too.
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct FailedAcceptanceOutcome {
+    host: HostAfterFailedTurn,
+    point: agent_runtime::core::journal::JournalCommitFailurePoint,
+    /// The live history after the cut turn equals the history before it.
+    live_history_unchanged: bool,
+    /// After the host action, the ordinary head's history and the protected
+    /// terminal checkpoint's history are the same boundary.
+    heads_agree: bool,
+    /// The next turn on the same live session (PersistAndContinue only).
+    same_session_turn: Option<Result<(), String>>,
+    /// A fresh runtime's resume and turn.
+    resumed: Result<(), String>,
+    /// How often the injection queued before the cut turn is in the resumed
+    /// history.
+    injection_count: Option<usize>,
+}
+
+fn replies(count: usize) -> Arc<FakeProvider> {
+    Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        (0..count)
+            .map(|index| {
+                ScriptedStream::new(vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: format!("reply {index}"),
+                    },
+                    agent_runtime::provider::fake::usage_event(6, 3),
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ])
+            })
+            .collect(),
+    ))
+}
+
+fn native_runtime_over(
+    provider: Arc<FakeProvider>,
+    ordinary: &Arc<InMemorySessionJournal>,
+    protected: &Arc<InMemorySessionJournal>,
+) -> Runtime {
+    RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(provider)
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(32_000, 32_000, 4_096),
+        ))
+        .clock(Arc::new(FixedClock))
+        .session_store(Arc::new(NativeSessionStore {
+            journal: ordinary.clone(),
+            legacy_saves: Mutex::new(0),
+        }))
+        .checkpoint_store(Arc::new(NativeCheckpointStore {
+            journal: protected.clone(),
+            legacy_saves: Mutex::new(0),
+        }))
+        .build()
+        .unwrap()
+}
+
+/// Runs one turn and reports whether it completed with an assistant reply.
+async fn completed_turn(
+    session: &agent_runtime::runtime::SessionHandle,
+    text: &str,
+) -> Result<(), String> {
+    let before = session.history().len();
+    session
+        .run(agent_runtime::core::content::UserInput::text(text))
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let history = session.history();
+    match history.last() {
+        Some(last)
+            if history.len() > before
+                && last.role == agent_runtime::core::content::Role::Assistant =>
+        {
+            Ok(())
+        }
+        _ => Err(format!("turn `{text}` did not complete")),
+    }
+}
+
+async fn failed_acceptance_case(
+    host: HostAfterFailedTurn,
+    point: agent_runtime::core::journal::JournalCommitFailurePoint,
+) -> FailedAcceptanceOutcome {
+    let label = format!("{host:?}-{point:?}");
+    let ordinary = Arc::new(InMemorySessionJournal::ordinary(
+        JournalStorageId::new(format!("failed-acceptance-ordinary-{label}")),
+        Arc::new(IdentityJournalProjection),
+    ));
+    let protected = Arc::new(InMemorySessionJournal::protected(JournalStorageId::new(
+        format!("failed-acceptance-protected-{label}"),
+    )));
+    let id = SessionId::new(format!("failed-acceptance-{label}"));
+    let session = native_runtime_over(replies(4), &ordinary, &protected)
+        .start_session(StartSession::create(id.clone(), Vec::new()))
+        .await
+        .unwrap();
+    completed_turn(&session, "first turn").await.unwrap();
+    session
+        .inject(agent_runtime::runtime::InjectedContent::text("queued child result").must_deliver())
+        .unwrap();
+    protected.fail_next_commit_at(point).unwrap();
+    let before = session.history();
+    let _ = session
+        .run(agent_runtime::core::content::UserInput::text("cut turn"))
+        .await;
+    let live_history_unchanged = session.history() == before;
+
+    let same_session_turn = match host {
+        HostAfterFailedTurn::PersistAndContinue => {
+            session.persist().await.unwrap();
+            None
+        }
+        HostAfterFailedTurn::Shutdown => {
+            session.shutdown().await.unwrap();
+            None
+        }
+    };
+    let ordinary_head = materialized_snapshot(ordinary.as_ref(), &id).await;
+    let protected_head = materialized_checkpoint(protected.as_ref(), &id).await;
+    let heads_agree = protected_head.state.is_terminal()
+        && ordinary_head.history.len() == protected_head.snapshot.history.len();
+    let same_session_turn = match host {
+        HostAfterFailedTurn::PersistAndContinue => {
+            let result = completed_turn(&session, "same session turn").await;
+            session.shutdown().await.unwrap();
+            Some(result)
+        }
+        HostAfterFailedTurn::Shutdown => same_session_turn,
+    };
+
+    let resumed = async {
+        let resumed = native_runtime_over(replies(2), &ordinary, &protected)
+            .start_session(StartSession::resume(id.clone()))
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let turn = completed_turn(&resumed, "resumed turn").await;
+        let history = resumed.history();
+        resumed
+            .shutdown()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        turn.map(|()| history)
+    }
+    .await;
+    let injection_count = resumed.as_ref().ok().map(|history| {
+        history
+            .iter()
+            .filter(|message| message.joined_text() == "queued child result")
+            .count()
+    });
+    FailedAcceptanceOutcome {
+        host,
+        point,
+        live_history_unchanged,
+        heads_agree,
+        same_session_turn,
+        resumed: resumed.map(|_| ()),
+        injection_count,
+    }
+}
+
+/// One failed protected commit on a turn's acceptance checkpoint fails the
+/// turn before provider I/O. The input was never accepted, so it must not
+/// stay in the live session either: a host that then persists or shuts down
+/// the session (as every host may) would otherwise publish it to the
+/// ordinary domain while the protected head stays at the previous terminal
+/// checkpoint, and every later resume would fail "canonical session history
+/// and terminal checkpoint are from different boundaries". Injected content
+/// drained for the unaccepted turn is returned to the queue, so the next turn
+/// on the same live session delivers it once; a session shut down instead
+/// loses it with its in-memory queue, exactly as if no turn had drained it.
+#[tokio::test]
+async fn failed_acceptance_commit_then_host_persist_resumes() {
+    use agent_runtime::core::journal::JournalCommitFailurePoint;
+    let mut outcomes = Vec::new();
+    for host in [
+        HostAfterFailedTurn::PersistAndContinue,
+        HostAfterFailedTurn::Shutdown,
+    ] {
+        for point in JournalCommitFailurePoint::ALL.iter().copied() {
+            outcomes.push(failed_acceptance_case(host, point).await);
+        }
+    }
+    for outcome in &outcomes {
+        println!("FAILED-ACCEPTANCE {outcome:?}");
+    }
+    let failing = outcomes
+        .iter()
+        .filter(|outcome| {
+            // A lost acknowledgement resolves to the published head, so that
+            // turn is accepted and completes normally.
+            outcome.live_history_unchanged == outcome.point.is_after_commit()
+                || !outcome.heads_agree
+                || outcome
+                    .same_session_turn
+                    .as_ref()
+                    .is_some_and(Result::is_err)
+                || outcome.resumed.is_err()
+                || outcome.injection_count
+                    != Some(match (outcome.host, outcome.point.is_after_commit()) {
+                        (HostAfterFailedTurn::Shutdown, false) => 0,
+                        _ => 1,
+                    })
+        })
+        .map(|outcome| format!("{:?}/{:?}", outcome.host, outcome.point))
+        .collect::<Vec<_>>();
+    assert!(failing.is_empty(), "failing cases {failing:?}");
+}
