@@ -455,6 +455,22 @@ restored. Its experimental measurements are identified as withdrawn in the
 step-8 report; they do not describe the retained implementation. The new
 O(1) LRU, read authority checks and per-session predecessor removal remain.
 
+Review rt-e8: the overflow most likely came from that attempt's synchronous,
+mutually recursive size walk (`value_size`/`sequence_size`/`item_size`, several
+frames per object-graph level with decoded nodes and collected vectors per
+frame), which the runtime runs inside its already deep turn poll stack on a
+2 MiB Tokio worker in debug builds; the same walk passed core tests, which call
+commit near the top of a stack. Boxing futures moves state, not synchronous
+frames, and the future-size gate stayed green. The review
+instead counts the canonical snapshot length with serde_json's compact writer
+into a byte counter (member order does not change a compact length), which
+removes the `Value` tree build, sorted write and drop. Debug builds assert
+equality with `canonical_journal_json` for every memo entry. Release C N=1000
+thread CPU, one run each: 16.06 -> 15.01 ms/commit. O(delta) sizing stays NOT
+MET: the counted pass, the exact-closure walk and the link-size walk are still
+O(history), and the commit path itself clones the full snapshot in
+`project_snapshot`, so an O(delta) charge would not make a commit O(delta).
+
 Exact-closure construction also caches parsed object links by object id and
 expected kind. New or differently typed edges run the original checks; reused
 immutable edges avoid JSON reparsing. Missing bodies still conflict. Parsed
