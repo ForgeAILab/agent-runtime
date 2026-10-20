@@ -516,13 +516,42 @@ pin recreation, with warm/cold parity throughout.
 Every object still passes hash/kind and lease reachability/liveness checks,
 and lease liveness is checked again after the metadata await.
 
+Review rt-e8 (two engines, one control write paused between hydrate and
+apply). Control writes (pin, release, authorize, stage, collect) keep the
+record's `(revision, writer_epoch)`, so they do not fence one another across
+engines. Two consequences broke the argument above and are fixed:
+- A writer open (writer-pin freezing) or re-pin re-put a pin another engine had
+  released and collected, still carrying the historical root's certificate. A
+  written pin now carries a certificate only for the stored head its own
+  `expect` fence observed; unchanged pins are not rewritten and keep theirs, so
+  a certificate is only ever issued for a head that is current at that apply.
+  Rewriting a pin drops certificates of its other roots (they take the cold
+  path). Test: `a_stale_writer_open_cannot_recertify_a_pin_another_engine_released`.
+- Retirement replaced the head without a new revision, so a stale control
+  write republished the retired head (losing the retirement) over bodies the
+  collection released, and a warm current read passed "stored head == root".
+  Retirement now issues the next writer epoch, so a `(revision, writer_epoch)`
+  pair names at most one head over a session's life and a superseded or retired
+  head cannot become current again. Test:
+  `a_stale_control_write_cannot_unretire_a_session_another_engine_collected`.
+
+Open decision (not fixed; needs a fence change in `JournalWrite`): a stale
+control write from another engine can still lose a pin release, an
+authorization or a retirement-dependents candidate. A lost release re-puts a
+pin over collected bodies; every later collection of that domain then fails
+with `StateConflict`, in any engine, and cold reads of that root fail closed.
+Memo reads no longer trust such a pin. Single-engine hosts (one engine and
+its clones per storage/domain) are unaffected because the write gate
+serializes hydrate and apply.
+
 Cost in both domains (body reads remain zero): warm writer open stays
 `load/pins/catalog/apply = 1/1/1/1`; warm snapshot changes from zero storage
 calls to one `load`; historical snapshot/extension use one `pins`; renew stays
 `load/pins = 1/1`; commit stays `load/pins/operation/apply = 1/1/1/1`.
 Hosts should clone one engine per storage/domain to share memo hits and local
-lease retention; this is a performance/retention recommendation, no longer a
-warm-read correctness requirement. The review repro and a historical-pin
+lease retention. It is no longer a warm-read correctness requirement, but it
+remains the only configuration where control writes cannot lose another
+engine's pin release (see the open decision above). The review repro and a historical-pin
 variant cover direct, snapshot and extension reads after another engine's GC.
 
 Successful commits remove the predecessor's memo proof unless a live lease
