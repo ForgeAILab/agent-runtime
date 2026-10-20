@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_runtime_core::checkpoint::{CheckpointStore, TurnCheckpoint, TurnState};
 use agent_runtime_core::error::RuntimeError;
@@ -50,6 +51,23 @@ pub(crate) struct SessionPersistence {
     session_store: Option<Arc<dyn SessionStore>>,
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     mode: PersistenceMode,
+    /// Set once an acceptance checkpoint failed with an outcome the protected
+    /// store cannot prove. The live session may then hold accepted input the
+    /// stores do or do not have, so every later publication from it is
+    /// refused; the host reopens the session from the stores instead.
+    fenced: AtomicBool,
+}
+
+/// A failed acceptance checkpoint, classified by what the protected store
+/// proves about it.
+#[derive(Debug)]
+pub(crate) enum AcceptanceSaveError {
+    /// The checkpoint is absent from the protected store; nothing of the
+    /// turn is durable.
+    NotCommitted(RuntimeError),
+    /// The store cannot prove the checkpoint absent: it may have committed
+    /// with its acknowledgement lost. Session persistence is now fenced.
+    Unresolved(RuntimeError),
 }
 
 impl fmt::Debug for SessionPersistence {
@@ -106,6 +124,10 @@ struct NativeDomain {
     /// may store projected IDs in the ordinary domain; this set intentionally
     /// tracks input drafts so an unchanged body is not submitted again.
     known_candidates: BTreeSet<JournalObjectId>,
+    /// Whether the last failed commit may have landed: its acknowledgement
+    /// was lost and neither renew nor the same-operation replay resolved it,
+    /// or the store answered with a head this domain cannot use.
+    unresolved_failure: bool,
 }
 
 impl fmt::Debug for NativeDomain {
@@ -127,6 +149,7 @@ impl SessionPersistence {
             session_store: None,
             checkpoint_store: None,
             mode: PersistenceMode::Legacy,
+            fenced: AtomicBool::new(false),
         })
     }
 
@@ -258,6 +281,7 @@ impl SessionPersistence {
                     session_store,
                     checkpoint_store,
                     mode: PersistenceMode::Legacy,
+                    fenced: AtomicBool::new(false),
                 }),
                 snapshot: None,
                 checkpoint: None,
@@ -289,6 +313,7 @@ impl SessionPersistence {
                     session_store,
                     checkpoint_store,
                     mode: PersistenceMode::Legacy,
+                    fenced: AtomicBool::new(false),
                 }),
                 snapshot: legacy_snapshot,
                 checkpoint: legacy_checkpoint,
@@ -358,6 +383,7 @@ impl SessionPersistence {
                         session_store,
                         checkpoint_store,
                         mode: PersistenceMode::Legacy,
+                        fenced: AtomicBool::new(false),
                     }),
                     snapshot: legacy_snapshot,
                     checkpoint: legacy_checkpoint,
@@ -494,6 +520,7 @@ impl SessionPersistence {
                     ordinary: ordinary.map(Mutex::new),
                     protected: protected.map(Mutex::new),
                 })),
+                fenced: AtomicBool::new(false),
             }),
             snapshot,
             checkpoint,
@@ -521,10 +548,85 @@ impl SessionPersistence {
         }
     }
 
+    fn ensure_not_fenced(&self) -> Result<(), RuntimeError> {
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(RuntimeError::conflict(
+                "session persistence is fenced: an acceptance checkpoint has an unknown \
+                 outcome; reopen the session",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Saves a turn's acceptance checkpoint and, when that fails, proves
+    /// whether it is absent from the protected store before the caller rolls
+    /// the turn's input back out of the live session.
+    ///
+    /// An error alone proves nothing: a store can commit and lose the
+    /// acknowledgement. A native domain knows when a failure is proven (the
+    /// renewed writer still owns the unchanged head). A legacy store is read
+    /// back: its previous head proves absence, this checkpoint proves the
+    /// write landed (success). Anything else is unresolved, and the session's
+    /// persistence is fenced so no later publication can pair the live state
+    /// with a protected head it does not match.
+    pub(crate) async fn save_acceptance_checkpoint(
+        &self,
+        checkpoint: &TurnCheckpoint,
+        predecessor: Option<&TurnCheckpoint>,
+    ) -> Result<(), AcceptanceSaveError> {
+        self.ensure_not_fenced()
+            .map_err(AcceptanceSaveError::NotCommitted)?;
+        if checkpoint.session != self.session {
+            return Err(AcceptanceSaveError::NotCommitted(RuntimeError::conflict(
+                "checkpoint belongs to another session",
+            )));
+        }
+        let outcome = match &self.mode {
+            PersistenceMode::Legacy => match &self.checkpoint_store {
+                Some(store) => match store.save(checkpoint).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => match store.load_latest(&self.session).await {
+                        Ok(latest) if latest.as_ref() == predecessor => {
+                            Err(AcceptanceSaveError::NotCommitted(error))
+                        }
+                        Ok(Some(latest)) if latest == *checkpoint => Ok(()),
+                        _ => Err(AcceptanceSaveError::Unresolved(error)),
+                    },
+                },
+                None => Ok(()),
+            },
+            PersistenceMode::Native(native) => match &native.protected {
+                Some(domain) => {
+                    let mut domain = domain.lock().await;
+                    match Box::pin(commit_domain(
+                        &mut domain,
+                        &checkpoint.snapshot,
+                        Some(checkpoint),
+                        CommitPurpose::Transition,
+                    ))
+                    .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error) if domain.unresolved_failure => {
+                            Err(AcceptanceSaveError::Unresolved(error))
+                        }
+                        Err(error) => Err(AcceptanceSaveError::NotCommitted(error)),
+                    }
+                }
+                None => Ok(()),
+            },
+        };
+        if matches!(outcome, Err(AcceptanceSaveError::Unresolved(_))) {
+            self.fenced.store(true, Ordering::Release);
+        }
+        outcome
+    }
+
     pub(crate) async fn save_checkpoint(
         &self,
         checkpoint: &TurnCheckpoint,
     ) -> Result<(), RuntimeError> {
+        self.ensure_not_fenced()?;
         if checkpoint.session != self.session {
             return Err(RuntimeError::conflict(
                 "checkpoint belongs to another session",
@@ -554,6 +656,7 @@ impl SessionPersistence {
         &self,
         snapshot: &SessionSnapshot,
     ) -> Result<(), RuntimeError> {
+        self.ensure_not_fenced()?;
         if snapshot.id != self.session {
             return Err(RuntimeError::conflict(
                 "snapshot belongs to another session",
@@ -866,6 +969,7 @@ async fn open_domain(
         checkpoint,
         encoding,
         known_candidates,
+        unresolved_failure: false,
     })
 }
 
@@ -983,31 +1087,45 @@ async fn commit_domain(
     };
     commit.digest = commit.input_digest()?;
     let old_revision = current.map(|head| head.revision);
+    domain.unresolved_failure = false;
     let result = domain.journal.commit(lease, commit.clone()).await;
     let head = match result {
         Ok(head) => head,
         Err(error) => {
             let Ok(renewed) = domain.journal.renew(lease).await else {
+                // Without a live lease the head cannot be inspected: the
+                // commit may have landed.
+                domain.unresolved_failure = true;
                 return Err(error);
             };
             let advanced = renewed.head().map(|head| head.revision) > old_revision;
             domain.lease = Some(renewed);
             if !advanced {
+                // The renewed writer still owns the unchanged head, so this
+                // commit is proven absent.
                 return Err(error);
             }
             // Resolve a lost acknowledgement through the lifetime operation
             // index. This cannot turn a pre-commit failure into success because
             // the refreshed head must already have advanced.
-            domain
+            match domain
                 .journal
                 .commit(
                     domain.lease.as_ref().expect("renewed above"),
                     commit.clone(),
                 )
-                .await?
+                .await
+            {
+                Ok(head) => head,
+                Err(error) => {
+                    domain.unresolved_failure = true;
+                    return Err(error);
+                }
+            }
         }
     };
     if head.role != domain.role || head.session != snapshot.id {
+        domain.unresolved_failure = true;
         return Err(incompatible_store());
     }
     domain.head = Some(head);

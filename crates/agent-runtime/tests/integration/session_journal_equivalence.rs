@@ -5283,11 +5283,68 @@ async fn assert_live_failed_commit(scenario: &LiveScenario, target: usize) {
     }
 }
 
+/// Commit `target` fails at `point` while the process lives and the host
+/// keeps the live session: the scenario's drive carries on after the failed
+/// turn and persists the session (`shutdown`), as hosts do after every turn.
+/// Whatever that commit cost, the persisted pair must resume and continue —
+/// equality with legacy alone would also accept a session that both paths
+/// wedge. Returns whether the drive reached its host persist.
+async fn assert_live_failed_commit_then_host_persist_resumes(
+    scenario: &LiveScenario,
+    target: usize,
+    point: JournalCommitFailurePoint,
+) -> bool {
+    let label = format!("{}/{point:?}@{target}+host-persist", scenario.label);
+    let id = SessionId::new(format!("live-{}", scenario.label));
+    let pair = Pair::new(identity);
+    let fault = Arc::new(LiveCommitFault {
+        attempts: AtomicUsize::new(0),
+        target,
+        point,
+    });
+    let stores = LiveFaultStores::new(&pair, fault.clone());
+    let first = (scenario.first)();
+    let live = live_drive(
+        &label,
+        first.drive,
+        build(
+            (first.provider)(),
+            stores.clone(),
+            stores.clone(),
+            first.configure,
+        ),
+        id.clone(),
+    )
+    .await;
+    assert!(fault.fired(), "{label}: the fault never fired");
+    if live.is_none() {
+        // The drive stopped at the failure itself, so no host persist
+        // followed; `assert_live_failed_commit` covers that outcome.
+        return false;
+    }
+    pair.crash(&id);
+    let second = (scenario.second)();
+    let resumed = live_drive(
+        &label,
+        second.drive,
+        pair.native_runtime((second.provider)(), second.configure),
+        id,
+    )
+    .await;
+    assert!(
+        resumed.is_some(),
+        "{label}: the session persisted after the failed commit does not resume"
+    );
+    true
+}
+
 /// Task 2.6, ambiguous outcomes resolved by the live writer: at every commit
 /// of the scenario, a lost acknowledgement (the commit landed) and a failed
 /// commit (it did not) are returned to the running runtime itself, so its
 /// renew / head-advance / same-operation recommit path decides the outcome.
-/// Every failing commit index is reported, not only the first.
+/// Every commit is also cut at every `JournalCommitFailurePoint` with the
+/// host persisting the live session after the failed turn, and that session
+/// must resume. Every failing commit index is reported, not only the first.
 async fn run_live_ambiguity_scenario(label: &str) {
     use futures_util::FutureExt;
     let scenario = live_ambiguity_scenarios()
@@ -5304,6 +5361,7 @@ async fn run_live_ambiguity_scenario(label: &str) {
     let commits = pair.submission_trace().len();
     assert!(commits > 0, "{label}: no commits");
     let mut failures = Vec::new();
+    let mut persisted = 0;
     for target in 0..commits {
         let lost =
             std::panic::AssertUnwindSafe(assert_live_lost_acknowledgement(&scenario, target))
@@ -5318,11 +5376,25 @@ async fn run_live_ambiguity_scenario(label: &str) {
         if failed.is_err() {
             failures.push(format!("failed@{target}"));
         }
+        for &point in JournalCommitFailurePoint::ALL {
+            match std::panic::AssertUnwindSafe(assert_live_failed_commit_then_host_persist_resumes(
+                &scenario, target, point,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(true) => persisted += 1,
+                Ok(false) => {}
+                Err(_) => failures.push(format!("{point:?}@{target}+host-persist")),
+            }
+        }
     }
     assert!(failures.is_empty(), "{label}: failing cases {failures:?}");
     println!(
-        "TASK 2.6 LIVE-AMBIGUITY scenario={label} commits={commits} cases={} results=pass",
-        commits * 2
+        "TASK 2.6 LIVE-AMBIGUITY scenario={label} commits={commits} cases={} \
+         host_persist_cases={} host_persisted={persisted} results=pass",
+        commits * 2,
+        commits * JournalCommitFailurePoint::ALL.len()
     );
 }
 

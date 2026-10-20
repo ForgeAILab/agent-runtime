@@ -36,6 +36,7 @@ use crate::agent::external::{
 
 #[cfg(feature = "external-agent-bridge")]
 use super::external_bridge::ExternalToolBridgeServer;
+use crate::runtime::inject::InjectionQueue;
 
 use super::{TurnMachine, TurnMachineContext, discard_reason_for_finish};
 
@@ -111,28 +112,39 @@ impl<'a> ExternalTurnMachine<'a> {
             None => Deadline::never(),
         };
         let accepted_input = input.clone();
-        let active_history_start = {
-            let mut guard = state.lock().expect("session state poisoned");
-            let history_start = guard.history.len();
-            guard.history.push(input.clone().into_message());
-            history_start
-        };
+        let active_history_start = state.lock().expect("session state poisoned").history.len();
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
-        driver.drain_injected(&state, &inbox);
+        // The input and the injections it drains stay staged until the
+        // acceptance checkpoint commits (see `Driver::settle_failed_acceptance`).
+        let injected = driver.take_injected_for_acceptance(&inbox);
+        let mut staged = vec![input.clone().into_message()];
+        staged.extend(InjectionQueue::messages(&injected));
 
         // An externally executed turn is still a turn: without its acceptance
         // checkpoint there is no state to transition, so every terminal --
         // including a completed one -- would fail to publish and the turn
         // would leave nothing durable behind.
-        if let Err(error) = self
+        match self
             .machine
-            .checkpoint_accepted(accepted_input, active_history_start, turn_deadline)
+            .checkpoint_accepted(accepted_input, active_history_start, turn_deadline, &staged)
             .await
         {
-            // No backend work has begun. A protected store failure is
-            // observable and fails closed before external I/O.
-            self.machine.emit_non_durable_failure(error, false);
-            return;
+            Ok(()) => driver.publish_accepted(&state, staged),
+            Err(failure) => {
+                // No backend work has begun. A protected store failure is
+                // observable and fails closed before external I/O.
+                let error = driver.settle_failed_acceptance(
+                    failure,
+                    &state,
+                    &inbox,
+                    &self.machine.execution,
+                    &self.machine.turn_id,
+                    staged,
+                    injected,
+                );
+                self.machine.emit_non_durable_failure(error, false);
+                return;
+            }
         }
 
         self.run_backend(input, turn_deadline).await;
@@ -166,30 +178,48 @@ impl<'a> ExternalTurnMachine<'a> {
             Some(ms) => Deadline::after(driver.clock.as_ref(), ms),
             None => Deadline::never(),
         };
-        let history_start = {
-            let state = self.machine.state.lock().expect("session state poisoned");
-            state.history.len()
-        };
-        self.machine.execution.begin_internal_turn(
-            self.machine.turn_id.clone(),
-            history_start,
-            driver.clock.now(),
-            input.clone(),
-        );
-        driver.drain_injected(&self.machine.state, &self.machine.inbox);
         // `kind` is the source category already serialized in attribution.
         // Keep its exact stable name, including host-defined categories.
         let delivery = UserInput::text(format!(
             "[Delivered by the host: {}]\n{}",
             input.source.kind, input.content,
         ));
+        let history_start = self
+            .machine
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .history
+            .len();
+        self.machine.execution.begin_internal_turn(
+            self.machine.turn_id.clone(),
+            history_start,
+            driver.clock.now(),
+            input.clone(),
+        );
+        // The drained injections stay staged until the acceptance checkpoint
+        // commits (see `Driver::settle_failed_acceptance`).
+        let injected = driver.take_injected_for_acceptance(&self.machine.inbox);
+        let staged = InjectionQueue::messages(&injected);
         match self
             .machine
-            .checkpoint_internal_accepted(input, history_start, deadline)
+            .checkpoint_internal_accepted(input, history_start, deadline, &staged)
             .await
         {
-            Ok(()) => self.machine.resolve_acceptance(Ok(())),
-            Err(error) => {
+            Ok(()) => {
+                driver.publish_accepted(&self.machine.state, staged);
+                self.machine.resolve_acceptance(Ok(()));
+            }
+            Err(failure) => {
+                let error = driver.settle_failed_acceptance(
+                    failure,
+                    &self.machine.state,
+                    &self.machine.inbox,
+                    &self.machine.execution,
+                    &self.machine.turn_id,
+                    staged,
+                    injected,
+                );
                 self.machine.resolve_acceptance(Err(error.clone()));
                 self.machine.emit_non_durable_failure(error, false);
                 return;

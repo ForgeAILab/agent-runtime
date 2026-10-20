@@ -44,6 +44,8 @@ mod safe_boundary_injection;
 mod session_journal;
 #[path = "integration/session_journal_equivalence.rs"]
 mod session_journal_equivalence;
+#[path = "integration/session_journal_failed_acceptance.rs"]
+mod session_journal_failed_acceptance;
 #[path = "integration/structured_output.rs"]
 mod structured_output;
 #[path = "integration/tool_argument_redaction.rs"]

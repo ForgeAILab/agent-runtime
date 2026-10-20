@@ -74,7 +74,8 @@ use crate::harness::{
 use crate::ids::IdMinter;
 use crate::provider::retry::is_retryable;
 use crate::runtime::emitter::EventEmitter;
-use crate::runtime::inject::InjectionQueue;
+use crate::runtime::inject::{InjectedContent, InjectionQueue, UnresolvedInjections};
+use crate::runtime::journal::AcceptanceSaveError;
 use crate::runtime::session::TurnAcceptance;
 use crate::runtime::state::{SessionExecutionContext, SessionState};
 use crate::runtime::steer::{DrainOrClose, SteerEntry, SteerMailbox};
@@ -817,6 +818,77 @@ impl Driver {
         }
         let mut guard = state.lock().expect("session state poisoned");
         guard.history.extend(messages);
+    }
+
+    /// Takes the injected content a turn's acceptance boundary introduces.
+    /// It is staged with the turn's input, outside live history, until the
+    /// acceptance checkpoint commits (see [`Self::settle_failed_acceptance`]).
+    fn take_injected_for_acceptance(
+        &self,
+        inbox: &Arc<Mutex<InjectionQueue>>,
+    ) -> Vec<InjectedContent> {
+        inbox.lock().expect("session inbox poisoned").drain_items()
+    }
+
+    /// Publishes a turn's staged messages to live history once its
+    /// acceptance checkpoint has committed.
+    fn publish_accepted(&self, state: &Arc<Mutex<SessionState>>, staged: Vec<Message>) {
+        state
+            .lock()
+            .expect("session state poisoned")
+            .history
+            .extend(staged);
+    }
+
+    /// Settles a turn whose acceptance checkpoint failed and returns the
+    /// error to publish.
+    ///
+    /// The turn's input and the injected content drained for it are staged
+    /// outside live history while the acceptance checkpoint commits, so an
+    /// ordinary save racing that commit (`persist`, `shutdown`, a background
+    /// component) can only publish the last committed boundary.
+    ///
+    /// When the checkpoint is proven absent, nothing of the turn is durable:
+    /// the staged messages are dropped and the injected content returns to
+    /// the front of the queue for the next turn. Publishing them would put
+    /// history past the protected terminal checkpoint, a pair no resume can
+    /// reconcile.
+    ///
+    /// When the outcome is unresolved, the input may be durably accepted, so
+    /// the staged messages enter live history; session persistence is
+    /// already fenced, and a reopen recovers whichever boundary the
+    /// protected store holds. The drained injections cannot be delivered by
+    /// the fenced session; they are held and handed back to the host once
+    /// (`SessionHandle::take_unresolved_injections`), which alone decides
+    /// what to do with them because the acceptance outcome is unknown.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_failed_acceptance(
+        &self,
+        failure: AcceptanceSaveError,
+        state: &Arc<Mutex<SessionState>>,
+        inbox: &Arc<Mutex<InjectionQueue>>,
+        execution: &SessionExecutionContext,
+        turn: &TurnId,
+        staged: Vec<Message>,
+        injected: Vec<InjectedContent>,
+    ) -> RuntimeError {
+        match failure {
+            AcceptanceSaveError::NotCommitted(error) => {
+                inbox
+                    .lock()
+                    .expect("session inbox poisoned")
+                    .restore_front(injected);
+                error
+            }
+            AcceptanceSaveError::Unresolved(error) => {
+                self.publish_accepted(state, staged);
+                execution.hold_unresolved_injections(UnresolvedInjections {
+                    turn: turn.clone(),
+                    items: injected,
+                });
+                error
+            }
+        }
     }
 
     /// Runs one turn to completion, emitting all of its events.

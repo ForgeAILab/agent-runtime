@@ -88,6 +88,23 @@ impl SessionHandle {
             .push(content)
     }
 
+    /// Hands back, once, the injected content this session drained for a
+    /// turn whose acceptance checkpoint failed with an outcome the protected
+    /// store could not prove. Later calls return `None`, as does a session
+    /// with no such turn.
+    ///
+    /// Such a session is fenced: it publishes nothing more and cannot deliver
+    /// the items. What the host knows is only that the acceptance outcome is
+    /// unknown. If it committed, the reopened session's recovered history
+    /// already holds the items and re-injecting them delivers them twice; if
+    /// it did not, they are in no store and dropping them loses them. The
+    /// runtime makes no exactly-once promise across an unresolved acceptance,
+    /// as with content still queued when a process crashes; the returned turn
+    /// id is information only and decides nothing.
+    pub fn take_unresolved_injections(&self) -> Option<UnresolvedInjections> {
+        self.inner.execution.take_unresolved_injections()
+    }
+
     /// Subscribes to events emitted after this call. Multiple concurrent
     /// subscribers receive the same live sequence; the persisted journal is
     /// authoritative for earlier events and any detected delivery gaps.

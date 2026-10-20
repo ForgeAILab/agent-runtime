@@ -42,7 +42,7 @@ use crate::harness::{
 use crate::ids::IdMinter;
 use crate::runtime::emitter::{CacheEventBatch, EventEmitter, RuntimeEventStream};
 use crate::runtime::engine::{ActiveSessionLease, RuntimeShared};
-use crate::runtime::inject::{InjectedContent, InjectionQueue};
+use crate::runtime::inject::{InjectedContent, InjectionQueue, UnresolvedInjections};
 use crate::runtime::state::{SessionExecutionContext, SessionState};
 use crate::runtime::steer::SteerMailbox;
 
