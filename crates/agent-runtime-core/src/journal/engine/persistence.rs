@@ -43,11 +43,17 @@ fn encode<T: Serialize>(value: &T) -> Result<JournalEngineState, RuntimeError> {
         bytes: canonical_journal_json(value)?,
     })
 }
+// Preserve the existing public kind/class while distinguishing a proven
+// validation failure from a concurrent state change during collection.
+fn invalid_state(mut error: RuntimeError) -> RuntimeError {
+    error.metadata.insert("journal_invalid_state", true);
+    error
+}
 pub(super) fn decode<T: DeserializeOwned>(state: &JournalEngineState) -> Result<T, RuntimeError> {
     if state.version != 1 {
-        return Err(conflict());
+        return Err(invalid_state(conflict()));
     }
-    serde_json::from_slice(&state.bytes).map_err(|_| conflict())
+    serde_json::from_slice(&state.bytes).map_err(|_| invalid_state(conflict()))
 }
 impl<S: JournalStorage> JournalEngine<S> {
     pub(super) async fn hydrate(
@@ -186,10 +192,10 @@ impl<S: JournalStorage> JournalEngine<S> {
                     id: id.clone(),
                     bytes: bytes.ok_or_else(conflict)?.to_vec(),
                 };
-                if !expected_matches(expected, object.kind()?) {
-                    return Err(conflict());
+                if !expected_matches(expected, object.kind().map_err(invalid_state)?) {
+                    return Err(invalid_state(conflict()));
                 }
-                pending.extend(object_links(&object, expected)?);
+                pending.extend(object_links(&object, expected).map_err(invalid_state)?);
                 objects.insert(id, object.bytes);
             }
         }
@@ -235,7 +241,8 @@ impl<S: JournalStorage> JournalEngine<S> {
                     // Only follow that epoch's own tip; selected roots are
                     // already recorded in the pin.
                     if head
-                        .decode::<JournalHead>(JournalObjectKind::Head)?
+                        .decode::<JournalHead>(JournalObjectKind::Head)
+                        .map_err(invalid_state)?
                         .writer_epoch
                         == record.writer_epoch
                     {
@@ -295,14 +302,14 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .ok_or_else(conflict)?
                 .to_vec(),
         };
-        let kind = object.kind()?;
+        let kind = object.kind().map_err(invalid_state)?;
         let closure = if kind == JournalObjectKind::Head {
             self.closure_objects(session, root)
                 .await?
                 .into_keys()
                 .collect()
         } else {
-            validate_leaf(&object, kind)?;
+            validate_leaf(&object, kind).map_err(invalid_state)?;
             [root.clone()].into()
         };
         memo.insert(root.clone(), closure);
@@ -372,55 +379,75 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         source: &SessionId,
         dependencies: BTreeSet<SessionId>,
-    ) -> Result<(), RuntimeError> {
+        failures: &mut super::controls::CollectionFailures,
+    ) -> Result<bool, RuntimeError> {
         for target in dependencies {
             if &target == source {
                 continue;
             }
-            let stored = self.storage.load(&self.domain, &target).await?;
-            let mut metadata = stored
-                .as_ref()
-                .map(|r| decode::<Metadata>(&r.engine))
-                .transpose()?
-                .unwrap_or_default();
-            if !metadata.retirement_dependents.insert(source.clone()) {
-                continue;
+            if !failures.skipped.contains(&target) {
+                let result = self.index_retirement_dependency(source, &target).await;
+                failures.isolate(&target, result)?;
             }
-            let mut record = stored.unwrap_or_else(|| JournalSessionRecord {
-                generation: 0,
-                revision: JournalRevision(0),
-                writer_epoch: 0,
-                head: None,
-                has_checkpoint: false,
-                retirement: None,
-                collection_dirty: false,
-                engine: JournalEngineState {
-                    version: 1,
-                    bytes: vec![],
-                },
-            });
-            let expect = record.fence();
-            record.generation = expect.generation.checked_add(1).ok_or_else(conflict)?;
-            record.engine = encode(&metadata)?;
-            self.apply(
-                JournalWrite {
-                    domain: self.domain.clone(),
-                    session: target.clone(),
-                    kind: JournalWriteKind::Collect,
-                    expect,
-                    record,
-                    objects: JournalObjectBatch::default(),
-                    operation: None,
-                    pins: vec![],
-                    catalog: vec![],
-                    release: vec![],
-                    prune_operations_before: None,
-                    inject: None,
-                },
-                &target,
-            )
-            .await?;
+            if failures.skipped.contains(&target) {
+                failures.skipped.insert(source.clone());
+                if failures.unreadable.contains(&target) {
+                    failures.unreadable.insert(source.clone());
+                }
+                return Ok(false);
+            }
         }
+        Ok(true)
+    }
+
+    async fn index_retirement_dependency(
+        &self,
+        source: &SessionId,
+        target: &SessionId,
+    ) -> Result<(), RuntimeError> {
+        let stored = self.storage.load(&self.domain, target).await?;
+        let mut metadata = stored
+            .as_ref()
+            .map(|r| decode::<Metadata>(&r.engine))
+            .transpose()?
+            .unwrap_or_default();
+        if !metadata.retirement_dependents.insert(source.clone()) {
+            return Ok(());
+        }
+        let mut record = stored.unwrap_or_else(|| JournalSessionRecord {
+            generation: 0,
+            revision: JournalRevision(0),
+            writer_epoch: 0,
+            head: None,
+            has_checkpoint: false,
+            retirement: None,
+            collection_dirty: false,
+            engine: JournalEngineState {
+                version: 1,
+                bytes: vec![],
+            },
+        });
+        let expect = record.fence();
+        record.generation = expect.generation.checked_add(1).ok_or_else(conflict)?;
+        record.engine = encode(&metadata)?;
+        self.apply(
+            JournalWrite {
+                domain: self.domain.clone(),
+                session: target.clone(),
+                kind: JournalWriteKind::Collect,
+                expect,
+                record,
+                objects: JournalObjectBatch::default(),
+                operation: None,
+                pins: vec![],
+                catalog: vec![],
+                release: vec![],
+                prune_operations_before: None,
+                inject: None,
+            },
+            target,
+        )
+        .await?;
         Ok(())
     }
 
@@ -447,6 +474,8 @@ impl<S: JournalStorage> JournalEngine<S> {
             after = page.last().cloned();
             candidates.extend(page);
         }
+        // Fail closed on unreadable candidates: their dependency metadata may
+        // protect the target. Unlike GC, retirement cannot safely skip them.
         let mut unresolved = false;
         let mut blocked = false;
         for candidate in candidates {

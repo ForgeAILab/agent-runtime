@@ -1026,7 +1026,7 @@ async fn review_public_error_transcript() {
         "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
         "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
         conflict.clone(),
-        "JournalGcReport { root_epoch: 35, examined: 16, deleted: 2, reclaimed_bytes: 1445 }".to_string(),
+        "JournalGcReport { root_epoch: 35, examined: 16, deleted: 2, reclaimed_bytes: 1445, unreadable_sessions: [] }".to_string(),
     ];
     assert_eq!(t, expected);
 }
