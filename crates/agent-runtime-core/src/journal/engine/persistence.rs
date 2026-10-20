@@ -727,14 +727,17 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         let (scratch, stored) = self.hydrate(lease.session()).await?;
         let lease_record = self.local.live_lease(&*self.local.lock()?, lease)?;
-        let mut objects =
-            if let Some(root) = stored.as_ref().and_then(|record| record.head.as_ref()) {
-                self.memoized_root(lease.session(), &root.id)?
-                    .map(|entry| entry.objects.clone())
-                    .unwrap_or_default()
-            } else {
-                ObjectStore::default()
-            };
+        // Only the stored head's closure is guaranteed membership (D4). Cached
+        // bodies outside it may have been released by another engine; any
+        // the new head references are rechecked before the write below.
+        let (mut objects, verified) = match stored.as_ref().and_then(|record| record.head.as_ref())
+        {
+            Some(root) => match self.memoized_root(lease.session(), &root.id)? {
+                Some(entry) => (entry.objects.clone(), Some(entry.closure.clone())),
+                None => (ObjectStore::default(), None),
+            },
+            None => (ObjectStore::default(), None),
+        };
         let ids: Vec<_> = lease_record
             .reachable
             .layers
@@ -744,6 +747,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let fetched: BTreeSet<_> = ids.iter().cloned().collect();
         if !ids.is_empty() {
             let bodies = self
                 .storage
@@ -816,7 +820,34 @@ impl<S: JournalStorage> JournalEngine<S> {
             .dependencies
             .sessions
             .clone();
-        if self.retired_dependency(&dependencies).await? {
+        let (root, entry) = self.commit_memo_entry(&scratch, lease.session())?;
+        // A body already in `objects` is never rewritten. Each one the new
+        // head references outside the stored closure must still be a member.
+        let unverified: Vec<_> = match &verified {
+            Some(closure) => {
+                let state = scratch.lock()?;
+                let written = state.objects.layers.last().ok_or_else(conflict)?;
+                entry
+                    .closure
+                    .iter()
+                    .filter(|id| {
+                        !closure.contains(*id)
+                            && !fetched.contains(*id)
+                            && !written.contains_key(*id)
+                    })
+                    .cloned()
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let released = !unverified.is_empty() && {
+            let bodies = self
+                .storage
+                .objects(&self.domain, lease.session(), &unverified)
+                .await?;
+            bodies.len() != unverified.len() || bodies.iter().any(Option::is_none)
+        };
+        if released || self.retired_dependency(&dependencies).await? {
             // The reference validates dependencies after the batch cut and
             // before the pin cut: an earlier cut wins, a later one stays armed.
             let cut = scratch.cut.lock().map_err(|_| host_failure())?.take();
@@ -912,7 +943,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 Some(self.local.token(lease)?.handle),
                 true,
             )?;
-            self.remember_commit(&scratch, lease.session())?;
+            self.remember_root(lease.session(), &root, entry)?;
             self.mark_dirty(lease.session())?;
         }
         applied?;

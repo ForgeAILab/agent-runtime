@@ -1336,3 +1336,523 @@ async fn a_new_writer_keeps_only_the_selected_closure_in_its_body_and_link_memo(
     );
     engine.close(writer2).await.unwrap();
 }
+
+// Review (rt-e6): the memo is per engine. Another engine over the same storage
+// can release membership; a warm writer must not then rely on a cached body
+// that a cold engine would find missing.
+fn ext_snapshot(session: &SessionId, value: &str) -> SessionSnapshot {
+    let mut extension_state = BTreeMap::new();
+    extension_state.insert(
+        "review.toggle".to_owned(),
+        crate::store::VersionedSessionState::new(
+            agent_runtime_registry::RegistryRevision::new("toggle-1"),
+            serde_json::json!({ "value": value }),
+        )
+        .redaction_safe(),
+    );
+    SessionSnapshot {
+        id: session.clone(),
+        history: vec![crate::content::Message::user("body")],
+        usage: Default::default(),
+        identity: Default::default(),
+        manifests: vec![],
+        extension_state,
+        updated: crate::clock::Timestamp(1),
+    }
+}
+
+fn full_commit(
+    session: &SessionId,
+    epoch: u64,
+    previous: Option<&JournalHead>,
+    operation: &str,
+    snapshot: SessionSnapshot,
+    known: &mut BTreeSet<JournalObjectId>,
+) -> JournalCommit {
+    let mut commit = empty_commit(session, epoch);
+    let mut assembler = ObjectAssembler::default();
+    commit.batch.snapshot = assembler.snapshot(&snapshot, 0).unwrap();
+    commit.objects = assembler
+        .objects
+        .into_iter()
+        .filter(|(id, _)| known.insert(id.clone()))
+        .map(|(id, bytes)| JournalObject { id, bytes })
+        .collect();
+    commit.delta.bootstrap = Some(Box::new(snapshot));
+    if let Some(head) = previous {
+        commit.batch.sequence = head.batch_sequence + 1;
+        commit.batch.expected_revision = Some(head.revision);
+        commit.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+    }
+    commit.batch.operation = JournalOperationId::new(operation);
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+fn reader(pin: &str) -> JournalOpen {
+    JournalOpen {
+        intent: JournalOpenIntent::ReadOnly,
+        ..writer(pin)
+    }
+}
+
+#[tokio::test]
+async fn a_warm_writer_cannot_publish_a_head_over_a_body_another_engine_released() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(VolatileJournalStorage::default());
+        let id = JournalStorageId::new("two-engines");
+        let writing = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let collector = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("shared");
+        let mut known = BTreeSet::new();
+        let lease = writing.open(&session, writer("one")).await.unwrap();
+        let first = writing
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        let second = writing
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        // The other engine cannot see this engine's live lease.
+        assert!(sweep(&collector, u64::MAX).await.deleted > 0);
+        let result = writing
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&second),
+                    "three",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await;
+        // The cold path refuses: the lease's released body is no member.
+        assert!(
+            result.is_err(),
+            "budget {budget}: published over a released body"
+        );
+        // Storage stays self-consistent: a cold engine can open and fully
+        // read the latest published head.
+        let cold = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: 0,
+                ..Default::default()
+            },
+        );
+        let check = cold.open(&session, reader("check")).await;
+        assert!(
+            check.is_ok(),
+            "budget {budget}: a published head has a missing body"
+        );
+        let check = check.unwrap();
+        let mut read = JournalReader::new(
+            &cold,
+            &check,
+            JournalReadLimits {
+                objects: u64::MAX,
+                encoded_bytes: u64::MAX,
+                entries: u64::MAX,
+            },
+        )
+        .unwrap();
+        assert!(read.snapshot().await.unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn collection_evicts_released_history_and_trims_released_cache_bodies() {
+    let storage = Arc::new(VolatileJournalStorage::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("release"),
+        JournalEngineConfig {
+            collection_enabled: true,
+            ..Default::default()
+        },
+    );
+    let session = SessionId::new("release");
+    let mut known = BTreeSet::new();
+    let lease = engine.open(&session, writer("one")).await.unwrap();
+    let first = engine
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                None,
+                "one",
+                ext_snapshot(&session, "a"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    let second = engine
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                Some(&first),
+                "two",
+                ext_snapshot(&session, "b"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    let old = JournalObject::encode(JournalObjectKind::Head, &first)
+        .unwrap()
+        .id;
+    let current = JournalObject::encode(JournalObjectKind::Head, &second)
+        .unwrap()
+        .id;
+    assert!(engine.memoized_root(&session, &old).unwrap().is_some());
+    let before = engine.memoized_root(&session, &current).unwrap().unwrap();
+    let cached: Vec<_> = before
+        .objects
+        .entries()
+        .into_keys()
+        .filter(|id| !before.closure.contains(id))
+        .collect();
+    assert!(!cached.is_empty(), "precondition: cache-only bodies exist");
+    let bytes = engine.memo.lock().unwrap().bytes;
+    assert!(sweep(&engine, u64::MAX).await.deleted > 0);
+    assert!(
+        engine.memoized_root(&session, &old).unwrap().is_none(),
+        "a root whose closure lost membership stayed memoized"
+    );
+    let after = engine.memoized_root(&session, &current).unwrap().unwrap();
+    assert_eq!(after.closure, before.closure);
+    let domain = engine.domain.clone();
+    for (id, _) in after.objects.entries() {
+        assert!(
+            storage
+                .objects(&domain, &session, std::slice::from_ref(&id))
+                .await
+                .unwrap()[0]
+                .is_some(),
+            "released body {id:?} stayed cached"
+        );
+    }
+    assert!(after.objects.len < before.objects.len);
+    assert!(engine.memo.lock().unwrap().bytes < bytes);
+}
+
+#[tokio::test]
+async fn the_extension_reader_honours_engine_lease_checks_warm_and_cold() {
+    let limits = JournalReadLimits {
+        objects: u64::MAX,
+        encoded_bytes: u64::MAX,
+        entries: u64::MAX,
+    };
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let engine = JournalEngine::protected(
+            Arc::new(VolatileJournalStorage::default()),
+            JournalStorageId::new("extension"),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("extension");
+        let mut known = BTreeSet::new();
+        let lease = engine.open(&session, writer("one")).await.unwrap();
+        let first = engine
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        let old = engine.open(&session, reader("old")).await.unwrap();
+        engine
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        // A pinned older lease keeps its own view, equal to the full reader's.
+        let value = JournalReader::new(&engine, &old, limits)
+            .unwrap()
+            .extension("review.toggle")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.value, serde_json::json!({ "value": "a" }));
+        let full = JournalReader::new(&engine, &old, limits)
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.extension_state["review.toggle"], value);
+        let renewed = engine.renew(&lease).await.unwrap();
+        let mut current = JournalReader::new(&engine, &renewed, limits).unwrap();
+        assert_eq!(
+            current
+                .extension("review.toggle")
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            serde_json::json!({ "value": "b" })
+        );
+        assert!(current.extension("review.absent").await.unwrap().is_none());
+        // A revoked writer lease reads nothing, through any reader method.
+        engine.revoke_writer(&session).unwrap();
+        assert!(
+            JournalReader::new(&engine, &renewed, limits)
+                .unwrap()
+                .extension("review.toggle")
+                .await
+                .is_err(),
+            "budget {budget}: a revoked lease read an extension"
+        );
+        engine.close(old).await.unwrap();
+    }
+}
+
+// Review (rt-e6): a warm engine must reach the same decision as a cold one
+// after another engine fences its writer, advances the head and retires.
+#[tokio::test]
+async fn a_warm_engine_matches_a_cold_one_after_another_engine_fences_and_retires() {
+    let mut outcomes = Vec::new();
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(VolatileJournalStorage::default());
+        let id = JournalStorageId::new("two-engines");
+        let local = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let other = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("shared");
+        let mut known = BTreeSet::new();
+        let stale = local.open(&session, writer("one")).await.unwrap();
+        let first = local
+            .commit(
+                &stale,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        // The other engine fences the local writer and advances the head.
+        let fencing = other.open(&session, writer("two")).await.unwrap();
+        let mut theirs = known.clone();
+        let second = other
+            .commit(
+                &fencing,
+                full_commit(
+                    &session,
+                    2,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut theirs,
+                ),
+            )
+            .await
+            .unwrap();
+        other.close(fencing).await.unwrap();
+        let mut outcome = Vec::new();
+        let stale_commit = local
+            .commit(
+                &stale,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "stale",
+                    ext_snapshot(&session, "c"),
+                    &mut known.clone(),
+                ),
+            )
+            .await;
+        assert!(
+            stale_commit.is_err(),
+            "budget {budget}: fenced writer committed"
+        );
+        outcome.push(stale_commit.is_ok());
+        local.close(stale).await.unwrap();
+        // A fresh local open sees the other engine's head.
+        let reader_lease = local.open(&session, reader("latest")).await.unwrap();
+        assert_eq!(reader_lease.head(), Some(&second));
+        local.close(reader_lease).await.unwrap();
+        other
+            .authorize_retirement(&session, second.revision, crate::clock::Timestamp(9))
+            .await
+            .unwrap();
+        other.retire(&session, second.revision).await.unwrap();
+        assert!(sweep(&other, u64::MAX).await.deleted > 0);
+        let writer_after = local.open(&session, writer("after")).await;
+        outcome.push(writer_after.is_ok());
+        if let Ok(lease) = writer_after {
+            assert!(
+                lease.head().is_none(),
+                "budget {budget}: retired head selected"
+            );
+            local.close(lease).await.unwrap();
+        }
+        let reader_after = local.open(&session, reader("after-read")).await;
+        outcome.push(reader_after.is_ok());
+        if let Ok(lease) = reader_after {
+            assert!(
+                lease.head().is_none(),
+                "budget {budget}: retired head selected"
+            );
+            local.close(lease).await.unwrap();
+        }
+        outcomes.push(outcome);
+    }
+    assert_eq!(outcomes[0], outcomes[1], "warm and cold engines diverged");
+    eprintln!(
+        "two engines [stale commit ok, writer after retire ok, reader after retire ok]: {outcomes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_memoized_commit_may_re_reference_a_superseded_member() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(LostAcknowledgement::default());
+        let engine = JournalEngine::protected(
+            storage.clone(),
+            JournalStorageId::new("rereference"),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("rereference");
+        let mut known = BTreeSet::new();
+        let lease = engine.open(&session, writer("one")).await.unwrap();
+        let mut head = None;
+        for (index, value) in ["a", "b", "a"].into_iter().enumerate() {
+            storage.calls.lock().unwrap().clear();
+            head = Some(
+                engine
+                    .commit(
+                        &lease,
+                        full_commit(
+                            &session,
+                            1,
+                            head.as_ref(),
+                            &format!("op-{index}"),
+                            ext_snapshot(&session, value),
+                            &mut known,
+                        ),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        if budget != 0 {
+            // Only the re-referenced superseded bodies are rechecked.
+            assert_eq!(
+                storage
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .get(&("objects", session.clone())),
+                Some(&1)
+            );
+        }
+        engine.close(lease).await.unwrap();
+        let cold = JournalEngine::protected(
+            storage.clone(),
+            engine.storage_id(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: 0,
+                ..Default::default()
+            },
+        );
+        let check = cold.open(&session, reader("check")).await.unwrap();
+        let snapshot = JournalReader::new(
+            &cold,
+            &check,
+            JournalReadLimits {
+                objects: u64::MAX,
+                encoded_bytes: u64::MAX,
+                entries: u64::MAX,
+            },
+        )
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot, ext_snapshot(&session, "a"));
+    }
+}

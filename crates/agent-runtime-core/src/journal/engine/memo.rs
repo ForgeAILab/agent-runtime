@@ -129,7 +129,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             .map_err(|_| host_failure())?
             .get(session, root))
     }
-    fn remember_root(
+    pub(super) fn remember_root(
         &self,
         session: &SessionId,
         root: &JournalObjectId,
@@ -314,11 +314,13 @@ impl<S: JournalStorage> JournalEngine<S> {
         self.seed_memo(scratch, session, root, &entry)?;
         Ok(entry)
     }
-    pub(super) fn remember_commit(
+    /// Validation evidence for the head a prepared commit publishes. It is
+    /// remembered only after that head is known to be durable.
+    pub(super) fn commit_memo_entry(
         &self,
         scratch: &Transition,
         session: &SessionId,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(JournalObjectId, Arc<ValidatedRoot>), RuntimeError> {
         let root = scratch
             .lock()?
             .sessions
@@ -327,7 +329,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             .map(|(root, _)| root.clone())
             .ok_or_else(conflict)?;
         let entry = self.memo_entry(scratch, session, &root, false)?;
-        self.remember_root(session, &root, entry)
+        Ok((root, entry))
     }
 }
 
