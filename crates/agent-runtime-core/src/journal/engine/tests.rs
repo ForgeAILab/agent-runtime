@@ -1667,3 +1667,118 @@ async fn the_extension_reader_honours_engine_lease_checks_warm_and_cold() {
         engine.close(old).await.unwrap();
     }
 }
+
+// Review (rt-e6): a warm engine must reach the same decision as a cold one
+// after another engine fences its writer, advances the head and retires.
+#[tokio::test]
+async fn a_warm_engine_matches_a_cold_one_after_another_engine_fences_and_retires() {
+    let mut outcomes = Vec::new();
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(VolatileJournalStorage::default());
+        let id = JournalStorageId::new("two-engines");
+        let local = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let other = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("shared");
+        let mut known = BTreeSet::new();
+        let stale = local.open(&session, writer("one")).await.unwrap();
+        let first = local
+            .commit(
+                &stale,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        // The other engine fences the local writer and advances the head.
+        let fencing = other.open(&session, writer("two")).await.unwrap();
+        let mut theirs = known.clone();
+        let second = other
+            .commit(
+                &fencing,
+                full_commit(
+                    &session,
+                    2,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut theirs,
+                ),
+            )
+            .await
+            .unwrap();
+        other.close(fencing).await.unwrap();
+        let mut outcome = Vec::new();
+        let stale_commit = local
+            .commit(
+                &stale,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "stale",
+                    ext_snapshot(&session, "c"),
+                    &mut known.clone(),
+                ),
+            )
+            .await;
+        assert!(
+            stale_commit.is_err(),
+            "budget {budget}: fenced writer committed"
+        );
+        outcome.push(stale_commit.is_ok());
+        local.close(stale).await.unwrap();
+        // A fresh local open sees the other engine's head.
+        let reader_lease = local.open(&session, reader("latest")).await.unwrap();
+        assert_eq!(reader_lease.head(), Some(&second));
+        local.close(reader_lease).await.unwrap();
+        other
+            .authorize_retirement(&session, second.revision, crate::clock::Timestamp(9))
+            .await
+            .unwrap();
+        other.retire(&session, second.revision).await.unwrap();
+        assert!(sweep(&other, u64::MAX).await.deleted > 0);
+        let writer_after = local.open(&session, writer("after")).await;
+        outcome.push(writer_after.is_ok());
+        if let Ok(lease) = writer_after {
+            assert!(
+                lease.head().is_none(),
+                "budget {budget}: retired head selected"
+            );
+            local.close(lease).await.unwrap();
+        }
+        let reader_after = local.open(&session, reader("after-read")).await;
+        outcome.push(reader_after.is_ok());
+        if let Ok(lease) = reader_after {
+            assert!(
+                lease.head().is_none(),
+                "budget {budget}: retired head selected"
+            );
+            local.close(lease).await.unwrap();
+        }
+        outcomes.push(outcome);
+    }
+    assert_eq!(outcomes[0], outcomes[1], "warm and cold engines diverged");
+    eprintln!(
+        "two engines [stale commit ok, writer after retire ok, reader after retire ok]: {outcomes:?}"
+    );
+}
