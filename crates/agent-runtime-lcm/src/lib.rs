@@ -43,10 +43,11 @@ pub use ids::{
 };
 pub use node::{CondensationCommit, LcmEdge, LcmNode, LcmNodeKind, LeafCommit};
 pub use planning::{
-    CharRatioSizer, CondensationGroupPlan, CondensationPlan, LcmSizer, LeafPlan,
+    CharRatioSizer, CondensationGroupPlan, CondensationMode, CondensationPlan, LcmSizer, LeafPlan,
     RequestSizerAdapter, SourceBlock, ToolExchangeBlock, plan_condensations, plan_leaf,
-    plan_leaf_with_frontier, select_tool_safe_blocks, source_fingerprint_entries,
-    source_fingerprint_nodes, tool_exchange_blocks,
+    plan_leaf_with_frontier, plan_next_condensation, select_condensation_group,
+    select_tool_safe_blocks, source_fingerprint_entries, source_fingerprint_nodes,
+    tool_exchange_blocks,
 };
 pub use pressure::{
     CompactionMode, LcmPressureDecision, LcmPressurePolicy, MAX_DERIVED_HARD_ROUNDS,
@@ -72,7 +73,7 @@ pub use memory::InMemoryLcmStore;
 
 /// The package's semantic contract revision.  Hosts should include this in
 /// their run manifests and compatibility checks when they persist LCM state.
-pub const LCM_ALGORITHM_REVISION: &str = "agent-runtime-lcm-3";
+pub const LCM_ALGORITHM_REVISION: &str = "agent-runtime-lcm-4";
 
 /// Stable purpose for separately attributed semantic summary model work.
 pub const LCM_SUMMARY_PURPOSE: &str = "context.semantic_summary";

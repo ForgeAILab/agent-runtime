@@ -1843,7 +1843,19 @@ async fn condensation_commit_before_checkpoint_is_adopted_without_model_retry() 
         .expect("serialized pending condensation commit");
     let commit: CondensationCommit =
         serde_json::from_value(commit_value).expect("pending condensation decodes");
-    assert_eq!(commit.child_ids.len(), 3);
+    // The explicit-set planner used to merge all three binary children.
+    // Frontier selection carries the newest full pair and preserves a sibling.
+    assert_eq!(
+        commit.child_ids,
+        vec![
+            LcmNodeId::new("fixture-leaf-node-1"),
+            LcmNodeId::new("fixture-leaf-node-2")
+        ]
+    );
+    assert_eq!(
+        commit.range,
+        LcmRange::new(LcmSequence::new(2), LcmSequence::new(5)).unwrap()
+    );
 
     // Simulate the crash boundary after the atomic DAG CAS and before the
     // protected pending-clear checkpoint is published.
@@ -1859,7 +1871,7 @@ async fn condensation_commit_before_checkpoint_is_adopted_without_model_retry() 
             .iter()
             .filter(|node| node.is_active())
             .count(),
-        1
+        2
     );
     assert_eq!(
         committed.node.edges,
@@ -1935,9 +1947,18 @@ async fn condensation_commit_before_checkpoint_is_adopted_without_model_retry() 
     );
     assert_eq!(
         nodes.iter().filter(|node| node.is_active()).count(),
-        1,
-        "exact supersession leaves one active parent"
+        2,
+        "exact supersession preserves the unselected sibling"
     );
+    let mut active_ids = nodes
+        .iter()
+        .filter(|node| node.is_active())
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    active_ids.sort();
+    let mut expected_ids = vec![LcmNodeId::new("fixture-leaf-node-0"), parent_id];
+    expected_ids.sort();
+    assert_eq!(active_ids, expected_ids);
     let persisted = sessions.latest(&session_id);
     let saved = persisted
         .extension_state

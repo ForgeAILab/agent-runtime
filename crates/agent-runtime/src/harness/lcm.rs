@@ -38,13 +38,13 @@ use agent_runtime_core::provider::ProviderAttemptPurpose;
 use agent_runtime_core::store::{SessionStateSensitivity, VersionedSessionState};
 use agent_runtime_core::usage::{CounterKind, Provenance, UsageDelta, UsageRecord, UsageSource};
 use agent_runtime_lcm::{
-    AppendResult, CondensationCommit, ExpansionRequest, LcmAppendRequest, LcmClassification,
-    LcmEntry, LcmEntryId, LcmError, LcmEscalatingSummarizer, LcmEscalationPolicy, LcmExpansion,
-    LcmNodeId, LcmOperationFingerprint, LcmOperationId, LcmPressureDecision, LcmPressurePolicy,
-    LcmRange, LcmRevision, LcmSequence, LcmSizer, LcmStore, LcmSummaryAttemptOutcome,
-    LcmSummaryError, LcmSummaryModel, LcmSummaryOutcome, LcmTimelineId, LcmView, LcmViewAuthority,
-    LeafCommit, decide_pressure_with_reclaim, plan_condensations, plan_leaf_with_frontier,
-    project_active_context,
+    AppendResult, CondensationCommit, CondensationMode, ExpansionRequest, LcmAppendRequest,
+    LcmClassification, LcmEntry, LcmEntryId, LcmError, LcmEscalatingSummarizer,
+    LcmEscalationPolicy, LcmExpansion, LcmNodeId, LcmOperationFingerprint, LcmOperationId,
+    LcmPressureDecision, LcmPressurePolicy, LcmRange, LcmRevision, LcmSequence, LcmSizer, LcmStore,
+    LcmSummaryAttemptOutcome, LcmSummaryError, LcmSummaryModel, LcmSummaryOutcome, LcmTimelineId,
+    LcmView, LcmViewAuthority, LeafCommit, decide_pressure_with_reclaim, plan_leaf_with_frontier,
+    plan_next_condensation, project_active_context,
 };
 use agent_runtime_registry::{Fingerprint, RegistryRevision, TrustClass};
 
@@ -3031,6 +3031,7 @@ impl LcmCoordinator {
         history_len: usize,
         idle: bool,
         protected_history_start: Option<usize>,
+        condensation_mode: CondensationMode,
     ) -> Result<CompactionReport, RuntimeError> {
         let view = binding.view();
         let mut active_nodes = self
@@ -3060,107 +3061,122 @@ impl LcmCoordinator {
             LCM_SUMMARY_PURPOSE
         };
         let mut report = CompactionReport::default();
-        if let Some(plan) = self.plan_canonical_leaf(&raw_entries, history_len, !idle)? {
-            if plan.eligible_for_model {
-                let operation_id = Self::operation_id("leaf", &plan.operation_fingerprint);
-                // Admission is recorded before any model attempt. The
-                // operation fingerprint and source metadata come from the
-                // deterministic plan, so a failed attempt cannot make the
-                // operation appear to have been admitted after the fact.
-                report.events.push(self.operation_event(
-                    binding,
-                    &operation_id,
-                    &plan.operation_fingerprint,
-                    plan.range,
-                    &plan.source_fingerprint,
-                    &plan.classification,
-                    plan.source_tokens,
-                )?);
-                // Capture the CAS predecessor before invoking the model. A
-                // response checkpoint must bind the eventual mutation to the
-                // exact DAG revision it summarized.
-                let expected_revision = self
-                    .store
-                    .current_revision(&view)
-                    .await
-                    .map_err(map_lcm_error)?;
-                let outcome = self
-                    .summarizer
-                    .summarize(
-                        &plan.entries,
-                        plan.operation_fingerprint.clone(),
-                        self.policy.sizer.as_ref(),
-                        purpose,
-                    )
-                    .await
-                    .map_err(map_summary_error)?;
-                let guarded_classification = self
-                    .validate_summary_body(
-                        &outcome.classification,
-                        &outcome.text,
-                        Some((outcome.input_tokens, outcome.output_tokens)),
-                    )
-                    .await?;
-                report
-                    .events
-                    .extend(self.summary_events(binding, &outcome)?);
-                let mut commit = LeafCommit {
-                    expected_revision,
-                    operation_id,
-                    node_id: LcmNodeId::new(format!(
-                        "leaf:{}:{}",
-                        binding.timeline, outcome.source_fingerprint
-                    )),
-                    range: outcome.source_range,
-                    entry_ids: plan.entries.iter().map(|entry| entry.id.clone()).collect(),
-                    source_fingerprint: outcome.source_fingerprint.clone(),
-                    summary: outcome.text.clone(),
-                    token_count: outcome.token_count,
-                    source_token_count: plan.source_tokens,
-                    policy_revision: self.policy.pressure.revision.clone(),
-                    algorithm_revision: self.policy.algorithm_revision.clone(),
-                    sizer_revision: self.policy.sizer.revision(),
-                    provenance: outcome.provenance.clone(),
-                    classification: guarded_classification,
-                    operation_fingerprint: None,
-                };
-                let operation_fingerprint =
-                    commit.computed_operation_fingerprint(&binding.timeline);
-                commit.operation_fingerprint = Some(operation_fingerprint);
-                report.pending_summary = Some(LcmPendingSummary::Leaf {
-                    timeline_id: binding.timeline.clone(),
-                    model_id: self.model.id().to_owned(),
-                    model_revision: self.model.revision().clone(),
-                    summary_policy_revision: self.summarizer.policy().policy_revision.clone(),
-                    classifier_revision: self.classifier.revision(),
-                    plan_operation_fingerprint: plan.operation_fingerprint.clone(),
-                    commit,
-                });
-                if let Some(record) = Self::usage_record(&outcome, purpose, idle) {
-                    report.usage.push(record);
+        let mut leaf_error = None;
+        'leaf: {
+            if let Some(plan) = self.plan_canonical_leaf(&raw_entries, history_len, !idle)? {
+                if plan.eligible_for_model {
+                    let operation_id = Self::operation_id("leaf", &plan.operation_fingerprint);
+                    // Admission is recorded before any model attempt. The
+                    // operation fingerprint and source metadata come from the
+                    // deterministic plan, so a failed attempt cannot make the
+                    // operation appear to have been admitted after the fact.
+                    report.events.push(self.operation_event(
+                        binding,
+                        &operation_id,
+                        &plan.operation_fingerprint,
+                        plan.range,
+                        &plan.source_fingerprint,
+                        &plan.classification,
+                        plan.source_tokens,
+                    )?);
+                    // Capture the CAS predecessor before invoking the model. A
+                    // response checkpoint must bind the eventual mutation to the
+                    // exact DAG revision it summarized.
+                    let expected_revision = self
+                        .store
+                        .current_revision(&view)
+                        .await
+                        .map_err(map_lcm_error)?;
+                    let outcome = match self
+                        .summarizer
+                        .summarize(
+                            &plan.entries,
+                            plan.operation_fingerprint.clone(),
+                            self.policy.sizer.as_ref(),
+                            purpose,
+                        )
+                        .await
+                        .map_err(map_summary_error)
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error)
+                            if condensation_mode == CondensationMode::Pressure
+                                && is_cannot_fit(&error) =>
+                        {
+                            // Exhaust leaf escalation first. A tiny retained source
+                            // may not shrink even though active summaries can.
+                            leaf_error = Some(error);
+                            break 'leaf;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let guarded_classification = self
+                        .validate_summary_body(
+                            &outcome.classification,
+                            &outcome.text,
+                            Some((outcome.input_tokens, outcome.output_tokens)),
+                        )
+                        .await?;
+                    report
+                        .events
+                        .extend(self.summary_events(binding, &outcome)?);
+                    let mut commit = LeafCommit {
+                        expected_revision,
+                        operation_id,
+                        node_id: LcmNodeId::new(format!(
+                            "leaf:{}:{}",
+                            binding.timeline, outcome.source_fingerprint
+                        )),
+                        range: outcome.source_range,
+                        entry_ids: plan.entries.iter().map(|entry| entry.id.clone()).collect(),
+                        source_fingerprint: outcome.source_fingerprint.clone(),
+                        summary: outcome.text.clone(),
+                        token_count: outcome.token_count,
+                        source_token_count: plan.source_tokens,
+                        policy_revision: self.policy.pressure.revision.clone(),
+                        algorithm_revision: self.policy.algorithm_revision.clone(),
+                        sizer_revision: self.policy.sizer.revision(),
+                        provenance: outcome.provenance.clone(),
+                        classification: guarded_classification,
+                        operation_fingerprint: None,
+                    };
+                    let operation_fingerprint =
+                        commit.computed_operation_fingerprint(&binding.timeline);
+                    commit.operation_fingerprint = Some(operation_fingerprint);
+                    report.pending_summary = Some(LcmPendingSummary::Leaf {
+                        timeline_id: binding.timeline.clone(),
+                        model_id: self.model.id().to_owned(),
+                        model_revision: self.model.revision().clone(),
+                        summary_policy_revision: self.summarizer.policy().policy_revision.clone(),
+                        classifier_revision: self.classifier.revision(),
+                        plan_operation_fingerprint: plan.operation_fingerprint.clone(),
+                        commit,
+                    });
+                    if let Some(record) = Self::usage_record(&outcome, purpose, idle) {
+                        report.usage.push(record);
+                    }
+                    return Ok(report);
                 }
-                return Ok(report);
             }
         }
 
-        active_nodes.sort_by_key(|node| (node.range.start, node.range.end, node.id.clone()));
-        if active_nodes.len() > self.policy.pressure.condensation_fanout {
-            let condensation_id = format!("condensation:{}", history_len);
-            let Some(plan) = plan_condensations(
-                &active_nodes,
-                self.policy.pressure.condensation_fanout,
-                &condensation_id,
-                &self.policy.pressure.revision,
-                &self.policy.algorithm_revision,
-                &self.policy.sizer.revision(),
-            )
-            .map_err(map_lcm_error)?
-            else {
-                return Ok(report);
-            };
-            let Some(group_plan) = plan.group_plans.first() else {
-                return Ok(report);
-            };
+        let condensation_id = format!("condensation:{}", history_len);
+        if let Some(group_plan) = plan_next_condensation(
+            &active_nodes,
+            self.policy.pressure.condensation_fanout,
+            condensation_mode,
+            &condensation_id,
+            &self.policy.pressure.revision,
+            &self.policy.algorithm_revision,
+            &self.policy.sizer.revision(),
+        )
+        .map_err(map_lcm_error)?
+        {
+            if let Some(error) = &leaf_error {
+                if let Some(record) = Self::failed_summary_usage(error, purpose, idle) {
+                    report.usage.push(record);
+                }
+            }
             let by_id = active_nodes
                 .iter()
                 .map(|node| (node.id.clone(), node))
@@ -3177,7 +3193,7 @@ impl LcmCoordinator {
                 ));
             }
             // Condensation admission likewise precedes model escalation. The
-            // first group plan is the complete source of the CAS metadata.
+            // selected group plan is the complete source of the CAS metadata.
             let operation_id =
                 Self::operation_id("condensation", &group_plan.operation_fingerprint);
             report.events.push(self.operation_event(
@@ -3205,7 +3221,22 @@ impl LcmCoordinator {
                     purpose,
                 )
                 .await
-                .map_err(map_summary_error)?;
+                .map_err(|error| {
+                    let mut error = map_summary_error(error);
+                    // The caller accounts failed work from error metadata.
+                    // Include both attempts when the fallback also fails.
+                    if let Some(prior) = &leaf_error {
+                        for key in ["summary_input_tokens", "summary_output_tokens"] {
+                            let tokens = |error: &RuntimeError| match error.metadata.get(key) {
+                                Some(MetaValue::Int(tokens)) => (*tokens).max(0),
+                                _ => 0,
+                            };
+                            let total = tokens(&error).saturating_add(tokens(prior));
+                            error.metadata.insert(key, total);
+                        }
+                    }
+                    error
+                })?;
             let guarded_classification = self
                 .validate_summary_body(
                     &outcome.classification,
@@ -3251,6 +3282,9 @@ impl LcmCoordinator {
                 report.usage.push(record);
             }
             return Ok(report);
+        }
+        if let Some(error) = leaf_error {
+            return Err(error);
         }
         Ok(report)
     }
@@ -3576,9 +3610,15 @@ impl LcmCoordinator {
                 commit,
                 ..
             } => {
-                let Some(plan) = plan_condensations(
+                let Some(group_plan) = plan_next_condensation(
                     active_nodes,
                     self.policy.pressure.condensation_fanout,
+                    // Both supported purposes enter compact_once only after
+                    // Soft/Hard admission. Pending responses retain that
+                    // admission even if current pressure has since changed.
+                    // Derive the same mode from this protected purpose; no
+                    // new persisted field or pressure remeasurement is needed.
+                    CondensationMode::Pressure,
                     &format!("condensation:{}", history.len()),
                     &self.policy.pressure.revision,
                     &self.policy.algorithm_revision,
@@ -3586,11 +3626,6 @@ impl LcmCoordinator {
                 )
                 .map_err(map_lcm_error)?
                 else {
-                    return Err(RuntimeError::conflict(
-                        "LCM pending condensation source plan disappeared",
-                    ));
-                };
-                let Some(group_plan) = plan.group_plans.first() else {
                     return Err(RuntimeError::conflict(
                         "LCM pending condensation source plan disappeared",
                     ));
@@ -4292,6 +4327,7 @@ impl LcmCoordinator {
                         view.history.len(),
                         false,
                         Some(Self::latest_active_user_boundary(&view.history)),
+                        CondensationMode::Pressure,
                     )
                     .await
                 {
@@ -4389,7 +4425,7 @@ impl LcmCoordinator {
         (hard_rounds, hard_round_limit): (usize, usize),
         usage: Vec<UsageRecord>,
         mut events: Vec<HarnessEvent>,
-        error: RuntimeError,
+        mut error: RuntimeError,
     ) -> Result<BeforeProviderPatch, RuntimeError> {
         let mut state = self
             .checkpoint_state(
@@ -4403,6 +4439,10 @@ impl LcmCoordinator {
             .await?;
         if hard_rounds > 0 {
             state.hard_round_limit = hard_round_limit;
+        }
+        if hard_round_limit > 0 && hard_rounds >= hard_round_limit {
+            // A pending commit can fail before the pressure guard runs.
+            error.metadata.insert("max_rounds", hard_round_limit as u64);
         }
         events.push(self.failure_event(binding, &state, &error)?);
         Ok(BeforeProviderPatch::blocked(
@@ -4961,7 +5001,13 @@ impl TurnCommitHook for LcmCoordinator {
         }
 
         match self
-            .compact_once(&binding, view.history.len(), true, None)
+            .compact_once(
+                &binding,
+                view.history.len(),
+                true,
+                None,
+                CondensationMode::Pressure,
+            )
             .await
         {
             Ok(report) => {
@@ -6868,7 +6914,10 @@ mod tests {
     #[tokio::test]
     async fn derived_hard_round_bound_is_fixed_per_admission_epoch() {
         let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
-        let coordinator = pressure_coordinator(store.clone(), 15, 0, 16);
+        // This budget derives seven rounds while pressure remains hard after
+        // seven leaves. Reach the bound before pressure condensation, whose
+        // commit is unsupported by TestStore and returns StoreFailure.
+        let coordinator = pressure_coordinator(store.clone(), 100, 0, 16);
         let history = (0..8)
             .flat_map(|index| {
                 [
@@ -6894,10 +6943,17 @@ mod tests {
             commit_view(&session, "hard-turn", &history, Some(persisted)),
         )
         .await;
-        let error = outcome.block.expect("15-token budget cannot fit");
+        let error = outcome
+            .block
+            .expect("hard pressure must reach the round bound");
         assert_eq!(
             error.metadata.get("max_rounds").unwrap().to_string(),
             limit.to_string()
+        );
+        assert_eq!(
+            error.metadata.get("rounds").unwrap().to_string(),
+            limit.to_string(),
+            "hard pressure must exhaust the fixed admission-epoch bound"
         );
         assert!(
             store.leaf_commit_count.load(Ordering::SeqCst) <= limit,
@@ -7159,6 +7215,219 @@ mod tests {
         assert!(!committed.retry_admission);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.leaf_commit_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_pressure_condensation_replans_partial_tier_without_model_retry() {
+        use agent_runtime_lcm::{LcmEdge, LcmNode, LcmNodeKind, SummaryProvenance};
+
+        let store = Arc::new(TestStore::new(LcmTimelineId::new("lcm-timeline")));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut coordinator = counting_pressure_coordinator(store.clone(), calls.clone());
+        coordinator.policy.pressure.condensation_fanout = 8;
+        let session = SessionId::new("lcm-session");
+        let binding = coordinator.timeline_binding(&session).unwrap();
+        let history = (0..20)
+            .map(|index| Message::user(format!("source entry {index}")))
+            .collect::<Vec<_>>();
+        *store.entries.lock().unwrap() = history
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                LcmEntry::new(
+                    binding.timeline.clone(),
+                    LcmEntryId::new(format!("entry-{index}")),
+                    LcmSequence::new(index as u64),
+                    message.clone(),
+                    coordinator.classifier.classify(message),
+                )
+            })
+            .collect();
+        let frontier = (0..5)
+            .map(|index| {
+                let start = if index == 0 { 0 } else { 15 + index };
+                let end = if index == 0 { 15 } else { start };
+                let summary = "source summary details ".repeat(20);
+                let source_fingerprint = Fingerprint::of(format!("source-{index}"));
+                let provenance = SummaryProvenance::Deterministic {
+                    revision: RegistryRevision::new("test-condensation-source"),
+                };
+                let token_count = coordinator.policy.sizer.summary_tokens(&summary);
+                let node = LcmNode {
+                    timeline_id: binding.timeline.clone(),
+                    id: LcmNodeId::new(format!("child-{index}")),
+                    kind: if index == 0 {
+                        LcmNodeKind::Condensed
+                    } else {
+                        LcmNodeKind::Leaf
+                    },
+                    range: LcmRange::new(LcmSequence::new(start), LcmSequence::new(end)).unwrap(),
+                    edges: if index == 0 {
+                        vec![
+                            LcmEdge::Node(LcmNodeId::new("old-child-a")),
+                            LcmEdge::Node(LcmNodeId::new("old-child-b")),
+                        ]
+                    } else {
+                        vec![LcmEdge::Entry(LcmEntryId::new(format!("entry-{start}")))]
+                    },
+                    summary_revision: LcmNode::compute_summary_revision(
+                        &source_fingerprint,
+                        &provenance,
+                        &summary,
+                    ),
+                    source_fingerprint,
+                    summary,
+                    policy_revision: coordinator.policy.pressure.revision.clone(),
+                    algorithm_revision: coordinator.policy.algorithm_revision.clone(),
+                    sizer_revision: coordinator.policy.sizer.revision(),
+                    provenance,
+                    token_count,
+                    source_token_count: token_count * 2,
+                    classification: coordinator
+                        .classifier
+                        .classify(&history[start as usize])
+                        .classification,
+                    revision: LcmRevision::new(1),
+                    superseded_by: None,
+                    operation_id: LcmOperationId::new(format!("source-{index}")),
+                    operation_fingerprint: LcmOperationFingerprint::from_fields([format!(
+                        "source-{index}"
+                    )]),
+                };
+                node.validate().unwrap();
+                node
+            })
+            .collect::<Vec<_>>();
+        // Store iteration order must not affect initial selection or resume.
+        *store.nodes.lock().unwrap() = frontier.iter().rev().cloned().collect();
+        *store.revision.lock().unwrap() = LcmRevision::new(1);
+        let report = coordinator
+            .compact_once(
+                &binding,
+                history.len(),
+                false,
+                None,
+                CondensationMode::Pressure,
+            )
+            .await
+            .unwrap();
+        let pending = report.pending_summary.expect("staged condensation");
+        let LcmPendingSummary::Condensation { commit, .. } = &pending else {
+            panic!("token pressure should stage condensation even without a full tier");
+        };
+        // The oldest-first planner included child-0 and re-wrapped its large
+        // range; pressure planning must select just the four new leaves,
+        // even though neither their tier nor the frontier reaches fanout=8.
+        assert_eq!(
+            commit.child_ids,
+            frontier[1..]
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            commit.range,
+            LcmRange::new(LcmSequence::new(16), LcmSequence::new(19)).unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut resumed = counting_pressure_coordinator(store.clone(), calls.clone());
+        resumed.policy.pressure.condensation_fanout = 8;
+        let restored: LcmPendingSummary =
+            serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+        assert_eq!(pending, restored);
+        assert!(resumed.pending_tunables_current(&restored));
+        resumed
+            .validate_pending_metadata(&binding, &restored)
+            .unwrap();
+        // Pending admission remains authoritative even when a new budget
+        // would no longer request pressure compaction during recovery.
+        resumed.policy.input_budget_tokens = u64::MAX;
+        resumed
+            .validate_pending_plan(&binding, &history, &restored, LCM_SUMMARY_PURPOSE)
+            .await
+            .expect("resume must reproduce the selected group and fingerprint");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut changed = restored;
+        if let LcmPendingSummary::Condensation { commit, .. } = &mut changed {
+            commit.child_ids[0] = frontier[0].id.clone();
+        }
+        resumed
+            .validate_pending_plan(&binding, &history, &changed, LCM_SUMMARY_PURPOSE)
+            .await
+            .expect_err("resume must reject a different group");
+
+        // A viable raw leaf still wins over the partial tier. If the raw
+        // source cannot shrink even after escalation, pressure can instead
+        // condense that tier and resume its exact plan without repeating I/O.
+        for (source, expect_leaf) in [
+            (Message::user("x"), false),
+            (Message::user("eligible raw source ".repeat(200)), true),
+        ] {
+            let mut source_history = history.clone();
+            source_history.push(source);
+            source_history.push(Message::user("protected active turn"));
+            *store.entries.lock().unwrap() = source_history
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    LcmEntry::new(
+                        binding.timeline.clone(),
+                        LcmEntryId::new(format!("entry-{index}")),
+                        LcmSequence::new(index as u64),
+                        message.clone(),
+                        resumed.classifier.classify(message),
+                    )
+                })
+                .collect();
+            let calls_before = calls.load(Ordering::SeqCst);
+            let report = resumed
+                .compact_once(
+                    &binding,
+                    source_history.len(),
+                    false,
+                    Some(21),
+                    CondensationMode::Pressure,
+                )
+                .await
+                .unwrap();
+            let pending = report
+                .pending_summary
+                .expect("leaf or pressure fallback staged");
+            if expect_leaf {
+                assert!(matches!(&pending, LcmPendingSummary::Leaf { .. }));
+                assert_eq!(calls.load(Ordering::SeqCst), calls_before + 1);
+            } else {
+                let LcmPendingSummary::Condensation { commit, .. } = &pending else {
+                    panic!("unsummarizable raw source must allow pressure condensation");
+                };
+                assert_eq!(
+                    commit.child_ids,
+                    frontier[1..]
+                        .iter()
+                        .map(|node| node.id.clone())
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    calls.load(Ordering::SeqCst) > calls_before + 1,
+                    "leaf escalation precedes condensation"
+                );
+                assert_eq!(
+                    report.usage.len(),
+                    2,
+                    "failed leaf and successful condensation usage are retained"
+                );
+            }
+            let restored: LcmPendingSummary =
+                serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+            let calls_before_resume = calls.load(Ordering::SeqCst);
+            resumed
+                .validate_pending_plan(&binding, &source_history, &restored, LCM_SUMMARY_PURPOSE)
+                .await
+                .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), calls_before_resume);
+        }
     }
 
     #[tokio::test]
