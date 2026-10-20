@@ -2902,10 +2902,10 @@ async fn r3_a_stale_collection_write_cannot_release_a_root_another_engine_pinned
             .all(Option::is_some),
         "stale collection released a root another engine pinned"
     );
-    assert_eq!(
-        collected.unwrap().unreadable_sessions,
-        vec![session.clone()]
-    );
+    let report = collected.unwrap();
+    assert!(report.unreadable_sessions.is_empty());
+    assert_eq!((report.deleted, report.reclaimed_bytes), (0, 0));
+    assert!(collector.dirty.lock().unwrap().contains(&session));
     // A retry reloads the new fence; used and fresh collectors stay healthy.
     sweep(&collector, u64::MAX).await;
     let (_, fresh) = two_engines(&storage, 0);
@@ -2962,10 +2962,11 @@ async fn r3_a_stale_dependent_candidate_write_cannot_lose_retirement_authorizati
         metadata(record)["authorization"].is_array(),
         "stale candidate write lost the authorization"
     );
-    assert_eq!(
-        collected.unwrap().unreadable_sessions,
-        vec![source.clone(), target.clone()]
-    );
+    let report = collected.unwrap();
+    assert!(report.unreadable_sessions.is_empty());
+    assert_eq!((report.deleted, report.reclaimed_bytes), (0, 0));
+    let dirty = collector.dirty.lock().unwrap().clone();
+    assert!(dirty.contains(&source) && dirty.contains(&target));
     // A retry records the candidate on the new fence and keeps the grant.
     sweep(&collector, u64::MAX).await;
     let record = storage

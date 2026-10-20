@@ -1,19 +1,44 @@
 use super::persistence::{pin_changes, pin_records};
 use super::*;
+use crate::error::{ErrorKind, FailureClass};
+use crate::metadata::MetaValue;
 
 // Only errors scoped to a session may be isolated. Domain discovery and root
 // epoch checks stay outside this boundary and still fail the whole call.
-pub(super) fn isolate_collection_failure<T>(
-    session: &SessionId,
-    result: Result<T, RuntimeError>,
-    unreadable: &mut BTreeSet<SessionId>,
-) -> Result<Option<T>, RuntimeError> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if error.retryable => Err(error),
-        Err(_) => {
-            unreadable.insert(session.clone());
-            Ok(None)
+#[derive(Default)]
+pub(super) struct CollectionFailures {
+    pub(super) skipped: BTreeSet<SessionId>,
+    pub(super) unreadable: BTreeSet<SessionId>,
+}
+impl CollectionFailures {
+    pub(super) fn isolate<T>(
+        &mut self,
+        session: &SessionId,
+        result: Result<T, RuntimeError>,
+    ) -> Result<Option<T>, RuntimeError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error)
+                if error.retryable
+                    || error.metadata.get("journal_lock_poisoned")
+                        == Some(&MetaValue::Bool(true)) =>
+            {
+                Err(error)
+            }
+            Err(error) => {
+                self.skipped.insert(session.clone());
+                // Older validation paths also use Conflict/StateConflict. The
+                // private validation marker distinguishes proven invalid data
+                // from a fence or non-atomic membership/body read race.
+                let conflict = error.kind == ErrorKind::Conflict
+                    || matches!(error.class, FailureClass::StateConflict { .. });
+                if !conflict
+                    || error.metadata.get("journal_invalid_state") == Some(&MetaValue::Bool(true))
+                {
+                    self.unreadable.insert(session.clone());
+                }
+                Ok(None)
+            }
         }
     }
 }
@@ -251,20 +276,16 @@ impl<S: JournalStorage> JournalEngine<S> {
         // the registry lock order; concurrent changes insert fresh hints and
         // therefore cannot be erased by this sweep.
         let local_dirty = std::mem::take(&mut *self.dirty.lock().map_err(|_| host_failure())?);
-        let result = self.collect_sessions(&request, &local_dirty).await;
-        match &result {
-            Err(_) => self
-                .dirty
-                .lock()
-                .map_err(|_| host_failure())?
-                .extend(local_dirty),
-            // Keep even local-only hints: a repaired record/key should be
-            // retried without requiring a new write to discover it.
-            Ok(report) => self
-                .dirty
-                .lock()
-                .map_err(|_| host_failure())?
-                .extend(report.unreadable_sessions.iter().cloned()),
+        let mut failures = CollectionFailures::default();
+        let result = self
+            .collect_sessions(&request, &local_dirty, &mut failures)
+            .await;
+        // Keep even local-only and dependency-discovered hints, including
+        // conflicts. A later abort must preserve these as well as the input.
+        let mut dirty = self.dirty.lock().map_err(|_| host_failure())?;
+        dirty.extend(failures.skipped);
+        if result.is_err() {
+            dirty.extend(local_dirty);
         }
         result
     }
@@ -273,6 +294,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         request: &JournalGcRequest,
         local_dirty: &BTreeSet<SessionId>,
+        failures: &mut CollectionFailures,
     ) -> Result<JournalGcReport, RuntimeError> {
         if self
             .local
@@ -292,7 +314,6 @@ impl<S: JournalStorage> JournalEngine<S> {
             reclaimed_bytes: 0,
             unreadable_sessions: Vec::new(),
         };
-        let mut unreadable = BTreeSet::new();
         // The work budget counts membership releases, including shared bodies
         // whose physical deletion receipt is zero. Reports count body deletions.
         let mut released = 0;
@@ -323,13 +344,13 @@ impl<S: JournalStorage> JournalEngine<S> {
                         .lock()
                         .map_err(|_| host_failure())?
                         .extend(local_pending);
-                    report.unreadable_sessions = unreadable.into_iter().collect();
+                    report.unreadable_sessions = failures.unreadable.iter().cloned().collect();
                     return Ok(report);
                 }
                 local_pending.remove(&session);
                 // A dependency-index read may already have failed for this
                 // session. Do not load it again within the same call.
-                if unreadable.contains(&session) {
+                if failures.skipped.contains(&session) {
                     continue;
                 }
                 let read = async {
@@ -345,7 +366,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 }
                 .await;
                 let Some((stored, live, dependencies, members)) =
-                    isolate_collection_failure(&session, read, &mut unreadable)?
+                    failures.isolate(&session, read)?
                 else {
                     continue;
                 };
@@ -355,16 +376,11 @@ impl<S: JournalStorage> JournalEngine<S> {
                 if released == 0 && self.root_epoch()? != request.expected_root_epoch {
                     return Err(conflict());
                 }
-                if !Box::pin(self.index_retirement_dependencies(
-                    &session,
-                    dependencies,
-                    &mut unreadable,
-                ))
-                .await?
+                if !Box::pin(self.index_retirement_dependencies(&session, dependencies, failures))
+                    .await?
                 {
                     // Without the candidate index, this source cannot safely
                     // become clean. Preserve its own state and retry hint too.
-                    unreadable.insert(session.clone());
                     continue;
                 }
                 if released == 0 && self.root_epoch()? != request.expected_root_epoch {
@@ -380,10 +396,9 @@ impl<S: JournalStorage> JournalEngine<S> {
                 let release: Vec<_> = garbage.into_iter().take(limit).collect();
                 if let Some(mut record) = stored {
                     let expect = record.fence();
-                    let Some(generation) = isolate_collection_failure(
+                    let Some(generation) = failures.isolate(
                         &session,
                         expect.generation.checked_add(1).ok_or_else(conflict),
-                        &mut unreadable,
                     )?
                     else {
                         continue;
@@ -412,18 +427,16 @@ impl<S: JournalStorage> JournalEngine<S> {
                         prune_operations_before: Some(replay_floor),
                         inject: None,
                     };
-                    let Some(receipt) = isolate_collection_failure(
-                        &session,
-                        self.apply(write, &session).await,
-                        &mut unreadable,
-                    )?
+                    let Some(receipt) =
+                        failures.isolate(&session, self.apply(write, &session).await)?
                     else {
                         continue;
                     };
                     report.deleted += receipt.reclaimed_objects;
                     report.reclaimed_bytes += receipt.reclaimed_bytes;
                 } else if !release.is_empty() {
-                    unreadable.insert(session.clone());
+                    failures.skipped.insert(session.clone());
+                    failures.unreadable.insert(session.clone());
                     continue;
                 }
                 self.local
@@ -449,7 +462,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 None => break,
             }
         }
-        report.unreadable_sessions = unreadable.into_iter().collect();
+        report.unreadable_sessions = failures.unreadable.iter().cloned().collect();
         Ok(report)
     }
 }

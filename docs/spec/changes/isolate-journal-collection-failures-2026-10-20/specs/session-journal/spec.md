@@ -2,26 +2,29 @@
 
 ### Requirement: Isolated session collection failures
 
-Collection SHALL isolate any non-retryable failure in a session's collection
+Collection SHALL silently skip state/fence conflicts and isolate other
+non-retryable failures in a session's collection
 reads or its own atomic apply, preserving its membership, retirement, replay rows
 and durable dirty mark, and SHALL continue remaining sessions. The report SHALL
-contain sorted unique session ids in `unreadable_sessions`, without object ids or
-content. Local dirty hints SHALL survive isolation so repair can be retried next
+contain sorted unique session ids whose state could not be read or validated
+in `unreadable_sessions`, excluding conflicts, without object ids or content.
+Local dirty hints SHALL survive both conflict skips and isolation so repair can be retried next
 call, with at most one failing load per session in that call. An unreadable
 retirement dependency SHALL leave its source dirty and uncollected as well.
-Retryable failures and domain-wide discovery or epoch failures SHALL abort;
+Retryable failures and domain-wide discovery, epoch or poisoned engine lock
+failures SHALL abort;
 previously acknowledged session transactions need not roll back.
 
 #### Scenario: An unreadable session does not stop collection
 
-- **GIVEN** three dirty sessions and a non-retryable load failure for the middle one
+- **GIVEN** three dirty sessions and a non-retryable, non-conflict load failure for the middle one
 - **WHEN** the shared engine collects the domain
 - **THEN** both readable sessions are collected and the middle one is unchanged and reported
 - **AND** another collection retries the middle session once and collects new garbage elsewhere
 
 #### Scenario: A session apply fails without effect
 
-- **WHEN** a session's atomic collection apply returns a non-retryable error
+- **WHEN** a session's atomic collection apply returns a non-retryable, non-conflict error
 - **THEN** its objects, replay rows and dirty mark remain unchanged
 - **AND** it is reported while collection continues with later sessions
 
@@ -31,9 +34,30 @@ previously acknowledged session transactions need not roll back.
 - **THEN** collection returns that error without changing durable session state
 - **AND** local dirty hints remain available for a later retry
 
+#### Scenario: Session changed between load and apply
+
+- **WHEN** a session read or apply returns a non-retryable state/fence conflict
+- **THEN** collection skips it without listing it in `unreadable_sessions`
+- **AND** its durable state and retry hint survive while unrelated collection continues
+- **AND** a dependency conflict also leaves its source dirty without reporting either as unreadable
+
+#### Scenario: Packed SQLite writer contention
+
+- **GIVEN** a second SQLite connection holds a write lock
+- **WHEN** packed apply encounters BUSY or LOCKED, including an extended code
+- **THEN** it returns a retryable error and collection aborts for retry
+- **AND** a failed transaction that did not commit has no durable effect
+- **AND** only ambiguous COMMIT I/O errors receive retryability on account of I/O
+
+#### Scenario: Local engine lock poisoned during collection
+
+- **WHEN** a session read or apply encounters a poisoned engine registry or memo lock
+- **THEN** collection returns the domain-wide error rather than isolating a session
+- **AND** unacknowledged session state and retry hints survive
+
 #### Scenario: Unreadable dependency candidate
 
-- **WHEN** collection cannot read a dependency target non-retryably
+- **WHEN** collection cannot read a dependency target with a non-retryable, non-conflict error
 - **THEN** the target and its source are reported and kept dirty without releasing source membership
 - **AND** independent sessions can still be collected
 

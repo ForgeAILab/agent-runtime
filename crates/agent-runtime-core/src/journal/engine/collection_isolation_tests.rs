@@ -131,14 +131,25 @@ fn failures() -> Vec<RuntimeError> {
             component: FailureComponent::Checkpoint,
         }),
         RuntimeError::conflict("session fence rejected"),
+        RuntimeError::internal("adapter state conflict").with_class(FailureClass::StateConflict {
+            stage: FailureStage::PreProvider,
+            component: FailureComponent::Checkpoint,
+        }),
     ]
 }
 
 #[tokio::test]
-async fn non_retryable_session_reads_and_applies_are_isolated() {
+async fn session_failures_are_isolated_and_only_non_conflicts_are_reported() {
     for role in [JournalRole::Protected, JournalRole::Ordinary] {
         for method in ["load", "objects", "members", "pins", "apply"] {
             for error in failures() {
+                let expected = if error.kind == ErrorKind::Conflict
+                    || matches!(error.class, FailureClass::StateConflict { .. })
+                {
+                    vec![]
+                } else {
+                    vec![SessionId::new("b")]
+                };
                 let (storage, engine) = setup(role);
                 let sessions = ["a", "b", "c"].map(SessionId::new);
                 let mut heads = Vec::new();
@@ -159,11 +170,7 @@ async fn non_retryable_session_reads_and_applies_are_isolated() {
                 storage.calls.lock().unwrap().clear();
                 let collector = engine.clone(); // use the same shared registries
                 let first = collector.collect(request(&collector)).await.unwrap();
-                assert_eq!(
-                    first.unreadable_sessions,
-                    vec![sessions[1].clone()],
-                    "{role:?}/{method}"
-                );
+                assert_eq!(first.unreadable_sessions, expected, "{role:?}/{method}");
                 assert!(first.deleted > 0 && first.reclaimed_bytes > 0);
                 assert_eq!(
                     storage
@@ -174,6 +181,7 @@ async fn non_retryable_session_reads_and_applies_are_isolated() {
                     Some(&1)
                 );
                 assert_eq!(durable(&storage, &engine, &sessions[1]).await, before);
+                assert!(collector.dirty.lock().unwrap().contains(&sessions[1]));
                 for session in [&sessions[0], &sessions[2]] {
                     assert!(
                         !storage
@@ -261,6 +269,127 @@ async fn unreadable_local_only_hints_survive_success_and_budget_exhaustion() {
 }
 
 #[tokio::test]
+async fn conflict_local_only_hints_survive_success_and_budget_exhaustion() {
+    let (storage, engine) = setup(JournalRole::Ordinary);
+    let sessions = ["a", "b", "c"].map(SessionId::new);
+    let mut heads = Vec::new();
+    for session in &sessions {
+        heads.push(seed(&engine, session).await);
+    }
+    let before = durable(&storage, &engine, &sessions[1]).await;
+    *storage.failure.lock().unwrap() = Some((
+        sessions[1].clone(),
+        "load",
+        RuntimeError::conflict("concurrent collection"),
+    ));
+    storage.hide_unreadable.store(true, Ordering::SeqCst);
+    for budget in [u64::MAX, 1, u64::MAX] {
+        heads[2] = publish(
+            &engine,
+            &sessions[2],
+            Some(&heads[2]),
+            &format!("c-{}", heads[2].revision.0),
+        )
+        .await;
+        storage.calls.lock().unwrap().clear();
+        let mut req = request(&engine);
+        req.max_objects = budget;
+        let report = engine.collect(req).await.unwrap();
+        assert!(report.unreadable_sessions.is_empty());
+        assert_eq!(durable(&storage, &engine, &sessions[1]).await, before);
+        assert!(engine.dirty.lock().unwrap().contains(&sessions[1]));
+        assert_eq!(
+            storage
+                .calls
+                .lock()
+                .unwrap()
+                .get(&("load", sessions[1].clone())),
+            Some(&1)
+        );
+    }
+    *storage.failure.lock().unwrap() = None;
+    assert!(sweep(&engine, u64::MAX).await.reclaimed_bytes > 0);
+}
+
+#[tokio::test]
+async fn poisoned_local_locks_abort_inside_session_reads_and_applies() {
+    for registry in [true, false] {
+        let (storage, engine) = setup(JournalRole::Ordinary);
+        let sessions = ["a", "b"].map(SessionId::new);
+        let mut before = Vec::new();
+        for session in &sessions {
+            seed(&engine, session).await;
+            before.push(durable(&storage, &engine, session).await);
+        }
+        let req = request(&engine);
+        let (ready, paused) = tokio::sync::oneshot::channel();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        *storage.pause_load.lock().unwrap() = Some((ready, wait));
+        let (result, ()) = tokio::join!(engine.collect(req), async {
+            paused.await.unwrap();
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if registry {
+                    let _guard = engine.local.state.lock().unwrap();
+                    panic!("deliberately poison registry during session read");
+                } else {
+                    let _guard = engine.memo.lock().unwrap();
+                    panic!("deliberately poison memo before session apply");
+                }
+            }));
+            assert!(panic.is_err());
+            resume.send(()).unwrap();
+        });
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Internal);
+        assert!(!error.retryable);
+        for (session, before) in sessions.iter().zip(before) {
+            assert_eq!(durable(&storage, &engine, session).await, before);
+            assert!(engine.dirty.lock().unwrap().contains(session));
+        }
+        engine.local.state.clear_poison();
+        engine.memo.clear_poison();
+        assert!(sweep(&engine, u64::MAX).await.reclaimed_bytes > 0);
+    }
+}
+
+#[tokio::test]
+async fn invalid_stored_metadata_is_unreadable_even_with_legacy_conflict_kind() {
+    let (storage, engine) = setup(JournalRole::Ordinary);
+    let sessions = ["a", "b"].map(SessionId::new);
+    for session in &sessions {
+        seed(&engine, session).await;
+    }
+    let record = storage
+        .inner
+        .load(&engine.domain, &sessions[0])
+        .await
+        .unwrap()
+        .unwrap();
+    let mut corrupt = JournalWrite {
+        domain: engine.domain.clone(),
+        session: sessions[0].clone(),
+        kind: JournalWriteKind::Collect,
+        expect: record.fence(),
+        record,
+        objects: JournalObjectBatch::default(),
+        operation: None,
+        pins: vec![],
+        catalog: vec![],
+        release: vec![],
+        prune_operations_before: None,
+        inject: None,
+    };
+    corrupt.record.generation += 1;
+    corrupt.record.engine.bytes = b"invalid metadata".to_vec();
+    storage.inner.apply(corrupt).await.unwrap();
+    let before = durable(&storage, &engine, &sessions[0]).await;
+    let report = sweep(&engine, u64::MAX).await;
+    assert_eq!(report.unreadable_sessions, vec![sessions[0].clone()]);
+    assert!(report.reclaimed_bytes > 0);
+    assert_eq!(durable(&storage, &engine, &sessions[0]).await, before);
+}
+
+#[tokio::test]
 async fn retryable_session_failure_aborts_without_writes_and_restores_hints() {
     for method in ["load", "apply"] {
         let (storage, engine) = setup(JournalRole::Ordinary);
@@ -323,53 +452,65 @@ async fn retryable_middle_failure_preserves_incremental_prefix_and_unvisited_ses
 }
 
 #[tokio::test]
-async fn unreadable_dependencies_are_loaded_once_and_leave_sources_dirty() {
-    let (storage, engine) = setup(JournalRole::Ordinary);
-    let target = SessionId::new("m-target");
-    seed(&engine, &target).await;
-    let mut sources = Vec::new();
-    for name in ["a-source", "b-source"] {
-        let session = SessionId::new(name);
-        let first = seed(&engine, &session).await;
-        let lease = engine.open(&session, writer("dependency")).await.unwrap();
-        let mut snapshot = ext_snapshot(&session, "depends");
-        snapshot.extension_state.insert("agent-runtime.delegation.children".into(),
+async fn dependency_failures_are_loaded_once_and_leave_sources_dirty() {
+    for conflict in [false, true] {
+        let (storage, engine) = setup(JournalRole::Ordinary);
+        let target = SessionId::new("m-target");
+        seed(&engine, &target).await;
+        let mut sources = Vec::new();
+        for name in ["a-source", "b-source"] {
+            let session = SessionId::new(name);
+            let first = seed(&engine, &session).await;
+            let lease = engine.open(&session, writer("dependency")).await.unwrap();
+            let mut snapshot = ext_snapshot(&session, "depends");
+            snapshot.extension_state.insert("agent-runtime.delegation.children".into(),
             crate::store::VersionedSessionState::new(agent_runtime_registry::RegistryRevision::new("resumable-child-catalog-1"),
                 serde_json::json!({"schema_version":1,"children":[{"child_session":target.as_str(),"status":{"state":{"state":"stopped"}}}]})));
-        engine
-            .commit(
-                &lease,
-                full_commit(
-                    &session,
-                    lease.writer_epoch().unwrap(),
-                    Some(&first),
-                    "dependency",
-                    snapshot,
-                    &mut BTreeSet::new(),
-                ),
-            )
-            .await
-            .unwrap();
-        engine.close(lease).await.unwrap();
-        sources.push((session.clone(), durable(&storage, &engine, &session).await));
+            engine
+                .commit(
+                    &lease,
+                    full_commit(
+                        &session,
+                        lease.writer_epoch().unwrap(),
+                        Some(&first),
+                        "dependency",
+                        snapshot,
+                        &mut BTreeSet::new(),
+                    ),
+                )
+                .await
+                .unwrap();
+            engine.close(lease).await.unwrap();
+            sources.push((session.clone(), durable(&storage, &engine, &session).await));
+        }
+        let independent = SessionId::new("z-independent");
+        seed(&engine, &independent).await;
+        *storage.failure.lock().unwrap() = Some((
+            target.clone(),
+            "load",
+            failures().remove(if conflict { 2 } else { 0 }),
+        ));
+        storage.calls.lock().unwrap().clear();
+        let report = sweep(&engine, u64::MAX).await;
+        assert_eq!(
+            report.unreadable_sessions,
+            if conflict {
+                vec![]
+            } else {
+                vec![sources[0].0.clone(), sources[1].0.clone(), target.clone()]
+            }
+        );
+        assert_eq!(
+            storage.calls.lock().unwrap().get(&("load", target.clone())),
+            Some(&1)
+        );
+        assert!(engine.dirty.lock().unwrap().contains(&target));
+        for (session, before) in sources {
+            assert!(engine.dirty.lock().unwrap().contains(&session));
+            assert_eq!(durable(&storage, &engine, &session).await, before);
+        }
+        assert!(report.reclaimed_bytes > 0);
     }
-    let independent = SessionId::new("z-independent");
-    seed(&engine, &independent).await;
-    *storage.failure.lock().unwrap() = Some((target.clone(), "load", failures().remove(0)));
-    storage.calls.lock().unwrap().clear();
-    let report = sweep(&engine, u64::MAX).await;
-    assert_eq!(
-        report.unreadable_sessions,
-        vec![sources[0].0.clone(), sources[1].0.clone(), target.clone()]
-    );
-    assert_eq!(
-        storage.calls.lock().unwrap().get(&("load", target)),
-        Some(&1)
-    );
-    for (session, before) in sources {
-        assert_eq!(durable(&storage, &engine, &session).await, before);
-    }
-    assert!(report.reclaimed_bytes > 0);
 }
 
 #[tokio::test]

@@ -1590,10 +1590,14 @@ impl Transition {
 }
 
 pub(in crate::journal) fn host_failure() -> RuntimeError {
-    RuntimeError::internal("journal backend failure").with_class(FailureClass::HostComponent {
-        stage: FailureStage::PreProvider,
-        component: FailureComponent::Checkpoint,
-    })
+    // Every caller is a poisoned local lock, including the volatile storage
+    // registry. This is domain-wide even inside a session read/apply boundary.
+    RuntimeError::internal("journal backend failure")
+        .with_class(FailureClass::HostComponent {
+            stage: FailureStage::PreProvider,
+            component: FailureComponent::Checkpoint,
+        })
+        .with_metadata(crate::metadata::Metadata::new().with("journal_lock_poisoned", true))
 }
 
 pub(in crate::journal) fn injected_failure() -> RuntimeError {

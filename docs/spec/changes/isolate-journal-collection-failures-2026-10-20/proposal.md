@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-20T12:43:20Z
-updated_at: 2026-10-20T13:13:52Z
+updated_at: 2026-10-20T14:03:25Z
 ---
 
 ## Why
@@ -13,9 +13,11 @@ lookup collisions and inaccurate membership enumeration.
 
 ## What Changes
 
-- Isolate non-retryable per-session collection read and apply failures. Preserve
+- Silently skip per-session state/fence conflicts without reporting them as
+  unreadable. Isolate other non-retryable collection read and apply failures. Preserve
   that session's durable state and dirty mark; continue unrelated sessions.
-  Retryable and domain-wide discovery/mark failures still abort. Collection is
+  Retryable and domain-wide discovery/mark failures, including poisoned local
+  engine locks, still abort. Collection is
   incremental: an abort does not roll back already acknowledged sessions.
 - **BREAKING**: add default-deserialized `unreadable_sessions: Vec<SessionId>` to
   public `JournalGcReport`. Only session ids are reported, sorted and unique;
@@ -44,3 +46,6 @@ lookup collisions and inaccurate membership enumeration.
   ambiguous lost acknowledgements must be marked retryable. Conservative
   dependency candidate additions may precede a source's failed collection;
   source membership, replay rows and dirty state remain unchanged.
+- Packed reference storage classifies SQLite BUSY/LOCKED as retryable, and I/O
+  errors as retryable only at ambiguous COMMIT boundaries. Accepted D5
+  order-dependent conservative blocking is documented in `design.md`.

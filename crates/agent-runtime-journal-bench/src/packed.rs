@@ -1,6 +1,7 @@
 use super::{
     codec::{self, Pack},
-    conflict, failure, metadata,
+    commit_failure, conflict, failure as storage_failure, invalid_data, metadata,
+    sqlite_failure as failure,
 };
 use agent_runtime_core::{error::RuntimeError, ids::SessionId, journal::*};
 use async_trait::async_trait;
@@ -26,6 +27,10 @@ struct State {
     version: i64,
     operations: BTreeMap<OperationKey, JournalOperationRecord>,
 }
+
+#[cfg(test)]
+#[path = "packed_tests.rs"]
+mod tests;
 impl State {
     fn refresh(&mut self) -> Result<(), RuntimeError> {
         let version = self
@@ -69,7 +74,7 @@ impl State {
                     )
                     .is_some()
                 {
-                    return Err(conflict());
+                    return Err(invalid_data());
                 }
             }
             self.packs.insert(pid, pack);
@@ -98,7 +103,7 @@ impl State {
                     op.operation.clone(),
                 );
                 if self.operations.insert(key, op).is_some() {
-                    return Err(conflict());
+                    return Err(invalid_data());
                 }
             }
         }
@@ -112,7 +117,7 @@ impl State {
             .query_row("PRAGMA data_version", [], |r| r.get(0))
             .map_err(failure)?;
         if version != self.version {
-            return Err(failure(()));
+            return Err(conflict());
         }
         Ok(())
     }
@@ -225,7 +230,7 @@ impl PackedSqliteJournalStorage {
         }
         let mut updates = Updates::new();
         repack(&tx, packs, &mut updates, session, false)?;
-        tx.commit().map_err(failure)?;
+        tx.commit().map_err(commit_failure)?;
         state.update(session, updates);
         Ok(())
     }
@@ -239,7 +244,7 @@ impl PackedSqliteJournalStorage {
             .map_err(failure)
     }
     fn lock(&self) -> Result<MutexGuard<'_, State>, RuntimeError> {
-        let mut state = self.state.lock().map_err(failure)?;
+        let mut state = self.state.lock().map_err(storage_failure)?;
         state.refresh()?;
         Ok(state)
     }
@@ -316,7 +321,7 @@ fn load(
 }
 fn fail(write: &JournalWrite, cut: JournalCommitFailurePoint) -> Result<(), RuntimeError> {
     if write.inject == Some(cut) {
-        Err(failure(()).retryable())
+        Err(storage_failure(()).retryable())
     } else {
         Ok(())
     }
@@ -634,7 +639,11 @@ fn append_operation(
         if let Some(old) = old {
             let mut combined = records.clone();
             combined.extend(codec::decode::<Vec<metadata::Operation>>(&old)?);
-            if serde_json::to_vec(&combined).map_err(failure)?.len() <= LOGICAL_PACK_CAP {
+            if serde_json::to_vec(&combined)
+                .map_err(storage_failure)?
+                .len()
+                <= LOGICAL_PACK_CAP
+            {
                 records = combined;
                 tx.execute("DELETE FROM operation_pack WHERE storage=? AND role=? AND session=? AND tier=?",
                     params![d.storage_id.as_str(), role(d), s.as_str(), tier]).map_err(failure)?;
@@ -660,7 +669,7 @@ fn save_operations(
     mut records: Vec<metadata::Operation>,
 ) -> Result<(), RuntimeError> {
     records.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)));
-    let raw = serde_json::to_vec(&records).map_err(failure)?;
+    let raw = serde_json::to_vec(&records).map_err(storage_failure)?;
     if raw.len() > LOGICAL_PACK_CAP {
         return Err(conflict());
     }
@@ -1142,10 +1151,7 @@ impl JournalStorage for PackedSqliteJournalStorage {
         if self.config.repack_on_collection && write.kind == JournalWriteKind::Collect {
             repack(&tx, packs, &mut updates, s, true)?;
         }
-        // A failed COMMIT is ambiguous (e.g. a WAL fsync error after the
-        // commit frame was written may still recover as committed), so it
-        // must be retryable: callers treat non-retryable errors as no effect.
-        tx.commit().map_err(|error| failure(error).retryable())?;
+        tx.commit().map_err(commit_failure)?;
         state.update(s, updates);
         if let Some(op) = &write.operation {
             state.operations.insert(
@@ -1204,7 +1210,7 @@ impl JournalStorage for PackedSqliteJournalStorage {
             repack(&tx, packs, &mut updates, &session, true)?;
             changes.push((session, updates));
         }
-        tx.commit().map_err(failure)?;
+        tx.commit().map_err(commit_failure)?;
         for (session, updates) in changes {
             state.update(&session, updates);
         }
