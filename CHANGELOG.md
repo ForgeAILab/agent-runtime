@@ -7,6 +7,30 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Breaking
+
+- `JournalGcReport` gains `unreadable_sessions: Vec<SessionId>`; struct literals
+  must set it (older serialized reports deserialize with an empty list).
+  Collection silently skips per-session state/fence conflicts and reports only
+  other non-retryable read/apply failures as sorted unique unreadable session
+  ids. Skipped sessions preserve durable state and dirty hints for retry on the
+  next call. Retryable and domain-wide failures, including poisoned engine
+  locks, still abort; previously acknowledged session transactions remain applied. Storage
+  adapters must mark ambiguous/lost apply acknowledgements retryable;
+  non-retryable apply errors must leave the transaction unapplied. Storage
+  conformance (`atomic_apply_cuts`) now rejects a non-retryable error from the
+  after-commit cut.
+
+### Added
+
+- Storage conformance cases for unreadable-session collection, membership checks
+  on warm body-cache hits, exact object lookup across four-byte id-prefix
+  collisions, and membership enumeration after release or without admission.
+  Collection regressions cover silent conflict skips and poisoned engine locks.
+  Packed reference storage treats SQLite BUSY/LOCKED as retryable; I/O errors
+  are retryable at ambiguous COMMIT boundaries, while proven no-effect failures
+  remain non-retryable. Real writer-contention tests verify apply and collection.
+
 ### Fixed
 
 - A turn whose protected acceptance checkpoint fails to commit (for example a
@@ -27,7 +51,9 @@ contain breaking changes and are coordinated with consumer proposals.
   and drained injections are staged outside live history until the
   acceptance checkpoint commits, so an ordinary save racing that commit
   (`persist`, `shutdown`, background saves) publishes only the last committed
-  boundary and never waits on it.
+  boundary and never waits on it. `SessionHandle::history()` therefore shows a
+  turn's input and injected content once its acceptance checkpoint commits,
+  not at turn start.
 
 ## [0.8.0] - 2026-10-20
 

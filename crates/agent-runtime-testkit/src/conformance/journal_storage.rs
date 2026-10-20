@@ -18,6 +18,11 @@ use futures_util::FutureExt;
 
 use super::journal::{self, *};
 
+#[path = "journal_storage_authority.rs"]
+mod authority;
+#[path = "journal_storage_isolation.rs"]
+mod isolation;
+
 /// Runs storage transactions, recovery, protected/ordinary engine contracts and
 /// every collection contract. For example:
 ///
@@ -45,6 +50,26 @@ where
     named(
         "control_generation_fence",
         control_generation_fence(&factory),
+    )
+    .await;
+    named(
+        "body_cache_membership",
+        authority::body_cache_membership(&factory),
+    )
+    .await;
+    named(
+        "full_object_id_lookup",
+        authority::full_object_id_lookup(&factory),
+    )
+    .await;
+    named(
+        "exact_membership_enumeration",
+        authority::exact_membership_enumeration(&factory),
+    )
+    .await;
+    named(
+        "unreadable_session_does_not_stop_collection",
+        isolation::unreadable_session_does_not_stop_collection(&factory),
     )
     .await;
     named("shared_body_last_membership", shared_body(&factory)).await;
@@ -416,9 +441,16 @@ where
         );
         let before = view(&*storage, &first, &next).await;
         next.inject = Some(cut);
-        assert!(storage.apply(next.clone()).await.is_err(), "cut {cut:?}");
+        let result = storage.apply(next.clone()).await;
+        assert!(result.is_err(), "cut {cut:?}");
         let after = view(&*storage, &first, &next).await;
         if cut.is_after_commit() {
+            // Collection isolates non-retryable apply errors as "no effect".
+            // An acknowledgement lost after the commit point must not be.
+            assert!(
+                result.as_ref().is_err_and(|error| error.retryable),
+                "cut {cut:?}: a lost acknowledgement must be retryable"
+            );
             assert_eq!(after.record, Some(next.record.clone()));
             assert_eq!(after.operations[1], next.operation);
             assert!(

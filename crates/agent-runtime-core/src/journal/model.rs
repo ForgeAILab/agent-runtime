@@ -593,6 +593,12 @@ pub struct JournalGcReport {
     /// Canonical encoded body bytes physically removed; excludes compression
     /// and backend amplification. Deferred bodies count at physical removal.
     pub reclaimed_bytes: u64,
+    /// Sessions whose state could not be read or validated; hosts may log each once.
+    /// Sorted and unique, without content/object ids. Only non-retryable,
+    /// non-conflict failures are reported. Dirty hints survive for the next call.
+    /// A source blocked by an unreadable dependency is included with that dependency.
+    #[serde(default)]
+    pub unreadable_sessions: Vec<SessionId>,
 }
 
 /// Final planned request, with independent persistent ordered message/tool refs.

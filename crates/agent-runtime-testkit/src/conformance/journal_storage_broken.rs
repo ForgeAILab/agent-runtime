@@ -15,6 +15,10 @@ enum Defect {
     StaleGeneration,
     SharedBodyDeleted,
     DeadBodyServed,
+    CachedBodyWithoutMembership,
+    PrefixLookup,
+    MembersWithoutMembership,
+    NonRetryableLostAck,
 }
 trait Fault: std::fmt::Debug + Send + Sync + 'static {
     const DEFECT: Defect;
@@ -26,7 +30,10 @@ macro_rules! faults {
         impl Fault for $name { const DEFECT: Defect = Defect::$name; }
     )*};
 }
-faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; }
+faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; }
+
+type CacheKey = (String, u8, SessionId, JournalObjectId);
+type AdmittedKey = (String, u8);
 
 #[derive(Debug)]
 struct Broken<F: Fault> {
@@ -35,6 +42,8 @@ struct Broken<F: Fault> {
     // while another membership still references it. Membership rows survive.
     unlinked: Mutex<BTreeSet<JournalObjectId>>,
     dead: Mutex<BTreeMap<JournalObjectId, Arc<[u8]>>>,
+    cache: Mutex<BTreeMap<CacheKey, Arc<[u8]>>>,
+    admitted: Mutex<BTreeMap<AdmittedKey, BTreeSet<JournalObjectId>>>,
     fault: PhantomData<F>,
 }
 impl<F: Fault> Default for Broken<F> {
@@ -43,6 +52,8 @@ impl<F: Fault> Default for Broken<F> {
             inner: Mutex::new(Arc::new(VolatileJournalStorage::default())),
             unlinked: Mutex::new(BTreeSet::new()),
             dead: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(BTreeMap::new()),
+            admitted: Mutex::new(BTreeMap::new()),
             fault: PhantomData,
         }
     }
@@ -86,6 +97,35 @@ impl<F: Fault> JournalStorage for Broken<F> {
                 *body = self.dead.lock().unwrap().get(id).cloned();
             }
         }
+        if F::DEFECT == Defect::CachedBodyWithoutMembership {
+            let mut cache = self.cache.lock().unwrap();
+            for (id, body) in ids.iter().zip(&mut bodies) {
+                let key = (
+                    d.storage_id.as_str().to_owned(),
+                    d.role as u8,
+                    s.clone(),
+                    id.clone(),
+                );
+                if let Some(hit) = cache.get(&key) {
+                    // The only defect: warm hits bypass the otherwise-correct
+                    // inner storage's current membership refusal.
+                    *body = Some(hit.clone());
+                } else if let Some(body) = body {
+                    cache.insert(key, body.clone());
+                }
+            }
+        }
+        if F::DEFECT == Defect::PrefixLookup {
+            let all = self.dead.lock().unwrap();
+            for (id, body) in ids.iter().zip(&mut bodies) {
+                if body.is_some() {
+                    *body = all
+                        .iter()
+                        .find(|(candidate, _)| candidate.to_bytes()[..4] == id.to_bytes()[..4])
+                        .map(|(_, body)| body.clone());
+                }
+            }
+        }
         Ok(bodies)
     }
     async fn members(
@@ -93,6 +133,17 @@ impl<F: Fault> JournalStorage for Broken<F> {
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Vec<JournalObjectId>, RuntimeError> {
+        if F::DEFECT == Defect::MembersWithoutMembership {
+            return Ok(self
+                .admitted
+                .lock()
+                .unwrap()
+                .get(&(d.storage_id.as_str().to_owned(), d.role as u8))
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect());
+        }
         self.inner().members(d, s).await
     }
     async fn operation(
@@ -228,6 +279,24 @@ impl<F: Fault> JournalStorage for Broken<F> {
             _ => {}
         }
         let release = write.release.clone();
+        if F::DEFECT == Defect::PrefixLookup {
+            self.dead.lock().unwrap().extend(
+                write
+                    .objects
+                    .objects
+                    .iter()
+                    .map(|o| (o.id.clone(), o.bytes.clone())),
+            );
+        }
+        let admitted = (
+            write.domain.clone(),
+            write
+                .objects
+                .objects
+                .iter()
+                .map(|o| o.id.clone())
+                .collect::<Vec<_>>(),
+        );
         if F::DEFECT == Defect::DeadBodyServed {
             let bodies = self
                 .inner()
@@ -241,7 +310,30 @@ impl<F: Fault> JournalStorage for Broken<F> {
                     .filter_map(|(id, body)| body.map(|body| (id, body))),
             );
         }
-        let receipt = self.inner().apply(write).await?;
+        let committed_cut = write
+            .inject
+            .is_some_and(JournalCommitFailurePoint::is_after_commit);
+        let mut result = self.inner().apply(write).await;
+        if F::DEFECT == Defect::NonRetryableLostAck && committed_cut {
+            // The transaction committed, but its lost acknowledgement claims
+            // a definite failure, which collection would treat as no effect.
+            result = result.map_err(|mut error| {
+                error.retryable = false;
+                error
+            });
+        }
+        if F::DEFECT == Defect::MembersWithoutMembership && (result.is_ok() || committed_cut) {
+            self.admitted
+                .lock()
+                .unwrap()
+                .entry((
+                    admitted.0.storage_id.as_str().to_owned(),
+                    admitted.0.role as u8,
+                ))
+                .or_default()
+                .extend(admitted.1);
+        }
+        let receipt = result?;
         if F::DEFECT == Defect::SharedBodyDeleted {
             self.unlinked.lock().unwrap().extend(release);
         }
@@ -305,11 +397,59 @@ async fn shared_body_deletion_fails_other_holder_open() {
 #[tokio::test]
 async fn serving_dead_bytes_fails_membership_isolation_in_both_scopes() {
     for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
-        rejects_with_sharing::<DeadBodyServed>("membership_isolation_and_receipts", sharing).await;
+        rejects_with_sharing::<DeadBodyServed>("body_cache_membership", sharing).await;
     }
 }
 
 #[tokio::test]
 async fn stale_generation_fails_control_generation_fence() {
     rejects::<StaleGeneration>("control_generation_fence").await;
+}
+
+#[tokio::test]
+async fn m2_warm_cache_without_membership_fails_in_both_scopes() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        rejects_with_sharing::<CachedBodyWithoutMembership>("body_cache_membership", sharing).await;
+    }
+}
+#[tokio::test]
+async fn m11_short_prefix_lookup_fails_in_both_scopes() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        rejects_with_sharing::<PrefixLookup>("full_object_id_lookup", sharing).await;
+    }
+}
+#[tokio::test]
+async fn m14_members_without_membership_fails_in_both_scopes() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        rejects_with_sharing::<MembersWithoutMembership>("exact_membership_enumeration", sharing)
+            .await;
+    }
+}
+#[tokio::test]
+async fn non_retryable_lost_acknowledgement_fails_atomic_apply_cuts() {
+    let message = rejects::<NonRetryableLostAck>("atomic_apply_cuts").await;
+    assert!(message.contains("a lost acknowledgement must be retryable"));
+}
+// body_cache_membership now runs first and catches DeadBodyServed. Keep the
+// original proof that membership_isolation_and_receipts also rejects it.
+#[tokio::test]
+async fn serving_dead_bytes_still_fails_membership_isolation_case() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        let factory =
+            move || async move { Arc::new(Broken::<DeadBodyServed>::with_sharing(sharing)) };
+        let result = AssertUnwindSafe(Box::pin(named(
+            "membership_isolation_and_receipts",
+            membership(&factory),
+        )))
+        .catch_unwind()
+        .await;
+        let payload = result.expect_err("dead bytes passed membership_isolation_and_receipts");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("named conformance failure");
+        assert!(
+            message.starts_with("journal_storage::membership_isolation_and_receipts:"),
+            "{sharing:?}: {message}"
+        );
+    }
 }

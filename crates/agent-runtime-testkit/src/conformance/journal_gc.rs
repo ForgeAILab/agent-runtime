@@ -1257,8 +1257,9 @@ where
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
 }
 
-/// A backend unable to interpret a future transfer-index revision cannot prove
-/// its root closure. It must refuse collection/retirement and retain content.
+/// An unknown stored transfer-index revision isolates its session, retaining
+/// everything it could protect while collection continues in other sessions.
+/// Retirement remains fail-closed for both the session and possible targets.
 pub async fn assert_journal_unknown_dependency_conformance<F, Fut>(factory: &F)
 where
     F: Fn() -> Fut,
@@ -1267,31 +1268,86 @@ where
     let fixture = factory().await;
     let journal = &*fixture.backend.journal;
     let session = SessionId::new("gc-unknown-intent");
+    let target = SessionId::new("gc-unknown-protected-target");
+    let target_writer = open_writer(journal, &target, None, "protected-target").await;
+    let (target_commit, _) = bootstrap_from_snapshot(
+        basic_snapshot(target.clone(), "possible transfer target", Timestamp(1)),
+        target_writer.writer_epoch().unwrap(),
+        "target",
+        None,
+    );
+    let target_head = journal
+        .commit(&target_writer, target_commit.clone())
+        .await
+        .unwrap();
+    journal.close(target_writer).await.unwrap();
+
     let writer = open_writer(journal, &session, None, "unknown-intent").await;
+    // This orphan is collectible unless isolation preserves the entire session,
+    // rather than merely tracing the unknown session's current head.
+    let orphan = JournalObject::encode(
+        JournalObjectKind::Message,
+        &Message::user("unknown session must retain orphan"),
+    )
+    .unwrap();
+    fixture
+        .host
+        .stage_leaves(&writer, JournalPinId::new("unknown-orphan"), vec![orphan])
+        .await
+        .unwrap();
     let mut snapshot = basic_snapshot(session.clone(), "must retain", Timestamp(1));
     snapshot.extension_state.insert(
         "runtime.session.fork_pending".into(),
         VersionedSessionState::new(
             RegistryRevision::new("future-intent-revision"),
-            serde_json::Value::Null,
+            serde_json::json!({"new_id": target.as_str()}),
         ),
     );
     let (commit, _) =
         bootstrap_from_snapshot(snapshot, writer.writer_epoch().unwrap(), "unknown", None);
     let head = journal.commit(&writer, commit.clone()).await.unwrap();
+    fixture.release(&session, "unknown-orphan").await;
     journal.close(writer).await.unwrap();
-    let before = fixture.host.retained_bytes().await.unwrap();
-    let error = journal
-        .collect(fixture.mark(u64::MAX).await)
+
+    // Sort after the unknown session, proving collection continues beyond it.
+    let independent = SessionId::new("zz-unknown-independent");
+    let other_writer = open_writer(journal, &independent, None, "independent").await;
+    let garbage = JournalObject::encode(
+        JournalObjectKind::Message,
+        &Message::user("independent releasable garbage"),
+    )
+    .unwrap();
+    fixture
+        .host
+        .stage_leaves(
+            &other_writer,
+            JournalPinId::new("independent-garbage"),
+            vec![garbage.clone()],
+        )
         .await
-        .unwrap_err();
-    assert!(matches!(
-        error.class,
-        FailureClass::UnsupportedCapability {
-            capability: agent_runtime_core::error::UnsupportedCapability::JournalCollection,
-            ..
-        }
-    ));
+        .unwrap();
+    fixture.release(&independent, "independent-garbage").await;
+    journal.close(other_writer).await.unwrap();
+
+    let before = fixture.host.retained_bytes().await.unwrap();
+    let report = journal.collect(fixture.mark(u64::MAX).await).await.unwrap();
+    assert_eq!(report.unreadable_sessions, vec![session.clone()]);
+    assert_eq!(
+        report.deleted, 1,
+        "only the independent orphan may be deleted"
+    );
+    assert_eq!(report.reclaimed_bytes, garbage.bytes.len() as u64);
+    let retained = fixture.host.retained_bytes().await.unwrap();
+    assert_eq!(
+        retained,
+        before - garbage.bytes.len() as u64,
+        "unknown-session and possible-target bytes must all remain retained"
+    );
+    let repeated = fixture.collect().await;
+    assert_eq!(repeated.unreadable_sessions, vec![session.clone()]);
+    assert_eq!((repeated.deleted, repeated.reclaimed_bytes), (0, 0));
+    assert_eq!(fixture.host.retained_bytes().await.unwrap(), retained);
+
     fixture.authorize(&session, &head).await;
     let error = journal.retire(&session, head.revision).await.unwrap_err();
     assert!(matches!(
@@ -1301,9 +1357,33 @@ where
             ..
         }
     ));
-    assert_eq!(fixture.host.retained_bytes().await.unwrap(), before);
+    fixture.authorize(&target, &target_head).await;
+    let error = journal
+        .retire(&target, target_head.revision)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.class,
+            FailureClass::UnsupportedCapability {
+                capability: agent_runtime_core::error::UnsupportedCapability::JournalRetirement,
+                ..
+            }
+        ),
+        "an unknown transfer index must still block possible-target retirement"
+    );
+    assert_eq!(fixture.host.retained_bytes().await.unwrap(), retained);
     let reader = open_reader(journal, &session, Some(head.revision), "unknown-readable").await;
     assert_closure(journal, &reader, &commit, &head).await;
+    journal.close(reader).await.unwrap();
+    let reader = open_reader(
+        journal,
+        &target,
+        Some(target_head.revision),
+        "target-readable",
+    )
+    .await;
+    assert_closure(journal, &reader, &target_commit, &target_head).await;
     journal.close(reader).await.unwrap();
 }
 
