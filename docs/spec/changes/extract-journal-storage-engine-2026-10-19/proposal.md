@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T04:41:05Z
+updated_at: 2026-10-20T06:44:24Z
 ---
 
 # Proposal: Storage-generic journal engine and physical disk reduction

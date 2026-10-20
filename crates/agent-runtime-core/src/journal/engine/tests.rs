@@ -2531,3 +2531,282 @@ async fn a_stale_control_write_cannot_unretire_a_session_another_engine_collecte
         );
     }
 }
+
+async fn seed_control_race(
+    engine: &JournalEngine<PausedApply>,
+    session: &SessionId,
+) -> JournalHead {
+    let lease = engine.open(session, writer("seed")).await.unwrap();
+    let head = engine
+        .commit(&lease, empty_commit(session, lease.writer_epoch().unwrap()))
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    head
+}
+
+fn assert_control_conflict<T: fmt::Debug>(result: Result<T, RuntimeError>) {
+    assert!(matches!(
+        result.unwrap_err().class,
+        crate::error::FailureClass::StateConflict { .. }
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_control_writes_through_clones_share_the_load_apply_gate() {
+    let storage = Arc::new(PausedApply::default());
+    let (engine, _) = two_engines(&storage, 0);
+    engine.enable_collection().unwrap();
+    let session = SessionId::new("clone-controls");
+    let head = seed_control_race(&engine, &session).await;
+    let mut leases = Vec::new();
+    for i in 0..8 {
+        leases.push(
+            engine
+                .open(&session, reader(&format!("clone-{i}")))
+                .await
+                .unwrap(),
+        );
+    }
+    let before = storage
+        .load(&engine.domain, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let (resume, paused) = storage.pause_next(JournalWriteKind::Pin);
+    let writes = leases.into_iter().map(|lease| {
+        let clone = engine.clone();
+        let session = session.clone();
+        async move {
+            clone.retain_root(&lease).await.unwrap();
+            clone
+                .authorize_retirement(&session, head.revision, crate::clock::Timestamp(9))
+                .await
+                .unwrap();
+            clone.close(lease).await.unwrap();
+        }
+    });
+    tokio::join!(futures_util::future::join_all(writes), async {
+        paused.await.unwrap();
+        tokio::task::yield_now().await;
+        // The other clones cannot load/apply while the first apply is paused.
+        assert_eq!(
+            storage.load(&engine.domain, &session).await.unwrap(),
+            Some(before.clone())
+        );
+        resume.send(()).unwrap();
+    });
+    let after = storage
+        .load(&engine.domain, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.generation, before.generation + 16);
+    assert_eq!(
+        (after.revision, after.writer_epoch),
+        (before.revision, before.writer_epoch)
+    );
+    assert_eq!(
+        storage.pins(&engine.domain, &session).await.unwrap().len(),
+        8
+    );
+}
+
+async fn stale_open_over_released_pin() -> (
+    Arc<PausedApply>,
+    JournalEngine<PausedApply>,
+    JournalEngine<PausedApply>,
+    SessionId,
+    Result<JournalLease, RuntimeError>,
+) {
+    let storage = Arc::new(PausedApply::default());
+    let (reading, collector) = two_engines(&storage, 0);
+    let session = SessionId::new("release-race");
+    let mut known = BTreeSet::new();
+    let lease = reading.open(&session, writer("pinned")).await.unwrap();
+    let first = reading
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                None,
+                "first",
+                ext_snapshot(&session, "a"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    reading.retain_root(&lease).await.unwrap();
+    reading
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                Some(&first),
+                "second",
+                ext_snapshot(&session, "b"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    reading.close(lease).await.unwrap();
+    let (resume, paused) = storage.pause_next(JournalWriteKind::OpenWriter);
+    let (opened, ()) = tokio::join!(reading.open(&session, writer("next")), async {
+        paused.await.unwrap();
+        collector
+            .release_pin(
+                &session,
+                &JournalPinId::new("pinned"),
+                collector.root_epoch().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(sweep(&collector, u64::MAX).await.deleted > 0);
+        resume.send(()).unwrap();
+    });
+    (storage, reading, collector, session, opened)
+}
+
+#[tokio::test]
+async fn r3_stale_control_write_cannot_lose_another_engines_pin_release() {
+    let (storage, reading, _, session, opened) = stale_open_over_released_pin().await;
+    assert!(
+        storage
+            .pins(&reading.domain, &session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "stale writer-pin freezing resurrected a released pin"
+    );
+    assert_control_conflict(opened);
+    // Retrying the operation reloads the full fence and succeeds.
+    let next = reading.open(&session, writer("retry")).await.unwrap();
+    reading.close(next).await.unwrap();
+}
+
+#[tokio::test]
+async fn r3_collection_stays_healthy_after_the_released_pin_race() {
+    let (storage, reading, collector, _, opened) = stale_open_over_released_pin().await;
+    if let Ok(lease) = opened {
+        reading.close(lease).await.unwrap();
+    }
+    // Reviewer's probe: both used and fresh collectors must remain healthy.
+    let used = collector
+        .collect(JournalGcRequest {
+            storage_id: collector.storage_id(),
+            expected_root_epoch: collector.root_epoch().unwrap(),
+            max_objects: u64::MAX,
+        })
+        .await;
+    let (_, fresh) = two_engines(&storage, 0);
+    let restarted = fresh
+        .collect(JournalGcRequest {
+            storage_id: fresh.storage_id(),
+            expected_root_epoch: fresh.root_epoch().unwrap(),
+            max_objects: u64::MAX,
+        })
+        .await;
+    assert!(
+        used.is_ok() && restarted.is_ok(),
+        "used collector: {used:?}; fresh collector: {restarted:?}"
+    );
+}
+
+#[tokio::test]
+async fn r3_stale_control_write_cannot_lose_retirement_authorization() {
+    let storage = Arc::new(PausedApply::default());
+    let (reading, collector) = two_engines(&storage, 0);
+    let session = SessionId::new("authorization-race");
+    let head = seed_control_race(&reading, &session).await;
+    let lease = reading.open(&session, reader("retain")).await.unwrap();
+    let (resume, paused) = storage.pause_next(JournalWriteKind::Pin);
+    let (retained, ()) = tokio::join!(reading.retain_root(&lease), async {
+        paused.await.unwrap();
+        collector
+            .authorize_retirement(&session, head.revision, crate::clock::Timestamp(9))
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+    });
+    let record = storage
+        .load(&collector.domain, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&record.engine.bytes).unwrap();
+    assert!(
+        metadata["authorization"].is_array(),
+        "stale control write lost the authorization"
+    );
+    assert_control_conflict(retained);
+    reading.close(lease).await.unwrap();
+    collector.retire(&session, head.revision).await.unwrap();
+}
+
+#[tokio::test]
+async fn r3_stale_control_write_cannot_lose_a_retirement_dependents_candidate() {
+    let storage = Arc::new(PausedApply::default());
+    let (reading, collector) = two_engines(&storage, 0);
+    let target = SessionId::new("z-target");
+    let source = SessionId::new("a-source");
+    let head = seed_control_race(&reading, &target).await;
+    let lease = reading
+        .open(&target, reader("retain-target"))
+        .await
+        .unwrap();
+    let writer = collector.open(&source, writer("source")).await.unwrap();
+    let mut snapshot = ext_snapshot(&source, "dependency");
+    snapshot.extension_state.insert(
+        "agent-runtime.delegation.children".into(),
+        crate::store::VersionedSessionState::new(
+            agent_runtime_registry::RegistryRevision::new("resumable-child-catalog-1"),
+            serde_json::json!({"schema_version": 1, "children": [{"child_session": target.as_str(),
+                "status": {"state": {"state": "stopped"}}}]}),
+        ),
+    );
+    collector
+        .commit(
+            &writer,
+            full_commit(&source, 1, None, "source", snapshot, &mut BTreeSet::new()),
+        )
+        .await
+        .unwrap();
+    collector.close(writer).await.unwrap();
+    let (resume, paused) = storage.pause_next(JournalWriteKind::Pin);
+    let (retained, ()) = tokio::join!(reading.retain_root(&lease), async {
+        paused.await.unwrap();
+        sweep(&collector, u64::MAX).await;
+        assert!(
+            !storage
+                .load(&collector.domain, &source)
+                .await
+                .unwrap()
+                .unwrap()
+                .collection_dirty
+        );
+        resume.send(()).unwrap();
+    });
+    let record = storage
+        .load(&collector.domain, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&record.engine.bytes).unwrap();
+    assert_eq!(
+        metadata["retirement_dependents"],
+        serde_json::json!([source.as_str()]),
+        "stale control write lost the now-clean source's candidate"
+    );
+    assert_control_conflict(retained);
+    reading.close(lease).await.unwrap();
+    let (_, fresh) = two_engines(&storage, 0);
+    fresh
+        .authorize_retirement(&target, head.revision, crate::clock::Timestamp(9))
+        .await
+        .unwrap();
+    assert_control_conflict(fresh.retire(&target, head.revision).await);
+}

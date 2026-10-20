@@ -29,6 +29,7 @@ impl From<Record> for JournalSessionRecord {
         Self {
             revision: r.revision,
             writer_epoch: r.epoch,
+            generation: 0, // loaded from the transaction-queryable session column
             head: r.head,
             has_checkpoint: r.checkpoint,
             retirement: r.retirement,

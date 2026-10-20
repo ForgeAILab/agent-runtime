@@ -136,8 +136,8 @@ impl State {
         }
     }
 }
-/// Durable bench-only storage. Each apply uses BEGIN IMMEDIATE and rechecks both
-/// fences. Full-id maps are rebuilt lazily per session, never across sessions.
+/// Durable bench-only storage. Each apply uses BEGIN IMMEDIATE and rechecks the full
+/// fence. Full-id maps are rebuilt lazily per session, never across sessions.
 /// All diagnostics and errors redact stored bytes. Clones share one connection.
 #[derive(Clone)]
 pub struct PackedSqliteJournalStorage {
@@ -299,16 +299,20 @@ fn load(
     d: &JournalDomain,
     s: &SessionId,
 ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
-    let raw: Option<Vec<u8>> = conn
+    let raw: Option<(Vec<u8>, [u8; 8])> = conn
         .query_row(
-            "SELECT payload FROM session WHERE storage=? AND role=? AND session=?",
+            "SELECT payload,generation FROM session WHERE storage=? AND role=? AND session=?",
             params![d.storage_id.as_str(), role(d), s.as_str()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(failure)?;
-    raw.map(|b| codec::decode::<metadata::Record>(&b).map(Into::into))
-        .transpose()
+    raw.map(|(b, generation)| {
+        let mut record: JournalSessionRecord = codec::decode::<metadata::Record>(&b)?.into();
+        record.generation = u64::from_le_bytes(generation);
+        Ok(record)
+    })
+    .transpose()
 }
 fn fail(write: &JournalWrite, cut: JournalCommitFailurePoint) -> Result<(), RuntimeError> {
     if write.inject == Some(cut) {
@@ -939,9 +943,11 @@ impl JournalStorage for PackedSqliteJournalStorage {
         }
         let d = &write.domain;
         let s = &write.session;
-        let actual =
-            load(&tx, d, s)?.map_or((JournalRevision(0), 0), |r| (r.revision, r.writer_epoch));
-        if actual != write.expect || write.objects.objects.windows(2).any(|p| p[0].id >= p[1].id) {
+        let actual = load(&tx, d, s)?.map_or(JournalFence::default(), |r| r.fence());
+        if actual != write.expect
+            || write.expect.generation.checked_add(1) != Some(write.record.generation)
+            || write.objects.objects.windows(2).any(|p| p[0].id >= p[1].id)
+        {
             return Err(conflict());
         }
         // Validate identities and immutable duplicates before performing any SQL.
@@ -1063,22 +1069,22 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 }
                 fail(&write, JournalCommitFailurePoint::AfterPin)?;
             } else if step == 3 {
-                if let Some(r) = &write.record {
-                    tx.execute(
-                        "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?)",
-                        params![
-                            d.storage_id.as_str(),
-                            role(d),
-                            s.as_str(),
-                            r.revision.0,
-                            r.writer_epoch,
-                            r.collection_dirty,
-                            codec::encode(&metadata::Record::from(r))?,
-                            [0u8; 24].as_slice()
-                        ],
-                    )
-                    .map_err(failure)?;
-                }
+                let r = &write.record;
+                tx.execute(
+                    "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?,?)",
+                    params![
+                        d.storage_id.as_str(),
+                        role(d),
+                        s.as_str(),
+                        r.revision.0,
+                        r.writer_epoch,
+                        r.collection_dirty,
+                        r.generation.to_le_bytes().as_slice(),
+                        codec::encode(&metadata::Record::from(r))?,
+                        [0u8; 24].as_slice()
+                    ],
+                )
+                .map_err(failure)?;
                 fail(&write, cut)?;
             } else {
                 fail(&write, cut)?;

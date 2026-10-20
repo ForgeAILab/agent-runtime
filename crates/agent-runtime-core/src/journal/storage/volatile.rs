@@ -300,8 +300,10 @@ impl JournalStorage for VolatileJournalStorage {
         let actual = state
             .records
             .get(&key)
-            .map_or((JournalRevision(0), 0), |r| (r.revision, r.writer_epoch));
-        if actual != write.expect {
+            .map_or(JournalFence::default(), JournalSessionRecord::fence);
+        if actual != write.expect
+            || write.expect.generation.checked_add(1) != Some(write.record.generation)
+        {
             return Err(conflict());
         }
         let mut staged = state.clone();
@@ -379,9 +381,7 @@ impl JournalStorage for VolatileJournalStorage {
             self.admit(&mut staged, &key, object, &mut added)?;
         }
         staged.add_layer(added);
-        if let Some(record) = write.record {
-            staged.records.insert(key.clone(), record);
-        }
+        staged.records.insert(key.clone(), write.record);
         fail(JournalCommitFailurePoint::AfterHead)?;
         if let Some(operation) = write.operation {
             let op_key = (key.clone(), operation.operation.clone());
@@ -510,8 +510,9 @@ mod tests {
             domain,
             session,
             kind: JournalWriteKind::Commit,
-            expect: (JournalRevision(0), 0),
-            record: Some(JournalSessionRecord {
+            expect: JournalFence::default(),
+            record: JournalSessionRecord {
+                generation: 1,
                 revision: JournalRevision(1),
                 writer_epoch: 1,
                 head: Some(head_object.clone()),
@@ -519,7 +520,7 @@ mod tests {
                 retirement: None,
                 collection_dirty: true,
                 engine: state(),
-            }),
+            },
             objects: JournalObjectBatch {
                 objects: vec![JournalStoredObject {
                     id: leaf.id.clone(),
@@ -607,10 +608,38 @@ mod tests {
             (JournalRevision(0), 0),
         ] {
             let mut transaction = write("s");
-            transaction.expect = expect;
+            transaction.expect = JournalFence {
+                revision: expect.0,
+                writer_epoch: expect.1,
+                generation: 1,
+            };
+            transaction.record.generation = 2;
             assert!(storage.apply(transaction).await.is_err());
             assert_eq!(*storage.lock().unwrap(), before);
         }
+    }
+    #[tokio::test]
+    async fn generation_exhaustion_cannot_wrap_or_change_storage() {
+        let storage = VolatileJournalStorage::default();
+        let mut transaction = write("s");
+        storage.apply(transaction.clone()).await.unwrap();
+        let key = session_key(&transaction.domain, &transaction.session);
+        storage
+            .lock()
+            .unwrap()
+            .records
+            .get_mut(&key)
+            .unwrap()
+            .generation = u64::MAX;
+        transaction.expect = storage.lock().unwrap().records[&key].fence();
+        transaction.record.generation = 0;
+        let before = storage.lock().unwrap().clone();
+        let error = storage.apply(transaction).await.unwrap_err();
+        assert!(matches!(
+            error.class,
+            crate::error::FailureClass::StateConflict { .. }
+        ));
+        assert_eq!(*storage.lock().unwrap(), before);
     }
     #[tokio::test]
     async fn reads_require_membership_and_only_the_last_member_deletes_a_body() {
@@ -646,10 +675,10 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            transaction.expect = (JournalRevision(1), 1);
+            transaction.expect = transaction.record.fence();
+            transaction.record.generation += 1;
             transaction.objects.objects.clear();
             transaction.operation = None;
-            transaction.record = None;
             transaction.pins.clear();
             transaction.catalog.clear();
             transaction.release = vec![id.clone()];
@@ -688,8 +717,8 @@ mod tests {
         }
         for (index, mut transaction) in holders.into_iter().enumerate() {
             transaction.kind = JournalWriteKind::Collect;
-            transaction.expect = (JournalRevision(1), 1);
-            transaction.record = None;
+            transaction.expect = transaction.record.fence();
+            transaction.record.generation += 1;
             transaction.objects.objects.clear();
             transaction.operation = None;
             transaction.pins.clear();
@@ -707,6 +736,8 @@ mod tests {
                     JournalApplyReceipt::default()
                 }
             );
+            transaction.expect = transaction.record.fence();
+            transaction.record.generation += 1;
             assert_eq!(
                 storage.apply(transaction).await.unwrap(),
                 JournalApplyReceipt::default()

@@ -323,6 +323,8 @@ impl<S: JournalStorage> JournalEngine<S> {
                 let complete = garbage.len() <= limit;
                 let release: Vec<_> = garbage.into_iter().take(limit).collect();
                 if let Some(mut record) = stored {
+                    let expect = record.fence();
+                    record.generation = expect.generation.checked_add(1).ok_or_else(conflict)?;
                     record.collection_dirty = !complete;
                     // Inclusive edge: revision -64 survives, -65 may be
                     // pruned. Storage also preserves this writer epoch's last
@@ -332,8 +334,8 @@ impl<S: JournalStorage> JournalEngine<S> {
                         domain: self.domain.clone(),
                         session: session.clone(),
                         kind: JournalWriteKind::Collect,
-                        expect: (record.revision, record.writer_epoch),
-                        record: Some(record),
+                        expect,
+                        record,
                         objects: JournalObjectBatch::default(),
                         operation: None,
                         pins: vec![],

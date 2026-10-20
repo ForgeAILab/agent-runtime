@@ -12,6 +12,7 @@ enum Defect {
     LostWrite,
     ReorderedCommit,
     StaleEpoch,
+    StaleGeneration,
     SharedBodyDeleted,
     DeadBodyServed,
 }
@@ -25,7 +26,7 @@ macro_rules! faults {
         impl Fault for $name { const DEFECT: Defect = Defect::$name; }
     )*};
 }
-faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; SharedBodyDeleted; DeadBodyServed; }
+faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; }
 
 #[derive(Debug)]
 struct Broken<F: Fault> {
@@ -139,7 +140,12 @@ impl<F: Fault> JournalStorage for Broken<F> {
                 // A faulty adapter exposes newly written bodies despite the
                 // transaction failing before its head and operation record.
                 write.inject = None;
-                write.record = None;
+                write.record = self
+                    .inner()
+                    .load(&write.domain, &write.session)
+                    .await?
+                    .unwrap();
+                write.record.generation += 1;
                 write.operation = None;
                 write.pins.clear();
                 write.catalog.clear();
@@ -147,8 +153,7 @@ impl<F: Fault> JournalStorage for Broken<F> {
                 return Err(RuntimeError::internal("injected torn storage transaction"));
             }
             Defect::ReorderedCommit
-                if write.kind == JournalWriteKind::Commit
-                    && write.record.as_ref().is_some_and(|r| r.revision.0 > 1) =>
+                if write.kind == JournalWriteKind::Commit && write.record.revision.0 > 1 =>
             {
                 // Publish n+1 into a store that never published n. Its record
                 // and immutable successor batch still name n as predecessor.
@@ -188,8 +193,9 @@ impl<F: Fault> JournalStorage for Broken<F> {
                 let replacement = Arc::new(VolatileJournalStorage::default());
                 let mut reservation = write.clone();
                 reservation.kind = JournalWriteKind::OpenWriter;
-                reservation.expect = (JournalRevision(0), 0);
-                let record = reservation.record.as_mut().unwrap();
+                reservation.expect = JournalFence::default();
+                let record = &mut reservation.record;
+                record.generation = 1;
                 record.revision = JournalRevision(0);
                 record.head = None;
                 record.has_checkpoint = false;
@@ -200,15 +206,23 @@ impl<F: Fault> JournalStorage for Broken<F> {
                 reservation.release.clear();
                 reservation.inject = None;
                 replacement.apply(reservation).await?;
-                write.expect.0 = JournalRevision(0);
+                write.expect.revision = JournalRevision(0);
+                write.expect.generation = 1;
+                write.record.generation = 2;
                 let receipt = replacement.apply(write).await?;
                 *self.inner.lock().unwrap() = replacement;
                 return Ok(receipt);
             }
+            Defect::StaleGeneration => {
+                if let Some(record) = self.inner().load(&write.domain, &write.session).await? {
+                    write.expect.generation = record.generation;
+                    write.record.generation = record.generation + 1;
+                }
+            }
             Defect::StaleEpoch => {
                 // Revision remains fenced; only the writer epoch check is lost.
                 if let Some(record) = self.inner().load(&write.domain, &write.session).await? {
-                    write.expect.1 = record.writer_epoch;
+                    write.expect.writer_epoch = record.writer_epoch;
                 }
             }
             _ => {}
@@ -293,4 +307,9 @@ async fn serving_dead_bytes_fails_membership_isolation_in_both_scopes() {
     for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
         rejects_with_sharing::<DeadBodyServed>("membership_isolation_and_receipts", sharing).await;
     }
+}
+
+#[tokio::test]
+async fn stale_generation_fails_control_generation_fence() {
+    rejects::<StaleGeneration>("control_generation_fence").await;
 }

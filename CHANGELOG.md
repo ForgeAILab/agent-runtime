@@ -16,7 +16,10 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Added
 
-- A storage-generic session-journal engine. `JournalEngine<S>` runs commit,
+- A storage-generic session-journal engine. Every session write, including
+  control writes, checks a revision/writer-epoch/control-generation fence to
+  prevent stale writes from losing pins, retirement grants or dependency
+  candidates. `JournalEngine<S>` runs commit,
   projection, validation, lease, retirement and collection semantics over any
   `JournalStorage`, which supplies atomic transactions, fences and object
   membership. `JournalEngineConfig` controls collection and the bounded memo.

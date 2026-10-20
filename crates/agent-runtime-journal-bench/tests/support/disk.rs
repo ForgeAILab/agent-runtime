@@ -226,7 +226,7 @@ pub(crate) fn existing(path: &Path, empty: u64) -> Size {
     for (table, columns) in [
         (
             "session",
-            "length(storage)+length(session)+length(payload)+length(nonce)",
+            "length(storage)+length(session)+length(generation)+length(payload)+length(nonce)",
         ),
         ("pack", "length(owner)+length(payload)+length(nonce)"),
         ("membership", "length(storage)+length(session)+length(bits)"),

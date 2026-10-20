@@ -42,6 +42,11 @@ where
     named("atomic_apply_cuts", atomic_apply_cuts(&factory)).await;
     named("revision_fence", revision_fence(&factory)).await;
     named("writer_epoch_fence", writer_epoch_fence(&factory)).await;
+    named(
+        "control_generation_fence",
+        control_generation_fence(&factory),
+    )
+    .await;
     named("shared_body_last_membership", shared_body(&factory)).await;
     named("replay_window_edges", replay_window_edges(&factory)).await;
     named(
@@ -258,10 +263,13 @@ fn raw_write(session: &str, label: &str, previous: Option<&JournalHead>) -> Jour
         domain: domain(JournalRole::Protected),
         session,
         kind: JournalWriteKind::Commit,
-        expect: previous.map_or((JournalRevision(0), 0), |head| {
-            (head.revision, head.writer_epoch)
+        expect: previous.map_or(JournalFence::default(), |head| JournalFence {
+            revision: head.revision,
+            writer_epoch: head.writer_epoch,
+            generation: head.revision.0,
         }),
-        record: Some(JournalSessionRecord {
+        record: JournalSessionRecord {
+            generation: head.revision.0,
             revision: head.revision,
             writer_epoch: 1,
             head: Some(head_object.clone()),
@@ -269,7 +277,7 @@ fn raw_write(session: &str, label: &str, previous: Option<&JournalHead>) -> Jour
             retirement: None,
             collection_dirty: true,
             engine: engine.clone(),
-        }),
+        },
         objects: JournalObjectBatch {
             objects: objects
                 .into_values()
@@ -306,11 +314,12 @@ fn edits(write: &JournalWrite) -> JournalWrite {
         domain: write.domain.clone(),
         session: write.session.clone(),
         kind: JournalWriteKind::Collect,
-        expect: write
-            .record
-            .as_ref()
-            .map_or(write.expect, |r| (r.revision, r.writer_epoch)),
-        record: None,
+        expect: write.record.fence(),
+        record: {
+            let mut record = write.record.clone();
+            record.generation += 1;
+            record
+        },
         objects: JournalObjectBatch::default(),
         operation: None,
         pins: vec![],
@@ -319,6 +328,10 @@ fn edits(write: &JournalWrite) -> JournalWrite {
         prune_operations_before: None,
         inject: None,
     }
+}
+fn advance(write: &mut JournalWrite) {
+    write.expect = write.record.fence();
+    write.record.generation += 1;
 }
 fn assert_conflict(error: RuntimeError) {
     assert!(matches!(
@@ -361,11 +374,7 @@ async fn view<S: JournalStorage>(storage: &S, first: &JournalWrite, second: &Jou
         );
         catalog.push(
             storage
-                .catalog(
-                    d,
-                    s,
-                    &write.record.as_ref().unwrap().head.as_ref().unwrap().id,
-                )
+                .catalog(d, s, &write.record.head.as_ref().unwrap().id)
                 .await
                 .unwrap(),
         );
@@ -410,7 +419,7 @@ where
         assert!(storage.apply(next.clone()).await.is_err(), "cut {cut:?}");
         let after = view(&*storage, &first, &next).await;
         if cut.is_after_commit() {
-            assert_eq!(after.record, next.record);
+            assert_eq!(after.record, Some(next.record.clone()));
             assert_eq!(after.operations[1], next.operation);
             assert!(
                 next.objects
@@ -446,10 +455,43 @@ where
         Some(&first.operation.as_ref().unwrap().result),
     );
     let before = view(&*storage, &first, &next).await;
-    next.expect.0 = JournalRevision(0);
+    next.expect.revision = JournalRevision(0);
     assert_conflict(storage.apply(next.clone()).await.unwrap_err());
     assert_eq!(view(&*storage, &first, &next).await, before);
 }
+// Revision/epoch stay unchanged: generation alone must reject the stale write.
+async fn control_generation_fence<S, F, Fut>(factory: &F)
+where
+    S: JournalStorage,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<S>>,
+{
+    let storage = factory().await;
+    let first = raw_write("generation-fence", "first", None);
+    storage.apply(first.clone()).await.unwrap();
+    let mut current = edits(&first);
+    current.pins = vec![JournalPinChange::Remove(JournalPinId::new("first"))];
+    storage.apply(current.clone()).await.unwrap();
+    let mut stale = edits(&first);
+    stale.objects = first.objects.clone();
+    stale.pins = first.pins.clone();
+    stale.catalog = first.catalog.clone();
+    stale.release = first.objects.objects.iter().map(|o| o.id.clone()).collect();
+    let before = view(&*storage, &first, &first).await;
+    assert_conflict(storage.apply(stale).await.unwrap_err());
+    assert_eq!(
+        view(&*storage, &first, &first).await,
+        before,
+        "generation mismatch must leave every storage component unchanged"
+    );
+    assert_eq!(before.record.as_ref().unwrap().generation, 2);
+    // Even an otherwise valid fence cannot skip or reuse its generation.
+    advance(&mut current);
+    current.record.generation += 1;
+    assert_conflict(storage.apply(current).await.unwrap_err());
+    assert_eq!(view(&*storage, &first, &first).await, before);
+}
+
 async fn writer_epoch_fence<S, F, Fut>(factory: &F)
 where
     S: JournalStorage,
@@ -481,7 +523,11 @@ where
     let d = domain(JournalRole::Protected);
     let before = storage.load(&d, &session).await.unwrap().unwrap();
     let mut stale = raw_write(session.as_str(), "stale", Some(&head));
-    stale.expect = (before.revision, old.writer_epoch().unwrap());
+    stale.expect = JournalFence {
+        writer_epoch: old.writer_epoch().unwrap(),
+        ..before.fence()
+    };
+    stale.record.generation = before.generation + 1;
     let members = storage.members(&d, &session).await.unwrap();
     assert_conflict(storage.apply(stale).await.unwrap_err());
     assert_eq!(storage.load(&d, &session).await.unwrap(), Some(before));
@@ -644,6 +690,7 @@ where
                 .unwrap(),
             vec![None]
         );
+        advance(&mut release);
         assert_eq!(
             storage.apply(release).await.unwrap(),
             JournalApplyReceipt::default()
@@ -715,12 +762,14 @@ where
             .iter()
             .all(Option::is_some)
     );
+    advance(&mut release);
     let middle = storage.apply(release.clone()).await.unwrap();
     assert!(first.reclaimed_objects + middle.reclaimed_objects <= 1);
     assert_eq!(
         middle.reclaimed_bytes,
         middle.reclaimed_objects * write.objects.objects[0].bytes.len() as u64
     );
+    advance(&mut release);
     release.release = ids;
     let last = storage.apply(release.clone()).await.unwrap();
     assert_eq!(
@@ -751,6 +800,7 @@ where
             .iter()
             .all(Option::is_none)
     );
+    advance(&mut release);
     assert_eq!(
         storage.apply(release).await.unwrap(),
         JournalApplyReceipt::default()
@@ -797,9 +847,10 @@ where
             .is_empty()
     );
     let mut clear = edits(&writes[1]);
-    let mut record = writes[1].record.clone().unwrap();
+    let mut record = writes[1].record.clone();
     record.collection_dirty = false;
-    clear.record = Some(record);
+    record.generation = clear.record.generation;
+    clear.record = record;
     storage.apply(clear).await.unwrap();
     assert_eq!(
         storage.dirty_sessions(&d, None, 10).await.unwrap(),
@@ -817,15 +868,15 @@ where
     storage.apply(first.clone()).await.unwrap();
     assert_eq!(
         storage.load(&first.domain, &first.session).await.unwrap(),
-        first.record
+        Some(first.record.clone())
     );
-    let mut redacted = first.record.as_ref().unwrap().engine.clone();
+    let mut redacted = first.record.engine.clone();
     redacted.bytes = b"never-print-engine-body".to_vec();
     assert!(!format!("{redacted:?}").contains("never-print-engine-body"));
     let mut object = first.objects.objects[0].clone();
     object.bytes = b"never-print-object-body".as_slice().into();
     assert!(!format!("{object:?}").contains("never-print-object-body"));
-    let before = view(&*storage, &first, &first).await;
+    let mut before = view(&*storage, &first, &first).await;
     storage.compact(&first.domain).await.unwrap();
     assert_eq!(view(&*storage, &first, &first).await, before);
     let mut duplicate = edits(&first);
@@ -834,7 +885,9 @@ where
         storage.apply(duplicate.clone()).await.unwrap(),
         JournalApplyReceipt::default()
     );
+    before.record = Some(duplicate.record.clone());
     assert_eq!(view(&*storage, &first, &first).await, before);
+    advance(&mut duplicate);
     let object = &mut duplicate.objects.objects[0];
     let mut bytes = object.bytes.to_vec();
     bytes.push(b' ');
@@ -1187,9 +1240,11 @@ where
         other.operation
     );
     // A newer writer fence has no operation to exempt from the floor.
-    let mut record = second.record.clone().unwrap();
+    let mut record = second.record.clone();
     record.writer_epoch += 1;
-    prune.record = Some(record);
+    record.generation = prune.record.generation + 1;
+    prune.expect = prune.record.fence();
+    prune.record = record;
     storage.apply(prune).await.unwrap();
     storage.load(&second.domain, &second.session).await.unwrap();
     assert!(

@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS session (
  storage TEXT NOT NULL, role INTEGER NOT NULL, session TEXT NOT NULL,
  revision INTEGER NOT NULL, epoch INTEGER NOT NULL, dirty INTEGER NOT NULL,
+ generation BLOB NOT NULL CHECK(length(generation)=8),
  payload BLOB NOT NULL, nonce BLOB NOT NULL,
  PRIMARY KEY(storage,role,session)
 ) WITHOUT ROWID;

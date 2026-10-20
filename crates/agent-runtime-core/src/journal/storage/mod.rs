@@ -1,6 +1,6 @@
 //! Atomic journal persistence boundary. Object identities never grant membership.
 //!
-//! `apply` rechecks both fences inside one all-or-nothing transaction. Commit
+//! `apply` rechecks the full fence inside one all-or-nothing transaction. Commit
 //! order is objects, checkpoint, batch, pins/catalog, record, operation. Every
 //! injected cut rolls back except `AfterCommit`, which loses the acknowledgement.
 //! Other errors are ambiguous: engines discard cached records before retrying.
@@ -51,17 +51,37 @@ pub struct JournalEngineState {
     pub bytes: Vec<u8>,
 }
 
-/// Durable per-(domain, session) record. `revision`/`writer_epoch` are the
-/// fence fields every write re-checks inside the storage transaction.
+/// Optimistic write fence. An absent session record has the zero fence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalFence {
+    pub revision: JournalRevision,
+    pub writer_epoch: u64,
+    pub generation: u64,
+}
+
+/// Durable per-(domain, session) record. Every successful apply advances
+/// `generation`, including control writes that preserve revision and epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalSessionRecord {
-    pub revision: JournalRevision,             // 0 = nothing published
-    pub writer_epoch: u64,                     // last durable writer fence issued
-    pub head: Option<JournalObject>,           // current head object (id + canonical bytes)
-    pub has_checkpoint: bool,                  // host-queryable; false when head is None
+    pub generation: u64,             // advances exactly once per successful apply
+    pub revision: JournalRevision,   // 0 = nothing published
+    pub writer_epoch: u64,           // last durable writer fence issued
+    pub head: Option<JournalObject>, // current head object (id + canonical bytes)
+    pub has_checkpoint: bool,        // host-queryable; false when head is None
     pub retirement: Option<JournalRetirement>, // tombstone; survives collection
-    pub collection_dirty: bool,                // roots/pins changed since last full sweep
+    pub collection_dirty: bool,      // roots/pins changed since last full sweep
     pub engine: JournalEngineState,
+}
+
+impl JournalSessionRecord {
+    /// The exact fence a write prepared from this record must carry.
+    pub fn fence(&self) -> JournalFence {
+        JournalFence {
+            revision: self.revision,
+            writer_epoch: self.writer_epoch,
+            generation: self.generation,
+        }
+    }
 }
 
 /// One immutable object handed to storage. `kind` lets the host cluster
@@ -133,12 +153,13 @@ pub struct JournalWrite {
     pub domain: JournalDomain,
     pub session: SessionId,
     pub kind: JournalWriteKind,
-    /// The stored record's (revision, writer_epoch) MUST equal this, else the
-    /// write fails with StateConflict and changes nothing. An absent record
-    /// matches (0, 0).
-    pub expect: (JournalRevision, u64),
-    pub record: Option<JournalSessionRecord>, // replacement; None = unchanged
-    pub objects: JournalObjectBatch,          // added to (domain, session) membership
+    /// The stored record's full fence MUST equal this, else the write fails
+    /// with StateConflict and changes nothing. An absent record matches zero.
+    pub expect: JournalFence,
+    /// Replacement record; generation MUST equal expect.generation + 1.
+    /// Overflow fails with StateConflict without changing storage.
+    pub record: JournalSessionRecord,
+    pub objects: JournalObjectBatch, // added to (domain, session) membership
     pub operation: Option<JournalOperationRecord>,
     pub pins: Vec<JournalPinChange>,
     pub catalog: Vec<JournalCatalogChange>,

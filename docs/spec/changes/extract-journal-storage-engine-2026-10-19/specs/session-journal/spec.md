@@ -18,13 +18,20 @@ The runtime SHALL provide a public `JournalEngine<S: JournalStorage>` that imple
 
 ### Requirement: Every journal write is one fenced storage transaction
 
-Each commit, writer open, retirement, retirement authorization, durable pin change, staging change and collection batch SHALL be submitted as exactly one `JournalWrite` and applied by the storage entirely or not at all. The storage MUST compare the stored revision and writer epoch with the write's expectation inside the same transaction and MUST reject a mismatch as `StateConflict` without effect. The engine MUST NOT hold a storage transaction outside a single `apply` call. All new immutable objects of one write SHALL be delivered to the storage as one batch.
+Each commit, writer open, retirement, retirement authorization, durable pin change, staging change and collection batch SHALL be submitted as exactly one `JournalWrite` and applied by the storage entirely or not at all. The storage MUST compare the stored revision, writer epoch and control generation with the write's `JournalFence` expectation inside the same transaction and MUST reject a mismatch as `StateConflict` without effect. An absent record MUST match the zero fence. Every apply MUST replace the session record with generation exactly one greater than expected; skipped generations and overflow MUST conflict without effect. Revision and writer epoch semantics MUST remain unchanged. The engine MUST NOT hold a storage transaction outside a single `apply` call. All new immutable objects of one write SHALL be delivered to the storage as one batch.
 
 #### Scenario: A fenced-out writer's commit cannot land
 
 - **WHEN** a writer's lease was revoked and a successor opened with a higher writer epoch
 - **AND** the stale writer submits a commit whose expectation names the old epoch
 - **THEN** the storage rejects the write and nothing it carried becomes visible
+
+#### Scenario: A stale control write cannot overwrite another engine's control state
+
+- **WHEN** one engine prepares a write and another engine releases a pin, authorizes retirement, records a retirement-dependent candidate or collects that session
+- **AND** the stored revision and writer epoch remain unchanged
+- **THEN** the first engine's stale generation conflicts without changing any record, object, membership, pin, catalog or operation
+- **AND** a caller retry reloads the new fence; clones of one engine serialize preparation through apply
 
 #### Scenario: A commit cut leaves no partial state
 

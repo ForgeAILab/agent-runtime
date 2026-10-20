@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T04:41:05Z
+updated_at: 2026-10-20T06:44:24Z
 ---
 
 # Design: Storage-generic journal engine and physical disk reduction (R1–R7)
@@ -116,10 +116,18 @@ pub struct JournalDomain { pub storage_id: JournalStorageId, pub role: JournalRo
 #[derive(Clone, PartialEq, Eq)]           // Debug prints version + length only
 pub struct JournalEngineState { pub version: u32, pub bytes: Vec<u8> }
 
-/// Durable per-(domain, session) record. `revision`/`writer_epoch` are the
-/// fence fields every write re-checks inside the storage transaction.
+/// Every session write compares all three fields inside the transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalFence {
+    pub revision: JournalRevision,
+    pub writer_epoch: u64,
+    pub generation: u64,
+}
+
+/// Durable per-(domain, session) record; generation advances on every apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalSessionRecord {
+    pub generation: u64,                    // all session writes, including controls
     pub revision: JournalRevision,          // 0 = nothing published
     pub writer_epoch: u64,                  // last durable writer fence issued
     pub head: Option<JournalObject>,        // current head object (id + canonical bytes)
@@ -174,11 +182,10 @@ pub struct JournalWrite {
     pub domain: JournalDomain,
     pub session: SessionId,
     pub kind: JournalWriteKind,
-    /// The stored record's (revision, writer_epoch) MUST equal this, else the
-    /// write fails with StateConflict and changes nothing. An absent record
-    /// matches (0, 0).
-    pub expect: (JournalRevision, u64),
-    pub record: Option<JournalSessionRecord>,   // replacement; None = unchanged
+    /// The full stored fence MUST equal this, else StateConflict with no effect.
+    /// An absent record matches the zero fence.
+    pub expect: JournalFence,
+    pub record: JournalSessionRecord,           // generation = expect.generation + 1
     pub objects: JournalObjectBatch,            // added to (domain, session) membership
     pub operation: Option<JournalOperationRecord>,
     pub pins: Vec<JournalPinChange>,
@@ -242,10 +249,18 @@ Rules the trait documents (and the storage suite in D11 checks):
    `JournalCommitFailurePoint` cuts reach a real transaction (Forge D5.1).
    `JournalCommitFailurePoint` keeps its seven variants; the engine passes the
    armed point through, so `fail_next_commit_at` works on every storage.
-3. **Fences inside the transaction.** The `expect` comparison runs inside the
-   storage transaction (`WHERE revision = ? AND writer_epoch = ?` in SQL), not
-   only in the engine's registry. A write from a fenced-out writer cannot land
-   even if the engine's cache is stale.
+3. **Fences inside the transaction.** `JournalWrite.expect` is a
+   `JournalFence { revision, writer_epoch, generation }`. Storage compares all
+   three stored fields inside its atomic apply, with zero for an absent record.
+   Every write carries a replacement record whose generation is exactly
+   `expect.generation.checked_add(1)`; a mismatch, skipped generation or
+   overflow is `StateConflict` and changes nothing. This includes pin/release,
+   transfer/retention, authorization, staging, per-session collection and
+   retirement-dependent candidate writes. Revision and writer epoch retain
+   their original meanings. The unreleased trait changes directly: `record`
+   is required, including formerly object-only writes. Physical `compact`
+   changes only pack layout, never session records or logical authority, so
+   it does not advance a session generation.
 4. **Membership and sharing (Q4 authoritative).** Objects are added to
    `(domain, session)` membership. An id already present with different bytes
    in the sharing scope is `StateConflict`. `JournalStorage::sharing()` declares
@@ -343,7 +358,8 @@ module unchanged and stay re-exported at the same paths.
   "register lease". `read` never takes it: objects are immutable and the lease
   set only grows under the gate.
 - **Writer open** loads the record, then `apply(OpenWriter)` with
-  `expect = (revision, writer_epoch)` writing `writer_epoch + 1` (creating the
+  `expect = JournalFence { revision, writer_epoch, generation }`, writing
+  `writer_epoch + 1` and `generation + 1` (creating the
   revision-0 reservation for an absent head). A second writer in the same
   process is refused from the registry before any I/O; a writer in another
   process (Forge forbids it with `runtime.lock`) fails the durable fence.
@@ -533,9 +549,9 @@ Every object still passes hash/kind and lease reachability/liveness checks,
 and lease liveness is checked again after the metadata await.
 
 Review rt-e8 (two engines, one control write paused between hydrate and
-apply). Control writes (pin, release, authorize, stage, collect) keep the
-record's `(revision, writer_epoch)`, so they do not fence one another across
-engines. Two consequences broke the argument above and are fixed:
+apply). With the original two-field fence, control writes (pin, release,
+authorize, stage, collect) kept `(revision, writer_epoch)` and could overwrite
+one another across engines. These read-side protections remain in place:
 - A writer open (writer-pin freezing) or re-pin re-put a pin another engine had
   released and collected, still carrying the historical root's certificate. A
   written pin now carries a certificate only for the stored head its own
@@ -551,23 +567,47 @@ engines. Two consequences broke the argument above and are fixed:
   head cannot become current again. Test:
   `a_stale_control_write_cannot_unretire_a_session_another_engine_collected`.
 
-Open decision (not fixed; needs a fence change in `JournalWrite`): a stale
-control write from another engine can still lose a pin release, an
-authorization or a retirement-dependents candidate. A lost release re-puts a
-pin over collected bodies; every later collection of that domain then fails
-with `StateConflict`, in any engine, and cold reads of that root fail closed.
-Memo reads no longer trust such a pin. Single-engine hosts (one engine and
-its clones per storage/domain) are unaffected because the write gate
-serializes hydrate and apply.
+Decision (step 9, owner/integrator): fence every session write with a separate
+monotonic control generation. `JournalFence { revision, writer_epoch,
+generation }` replaces the tuple; `JournalSessionRecord.generation` advances
+exactly once per successful apply, even when revision and epoch stay fixed.
+An absent record has generation zero. Both reference storages reject a stale
+full fence or an invalid successor generation atomically; generation never
+wraps. The engine supplies a required replacement record, so no object-only or
+collection write can leave the generation unchanged. The packed adapter stores
+it as an eight-byte little-endian BLOB in the session row and compares it under
+`BEGIN IMMEDIATE`, including after connection restart. Its compressed opaque
+record payload is unchanged; SQLite adds eight data bytes and one record-header
+serial-type byte per row, subject to normal page allocation.
+
+A stale write can no longer lose a released pin, retirement authorization or
+`retirement_dependents` candidate, nor recreate a pin over collected bodies.
+Controls, writer opens, commits, retirements and collection propagate
+`StateConflict` exactly as for a revision mismatch; the next caller attempt
+reloads storage. There is no internal retry loop. A partially completed
+multi-session collection may keep earlier successful writes, as before; the
+conflicting apply itself changes nothing and the remaining dirty markers
+survive. One engine and its clones serialize load through apply under the
+shared write gate. The concurrent clone regression proves those hosts see no
+new generation conflicts. Revision, S5's current writer epoch last-operation
+exemption, R2's retirement epoch increment and memo certificates are unchanged.
+Physical compaction does not replace session records and needs no logical
+fence.
+
+Cost: one u64 per in-memory session record and one per expected fence, plus constant-time
+generation comparisons and checked increments per apply; no extra storage call, body, pin, catalog or
+operation-pack write. Tests cover all four two-engine races and reject a
+storage that ignores only generation. Locally restoring the original
+revision/epoch-only comparison makes all four R3 regressions fail.
 
 Cost in both domains (body reads remain zero): warm writer open stays
 `load/pins/catalog/apply = 1/1/1/1`; warm snapshot changes from zero storage
 calls to one `load`; historical snapshot/extension use one `pins`; renew stays
 `load/pins = 1/1`; commit stays `load/pins/operation/apply = 1/1/1/1`.
 Hosts should clone one engine per storage/domain to share memo hits and local
-lease retention. It is no longer a warm-read correctness requirement, but it
-remains the only configuration where control writes cannot lose another
-engine's pin release (see the open decision above). The review repro and a historical-pin
+lease retention. It is no longer a correctness requirement: separate engines'
+stale control writes conflict under the generation fence. Clones also avoid
+those conflicts by sharing the write gate. The review repro and a historical-pin
 variant cover direct, snapshot and extension reads after another engine's GC.
 
 Successful commits remove the predecessor's memo proof unless a live lease
@@ -983,7 +1023,7 @@ Unchanged (source-compatible): `SessionJournal`, `SessionStore::journal`,
 Added (all additive):
 
 - core `journal::storage`: `JournalStorage`, `JournalDomain`,
-  `JournalEngineState`, `JournalSessionRecord`, `JournalStoredObject`,
+  `JournalEngineState`, `JournalFence`, `JournalSessionRecord`, `JournalStoredObject`,
   `JournalObjectBatch`, `JournalOperationRecord`, `JournalPinRecord`,
   `JournalCatalogEntry`, `JournalPinChange`, `JournalCatalogChange`,
   `JournalWriteKind`, `JournalWrite`, `JournalApplyReceipt`,
@@ -1217,3 +1257,41 @@ schedules. The required 2.0× gate passes; group 5 remains intentionally unbuilt
 The earlier Step-6 C/N=4000 timeout remains historical evidence; Step 7 now
 supplies the completed measurement. Full report and raw JSON are
 `/Volumes/Data/tmp/refactor/rt-e7/report.md` and `measurements.json`.
+
+## Step 9 final verification evidence (review R3)
+
+The full control-generation fence and required replacement record pass all
+requested gates: fmt, clippy (all targets/features, warnings denied), core
+**331**, runtime **677**, testkit **446**, LCM **62**, bench **18** passing
+tests (three existing opt-in reports ignored), the primary release report
+(**18 cases**, one additional test), Rust 1.86 core/runtime build, strict spec
+validation and the six-command CI dependency-boundary check (plus the
+13-package unpublished bench-leaf check). Normal package total: **1,534**.
+The unchanged future-size guard passes; largest `commit_inner` is
+**5,136 / 16,384 bytes**.
+
+Locally restoring the original revision/epoch-only comparison makes all four
+R3 race regressions fail. The reviewer probe records the same boundary
+conflict from both the used collector and a freshly built engine. Restoring
+the generation comparison passes all four; eight concurrent clones also
+complete 16 control writes with no conflict and exactly 16 generation advances.
+The named `control_generation_fence` case rejects the faulty adapter that
+ignores only generation; packed connection/restart tests pass.
+
+Against `rt-e8/measurements.json`, all **4,032 size fields / 252 size records**
+were compared. Every allocated physical/file/page/table size and pack-write
+meter is identical. Only **72** size fields differ: actual packed before/after
+`row_value_bytes` is **+16 bytes** per fixture (two session rows × eight bytes),
+and its `row_index_page_overhead` accounting residual is **−16 bytes**. The
+other **3,960** size fields and all non-size fields are identical. Compressed
+record metadata and all object/pin/catalog/operation payloads are unchanged.
+
+Existing expectation adaptations are limited to required session records and
+generation advancement; receipt, revision/epoch, memo and replay expectations
+remain intact. The full file:line old→new list, 288-assertion audit, all command
+counts/timeouts and negative proofs are in
+`/Volumes/Data/tmp/refactor/rt-e9/report.md`, `expectation-review.json`,
+`verification-summary.json`, `mutation-proof.json` and
+`physical-comparison.json`. `engine/memo.rs` and `engine/transition.rs` remain
+byte-identical. **NOT MET: none for step 9.** Earlier step-8 partial sizing and
+C/N=4000 follow-ups remain historical and out of scope.

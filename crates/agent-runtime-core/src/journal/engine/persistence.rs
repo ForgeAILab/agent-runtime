@@ -387,6 +387,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 continue;
             }
             let mut record = stored.unwrap_or_else(|| JournalSessionRecord {
+                generation: 0,
                 revision: JournalRevision(0),
                 writer_epoch: 0,
                 head: None,
@@ -398,14 +399,16 @@ impl<S: JournalStorage> JournalEngine<S> {
                     bytes: vec![],
                 },
             });
+            let expect = record.fence();
+            record.generation = expect.generation.checked_add(1).ok_or_else(conflict)?;
             record.engine = encode(&metadata)?;
             self.apply(
                 JournalWrite {
                     domain: self.domain.clone(),
                     session: target.clone(),
                     kind: JournalWriteKind::Collect,
-                    expect: (record.revision, record.writer_epoch),
-                    record: Some(record),
+                    expect,
+                    record,
                     objects: JournalObjectBatch::default(),
                     operation: None,
                     pins: vec![],
@@ -586,8 +589,12 @@ impl<S: JournalStorage> JournalEngine<S> {
             domain: self.domain.clone(),
             session: session.clone(),
             kind,
-            expect: stored.map_or((JournalRevision(0), 0), |r| (r.revision, r.writer_epoch)),
-            record: Some(JournalSessionRecord {
+            expect: stored.map_or(JournalFence::default(), JournalSessionRecord::fence),
+            record: JournalSessionRecord {
+                generation: stored
+                    .map_or(0, |r| r.generation)
+                    .checked_add(1)
+                    .ok_or_else(conflict)?,
                 revision,
                 writer_epoch: record.last_writer_epoch,
                 has_checkpoint: record
@@ -598,7 +605,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 retirement: record.retirement.clone(),
                 collection_dirty: true,
                 engine: encode(&metadata)?,
-            }),
+            },
             objects: JournalObjectBatch::default(),
             operation: None,
             pins: vec![],
@@ -894,13 +901,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                     })
                 })
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
-            let root = write
-                .record
-                .as_ref()
-                .and_then(|r| r.head.as_ref())
-                .ok_or_else(conflict)?
-                .id
-                .clone();
+            let root = write.record.head.as_ref().ok_or_else(conflict)?.id.clone();
             let deps = &state.sessions[lease.session()].dependencies;
             write
                 .catalog

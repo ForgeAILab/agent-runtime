@@ -170,8 +170,20 @@ fn stage(d: JournalDomain, s: &str, values: &[usize]) -> JournalWrite {
         domain: d,
         session: SessionId::new(s),
         kind: JournalWriteKind::Stage,
-        expect: (JournalRevision(0), 0),
-        record: None,
+        expect: JournalFence::default(),
+        record: JournalSessionRecord {
+            generation: 1,
+            revision: JournalRevision(0),
+            writer_epoch: 0,
+            head: None,
+            has_checkpoint: false,
+            retirement: None,
+            collection_dirty: true,
+            engine: JournalEngineState {
+                version: 1,
+                bytes: b"{}".to_vec(),
+            },
+        },
         objects: JournalObjectBatch { objects },
         operation: None,
         pins: vec![],
@@ -180,6 +192,14 @@ fn stage(d: JournalDomain, s: &str, values: &[usize]) -> JournalWrite {
         prune_operations_before: None,
         inject: None,
     }
+}
+async fn prepare(storage: &PackedSqliteJournalStorage, mut write: JournalWrite) -> JournalWrite {
+    if let Some(record) = storage.load(&write.domain, &write.session).await.unwrap() {
+        write.expect = record.fence();
+        write.record = record;
+        write.record.generation += 1;
+    }
+    write
 }
 async fn contents(storage: &PackedSqliteJournalStorage) -> Vec<Vec<(JournalObjectId, Arc<[u8]>)>> {
     let mut out = Vec::new();
@@ -222,7 +242,10 @@ async fn repack_preserves_all_holders_bytes_and_membership_bits_on_disk() {
     let mut collect = stage(domain(JournalRole::Ordinary), "s", &[]);
     collect.kind = JournalWriteKind::Collect;
     assert_eq!(
-        storage.apply(collect).await.unwrap(),
+        storage
+            .apply(prepare(&storage, collect).await)
+            .await
+            .unwrap(),
         JournalApplyReceipt::default()
     );
     assert_eq!(contents(&storage).await, before);
@@ -245,7 +268,7 @@ async fn post_terminal_geometric_merges_leave_one_pack_per_size_tier() {
     let storage = PackedSqliteJournalStorage::open(&path).unwrap();
     for i in 0..25 {
         storage
-            .apply(stage(domain(JournalRole::Protected), "s", &[i]))
+            .apply(prepare(&storage, stage(domain(JournalRole::Protected), "s", &[i])).await)
             .await
             .unwrap();
     }
@@ -277,7 +300,8 @@ async fn independent_connections_refresh_pack_caches_and_recheck_fences() {
     let a = PackedSqliteJournalStorage::open(&path).unwrap();
     let b = PackedSqliteJournalStorage::open(&path).unwrap();
     let mut first = stage(domain(JournalRole::Protected), "s", &[100]);
-    first.record = Some(JournalSessionRecord {
+    first.record = JournalSessionRecord {
+        generation: 1,
         revision: JournalRevision(0),
         writer_epoch: 1,
         head: None,
@@ -288,13 +312,15 @@ async fn independent_connections_refresh_pack_caches_and_recheck_fences() {
             version: 93,
             bytes: vec![0, 255, 1],
         },
-    });
+    };
     a.apply(first.clone()).await.unwrap();
     let stale = stage(domain(JournalRole::Protected), "s", &[200]);
     assert!(b.apply(stale.clone()).await.is_err());
     let mut next = stale;
-    next.expect.1 = 1;
-    b.apply(next).await.unwrap();
+    next.expect = first.record.fence();
+    next.record = first.record.clone();
+    next.record.generation += 1;
+    b.apply(next.clone()).await.unwrap();
     assert_eq!(
         a.members(&first.domain, &first.session)
             .await
@@ -304,7 +330,7 @@ async fn independent_connections_refresh_pack_caches_and_recheck_fences() {
     );
     assert_eq!(
         a.load(&first.domain, &first.session).await.unwrap(),
-        first.record
+        Some(next.record)
     );
     assert_eq!(contents(&a).await, contents(&b).await);
 }
@@ -320,7 +346,10 @@ async fn receipts_describe_bodies_removed_from_the_persisted_pack_not_only_bits(
     release.kind = JournalWriteKind::Collect;
     release.release = vec![object.id.clone(), object.id.clone()];
     assert_eq!(
-        storage.apply(release).await.unwrap(),
+        storage
+            .apply(prepare(&storage, release).await)
+            .await
+            .unwrap(),
         JournalApplyReceipt {
             reclaimed_objects: 1,
             reclaimed_bytes: object.bytes.len() as u64
@@ -394,7 +423,10 @@ async fn per_session_admission_and_lazy_open_do_not_decode_other_sessions() {
         .unwrap();
     drop(storage);
     let storage = PackedSqliteJournalStorage::open(&path).unwrap();
-    assert!(storage.load(&b.domain, &b.session).await.unwrap().is_none());
+    assert_eq!(
+        storage.load(&b.domain, &b.session).await.unwrap(),
+        Some(b.record.clone())
+    );
     assert_eq!(
         storage.members(&a.domain, &a.session).await.unwrap().len(),
         1
@@ -402,7 +434,14 @@ async fn per_session_admission_and_lazy_open_do_not_decode_other_sessions() {
     assert!(storage.members(&b.domain, &b.session).await.is_err());
     let mut release = stage(a.domain, "s", &[]);
     release.release = vec![a.objects.objects[0].id.clone()];
-    assert_eq!(storage.apply(release).await.unwrap().reclaimed_objects, 1);
+    assert_eq!(
+        storage
+            .apply(prepare(&storage, release).await)
+            .await
+            .unwrap()
+            .reclaimed_objects,
+        1
+    );
 }
 #[tokio::test]
 async fn deferred_bytes_are_hidden_then_counted_at_the_quarter_pack_threshold() {
@@ -427,7 +466,10 @@ async fn deferred_bytes_are_hidden_then_counted_at_the_quarter_pack_threshold() 
         release.kind = JournalWriteKind::Collect;
         release.release = vec![object.id.clone()];
         assert_eq!(
-            storage.apply(release.clone()).await.unwrap(),
+            storage
+                .apply(prepare(&storage, release.clone()).await)
+                .await
+                .unwrap(),
             JournalApplyReceipt::default()
         );
         assert!(raw_packs(&path).iter().any(|raw| {
@@ -452,7 +494,10 @@ async fn deferred_bytes_are_hidden_then_counted_at_the_quarter_pack_threshold() 
         let second = &write.objects.objects[1];
         release.release = vec![second.id.clone()];
         assert_eq!(
-            storage.apply(release).await.unwrap(),
+            storage
+                .apply(prepare(&storage, release).await)
+                .await
+                .unwrap(),
             JournalApplyReceipt {
                 reclaimed_objects: 2,
                 reclaimed_bytes: (object.bytes.len() + second.bytes.len()) as u64,
@@ -522,7 +567,10 @@ async fn imports_and_repacks_obey_the_logical_cap_and_leave_large_packs_sealed()
     }
     let mut collect = stage(write.domain, "s", &[]);
     collect.kind = JournalWriteKind::Collect;
-    storage.apply(collect).await.unwrap();
+    storage
+        .apply(prepare(&storage, collect).await)
+        .await
+        .unwrap();
     assert_eq!(
         raw_packs(&path),
         before,
@@ -574,7 +622,12 @@ async fn pack_write_meter_counts_committed_payloads_and_rolls_back_with_apply() 
     assert_eq!(storage.pack_write_bytes().unwrap(), actual);
     let mut failing = stage(domain(JournalRole::Protected), "s", &[3, 4]);
     failing.inject = Some(JournalCommitFailurePoint::AfterObjects);
-    assert!(storage.apply(failing).await.is_err());
+    assert!(
+        storage
+            .apply(prepare(&storage, failing).await)
+            .await
+            .is_err()
+    );
     assert_eq!(storage.pack_write_bytes().unwrap(), actual);
 }
 
@@ -622,7 +675,10 @@ async fn operation_segments_remain_capped_and_recover_original_results() {
             },
         };
         write.operation = Some(operation.clone());
-        storage.apply(write.clone()).await.unwrap();
+        storage
+            .apply(prepare(&storage, write.clone()).await)
+            .await
+            .unwrap();
         operations.push(operation);
     }
     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -696,7 +752,8 @@ async fn collection_does_not_rewrite_an_unchanged_operation_pack() {
             updated: Timestamp(1),
         },
     };
-    write.record = Some(JournalSessionRecord {
+    write.record = JournalSessionRecord {
+        generation: 1,
         revision: JournalRevision(1),
         writer_epoch: 1,
         head: None,
@@ -707,17 +764,19 @@ async fn collection_does_not_rewrite_an_unchanged_operation_pack() {
             version: 0,
             bytes: vec![],
         },
-    });
+    };
     write.operation = Some(operation.clone());
     storage.apply(write.clone()).await.unwrap();
     let before = storage.pack_write_bytes().unwrap();
     write.kind = JournalWriteKind::Collect;
-    write.expect = (JournalRevision(1), 1);
-    write.record = None;
+    write.expect = write.record.fence();
+    write.record.generation += 1;
     write.operation = None;
     for floor in [0, 100] {
         write.prune_operations_before = Some(JournalRevision(floor));
         storage.apply(write.clone()).await.unwrap();
+        write.expect = write.record.fence();
+        write.record.generation += 1;
         assert_eq!(
             storage.pack_write_bytes().unwrap(),
             before,
@@ -731,4 +790,60 @@ async fn collection_does_not_rewrite_an_unchanged_operation_pack() {
             Some(operation.clone())
         );
     }
+}
+
+#[tokio::test]
+async fn control_generation_is_fenced_across_connections_and_restart() {
+    let files = Files::new();
+    let path = files.path();
+    let a = PackedSqliteJournalStorage::open(&path).unwrap();
+    let b = PackedSqliteJournalStorage::open(&path).unwrap();
+    let first = stage(domain(JournalRole::Protected), "s", &[10]);
+    a.apply(first.clone()).await.unwrap();
+    let stale = prepare(&a, stage(first.domain.clone(), "s", &[20])).await;
+    let mut current = prepare(&b, stage(first.domain.clone(), "s", &[])).await;
+    current.record.engine.bytes = b"retirement authorization or dependency candidate".to_vec();
+    b.apply(current.clone()).await.unwrap();
+    for storage in [&a, &b] {
+        let meter = storage.pack_write_bytes().unwrap();
+        let error = storage.apply(stale.clone()).await.unwrap_err();
+        assert!(matches!(
+            error.class,
+            agent_runtime_core::error::FailureClass::StateConflict { .. }
+        ));
+        assert_eq!(
+            storage.load(&first.domain, &first.session).await.unwrap(),
+            Some(current.record.clone())
+        );
+        assert_eq!(
+            storage
+                .members(&first.domain, &first.session)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(storage.pack_write_bytes().unwrap(), meter);
+    }
+    drop(a);
+    drop(b);
+    let restarted = PackedSqliteJournalStorage::open(&path).unwrap();
+    let meter = restarted.pack_write_bytes().unwrap();
+    assert!(matches!(
+        restarted.apply(stale).await.unwrap_err().class,
+        agent_runtime_core::error::FailureClass::StateConflict { .. }
+    ));
+    assert_eq!(
+        restarted.load(&first.domain, &first.session).await.unwrap(),
+        Some(current.record)
+    );
+    assert_eq!(
+        restarted
+            .members(&first.domain, &first.session)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(restarted.pack_write_bytes().unwrap(), meter);
 }

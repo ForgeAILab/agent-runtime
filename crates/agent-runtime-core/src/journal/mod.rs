@@ -70,6 +70,8 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
     /// Optional transport for a single reader operation. Implementations that
     /// cache bodies can validate their authority once after materialization.
     /// The default keeps the ordinary per-object `read` contract.
+    /// A wrapper forwarding `begin_read` while metering or fault-injecting `read`
+    /// will not see memo-served reads.
     #[doc(hidden)]
     fn begin_read<'a>(
         &'a self,

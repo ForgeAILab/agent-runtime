@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T04:41:05Z
+updated_at: 2026-10-20T06:44:24Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -257,3 +257,18 @@ overflows. Full sizing is restored. The debug C/N=1000 baseline timed out at
 900 seconds, writer epoch 120. Step 9.7's prerequisite (completed sizing/time
 work) is therefore NOT MET; no new C/N=4000 claim supersedes step 7's measured
 result. Detailed measurements, mutations and verification: `rt-e8/report.md`.
+
+## 10. Control-generation fence (step 9 / review R3 owner instruction)
+
+- [x] 10.1 Replace the two-field fence with revision/epoch/generation; every
+  engine session write supplies a required record and advances generation.
+- [x] 10.2 Check full fences and successor generations atomically in volatile
+  and packed storage, including packed connection restart; add a named
+  generation conformance case and a broken adapter that fails it.
+- [x] 10.3 Preserve revision-mismatch conflict propagation without retry loops;
+  prove shared load/apply atomicity with concurrent controls through clones.
+- [x] 10.4 Prove all four two-engine R3 regressions fail with the original
+  two-field fence and pass with the generation fence restored.
+- [x] 10.5 Update D2/D5, development docs, existing Added changelog entry and
+  begin_read wrapper documentation; run all requested gates, compare physical
+  sizes with rt-e8 and record changed expectations and final rt-e9 evidence.

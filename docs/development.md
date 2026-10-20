@@ -138,8 +138,19 @@ packed SQLite adapter demonstrates storage levers and conformance; production
 framing, encryption, flushes and process locking remain host responsibilities.
 
 The storage boundary supplies membership-scoped reads and one atomic fenced
-`JournalWrite` per write. `apply` rechecks `(revision, writer_epoch)` inside
-its transaction, persists engine metadata verbatim, and reclaims unreferenced copies
+`JournalWrite` per write. `apply` rechecks the full
+`JournalFence { revision, writer_epoch, generation }` inside its transaction.
+An absent record matches zero; every apply requires a replacement session
+record with generation exactly one greater than the expected generation.
+Mismatch or overflow is `StateConflict` with no effects. This also fences
+control writes, collection batches and retirement-dependent candidate updates;
+revision and writer epoch semantics are unchanged. Controls propagate conflicts
+as they do revision mismatches; a caller retry reloads storage, with no internal
+retry loop. Clones share the load-through-apply write gate. Physical `compact`
+changes pack layout without replacing session records, so it does not advance
+a session generation. The packed reference stores the u64 as an eight-byte
+session column and checks it in the same SQL transaction, also after restart.
+Storage persists engine metadata verbatim and reclaims unreferenced copies
 within its declared `JournalBodySharing` scope: `Global` (the compatibility
 default) or `PerSession` (independent session copies, optionally shared across
 domains). Every surviving membership remains readable; non-members never are.
@@ -265,9 +276,9 @@ rejected.
 Run `agent_runtime_testkit::conformance::journal_storage::assert_journal_storage_conformance`
 with a factory that returns isolated empty storage. The suite runs protected,
 ordinary and collection contracts through `JournalEngine<S>`, atomic failure
-cuts, revision/writer fences, membership isolation and last-member receipts,
+cuts, revision/writer/generation fences, membership isolation and last-member receipts,
 restart recovery, and replay pruning's inclusive edge/last-writer exception.
-It rejects torn, lost, reordered, stale-fenced and shared-body-deleting adapters.
+It rejects torn, lost, reordered, stale-fenced (including generation-only staleness) and shared-body-deleting adapters.
 The packed adapter runs it with repacking disabled, enabled, and a reopened
 connection on every hydration.
 
