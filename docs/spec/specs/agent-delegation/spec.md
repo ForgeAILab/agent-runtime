@@ -352,3 +352,92 @@ MUST NOT change the batch or lose a terminal result.
 - **WHEN** Runtime records the second notification
 - **THEN** it rejects or idempotently ignores the duplicate
 - **AND** the protected result and cursor remain unchanged
+
+### Requirement: Child-completion delivery is budgeted and never refused for size
+
+Automatic child-completion delivery SHALL inline completed child replies in
+canonical batch order while each fits the remaining
+`DelegationConfig::delivery_inline_bytes`; a reply of at most 1,024 bytes
+SHALL always be inlined. A reply that does not fit SHALL be delivered as its
+opening 1,024 bytes plus the reference of its parent-owned stored copy, or
+with a pointer to the child's result when no copy exists. Runtime MUST NOT
+refuse, defer, or leave ready an admission because of the size of its
+replies.
+
+#### Scenario: A long reply is delivered by reference
+
+- **GIVEN** a factory with an artifact store and a child reply over the budget
+- **WHEN** the ready batch is admitted
+- **THEN** the delivery carries the reply's opening bytes and the stored
+  reference
+- **AND** the stored copy is owned by the parent session and holds the exact
+  reply
+
+#### Scenario: A batch over the child-completion ceiling
+
+- **GIVEN** a ready batch whose inline form exceeds
+  `MAX_CHILD_COMPLETION_TURN_CHARS`
+- **WHEN** the batch is admitted
+- **THEN** each outcome is delivered as one compact line
+- **AND** the admission is accepted
+
+#### Scenario: A short reply keeps the existing text
+
+- **GIVEN** a reply within the budget and no transferred artifacts
+- **WHEN** it is delivered
+- **THEN** the delivery text is unchanged from previous releases
+
+### Requirement: Delivered outcomes name their transferred artifacts
+
+Each completed outcome in an automatic delivery SHALL list the artifacts
+transferred to the parent from that child turn, giving the parent-owned id,
+the child-owned source id, media type, and byte length. At most 32 SHALL be
+listed per outcome, followed by the count of the rest.
+
+#### Scenario: A transferred tool-output artifact
+
+- **GIVEN** a child turn whose offloaded tool output was transferred to the
+  parent
+- **WHEN** its outcome is delivered automatically
+- **THEN** the delivery names the parent-owned copy and its child-owned source
+
+### Requirement: Outcomes returned through a tool result are not delivered again
+
+The runtime SHALL let a host delegation tool acknowledge that the child task
+outcome it returns is the result of one tool call in the parent's serving
+turn. When that call's result commits to the parent's canonical history
+without an error, the runtime MUST remove that exact outcome from automatic
+child-completion delivery and persist the removal before the turn continues.
+The outcome MUST remain available to idempotent host inspection, and the
+protected automatic outcome cursor MUST NOT change. When the result is an
+error, or the turn ends before the result commits, the outcome MUST remain
+ready for automatic delivery. Acknowledging against a turn that is not
+serving, or an outcome that is not a durable recorded outcome of the parent,
+SHALL fail without effect.
+
+#### Scenario: The model read the result with a tool
+
+- **GIVEN** a child completed and its outcome is ready for automatic delivery
+- **WHEN** a parent tool call returns the outcome, acknowledges it, and its
+  result commits
+- **THEN** no ready outcome remains and admission delivers nothing
+- **AND** host inspection still returns the outcome
+- **AND** a parent restored from its stores has no ready outcome
+
+#### Scenario: The tool result is an error
+
+- **GIVEN** a parent tool call acknowledged a ready outcome
+- **WHEN** the call's result commits as an error
+- **THEN** the outcome is still delivered automatically
+
+#### Scenario: The turn ends before the result commits
+
+- **GIVEN** a parent tool call acknowledged a ready outcome
+- **WHEN** the turn is interrupted before the call's result commits
+- **THEN** the outcome is still delivered automatically
+
+#### Scenario: Acknowledging outside the serving turn
+
+- **GIVEN** a ready outcome
+- **WHEN** a host acknowledges it against a turn that is not serving
+- **THEN** the call fails and the outcome stays ready

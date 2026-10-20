@@ -2,9 +2,9 @@
   "change_id": "add-one-shot-calls",
   "change_ref": "add-one-shot-calls-2026-10-16",
   "created_at": "2026-10-16T23:45:00Z",
-  "updated_at": "2026-10-16T23:45:00Z",
-  "completed_at": null,
-  "status": "proposed",
+  "updated_at": "2026-10-20T01:02:12Z",
+  "completed_at": "2026-10-20T01:02:12Z",
+  "status": "archived",
   "depends_on": [],
   "external_dependencies": []
 }

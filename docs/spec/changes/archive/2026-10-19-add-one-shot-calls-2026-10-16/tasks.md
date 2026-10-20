@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-16T23:45:00Z
-updated_at: 2026-10-16T23:45:00Z
-completed_at:
+updated_at: 2026-10-20T01:02:12Z
+completed_at: 2026-10-20T01:02:12Z
 ---
 
 ## 1. External request
@@ -40,4 +40,14 @@ completed_at:
 - [x] 4.2 Gate: `cargo fmt --check`, `cargo clippy --workspace
       --all-targets --all-features -- -D warnings`, `cargo test --workspace
       --all-features`, and `cargo test -p agent-runtime-testkit`.
-- [ ] 4.3 Release v0.5.0 per the release PR process.
+- [x] 4.3 Release v0.5.0 per the release PR process.
+
+## Completion evidence (2026-10-19)
+
+The implementation landed in
+[PR #34](https://github.com/ForgeAILab/agent-runtime/pull/34). Release
+[PR #35](https://github.com/ForgeAILab/agent-runtime/pull/35) merged as
+`82f5aac`, and the immutable
+[v0.5.0 tag](https://github.com/ForgeAILab/agent-runtime/tree/v0.5.0)
+contains the one-shot API, per-turn instructions, and the dated 0.5.0
+CHANGELOG entries. The release task was complete; its checkbox was stale.
