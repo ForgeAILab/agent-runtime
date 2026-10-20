@@ -51,6 +51,7 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-util",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",
