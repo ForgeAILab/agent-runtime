@@ -1142,7 +1142,10 @@ impl JournalStorage for PackedSqliteJournalStorage {
         if self.config.repack_on_collection && write.kind == JournalWriteKind::Collect {
             repack(&tx, packs, &mut updates, s, true)?;
         }
-        tx.commit().map_err(failure)?;
+        // A failed COMMIT is ambiguous (e.g. a WAL fsync error after the
+        // commit frame was written may still recover as committed), so it
+        // must be retryable: callers treat non-retryable errors as no effect.
+        tx.commit().map_err(|error| failure(error).retryable())?;
         state.update(s, updates);
         if let Some(op) = &write.operation {
             state.operations.insert(
