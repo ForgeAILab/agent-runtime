@@ -7,6 +7,12 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- CLI agent turn cleanup signals the spawned CLI's private process group
+  directly on Unix, avoiding external `kill` argument parsing. Reaped child
+  ids, special signal targets, and the host's process group are excluded.
+
 ### Breaking
 
 - `JournalGcReport` gains `unreadable_sessions: Vec<SessionId>`; struct literals
