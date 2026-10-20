@@ -9,6 +9,11 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Added
 
+- Optional Anthropic thinking block-binding controls through
+  `AnthropicConfig::with_thinking_block_binding`, with `error` or `drop_block`
+  prefix-mismatch behavior for explicit adaptive or budget thinking. The
+  required beta is added only when the control is attached; beta header values
+  are merged without duplicates in first-seen order. The default is unset.
 - Explicit host-triggered retirement and logical collection in the volatile
   `InMemorySessionJournal`, with revision-bound retention authorization, durable
   migration/fork/child and historical pins, transactional root/pin epochs,
