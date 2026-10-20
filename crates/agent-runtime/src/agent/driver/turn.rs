@@ -108,6 +108,15 @@ impl<'a> TurnMachine<'a> {
         self.capture_snapshot(true)
     }
 
+    /// The acceptance checkpoint's snapshot: live history plus the turn's
+    /// staged messages, which enter live history only once it commits.
+    fn acceptance_snapshot(&self, staged: &[Message]) -> Result<SessionSnapshot, RuntimeError> {
+        let mut snapshot = self.capture_snapshot(false);
+        snapshot.history.extend(staged.iter().cloned());
+        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
+        Ok(snapshot)
+    }
+
     fn checkpoint_snapshot(&self) -> Result<SessionSnapshot, RuntimeError> {
         let mut snapshot = self.capture_snapshot(false);
         crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
@@ -239,41 +248,49 @@ impl<'a> TurnMachine<'a> {
         input: UserInput,
         active_history_start: usize,
         deadline: Deadline,
-    ) -> Result<(), RuntimeError> {
+        staged: &[Message],
+    ) -> Result<(), AcceptanceSaveError> {
+        use AcceptanceSaveError::NotCommitted;
         if self.checkpoint.is_some() {
-            return Err(RuntimeError::conflict(
+            return Err(NotCommitted(RuntimeError::conflict(
                 "accepted checkpoint already exists for this turn",
-            ));
+            )));
         }
-        let checkpoint_sequence = if self.execution.persistence.has_checkpoint_store() {
-            match self.execution.persistence.latest_checkpoint().await? {
-                None => 1,
-                Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
-                    previous.watermark.checkpoint_sequence.saturating_add(1)
-                }
-                Some(_) => {
-                    return Err(RuntimeError::conflict(
-                        "cannot accept a new turn over a non-terminal checkpoint",
-                    ));
-                }
-            }
+        let predecessor = if self.execution.persistence.has_checkpoint_store() {
+            self.execution
+                .persistence
+                .latest_checkpoint()
+                .await
+                .map_err(NotCommitted)?
         } else {
-            1
+            None
+        };
+        let checkpoint_sequence = match &predecessor {
+            None => 1,
+            Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
+                previous.watermark.checkpoint_sequence.saturating_add(1)
+            }
+            Some(_) => {
+                return Err(NotCommitted(RuntimeError::conflict(
+                    "cannot accept a new turn over a non-terminal checkpoint",
+                )));
+            }
         };
         let checkpoint = TurnCheckpoint::accepted(
             self.turn_id.clone(),
             input,
-            self.checkpoint_snapshot()?,
+            self.acceptance_snapshot(staged).map_err(NotCommitted)?,
             active_history_start,
             deadline,
             checkpoint_sequence,
             self.emitter.next_sequence(),
             self.driver.clock.now(),
-        )?;
+        )
+        .map_err(NotCommitted)?;
         if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
-                .save_checkpoint(&checkpoint)
+                .save_acceptance_checkpoint(&checkpoint, predecessor.as_ref())
                 .await?;
         }
         self.checkpoint = Some(checkpoint);
@@ -285,41 +302,49 @@ impl<'a> TurnMachine<'a> {
         input: InternalTurnInput,
         active_history_start: usize,
         deadline: Deadline,
-    ) -> Result<(), RuntimeError> {
+        staged: &[Message],
+    ) -> Result<(), AcceptanceSaveError> {
+        use AcceptanceSaveError::NotCommitted;
         if self.checkpoint.is_some() {
-            return Err(RuntimeError::conflict(
+            return Err(NotCommitted(RuntimeError::conflict(
                 "accepted checkpoint already exists for this turn",
-            ));
+            )));
         }
-        let checkpoint_sequence = if self.execution.persistence.has_checkpoint_store() {
-            match self.execution.persistence.latest_checkpoint().await? {
-                None => 1,
-                Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
-                    previous.watermark.checkpoint_sequence.saturating_add(1)
-                }
-                Some(_) => {
-                    return Err(RuntimeError::conflict(
-                        "cannot accept a new turn over a non-terminal checkpoint",
-                    ));
-                }
-            }
+        let predecessor = if self.execution.persistence.has_checkpoint_store() {
+            self.execution
+                .persistence
+                .latest_checkpoint()
+                .await
+                .map_err(NotCommitted)?
         } else {
-            1
+            None
+        };
+        let checkpoint_sequence = match &predecessor {
+            None => 1,
+            Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
+                previous.watermark.checkpoint_sequence.saturating_add(1)
+            }
+            Some(_) => {
+                return Err(NotCommitted(RuntimeError::conflict(
+                    "cannot accept a new turn over a non-terminal checkpoint",
+                )));
+            }
         };
         let checkpoint = TurnCheckpoint::internal_accepted(
             self.turn_id.clone(),
             input,
-            self.checkpoint_snapshot()?,
+            self.acceptance_snapshot(staged).map_err(NotCommitted)?,
             active_history_start,
             deadline,
             checkpoint_sequence,
             self.emitter.next_sequence(),
             self.driver.clock.now(),
-        )?;
+        )
+        .map_err(NotCommitted)?;
         if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
-                .save_checkpoint(&checkpoint)
+                .save_acceptance_checkpoint(&checkpoint, predecessor.as_ref())
                 .await?;
         }
         self.checkpoint = Some(checkpoint);
@@ -1038,26 +1063,27 @@ impl<'a> TurnMachine<'a> {
             None => Deadline::never(),
         };
         let accepted_input = input.clone();
-        let active_history_start = {
-            let mut guard = state.lock().expect("session state poisoned");
-            let history_start = guard.history.len();
-            guard.history.push(input.into_message());
-            history_start
-        };
+        let active_history_start = state.lock().expect("session state poisoned").history.len();
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
-        let injected = driver.drain_injected_for_acceptance(&state, &inbox);
+        // The input and the injections it drains stay staged until the
+        // acceptance checkpoint commits (see `Driver::settle_failed_acceptance`).
+        let injected = driver.take_injected_for_acceptance(&inbox);
+        let mut staged = vec![input.into_message()];
+        staged.extend(InjectionQueue::messages(&injected));
 
-        if let Err(error) = self
-            .checkpoint_accepted(accepted_input, active_history_start, turn_deadline)
+        match self
+            .checkpoint_accepted(accepted_input, active_history_start, turn_deadline, &staged)
             .await
         {
-            // No provider/tool work has begun. A protected store failure is
-            // observable and fails closed before external I/O: the turn was
-            // never accepted, so the live session returns to its last
-            // committed boundary before the failure is published.
-            driver.rollback_unaccepted(&state, &inbox, active_history_start, injected);
-            self.emit_non_durable_failure(error, false);
-            return;
+            Ok(()) => driver.publish_accepted(&state, staged),
+            Err(failure) => {
+                // No provider/tool work has begun. A protected store failure
+                // is observable and fails closed before external I/O.
+                let error =
+                    driver.settle_failed_acceptance(failure, &state, &inbox, staged, injected);
+                self.emit_non_durable_failure(error, false);
+                return;
+            }
         }
 
         self.run_loop(active_history_start, turn_deadline, 0, false)
@@ -1095,25 +1121,29 @@ impl<'a> TurnMachine<'a> {
             Some(ms) => Deadline::after(driver.clock.as_ref(), ms),
             None => Deadline::never(),
         };
-        let active_history_start = {
-            let guard = state.lock().expect("session state poisoned");
-            guard.history.len()
-        };
+        let active_history_start = state.lock().expect("session state poisoned").history.len();
         execution.begin_internal_turn(
             turn_id,
             active_history_start,
             driver.clock.now(),
             input.clone(),
         );
-        let injected = driver.drain_injected_for_acceptance(&state, &inbox);
+        // The drained injections stay staged until the acceptance checkpoint
+        // commits (see `Driver::settle_failed_acceptance`).
+        let injected = driver.take_injected_for_acceptance(&inbox);
+        let staged = InjectionQueue::messages(&injected);
 
         match self
-            .checkpoint_internal_accepted(input, active_history_start, turn_deadline)
+            .checkpoint_internal_accepted(input, active_history_start, turn_deadline, &staged)
             .await
         {
-            Ok(()) => self.resolve_acceptance(Ok(())),
-            Err(error) => {
-                driver.rollback_unaccepted(&state, &inbox, active_history_start, injected);
+            Ok(()) => {
+                driver.publish_accepted(&state, staged);
+                self.resolve_acceptance(Ok(()));
+            }
+            Err(failure) => {
+                let error =
+                    driver.settle_failed_acceptance(failure, &state, &inbox, staged, injected);
                 self.resolve_acceptance(Err(error.clone()));
                 self.emit_non_durable_failure(error, false);
                 return;

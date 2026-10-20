@@ -16,7 +16,18 @@ contain breaking changes and are coordinated with consumer proposals.
   checkpoint, and every later resume failed with "canonical session history
   and terminal checkpoint are from different boundaries". The live session
   now returns to its last committed boundary and the drained injected content
-  goes back to the front of the queue.
+  goes back to the front of the queue. The rollback happens only when the
+  protected store proves the checkpoint absent: an error alone does not (a
+  commit can land and lose its acknowledgement). A native writer proves it
+  through its renewed, unchanged head; a legacy store is read back, and a
+  read-back holding the checkpoint resolves the save as accepted. When the
+  outcome stays unknown the input is kept and the session's persistence is
+  fenced: every later save from that live session fails with a conflict, and
+  a reopen recovers whichever boundary the protected store holds. The input
+  and drained injections are staged outside live history until the
+  acceptance checkpoint commits, so an ordinary save racing that commit
+  (`persist`, `shutdown`, background saves) publishes only the last committed
+  boundary and never waits on it.
 
 ## [0.8.0] - 2026-10-20
 
