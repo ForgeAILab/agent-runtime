@@ -487,6 +487,21 @@ where
         .clone();
     let second_head = fixture.journal.commit(&writer, second).await.unwrap();
 
+    let head_object = JournalObject::encode(JournalObjectKind::Head, &first_head).unwrap();
+    let bytes = fixture
+        .journal
+        .read(&pinned, &head_object.id)
+        .await
+        .expect("a pinned closure must include its head object");
+    assert_eq!(
+        JournalObject {
+            id: head_object.id,
+            bytes
+        }
+        .decode::<JournalHead>(JournalObjectKind::Head)
+        .unwrap(),
+        first_head
+    );
     assert!(
         fixture
             .journal
@@ -1640,7 +1655,7 @@ where
     let _ = head;
 }
 
-async fn open_writer(
+pub(super) async fn open_writer(
     journal: &dyn SessionJournal,
     session: &SessionId,
     expected: Option<JournalRevision>,
@@ -1655,7 +1670,7 @@ async fn open_writer(
         .unwrap()
 }
 
-async fn open_reader(
+pub(super) async fn open_reader(
     journal: &dyn SessionJournal,
     session: &SessionId,
     expected: Option<JournalRevision>,
@@ -1686,7 +1701,11 @@ fn writer_open(expected: Option<JournalRevision>, operation: &str, pin: &str) ->
     }
 }
 
-fn basic_snapshot(session: SessionId, body: &str, updated: Timestamp) -> SessionSnapshot {
+pub(super) fn basic_snapshot(
+    session: SessionId,
+    body: &str,
+    updated: Timestamp,
+) -> SessionSnapshot {
     SessionSnapshot {
         id: session,
         history: vec![Message::user(body)],
@@ -1713,7 +1732,7 @@ fn bootstrap_commit(
     (commit, message)
 }
 
-fn bootstrap_from_snapshot(
+pub(super) fn bootstrap_from_snapshot(
     snapshot: SessionSnapshot,
     writer_epoch: u64,
     operation: &str,
@@ -1777,7 +1796,7 @@ fn bootstrap_from_snapshot(
     (commit, ids)
 }
 
-fn append_commit(
+pub(super) fn append_commit(
     session: SessionId,
     writer_epoch: u64,
     current: &JournalHead,
@@ -1890,7 +1909,7 @@ fn append_from_snapshot(
     commit
 }
 
-fn checkpoint_commit(
+pub(super) fn checkpoint_commit(
     session: SessionId,
     writer_epoch: u64,
     current: Option<&JournalHead>,

@@ -246,8 +246,8 @@ pub async fn assert_chunked_journal_recovery() {
                 import(&pair, &checkpoint).await;
                 assert_eq!(
                     pair.legacy.load(Ordering::SeqCst),
-                    loads + 2,
-                    "open reads each configured legacy store once, even with native heads"
+                    loads,
+                    "native heads skip both configured legacy stores"
                 );
                 assert_eq!(
                     (pair.ordinary.counted(), pair.exact.counted()),

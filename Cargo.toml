@@ -13,6 +13,7 @@ members = [
     "crates/agent-runtime-agent-cli",
     "crates/agent-runtime-cli",
     "crates/agent-runtime-testkit",
+    "crates/agent-runtime-journal-bench",
 ]
 
 [workspace.package]

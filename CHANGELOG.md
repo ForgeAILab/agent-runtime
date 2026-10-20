@@ -7,8 +7,46 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Breaking
+
+- After collection, journal replays older than 64 revisions can return
+  `StateConflict` instead of the original result. Collection preserves the
+  inclusive `current_revision - 64` boundary and the current writer epoch's
+  last operation. A pruned operation never applies again.
+
 ### Added
 
+- A storage-generic session-journal engine. Every session write, including
+  control writes, checks a revision/writer-epoch/control-generation fence to
+  prevent stale writes from losing pins, retirement grants or dependency
+  candidates. `JournalEngine<S>` runs commit,
+  projection, validation, lease, retirement and collection semantics over any
+  `JournalStorage`, which supplies atomic transactions, fences and object
+  membership. `JournalEngineConfig` controls collection and the bounded memo.
+  `InMemorySessionJournal` now wraps this engine over `VolatileJournalStorage`
+  with its existing API. Storage receives each write's new objects as one
+  batch so a host can compress and seal them together.
+- A bounded validated-root memo lets new writers reuse heads already validated
+  in the same engine, avoiding repeated closure reads across writer epochs.
+  `JournalReader::extension` reads one opaque extension in O(log n) objects;
+  structured runtime cache state remains subject to the reader's JSON limits.
+- `JournalApplyReceipt` reports the body count and encoded bytes physically
+  deleted by `JournalStorage::apply`, within the declared
+  `JournalBodySharing::{Global, PerSession}` scope. The additive
+  `JournalStorage::sharing()` defaults to `Global` to preserve existing
+  adapters; `VolatileJournalStorage::new(sharing)` selects either mode.
+  Per-session copies need no cross-session body index. Sealed packs
+  may defer deletion below a 25% dead-byte threshold while reads stop
+  immediately; receipts count bytes when a rewrite physically removes them.
+  Collection now sweeps dirty sessions incrementally.
+  Deferred adapters can supply `JournalStorage::retained_bytes(domain)` so
+  `JournalEngine::retained_bytes` includes unserved bytes until physical removal;
+  its default keeps the existing live-membership diagnostic.
+- Testkit `conformance::journal_storage::assert_journal_storage_conformance`
+  checks storage transactions, restart recovery and the protected, ordinary and
+  collection engine suites. `JournalCollectionHost` is implemented for
+  `JournalEngine<S>`; broken storages verify named failure cases, including
+  premature shared deletion and serving released bodies in both sharing modes.
 - Optional Anthropic thinking block-binding controls through
   `AnthropicConfig::with_thinking_block_binding`, with `error` or `drop_block`
   prefix-mismatch behavior for explicit adaptive or budget thinking. The
@@ -72,6 +110,9 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Changed
 
+- Opening a session whose ordinary and protected journals both have native
+  heads skips legacy v3 loads. Absent native heads and supported partial-import
+  repair still load the legacy records when needed.
 - **Breaking (pre-1.0):** `ChildTaskResult` gains `reply: Option<Box<ArtifactRef>>`
   and `DelegationConfig` gains `delivery_inline_bytes`. Struct literals must
   set them; `ChildTaskResult::reply` deserializes as `None` from older state.

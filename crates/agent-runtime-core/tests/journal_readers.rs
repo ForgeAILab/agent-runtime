@@ -676,3 +676,262 @@ async fn host_limits_height_and_json_depth_reject_hostile_input_without_reading_
     assert_conflict(read_snapshot_json(&vec![b'['; 200_000]).unwrap_err());
     assert_conflict(read_checkpoint_json(&vec![b'['; 200_000]).unwrap_err());
 }
+
+fn extension_probe(namespaces: usize) -> (ReadFixture, SessionSnapshot) {
+    let mut snapshot = fixture::snapshot();
+    snapshot.history = (0..4000)
+        .map(|i| Message::user(format!("message-{i}")))
+        .collect();
+    snapshot.extension_state = (0..namespaces)
+        .map(|i| {
+            (
+                format!("namespace.{i:05}"),
+                VersionedSessionState::new(
+                    RegistryRevision::new("opaque-v1"),
+                    serde_json::json!({"value":i, "negative_zero":-0.0}),
+                ),
+            )
+        })
+        .collect();
+    let checkpoint = TurnCheckpoint::accepted(
+        TurnId::new("probe"),
+        UserInput::text("message-3999"),
+        snapshot.clone(),
+        3999,
+        accepted().deadline,
+        1,
+        9,
+        Timestamp(100),
+    )
+    .unwrap();
+    let mut fixture = ReadFixture::checkpoint(&checkpoint);
+    // An extension probe has no reason to fetch any of these other closures.
+    let batch = fixture.head.batch.clone();
+    fixture.objects.retain(|id, bytes| {
+        id == &batch
+            || matches!(
+                (JournalObject {
+                    id: id.clone(),
+                    bytes: bytes.clone()
+                })
+                .kind()
+                .unwrap(),
+                JournalObjectKind::Map | JournalObjectKind::Extension
+            )
+    });
+    add_probe_head(&mut fixture);
+    (fixture, snapshot)
+}
+
+fn add_probe_head(fixture: &mut ReadFixture) {
+    let head = JournalObject::encode(JournalObjectKind::Head, &fixture.head).unwrap();
+    fixture.objects.insert(head.id, head.bytes);
+}
+
+#[tokio::test]
+async fn single_extension_reads_only_head_batch_map_path_and_value_at_10_and_10000_namespaces() {
+    use std::sync::atomic::Ordering;
+    for namespaces in [10, 10_000] {
+        let (fixture, snapshot) = extension_probe(namespaces);
+        let lease = fixture.lease();
+        let levels = fixture.head.snapshot.extensions.height as usize + 1;
+        let expected_reads = 1 + 1 + levels + 1;
+        for index in [0, namespaces / 2, namespaces - 1] {
+            fixture.reads.store(0, Ordering::Relaxed);
+            let namespace = format!("namespace.{index:05}");
+            let mut reader = JournalReader::new(&fixture, &lease, LIMITS).unwrap();
+            let value = reader.extension(&namespace).await.unwrap().unwrap();
+            assert_eq!(value, snapshot.extension_state[&namespace]);
+            assert_eq!(value.sensitivity, SessionStateSensitivity::Sensitive);
+            assert_eq!(
+                value.value["negative_zero"].as_f64().unwrap().to_bits(),
+                (-0.0f64).to_bits()
+            );
+            assert_eq!(fixture.reads.load(Ordering::Relaxed), expected_reads);
+        }
+        for namespace in ["before", "namespace.00000x", "zzzz"] {
+            fixture.reads.store(0, Ordering::Relaxed);
+            let mut reader = JournalReader::new(&fixture, &lease, LIMITS).unwrap();
+            assert_eq!(reader.extension(namespace).await.unwrap(), None);
+            assert!(fixture.reads.load(Ordering::Relaxed) < expected_reads);
+        }
+        eprintln!(
+            "R6 namespaces={namespaces}, history=4000: head=1 + batch=1 + map levels={levels} + value=1 = {expected_reads} reads; unrelated closures absent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn single_extension_obeys_limits_and_rejects_bad_map_separators() {
+    use std::sync::atomic::Ordering;
+    let (fixture, _) = extension_probe(10);
+    let lease = fixture.lease();
+    for (limits, reads) in [
+        (
+            JournalReadLimits {
+                objects: 0,
+                ..LIMITS
+            },
+            0,
+        ),
+        (
+            JournalReadLimits {
+                objects: 3,
+                ..LIMITS
+            },
+            3,
+        ),
+        (
+            JournalReadLimits {
+                encoded_bytes: 1,
+                ..LIMITS
+            },
+            1,
+        ),
+        (
+            JournalReadLimits {
+                entries: 9,
+                ..LIMITS
+            },
+            2,
+        ),
+    ] {
+        fixture.reads.store(0, Ordering::Relaxed);
+        let mut reader = JournalReader::new(&fixture, &lease, limits).unwrap();
+        assert_conflict(reader.extension("namespace.00005").await.unwrap_err());
+        assert_eq!(fixture.reads.load(Ordering::Relaxed), reads);
+    }
+    let (empty, _) = extension_probe(0);
+    let lease = empty.lease();
+    assert_eq!(
+        JournalReader::new(&empty, &lease, LIMITS)
+            .unwrap()
+            .extension("missing")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(empty.reads.load(Ordering::Relaxed), 2);
+    let absent = JournalLease::new(
+        empty.storage_id(),
+        empty.head.session.clone(),
+        None,
+        None,
+        std::sync::Arc::new(42u64),
+    );
+    empty.reads.store(0, Ordering::Relaxed);
+    assert_eq!(
+        JournalReader::new(&empty, &absent, LIMITS)
+            .unwrap()
+            .extension("missing")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(empty.reads.load(Ordering::Relaxed), 0);
+    let (mut malformed, _) = extension_probe(130);
+    let root = malformed.head.snapshot.extensions.root.clone().unwrap();
+    let mut node: JournalMapNode = malformed
+        .object(&root)
+        .decode(JournalObjectKind::Map)
+        .unwrap();
+    let JournalMapNode::Branch { children } = &mut node else {
+        panic!("expected branch");
+    };
+    children[1].first_key = children[0].first_key.clone();
+    malformed.head.snapshot.extensions.root =
+        Some(malformed.replace(JournalObjectKind::Map, &node));
+    malformed.repair_batch_refs();
+    add_probe_head(&mut malformed);
+    let lease = malformed.lease();
+    assert_conflict(
+        JournalReader::new(&malformed, &lease, LIMITS)
+            .unwrap()
+            .extension("namespace.00090")
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(malformed.reads.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn single_extension_materializes_the_documented_structured_namespace() {
+    use std::sync::atomic::Ordering;
+    let state = VersionedSessionState {
+        revision: RegistryRevision::new("structured-v1"),
+        sensitivity: SessionStateSensitivity::RedactionSafe,
+        value: serde_json::json!({"cached":[1,2]}),
+    };
+    let mut fixture = ReadFixture::snapshot(&fixture::snapshot());
+    let value = fixture.replace(
+        JournalObjectKind::JsonInline,
+        &JournalJsonInline(serde_json::to_value(&state).unwrap()),
+    );
+    let reference = fixture.replace(
+        JournalObjectKind::ExtensionReference,
+        &ReferencedSessionState { value },
+    );
+    let map = fixture.replace(
+        JournalObjectKind::Map,
+        &JournalMapNode::Leaf {
+            entries: vec![JournalMapEntry {
+                key: RUNTIME_PREVIOUS_CACHE_NAMESPACE.into(),
+                value: reference.clone(),
+            }],
+        },
+    );
+    fixture.head.snapshot.extensions = JournalMap {
+        root: Some(map),
+        len: 1,
+        height: 0,
+    };
+    fixture.repair_batch_refs();
+    add_probe_head(&mut fixture);
+    let lease = fixture.lease();
+    assert_eq!(
+        JournalReader::new(&fixture, &lease, LIMITS)
+            .unwrap()
+            .extension(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+            .await
+            .unwrap(),
+        Some(state)
+    );
+    assert_eq!(fixture.reads.load(Ordering::Relaxed), 5);
+    fixture.reads.store(0, Ordering::Relaxed);
+    assert_conflict(
+        JournalReader::new(
+            &fixture,
+            &lease,
+            JournalReadLimits {
+                objects: 4,
+                ..LIMITS
+            },
+        )
+        .unwrap()
+        .extension(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(fixture.reads.load(Ordering::Relaxed), 4);
+    // Structured objects in arbitrary opaque namespaces are rejected.
+    let map = fixture.replace(
+        JournalObjectKind::Map,
+        &JournalMapNode::Leaf {
+            entries: vec![JournalMapEntry {
+                key: "host.structured".into(),
+                value: reference,
+            }],
+        },
+    );
+    fixture.head.snapshot.extensions.root = Some(map);
+    fixture.repair_batch_refs();
+    add_probe_head(&mut fixture);
+    let lease = fixture.lease();
+    assert_conflict(
+        JournalReader::new(&fixture, &lease, LIMITS)
+            .unwrap()
+            .extension("host.structured")
+            .await
+            .unwrap_err(),
+    );
+}

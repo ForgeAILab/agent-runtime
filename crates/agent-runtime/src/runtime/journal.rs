@@ -228,7 +228,8 @@ impl SessionPersistence {
 
     /// Discovers native capabilities and fixes this session's mode. A fully
     /// capable pair acquires its create/import writer reservations before it
-    /// loads the legacy records exactly once. A resumable v3 pair is imported
+    /// loads legacy records once only for absent native heads or a supported
+    /// partial-import repair. A resumable v3 pair is imported
     /// only when both configured policy stores expose native journals.
     /// Ephemeral callers pass no stores and therefore perform no discovery.
     pub(crate) async fn open(
@@ -315,13 +316,31 @@ impl SessionPersistence {
             None => None,
         };
 
-        let loaded = load_legacy_records(
-            &session,
-            explicit_id,
-            session_store.as_ref(),
-            checkpoint_store.as_ref(),
-        )
-        .await;
+        let protected_head = protected
+            .as_ref()
+            .is_some_and(|domain| domain.head.is_some());
+        let ordinary_head = ordinary
+            .as_ref()
+            .is_some_and(|domain| domain.head.is_some());
+        let native_exists = protected_head || ordinary_head;
+        let can_import = import_legacy
+            && session_store.is_some()
+            && checkpoint_store.is_some()
+            && ordinary.is_some()
+            && protected.is_some();
+        // Native heads are authoritative. The only headed case that can use
+        // v3 is the supported exact-first, ordinary-missing import repair.
+        let loaded = if !native_exists || (can_import && protected_head && !ordinary_head) {
+            load_legacy_records(
+                &session,
+                explicit_id,
+                session_store.as_ref(),
+                checkpoint_store.as_ref(),
+            )
+            .await
+        } else {
+            Ok((None, None))
+        };
         let (legacy_snapshot, legacy_checkpoint) = match loaded {
             Ok(records) => records,
             Err(error) => {
@@ -329,19 +348,7 @@ impl SessionPersistence {
                 return Err(error);
             }
         };
-
-        let native_exists = protected
-            .as_ref()
-            .is_some_and(|domain| domain.head.is_some())
-            || ordinary
-                .as_ref()
-                .is_some_and(|domain| domain.head.is_some());
         let legacy_exists = legacy_snapshot.is_some() || legacy_checkpoint.is_some();
-        let can_import = import_legacy
-            && session_store.is_some()
-            && checkpoint_store.is_some()
-            && ordinary.is_some()
-            && protected.is_some();
         if !native_exists && legacy_exists {
             if !can_import {
                 close_import_domains(&mut ordinary, &mut protected).await?;
