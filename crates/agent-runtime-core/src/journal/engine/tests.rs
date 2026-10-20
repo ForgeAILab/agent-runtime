@@ -1578,3 +1578,92 @@ async fn collection_evicts_released_history_and_trims_released_cache_bodies() {
     assert!(after.objects.len < before.objects.len);
     assert!(engine.memo.lock().unwrap().bytes < bytes);
 }
+
+#[tokio::test]
+async fn the_extension_reader_honours_engine_lease_checks_warm_and_cold() {
+    let limits = JournalReadLimits {
+        objects: u64::MAX,
+        encoded_bytes: u64::MAX,
+        entries: u64::MAX,
+    };
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let engine = JournalEngine::protected(
+            Arc::new(VolatileJournalStorage::default()),
+            JournalStorageId::new("extension"),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("extension");
+        let mut known = BTreeSet::new();
+        let lease = engine.open(&session, writer("one")).await.unwrap();
+        let first = engine
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        let old = engine.open(&session, reader("old")).await.unwrap();
+        engine
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        // A pinned older lease keeps its own view, equal to the full reader's.
+        let value = JournalReader::new(&engine, &old, limits)
+            .unwrap()
+            .extension("review.toggle")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.value, serde_json::json!({ "value": "a" }));
+        let full = JournalReader::new(&engine, &old, limits)
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.extension_state["review.toggle"], value);
+        let renewed = engine.renew(&lease).await.unwrap();
+        let mut current = JournalReader::new(&engine, &renewed, limits).unwrap();
+        assert_eq!(
+            current
+                .extension("review.toggle")
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            serde_json::json!({ "value": "b" })
+        );
+        assert!(current.extension("review.absent").await.unwrap().is_none());
+        // A revoked writer lease reads nothing, through any reader method.
+        engine.revoke_writer(&session).unwrap();
+        assert!(
+            JournalReader::new(&engine, &renewed, limits)
+                .unwrap()
+                .extension("review.toggle")
+                .await
+                .is_err(),
+            "budget {budget}: a revoked lease read an extension"
+        );
+        engine.close(old).await.unwrap();
+    }
+}
