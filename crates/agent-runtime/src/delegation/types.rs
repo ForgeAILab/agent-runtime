@@ -601,6 +601,9 @@ pub struct ChildStatus {
     /// Cumulative provider tokens attributed to this child.
     pub tokens_used: u64,
     /// The latest completed task's final visible answer, if any.
+    /// Remains available while a follow-up is running; it does not imply that
+    /// the current task has completed. Inspect [`Self::state`] or await
+    /// [`DelegationCoordinator::wait_task_outcome`] for that boundary.
     pub last_result: Option<String>,
     /// Parent-owned artifact references returned with the latest completed
     /// task.

@@ -68,6 +68,10 @@ impl Drop for ParentCapacityReservation {
 impl DelegationCoordinator {
     /// Sends a follow-up task to an existing child under its original
     /// specification and limits.
+    ///
+    /// Success means the new task was accepted. Use [`Self::wait_task_outcome`]
+    /// to await its typed completion; [`Self::wait`] can time out with a
+    /// running snapshot that still contains the previous task's result.
     pub async fn follow_up(&self, child: &ChildId, input: UserInput) -> Result<(), RuntimeError> {
         self.check_depth()?;
         self.authorize(
@@ -283,6 +287,11 @@ impl DelegationCoordinator {
     /// terminal) and returns its snapshot. The default wait is bounded at five
     /// seconds; a timeout returns the current running projection and never
     /// cancels the child.
+    ///
+    /// `Ok` alone does not imply completion: inspect [`ChildStatus::state`].
+    /// While running a follow-up, [`ChildStatus::last_result`] still describes
+    /// the previous completed task. Use [`Self::wait_task_outcome`] when a
+    /// typed task outcome is required instead of a bounded snapshot.
     pub async fn wait(&self, child: &ChildId) -> Result<ChildStatus, RuntimeError> {
         self.wait_with_options(child, DelegationWaitOptions::default())
             .await
