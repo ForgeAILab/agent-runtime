@@ -32,7 +32,7 @@ use std::time::Duration;
 use async_stream::stream;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use agent_runtime_core::clock::{Deadline, SystemClock};
@@ -57,6 +57,19 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// capabilities name one. The Messages API requires `max_tokens`.
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
+/// The beta required for thinking block-binding controls.
+const THINKING_BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// How to handle a thinking block bound to a different conversation prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingBlockBinding {
+    /// Reject the request when a thinking block's conversation prefix differs.
+    Error,
+    /// Drop a thinking block whose conversation prefix differs.
+    DropBlock,
+}
+
 /// Configuration for an [`AnthropicProvider`].
 pub struct AnthropicConfig {
     /// The API base URL (e.g. `https://api.anthropic.com/v1`).
@@ -68,7 +81,10 @@ pub struct AnthropicConfig {
     /// The API key, sent as `x-api-key` when present.
     pub api_key: Option<Secret>,
     /// Additional headers to send with every request (e.g. beta flags).
+    /// Beta values are merged into one header, preserving first-seen order.
     pub extra_headers: Vec<(String, String)>,
+    /// Optional prefix-mismatch behavior, applied only when thinking is configured.
+    pub thinking_block_binding: Option<ThinkingBlockBinding>,
 }
 
 impl fmt::Debug for AnthropicConfig {
@@ -87,6 +103,7 @@ impl fmt::Debug for AnthropicConfig {
             .field("capabilities", &self.capabilities)
             .field("api_key_configured", &self.api_key.is_some())
             .field("extra_header_names", &header_names)
+            .field("thinking_block_binding", &self.thinking_block_binding)
             .finish()
     }
 }
@@ -107,6 +124,7 @@ impl AnthropicConfig {
             },
             api_key: None,
             extra_headers: Vec::new(),
+            thinking_block_binding: None,
         }
     }
 
@@ -128,12 +146,21 @@ impl AnthropicConfig {
         self
     }
 
-    /// Adds standard interleaved-thinking and fine-grained tool streaming beta headers.
+    /// Adds the standard interleaved-thinking and fine-grained tool streaming betas.
     pub fn with_interleaved_thinking(self) -> Self {
         self.with_extra_header(
             "anthropic-beta",
             "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
         )
+    }
+
+    /// Sets the thinking block prefix-mismatch behavior.
+    ///
+    /// Adds the block-binding control and its beta only to requests with an
+    /// explicit reasoning effort or token budget. The default is unset.
+    pub fn with_thinking_block_binding(mut self, behavior: ThinkingBlockBinding) -> Self {
+        self.thinking_block_binding = Some(behavior);
+        self
     }
 
     /// Preset config for Anthropic (`https://api.anthropic.com/v1`).
@@ -527,7 +554,10 @@ impl<T: HttpTransport> AnthropicProvider<T> {
 
         let mut output_config = Map::new();
         if let Some(reasoning) = &request.reasoning {
-            if let Some(thinking) = thinking_config(reasoning, &mut output_config) {
+            if let Some(mut thinking) = thinking_config(reasoning, &mut output_config) {
+                if let Some(behavior) = self.config.thinking_block_binding {
+                    thinking["block_binding"] = json!({"prefix_mismatch_behavior": behavior});
+                }
                 obj.insert("thinking".into(), thinking);
             }
         }
@@ -1441,7 +1471,39 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
         if let Some(key) = &self.config.api_key {
             headers.push(("x-api-key".into(), key.expose().to_owned()));
         }
-        headers.extend(self.config.extra_headers.iter().cloned());
+        let mut beta_header_index = None;
+        let mut betas = Vec::new();
+        for (name, value) in &self.config.extra_headers {
+            if name.eq_ignore_ascii_case("anthropic-beta") {
+                if beta_header_index.is_none() {
+                    beta_header_index = Some(headers.len());
+                    headers.push((name.clone(), String::new()));
+                }
+                for beta in value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|beta| !beta.is_empty())
+                {
+                    if !betas.contains(&beta) {
+                        betas.push(beta);
+                    }
+                }
+            } else {
+                headers.push((name.clone(), value.clone()));
+            }
+        }
+        let binding_attached = self.config.thinking_block_binding.is_some()
+            && request.reasoning.as_ref().is_some_and(|reasoning| {
+                reasoning.effort.is_some() || reasoning.max_tokens.is_some()
+            });
+        if binding_attached && !betas.contains(&THINKING_BLOCK_BINDING_BETA) {
+            betas.push(THINKING_BLOCK_BINDING_BETA);
+        }
+        if let Some(index) = beta_header_index {
+            headers[index].1 = betas.join(",");
+        } else if !betas.is_empty() {
+            headers.push(("anthropic-beta".into(), betas.join(",")));
+        }
 
         let http = HttpRequest {
             url: format!("{}/messages", self.config.base_url.trim_end_matches('/')),
@@ -2161,6 +2223,14 @@ mod tests {
         request: ProviderRequest,
         config: AnthropicConfig,
     ) -> Result<Value, ProviderError> {
+        let recorded = sent_request_with_config(request, config).await?;
+        Ok(serde_json::from_slice(&recorded.body).expect("request body is JSON"))
+    }
+
+    async fn sent_request_with_config(
+        request: ProviderRequest,
+        config: AnthropicConfig,
+    ) -> Result<HttpRequest, ProviderError> {
         let provider = AnthropicProvider::new(ReplayTransport::new(vec![EMPTY_STREAM]), config);
         let events = collect(provider.stream(request, ctx()).await?).await;
         assert!(
@@ -2168,8 +2238,7 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ProviderStreamEvent::Error { .. }))
         );
-        let recorded = provider.transport().recorded();
-        Ok(serde_json::from_slice(&recorded.body).expect("request body is JSON"))
+        Ok(provider.transport().recorded())
     }
 
     #[tokio::test]
@@ -2511,6 +2580,240 @@ mod tests {
         assert_eq!(payload["thinking"]["type"], "enabled");
         assert_eq!(payload["thinking"]["budget_tokens"], 2048);
         assert!(payload.get("output_config").is_none());
+    }
+
+    #[tokio::test]
+    async fn unset_thinking_block_binding_preserves_request_bytes_and_headers() {
+        for (reasoning, expected_body) in [
+            (
+                ReasoningConfig {
+                    effort: Some("high".into()),
+                    max_tokens: None,
+                },
+                concat!(
+                    r#"{"max_tokens":4096,"messages":[{"content":"hi","role":"user"}],"model":"claude-test","#,
+                    r#""output_config":{"effort":"high"},"stream":true,"thinking":{"type":"adaptive"}}"#,
+                ),
+            ),
+            (
+                ReasoningConfig {
+                    effort: None,
+                    max_tokens: Some(2048),
+                },
+                concat!(
+                    r#"{"max_tokens":4096,"messages":[{"content":"hi","role":"user"}],"model":"claude-test","#,
+                    r#""stream":true,"thinking":{"budget_tokens":2048,"type":"enabled"}}"#,
+                ),
+            ),
+        ] {
+            for interleaved in [false, true] {
+                let mut config = AnthropicConfig::new("http://x/v1", "claude-test")
+                    .with_api_key(Secret::new("test-key"))
+                    .with_extra_header("x-before", "keep");
+                assert_eq!(config.thinking_block_binding, None);
+                let mut expected_headers: Vec<(String, String)> = vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("anthropic-version".into(), ANTHROPIC_VERSION.into()),
+                    ("x-api-key".into(), "test-key".into()),
+                    ("x-before".into(), "keep".into()),
+                ];
+                if interleaved {
+                    config = config.with_interleaved_thinking();
+                    expected_headers.push((
+                        "anthropic-beta".into(),
+                        concat!(
+                            "interleaved-thinking-2025-05-14,",
+                            "fine-grained-tool-streaming-2025-05-14",
+                        )
+                        .into(),
+                    ));
+                }
+                config = config.with_extra_header("x-after", "keep");
+                expected_headers.push(("x-after".into(), "keep".into()));
+                let mut request =
+                    ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
+                request.reasoning = Some(reasoning.clone());
+                let recorded = sent_request_with_config(request, config).await.unwrap();
+                assert_eq!(recorded.body.as_slice(), expected_body.as_bytes());
+                assert_eq!(recorded.headers, expected_headers);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_block_binding_is_attached_to_adaptive_and_budget_thinking() {
+        for (reasoning, expected_thinking, expected_output) in [
+            (
+                ReasoningConfig {
+                    effort: Some("high".into()),
+                    max_tokens: None,
+                },
+                json!({
+                    "type": "adaptive",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+                }),
+                Some(json!({"effort": "high"})),
+            ),
+            (
+                ReasoningConfig {
+                    effort: None,
+                    max_tokens: Some(2048),
+                },
+                json!({
+                    "type": "enabled",
+                    "budget_tokens": 2048,
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+                }),
+                None,
+            ),
+        ] {
+            for interleaved in [false, true] {
+                let mut config = AnthropicConfig::new("http://x/v1", "claude-test")
+                    .with_thinking_block_binding(ThinkingBlockBinding::DropBlock);
+                let expected_beta = if interleaved {
+                    config = config.with_interleaved_thinking();
+                    concat!(
+                        "interleaved-thinking-2025-05-14,",
+                        "fine-grained-tool-streaming-2025-05-14,",
+                        "thinking-binding-controls-2026-08-01",
+                    )
+                } else {
+                    THINKING_BLOCK_BINDING_BETA
+                };
+                let mut request =
+                    ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
+                request.reasoning = Some(reasoning.clone());
+                let recorded = sent_request_with_config(request, config).await.unwrap();
+                let payload: Value = serde_json::from_slice(&recorded.body).unwrap();
+                assert_eq!(payload["thinking"], expected_thinking);
+                assert_eq!(payload.get("output_config"), expected_output.as_ref());
+                assert_eq!(
+                    recorded.headers,
+                    vec![
+                        ("content-type".into(), "application/json".into()),
+                        ("anthropic-version".into(), ANTHROPIC_VERSION.into()),
+                        ("anthropic-beta".into(), expected_beta.into()),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_block_binding_without_thinking_changes_nothing() {
+        for reasoning in [
+            None,
+            Some(ReasoningConfig {
+                effort: None,
+                max_tokens: None,
+            }),
+        ] {
+            for behavior in [ThinkingBlockBinding::Error, ThinkingBlockBinding::DropBlock] {
+                let config = || {
+                    AnthropicConfig::new("http://x/v1", "claude-test")
+                        .with_interleaved_thinking()
+                        .with_extra_header("X-Request-Tag", "preserved")
+                };
+                let mut request =
+                    ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
+                request.reasoning = reasoning.clone();
+                let baseline = sent_request_with_config(request.clone(), config())
+                    .await
+                    .unwrap();
+                let recorded = sent_request_with_config(
+                    request,
+                    config().with_thinking_block_binding(behavior),
+                )
+                .await
+                .unwrap();
+                assert_eq!(recorded.body, baseline.body);
+                assert_eq!(recorded.headers, baseline.headers);
+                let payload: Value = serde_json::from_slice(&recorded.body).unwrap();
+                assert!(payload.get("thinking").is_none());
+                assert!(!recorded.headers.iter().any(|(_, value)| {
+                    value
+                        .split(',')
+                        .any(|beta| beta == THINKING_BLOCK_BINDING_BETA)
+                }));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_block_binding_error_serializes_as_error() {
+        assert_eq!(
+            serde_json::to_string(&ThinkingBlockBinding::Error).unwrap(),
+            r#""error""#
+        );
+        let mut request =
+            ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
+        request.reasoning = Some(ReasoningConfig {
+            effort: Some("high".into()),
+            max_tokens: None,
+        });
+        let payload = sent_payload_with_config(
+            request,
+            AnthropicConfig::new("http://x/v1", "claude-test")
+                .with_thinking_block_binding(ThinkingBlockBinding::Error),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            payload["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "error"
+        );
+    }
+
+    #[tokio::test]
+    async fn beta_headers_merge_case_insensitively_in_first_seen_order() {
+        for binding in [None, Some(ThinkingBlockBinding::DropBlock)] {
+            let mut config = AnthropicConfig::new("http://x/v1", "claude-test")
+                .with_extra_header("X-Before", "first")
+                .with_extra_header(
+                    "AnThRoPiC-BeTa",
+                    " host-beta, interleaved-thinking-2025-05-14,host-beta,, ",
+                )
+                .with_extra_header("X-Middle", "second")
+                .with_interleaved_thinking()
+                .with_extra_header(
+                    "ANTHROPIC-BETA",
+                    concat!(
+                        " fine-grained-tool-streaming-2025-05-14, second-beta, ",
+                        "thinking-binding-controls-2026-08-01,",
+                        "thinking-binding-controls-2026-08-01 ",
+                    ),
+                )
+                .with_extra_header("X-After", "third");
+            if let Some(behavior) = binding {
+                config = config.with_thinking_block_binding(behavior);
+            }
+            let mut request =
+                ProviderRequest::new(ModelId::new("claude-test"), vec![Message::user("hi")]);
+            request.reasoning = Some(ReasoningConfig {
+                effort: Some("high".into()),
+                max_tokens: None,
+            });
+            let recorded = sent_request_with_config(request, config).await.unwrap();
+            assert_eq!(
+                recorded.headers,
+                vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("anthropic-version".into(), ANTHROPIC_VERSION.into()),
+                    ("X-Before".into(), "first".into()),
+                    (
+                        "AnThRoPiC-BeTa".into(),
+                        concat!(
+                            "host-beta,interleaved-thinking-2025-05-14,",
+                            "fine-grained-tool-streaming-2025-05-14,second-beta,",
+                            "thinking-binding-controls-2026-08-01",
+                        )
+                        .into(),
+                    ),
+                    ("X-Middle".into(), "second".into()),
+                    ("X-After".into(), "third".into()),
+                ]
+            );
+        }
     }
 
     #[tokio::test]
