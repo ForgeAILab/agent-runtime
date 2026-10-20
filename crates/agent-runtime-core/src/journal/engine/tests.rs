@@ -1011,3 +1011,328 @@ async fn engine_future_sizes_stay_bounded() {
         assert!(size <= 16 * 1024, "{name} future is {size} bytes");
     }
 }
+
+#[tokio::test]
+async fn memoized_writer_open_renew_and_commit_read_no_storage_objects() {
+    use std::sync::atomic::Ordering;
+    for role in [JournalRole::Protected, JournalRole::Ordinary] {
+        let storage = Arc::new(LostAcknowledgement::default());
+        let engine = if role == JournalRole::Protected {
+            JournalEngine::protected(
+                storage.clone(),
+                JournalStorageId::new("memo"),
+                JournalEngineConfig {
+                    collection_enabled: true,
+                    ..Default::default()
+                },
+            )
+        } else {
+            JournalEngine::ordinary(
+                storage.clone(),
+                JournalStorageId::new("memo"),
+                Arc::new(IdentityJournalProjection),
+                JournalEngineConfig {
+                    collection_enabled: true,
+                    ..Default::default()
+                },
+            )
+        };
+        let session = SessionId::new("memo-session");
+        let first = engine.open(&session, writer("first")).await.unwrap();
+        let mut initial = empty_commit(&session, first.writer_epoch().unwrap());
+        let snapshot = initial.delta.bootstrap.as_mut().unwrap();
+        snapshot.history = (0..100)
+            .map(|i| crate::content::Message::user(format!("message {i}")))
+            .collect();
+        let mut assembler = ObjectAssembler::default();
+        initial.batch.snapshot = assembler.snapshot(snapshot, 0).unwrap();
+        let known: BTreeSet<_> = assembler.objects.keys().cloned().collect();
+        initial.objects = assembler
+            .objects
+            .into_iter()
+            .map(|(id, bytes)| JournalObject { id, bytes })
+            .collect();
+        initial.digest = initial.input_digest().unwrap();
+        let base = *initial.delta.bootstrap.clone().unwrap();
+        let head = engine.commit(&first, initial).await.unwrap();
+        let mut before_close = empty_commit(&session, first.writer_epoch().unwrap());
+        before_close.delta.bootstrap = Some(Box::new(base.clone()));
+        before_close.batch.snapshot = head.snapshot.clone();
+        before_close.batch.sequence = head.batch_sequence + 1;
+        before_close.batch.expected_revision = Some(head.revision);
+        before_close.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+        before_close.batch.operation = JournalOperationId::new("before-close");
+        before_close.digest = before_close.input_digest().unwrap();
+        let head = engine.commit(&first, before_close).await.unwrap();
+        engine.close(first).await.unwrap();
+        assert!(
+            engine
+                .collect(JournalGcRequest {
+                    storage_id: engine.storage_id(),
+                    expected_root_epoch: engine.root_epoch().unwrap(),
+                    max_objects: u64::MAX
+                })
+                .await
+                .unwrap()
+                .deleted
+                > 0
+        );
+        storage.calls.lock().unwrap().clear();
+        let validations = engine.local.full_validations.load(Ordering::Relaxed);
+        let second = engine.open(&session, writer("second")).await.unwrap();
+        assert_eq!(
+            storage
+                .calls
+                .lock()
+                .unwrap()
+                .get(&("objects", session.clone())),
+            None
+        );
+        assert_eq!(
+            engine.local.full_validations.load(Ordering::Relaxed),
+            validations
+        );
+        let mut reader = JournalReader::new(
+            &engine,
+            &second,
+            JournalReadLimits {
+                objects: u64::MAX,
+                encoded_bytes: u64::MAX,
+                entries: u64::MAX,
+            },
+        )
+        .unwrap();
+        assert_eq!(reader.snapshot().await.unwrap(), Some(base.clone()));
+        assert_eq!(
+            storage
+                .calls
+                .lock()
+                .unwrap()
+                .get(&("objects", session.clone())),
+            None,
+            "warm snapshot reloaded immutable bodies"
+        );
+        let renewed = engine.renew(&second).await.unwrap();
+        assert_eq!(
+            storage
+                .calls
+                .lock()
+                .unwrap()
+                .get(&("objects", session.clone())),
+            None
+        );
+        let mut next = empty_commit(&session, renewed.writer_epoch().unwrap());
+        let message = crate::content::Message::user("appended after writer change");
+        let mut snapshot = base;
+        snapshot.history.push(message.clone());
+        let mut assembler = ObjectAssembler::default();
+        next.batch.snapshot = assembler.snapshot(&snapshot, 0).unwrap();
+        next.objects = assembler
+            .objects
+            .into_iter()
+            .filter(|(id, _)| !known.contains(id))
+            .map(|(id, bytes)| JournalObject { id, bytes })
+            .collect();
+        next.batch.sequence = head.batch_sequence + 1;
+        next.batch.expected_revision = Some(head.revision);
+        next.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+        next.batch.operation = JournalOperationId::new("next");
+        next.delta.bootstrap = None;
+        next.delta.history_append = vec![message];
+        next.digest = next.input_digest().unwrap();
+        storage.calls.lock().unwrap().clear();
+        let result = engine.commit(&renewed, next).await.unwrap();
+        assert_eq!(
+            storage
+                .calls
+                .lock()
+                .unwrap()
+                .get(&("objects", session.clone())),
+            None
+        );
+        assert_eq!(
+            engine.local.full_validations.load(Ordering::Relaxed),
+            validations
+        );
+        assert_eq!(
+            result.snapshot,
+            ObjectAssembler::default().snapshot(&snapshot, 0).unwrap()
+        );
+        eprintln!(
+            "R4/N2 {role:?}: 100-message head; new writer open=0 object calls, renew=0, commit=0; full validations delta=0; commit calls={:?}",
+            storage.calls.lock().unwrap()
+        );
+        engine.close(renewed).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn memo_eviction_and_an_oversized_root_fall_back_to_one_full_validation() {
+    use std::sync::atomic::Ordering;
+    let storage = Arc::new(LostAcknowledgement::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("eviction"),
+        JournalEngineConfig::default(),
+    );
+    let a = SessionId::new("aaa");
+    let b = SessionId::new("bbb");
+    for session in [&a, &b] {
+        let lease = engine.open(session, writer("writer")).await.unwrap();
+        engine
+            .commit(&lease, empty_commit(session, lease.writer_epoch().unwrap()))
+            .await
+            .unwrap();
+        engine.close(lease).await.unwrap();
+        if session == &a {
+            let mut memo = engine.memo.lock().unwrap();
+            memo.budget = memo.bytes;
+        }
+    }
+    let root = engine.local.lock().unwrap().sessions[&a]
+        .current
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
+    assert!(engine.memoized_root(&a, &root).unwrap().is_none());
+    let before = engine.local.full_validations.load(Ordering::Relaxed);
+    storage.calls.lock().unwrap().clear();
+    let first = engine.open(&a, writer("after-eviction")).await.unwrap();
+    assert_eq!(
+        engine.local.full_validations.load(Ordering::Relaxed),
+        before + 1
+    );
+    assert!(storage.calls.lock().unwrap()[&("objects", a.clone())] > 0);
+    engine.close(first).await.unwrap();
+    storage.calls.lock().unwrap().clear();
+    let again = engine.open(&a, writer("memo-hit")).await.unwrap();
+    assert_eq!(
+        engine.local.full_validations.load(Ordering::Relaxed),
+        before + 1
+    );
+    assert_eq!(
+        storage.calls.lock().unwrap().get(&("objects", a.clone())),
+        None
+    );
+    engine.close(again).await.unwrap();
+    let cold = JournalEngine::protected(
+        storage.clone(),
+        engine.storage_id(),
+        JournalEngineConfig {
+            validated_root_memo_bytes: 0,
+            ..Default::default()
+        },
+    );
+    for index in 1..=2 {
+        let lease = cold
+            .open(&a, writer(&format!("disabled-{index}")))
+            .await
+            .unwrap();
+        assert_eq!(cold.local.full_validations.load(Ordering::Relaxed), index);
+        assert_eq!(cold.memo.lock().unwrap().bytes, 0);
+        cold.close(lease).await.unwrap();
+    }
+    eprintln!(
+        "R4 eviction: first reopen=1 full validation; memo-hit reopen=0; budget zero=1 per reopen"
+    );
+}
+
+#[test]
+fn memo_links_reuse_parsing_and_preserve_expected_kinds_and_missing_body_checks() {
+    let message = JournalObject::encode(
+        JournalObjectKind::Message,
+        &crate::content::Message::user("cached"),
+    )
+    .unwrap();
+    let sequence = JournalObject::encode(
+        JournalObjectKind::Sequence,
+        &JournalSequenceNode::Leaf {
+            items: vec![message.id.clone()],
+        },
+    )
+    .unwrap();
+    let mut objects = ObjectStore::from_map(
+        [
+            (message.id.clone(), message.bytes),
+            (sequence.id.clone(), sequence.bytes),
+        ]
+        .into(),
+    );
+    let expected = ExpectedObject::Sequence(ExpectedLeaf::Kind(JournalObjectKind::Message));
+    let closure = memoized_closure(&mut objects, &sequence.id, expected).unwrap();
+    assert_eq!(closure, [sequence.id.clone(), message.id.clone()].into());
+    let parsed = objects.links.clone();
+    assert_eq!(
+        memoized_closure(&mut objects, &sequence.id, expected).unwrap(),
+        closure
+    );
+    assert!(
+        Arc::ptr_eq(&parsed, &objects.links),
+        "unchanged links were parsed again"
+    );
+    assert!(
+        memoized_closure(
+            &mut objects,
+            &sequence.id,
+            ExpectedObject::Sequence(ExpectedLeaf::Kind(JournalObjectKind::UsageRecord))
+        )
+        .is_err()
+    );
+    let mut missing = objects.retain_cached(&[sequence.id.clone()].into());
+    assert!(memoized_closure(&mut missing, &sequence.id, expected).is_err());
+}
+
+#[tokio::test]
+async fn a_new_writer_keeps_only_the_selected_closure_in_its_body_and_link_memo() {
+    let storage = Arc::new(LostAcknowledgement::default());
+    let engine = JournalEngine::protected(
+        storage.clone(),
+        JournalStorageId::new("trim"),
+        JournalEngineConfig::default(),
+    );
+    let session = SessionId::new("trim");
+    let writer1 = engine.open(&session, writer("one")).await.unwrap();
+    let head = engine
+        .commit(&writer1, empty_commit(&session, 1))
+        .await
+        .unwrap();
+    let mut commit = empty_commit(&session, 1);
+    commit.batch.operation = JournalOperationId::new("two");
+    commit.batch.expected_revision = Some(head.revision);
+    commit.batch.sequence = head.batch_sequence + 1;
+    commit.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+    commit.digest = commit.input_digest().unwrap();
+    let head = engine.commit(&writer1, commit).await.unwrap();
+    let root = JournalObject::encode(JournalObjectKind::Head, &head)
+        .unwrap()
+        .id;
+    let before = engine.memoized_root(&session, &root).unwrap().unwrap();
+    assert!(before.objects.len > before.closure.len());
+    engine.close(writer1).await.unwrap();
+    let members = storage.members(&engine.domain, &session).await.unwrap();
+    storage.calls.lock().unwrap().clear();
+    let writer2 = engine.open(&session, writer("two")).await.unwrap();
+    let after = engine.memoized_root(&session, &root).unwrap().unwrap();
+    assert_eq!(after.objects.len, after.closure.len());
+    assert!(
+        after
+            .objects
+            .links
+            .keys()
+            .all(|id| after.closure.contains(id))
+    );
+    assert_eq!(
+        storage
+            .calls
+            .lock()
+            .unwrap()
+            .get(&("objects", session.clone())),
+        None
+    );
+    assert_eq!(
+        storage.members(&engine.domain, &session).await.unwrap(),
+        members
+    );
+    engine.close(writer2).await.unwrap();
+}

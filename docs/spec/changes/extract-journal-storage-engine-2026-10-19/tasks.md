@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:18:57Z
+updated_at: 2026-10-20T01:19:53Z
 ---
 
 # Tasks: Storage-generic journal engine and physical disk reduction
@@ -127,29 +127,37 @@ N5 requires retaining it. Regression and byte-count evidence is recorded in
   Verified in step 5: both domains keep revision −64, prune −65, and reject
   an identical pruned replay without changing the stored head, membership or
   root epoch. The unchanged replay-fence and storage/collection conformance
-  tests pass. D8.6 records the explicit inclusive-edge/last-operation owner
+  tests pass. Step 6 additionally verifies the packed adapter (repacking off,
+  on, and connection restart), including transactional pruning of operation
+  packs and preservation of the current writer epoch’s last operation. D8.6 records the explicit inclusive-edge/last-operation owner
   instruction; CHANGELOG has the owner-approved pre-1.0 Breaking entry.
 - [ ] 4.5 Gate: record native/L2 at N=4000 for B (and A, C). If B ≤ 2.0× and
   the owner did not require more (Q2), group 5 is skipped.
 
+4.5 final-source evidence: A/N=4000 plain/tool = 5.32000× / 5.21569× L2;
+B/N=4000 = 1.49096× / 1.62353×. C/N=1000/tool = 1.02174×;
+4,002 → 130 operation results after collection. C/N=4000 remains NOT MET: supplement exceeded the reserved measurement time. All 13 primary cases pass.
+Raw JSON: `/Volumes/Data/tmp/refactor/rt-e6/measurements.json`. B passes
+≤2.0× L2, so 5.1–5.4 are not built. B/tool misses only the optional 1.5× aim.
+
 ## 5. R7 format levers (gate: only if 4.5 fails or Q2 requires them)
 
-- [ ] 5.1 (not built: owner gated on L2, storage levers meet it) Journal schema 5 readers for chunked JSON leaves (F1), with frozen
+- [ ] 5.1 (not built: measured 4.5 B/N=4000 passes ≤2.0× L2) Journal schema 5 readers for chunked JSON leaves (F1), with frozen
   golden fixtures; schema-4 readers unchanged. Tests: core fixture and
   round-trip tests at chunk boundaries (63/64/65, 8 KiB ±1).
-- [ ] 5.2 F1 writer and engine assembler behind `JournalEngineConfig::format`;
+- [ ] 5.2 (not built: measured 4.5 B/N=4000 passes ≤2.0× L2) F1 writer and engine assembler behind `JournalEngineConfig::format`;
   v4 heads keep v4 writes. Tests: cold-encoding oracle and equivalence
   harness in both formats; prefix-identical arrays share chunks.
-- [ ] 5.3 F2 chunked history with virtual message ids for `history_chain`,
+- [ ] 5.3 (not built: measured 4.5 B/N=4000 passes ≤2.0× L2) F2 chunked history with virtual message ids for `history_chain`,
   and F3 minimum-height generic sequences. Tests: equivalence harness both
   formats; FromIndex fork cases; spine-sized histories.
-- [ ] 5.4 Explicit v4→v5 upgrade operation (one counted full replacement);
+- [ ] 5.4 (not built: measured 4.5 B/N=4000 passes ≤2.0× L2) Explicit v4→v5 upgrade operation (one counted full replacement);
   re-run the harness. Tests: upgrade of every task-2.6 checkpoint state
   materializes byte-identical schema-3 checkpoints.
 
 ## 6. R4–R6 (after 2.3; independent of groups 4–5)
 
-- [ ] 6.1 R4 validated-root memo (D5) replacing the writer-changed full
+- [x] 6.1 R4 validated-root memo (D5) replacing the writer-changed full
   validation. Tests: a new writer on an unchanged head performs zero full
   validations and zero object reads at open (counters); eviction falls back
   to one full validation; cold-encoding checks unchanged. Check
@@ -158,18 +166,31 @@ N5 requires retaining it. Regression and byte-count evidence is recorded in
   (`memory.rs` tests) first: if either asserts that a writer change on a
   validated head forces full validation, report it as the one intended
   expectation change before editing it.
-- [ ] 6.2 R5 native-first open (D6). Update the group-D tests that record
+  Step-6 verification: core, runtime and testkit all-feature suites pass;
+  packed adapter conformance and smoke pass. LRU key, 256 MiB default budget,
+  collection-aware trimming and N2 zero-object-read counters are recorded in D5
+  and `rt-e6/r4-core-final.log`. Neither named existing test required an
+  assertion change.
+- [x] 6.2 R5 native-first open (D6). Update the group-D tests that record
   legacy load counts to the lower counts and list each changed expectation
   in the task report. Tests: imported session reopened N times loads legacy
   zero times; partial-import repair still loads once.
-- [ ] 6.3 R6 `JournalReader::extension` (D7). Tests: read count is
+  Step-6 verification: the new runtime reopen/repair regression and the full
+  testkit suite pass. The sole existing assertion change is the shared consumer
+  recovery load count, `loads + 2` → `loads` (all three consumer fixtures).
+- [x] 6.3 R6 `JournalReader::extension` (D7). Tests: read count is
   head + batch + map height + 1 at 10 and 10,000 namespaces; Sensitive and
   missing namespaces; structured namespace rejected or materialized as
   documented.
 
+  Step-6 verification: all 12 reader tests and the complete core all-feature
+  suite pass. Opaque read counts are 4 / 6 at 10 / 10,000 namespaces with
+  4,000 messages; map height is counted in visited levels (D7). No existing
+  expectation changes and no storage trait changes.
+
 ## 7. Documentation and release notes
 
-- [ ] 7.1 Update `docs/development.md` (engine/storage split, storage
+- [x] 7.1 Update `docs/development.md` (engine/storage split, storage
   conformance, harness commands, measured tables) and the CHANGELOG
   `Unreleased` entries from design D12. Record final verification evidence in
   `design.md`.

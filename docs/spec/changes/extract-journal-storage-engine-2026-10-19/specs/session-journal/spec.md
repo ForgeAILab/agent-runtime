@@ -90,7 +90,7 @@ The engine SHALL memoize, per process and within a configured byte budget, each 
 #### Scenario: Probe a large session
 
 - **WHEN** a host reads the LCM component extension of a session with 4,000 messages and 10,000 extension namespaces
-- **THEN** the number of object reads is at most head + batch + map height + 1
+- **THEN** the number of object reads is at most head + batch + map height + 1 (height counted in map levels; a nonempty descriptor has `JournalMap.height + 1` levels)
 
 ### Requirement: Physical retained bytes are measured before they are reduced
 

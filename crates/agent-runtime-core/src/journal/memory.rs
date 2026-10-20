@@ -696,9 +696,8 @@ mod structured_json_tests {
         assert!(head.snapshot == ObjectAssembler::default().snapshot(&next, 0).unwrap());
     }
 
-    /// A writer change forces one full validation; the fast path must then be
-    /// re-seeded from that validated head instead of staying off for the rest
-    /// of the session.
+    /// A writer change reuses the validated head's memoized seed; subsequent
+    /// commits must keep the fast path seeded.
     #[tokio::test]
     async fn the_protected_fast_path_reseeds_after_a_writer_change() {
         let journal = InMemorySessionJournal::protected(JournalStorageId::new("reseed"));

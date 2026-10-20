@@ -43,6 +43,12 @@ where
     named("revision_fence", revision_fence(&factory)).await;
     named("writer_epoch_fence", writer_epoch_fence(&factory)).await;
     named("shared_body_last_membership", shared_body(&factory)).await;
+    named("replay_window_edges", replay_window_edges(&factory)).await;
+    named(
+        "replay_prune_last_writer_operation",
+        replay_prune_last_writer_operation(&factory),
+    )
+    .await;
     named("membership_isolation_and_receipts", membership(&factory)).await;
     named("dirty_session_paging", dirty_paging(&factory)).await;
     named(
@@ -840,6 +846,208 @@ where
     let absent =
         journal::open_reader(&*fresh, &SessionId::new("never-written"), None, "absent").await;
     assert!(absent.head().is_none());
+}
+
+async fn replay_window_edges<S, F, Fut>(factory: &F)
+where
+    S: JournalStorage,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<S>>,
+{
+    let storage = factory().await;
+    let session = SessionId::new("window");
+    for role in [JournalRole::Protected, JournalRole::Ordinary] {
+        let engine = if role == JournalRole::Protected {
+            protected(storage.clone(), true)
+        } else {
+            ordinary(storage.clone(), Arc::new(IdentityJournalProjection), true)
+        };
+        let d = domain(role);
+        let writer = journal::open_writer(&*engine, &session, None, "writer").await;
+        let mut previous = None;
+        let mut commits = Vec::new();
+        let mut heads = Vec::new();
+        let mut known = BTreeSet::new();
+        for revision in 1..=70 {
+            let snapshot = journal::basic_snapshot(
+                session.clone(),
+                "window body",
+                agent_runtime_core::clock::Timestamp(revision),
+            );
+            let (mut commit, _) = journal::bootstrap_from_snapshot(
+                snapshot,
+                writer.writer_epoch().unwrap(),
+                &format!("op-{revision}"),
+                None,
+            );
+            if let Some(head) = &previous {
+                let head: &JournalHead = head;
+                commit.batch.sequence = head.batch_sequence + 1;
+                commit.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+                commit.batch.expected_revision = Some(head.revision);
+                commit.digest = commit.input_digest().unwrap();
+            }
+            commit
+                .objects
+                .retain(|object| known.insert(object.id.clone()));
+            commit.digest = commit.input_digest().unwrap();
+            let head = engine.commit(&writer, commit.clone()).await.unwrap();
+            previous = Some(head.clone());
+            heads.push(head);
+            commits.push(commit);
+        }
+        assert!(
+            storage
+                .operation(&d, &session, &commits[4].batch.operation)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        engine
+            .collect(JournalGcRequest {
+                storage_id: engine.storage_id(),
+                expected_root_epoch: engine.root_epoch().unwrap(),
+                max_objects: u64::MAX,
+            })
+            .await
+            .unwrap();
+        let before = storage.load(&d, &session).await.unwrap();
+        let members = storage.members(&d, &session).await.unwrap();
+        let epoch = engine.root_epoch().unwrap();
+        for (index, commit) in commits.iter().enumerate() {
+            assert_eq!(
+                storage
+                    .operation(&d, &session, &commit.batch.operation)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                index + 1 >= 6
+            );
+        }
+        assert_eq!(
+            engine.commit(&writer, commits[5].clone()).await.unwrap(),
+            heads[5]
+        );
+        assert_conflict(
+            engine
+                .commit(&writer, commits[4].clone())
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            engine.commit(&writer, commits[69].clone()).await.unwrap(),
+            heads[69]
+        );
+        assert_eq!(storage.load(&d, &session).await.unwrap(), before);
+        assert_eq!(storage.members(&d, &session).await.unwrap(), members);
+        assert_eq!(engine.root_epoch().unwrap(), epoch);
+        // Hydration/restart must not resurrect pruned results from old packs.
+        engine.close(writer).await.unwrap();
+        let fresh = if role == JournalRole::Protected {
+            protected(storage.clone(), true)
+        } else {
+            ordinary(storage.clone(), Arc::new(IdentityJournalProjection), true)
+        };
+        let successor =
+            journal::open_writer(&*fresh, &session, Some(heads[69].revision), "successor").await;
+        assert!(
+            storage
+                .operation(&d, &session, &commits[4].batch.operation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fresh.commit(&successor, commits[5].clone()).await.unwrap(),
+            heads[5]
+        );
+        fresh.close(successor).await.unwrap();
+    }
+}
+
+async fn replay_prune_last_writer_operation<S, F, Fut>(factory: &F)
+where
+    S: JournalStorage,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<S>>,
+{
+    let storage = factory().await;
+    let first = raw_write("prune", "first", None);
+    storage.apply(first.clone()).await.unwrap();
+    let second = raw_write(
+        "prune",
+        "second",
+        Some(&first.operation.as_ref().unwrap().result),
+    );
+    storage.apply(second.clone()).await.unwrap();
+    let other = raw_write("other", "first", None);
+    storage.apply(other.clone()).await.unwrap();
+    let mut prune = edits(&second);
+    prune.prune_operations_before = Some(JournalRevision(100));
+    prune.inject = Some(JournalCommitFailurePoint::AfterIdempotency);
+    assert!(storage.apply(prune.clone()).await.is_err());
+    assert!(
+        storage
+            .operation(
+                &first.domain,
+                &first.session,
+                &first.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    prune.inject = None;
+    storage.apply(prune.clone()).await.unwrap();
+    assert!(
+        storage
+            .operation(
+                &first.domain,
+                &first.session,
+                &first.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .operation(
+                &second.domain,
+                &second.session,
+                &second.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap(),
+        second.operation
+    );
+    assert_eq!(
+        storage
+            .operation(
+                &other.domain,
+                &other.session,
+                &other.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap(),
+        other.operation
+    );
+    // A newer writer fence has no operation to exempt from the floor.
+    let mut record = second.record.clone().unwrap();
+    record.writer_epoch += 1;
+    prune.record = Some(record);
+    storage.apply(prune).await.unwrap();
+    assert!(
+        storage
+            .operation(
+                &second.domain,
+                &second.session,
+                &second.operation.as_ref().unwrap().operation
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 async fn shared_body<S, F, Fut>(factory: &F)

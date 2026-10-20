@@ -225,6 +225,7 @@ pub(in crate::journal) struct ObjectStore {
     pub(in crate::journal) layers: Vec<Arc<BTreeMap<JournalObjectId, Arc<Vec<u8>>>>>,
     pub(in crate::journal) len: usize,
     pub(in crate::journal) bytes: usize,
+    pub(in crate::journal) links: Arc<BTreeMap<JournalObjectId, Vec<CachedLinks>>>,
 }
 
 impl ObjectStore {
@@ -247,6 +248,7 @@ impl ObjectStore {
         self.len = entries.len();
         self.bytes = entries.values().map(|bytes| bytes.len()).sum();
         self.layers = vec![Arc::new(entries)];
+        self.links = Default::default();
     }
 
     pub(in crate::journal) fn get(&self, id: &JournalObjectId) -> Option<&Vec<u8>> {
@@ -276,18 +278,58 @@ impl ObjectStore {
     }
 
     pub(in crate::journal) fn from_map(objects: BTreeMap<JournalObjectId, Vec<u8>>) -> Self {
-        let bytes = objects.values().map(Vec::len).sum();
+        Self::from_shared(
+            objects
+                .into_iter()
+                .map(|(id, bytes)| (id, Arc::new(bytes)))
+                .collect(),
+        )
+    }
+
+    pub(super) fn from_shared(objects: BTreeMap<JournalObjectId, Arc<Vec<u8>>>) -> Self {
+        let bytes = objects.values().map(|bytes| bytes.len()).sum();
         let len = objects.len();
         Self {
-            layers: vec![Arc::new(
-                objects
-                    .into_iter()
-                    .map(|(id, bytes)| (id, Arc::new(bytes)))
-                    .collect(),
-            )],
+            layers: vec![Arc::new(objects)],
             len,
             bytes,
+            links: Default::default(),
         }
+    }
+    pub(super) fn link_bytes(&self) -> usize {
+        let id_bytes =
+            std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
+        self.links
+            .values()
+            .map(|variants| {
+                id_bytes
+                    + variants
+                        .iter()
+                        .map(|entry| {
+                            std::mem::size_of::<CachedLinks>()
+                                + entry.children.len().saturating_mul(
+                                    id_bytes + std::mem::size_of::<ExpectedObject>(),
+                                )
+                        })
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+    pub(super) fn retain_cached(&self, keep: &BTreeSet<JournalObjectId>) -> Self {
+        let mut next = Self::from_shared(
+            self.entries()
+                .into_iter()
+                .filter(|(id, _)| keep.contains(id))
+                .collect(),
+        );
+        next.links = Arc::new(
+            self.links
+                .iter()
+                .filter(|(id, _)| keep.contains(*id))
+                .map(|(id, links)| (id.clone(), links.clone()))
+                .collect(),
+        );
+        next
     }
 }
 
@@ -324,6 +366,8 @@ pub(in crate::journal) struct Transition {
     pub(in crate::journal) state: Arc<Mutex<State>>,
     pub(in crate::journal) failure: Arc<Mutex<Option<JournalCommitFailurePoint>>>,
     pub(in crate::journal) cut: Arc<Mutex<Option<JournalCommitFailurePoint>>>,
+    #[cfg(test)]
+    pub(super) full_validations: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for Transition {
@@ -350,6 +394,8 @@ impl Transition {
             state: Arc::new(Mutex::new(State::default())),
             failure: Arc::new(Mutex::new(None)),
             cut: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            full_validations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -585,6 +631,14 @@ impl Transition {
         state: &State,
         lease: &JournalLease,
     ) -> Result<LeaseRecord, RuntimeError> {
+        self.checked_lease(state, lease).cloned()
+    }
+
+    pub(in crate::journal) fn checked_lease<'a>(
+        &self,
+        state: &'a State,
+        lease: &JournalLease,
+    ) -> Result<&'a LeaseRecord, RuntimeError> {
         let token = self.token(lease)?;
         let record = state.leases.get(&token.handle).ok_or_else(conflict)?;
         if &record.session != lease.session() || record.writer_epoch != lease.writer_epoch() {
@@ -596,7 +650,7 @@ impl Transition {
                 return Err(conflict());
             }
         }
-        Ok(record.clone())
+        Ok(record)
     }
 
     pub(in crate::journal) fn validate_commit_request(
@@ -891,10 +945,20 @@ impl Transition {
 }
 
 impl Transition {
+    #[cfg(test)]
     pub(in crate::journal) fn open(
         &self,
         session: &SessionId,
         request: JournalOpen,
+    ) -> Result<JournalLease, RuntimeError> {
+        self.open_validated(session, request, None)
+    }
+
+    pub(in crate::journal) fn open_validated(
+        &self,
+        session: &SessionId,
+        request: JournalOpen,
+        validated: Option<ReachableSet>,
     ) -> Result<JournalLease, RuntimeError> {
         if self.storage_id.as_str().is_empty()
             || session.as_str().is_empty()
@@ -956,10 +1020,13 @@ impl Transition {
             }
         }
 
-        let mut reachable = BTreeSet::new();
-        if let Some(root) = &root {
-            reachable = reachable_closure(&state.objects, root, None, None)?;
-        }
+        let reachable = match (root.as_ref(), validated) {
+            (Some(_), Some(closure)) => closure,
+            (Some(root), None) => {
+                ReachableSet::from_set(reachable_closure(&state.objects, root, None, None)?)
+            }
+            (None, _) => ReachableSet::default(),
+        };
         let dependencies = root
             .as_ref()
             .map(|root| {
@@ -999,7 +1066,7 @@ impl Transition {
                 pin: request.pin,
                 selected_head: selected_head.clone(),
                 writer_epoch,
-                reachable: ReachableSet::from_set(reachable),
+                reachable,
                 roots: ReachableSet::from_set(root.into_iter().collect()),
                 staged_roots: BTreeSet::new(),
                 dependencies,
@@ -1064,15 +1131,11 @@ impl Transition {
         let mut staged = state.clone();
         staged.objects.begin_layer();
         let mut admitted = BTreeSet::new();
-        let protected_writer_changed = self.role == JournalRole::Protected
-            && current_session
-                .current
-                .as_ref()
-                .is_some_and(|(_, head)| head.writer_epoch != commit.batch.writer_epoch);
-        let unstructured_protected_seed = self.role == JournalRole::Protected
+        // A validated seed is immutable across writer fences. A memo miss is
+        // validated at open; an unreplayable advisory delta still falls back.
+        let full_protected_validation = self.role == JournalRole::Protected
             && current_session.protected_snapshot.is_none()
             && commit.delta.bootstrap.is_none();
-        let full_protected_validation = protected_writer_changed || unstructured_protected_seed;
         let prepared = if full_protected_validation {
             None
         } else {
@@ -1209,6 +1272,8 @@ impl Transition {
                 snapshot.clone(),
             )?;
         } else if self.role == JournalRole::Protected {
+            #[cfg(test)]
+            self.full_validations.fetch_add(1, Ordering::Relaxed);
             let snapshot = materialize_staged_snapshot(
                 &self.storage_id,
                 &head,

@@ -9,12 +9,24 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Breaking
 
-- Journal replays older than 64 revisions now return `StateConflict` instead
-  of the original result after collection. Collection preserves the current
-  writer epoch's last operation. A pruned operation never applies again.
+- After collection, journal replays older than 64 revisions can return
+  `StateConflict` instead of the original result. Collection preserves the
+  inclusive `current_revision - 64` boundary and the current writer epoch's
+  last operation. A pruned operation never applies again.
 
 ### Added
 
+- A storage-generic session-journal engine. `JournalEngine<S>` runs commit,
+  projection, validation, lease, retirement and collection semantics over any
+  `JournalStorage`, which supplies atomic transactions, fences and object
+  membership. `JournalEngineConfig` controls collection and the bounded memo.
+  `InMemorySessionJournal` now wraps this engine over `VolatileJournalStorage`
+  with its existing API. Storage receives each write's new objects as one
+  batch so a host can compress and seal them together.
+- A bounded validated-root memo lets new writers reuse heads already validated
+  in the same engine, avoiding repeated closure reads across writer epochs.
+  `JournalReader::extension` reads one opaque extension in O(log n) objects;
+  structured runtime cache state remains subject to the reader's JSON limits.
 - `JournalApplyReceipt` reports the body count and encoded bytes physically
   deleted by `JournalStorage::apply`, including shared-body last-membership
   accounting. Collection now sweeps dirty sessions incrementally.
@@ -72,6 +84,9 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Changed
 
+- Opening a session whose ordinary and protected journals both have native
+  heads skips legacy v3 loads. Absent native heads and supported partial-import
+  repair still load the legacy records when needed.
 - **Breaking (pre-1.0):** `ChildTaskResult` gains `reply: Option<Box<ArtifactRef>>`
   and `DelegationConfig` gains `delivery_inline_bytes`. Struct literals must
   set them; `ChildTaskResult::reply` deserializes as `None` from older state.

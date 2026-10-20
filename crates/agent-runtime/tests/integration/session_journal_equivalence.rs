@@ -6072,3 +6072,78 @@ fn task_2_6_unpublished_torn_tail_requires_fenced_trim() {
         .unwrap();
     println!("TASK 2.6 TORN-TAIL unpublished_cases=1 results=prior-head+fenced-trim");
 }
+
+#[tokio::test]
+async fn native_reopens_skip_legacy_and_partial_import_repair_loads_each_store_once() {
+    let fixture = legacy_import_fixtures().await.remove(0);
+    for partial in [false, true] {
+        let stores = ImportStores::new(
+            Some(fixture.snapshot.clone()),
+            Some(fixture.checkpoint.clone()),
+            identity,
+        );
+        if partial {
+            stores
+                .ordinary
+                .inner
+                .fail_next_commit_at(JournalCommitFailurePoint::AfterObjects)
+                .unwrap();
+            let failed = build(
+                (fixture.provider)(),
+                stores.clone(),
+                stores.clone(),
+                fixture.configure,
+            )
+            .start_session(
+                StartSession::resume(fixture.snapshot.id.clone())
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+            )
+            .await;
+            assert!(failed.is_err());
+            assert_eq!(stores.legacy_loads.load(Ordering::SeqCst), 2);
+            assert!(import_head_exists(&stores.protected, &fixture.snapshot.id).await);
+            assert!(!import_head_exists(&stores.ordinary, &fixture.snapshot.id).await);
+        }
+        let before = stores.legacy_loads.load(Ordering::SeqCst);
+        let imported = build(
+            (fixture.provider)(),
+            stores.clone(),
+            stores.clone(),
+            fixture.configure,
+        )
+        .start_session(
+            StartSession::resume(fixture.snapshot.id.clone())
+                .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stores.legacy_loads.load(Ordering::SeqCst) - before,
+            2,
+            "one pair load for import/repair"
+        );
+        imported.shutdown().await.unwrap();
+        let loaded = stores.legacy_loads.load(Ordering::SeqCst);
+        for _ in 0..5 {
+            let provider = (fixture.provider)();
+            let resumed = build(
+                provider.clone(),
+                stores.clone(),
+                stores.clone(),
+                fixture.configure,
+            )
+            .start_session(
+                StartSession::resume(fixture.snapshot.id.clone())
+                    .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+            )
+            .await
+            .unwrap();
+            assert!(provider.requests().is_empty());
+            resumed.shutdown().await.unwrap();
+            assert_eq!(stores.legacy_loads.load(Ordering::SeqCst), loaded);
+        }
+        eprintln!(
+            "R5 partial={partial}: import/repair=1 legacy pair load (2 store calls), 5 native reopens=0 legacy calls"
+        );
+    }
+}

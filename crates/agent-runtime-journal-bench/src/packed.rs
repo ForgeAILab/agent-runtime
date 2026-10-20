@@ -471,7 +471,7 @@ fn repack(
 
 // Binary-carry operation packs contain 2^tier complete original results.
 // Appending merges equal counts, so each operation is recompressed O(log N)
-// times. Keys/digests/results remain lossless; no replay pruning is performed.
+// times. Collection rewrites or drops packs below its inclusive replay floor.
 fn append_operation(
     tx: &Transaction<'_>,
     d: &JournalDomain,
@@ -506,6 +506,59 @@ fn append_operation(
         }
     }
     Err(conflict())
+}
+
+// Prune the durable payloads in the same fenced transaction as collection.
+// The RAM replay index is updated only after that transaction commits.
+fn prune_operations(
+    tx: &Transaction<'_>,
+    d: &JournalDomain,
+    s: &SessionId,
+    before: JournalRevision,
+) -> Result<BTreeSet<JournalOperationId>, RuntimeError> {
+    let epoch = load(tx, d, s)?.ok_or_else(conflict)?.writer_epoch;
+    let packs: Vec<(u32, Vec<metadata::Operation>)> = {
+        let mut st = tx
+            .prepare(
+                "SELECT tier,payload FROM operation_pack WHERE storage=? AND role=? AND session=?",
+            )
+            .map_err(failure)?;
+        st.query_map(params![d.storage_id.as_str(), role(d), s.as_str()], |r| {
+            Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(failure)?
+        .map(|row| {
+            let (tier, bytes) = row.map_err(failure)?;
+            Ok((tier, codec::decode(&bytes)?))
+        })
+        .collect::<Result<_, RuntimeError>>()?
+    };
+    let last = packs
+        .iter()
+        .flat_map(|(_, ops)| ops)
+        .filter(|op| op.3.writer_epoch == epoch)
+        .map(|op| op.2)
+        .max();
+    let mut removed = BTreeSet::new();
+    for (tier, mut ops) in packs {
+        ops.retain(|op| {
+            let keep = op.2 >= before || (op.3.writer_epoch == epoch && Some(op.2) == last);
+            if !keep {
+                removed.insert(op.0.clone());
+            }
+            keep
+        });
+        if ops.is_empty() {
+            tx.execute(
+                "DELETE FROM operation_pack WHERE storage=? AND role=? AND session=? AND tier=?",
+                params![d.storage_id.as_str(), role(d), s.as_str(), tier],
+            )
+            .map_err(failure)?;
+        } else {
+            tx.execute("UPDATE operation_pack SET payload=? WHERE storage=? AND role=? AND session=? AND tier=?", params![codec::encode(&ops)?, d.storage_id.as_str(), role(d), s.as_str(), tier]).map_err(failure)?;
+        }
+    }
+    Ok(removed)
 }
 
 #[async_trait]
@@ -834,10 +887,11 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 None => append_operation(&tx, d, s, op)?,
             }
         }
-        // S5 intentionally not implemented: reject an unsupported pruning request.
-        if write.prune_operations_before.is_some() {
-            return Err(conflict());
-        }
+        let pruned = write
+            .prune_operations_before
+            .map(|before| prune_operations(&tx, d, s, before))
+            .transpose()?
+            .unwrap_or_default();
         fail(&write, JournalCommitFailurePoint::AfterIdempotency)?;
         let mut touched = BTreeSet::new();
         for id in &write.release {
@@ -875,6 +929,14 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 ),
                 op.clone(),
             );
+        }
+        for operation in pruned {
+            state.operations.remove(&(
+                d.storage_id.as_str().to_owned(),
+                role(d),
+                s.as_str().to_owned(),
+                operation,
+            ));
         }
         fail(&write, JournalCommitFailurePoint::AfterCommit)?;
         Ok(receipt)

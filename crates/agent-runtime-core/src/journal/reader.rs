@@ -513,7 +513,7 @@ impl<'a> JournalReader<'a> {
         })
     }
 
-    async fn extension(
+    async fn extension_value(
         &mut self,
         namespace: &str,
         id: &JournalObjectId,
@@ -617,7 +617,7 @@ impl<'a> JournalReader<'a> {
         }
         let mut extension_state = BTreeMap::new();
         for entry in self.map(&roots.extensions).await? {
-            let value = self.extension(&entry.key, &entry.value).await?;
+            let value = self.extension_value(&entry.key, &entry.value).await?;
             extension_state.insert(entry.key, value);
         }
         Ok(SessionSnapshot {
@@ -702,6 +702,111 @@ impl<'a> JournalReader<'a> {
             return Err(conflict());
         }
         Ok(state)
+    }
+
+    /// Reads one extension of the pinned head, preserving its stored sensitivity.
+    ///
+    /// Opaque values need one head, one batch, one map node per level and one
+    /// value read. A nonempty map has `height + 1` levels (leaves have height
+    /// zero). History, usage, manifests and execution checkpoints are not read.
+    /// The structured `runtime.core.previous_cache` namespace is materialized
+    /// through its JSON tree and may need additional reads. All reader limits
+    /// apply; other structured extension namespaces conflict.
+    pub async fn extension(
+        &mut self,
+        namespace: &str,
+    ) -> Result<Option<VersionedSessionState>, RuntimeError> {
+        let Some(selected) = self.lease.head().cloned() else {
+            return Ok(None);
+        };
+        let root = JournalObject::encode(JournalObjectKind::Head, &selected)?.id;
+        let head: JournalHead = self.object(&root, JournalObjectKind::Head).await?;
+        if head != selected {
+            return Err(conflict());
+        }
+        self.batch(&head).await?;
+        let Some(value) = self.map_value(&head.snapshot.extensions, namespace).await? else {
+            return Ok(None);
+        };
+        self.extension_value(namespace, &value).await.map(Some)
+    }
+
+    async fn map_value(
+        &mut self,
+        map: &JournalMap,
+        namespace: &str,
+    ) -> Result<Option<JournalObjectId>, RuntimeError> {
+        validate_tree(map.root.as_ref(), map.len, map.height)?;
+        if map.len > self.limits.entries {
+            return Err(conflict());
+        }
+        let mut tree = map.clone();
+        let mut first: Option<String> = None;
+        let mut upper: Option<String> = None;
+        loop {
+            let Some(root) = &tree.root else {
+                return Ok(None);
+            };
+            let node: JournalMapNode = self.object(root, JournalObjectKind::Map).await?;
+            match node {
+                JournalMapNode::Leaf { entries } => {
+                    bounded(entries.len())?;
+                    if tree.height != 0
+                        || entries.len() as u64 != tree.len
+                        || first.as_ref().is_some_and(|key| key != &entries[0].key)
+                        || entries.iter().any(|entry| {
+                            entry.key.is_empty()
+                                || upper.as_ref().is_some_and(|key| &entry.key >= key)
+                        })
+                        || entries.windows(2).any(|pair| pair[0].key >= pair[1].key)
+                    {
+                        return Err(conflict());
+                    }
+                    return Ok(entries
+                        .binary_search_by(|entry| entry.key.as_str().cmp(namespace))
+                        .ok()
+                        .map(|index| entries[index].value.clone()));
+                }
+                JournalMapNode::Branch { children } => {
+                    bounded(children.len())?;
+                    if tree.height == 0
+                        || first
+                            .as_ref()
+                            .is_some_and(|key| key != &children[0].first_key)
+                    {
+                        return Err(conflict());
+                    }
+                    let mut len = 0u64;
+                    for (index, child) in children.iter().enumerate() {
+                        validate_tree(child.tree.root.as_ref(), child.tree.len, child.tree.height)?;
+                        if child.tree.len == 0
+                            || child.tree.height != tree.height - 1
+                            || child.first_key.is_empty()
+                            || upper.as_ref().is_some_and(|key| &child.first_key >= key)
+                            || (index > 0 && children[index - 1].first_key >= child.first_key)
+                        {
+                            return Err(conflict());
+                        }
+                        len = len.checked_add(child.tree.len).ok_or_else(conflict)?;
+                    }
+                    if len != tree.len {
+                        return Err(conflict());
+                    }
+                    let index =
+                        children.partition_point(|child| child.first_key.as_str() <= namespace);
+                    if index == 0 {
+                        return Ok(None);
+                    }
+                    let child = &children[index - 1];
+                    upper = children
+                        .get(index)
+                        .map(|next| next.first_key.clone())
+                        .or(upper);
+                    first = Some(child.first_key.clone());
+                    tree = child.tree.clone();
+                }
+            }
+        }
     }
 
     /// Materializes the selected stored view, preserving ordinary redaction.

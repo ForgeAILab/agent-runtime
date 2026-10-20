@@ -219,15 +219,30 @@ impl Measuring {
                 head.decode(JournalObjectKind::Head).unwrap(),
             );
         }
-        let traces = self.storage.traces.lock().unwrap();
-        let trace = &traces[&trace_key(&self.domain)];
-        // Export is bench-local inspection over the real storage contract.
+        let (candidates, commit_batches) = {
+            let traces = self.storage.traces.lock().unwrap();
+            let trace = &traces[&trace_key(&self.domain)];
+            (trace.operations.clone(), trace.batches.clone())
+        };
+        let mut operations = Vec::new();
+        for operation in candidates {
+            if self
+                .storage
+                .operation(&self.domain, session, &operation.operation)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                operations.push(operation);
+            }
+        }
+        // Inspect retained durable results, including real S5 pruning.
         JournalMeasurementExport {
             objects,
             heads,
-            operations: trace.operations.clone(),
-            operation_count: trace.operations.len(),
-            commit_batches: trace.batches.clone(),
+            operation_count: operations.len(),
+            operations,
+            commit_batches,
         }
     }
     async fn object_count(&self, session: &SessionId) -> usize {
@@ -574,16 +589,25 @@ async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'static
         capabilities.cache = true;
         capabilities.override_prompt_cache(PromptCacheControl::Implicit);
     }
-    let provider = Arc::new(FakeProvider::new(
-        "fake",
-        capabilities,
-        scripts(fixture, tools, turns),
-    ));
+    let mut scripted = scripts(fixture, tools, turns).into_iter();
     let id = SessionId::new(format!(
         "task-27-{}-{n}",
         if tools { "tool" } else { "plain" }
     ));
-    let make = || {
+    let mut make = || {
+        // C already builds a runtime per turn. Keep its unused fake-provider
+        // request/call diagnostics bounded to that turn too. Script events,
+        // model capabilities and the explicit cache endpoint remain identical.
+        let count = if fixture == "C" {
+            if tools { 2 } else { 1 }
+        } else {
+            scripted.len()
+        };
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            capabilities.clone(),
+            scripted.by_ref().take(count).collect(),
+        ));
         let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
             .provider(provider.clone())
             .model_profile(ResolvedModelProfile::explicit(

@@ -155,6 +155,7 @@ impl VolatileJournalStorage {
             layers,
             len: ids.len(),
             bytes,
+            links: Default::default(),
         })
     }
 }

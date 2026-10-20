@@ -126,16 +126,55 @@ from an opaque node or cursor supplied by a caller.
 
 ## Session journal reference backend and conformance
 
-`agent-runtime-core::journal::InMemorySessionJournal` is the volatile neutral
-reference implementation of `SessionJournal`. Construct protected stores with
-`InMemorySessionJournal::protected`; ordinary stores require an explicit
-`JournalProjectionPolicy` through `InMemorySessionJournal::ordinary`, and the
-projected values are encoded and hashed only after that policy succeeds. The U9
-design names no durable neutral file/database adapter: production hosts remain
-responsible for crash-safe framing, flushes and cross-process fencing.
+`agent-runtime-core::journal::JournalEngine<S>` owns journal semantics:
+commit and cold-root validation, projection, leases, writer fencing, retirement,
+root-only durable pins, dependency indexes and incremental collection.
+`InMemorySessionJournal` preserves its existing API as the engine over
+`VolatileJournalStorage`. Protected engines keep exact execution state;
+ordinary engines require an explicit `JournalProjectionPolicy` and encode
+values only after that policy succeeds. Production hosts implement
+`JournalStorage`, rather than copying the engine. The unpublished bench crate's
+packed SQLite adapter demonstrates storage levers and conformance; production
+framing, encryption, flushes and process locking remain host responsibilities.
+
+The storage boundary supplies membership-scoped reads and one atomic fenced
+`JournalWrite` per write. `apply` rechecks `(revision, writer_epoch)` inside
+its transaction, persists engine metadata verbatim, and deletes bodies only
+at the last membership across every domain/session. `JournalApplyReceipt`
+counts canonical body bytes actually deleted. Session records, operation
+results, pins, retained-root catalogs and dirty flags are durable; leases,
+writer slots and the root/pin epoch remain process-local. An async engine
+write gate serializes preparation/publication without holding a storage
+transaction. `close` and host revocation only touch the local registry, so
+`close` remains immediately ready under `now_or_never` while storage waits.
+
+A per-engine LRU keyed by session and head id retains validated closures,
+shared immutable bodies, parsed links, decoded snapshots, encoding caches and
+dependencies.
+`JournalEngineConfig::validated_root_memo_bytes` defaults to 256 MiB, using a
+conservative encoded-byte estimate; zero disables retention and oversized
+entries are skipped. Eviction falls back to one full validation. A memoized
+writer open, renew and ordinary/protected commit can make zero storage-object
+reads, including after writer changes. Warm snapshot reads reuse admitted,
+immutable cached bodies; lease checks and hash verification remain in place. New writers trim prior cache-only bodies/links without changing membership.
+Collection trims released cache-only bodies and evicts affected historical proofs; a memo never acts as a GC pin.
+The existing live writer/session working caches are separate from this budget.
+Keep an engine per domain in the host store and return clones from `journal()`;
+new runtime instances then reuse the same registry and memo across turns.
+
+`JournalReader::extension(namespace)` reads a head, batch, one map node per
+level and one opaque value: 4 reads at 10 namespaces and 6 at 10,000, independent
+of a 4,000-message history. Map descriptors count leaves as height zero, so
+visited levels are `height + 1`. The method preserves stored sensitivity,
+returns `None` for missing namespaces and obeys object/byte/entry limits.
+`runtime.core.previous_cache` may use a structured JSON tree and require more
+reads. Other structured extension namespaces are rejected.
 
 The reference backend has no wall-clock lease expiry. It implements atomic
-commit, lifetime idempotency, pinned reachability and monotonic writer fences.
+commit, bounded replay results, pinned reachability and monotonic writer fences.
+Collection retains revisions at or above the inclusive `current - 64` floor,
+plus the current writer epoch’s own last operation. Commits never prune; an
+identical pruned replay conflicts without applying.
 Before a head becomes visible it is materialized through `JournalReader`, so a
 boundary with a wrong history chain or count, or a checkpoint whose operation
 fingerprint does not match its state, is refused instead of published.
@@ -143,8 +182,8 @@ Checkpoint progress is compared with the latest published checkpoint of the
 session, even across heads that carry none. Lease expiry and revocation stay
 host policy: `InMemorySessionJournal::revoke_writer` is that host control, and a
 writer lease dropped without `close` keeps the session's writer slot until the
-host revokes it. The single transaction lock is held while the ordinary
-projection policy runs, so a policy must not call back into the same journal.
+host revokes it. The ordinary projection policy runs synchronously under the write gate and
+workspace lock, so a policy must not call back into the same journal.
 `retire` and `collect` return typed unsupported and retain all content until the
 host explicitly calls `enable_collection`. Retirement additionally requires
 `authorize_retirement(session, revision, host_timestamp)` for that exact current
@@ -164,7 +203,9 @@ leaves v3 authoritative; a failure after it is repaired from that native head
 plus the unchanged legacy ordinary record, without a migration marker, but
 only while the exact head is still the imported v3 checkpoint. Import
 leases stay pinned through both publications and are closed before fresh live
-writer leases are opened. The original v3 records are not saved, pruned or
+writer leases are opened. Reopening headed native sessions skips legacy loads;
+only absent heads and the supported partial import need the legacy pair. The
+original v3 records are not saved, pruned or
 rewritten, so a release older than the import must never resume a migrated
 session (it would read the stale v3 pair), and older legacy-mode writers of a
 session must be stopped before a new runtime resumes it: legacy mode holds no
@@ -198,6 +239,22 @@ unverified object reuse, a revocation that keeps the writer, an ordinary
 adapter ignoring policy or dropping exact roots) and require each to be
 rejected.
 
+### Storage adapter conformance
+
+Run `agent_runtime_testkit::conformance::journal_storage::assert_journal_storage_conformance`
+with a factory that returns isolated empty storage. The suite runs protected,
+ordinary and collection contracts through `JournalEngine<S>`, atomic failure
+cuts, revision/writer fences, membership isolation and last-member receipts,
+restart recovery, and replay pruning's inclusive edge/last-writer exception.
+It rejects torn, lost, reordered, stale-fenced and shared-body-deleting adapters.
+The packed adapter runs it with repacking disabled, enabled, and a reopened
+connection on every hydration.
+
+```sh
+cargo test -p agent-runtime-testkit --all-features conformance::journal_storage
+cargo test -p agent-runtime-journal-bench --test packed
+```
+
 ### Explicit retirement, pins and collection (U9 group C)
 
 Collection is a host action with no library schedule, lease duration, retention
@@ -218,7 +275,8 @@ An intervening open, commit, renewal, close, host writer revocation, durable pin
 change, staging change or retirement invalidates that mark. A `StateConflict`
 requires a fresh mark; an epoch of zero is not a wildcard. The reference traces
 current roots and all process, retained, migration, transfer and staging pins
-under the same lock as deletion. A retained-root open either pins its complete
+under the engine write gate, with deletion in an atomic storage write.
+A retained-root open either pins its complete
 closure before deletion or fails before returning a lease. Batch predecessor
 digests and idempotency results attest history; they do not root every obsolete
 request/checkpoint. Replay-fence metadata survives collection while execution
@@ -358,6 +416,8 @@ submit zero drafts and zero body bytes.
 | Ordinary terminal | 16,496 / 34,042 | 17,848 / 35,983 | 18,520 / 36,217 |
 | Ordinary unchanged (each) | 1,180 / 2,011 | 1,184 / 2,017 | 1,184 / 2,017 |
 
+These historical latency rows were captured before engine extraction and the
+validated-root memo; they are not timings of the current engine.
 Wall-clock rows are complete API-phase elapsed time divided by that phase's
 native commit count (debug build, milliseconds/commit), so they conservatively
 include planning and snapshot construction outside the journal backend.
@@ -405,6 +465,65 @@ cargo test -p agent-runtime --all-features --test integration \
 ```
 
 Add `--release` for the optimized rows.
+
+### Packed SQLite physical measurements
+
+The unpublished `agent-runtime-journal-bench` harness drives the same fixtures
+through native engines over real packed SQLite storage and the legacy row.
+A is synthetic, B uses seeded realistic content, and C grows through per-turn
+writer epochs. Idle legacy rows retain two sealed blobs (L2). These are physical
+bytes after truncated WAL checkpoints and VACUUM, minus the empty schema;
+head/fence/engine metadata, pins, catalogs, membership, object packs and
+operation packs are included. The seal model adds a 24-byte nonce and 16-byte
+tag to real zstd-compressed bytes; it is not a production cipher.
+
+Measured on 2026-10-19 with root-only pins and S1–S5, including real collection
+pruning. Native after/L2 is the gate metric; L1 and layout simulators are
+separate diagnostics. All 13 primary cases pass. B/N=4000 is 1.49096× plain
+and 1.62353× tool, so the ≤2.0× L2 gate keeps format levers 5.1–5.4 unbuilt.
+Only plain meets the optional 1.5× aim; schema 4 is unchanged.
+
+| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 100 | plain | 0 | 8192 | 90112 | 57344 | 11.00000 | 7.00000 |
+| A | 100 | tool | 0 | 8192 | 118784 | 61440 | 14.50000 | 7.50000 |
+| A | 1000 | plain | 20480 | 53248 | 348160 | 303104 | 6.53846 | 5.69231 |
+| A | 1000 | tool | 24576 | 53248 | 372736 | 307200 | 7.00000 | 5.76923 |
+| A | 4000 | plain | 90112 | 204800 | 1126400 | 1089536 | 5.50000 | 5.32000 |
+| A | 4000 | tool | 94208 | 208896 | 1155072 | 1089536 | 5.52941 | 5.21569 |
+| B | 100 | plain | 20480 | 40960 | 135168 | 86016 | 3.30000 | 2.10000 |
+| B | 100 | tool | 20480 | 45056 | 151552 | 94208 | 3.36364 | 2.09091 |
+| B | 1000 | plain | 159744 | 335872 | 606208 | 540672 | 1.80488 | 1.60976 |
+| B | 1000 | tool | 163840 | 339968 | 671744 | 589824 | 1.97590 | 1.73494 |
+| B | 4000 | plain | 655360 | 1359872 | 2248704 | 2027520 | 1.65361 | 1.49096 |
+| B | 4000 | tool | 655360 | 1392640 | 2469888 | 2260992 | 1.77353 | 1.62353 |
+| C | 1000 | tool | 454656 | 942080 | 11071488 | 962560 | 11.75217 | 1.02174 |
+
+
+
+NOT MET: the supplemental growing C/N=4000 report did not complete within its reserved wall-clock limit. The required primary C script is measured at N=1000; no N=4000 value is estimated.
+Reproduce the smoke and release report (JSON/Markdown are written to the chosen
+directory). The supplemental command measures the growing C script at N=4000;
+the primary report measures it at N=1000.
+
+```sh
+cargo test -p agent-runtime-journal-bench --test report n100
+JOURNAL_MEASUREMENT_DIR=/tmp/journal-report cargo test \
+  -p agent-runtime-journal-bench --release --test report \
+  physical_disk_release_report -- --ignored --nocapture
+JOURNAL_MEASUREMENT_DIR=/tmp/journal-report cargo test \
+  -p agent-runtime-journal-bench --release --test report \
+  physical_disk_grown_4000_report -- --ignored --nocapture
+```
+
+The supplement appends its row to `measurements.json` and also writes
+`measurements-c4000.json`/`.md`. `retained_operations_before` and
+`retained_operations_after` inspect real storage. Legacy `projected_after_s5_*`
+fields are aliases of the measured native after size; the archived simulator
+payload delta is not subtracted again. Full per-kind and manifest-closure
+breakdowns accompany each row. See design D8.4 in
+`docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md` for the
+gate evidence and measurement boundaries.
 
 ## Quality gates
 

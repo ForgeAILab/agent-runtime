@@ -35,6 +35,7 @@ pub(super) use transition::{
     injected_failure,
 };
 mod controls;
+mod memo;
 mod persistence;
 
 use std::sync::Mutex;
@@ -42,7 +43,8 @@ use std::sync::Mutex;
 /// Process-local engine configuration. Collection remains explicit host policy.
 #[derive(Debug, Clone)]
 pub struct JournalEngineConfig {
-    /// Reserved budget for the validated-root memo (256 MiB by default).
+    /// Estimated byte budget for validated roots (256 MiB by default).
+    /// Zero disables memo retention; oversized entries are not retained.
     pub validated_root_memo_bytes: usize,
     /// Whether explicit host collection and retirement are enabled initially.
     pub collection_enabled: bool,
@@ -75,6 +77,7 @@ pub struct JournalEngine<S: JournalStorage> {
     // Collection consumes these hints for I/O-free close/revoke and read-only
     // opens, whose root changes do not set storage's collection_dirty flag.
     dirty: Arc<Mutex<BTreeSet<SessionId>>>,
+    memo: Arc<Mutex<memo::RootMemo>>,
 }
 impl<S: JournalStorage> Clone for JournalEngine<S> {
     fn clone(&self) -> Self {
@@ -84,6 +87,7 @@ impl<S: JournalStorage> Clone for JournalEngine<S> {
             local: self.local.clone(),
             gate: self.gate.clone(),
             dirty: self.dirty.clone(),
+            memo: self.memo.clone(),
         }
     }
 }
@@ -133,6 +137,9 @@ impl<S: JournalStorage> JournalEngine<S> {
             local,
             gate: Arc::new(futures_util::lock::Mutex::new(())),
             dirty: Arc::new(Mutex::new(BTreeSet::new())),
+            memo: Arc::new(Mutex::new(memo::RootMemo::new(
+                config.validated_root_memo_bytes,
+            ))),
         }
     }
     /// Arms one deterministic commit cut; it is consumed when that step is reached.
@@ -210,6 +217,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                 .map(|h| h.id.clone()),
             JournalRootSelection::Retained { root } => Some(root.clone()),
         };
+        let mut validated = None;
         if let Some(root) = &root {
             let catalog = self
                 .storage
@@ -217,22 +225,28 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                 .await?
                 .ok_or_else(conflict)?;
             let deps = persistence::decode(&catalog.engine)?;
-            let objects = self.closure_objects(session, root).await?;
-            let mut state = scratch.lock()?;
-            state.objects = ObjectStore::from_map(objects);
-            state
+            scratch
+                .lock()?
                 .sessions
                 .entry(session.clone())
                 .or_default()
                 .retained_heads
                 .insert(root.clone(), deps);
+            let mut entry = Box::pin(self.validated_root(&scratch, session, root)).await?;
+            if request.intent == JournalOpenIntent::ExclusiveWriter {
+                entry = self.writer_memo(session, root, entry)?;
+                self.seed_memo(&scratch, session, root, &entry)?;
+            }
+            validated = Some(ReachableSet {
+                layers: vec![entry.closure.clone()],
+            });
         }
         let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
         let before_pins = persistence::pin_records(&scratch, session)?;
         if writer {
             self.freeze_writer_pins(&scratch, session, stored.as_ref())?;
         }
-        let lease = scratch.open(session, request)?;
+        let lease = scratch.open_validated(session, request, validated)?;
         let dependencies = scratch
             .lock()?
             .leases
@@ -270,29 +284,46 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         lease: &JournalLease,
         object: &JournalObjectId,
     ) -> Result<Vec<u8>, RuntimeError> {
-        if !self
-            .local
-            .live_lease(&*self.local.lock()?, lease)?
-            .reachable
-            .contains(object)
-        {
-            return Err(conflict());
-        }
-        let bytes = self
-            .storage
-            .objects(&self.domain, lease.session(), std::slice::from_ref(object))
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(conflict)?
-            .to_vec();
+        let current = {
+            let state = self.local.lock()?;
+            if !self
+                .local
+                .checked_lease(&state, lease)?
+                .reachable
+                .contains(object)
+            {
+                return Err(conflict());
+            }
+            state
+                .sessions
+                .get(lease.session())
+                .and_then(|record| record.current.as_ref())
+                .map(|(root, _)| root.clone())
+        };
+        let cached = match current {
+            Some(root) => self
+                .memoized_root(lease.session(), &root)?
+                .and_then(|entry| entry.objects.get(object).cloned()),
+            None => None,
+        };
+        let bytes = if let Some(bytes) = cached {
+            bytes
+        } else {
+            self.storage
+                .objects(&self.domain, lease.session(), std::slice::from_ref(object))
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(conflict)?
+                .to_vec()
+        };
         let encoded = JournalObject {
             id: object.clone(),
             bytes,
         };
         encoded.kind()?;
-        self.local.live_lease(&*self.local.lock()?, lease)?;
+        self.local.checked_lease(&*self.local.lock()?, lease)?;
         Ok(encoded.bytes)
     }
     async fn commit(
@@ -312,14 +343,17 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
             }
             if let Some(object) = stored.as_ref().and_then(|r| r.head.as_ref()) {
                 let head: JournalHead = object.decode(JournalObjectKind::Head)?;
-                let objects = self.closure_objects(lease.session(), &object.id).await?;
+                let entry =
+                    Box::pin(self.validated_root(&scratch, lease.session(), &object.id)).await?;
                 let mut state = scratch.lock()?;
                 let dependencies = state.sessions[lease.session()].dependencies.clone();
                 let record = state
                     .leases
                     .get_mut(&self.local.token(lease)?.handle)
                     .ok_or_else(conflict)?;
-                record.reachable.extend(objects.into_keys().collect());
+                if !record.reachable.contains(&object.id) {
+                    record.reachable.layers.push(entry.closure.clone());
+                }
                 record.roots.extend([object.id.clone()].into());
                 record.dependencies.extend(&dependencies);
                 record.selected_head = Some(head);

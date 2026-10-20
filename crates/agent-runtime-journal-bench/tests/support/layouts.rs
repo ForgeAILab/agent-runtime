@@ -81,6 +81,8 @@ pub(crate) struct Report {
     pub(crate) packed_after: Size,
     pub(crate) packed_before_l2_ratio: f64,
     pub(crate) packed_after_l2_ratio: f64,
+    pub(crate) retained_operations_before: usize,
+    pub(crate) retained_operations_after: usize,
     pub(crate) s5_simulator_payload_delta: u64,
     pub(crate) projected_after_s5_bytes: u64,
     pub(crate) projected_after_s5_l2_ratio: f64,
@@ -136,13 +138,20 @@ fn operations(db: &mut Db, exports: &[(&str, JournalMeasurementExport)], mode: u
             continue;
         }
         let current = export.heads.values().next().unwrap();
+        let last = export
+            .operations
+            .iter()
+            .filter(|op| op.result.writer_epoch == current.writer_epoch)
+            .map(|op| op.result.revision)
+            .max();
         let records: Vec<_> = export
             .operations
             .iter()
             .filter(|op| {
                 mode != 3
-                    || op.result.revision.0 > current.revision.0.saturating_sub(64)
-                    || op.result.writer_epoch == current.writer_epoch
+                    || op.result.revision.0 >= current.revision.0.saturating_sub(64)
+                    || (op.result.writer_epoch == current.writer_epoch
+                        && Some(op.result.revision) == last)
             })
             .collect();
         if mode >= 2 {
@@ -527,12 +536,19 @@ pub(crate) fn measure(root: &Path, fixture: fixture::Fixture) -> Report {
     let mut epochs = 0;
     for (_, export) in &fixture.before {
         let current = export.heads.values().next().unwrap();
+        let last = export
+            .operations
+            .iter()
+            .filter(|op| op.result.writer_epoch == current.writer_epoch)
+            .map(|op| op.result.revision)
+            .max();
         let window: Vec<_> = export
             .operations
             .iter()
             .filter(|op| {
-                op.result.revision.0 > current.revision.0.saturating_sub(64)
-                    || op.result.writer_epoch == current.writer_epoch
+                op.result.revision.0 >= current.revision.0.saturating_sub(64)
+                    || (op.result.writer_epoch == current.writer_epoch
+                        && Some(op.result.revision) == last)
             })
             .collect();
         epochs += export
@@ -568,10 +584,21 @@ pub(crate) fn measure(root: &Path, fixture: fixture::Fixture) -> Report {
     let provider_cache_enabled = fixture.name != "A";
     // Task-1.4 archived simulator payload delta. All A/B records are in the
     // replay window. C: 819747 lifetime - 23769 window = 795978 bytes.
-    // This is a projection, not an S5 implementation or a measured file size.
+    // Historical simulator delta only. The former projected-size fields are
+    // now aliases of the actual S5 measurement; never subtract S5 twice.
     let s5_delta = if fixture.name == "C" { 795_978 } else { 0 };
-    let projected = fixture.packed_after.physical_bytes.saturating_sub(s5_delta);
+    let projected = fixture.packed_after.physical_bytes;
     Report {
+        retained_operations_before: fixture
+            .before
+            .iter()
+            .map(|(_, export)| export.operation_count)
+            .sum(),
+        retained_operations_after: fixture
+            .after
+            .iter()
+            .map(|(_, export)| export.operation_count)
+            .sum(),
         packed_before_l2_ratio: fixture.packed_before.physical_bytes as f64
             / l2.physical_bytes as f64,
         packed_after_l2_ratio: fixture.packed_after.physical_bytes as f64

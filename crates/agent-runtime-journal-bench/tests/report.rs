@@ -70,8 +70,10 @@ async fn physical_disk_release_report() {
                 eprintln!("measuring {name} N={n} tools={tools}");
                 let report = layouts::measure(&root, fixture::build(name, n, tools).await);
                 eprintln!(
-                    "measured {name} N={n} tools={tools}: ratio={:?}",
-                    report.gate_ratio
+                    "measured {name} N={n} tools={tools}: native/L2={:.5}, retained operations {} -> {}",
+                    report.packed_after_l2_ratio,
+                    report.retained_operations_before,
+                    report.retained_operations_after
                 );
                 reports.push(report);
                 std::fs::write(
@@ -88,12 +90,12 @@ async fn physical_disk_release_report() {
 fn markdown(reports: &[layouts::Report]) -> String {
     use std::fmt::Write;
     let mut out = String::from(
-        "Real packed SQLite physical bytes; schema baseline subtracted. S1–S4 implemented; S5 projected from task-1.4 payload savings.\n\n| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 | Projected S5 after | Projected/L2 |\n| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "Real packed SQLite physical bytes; schema baseline subtracted. S1–S5 implemented; packed after includes real collection pruning.\n\n| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 |\n| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in reports {
         writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {:.5} | {:.5} | {} | {:.5} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {:.5} | {:.5} |",
             r.fixture,
             r.n,
             if r.tools { "tool" } else { "plain" },
@@ -102,9 +104,7 @@ fn markdown(reports: &[layouts::Report]) -> String {
             r.packed_before.physical_bytes,
             r.packed_after.physical_bytes,
             r.packed_before_l2_ratio,
-            r.packed_after_l2_ratio,
-            r.projected_after_s5_bytes,
-            r.projected_after_s5_l2_ratio
+            r.packed_after_l2_ratio
         )
         .unwrap();
     }
@@ -133,4 +133,36 @@ async fn n100_actual_packed_physical_smoke() {
             report.packed_after_l2_ratio
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "supplemental growing N=4000 physical report; run in release mode"]
+async fn physical_disk_grown_4000_report() {
+    let root = root();
+    std::fs::create_dir_all(&root).unwrap();
+    eprintln!("measuring supplemental C N=4000 tools=true");
+    let report = layouts::measure(&root, fixture::build("C", 4000, true).await);
+    eprintln!(
+        "measured C N=4000: native/L2={:.5}, retained operations {} -> {}",
+        report.packed_after_l2_ratio,
+        report.retained_operations_before,
+        report.retained_operations_after
+    );
+    let row = serde_json::to_value(&report).unwrap();
+    std::fs::write(
+        root.join("measurements-c4000.json"),
+        serde_json::to_vec_pretty(&row).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("measurements-c4000.md"),
+        markdown(std::slice::from_ref(&report)),
+    )
+    .unwrap();
+    let path = root.join("measurements.json");
+    let mut rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    rows.retain(|old| !(old["fixture"] == "C" && old["n"] == 4000));
+    rows.push(row);
+    std::fs::write(path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
 }

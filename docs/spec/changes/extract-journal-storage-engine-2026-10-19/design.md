@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:18:57Z
+updated_at: 2026-10-20T01:19:53Z
 ---
 
 # Design: Storage-generic journal engine and physical disk reduction (R1–R7)
@@ -383,44 +383,100 @@ preserve the original transfer/retention closure and epoch semantics.
 
 ### D5. Validated-root memo (R4)
 
-- The engine keeps an LRU memo keyed by `(session, head object id)`:
-  `{ closure: Arc<BTreeSet<JournalObjectId>>, snapshot: Arc<SessionSnapshot>,
-  encoding: Arc<SnapshotEncodingCache>, dependencies }`. Entries are created
-  only from a head this engine fully validated (its own commit, or a full
-  `materialize_staged_*` pass that reproduced the roots).
-- Content addressing makes an entry immutable: the same head id is the same
-  closure. A changed head is a different key, so no invalidation protocol is
-  needed. Budget: `validated_root_memo_bytes` (estimated from encoded bytes).
-- Open of a memoized root reuses its closure without object reads. A protected
-  commit whose lease selected a memoized head uses the fast path even after a
-  writer change (replacing `protected_writer_changed` at `memory.rs:1282-1286`).
-  A memo miss (restart, eviction) costs one full validation, as today.
-- Forge builds a runtime per turn (Forge D2 R4); with the memo only the first
-  turn after process start pays the full validation.
+The engine and its clones share an LRU keyed by `(session, head object id)`;
+the domain is fixed by the engine. Each immutable entry holds the exact head
+closure (`Arc<BTreeSet<JournalObjectId>>`), shared immutable object layers,
+decoded snapshot, optional encoding cache, and dependency roots. Only a
+root-checked successful commit or a complete materialization can create an
+entry. Cold opens validate once; memoized opens reuse the closure and seed
+without object reads or full materialization, including across writer epochs.
+Unreplayable protected deltas still fall back to full validation.
+
+`validated_root_memo_bytes` defaults to 256 MiB per engine. The conservative
+charge includes stored encoded bodies and their id/index overhead, canonical
+snapshot bytes, closure ids, encoding-cache ids/keys, and entry overhead;
+shared data is charged to every entry. Least recently used entries are evicted
+until the new entry fits. An oversized entry is not retained; zero disables
+retention. This budget covers the memo, independently of live writer working
+sets and the pre-existing session state caches. No storage trait change is
+needed.
+
+Exact-closure construction also caches parsed object links by object id and
+expected kind. New or differently typed edges run the original checks; reused
+immutable edges avoid JSON reparsing. Missing bodies still conflict. Parsed
+links are charged to the memo budget. A new writer trims cache-only bodies and
+links from the previous writer, preserving the selected exact closure and all
+durable memberships; reader/GC roots are unchanged. Tests prove edge reuse,
+wrong-kind rejection, missing-body rejection and unchanged membership on trim.
+
+The immutable body cache also mitigates N2: commit starts from the memoized
+head's shared object layers and fetches only missing admitted lease objects
+(e.g. separately staged leaves), rather than reloading the whole lease closure.
+Renew reuses the same validated closure. Public reads can reuse immutable
+memoized bodies after validating the live lease and its admitted reachability;
+bytes retain the ordinary hash/kind check and the lease is checked again before
+return. Missing cache bodies fall back to membership-scoped storage reads.
+This also avoids rereading a full closure while a per-turn runtime restores a
+warm snapshot. Storage still supplies durable fences, current records, pins and
+operation results for every write.
+
+Collection evicts historical entries whose closure intersects released
+membership, and trims released cache-only bodies from unaffected entries.
+Thus current-root validation survives ordinary collection, and a cached body
+can never suppress re-admission of an object whose membership was released.
+A failed storage apply clears the session's memo conservatively.
+
+The two named existing writer-change/advisory-delta tests have no full-count
+assertion requiring a change; all their assertions stay unchanged. New tests
+cover true LRU pressure, oversized/zero-budget misses, one full validation
+following eviction, and zero storage object calls for open, renew and commit
+of a 100-message memoized head in both domains, after collection between writer
+epochs. Evidence: `rt-e6/r4-core-final.log`; each tested commit calls load, pins,
+operation and apply once, and objects zero times. The future-size gate remains
+16,384 bytes (largest observed: commit_inner, 4,944 bytes).
 
 ### D6. Native-first open (R5)
 
-`SessionPersistence::open` (`runtime/journal.rs:318`) loads the legacy pair
-only when it can be used:
+`SessionPersistence::open` opens and validates the configured native domains
+first. It loads the legacy pair only when neither domain has a head, or when
+legacy import is enabled, both store/journal capabilities are present, the
+protected head exists and the ordinary head is absent (the supported repair).
+Headed sessions otherwise skip both `load` and `load_latest`. Capability-loss,
+retirement, absent-head, native authority and import fences are unchanged.
 
-- neither domain has a head (import or legacy mode), or
-- the protected head exists, the ordinary head is absent and an import repair
-  is possible (`:398-405`).
-
-Otherwise it skips `load_legacy_records`. Behavior is otherwise identical.
-The group-D tests that record today's legacy load counts change their
-expected counts (fewer loads); the CHANGELOG states this under `Changed`.
+The shared group-D consumer assertion in
+`conformance/journal_consumers/recovery.rs` changes `loads + 2` → `loads`,
+executed by the Smith, Nyx and Open Forge fixtures. A new runtime regression
+checks a complete import and a protected-first partial import: import/repair
+loads the legacy pair once (one call per store); five subsequent native
+reopens make zero legacy calls and no provider calls. Evidence:
+`rt-e6/r5-runtime-focused.log`. No other existing assertion changes for R5.
 
 ### D7. Bounded single-extension read (R6)
 
 `JournalReader::extension(&mut self, namespace: &str)
--> Result<Option<VersionedSessionState>, RuntimeError>` reads the selected
-head, its batch, then descends the head's extension map by `first_key`
-separators: `O(height)` map nodes plus one value object. It returns the value
-of an opaque `Extension` object. A structured `ExtensionReference`
-(`runtime.core.previous_cache`) is materialized through its JSON tree and is
-not bounded; Forge needs only the opaque LCM component namespace. Read limits
-apply as for any reader. It never touches history, usage or the checkpoint.
+-> Result<Option<VersionedSessionState>, RuntimeError>` validates the selected
+head object and its batch, then descends the extension map by `first_key`
+separators. It validates fanout, ordering, inherited bounds, subtree heights and
+counts along the path, and reads one opaque `Extension` value. It never reads
+history, usage, manifests or the checkpoint. Stored sensitivity and numeric
+bits are preserved; absent heads, empty maps and missing namespaces return
+`None`. Object, byte and entry limits apply as for the other reader methods.
+
+For a nonempty map, height measured in visited levels is
+`JournalMap.height + 1` (the descriptor uses zero for a leaf). Exact opaque
+read counts are **head + batch + map levels + value**: 4 reads at 10 namespaces
+and 6 at 10,000 namespaces, each with a 4,000-message history and the unrelated
+closures absent from the test transport. Evidence:
+`rt-e6/r6-readers-valid-fixture.log`. This clarifies the height convention in
+the bounded-read scenario; no additional off-path object is read.
+
+A structured `ExtensionReference` at `runtime.core.previous_cache` is
+materialized through its JSON tree and is not bounded by that opaque count;
+reader limits still apply. Structured objects at other namespaces conflict.
+The storage trait is unchanged. Tests also cover Sensitive values, missing
+keys, empty/absent heads, all three limits, malformed separators, and the
+structured namespace's additional reads and limit failure.
 
 ### D8. Physical disk (R7)
 
@@ -508,8 +564,8 @@ Storage-level (no format change):
 - **S4 Op-record packing.** Operation records of a session live in its packs,
   so successive heads compress against each other.
 - **S5 Bounded replay window** (contract change, owner Q1). Keep operation
-  records for the latest K = 64 published revisions per domain (and every
-  record of the current writer epoch). Older identical replays return
+  records at or above the inclusive current −64 floor per domain, plus the
+  current writer epoch’s own last operation. Older pruned identical replays return
   `StateConflict`, which CAS already guarantees because every commit binds
   expected revision, sequence and predecessor (`memory.rs:833-865`).
 
@@ -529,98 +585,66 @@ Format-level (journal schema 5; D9):
   or Z85 id already costs ~33 bytes, so it saves ~0 physical bytes for a
   format break.
 
-#### D8.4 Measured physical bytes through the reference adapter (tasks 4.1–4.3)
+#### D8.4 Measured physical bytes through the reference adapter (task 4.5)
 
-Measured 2026-10-19 with `JournalEngine<PackedSqliteJournalStorage>` in the
-unpublished bench crate, bundled SQLite 3.46.0, 4096-byte pages, zstd 1.5.7
-level 3. These **replace the task-1.3 simulator totals** as the authoritative
-native sizes. Both ordinary and protected engines write the same real SQLite
-file. All head/fence/tombstone/opaque engine metadata, pins, catalogs,
-memberships, object packs and lifetime operation records are included.
+Measured 2026-10-19 on the merged engine with root-only durable pins and real
+S1–S5 storage levers. Both domains use `JournalEngine<PackedSqliteJournalStorage>`
+in one SQLite file (bundled SQLite 3.46.0, 4096-byte pages, zstd 1.5.7 level 3).
+All fences, heads, tombstones, opaque metadata, pins, catalogs, memberships,
+object packs and retained operation packs are included.
 
-Metric: `page_count × page_size` after `wal_checkpoint(TRUNCATE); VACUUM;
-wal_checkpoint(TRUNCATE)`, minus the same empty schema. File length, pragma
-product and `dbstat` page sum agree. The before and after columns measure the
-same adapter file, before and after the first full engine collection.
-The host invokes geometric `post_terminal` merging after each terminal turn;
-no collection occurs before the before measurement. The 13 fixtures retain
-exactly the task-1 A/B/C generators and scripts. B/C enable implicit-prefix
-provider caching; C grows to 1000 messages in 250 per-turn writer epochs.
+Physical bytes are `page_count × page_size` after truncated WAL checkpoints
+and VACUUM, minus the empty schema. File length and `dbstat` agree. Before and
+after refer to the same file, before and after its first full collection;
+the explicit geometric terminal hook runs after terminal publication. All 13
+idle legacy rows contain two sealed blobs (L2), since `identity.event` and
+`identity.event_seq` advance after the terminal checkpoint. Sealing models a
+24-byte nonce and 16-byte tag, rather than a real cipher.
 
-Every idle legacy row holds **two sealed blobs (L2)**, because
-`identity.event` / `identity.event_seq` advance after the terminal checkpoint.
-The owner’s later L2 decision is authoritative; L1 remains reported only.
-All actual and legacy units model a 24-byte nonce and 16-byte tag, not a real
-cipher. The adapter retains actual compressed bytes for recovery tests.
+| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 100 | plain | 0 | 8192 | 90112 | 57344 | 11.00000 | 7.00000 |
+| A | 100 | tool | 0 | 8192 | 118784 | 61440 | 14.50000 | 7.50000 |
+| A | 1000 | plain | 20480 | 53248 | 348160 | 303104 | 6.53846 | 5.69231 |
+| A | 1000 | tool | 24576 | 53248 | 372736 | 307200 | 7.00000 | 5.76923 |
+| A | 4000 | plain | 90112 | 204800 | 1126400 | 1089536 | 5.50000 | 5.32000 |
+| A | 4000 | tool | 94208 | 208896 | 1155072 | 1089536 | 5.52941 | 5.21569 |
+| B | 100 | plain | 20480 | 40960 | 135168 | 86016 | 3.30000 | 2.10000 |
+| B | 100 | tool | 20480 | 45056 | 151552 | 94208 | 3.36364 | 2.09091 |
+| B | 1000 | plain | 159744 | 335872 | 606208 | 540672 | 1.80488 | 1.60976 |
+| B | 1000 | tool | 163840 | 339968 | 671744 | 589824 | 1.97590 | 1.73494 |
+| B | 4000 | plain | 655360 | 1359872 | 2248704 | 2027520 | 1.65361 | 1.49096 |
+| B | 4000 | tool | 655360 | 1392640 | 2469888 | 2260992 | 1.77353 | 1.62353 |
+| C | 1000 | tool | 454656 | 942080 | 11071488 | 962560 | 11.75217 | 1.02174 |
 
-| Fixture | N | Turn | L1 | L2 | Packed before | Packed after | Before/L2 | After/L2 | Projected S5 after | Projected/L2 |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A | 100 | plain | 0 | 8192 | 90112 | 57344 | 11.00000 | 7.00000 | 57344 | 7.00000 |
-| A | 100 | tool | 0 | 8192 | 118784 | 61440 | 14.50000 | 7.50000 | 61440 | 7.50000 |
-| A | 1000 | plain | 20480 | 53248 | 344064 | 303104 | 6.46154 | 5.69231 | 303104 | 5.69231 |
-| A | 1000 | tool | 24576 | 53248 | 372736 | 307200 | 7.00000 | 5.76923 | 307200 | 5.76923 |
-| A | 4000 | plain | 90112 | 204800 | 1126400 | 1089536 | 5.50000 | 5.32000 | 1089536 | 5.32000 |
-| A | 4000 | tool | 94208 | 208896 | 1155072 | 1089536 | 5.52941 | 5.21569 | 1089536 | 5.21569 |
-| B | 100 | plain | 20480 | 40960 | 135168 | 86016 | 3.30000 | 2.10000 | 86016 | 2.10000 |
-| B | 100 | tool | 20480 | 45056 | 151552 | 94208 | 3.36364 | 2.09091 | 94208 | 2.09091 |
-| B | 1000 | plain | 159744 | 335872 | 606208 | 540672 | 1.80488 | 1.60976 | 540672 | 1.60976 |
-| B | 1000 | tool | 163840 | 339968 | 671744 | 589824 | 1.97590 | 1.73494 | 589824 | 1.73494 |
-| B | 4000 | plain | 655360 | 1359872 | 2244608 | 2027520 | 1.65060 | 1.49096 | 2027520 | 1.49096 |
-| B | 4000 | tool | 655360 | 1392640 | 2469888 | 2260992 | 1.77353 | 1.62353 | 2260992 | 1.62353 |
-| C | 1000 | tool | 454656 | 942080 | 10514432 | 1675264 | 11.16087 | 1.77826 | 879286 | 0.93335 |
+Actual `packed_before`, `packed_after` and `packed_after_l2_ratio` fields in
+`/Volumes/Data/tmp/refactor/rt-e6/measurements.json` are authoritative. The
+`layouts`, `s123_s4_s5_*` and `gate_ratio` are counterfactual simulator
+diagnostics, not physical native estimates. Former `projected_after_s5_*`
+fields now alias the measured native after size, so S5 is not subtracted twice.
+The archived simulator payload delta remains a historical diagnostic only. The old
+projected tables are replaced by these measured S5 results. Task-1 and task-4
+raw evidence remains under `rt-e1` and `rt-e4`.
 
-S1–S4 are implemented. **S5 is not implemented in this job.** Since S5 prunes
-only in collection, projected before sizes equal the measured before sizes.
-Projected after sizes subtract the archived task-1.4 **encoded payload** S5
-delta: zero for A/B; 795,978 B for C (819,747 lifetime − 23,769 window).
-These are estimates, not measured SQLite sizes: page rounding and the eventual
-operation-pack compression/metadata interactions can differ.
+B/N=4000 is **1.49096× L2 plain / 1.62353× L2 tool** after collection.
+Both pass the required ≤2.0× L2 gate; only plain meets the optional 1.5× aim.
+A/N=4000 is **5.32000× plain / 5.21569× tool** and is reported without gating.
+C is the requested growing N=1000/tool case (250 writer epochs), not N=4000:
+its measured native/L2 is **1.02174×** after real pruning. Group 5 (5.1–5.4)
+is not built because B meets the gate; schema 4 remains the format.
 
-The unscaled C delta is optimistic: the actual operation table contributes
-761,856 B above its empty 4,096-B root page, less than the old 795,978-B payload
-saving. The other actual tables already contribute 913,408 B (0.96957× L2),
-so the literal 879,286-B subtraction cannot be a physical same-layout result.
-Transferring the archived **keep fraction** (23,769 / 819,747) to the actual
-operation-table increment instead estimates 935,498 B, **0.99301× L2**.
-Both calculations are reported; only S1–S4 has been measured. Detailed
-projection arithmetic is `/Volumes/Data/tmp/refactor/rt-e4/s5-projection.json`.
+The adapter uses sealed object packs with four-byte prefixes and full-id
+verification, membership bitmaps, physical last-membership deletion, and
+kind-ordered collection repacks. Operation packs are pruned transactionally:
+empty packs are dropped and mixed packs rewritten, preserving revision −64
+and the current writer epoch’s last operation. The RAM replay index changes
+only after commit. Prefix-alignment and per-kind/manifest-closure diagnostics
+remain in the raw report: JSON array leaves can share while the binary spines
+of cache fragments and prepended tool-schema manifests differ.
 
-The full raw JSON is `/Volumes/Data/tmp/refactor/rt-e4/measurements.json`;
-`packed_before` / `packed_after` are actual adapter sizes and
-`packed_after_l2_ratio` is the current gate ratio. The old `layouts`,
-`s123_s4_s5_*` and `gate_ratio` fields remain explicitly counterfactual
-simulator diagnostics (the last is the historical L1 comparison), now fed by
-bench-local observations of real stored objects. Task-1.4 evidence remains
-archived under `/Volumes/Data/tmp/refactor/rt-e1/`.
 
-The adapter stores no per-object SQL index: each sealed pack has sorted
-four-byte prefixes and varint offsets/lengths, with full-id verification.
-The session directory is per-domain/session membership bitmaps. Final
-membership release physically removes each body in that transaction; receipts
-sum original canonical input lengths, not compressed bytes or page deltas.
-Collection builds a kind-ordered base, and the explicit terminal hook merges
-small packs geometrically. Shared selected packs move every holder’s bitmap,
-including other sessions. Operations use lossless binary-carry session/domain
-packs and retain all original results; no replay window is applied.
 
-B/N=4000 is **1.49096× L2 plain / 1.62353× L2 tool** after collection,
-already within the required 2.0× gate without S5. The plain case meets the
-optional 1.5× aim; tool does not. A remains the reported worst case, not a gate.
-Group 5 stays gated out. Task 4.4 (S5) and the final 4.5 recheck remain separate.
-
-C retains 32 manifests and 4,002 lifetime operation records; collection
-leaves its operation-pack pages unchanged. Its measured after size is
-1,675,264 B (1.77826× L2); the S5 payload-delta projection is
-879,286 B (0.93335× L2).
-
-Per-kind and manifest-closure diagnostics remain in the raw JSON. The earlier
-~4000-spine-object observation still has the same explanation: a wide JSON
-array has roughly 2000 `Sequence` and 2000 `JsonBranch` nodes; prepending a
-tool schema shifts `chunks(2)` alignment between stable-prefix and stable-history
-arrays. Leaves can share while those spines differ. Audit-segment shapes also
-differ from cache-plan fragments, and unchanged manifest prefixes share with
-prior manifests. Those diagnostics do not substitute for actual physical totals.
-
+NOT MET: the supplemental growing C/N=4000 report did not complete within its reserved wall-clock limit. The required primary C script is measured at N=1000; no N=4000 value is estimated.
 #### D8.5 Decision rule
 
 1. Build the measurement harness first (task 1). It reports L1/L2, the D4
@@ -649,8 +673,8 @@ prior manifests. Those diagnostics do not substitute for actual physical totals.
   one sweep and stays green; a new conformance case checks the window edge.
 - Released contract text ("returns its original result even after head
   advance", `mod.rs:63-65`) becomes "for at least the latest 64 revisions and
-  the current writer epoch's last operation". This is a pre-1.0 semantic break and needs owner
-  approval (Q1).
+  the current writer epoch's last operation". This adopted pre-1.0 semantic
+  break is recorded in the Q1 decision below.
 
 ### D9. Journal schema 5 (only if F1/F2 are gated in)
 
@@ -693,12 +717,13 @@ prior manifests. Those diagnostics do not substitute for actual physical totals.
     B at N=4000 is the R7 gate (Q2).
   - **C** (report only): B's content grown by turns to N=1000 (250 turns),
     to count operation records per turn and the retained manifest window.
-- Authoritative native sizes are the actual S1–S4 adapter file before and
-  after collection. Legacy uses Forge's row shape/save rules (`FORGE-SESSION\0`,
+- Authoritative native sizes are the actual S1–S5 adapter file before and
+  after collection, with root-only pins and real operation pruning. Legacy uses Forge's row shape/save rules (`FORGE-SESSION\0`,
   zstd 3, modeled sealing, checkpoint NULLs snapshot, digest skip). D4,
   isolated S1/S2/S3 and the old S4/S5 layouts remain counterfactual SQL
-  diagnostics over the real stored object sets. S5 is projected in task 4.3;
-  no F lever is built.
+  diagnostics over the real stored object sets. Task 4.5 replaces the earlier
+  S5 projections with measurements; no F lever is built. The supplemental C
+  script grows to N=4000 (1000 writer epochs) for the step-6 ratio table.
 - Output: one JSON report plus a Markdown table with N=100/1000/4000, both
   baselines, per-kind breakdown (objects, logical, compressed, row/index
   overhead), pre- and post-collection bytes, and op-record bytes per turn.
@@ -754,18 +779,21 @@ Added (all additive):
   `JournalEngineState`, `JournalSessionRecord`, `JournalStoredObject`,
   `JournalObjectBatch`, `JournalOperationRecord`, `JournalPinRecord`,
   `JournalCatalogEntry`, `JournalPinChange`, `JournalCatalogChange`,
-  `JournalWriteKind`, `JournalWrite`, `VolatileJournalStorage`.
-- core `journal::engine`: `JournalEngine<S>`, `JournalEngineConfig`.
+  `JournalWriteKind`, `JournalWrite`, `JournalApplyReceipt`,
+  `VolatileJournalStorage`.
+- core `journal` re-exports: `JournalEngine<S>`, `JournalEngineConfig`, and
+  `JournalEngine::retained_bytes`.
 - `JournalReader::extension`.
 - testkit `conformance::journal_storage`: `assert_journal_storage_conformance`,
   `JournalCollectionHost for JournalEngine<S>`, the five broken storages
   (test-only, not exported).
 - the bench crate (not published).
 
-Breaking: none in this change's storage-level part. Behavior change:
-`SessionPersistence::open` skips the legacy load when both native heads
-exist. Conditional breaks, only if approved: S5 (replay window, Q1) and
-schema 5 (F1/F2, Q3).
+The implemented pre-1.0 break is S5's bounded replay window: collection may
+prune results below the inclusive current −64 floor, preserving the current
+writer epoch's own last operation. `SessionPersistence::open` also skips unused
+legacy loads. The storage abstraction and extension reader are source-compatible
+additions. Schema 5 is not built because task 4.5 passes the L2 gate.
 
 Migration: none for existing users. `InMemorySessionJournal` callers and
 testkit consumers recompile without edits. Forge adopts by implementing
@@ -788,11 +816,10 @@ CHANGELOG `Unreleased` text (applied in the last task):
   torn, lost, reordered and stale-fenced writes and shared-object deletion."
 - `### Changed` — "Opening a session whose ordinary and protected journals
   both have a native head no longer loads the legacy v3 records."
-- If Q1 is approved, `### Changed` **Breaking (pre-1.0)** — "A journal keeps
-  the original result of an operation for at least the latest 64 published
-  revisions and the current writer epoch. An identical retry of an older
-  operation now fails with `StateConflict` instead of returning its original
-  head; it could never apply again."
+- `### Breaking` (pre-1.0) — "After collection a journal may reject replays
+  below the inclusive current −64 revision floor with `StateConflict`. The
+  current writer epoch's own last operation is preserved; pruned operations
+  never apply again."
 - If schema 5 ships, `### Changed` **Breaking (pre-1.0)** — "Journal schema 5
   stores small JSON array elements and messages in chunked leaves. Readers
   accept schema 4 and 5; writers continue existing schema-4 sessions in
@@ -812,12 +839,10 @@ CHANGELOG `Unreleased` text (applied in the last task):
   (Forge D1 facts). Correctness is unchanged; the collection suite's
   shared-suffix cases still pass because each session's membership holds its
   closure.
-- **S5 projection versus engine.** S1–S4 now run through the actual packed
-  adapter and pass storage conformance. S5 still needs task 4.4 and the 4.5
-  recheck; its C projections are estimates. The archived absolute payload
-  saving overstates the current operation-table footprint, so D8.4 also
-  records a proportional estimate. No format change is selected by those
-  projections: measured B/N=4000 already meets the L2 gate without S5.
+- **S5 projection versus engine.** S1–S5 now run through the actual packed
+  adapter and pass storage conformance. D8.4 records physical measurements
+  after actual pruning; archived payload projections do not select a format
+  change. Measured B/N=4000 passes the L2 gate.
 - **Memo memory.** The R4 memo holds decoded snapshots; bounded by
   `validated_root_memo_bytes`.
 - **CPU stays O(N) per commit** for policy and checkpoint validation (U9
@@ -876,3 +901,57 @@ Group 4 builds S1–S5. The format levers F1 and F2 (journal schema 5) are not
 built, because storage-only levers meet the gate. They stay documented as the
 path if a later gate tightens. Fixture A and the L1 ratios remain reported,
 but they do not gate.
+
+## Step 6 final verification evidence
+
+All Cargo checks used `/Volumes/Data/tmp/refactor/c.sh`, explicit timeouts,
+foreground supervision and this worktree's single `target` directory.
+
+| Check | Result | Evidence under `rt-e6/` |
+| --- | --- | --- |
+| Formatting | PASS | `v3-fmt.log` |
+| Clippy all targets/features, warnings denied | PASS; zero warnings | `v3-clippy.log` |
+| Core all features | 314 passed | `warm-read-core.log` |
+| Runtime all features | 677 passed | `v3-runtime.log` |
+| Testkit all features | 441 passed | `v3-testkit.log` |
+| LCM all features | 62 passed | `v3-lcm.log` |
+| Bench | 10 passed; two reports ignored in debug | `v3-bench.log` |
+| Primary release report | PASS; 13 cases | `v3-release-report.log` |
+| C/N=4000 supplement | NOT MET: timeout | `final-c4000-attempt2.log` |
+| Rust 1.86 core/runtime build | PASS | `v3-msrv.log` |
+| Dependency boundaries | PASS; six commands, 13-package bench-leaf check | `dependency-boundaries.json` |
+| Existing expectation integrity | PASS; one authorized change | `test-integrity.json` |
+| Strict spec validation | PASS; 2 delta files, 13 requirements | `strict-spec-final.log` |
+
+Normal commands total **1,504 passed, zero failed**. Release reports add
+**1 passing tests**. Every primary before/after physical value is
+identical to the pre-R4 S5 run. C/N=1000 prunes 4,002 results to 130; C/N=4000 remains NOT MET: supplement exceeded the reserved measurement time. All 13 primary cases pass.
+
+The memo is keyed by session/head id, bounded by the existing 256 MiB estimated
+budget, with LRU eviction, oversize rejection and zero-budget disablement.
+Charges include bodies, decoded snapshot estimates, closure ids, parsed links
+and encoding metadata. Exact closures remain eager. Parsed links are cached by
+id and expected kind; missing bodies/wrong kinds still fail. New writers trim
+cache-only data without changing membership. Both domains' 100-message tests
+prove zero storage object calls at memoized open, warm snapshot, renew and
+commit, after collection/writer change. Tested commits call load/pins/operation/
+apply once each and perform zero full snapshot validations. Eviction causes one
+full validation, then a hit. The unchanged future-size gate passes: largest
+`commit_inner` = **4,944 / 16,384 bytes**, read = 104 bytes.
+
+The only existing expectation change is
+`crates/agent-runtime-testkit/src/conformance/journal_consumers/recovery.rs:249`,
+`loads + 2` → `loads`, explicitly authorized for R5 and shared by three consumer
+fixtures. Both named memory tests' assertions are unchanged (comment only).
+Original GC/replay conformance, reviewer tests and the storage trait remain
+byte-identical. The only new public API is `JournalReader::extension`.
+
+The first C/N=4000 attempt was intentionally stopped to bound unused fake-provider
+request/call diagnostics. An initial supervisor interruption left its child
+running; cleanup retired only its disposable fixture session, and the temporary
+control helper was removed. The revised runner forwards cancellation to its own
+child group (timeout self-test passes). Per-turn fresh fakes use the same scripts,
+capabilities and explicit cache endpoint; all 13 physical sizes remain identical.
+No production data, schema, dependency or storage-trait signature changed.
+
+NOT MET: C/N=4000 physical ratio is unavailable within the reserved budget. The B gate and all 13 primary release cases pass; B/tool also misses the optional 1.5× aim.

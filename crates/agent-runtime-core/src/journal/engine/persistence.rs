@@ -609,6 +609,14 @@ impl<S: JournalStorage> JournalEngine<S> {
         write: JournalWrite,
         session: &SessionId,
     ) -> Result<JournalApplyReceipt, RuntimeError> {
+        // Even a lost acknowledgement may have released membership. Preserve
+        // unaffected validation evidence, trimming only released cache bodies.
+        if !write.release.is_empty() {
+            self.memo
+                .lock()
+                .map_err(|_| host_failure())?
+                .release(session, &write.release);
+        }
         match self.storage.apply(write).await {
             Ok(receipt) => Ok(receipt),
             Err(error) => {
@@ -618,6 +626,10 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
     }
     fn invalidate(&self, session: &SessionId) -> Result<(), RuntimeError> {
+        self.memo
+            .lock()
+            .map_err(|_| host_failure())?
+            .remove_session(session);
         if let Some(record) = self.local.lock()?.sessions.get_mut(session) {
             record.ordinary_snapshot = None;
             record.ordinary_encoding = None;
@@ -715,27 +727,37 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         let (scratch, stored) = self.hydrate(lease.session()).await?;
         let lease_record = self.local.live_lease(&*self.local.lock()?, lease)?;
+        let mut objects =
+            if let Some(root) = stored.as_ref().and_then(|record| record.head.as_ref()) {
+                self.memoized_root(lease.session(), &root.id)?
+                    .map(|entry| entry.objects.clone())
+                    .unwrap_or_default()
+            } else {
+                ObjectStore::default()
+            };
         let ids: Vec<_> = lease_record
             .reachable
             .layers
             .iter()
-            .flat_map(|l| l.iter().cloned())
+            .flat_map(|layer| layer.iter().cloned())
+            .filter(|id| objects.get(id).is_none())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let bodies = self
-            .storage
-            .objects(&self.domain, lease.session(), &ids)
-            .await?;
-        if bodies.len() != ids.len() {
-            return Err(conflict());
+        if !ids.is_empty() {
+            let bodies = self
+                .storage
+                .objects(&self.domain, lease.session(), &ids)
+                .await?;
+            if bodies.len() != ids.len() {
+                return Err(conflict());
+            }
+            objects.begin_layer();
+            for (id, body) in ids.into_iter().zip(bodies) {
+                objects.insert_new(id, body.ok_or_else(conflict)?.to_vec())?;
+            }
         }
-        let objects = ids
-            .into_iter()
-            .zip(bodies)
-            .map(|(id, b)| Ok((id, b.ok_or_else(conflict)?.to_vec())))
-            .collect::<Result<BTreeMap<_, _>, RuntimeError>>()?;
-        scratch.lock()?.objects = ObjectStore::from_map(objects);
+        scratch.lock()?.objects = objects;
         // A storage error invalidates cached records. On a cold ordinary
         // record, recover the projected base from its immutable published root
         // before replaying an advisory transition delta.
@@ -890,6 +912,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 Some(self.local.token(lease)?.handle),
                 true,
             )?;
+            self.remember_commit(&scratch, lease.session())?;
             self.mark_dirty(lease.session())?;
         }
         applied?;

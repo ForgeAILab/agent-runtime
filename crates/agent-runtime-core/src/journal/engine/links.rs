@@ -10,7 +10,7 @@ pub(in crate::journal) fn stored_object(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::journal) enum ExpectedLeaf {
     Kind(JournalObjectKind),
     Extension,
@@ -19,11 +19,66 @@ pub(in crate::journal) enum ExpectedLeaf {
     JsonObjectEntry,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::journal) enum ExpectedObject {
     Leaf(ExpectedLeaf),
     Sequence(ExpectedLeaf),
     Map(ExpectedLeaf),
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::journal) struct CachedLinks {
+    pub(in crate::journal) expected: ExpectedObject,
+    pub(in crate::journal) children: Arc<Vec<(JournalObjectId, ExpectedObject)>>,
+}
+
+/// Exact closure with immutable, expected-kind-scoped parsed edges. Validation
+/// still runs on every new (id, expected kind); old edges need no JSON reparse.
+pub(in crate::journal) fn memoized_closure(
+    objects: &mut ObjectStore,
+    root: &JournalObjectId,
+    expected: ExpectedObject,
+) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
+    let mut closure = BTreeSet::new();
+    let mut pending = vec![(root.clone(), expected)];
+    let mut added: BTreeMap<JournalObjectId, Vec<CachedLinks>> = BTreeMap::new();
+    while let Some((id, expected)) = pending.pop() {
+        if !closure.insert(id.clone()) {
+            continue;
+        }
+        let bytes = objects.get(&id).ok_or_else(conflict)?;
+        let cached = added
+            .get(&id)
+            .into_iter()
+            .chain(objects.links.get(&id))
+            .flat_map(|variants| variants.iter())
+            .find(|entry| entry.expected == expected);
+        let children = if let Some(entry) = cached {
+            entry.children.clone()
+        } else {
+            let object = JournalObject {
+                id: id.clone(),
+                bytes: bytes.clone(),
+            };
+            if !expected_matches(expected, object.kind()?) {
+                return Err(conflict());
+            }
+            let children = Arc::new(object_links(&object, expected)?);
+            added.entry(id).or_default().push(CachedLinks {
+                expected,
+                children: children.clone(),
+            });
+            children
+        };
+        pending.extend(children.iter().cloned());
+    }
+    if !added.is_empty() {
+        let cached = Arc::make_mut(&mut objects.links);
+        for (id, variants) in added {
+            cached.entry(id).or_default().extend(variants);
+        }
+    }
+    Ok(closure)
 }
 
 pub(in crate::journal) fn snapshot_links(
