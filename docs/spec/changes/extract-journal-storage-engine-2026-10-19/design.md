@@ -392,10 +392,14 @@ entry. Cold opens validate once; memoized opens reuse the closure and seed
 without object reads or full materialization, including across writer epochs.
 Unreplayable protected deltas still fall back to full validation.
 
-`validated_root_memo_bytes` defaults to 256 MiB per engine. The conservative
+`validated_root_memo_bytes` defaults to 256 MiB per engine. The estimated
 charge includes stored encoded bodies and their id/index overhead, canonical
 snapshot bytes, closure ids, encoding-cache ids/keys, and entry overhead;
-shared data is charged to every entry. Least recently used entries are evicted
+shared data is charged to every entry. It is not an upper bound for one entry:
+a counting-allocator probe (review rt-e6) measured actual retained heap at
+1.007–1.240× the charge, highest for many small messages, where decoded values
+and per-object index overhead exceed their encoded size. Several entries that
+share layers are over-charged instead. Least recently used entries are evicted
 until the new entry fits. An oversized entry is not retained; zero disables
 retention. This budget covers the memo, independently of live writer working
 sets and the pre-existing session state caches. No storage trait change is
@@ -410,8 +414,13 @@ durable memberships; reader/GC roots are unchanged. Tests prove edge reuse,
 wrong-kind rejection, missing-body rejection and unchanged membership on trim.
 
 The immutable body cache also mitigates N2: commit starts from the memoized
-head's shared object layers and fetches only missing admitted lease objects
-(e.g. separately staged leaves), rather than reloading the whole lease closure.
+head's shared object layers and trusts only that stored head's exact closure,
+whose membership D4 guarantees. Every other lease-reachable id (superseded
+bodies of the current writer epoch, separately staged leaves) is reread through
+membership-scoped storage, as on the cold path, rather than reloading the whole
+lease closure. A cached body is never rewritten by a commit, so trusting a
+cache-only body that another engine had released would publish a head over a
+missing body (review rt-e6).
 Renew reuses the same validated closure. Public reads can reuse immutable
 memoized bodies after validating the live lease and its admitted reachability;
 bytes retain the ordinary hash/kind check and the lease is checked again before
@@ -425,6 +434,22 @@ membership, and trims released cache-only bodies from unaffected entries.
 Thus current-root validation survives ordinary collection, and a cached body
 can never suppress re-admission of an object whose membership was released.
 A failed storage apply clears the session's memo conservatively.
+
+**Open decision (review rt-e6): warm reads and another engine's collection.**
+The memo is per engine. Within one engine and its clones every membership
+release passes through collection's `release` and the new-writer trim, and
+collection keeps every local lease's reachable set, so served bodies stay
+members. A second engine over the same storage and domain (another process, or
+a host that builds a second engine instead of cloning) does not see this
+engine's leases. When it advances the head and collects, a cold `read` on an
+older lease here returns `StateConflict` for the released body, but a warm
+`read` serves it from the memo, against D2 rule 7. Commit, open, renew and
+retirement checks already match the cold path. The options are: (a) require one
+engine, cloned, per storage and domain wherever collection runs, and document
+it for hosts; (b) always read public bodies through membership-scoped storage,
+giving up zero-I/O warm snapshot restoration; or (c) recheck the stored head
+once per reader before serving memo bodies. Reproduction:
+`rt-e6-review/two-engine-read-repro.rs`.
 
 The two named existing writer-change/advisory-delta tests have no full-count
 assertion requiring a change; all their assertions stay unchanged. New tests
