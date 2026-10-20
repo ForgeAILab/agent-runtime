@@ -7,6 +7,23 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Breaking
+
+- `JournalGcReport` gains `unreadable_sessions: Vec<SessionId>`; struct literals
+  must set it (older serialized reports deserialize with an empty list).
+  Collection now isolates non-retryable per-session read/apply failures and
+  reports sorted unique session ids, preserving their durable state and dirty
+  hints for retry on the next call. Retryable and domain-wide failures still
+  abort; previously acknowledged session transactions remain applied. Storage
+  adapters must mark ambiguous/lost apply acknowledgements retryable;
+  non-retryable apply errors must leave the transaction unapplied.
+
+### Added
+
+- Storage conformance cases for unreadable-session collection, membership checks
+  on warm body-cache hits, exact object lookup across four-byte id-prefix
+  collisions, and membership enumeration after release or without admission.
+
 ## [0.8.0] - 2026-10-20
 
 ### Breaking

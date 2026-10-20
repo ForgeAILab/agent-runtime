@@ -244,7 +244,10 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
         limit: usize,
     ) -> Result<Vec<SessionId>, RuntimeError>;
     /// Returns exactly the bodies this transaction physically deleted and the
-    /// sum of their canonical encoded lengths. Deferred dead bodies count when
+    /// sum of their canonical encoded lengths. Non-retryable errors must leave
+    /// the transaction unapplied; ambiguous/lost acknowledgements must be
+    /// retryable so the engine aborts rather than reporting safe isolation.
+    /// Deferred dead bodies count when
     /// a later apply physically removes them; clearing bits alone counts zero.
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError>;
     /// Physical compaction only (repack, VACUUM). Never changes membership.

@@ -1584,6 +1584,7 @@ impl Transition {
             examined,
             deleted: deleted.len() as u64,
             reclaimed_bytes,
+            unreadable_sessions: Vec::new(),
         })
     }
 }

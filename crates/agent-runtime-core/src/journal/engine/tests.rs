@@ -52,8 +52,18 @@ struct LostAcknowledgement {
     calls: Mutex<BTreeMap<(&'static str, SessionId), usize>>,
     pause_load: Mutex<Option<LoadPause>>,
     pin_writes: Mutex<Vec<(JournalWriteKind, usize)>>,
+    failure: Mutex<Option<(SessionId, &'static str, RuntimeError)>>,
+    hide_unreadable: std::sync::atomic::AtomicBool,
 }
 impl LostAcknowledgement {
+    fn fail(&self, name: &str, session: &SessionId) -> Result<(), RuntimeError> {
+        if let Some((target, method, error)) = &*self.failure.lock().unwrap() {
+            if target == session && *method == name {
+                return Err(error.clone());
+            }
+        }
+        Ok(())
+    }
     fn count(&self, name: &'static str, session: &SessionId) {
         *self
             .calls
@@ -71,6 +81,7 @@ impl JournalStorage for LostAcknowledgement {
         s: &SessionId,
     ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
         self.count("load", s);
+        self.fail("load", s)?;
         let pause = self.pause_load.lock().unwrap().take();
         if let Some((ready, resume)) = pause {
             ready.send(()).unwrap();
@@ -85,6 +96,7 @@ impl JournalStorage for LostAcknowledgement {
         ids: &[JournalObjectId],
     ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
         self.count("objects", s);
+        self.fail("objects", s)?;
         self.inner.objects(d, s, ids).await
     }
     async fn members(
@@ -93,6 +105,7 @@ impl JournalStorage for LostAcknowledgement {
         s: &SessionId,
     ) -> Result<Vec<JournalObjectId>, RuntimeError> {
         self.count("members", s);
+        self.fail("members", s)?;
         self.inner.members(d, s).await
     }
     async fn operation(
@@ -110,6 +123,7 @@ impl JournalStorage for LostAcknowledgement {
         s: &SessionId,
     ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
         self.count("pins", s);
+        self.fail("pins", s)?;
         self.inner.pins(d, s).await
     }
     async fn catalog(
@@ -128,13 +142,26 @@ impl JournalStorage for LostAcknowledgement {
         n: usize,
     ) -> Result<Vec<SessionId>, RuntimeError> {
         self.count("dirty_sessions", &SessionId::new(""));
-        self.inner.dirty_sessions(d, a, n).await
+        self.fail("dirty_sessions", &SessionId::new(""))?;
+        let mut page = self.inner.dirty_sessions(d, a, n).await?;
+        if self
+            .hide_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Some((session, _, _)) = &*self.failure.lock().unwrap() {
+                page.retain(|s| s != session);
+            }
+        }
+        Ok(page)
     }
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(d).await
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.count("apply", &write.session);
+        if write.kind == JournalWriteKind::Collect {
+            self.fail("apply", &write.session)?;
+        }
         // Logical durable payload: raw ids, pin id, flag, metadata version and
         // metadata bytes. Excludes host-specific row/framing overhead.
         let bytes = write
@@ -2875,7 +2902,10 @@ async fn r3_a_stale_collection_write_cannot_release_a_root_another_engine_pinned
             .all(Option::is_some),
         "stale collection released a root another engine pinned"
     );
-    assert_control_conflict(collected);
+    assert_eq!(
+        collected.unwrap().unreadable_sessions,
+        vec![session.clone()]
+    );
     // A retry reloads the new fence; used and fresh collectors stay healthy.
     sweep(&collector, u64::MAX).await;
     let (_, fresh) = two_engines(&storage, 0);
@@ -2932,7 +2962,10 @@ async fn r3_a_stale_dependent_candidate_write_cannot_lose_retirement_authorizati
         metadata(record)["authorization"].is_array(),
         "stale candidate write lost the authorization"
     );
-    assert_control_conflict(collected);
+    assert_eq!(
+        collected.unwrap().unreadable_sessions,
+        vec![source.clone(), target.clone()]
+    );
     // A retry records the candidate on the new fence and keeps the grant.
     sweep(&collector, u64::MAX).await;
     let record = storage
@@ -2947,3 +2980,6 @@ async fn r3_a_stale_dependent_candidate_write_cannot_lose_retirement_authorizati
         serde_json::json!([source.as_str()])
     );
 }
+
+#[path = "collection_isolation_tests.rs"]
+mod collection_isolation;

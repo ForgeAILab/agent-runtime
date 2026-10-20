@@ -1,6 +1,23 @@
 use super::persistence::{pin_changes, pin_records};
 use super::*;
 
+// Only errors scoped to a session may be isolated. Domain discovery and root
+// epoch checks stay outside this boundary and still fail the whole call.
+pub(super) fn isolate_collection_failure<T>(
+    session: &SessionId,
+    result: Result<T, RuntimeError>,
+    unreadable: &mut BTreeSet<SessionId>,
+) -> Result<Option<T>, RuntimeError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.retryable => Err(error),
+        Err(_) => {
+            unreadable.insert(session.clone());
+            Ok(None)
+        }
+    }
+}
+
 impl<S: JournalStorage> JournalEngine<S> {
     /// Records host authorization for exactly this published revision.
     pub async fn authorize_retirement(
@@ -142,6 +159,8 @@ impl<S: JournalStorage> JournalEngine<S> {
     /// Canonical retained-body bytes from storage when available (including
     /// deferred dead copies); otherwise live bytes in observed/dirty sessions,
     /// deduplicated within this domain. Diagnostic only, not on-disk file size.
+    /// Errors remain errors: this scalar cannot describe omitted sessions, so
+    /// skipping unreadable membership would silently undercount retained bytes.
     pub async fn retained_bytes(&self) -> Result<u64, RuntimeError> {
         let _gate = self.gate.lock().await;
         if let Some(bytes) = self.storage.retained_bytes(&self.domain).await? {
@@ -233,11 +252,19 @@ impl<S: JournalStorage> JournalEngine<S> {
         // therefore cannot be erased by this sweep.
         let local_dirty = std::mem::take(&mut *self.dirty.lock().map_err(|_| host_failure())?);
         let result = self.collect_sessions(&request, &local_dirty).await;
-        if result.is_err() {
-            self.dirty
+        match &result {
+            Err(_) => self
+                .dirty
                 .lock()
                 .map_err(|_| host_failure())?
-                .extend(local_dirty);
+                .extend(local_dirty),
+            // Keep even local-only hints: a repaired record/key should be
+            // retried without requiring a new write to discover it.
+            Ok(report) => self
+                .dirty
+                .lock()
+                .map_err(|_| host_failure())?
+                .extend(report.unreadable_sessions.iter().cloned()),
         }
         result
     }
@@ -263,7 +290,9 @@ impl<S: JournalStorage> JournalEngine<S> {
             examined: 0,
             deleted: 0,
             reclaimed_bytes: 0,
+            unreadable_sessions: Vec::new(),
         };
+        let mut unreadable = BTreeSet::new();
         // The work budget counts membership releases, including shared bodies
         // whose physical deletion receipt is zero. Reports count body deletions.
         let mut released = 0;
@@ -294,23 +323,50 @@ impl<S: JournalStorage> JournalEngine<S> {
                         .lock()
                         .map_err(|_| host_failure())?
                         .extend(local_pending);
+                    report.unreadable_sessions = unreadable.into_iter().collect();
                     return Ok(report);
                 }
                 local_pending.remove(&session);
-                let stored = self.storage.load(&self.domain, &session).await?;
-                let (live, dependencies) = self.collection_live(&session, stored.as_ref()).await?;
-                let members = self.storage.members(&self.domain, &session).await?;
-                let member_set: BTreeSet<_> = members.iter().cloned().collect();
-                if !live.is_subset(&member_set) {
-                    return Err(conflict());
+                // A dependency-index read may already have failed for this
+                // session. Do not load it again within the same call.
+                if unreadable.contains(&session) {
+                    continue;
                 }
+                let read = async {
+                    let stored = self.storage.load(&self.domain, &session).await?;
+                    let (live, dependencies) =
+                        self.collection_live(&session, stored.as_ref()).await?;
+                    let members = self.storage.members(&self.domain, &session).await?;
+                    let member_set: BTreeSet<_> = members.iter().cloned().collect();
+                    if !live.is_subset(&member_set) {
+                        return Err(conflict());
+                    }
+                    Ok((stored, live, dependencies, members))
+                }
+                .await;
+                let Some((stored, live, dependencies, members)) =
+                    isolate_collection_failure(&session, read, &mut unreadable)?
+                else {
+                    continue;
+                };
                 // Close/revocation remain I/O-free while storage reads await.
                 // Preserve the original collector's post-read mark check before
                 // the first write can change membership or clear dirty flags.
                 if released == 0 && self.root_epoch()? != request.expected_root_epoch {
                     return Err(conflict());
                 }
-                Box::pin(self.index_retirement_dependencies(&session, dependencies)).await?;
+                if !Box::pin(self.index_retirement_dependencies(
+                    &session,
+                    dependencies,
+                    &mut unreadable,
+                ))
+                .await?
+                {
+                    // Without the candidate index, this source cannot safely
+                    // become clean. Preserve its own state and retry hint too.
+                    unreadable.insert(session.clone());
+                    continue;
+                }
                 if released == 0 && self.root_epoch()? != request.expected_root_epoch {
                     return Err(conflict());
                 }
@@ -324,7 +380,15 @@ impl<S: JournalStorage> JournalEngine<S> {
                 let release: Vec<_> = garbage.into_iter().take(limit).collect();
                 if let Some(mut record) = stored {
                     let expect = record.fence();
-                    record.generation = expect.generation.checked_add(1).ok_or_else(conflict)?;
+                    let Some(generation) = isolate_collection_failure(
+                        &session,
+                        expect.generation.checked_add(1).ok_or_else(conflict),
+                        &mut unreadable,
+                    )?
+                    else {
+                        continue;
+                    };
+                    record.generation = generation;
                     record.collection_dirty = !complete;
                     // Inclusive edge: revision -64 survives, -65 may be
                     // pruned. Storage also preserves this writer epoch's last
@@ -348,11 +412,19 @@ impl<S: JournalStorage> JournalEngine<S> {
                         prune_operations_before: Some(replay_floor),
                         inject: None,
                     };
-                    let receipt = self.apply(write, &session).await?;
+                    let Some(receipt) = isolate_collection_failure(
+                        &session,
+                        self.apply(write, &session).await,
+                        &mut unreadable,
+                    )?
+                    else {
+                        continue;
+                    };
                     report.deleted += receipt.reclaimed_objects;
                     report.reclaimed_bytes += receipt.reclaimed_bytes;
                 } else if !release.is_empty() {
-                    return Err(conflict());
+                    unreadable.insert(session.clone());
+                    continue;
                 }
                 self.local
                     .lock()?
@@ -377,6 +449,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 None => break,
             }
         }
+        report.unreadable_sessions = unreadable.into_iter().collect();
         Ok(report)
     }
 }
