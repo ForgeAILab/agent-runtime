@@ -16,7 +16,9 @@ contain breaking changes and are coordinated with consumer proposals.
   hints for retry on the next call. Retryable and domain-wide failures still
   abort; previously acknowledged session transactions remain applied. Storage
   adapters must mark ambiguous/lost apply acknowledgements retryable;
-  non-retryable apply errors must leave the transaction unapplied.
+  non-retryable apply errors must leave the transaction unapplied. Storage
+  conformance (`atomic_apply_cuts`) now rejects a non-retryable error from the
+  after-commit cut.
 
 ### Added
 

@@ -18,6 +18,7 @@ enum Defect {
     CachedBodyWithoutMembership,
     PrefixLookup,
     MembersWithoutMembership,
+    NonRetryableLostAck,
 }
 trait Fault: std::fmt::Debug + Send + Sync + 'static {
     const DEFECT: Defect;
@@ -29,7 +30,7 @@ macro_rules! faults {
         impl Fault for $name { const DEFECT: Defect = Defect::$name; }
     )*};
 }
-faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; }
+faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; }
 
 type CacheKey = (String, u8, SessionId, JournalObjectId);
 type AdmittedKey = (String, u8);
@@ -312,7 +313,15 @@ impl<F: Fault> JournalStorage for Broken<F> {
         let committed_cut = write
             .inject
             .is_some_and(JournalCommitFailurePoint::is_after_commit);
-        let result = self.inner().apply(write).await;
+        let mut result = self.inner().apply(write).await;
+        if F::DEFECT == Defect::NonRetryableLostAck && committed_cut {
+            // The transaction committed, but its lost acknowledgement claims
+            // a definite failure, which collection would treat as no effect.
+            result = result.map_err(|mut error| {
+                error.retryable = false;
+                error
+            });
+        }
         if F::DEFECT == Defect::MembersWithoutMembership && (result.is_ok() || committed_cut) {
             self.admitted
                 .lock()
@@ -415,4 +424,9 @@ async fn m14_members_without_membership_fails_in_both_scopes() {
         rejects_with_sharing::<MembersWithoutMembership>("exact_membership_enumeration", sharing)
             .await;
     }
+}
+#[tokio::test]
+async fn non_retryable_lost_acknowledgement_fails_atomic_apply_cuts() {
+    let message = rejects::<NonRetryableLostAck>("atomic_apply_cuts").await;
+    assert!(message.contains("a lost acknowledgement must be retryable"));
 }

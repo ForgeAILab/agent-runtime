@@ -441,9 +441,16 @@ where
         );
         let before = view(&*storage, &first, &next).await;
         next.inject = Some(cut);
-        assert!(storage.apply(next.clone()).await.is_err(), "cut {cut:?}");
+        let result = storage.apply(next.clone()).await;
+        assert!(result.is_err(), "cut {cut:?}");
         let after = view(&*storage, &first, &next).await;
         if cut.is_after_commit() {
+            // Collection isolates non-retryable apply errors as "no effect".
+            // An acknowledgement lost after the commit point must not be.
+            assert!(
+                result.as_ref().is_err_and(|error| error.retryable),
+                "cut {cut:?}: a lost acknowledgement must be retryable"
+            );
             assert_eq!(after.record, Some(next.record.clone()));
             assert_eq!(after.operations[1], next.operation);
             assert!(
