@@ -727,11 +727,9 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         let (scratch, stored) = self.hydrate(lease.session()).await?;
         let lease_record = self.local.live_lease(&*self.local.lock()?, lease)?;
-        // Only the stored head's closure is guaranteed membership (D4). Any
-        // other lease-reachable body, even one cached here, is rechecked: a
-        // collection elsewhere may have released it, and a body already in
-        // `objects` is never rewritten, so trusting it would publish a head
-        // over a missing body.
+        // Only the stored head's closure is guaranteed membership (D4). Cached
+        // bodies outside it may have been released by another engine; any
+        // the new head references are rechecked before the write below.
         let (mut objects, verified) = match stored.as_ref().and_then(|record| record.head.as_ref())
         {
             Some(root) => match self.memoized_root(lease.session(), &root.id)? {
@@ -745,14 +743,11 @@ impl<S: JournalStorage> JournalEngine<S> {
             .layers
             .iter()
             .flat_map(|layer| layer.iter().cloned())
-            .filter(|id| {
-                !verified
-                    .as_ref()
-                    .is_some_and(|closure| closure.contains(id))
-            })
+            .filter(|id| objects.get(id).is_none())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let fetched: BTreeSet<_> = ids.iter().cloned().collect();
         if !ids.is_empty() {
             let bodies = self
                 .storage
@@ -761,18 +756,9 @@ impl<S: JournalStorage> JournalEngine<S> {
             if bodies.len() != ids.len() {
                 return Err(conflict());
             }
-            let mut missing = Vec::new();
+            objects.begin_layer();
             for (id, body) in ids.into_iter().zip(bodies) {
-                let body = body.ok_or_else(conflict)?;
-                if objects.get(&id).is_none() {
-                    missing.push((id, body));
-                }
-            }
-            if !missing.is_empty() {
-                objects.begin_layer();
-                for (id, body) in missing {
-                    objects.insert_new(id, body.to_vec())?;
-                }
+                objects.insert_new(id, body.ok_or_else(conflict)?.to_vec())?;
             }
         }
         scratch.lock()?.objects = objects;
@@ -834,7 +820,34 @@ impl<S: JournalStorage> JournalEngine<S> {
             .dependencies
             .sessions
             .clone();
-        if self.retired_dependency(&dependencies).await? {
+        let (root, entry) = self.commit_memo_entry(&scratch, lease.session())?;
+        // A body already in `objects` is never rewritten. Each one the new
+        // head references outside the stored closure must still be a member.
+        let unverified: Vec<_> = match &verified {
+            Some(closure) => {
+                let state = scratch.lock()?;
+                let written = state.objects.layers.last().ok_or_else(conflict)?;
+                entry
+                    .closure
+                    .iter()
+                    .filter(|id| {
+                        !closure.contains(*id)
+                            && !fetched.contains(*id)
+                            && !written.contains_key(*id)
+                    })
+                    .cloned()
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let released = !unverified.is_empty() && {
+            let bodies = self
+                .storage
+                .objects(&self.domain, lease.session(), &unverified)
+                .await?;
+            bodies.len() != unverified.len() || bodies.iter().any(Option::is_none)
+        };
+        if released || self.retired_dependency(&dependencies).await? {
             // The reference validates dependencies after the batch cut and
             // before the pin cut: an earlier cut wins, a later one stays armed.
             let cut = scratch.cut.lock().map_err(|_| host_failure())?.take();
@@ -930,7 +943,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 Some(self.local.token(lease)?.handle),
                 true,
             )?;
-            self.remember_commit(&scratch, lease.session())?;
+            self.remember_root(lease.session(), &root, entry)?;
             self.mark_dirty(lease.session())?;
         }
         applied?;

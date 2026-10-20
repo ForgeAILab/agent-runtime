@@ -414,13 +414,15 @@ durable memberships; reader/GC roots are unchanged. Tests prove edge reuse,
 wrong-kind rejection, missing-body rejection and unchanged membership on trim.
 
 The immutable body cache also mitigates N2: commit starts from the memoized
-head's shared object layers and trusts only that stored head's exact closure,
-whose membership D4 guarantees. Every other lease-reachable id (superseded
-bodies of the current writer epoch, separately staged leaves) is reread through
-membership-scoped storage, as on the cold path, rather than reloading the whole
-lease closure. A cached body is never rewritten by a commit, so trusting a
-cache-only body that another engine had released would publish a head over a
-missing body (review rt-e6).
+head's shared object layers and fetches only missing admitted lease objects
+(e.g. separately staged leaves), rather than reloading the whole lease closure.
+Only the stored head's exact closure has guaranteed membership (D4), and a
+commit never rewrites a body it already holds. So before its write, a memoized
+commit rechecks through membership-scoped storage every body the new head
+references that lies outside that closure and was neither fetched nor newly
+written (a re-referenced superseded body); a missing one is `StateConflict`, as
+on the cold path. Append-only commits recheck nothing. Without this, a body
+released by another engine published a head over a missing body (review rt-e6).
 Renew reuses the same validated closure. Public reads can reuse immutable
 memoized bodies after validating the live lease and its admitted reachability;
 bytes retain the ordinary hash/kind check and the lease is checked again before
@@ -444,7 +446,7 @@ a host that builds a second engine instead of cloning) does not see this
 engine's leases. When it advances the head and collects, a cold `read` on an
 older lease here returns `StateConflict` for the released body, but a warm
 `read` serves it from the memo, against D2 rule 7. Commit, open, renew and
-retirement checks already match the cold path. The options are: (a) require one
+retirement decisions already match the cold path. The options are: (a) require one
 engine, cloned, per storage and domain wherever collection runs, and document
 it for hosts; (b) always read public bodies through membership-scoped storage,
 giving up zero-I/O warm snapshot restoration; or (c) recheck the stored head

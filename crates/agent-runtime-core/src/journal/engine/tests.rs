@@ -1782,3 +1782,77 @@ async fn a_warm_engine_matches_a_cold_one_after_another_engine_fences_and_retire
         "two engines [stale commit ok, writer after retire ok, reader after retire ok]: {outcomes:?}"
     );
 }
+
+#[tokio::test]
+async fn a_memoized_commit_may_re_reference_a_superseded_member() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(LostAcknowledgement::default());
+        let engine = JournalEngine::protected(
+            storage.clone(),
+            JournalStorageId::new("rereference"),
+            JournalEngineConfig {
+                validated_root_memo_bytes: budget,
+                ..Default::default()
+            },
+        );
+        let session = SessionId::new("rereference");
+        let mut known = BTreeSet::new();
+        let lease = engine.open(&session, writer("one")).await.unwrap();
+        let mut head = None;
+        for (index, value) in ["a", "b", "a"].into_iter().enumerate() {
+            storage.calls.lock().unwrap().clear();
+            head = Some(
+                engine
+                    .commit(
+                        &lease,
+                        full_commit(
+                            &session,
+                            1,
+                            head.as_ref(),
+                            &format!("op-{index}"),
+                            ext_snapshot(&session, value),
+                            &mut known,
+                        ),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        if budget != 0 {
+            // Only the re-referenced superseded bodies are rechecked.
+            assert_eq!(
+                storage
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .get(&("objects", session.clone())),
+                Some(&1)
+            );
+        }
+        engine.close(lease).await.unwrap();
+        let cold = JournalEngine::protected(
+            storage.clone(),
+            engine.storage_id(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: 0,
+                ..Default::default()
+            },
+        );
+        let check = cold.open(&session, reader("check")).await.unwrap();
+        let snapshot = JournalReader::new(
+            &cold,
+            &check,
+            JournalReadLimits {
+                objects: u64::MAX,
+                encoded_bytes: u64::MAX,
+                entries: u64::MAX,
+            },
+        )
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot, ext_snapshot(&session, "a"));
+    }
+}
