@@ -2810,3 +2810,140 @@ async fn r3_stale_control_write_cannot_lose_a_retirement_dependents_candidate() 
         .unwrap();
     assert_control_conflict(fresh.retire(&target, head.revision).await);
 }
+
+fn collect_all(engine: &JournalEngine<PausedApply>) -> JournalGcRequest {
+    JournalGcRequest {
+        storage_id: engine.storage_id(),
+        expected_root_epoch: engine.root_epoch().unwrap(),
+        max_objects: u64::MAX,
+    }
+}
+
+// Here the per-session collection write is the stale writer: it computed its
+// live set before another engine durably pinned a root it is releasing.
+#[tokio::test]
+async fn r3_a_stale_collection_write_cannot_release_a_root_another_engine_pinned() {
+    let storage = Arc::new(PausedApply::default());
+    let (reading, collector) = two_engines(&storage, 0);
+    let session = SessionId::new("collect-race");
+    let mut known = BTreeSet::new();
+    let lease = reading.open(&session, writer("writer")).await.unwrap();
+    let first = reading
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                None,
+                "first",
+                ext_snapshot(&session, "a"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    let historical = reading.open(&session, reader("historical")).await.unwrap();
+    reading
+        .commit(
+            &lease,
+            full_commit(
+                &session,
+                1,
+                Some(&first),
+                "second",
+                ext_snapshot(&session, "b"),
+                &mut known,
+            ),
+        )
+        .await
+        .unwrap();
+    reading.close(lease).await.unwrap();
+    let (resume, paused) = storage.pause_next(JournalWriteKind::Collect);
+    let (collected, ()) = tokio::join!(collector.collect(collect_all(&collector)), async {
+        paused.await.unwrap();
+        reading.retain_root(&historical).await.unwrap();
+        resume.send(()).unwrap();
+    });
+    let pins = storage.pins(&reading.domain, &session).await.unwrap();
+    assert_eq!(pins.len(), 1);
+    assert!(
+        storage
+            .objects(&reading.domain, &session, &pins[0].roots)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_some),
+        "stale collection released a root another engine pinned"
+    );
+    assert_control_conflict(collected);
+    // A retry reloads the new fence; used and fresh collectors stay healthy.
+    sweep(&collector, u64::MAX).await;
+    let (_, fresh) = two_engines(&storage, 0);
+    sweep(&fresh, u64::MAX).await;
+    reading.close(historical).await.unwrap();
+}
+
+// Here the retirement-dependent candidate write on another session's record is
+// the stale writer: it loaded the target before another engine authorized it.
+#[tokio::test]
+async fn r3_a_stale_dependent_candidate_write_cannot_lose_retirement_authorization() {
+    let storage = Arc::new(PausedApply::default());
+    let (reading, collector) = two_engines(&storage, 0);
+    reading.enable_collection().unwrap();
+    let target = SessionId::new("z-target");
+    let source = SessionId::new("a-source");
+    let head = seed_control_race(&reading, &target).await;
+    let writer = collector.open(&source, writer("source")).await.unwrap();
+    let mut snapshot = ext_snapshot(&source, "dependency");
+    snapshot.extension_state.insert(
+        "agent-runtime.delegation.children".into(),
+        crate::store::VersionedSessionState::new(
+            agent_runtime_registry::RegistryRevision::new("resumable-child-catalog-1"),
+            serde_json::json!({"schema_version": 1, "children": [{"child_session": target.as_str(),
+                "status": {"state": {"state": "stopped"}}}]}),
+        ),
+    );
+    collector
+        .commit(
+            &writer,
+            full_commit(&source, 1, None, "source", snapshot, &mut BTreeSet::new()),
+        )
+        .await
+        .unwrap();
+    collector.close(writer).await.unwrap();
+    let (resume, paused) = storage.pause_next(JournalWriteKind::Collect);
+    let (collected, ()) = tokio::join!(collector.collect(collect_all(&collector)), async {
+        paused.await.unwrap();
+        reading
+            .authorize_retirement(&target, head.revision, crate::clock::Timestamp(9))
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+    });
+    let metadata = |record: JournalSessionRecord| {
+        serde_json::from_slice::<serde_json::Value>(&record.engine.bytes).unwrap()
+    };
+    let record = storage
+        .load(&collector.domain, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        metadata(record)["authorization"].is_array(),
+        "stale candidate write lost the authorization"
+    );
+    assert_control_conflict(collected);
+    // A retry records the candidate on the new fence and keeps the grant.
+    sweep(&collector, u64::MAX).await;
+    let record = storage
+        .load(&collector.domain, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata = metadata(record);
+    assert!(metadata["authorization"].is_array());
+    assert_eq!(
+        metadata["retirement_dependents"],
+        serde_json::json!([source.as_str()])
+    );
+}
