@@ -7,11 +7,7 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
-### Fixed
-
-- CLI agent turn cleanup signals the spawned CLI's private process group
-  directly on Unix, avoiding external `kill` argument parsing. Reaped child
-  ids, special signal targets, and the host's process group are excluded.
+## [0.9.0] - 2026-10-20
 
 ### Breaking
 
@@ -36,6 +32,7 @@ contain breaking changes and are coordinated with consumer proposals.
   Packed reference storage treats SQLite BUSY/LOCKED as retryable; I/O errors
   are retryable at ambiguous COMMIT boundaries, while proven no-effect failures
   remain non-retryable. Real writer-contention tests verify apply and collection.
+
 - `SessionHandle::take_unresolved_injections` (with `UnresolvedInjections`):
   when a turn's acceptance checkpoint fails with an outcome the protected
   store cannot prove, the fenced session hands the injected content it
@@ -46,29 +43,39 @@ contain breaking changes and are coordinated with consumer proposals.
   promise across an unresolved acceptance, as with content still queued when
   a process crashes; the injection queue remains process-local.
 
+### Changed
+
+- A turn's input and drained injections are staged outside live history while its
+  acceptance checkpoint is pending, so an ordinary save racing that checkpoint
+  (`persist`, `shutdown`, background saves) publishes only the last committed
+  boundary and never waits on it. `SessionHandle::history()` therefore excludes a
+  turn's input and injected content while acceptance is pending and normally
+  shows them once its acceptance checkpoint commits, not at turn start. If
+  the store cannot prove the outcome after an error, the staged messages enter
+  the fenced session's live history; their visibility does not prove acceptance.
+
 ### Fixed
 
-- A turn whose protected acceptance checkpoint fails to commit (for example a
-  transient storage error) no longer leaves its input and the injected content
-  drained for it in the live session. A later `persist()` or `shutdown()`
+- CLI agent turn cleanup signals the spawned CLI's private process group
+  directly on Unix, avoiding external `kill` argument parsing. Reaped child
+  ids, special signal targets, and the host's process group are excluded.
+
+- A turn whose protected acceptance checkpoint is proven not to have committed
+  (for example after a transient storage error) no longer leaves its input and
+  the injected content drained for it in the live session. A later `persist()` or `shutdown()`
   published that history to the ordinary store past the protected terminal
   checkpoint, and every later resume failed with "canonical session history
   and terminal checkpoint are from different boundaries". The live session
-  now returns to its last committed boundary and the drained injected content
-  goes back to the front of the queue. The rollback happens only when the
+  now stays at its last committed boundary and the drained injected content
+  goes back to the front of the queue. The requeue happens only when the
   protected store proves the checkpoint absent: an error alone does not (a
   commit can land and lose its acknowledgement). A native writer proves it
   through its renewed, unchanged head; a legacy store is read back, and a
   read-back holding the checkpoint resolves the save as accepted. When the
-  outcome stays unknown the input is kept and the session's persistence is
-  fenced: every later save from that live session fails with a conflict, and
-  a reopen recovers whichever boundary the protected store holds. The input
-  and drained injections are staged outside live history until the
-  acceptance checkpoint commits, so an ordinary save racing that commit
-  (`persist`, `shutdown`, background saves) publishes only the last committed
-  boundary and never waits on it. `SessionHandle::history()` therefore shows a
-  turn's input and injected content once its acceptance checkpoint commits,
-  not at turn start.
+  outcome stays unknown, the staged input and injections enter live history
+  and the session's persistence is fenced: every later save from that live
+  session fails with a conflict, and a reopen recovers whichever boundary the
+  protected store holds.
 
 ## [0.8.0] - 2026-10-20
 
