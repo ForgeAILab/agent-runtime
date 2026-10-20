@@ -605,9 +605,13 @@ Cost in both domains (body reads remain zero): warm writer open stays
 calls to one `load`; historical snapshot/extension use one `pins`; renew stays
 `load/pins = 1/1`; commit stays `load/pins/operation/apply = 1/1/1/1`.
 Hosts should clone one engine per storage/domain to share memo hits and local
-lease retention. It is no longer a correctness requirement: separate engines'
-stale control writes conflict under the generation fence. Clones also avoid
-those conflicts by sharing the write gate. The review repro and a historical-pin
+lease retention. The generation fence makes a separate engine's stale write to
+the same session record conflict instead of overwriting it, but one engine
+(plus clones) per storage/domain remains required whenever collection or
+retirement runs: a collector sees only its own engine's process-local leases,
+and cross-session dependency checks (`retired_dependency`, retirement's
+blocker scan) read other sessions' records without fencing them. Clones also
+avoid generation conflicts by sharing the write gate. The review repro and a historical-pin
 variant cover direct, snapshot and extension reads after another engine's GC.
 
 Successful commits remove the predecessor's memo proof unless a live lease
