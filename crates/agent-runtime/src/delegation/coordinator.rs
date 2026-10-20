@@ -769,6 +769,10 @@ impl DelegationCoordinator {
     }
 
     /// Waits until the child completes normally or returns exact task input.
+    ///
+    /// Unlike [`Self::wait`], this has no snapshot timeout and returns a typed
+    /// [`ChildTaskOutcome`]. An accepted [`Self::follow_up`] clears the prior
+    /// task's ready outcome, so a subsequent call waits for the new task.
     pub async fn wait_task_outcome(
         &self,
         child: &ChildId,

@@ -9,11 +9,12 @@ use agent_runtime::core::checkpoint::{CheckpointStore, TurnCheckpoint};
 use agent_runtime::core::clock::Timestamp;
 use agent_runtime::core::content::{Message, Role, UserInput};
 use agent_runtime::core::error::{FailureClass, RuntimeError};
-use agent_runtime::core::ids::SessionId;
+use agent_runtime::core::ids::{ChildId, SessionId};
 use agent_runtime::core::journal::*;
 use agent_runtime::core::store::{SessionSnapshot, SessionStore};
 use agent_runtime::delegation::{
-    ChildState, DelegationConfig, DelegationCoordinator, SpawnOutcome,
+    ChildState, ChildStatus, ChildTaskOutcome, DelegationConfig, DelegationCoordinator,
+    SpawnOutcome,
 };
 use agent_runtime::harness::LcmTimelineResolver;
 use agent_runtime::lcm::{ExpansionItem, ExpansionRequest, LcmTimelineId};
@@ -495,6 +496,28 @@ async fn continue_with_sources(step: Step) {
 }
 
 async fn pending_child(step: Step) {
+    pending_child_with_gated_follow_up(step, false).await;
+}
+
+async fn wait_for_child_task(coordinator: &DelegationCoordinator, child: &ChildId) -> ChildStatus {
+    // `wait` is a bounded snapshot observation and may return Running with
+    // the previous task's result. GC schedules need the protected completion
+    // boundary, regardless of how long collection takes on a loaded runner.
+    let ChildTaskOutcome::Completed {
+        child: completed_child,
+        result,
+    } = coordinator.wait_task_outcome(child).await.unwrap()
+    else {
+        panic!("child must complete normally");
+    };
+    assert_eq!(&completed_child, child);
+    let status = coordinator.status(child).unwrap();
+    assert_eq!(status.state, ChildState::Idle);
+    assert_eq!(status.last_result.as_deref(), Some(result.text.as_str()));
+    status
+}
+
+async fn pending_child_with_gated_follow_up(step: Step, gate_follow_up: bool) {
     let gate = Arc::new(ChildGate::default());
     let stores = Stores::new(step, Some(gate.clone()));
     let parent_id = SessionId::new("gc-delegating-parent");
@@ -529,7 +552,7 @@ async fn pending_child(step: Step) {
     assert!(stores.ordinary.latest(&parent_id).await.1.is_some());
     assert!(stores.protected.latest(&child_id).await.1.is_some());
     gate.release.notify_one();
-    let status = coordinator.wait(&child).await.unwrap();
+    let status = wait_for_child_task(&coordinator, &child).await;
     assert_eq!(status.state, ChildState::Idle);
     assert_eq!(status.last_result.as_deref(), Some("child result"));
     coordinator.flush().await.unwrap();
@@ -595,13 +618,37 @@ async fn pending_child(step: Step) {
         ScriptedChildFactory::new(vec![text_child_script("child after GC")])
             .with_durable_stores(stores.clone(), stores.clone()),
     );
-    let coordinator =
-        DelegationCoordinator::new(&parent, next_factory, DelegationConfig::default()).unwrap();
+    let mut config = DelegationConfig::default();
+    if gate_follow_up {
+        // Force the bounded snapshot wait to expire while the accepted
+        // follow-up is held before provider I/O. No wall-clock delay is needed.
+        config.wait_default = std::time::Duration::ZERO;
+        gate.armed.store(true, Ordering::SeqCst);
+    }
+    let coordinator = DelegationCoordinator::new(&parent, next_factory.clone(), config).unwrap();
     coordinator
         .follow_up(&child, UserInput::text("fresh-process follow-up"))
         .await
         .unwrap();
-    let status = coordinator.wait(&child).await.unwrap();
+    let status = if gate_follow_up {
+        gate.arrived.notified().await;
+        assert!(next_factory.provider(0).requests().is_empty());
+        let snapshot = coordinator.wait(&child).await.unwrap();
+        assert_eq!(snapshot.state, ChildState::Running);
+        assert_eq!(snapshot.turns_used, 2);
+        assert_eq!(snapshot.last_result.as_deref(), Some("child result"));
+        let waiting = wait_for_child_task(&coordinator, &child);
+        tokio::pin!(waiting);
+        let observed = futures_util::poll!(waiting.as_mut());
+        assert!(
+            observed.is_pending(),
+            "task completion wait returned before follow-up provider I/O: {observed:?}"
+        );
+        gate.release.notify_one();
+        waiting.await
+    } else {
+        wait_for_child_task(&coordinator, &child).await
+    };
     assert_eq!(status.last_result.as_deref(), Some("child after GC"));
     assert_eq!(status.turns_used, 2);
     assert_eq!(
@@ -611,6 +658,13 @@ async fn pending_child(step: Step) {
     );
     coordinator.flush().await.unwrap();
     parent.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_pending_child_follow_up_waits_for_outcome_after_snapshot_timeout() {
+    tokio::spawn(async { pending_child_with_gated_follow_up(Step::AfterDelete, true).await })
+        .await
+        .unwrap();
 }
 
 macro_rules! scheduled {
