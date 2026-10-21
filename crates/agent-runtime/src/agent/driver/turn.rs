@@ -1340,6 +1340,33 @@ impl<'a> TurnMachine<'a> {
                 .await;
 
             match outcome {
+                ProviderTurnOutcome::InputBudgetExceeded { requested, limit } => {
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::BudgetFailure {
+                            category: BudgetCategory::Input,
+                            requested_tokens: requested,
+                            limit_tokens: limit,
+                        },
+                    );
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::Error {
+                            error: RuntimeError::config(
+                                "tool argument correction exceeds the input budget",
+                            )
+                            .with_class(
+                                FailureClass::ContextOverflow {
+                                    stage: FailureStage::PreProvider,
+                                    required_tokens: Some(requested),
+                                    available_tokens: Some(limit),
+                                },
+                            ),
+                        },
+                    );
+                    self.complete(TurnFinish::Failed, visible_output).await;
+                    return;
+                }
                 ProviderTurnOutcome::Cancelled => {
                     self.complete_cancelled(visible_output).await;
                     return;

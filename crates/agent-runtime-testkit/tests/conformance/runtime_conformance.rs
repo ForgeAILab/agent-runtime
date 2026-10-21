@@ -10,6 +10,9 @@ mod interaction;
 mod local_action;
 #[path = "runtime_conformance/provider_loop.rs"]
 mod provider_loop;
+
+#[path = "runtime_conformance/malformed_tool_arguments.rs"]
+mod malformed_tool_arguments;
 #[path = "runtime_conformance/recovery.rs"]
 mod recovery;
 #[path = "runtime_conformance/session.rs"]

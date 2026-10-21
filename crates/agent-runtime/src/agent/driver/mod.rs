@@ -405,6 +405,10 @@ enum ProviderTurnOutcome {
         finish: FinishReason,
     },
     Failed(ProviderError),
+    InputBudgetExceeded {
+        requested: u32,
+        limit: u32,
+    },
     Cancelled,
     LimitReached {
         limit: LimitKind,
