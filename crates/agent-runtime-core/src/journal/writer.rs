@@ -2659,6 +2659,79 @@ mod review_tests {
         assert!(certified > 100);
     }
 
+    /// Typed segment arrays under random mid-array edits, inserts and
+    /// deletes encode exactly as the complete path, chained through both
+    /// certified and uncertified compositions.
+    #[test]
+    fn typed_segment_arrays_match_complete_path_under_random_edits() {
+        use crate::manifest::{ContextSegmentRecord, SegmentSensitivity};
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound.max(1) as u64) as usize
+        };
+        let segment = |label: usize| {
+            ContextSegmentRecord::new(
+                format!("history:{label}"),
+                "history",
+                SegmentSensitivity::Internal,
+                Fingerprint::of(label.to_string()),
+                label as u32,
+            )
+        };
+        let mut segments = (0..150).map(segment).collect::<Vec<_>>();
+        let mut label = 1_000;
+        let mut previous: Option<(Arc<TurnManifest>, JournalJsonEncoding)> = None;
+        for step in 0..160 {
+            for _ in 0..(1 + next(4)) {
+                label += 1;
+                match next(4) {
+                    0 if !segments.is_empty() => {
+                        let at = next(segments.len());
+                        segments[at] = segment(label);
+                    }
+                    1 => {
+                        let at = next(segments.len() + 1);
+                        segments.insert(at, segment(label));
+                    }
+                    2 if !segments.is_empty() => {
+                        let at = next(segments.len());
+                        segments.remove(at);
+                    }
+                    _ => {
+                        let from = next(segments.len() + 1);
+                        let to = (from + next(70)).min(segments.len());
+                        segments.drain(from..to);
+                    }
+                }
+            }
+            if step % 37 == 0 {
+                segments.extend((0..130).map(|i| segment(label + i + 1)));
+                label += 131;
+            }
+            let mut value = manifest(step);
+            value.manifest.segments = segments.clone();
+            let current = Arc::new(value);
+            // Every fifth step drops the pairing to exercise uncertified
+            // composition from the same cache.
+            let prior = previous
+                .as_ref()
+                .filter(|_| step % 5 != 0)
+                .map(|(v, c)| (v.as_ref(), c));
+            let (_, cache) = JournalWriterAssembler::default()
+                .manifest_shared_cached(current.clone(), prior)
+                .unwrap();
+            let mut complete = super::super::engine::ObjectAssembler::default();
+            let oracle = complete
+                .json_value(&serde_json::to_value(current.as_ref()).unwrap())
+                .unwrap();
+            assert_eq!(cache.root, oracle, "step {step} len {}", segments.len());
+            previous = Some((current, cache));
+        }
+    }
+
     /// Witness decode caches never outlive a round-trip check (M3).
     #[test]
     fn retained_witnesses_hold_no_decoded_copies() {
