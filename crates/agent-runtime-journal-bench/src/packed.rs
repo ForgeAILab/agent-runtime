@@ -1231,7 +1231,13 @@ impl JournalStorage for PackedSqliteJournalStorage {
                     .sum(),
             );
             let mut state = self.lock()?;
-            state.session(&write.session)?;
+            {
+                #[cfg(feature = "journal-profile")]
+                let _profile = agent_runtime_core::journal::profile::enter_sync(
+                    "rt.storage.apply_session_index",
+                );
+                state.session(&write.session)?;
+            }
             let State {
                 conn,
                 packs,
@@ -1356,6 +1362,10 @@ impl JournalStorage for PackedSqliteJournalStorage {
                             }
                         }
                     }
+                    #[cfg(feature = "journal-profile")]
+                    let _catalog = agent_runtime_core::journal::profile::enter_sync(
+                        "rt.storage.catalog_changes",
+                    );
                     for entry in &write.catalog {
                         match entry {
                             JournalCatalogChange::Put(e) => {
@@ -1419,6 +1429,9 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 .transpose()?
                 .unwrap_or_default();
             fail(&write, JournalCommitFailurePoint::AfterIdempotency)?;
+            #[cfg(feature = "journal-profile")]
+            let release_timer =
+                agent_runtime_core::journal::profile::enter_sync("rt.storage.release_bits");
             let mut touched = BTreeSet::new();
             for id in &write.release {
                 let location = locations
@@ -1448,11 +1461,17 @@ impl JournalStorage for PackedSqliteJournalStorage {
                         .map_err(failure)?,
                 );
             }
+            #[cfg(feature = "journal-profile")]
+            drop(release_timer);
             let receipt = purge(&tx, packs, &mut updates, &touched, retired)?;
             if self.config.repack_on_collection && write.kind == JournalWriteKind::Collect {
                 repack(&tx, packs, &mut updates, s, true)?;
             }
-            tx.commit().map_err(commit_failure)?;
+            {
+                #[cfg(feature = "journal-profile")]
+                let _commit = agent_runtime_core::journal::profile::enter_sync("rt.storage.commit");
+                tx.commit().map_err(commit_failure)?;
+            }
             state.update(s, updates);
             if let Some(op) = &write.operation {
                 state.operations.insert(
