@@ -779,6 +779,21 @@ impl SessionState {
         std::mem::take(&mut self.changes)
     }
 
+    /// Re-records changes taken by a capture that failed before use.
+    pub(crate) fn restore_changes(&mut self, changes: StateChanges) {
+        if let Some(from) = changes.history_from {
+            self.history_changed(from);
+        }
+        if let Some(from) = changes.usage_from {
+            self.usage_changed(from);
+        }
+        self.changes.manifests_appended = self
+            .changes
+            .manifests_appended
+            .saturating_add(changes.manifests_appended);
+        self.changes.manifests_replaced |= changes.manifests_replaced;
+    }
+
     fn history_changed(&mut self, from: usize) {
         self.changes.history_from =
             Some(self.changes.history_from.map_or(from, |old| old.min(from)));

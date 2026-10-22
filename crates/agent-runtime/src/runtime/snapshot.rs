@@ -47,71 +47,83 @@ impl LiveSnapshot {
                     && (view.manifest_len() == state.manifests().len()
                         || changes.manifests_appended != 0)
             });
-        let view = if compatible {
-            #[cfg(test)]
-            {
-                self.incremental_captures += 1;
-            }
-            let base = self.view.as_ref().expect("compatible live version");
-            let mut mutation = base.mutation();
-            if let Some(from) = changes.history_from {
-                let from = from.min(base.history_len()).min(state.history().len());
-                mutation.truncate_history(from);
-                mutation.append_history(state.history()[from..].iter().cloned());
-            }
-            if let Some(from) = changes.usage_from {
-                let from = from
-                    .min(base.usage_len())
-                    .min(state.usage().records().len());
-                mutation.truncate_usage(from);
-                mutation.append_usage(state.usage().records()[from..].iter().cloned());
-            }
-            if changes.manifests_appended != 0 {
-                let manifests = state.manifests();
-                let appended = changes.manifests_appended.min(manifests.len());
-                mutation.append_manifests(manifests[manifests.len() - appended..].iter().cloned());
-                mutation.retain_manifests(manifests.len());
-            }
-            for (key, old) in base.extensions() {
-                if !extensions.contains_key(key) {
-                    mutation.set_extension(key.clone(), None);
-                } else if !base
-                    .extension_shared(key)
-                    .zip(extensions.get(key))
-                    .is_some_and(|(old, next)| Arc::ptr_eq(&old, next))
-                    && !state_identical(Some(old), extensions.get(key).map(Arc::as_ref))
+        // Recorded changes are consumed only once a view is built from them;
+        // a failed build keeps them for the next capture.
+        let built = (|| -> Result<JournalSnapshotView, RuntimeError> {
+            Ok(if compatible {
+                #[cfg(test)]
                 {
-                    mutation.set_extension_shared(
-                        key.clone(),
-                        extensions.get(key).expect("present namespace").clone(),
+                    self.incremental_captures += 1;
+                }
+                let base = self.view.as_ref().expect("compatible live version");
+                let mut mutation = base.mutation();
+                if let Some(from) = changes.history_from {
+                    let from = from.min(base.history_len()).min(state.history().len());
+                    mutation.truncate_history(from);
+                    mutation.append_history(state.history()[from..].iter().cloned());
+                }
+                if let Some(from) = changes.usage_from {
+                    let from = from
+                        .min(base.usage_len())
+                        .min(state.usage().records().len());
+                    mutation.truncate_usage(from);
+                    mutation.append_usage(state.usage().records()[from..].iter().cloned());
+                }
+                if changes.manifests_appended != 0 {
+                    let manifests = state.manifests();
+                    let appended = changes.manifests_appended.min(manifests.len());
+                    mutation
+                        .append_manifests(manifests[manifests.len() - appended..].iter().cloned());
+                    mutation.retain_manifests(manifests.len());
+                }
+                for (key, old) in base.extensions() {
+                    if !extensions.contains_key(key) {
+                        mutation.set_extension(key.clone(), None);
+                    } else if !base
+                        .extension_shared(key)
+                        .zip(extensions.get(key))
+                        .is_some_and(|(old, next)| Arc::ptr_eq(&old, next))
+                        && !state_identical(Some(old), extensions.get(key).map(Arc::as_ref))
+                    {
+                        mutation.set_extension_shared(
+                            key.clone(),
+                            extensions.get(key).expect("present namespace").clone(),
+                        );
+                    }
+                }
+                for (key, value) in &extensions {
+                    if base.extension(key).is_none() {
+                        mutation.set_extension_shared(key.clone(), value.clone());
+                    }
+                }
+                let view = mutation.finish(identity, updated)?;
+                #[cfg(any(test, debug_assertions))]
+                {
+                    let complete =
+                        complete_snapshot(session, state, &extensions, view.identity(), updated);
+                    assert_eq!(
+                        serde_json::to_value(view.materialize()).expect("live view serializes"),
+                        serde_json::to_value(&complete).expect("complete snapshot serializes"),
+                        "live snapshot view diverged from the complete session state"
                     );
                 }
+                view
+            } else {
+                JournalSnapshotView::from_snapshot(complete_snapshot(
+                    session,
+                    state,
+                    &extensions,
+                    &identity,
+                    updated,
+                ))?
+            })
+        })();
+        let view = match built {
+            Ok(view) => view,
+            Err(error) => {
+                state.restore_changes(changes);
+                return Err(error);
             }
-            for (key, value) in &extensions {
-                if base.extension(key).is_none() {
-                    mutation.set_extension_shared(key.clone(), value.clone());
-                }
-            }
-            let view = mutation.finish(identity, updated)?;
-            #[cfg(any(test, debug_assertions))]
-            {
-                let complete =
-                    complete_snapshot(session, state, &extensions, view.identity(), updated);
-                assert_eq!(
-                    serde_json::to_value(view.materialize()).expect("live view serializes"),
-                    serde_json::to_value(&complete).expect("complete snapshot serializes"),
-                    "live snapshot view diverged from the complete session state"
-                );
-            }
-            view
-        } else {
-            JournalSnapshotView::from_snapshot(complete_snapshot(
-                session,
-                state,
-                &extensions,
-                &identity,
-                updated,
-            ))?
         };
         if self.enabled {
             self.view = Some(view.clone());
@@ -451,6 +463,25 @@ mod tests {
         );
         oracle.check(&mut live, &mut replaced, &extensions, 4, true);
         assert_eq!(live.incremental_captures, 2);
+    }
+
+    // Changes taken by a capture whose build fails are restored, so the next
+    // capture still applies them.
+    #[test]
+    fn changes_restored_after_a_failed_build_still_apply() {
+        let mut live = LiveSnapshot::default();
+        live.enable();
+        let mut oracle = Oracle::new();
+        let extensions = boundary();
+        let mut state = SessionState::with_history(vec![Message::user("a"), Message::user("b")]);
+        oracle.check(&mut live, &mut state, &extensions, 0, true);
+        state.truncate_history(1);
+        state.append_history([Message::user("c")]);
+        state.record_usage(usage(0));
+        let taken = state.take_changes();
+        state.restore_changes(taken);
+        oracle.check(&mut live, &mut state, &extensions, 1, true);
+        assert_eq!(live.incremental_captures, 1);
     }
 
     #[test]
