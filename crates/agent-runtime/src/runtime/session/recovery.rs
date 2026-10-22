@@ -252,7 +252,7 @@ impl SessionHandle {
             delta: UsageDelta::new(),
         };
         let mut state = self.inner.state.lock().expect("session state poisoned");
-        if state.usage.records().iter().any(|existing| {
+        if state.usage().records().iter().any(|existing| {
             existing.source == record.source
                 && existing.provenance.request == record.provenance.request
                 && existing.provenance.attempt == record.provenance.attempt
@@ -261,9 +261,7 @@ impl SessionHandle {
                 "started cache checkpoint already has an attempted usage record",
             ));
         }
-        self.inner
-            .execution
-            .record_usage(&mut state, record.clone());
+        state.record_usage(record.clone());
         Ok(record)
     }
 

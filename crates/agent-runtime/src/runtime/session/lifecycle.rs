@@ -118,8 +118,8 @@ impl SessionHandle {
             .state
             .lock()
             .expect("session state poisoned")
-            .history
-            .clone()
+            .history()
+            .to_vec()
     }
 
     /// Owned snapshot of tools the BACKEND ran, not runtime tool-call history.
@@ -140,7 +140,7 @@ impl SessionHandle {
     /// short synchronous projection — a tail scan, not a blocking wait.
     pub fn with_history<R>(&self, f: impl FnOnce(&[Message]) -> R) -> R {
         let state = self.inner.state.lock().expect("session state poisoned");
-        f(&state.history)
+        f(&state.history())
     }
 
     /// Expands one opaque LCM node through the host-authorized coordinator.
@@ -247,16 +247,16 @@ impl SessionHandle {
         }
         {
             let state = self.inner.state.lock().expect("session state poisoned");
-            if summary.omit_prefix > state.history.len()
-                || (summary.omit_prefix < state.history.len()
-                    && state.history[summary.omit_prefix].role != Role::User)
+            if summary.omit_prefix > state.history().len()
+                || (summary.omit_prefix < state.history().len()
+                    && state.history()[summary.omit_prefix].role != Role::User)
             {
                 return Err(RuntimeError::conflict(
                     "semantic summary restore would split or exceed canonical history",
                 ));
             }
             let encoded =
-                serde_json::to_vec(&state.history[..summary.omit_prefix]).map_err(|error| {
+                serde_json::to_vec(&state.history()[..summary.omit_prefix]).map_err(|error| {
                     RuntimeError::internal(format!(
                         "failed to verify restored semantic summary source: {error}"
                     ))
@@ -289,7 +289,7 @@ impl SessionHandle {
     /// `snapshot().manifests`. Empty does not imply no provider activity.
     pub fn recent_manifests(&self) -> Vec<agent_runtime_core::store::TurnManifest> {
         let state = self.inner.state.lock().expect("session state poisoned");
-        crate::runtime::manifests::recent(&state.manifests, self.inner.shared.manifest_window)
+        crate::runtime::manifests::recent(&state.manifests(), self.inner.shared.manifest_window)
     }
 
     pub(crate) fn manifest_window(&self) -> std::num::NonZeroUsize {
@@ -306,7 +306,7 @@ impl SessionHandle {
         &self,
         include_manifests: bool,
     ) -> Result<agent_runtime_core::journal::JournalSnapshotView, RuntimeError> {
-        let state = self.inner.state.lock().expect("session state poisoned");
+        let mut state = self.inner.state.lock().expect("session state poisoned");
         let mut extensions = self
             .inner
             .execution
@@ -324,7 +324,7 @@ impl SessionHandle {
             .expect("live snapshot poisoned")
             .capture(
                 &self.inner.id,
-                &state,
+                &mut state,
                 extensions,
                 self.inner
                     .minter
@@ -349,10 +349,10 @@ impl SessionHandle {
         }
         SessionSnapshot {
             id: self.inner.id.clone(),
-            history: state.history.clone(),
-            usage: state.usage.clone(),
+            history: state.history().to_vec(),
+            usage: state.usage().clone(),
             manifests: crate::runtime::manifests::recent(
-                &state.manifests,
+                &state.manifests(),
                 self.inner.shared.manifest_window,
             ),
             identity: self

@@ -690,14 +690,27 @@ fn take_returned_interaction_state(
 }
 
 /// The canonical mutable state of one session.
+///
+/// Fields are private: every Runtime mutation goes through a method that
+/// records the changed suffix, so the live journal snapshot view can never
+/// silently reuse a stale prefix. A replaced or swapped value carries a
+/// different instance token and forces a complete capture.
 #[derive(Debug, Default)]
 pub struct SessionState {
-    /// The canonical conversation history.
-    pub history: Vec<Message>,
-    /// The accumulated usage ledger.
-    pub usage: UsageLedger,
-    /// The ordered recent window of planned-step diagnostic manifests.
-    pub manifests: Vec<TurnManifest>,
+    history: Vec<Message>,
+    usage: UsageLedger,
+    manifests: Vec<TurnManifest>,
+    changes: StateChanges,
+    instance: Arc<()>,
+}
+
+/// Mutations recorded since the last live snapshot capture.
+#[derive(Debug, Default)]
+pub(crate) struct StateChanges {
+    pub(crate) history_from: Option<usize>,
+    pub(crate) usage_from: Option<usize>,
+    pub(crate) manifests_appended: usize,
+    pub(crate) manifests_replaced: bool,
 }
 
 impl SessionState {
@@ -705,9 +718,100 @@ impl SessionState {
     pub fn with_history(history: Vec<Message>) -> Self {
         Self {
             history,
-            usage: UsageLedger::new(),
-            manifests: Vec::new(),
+            ..Self::default()
         }
+    }
+
+    /// The canonical conversation history.
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
+    /// The accumulated usage ledger.
+    pub fn usage(&self) -> &UsageLedger {
+        &self.usage
+    }
+
+    /// The ordered recent window of planned-step diagnostic manifests.
+    pub fn manifests(&self) -> &[TurnManifest] {
+        &self.manifests
+    }
+
+    pub(crate) fn instance(&self) -> &Arc<()> {
+        &self.instance
+    }
+
+    pub(crate) fn take_changes(&mut self) -> StateChanges {
+        std::mem::take(&mut self.changes)
+    }
+
+    fn history_changed(&mut self, from: usize) {
+        self.changes.history_from =
+            Some(self.changes.history_from.map_or(from, |old| old.min(from)));
+    }
+
+    fn usage_changed(&mut self, from: usize) {
+        self.changes.usage_from = Some(self.changes.usage_from.map_or(from, |old| old.min(from)));
+    }
+
+    pub(crate) fn append_history(&mut self, values: impl IntoIterator<Item = Message>) {
+        self.history_changed(self.history.len());
+        self.history.extend(values);
+    }
+
+    pub(crate) fn truncate_history(&mut self, keep: usize) {
+        self.history_changed(keep);
+        self.history.truncate(keep);
+    }
+
+    pub(crate) fn pop_history(&mut self) -> Option<Message> {
+        self.history_changed(self.history.len().saturating_sub(1));
+        self.history.pop()
+    }
+
+    pub(crate) fn replace_history(&mut self, history: Vec<Message>) {
+        self.history_changed(0);
+        self.history = history;
+    }
+
+    pub(crate) fn record_usage(&mut self, value: agent_runtime_core::usage::UsageRecord) {
+        self.usage_changed(self.usage.records().len());
+        self.usage.record(value);
+    }
+
+    /// Rolls the ledger back to an uncommitted append boundary.
+    pub(crate) fn truncate_usage(&mut self, keep: usize) {
+        debug_assert!(
+            self.usage.records().len() >= keep,
+            "usage rollback boundary {keep} is beyond the ledger ({})",
+            self.usage.records().len()
+        );
+        self.usage_changed(keep);
+        self.usage.truncate(keep);
+    }
+
+    pub(crate) fn replace_usage(&mut self, usage: UsageLedger) {
+        self.usage_changed(0);
+        self.usage = usage;
+    }
+
+    /// Appends one manifest and evicts beyond the recent window.
+    pub(crate) fn push_manifest(&mut self, value: TurnManifest, window: std::num::NonZeroUsize) {
+        self.changes.manifests_appended = self.changes.manifests_appended.saturating_add(1);
+        self.manifests.push(value);
+        crate::runtime::manifests::trim(&mut self.manifests, window);
+    }
+
+    /// A raw history handle that bypasses recording, for tests that model a
+    /// buggy in-crate mutation.
+    #[cfg(test)]
+    pub(crate) fn history_mut_unrecorded(&mut self) -> &mut Vec<Message> {
+        &mut self.history
+    }
+
+    pub(crate) fn replace_manifests(&mut self, manifests: Vec<TurnManifest>) {
+        self.changes.manifests_replaced = true;
+        self.manifests = manifests;
     }
 }
 

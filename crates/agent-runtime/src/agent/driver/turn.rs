@@ -90,7 +90,7 @@ impl<'a> TurnMachine<'a> {
         #[cfg(feature = "test-support")]
         let _profile =
             agent_runtime_core::journal::profile::enter_sync("rt.runtime.capture_snapshot");
-        let state = self.state.lock().expect("session state poisoned");
+        let mut state = self.state.lock().expect("session state poisoned");
         let mut extensions = self.execution.snapshot_extension_state_for_journal(true);
         if let Some(cache) = self.driver.cache.persisted_session(self.emitter.session()) {
             extensions.insert(
@@ -104,7 +104,7 @@ impl<'a> TurnMachine<'a> {
             .expect("live snapshot poisoned")
             .capture(
                 self.emitter.session(),
-                &state,
+                &mut state,
                 extensions,
                 self.minter.snapshot(self.emitter.next_sequence()),
                 self.driver.clock.now(),
@@ -160,9 +160,8 @@ impl<'a> TurnMachine<'a> {
         }
         let history_len = {
             let mut state = self.state.lock().expect("session state poisoned");
-            let history_len = state.history.len();
-            self.execution.append_history(
-                &mut state,
+            let history_len = state.history().len();
+            state.append_history(
                 entries
                     .iter()
                     .map(|entry| entry.input.clone().into_message()),
@@ -170,10 +169,10 @@ impl<'a> TurnMachine<'a> {
             history_len
         };
         if let Err(error) = self.transition(TurnState::Planning { step }).await {
-            self.execution.truncate_history(
-                &mut self.state.lock().expect("session state poisoned"),
-                history_len,
-            );
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .truncate_history(history_len);
             self.emit_discarded_steers(entries, SteerDiscardReason::Failed);
             return Err(error);
         }
@@ -203,8 +202,7 @@ impl<'a> TurnMachine<'a> {
             DrainOrClose::Pending(entries) => {
                 // Frozen cross-kind order at this boundary: committed model
                 // response, generic injected messages, FIFO real-user steers.
-                self.driver
-                    .drain_injected(&self.state, &self.inbox, &self.execution);
+                self.driver.drain_injected(&self.state, &self.inbox);
                 self.commit_steers_for_planning(entries, step).await?;
                 Ok(true)
             }
@@ -610,14 +608,14 @@ impl<'a> TurnMachine<'a> {
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
         let history = self.execution.shared_history(
             self.emitter.session(),
-            &self.state.lock().expect("session state poisoned").history,
+            &self.state.lock().expect("session state poisoned").history(),
             self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
             self.state
                 .lock()
                 .expect("session state poisoned")
-                .usage
+                .usage()
                 .records()
                 .to_vec()
                 .into_boxed_slice(),
@@ -735,10 +733,10 @@ impl<'a> TurnMachine<'a> {
             }
         }
         for record in hook_usage {
-            self.execution.record_usage(
-                &mut self.state.lock().expect("session state poisoned"),
-                record.clone(),
-            );
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .record_usage(record.clone());
             self.emitter
                 .emit(Some(self.turn_id.clone()), RuntimeEvent::Usage { record });
         }
@@ -794,14 +792,14 @@ impl<'a> TurnMachine<'a> {
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
         let history = self.execution.shared_history(
             self.emitter.session(),
-            &self.state.lock().expect("session state poisoned").history,
+            &self.state.lock().expect("session state poisoned").history(),
             self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
             self.state
                 .lock()
                 .expect("session state poisoned")
-                .usage
+                .usage()
                 .records()
                 .to_vec()
                 .into_boxed_slice(),
@@ -875,10 +873,10 @@ impl<'a> TurnMachine<'a> {
             }
         }
         for record in hook_usage {
-            self.execution.record_usage(
-                &mut self.state.lock().expect("session state poisoned"),
-                record.clone(),
-            );
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .record_usage(record.clone());
             self.emitter
                 .emit(Some(self.turn_id.clone()), RuntimeEvent::Usage { record });
         }
@@ -904,10 +902,10 @@ impl<'a> TurnMachine<'a> {
         step: u32,
         block: ToolResultBlock,
     ) -> Result<(), RuntimeError> {
-        self.execution.append_history(
-            &mut self.state.lock().expect("session state poisoned"),
-            [Message::tool_result(block.clone())],
-        );
+        self.state
+            .lock()
+            .expect("session state poisoned")
+            .append_history([Message::tool_result(block.clone())]);
         completed.push(block.clone());
 
         let transition = self
@@ -922,8 +920,10 @@ impl<'a> TurnMachine<'a> {
         if let Err(error) = transition {
             completed.pop();
             let removed = self
-                .execution
-                .pop_history(&mut self.state.lock().expect("session state poisoned"));
+                .state
+                .lock()
+                .expect("session state poisoned")
+                .pop_history();
             debug_assert_eq!(removed, Some(Message::tool_result(block)));
             return Err(error);
         }
@@ -1086,7 +1086,11 @@ impl<'a> TurnMachine<'a> {
             None => Deadline::never(),
         };
         let accepted_input = input.clone();
-        let active_history_start = state.lock().expect("session state poisoned").history.len();
+        let active_history_start = state
+            .lock()
+            .expect("session state poisoned")
+            .history()
+            .len();
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
         // The input and the injections it drains stay staged until the
         // acceptance checkpoint commits (see `Driver::settle_failed_acceptance`).
@@ -1098,7 +1102,7 @@ impl<'a> TurnMachine<'a> {
             .checkpoint_accepted(accepted_input, active_history_start, turn_deadline, &staged)
             .await
         {
-            Ok(()) => driver.publish_accepted(&state, staged, &execution),
+            Ok(()) => driver.publish_accepted(&state, staged),
             Err(failure) => {
                 // No provider/tool work has begun. A protected store failure
                 // is observable and fails closed before external I/O.
@@ -1151,7 +1155,11 @@ impl<'a> TurnMachine<'a> {
             Some(ms) => Deadline::after(driver.clock.as_ref(), ms),
             None => Deadline::never(),
         };
-        let active_history_start = state.lock().expect("session state poisoned").history.len();
+        let active_history_start = state
+            .lock()
+            .expect("session state poisoned")
+            .history()
+            .len();
         execution.begin_internal_turn(
             turn_id,
             active_history_start,
@@ -1168,7 +1176,7 @@ impl<'a> TurnMachine<'a> {
             .await
         {
             Ok(()) => {
-                driver.publish_accepted(&state, staged, &execution);
+                driver.publish_accepted(&state, staged);
                 self.resolve_acceptance(Ok(()));
             }
             Err(failure) => {
@@ -1270,7 +1278,7 @@ impl<'a> TurnMachine<'a> {
 
             let history = execution.shared_history(
                 emitter.session(),
-                &state.lock().expect("session state poisoned").history,
+                &state.lock().expect("session state poisoned").history(),
                 driver.history_lcm.as_ref(),
             );
             let mut planned_request = match driver
@@ -1407,7 +1415,6 @@ impl<'a> TurnMachine<'a> {
                     &turn,
                     turn_deadline,
                     &state,
-                    &execution,
                 )
                 .await;
 
@@ -1557,10 +1564,10 @@ impl<'a> TurnMachine<'a> {
                             }
                         }
                         if !parts.is_empty() {
-                            execution.append_history(
-                                &mut state.lock().expect("session state poisoned"),
-                                [Message::assistant(parts)],
-                            );
+                            state
+                                .lock()
+                                .expect("session state poisoned")
+                                .append_history([Message::assistant(parts)]);
                         }
                     }
 
@@ -1760,7 +1767,7 @@ fn reassign_colliding_tool_call_ids(state: &Arc<Mutex<SessionState>>, tool_calls
     let mut used: std::collections::BTreeSet<String> = {
         let guard = state.lock().expect("session state poisoned");
         guard
-            .history
+            .history()
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
@@ -1801,10 +1808,7 @@ mod tool_call_id_collision_tests {
     }
 
     fn session_with(history: Vec<Message>) -> Arc<Mutex<SessionState>> {
-        Arc::new(Mutex::new(SessionState {
-            history,
-            ..SessionState::default()
-        }))
+        Arc::new(Mutex::new(SessionState::with_history(history)))
     }
 
     #[test]

@@ -168,7 +168,7 @@ impl<'a> TurnMachine<'a> {
         let calls = self.active_tool_calls(checkpoint.active_history_start);
         let mut state = self.state.lock().expect("session state poisoned");
         for call in calls {
-            let already_recorded = state.history.iter().any(|message| {
+            let already_recorded = state.history().iter().any(|message| {
                 message.content.iter().any(|part| {
                     matches!(part, ContentPart::ToolResult(result) if result.call_id == call.id)
                 })
@@ -179,8 +179,7 @@ impl<'a> TurnMachine<'a> {
             let result = known.get(&call.id).cloned().unwrap_or_else(|| {
                 crate::tool::executor::error_block(&call, reason, self.driver.config.output_limit)
             });
-            self.execution
-                .append_history(&mut state, [Message::tool_result(result.clone())]);
+            state.append_history([Message::tool_result(result.clone())]);
             self.emitter.emit(
                 Some(self.turn_id.clone()),
                 RuntimeEvent::ToolCallCompleted {
@@ -614,8 +613,7 @@ impl<'a> TurnMachine<'a> {
                         return;
                     }
                 }
-                self.driver
-                    .drain_injected(&self.state, &self.inbox, &self.execution);
+                self.driver.drain_injected(&self.state, &self.inbox);
                 boxed(|| {
                     self.resume_after_tool_boundary(
                         checkpoint.active_history_start,
@@ -845,7 +843,7 @@ impl<'a> TurnMachine<'a> {
         self.state
             .lock()
             .expect("session state poisoned")
-            .history
+            .history()
             .iter()
             .skip(active_history_start)
             .rev()
@@ -942,10 +940,10 @@ impl<'a> TurnMachine<'a> {
                 );
             }
             if !parts.is_empty() {
-                self.execution.append_history(
-                    &mut self.state.lock().expect("session state poisoned"),
-                    [Message::assistant(parts)],
-                );
+                self.state
+                    .lock()
+                    .expect("session state poisoned")
+                    .append_history([Message::assistant(parts)]);
             }
         }
 

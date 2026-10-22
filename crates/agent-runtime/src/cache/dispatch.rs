@@ -1814,8 +1814,7 @@ fn record_usage(
     state
         .lock()
         .expect("session state poisoned")
-        .usage
-        .record(record.clone());
+        .record_usage(record.clone());
     emitter.emit_cache(
         Some(cache_operation_turn(&operation)),
         RuntimeEvent::Usage { record },

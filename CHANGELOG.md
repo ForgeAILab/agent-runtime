@@ -7,6 +7,14 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Breaking
+
+- `runtime::SessionState` fields are private. Read them through `history()`,
+  `usage()` and `manifests()`; construct with `SessionState::with_history` or
+  `Default`. Runtime-owned mutation now records every changed suffix, so the
+  live journal snapshot view cannot reuse a stale prefix, and the public
+  `run_turn` no longer turns that view off.
+
 ## [0.9.0] - 2026-10-20
 
 ### Breaking

@@ -1686,9 +1686,9 @@ impl Runtime {
             (events, repaired)
         } else if let Some(coordinator) = self.shared.lcm.as_ref() {
             let initialized = coordinator
-                .claim_session(&session_id, &state.history, request.lcm_policy, false)
+                .claim_session(&session_id, &state.history(), request.lcm_policy, false)
                 .await?;
-            state.history = initialized.history;
+            state.replace_history(initialized.history);
             if let Some(lcm_state) = initialized.state {
                 extension_state.insert(LCM_COMPONENT_ID.to_owned(), lcm_state);
             }
@@ -1715,9 +1715,9 @@ impl Runtime {
         if let Some(mut snapshot) = snapshot {
             initialize_boundary(&mut snapshot)?;
             trim(&mut snapshot.manifests, self.shared.manifest_window);
-            state.history = snapshot.history;
-            state.usage = snapshot.usage;
-            state.manifests = snapshot.manifests;
+            state.replace_history(snapshot.history);
+            state.replace_usage(snapshot.usage);
+            state.replace_manifests(snapshot.manifests);
             identity = snapshot.identity;
             extension_state = snapshot.extension_state;
         }
