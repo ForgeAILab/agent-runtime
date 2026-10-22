@@ -13,11 +13,14 @@
 //!   marked under one stored fence, and its entire membership has been
 //!   inventoried under that same fence.
 //! - Every resumed call re-loads the session record and discards the mark if
-//!   its fence changed; an unexplained root-epoch change also discards it.
+//!   its fence changed (every root, pin, staging, retirement and dependency
+//!   change writes the session). Work on other sessions never restarts it.
 //! - Every release batch is one atomic fenced apply. After an acknowledged
 //!   collector-owned apply the cursor adopts exactly the fence it wrote; any
 //!   other writer makes the next apply fail its fence instead.
-//! - Lease roots are re-checked under the gate before every apply.
+//! - Lease roots are re-checked under the gate before every apply: a lease
+//!   registered after the mark protects its whole closure from that batch.
+//!   Close, renew and revocation only remove protection.
 use super::controls::CollectionFailures;
 use super::persistence::{CatalogMetadata, Metadata, PinMetadata, decode, invalid_state};
 use super::*;
@@ -54,12 +57,16 @@ const UNIT_KINDS: usize = 9;
 pub(super) struct CollectionState {
     pub(super) cursor: Option<CollectionCursor>,
     pub(super) cap: usize,
+    // Largest charge of a mark skipped over the cap (test observability of
+    // how far one unit can overshoot before the in-unit check stops it).
+    pub(super) peak_skip_charge: usize,
 }
 impl CollectionState {
     pub(super) fn new() -> Self {
         Self {
             cursor: None,
             cap: CURSOR_CAP_BYTES,
+            peak_skip_charge: 0,
         }
     }
     #[cfg(feature = "test-support")]
@@ -73,11 +80,17 @@ impl CollectionState {
 
 #[derive(Debug)]
 pub(super) struct CollectionCursor {
-    // Engine root epoch the speculative mark is valid for.
-    epoch: u64,
-    // Last session finished in this pass.
+    // Highest in-order session finished in this pass.
     after: Option<SessionId>,
     queue: VecDeque<SessionId>,
+    // Sessions whose mark restarted; retried after the current page so one
+    // churning session never stalls the pass.
+    deferred: VecDeque<SessionId>,
+    // Consecutive calls that started no unit.
+    zero_work: u64,
+    // A session of this pass stopped at the release budget with garbage
+    // left (durable dirty flag only): the pass ends with `has_more`.
+    partial: bool,
     mark: Option<SessionMark>,
     costs: [Duration; UNIT_KINDS],
     // Sessions skipped by a failure earlier in this pass; their retained
@@ -132,6 +145,8 @@ struct SessionMark {
     live_members: usize,
     garbage: VecDeque<JournalObjectId>,
     dep_queue: VecDeque<SessionId>,
+    // This session's lease ids when its lease roots were added to the mark.
+    leases: Option<BTreeSet<u64>>,
 }
 
 impl SessionMark {
@@ -159,6 +174,7 @@ impl SessionMark {
             live_members: 0,
             garbage: VecDeque::new(),
             dep_queue: VecDeque::new(),
+            leases: None,
         }
     }
     fn charge(&self) -> usize {
@@ -171,8 +187,11 @@ impl SessionMark {
             + self.frontier.len()
             + self.catalog.len()
             + self.garbage.len()
+            + self.dep_queue.len()
+            + self.dependencies.len()
             + chain)
             * ID_CHARGE
+            + self.visited.values().map(Vec::len).sum::<usize>() * 8
             + self.pin_bytes
     }
     fn live(&self, id: &JournalObjectId) -> bool {
@@ -194,18 +213,40 @@ struct Call {
     target: Duration,
     max_units: u64,
     unit_items: usize,
+    cap: usize,
     units: u64,
     released: u64,
     restarted: bool,
+    peak_skip_charge: usize,
+    // Sessions restarted in this call; a second restart skips them.
+    restarts: BTreeSet<SessionId>,
+    over_capacity: BTreeSet<SessionId>,
 }
 impl Call {
     fn admit(&self, kind: Unit, costs: &[Duration; UNIT_KINDS]) -> bool {
         if self.units >= self.max_units {
             return false;
         }
-        // Reserve the measured cost of the next unit of this kind. The first
-        // unit always starts, so every call with a positive budget progresses.
+        // Reserve the measured cost of the next unit of this kind. Once the
+        // gate is held the first unit always starts, even if the gate wait
+        // consumed the target, so a call under sustained contention still
+        // progresses; its hold is then that one bounded unit.
         self.units == 0 || self.started.elapsed() + costs[kind as usize] <= self.target
+    }
+}
+
+// Restores the hints a call took if its future is dropped mid-call.
+struct HintGuard<'a> {
+    dirty: &'a Mutex<BTreeSet<SessionId>>,
+    taken: Option<BTreeSet<SessionId>>,
+}
+impl Drop for HintGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(taken) = self.taken.take() {
+            if let Ok(mut dirty) = self.dirty.lock() {
+                dirty.extend(taken);
+            }
+        }
     }
 }
 
@@ -224,6 +265,25 @@ enum Step {
 
 fn unsupported() -> RuntimeError {
     RuntimeError::unsupported_capability(UnsupportedCapability::JournalCollection)
+}
+
+// A plain state conflict from a fence-bound page under an unchanged fence:
+// the adapter rejected a continuation after a physical change.
+pub(super) fn page_restart(error: &RuntimeError) -> bool {
+    !error.retryable
+        && error.metadata.get("journal_invalid_state").is_none()
+        && matches!(
+            error.class,
+            crate::error::FailureClass::StateConflict { .. }
+        )
+}
+
+fn over_capacity() -> RuntimeError {
+    let mut error = unsupported();
+    error
+        .metadata
+        .insert("journal_collection_cursor_capacity", true);
+    error
 }
 
 fn contract_violation() -> RuntimeError {
@@ -280,6 +340,12 @@ impl<S: JournalStorage> JournalEngine<S> {
                 progress: Some(JournalGcProgress::Yielded),
                 has_more: true,
                 work_units: 0,
+                zero_work_calls: 0,
+                over_capacity_sessions: Vec::new(),
+            };
+            let (mut kept, cap) = {
+                let mut state = self.collection.lock().map_err(|_| host_failure())?;
+                (state.cursor.take(), state.cap)
             };
             let mut call = Call {
                 started,
@@ -288,40 +354,32 @@ impl<S: JournalStorage> JournalEngine<S> {
                 unit_items: budget
                     .max_unit_items
                     .clamp(1, JournalGcBudget::MAX_UNIT_ITEMS) as usize,
+                cap,
                 units: 0,
                 released: 0,
                 restarted: false,
-            };
-            // The gate wait counts against the call. Yield without work if it
-            // consumed the soft budget.
-            if started.elapsed() >= target {
-                return Ok(report);
-            }
-            let (mut kept, cap) = {
-                let mut state = self.collection.lock().map_err(|_| host_failure())?;
-                (state.cursor.take(), state.cap)
+                peak_skip_charge: 0,
+                restarts: BTreeSet::new(),
+                over_capacity: BTreeSet::new(),
             };
             let cursor = kept.get_or_insert_with(|| CollectionCursor {
-                epoch: request.expected_root_epoch,
                 after: None,
                 queue: VecDeque::new(),
+                deferred: VecDeque::new(),
+                zero_work: 0,
+                partial: false,
                 mark: None,
                 costs: [Duration::ZERO; UNIT_KINDS],
                 failed: BTreeSet::new(),
             });
-            if cursor.epoch != request.expected_root_epoch {
-                // An unexplained epoch change: conservatively restart the
-                // speculative mark, keeping the discovery position.
-                if let Some(mark) = cursor.mark.take() {
-                    cursor.queue.push_front(mark.session);
-                    call.restarted = true;
-                }
-                cursor.epoch = request.expected_root_epoch;
-            }
             // Close and revocation do no I/O. Drain their local dirty hints under
             // the registry lock order; concurrent changes insert fresh hints and
-            // therefore cannot be erased by this call.
+            // therefore cannot be erased by this call. A dropped call restores them.
             let taken = std::mem::take(&mut *self.dirty.lock().map_err(|_| host_failure())?);
+            let mut guard = HintGuard {
+                dirty: &self.dirty,
+                taken: Some(taken.clone()),
+            };
             let mut local_pending = taken.clone();
             if let Some(mark) = &cursor.mark {
                 local_pending.remove(&mark.session);
@@ -331,13 +389,13 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .collect_steps(
                     &request,
                     cursor,
-                    cap,
                     &mut call,
                     &mut report,
                     &mut local_pending,
                     &mut failures,
                 )
                 .await;
+            guard.taken = None;
             {
                 let mut dirty = self.dirty.lock().map_err(|_| host_failure())?;
                 // Keep even local-only and dependency-discovered hints, including
@@ -350,14 +408,19 @@ impl<S: JournalStorage> JournalEngine<S> {
                 match &result {
                     Ok(true) => {
                         report.progress = Some(JournalGcProgress::Complete);
-                        report.has_more = dirty
-                            .iter()
-                            .any(|s| !failures.skipped.contains(s) && !cursor.failed.contains(s));
+                        // A session stopped by the release budget with garbage
+                        // left keeps its durable dirty flag only; ask for a pass.
+                        report.has_more = cursor.partial
+                            || dirty.iter().any(|s| {
+                                !failures.skipped.contains(s) && !cursor.failed.contains(s)
+                            });
                         // A completed pass keeps only its epoch and measured unit costs.
                         cursor.after = None;
                         cursor.queue.clear();
                         cursor.mark = None;
+                        cursor.deferred.clear();
                         cursor.failed.clear();
+                        cursor.partial = false;
                     }
                     Ok(false) => {
                         cursor.failed.extend(failures.skipped.iter().cloned());
@@ -375,10 +438,23 @@ impl<S: JournalStorage> JournalEngine<S> {
                     }
                 }
             }
-            self.collection.lock().map_err(|_| host_failure())?.cursor = kept;
+            if let Some(cursor) = kept.as_mut() {
+                cursor.zero_work = if call.units == 0 {
+                    cursor.zero_work + 1
+                } else {
+                    0
+                };
+                report.zero_work_calls = cursor.zero_work;
+            }
+            {
+                let mut state = self.collection.lock().map_err(|_| host_failure())?;
+                state.cursor = kept;
+                state.peak_skip_charge = state.peak_skip_charge.max(call.peak_skip_charge);
+            }
             result?;
             report.work_units = call.units;
             report.unreadable_sessions = failures.unreadable.iter().cloned().collect();
+            report.over_capacity_sessions = call.over_capacity.iter().cloned().collect();
             Ok(report)
         })
     }
@@ -388,7 +464,6 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         request: &JournalGcRequest,
         cursor: &mut CollectionCursor,
-        cap: usize,
         call: &mut Call,
         report: &mut JournalGcReport,
         local_pending: &mut BTreeSet<SessionId>,
@@ -409,15 +484,25 @@ impl<S: JournalStorage> JournalEngine<S> {
                         let fence = stored
                             .as_ref()
                             .map_or(JournalFence::default(), JournalSessionRecord::fence);
-                        if fence != cursor.mark.as_ref().expect("mark").fence {
+                        let mark = cursor.mark.as_ref().expect("mark");
+                        // Only this session's own changes invalidate its mark:
+                        // a write (fence) or a lease opened/closed since its
+                        // lease roots were taken. Added leases are also
+                        // filtered before every apply; a closed one would only
+                        // keep garbage until the next pass.
+                        let leases_changed = mark.leases.as_ref().is_some_and(|taken| {
+                            self.local
+                                .lock()
+                                .is_ok_and(|local| Self::lease_ids(&local, &session) != *taken)
+                        });
+                        if fence != mark.fence || leases_changed {
                             cursor.mark = None;
-                            cursor.queue.push_front(session);
-                            call.restarted = true;
+                            Self::restart(cursor, call, failures, session);
                         }
                     }
                     None => {
                         cursor.mark = None;
-                        cursor.after = Some(session);
+                        Self::advance(cursor, session);
                     }
                 }
             }
@@ -430,18 +515,9 @@ impl<S: JournalStorage> JournalEngine<S> {
                         .await?
                 };
                 if let Some(mark) = &cursor.mark {
-                    if mark.charge() > cap {
-                        // Unchanged work cannot fit the cursor capacity. Retain
-                        // everything and report the typed refusal instead of
-                        // repeatedly restarting without progress.
+                    if mark.charge() > call.cap {
                         let session = mark.session.clone();
-                        cursor.mark = None;
-                        local_pending.insert(session);
-                        let mut error = unsupported();
-                        error
-                            .metadata
-                            .insert("journal_collection_cursor_capacity", true);
-                        return Err(error);
+                        Self::skip_over_capacity(cursor, call, failures, session);
                     }
                 }
                 match step {
@@ -463,6 +539,10 @@ impl<S: JournalStorage> JournalEngine<S> {
         failures: &mut CollectionFailures,
     ) -> Result<Step, RuntimeError> {
         if cursor.queue.is_empty() {
+            if let Some(session) = cursor.deferred.pop_front() {
+                cursor.queue.push_back(session);
+                return Ok(Step::Continue);
+            }
             if !call.admit(Unit::Discover, &cursor.costs) {
                 return Ok(Step::Yield);
             }
@@ -511,7 +591,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         // A dependency-index read may already have failed for this session.
         // Do not load it again within the same call.
         if failures.skipped.contains(&session) {
-            cursor.after = Some(session);
+            Self::advance(cursor, session);
             return Ok(Step::Continue);
         }
         let started = Instant::now();
@@ -538,15 +618,58 @@ impl<S: JournalStorage> JournalEngine<S> {
         observe(&mut cursor.costs, Unit::Load, started.elapsed());
         match failures.isolate(&session, read)? {
             Some(mark) => cursor.mark = Some(mark),
-            None => cursor.after = Some(session),
+            None => Self::advance(cursor, session),
         }
         Ok(Step::Continue)
     }
 
+    // The discovery position only moves forward; a deferred (restarted)
+    // session finishing later never re-opens earlier pages.
+    fn advance(cursor: &mut CollectionCursor, session: SessionId) {
+        if cursor.after.as_ref().is_none_or(|after| &session > after) {
+            cursor.after = Some(session);
+        }
+    }
+
     fn finish_session(cursor: &mut CollectionCursor) {
         if let Some(mark) = cursor.mark.take() {
-            cursor.after = Some(mark.session);
+            Self::advance(cursor, mark.session);
         }
+    }
+
+    // Discard a stale speculative mark and retry the session after the
+    // current page. A second restart within one call skips it for the call
+    // (its dirty state and hint survive).
+    fn restart(
+        cursor: &mut CollectionCursor,
+        call: &mut Call,
+        failures: &mut CollectionFailures,
+        session: SessionId,
+    ) {
+        call.restarted = true;
+        if call.restarts.insert(session.clone()) {
+            cursor.deferred.push_back(session);
+        } else {
+            failures.skipped.insert(session.clone());
+            Self::advance(cursor, session);
+        }
+    }
+
+    // A mark that cannot fit the cursor cap skips only its own session: its
+    // durable and local dirty state survive and it is reported, while other
+    // sessions keep progressing.
+    fn skip_over_capacity(
+        cursor: &mut CollectionCursor,
+        call: &mut Call,
+        failures: &mut CollectionFailures,
+        session: SessionId,
+    ) {
+        if let Some(mark) = cursor.mark.take() {
+            call.peak_skip_charge = call.peak_skip_charge.max(mark.charge());
+        }
+        failures.skipped.insert(session.clone());
+        call.over_capacity.insert(session.clone());
+        Self::advance(cursor, session);
     }
 
     async fn mark_step(
@@ -576,16 +699,10 @@ impl<S: JournalStorage> JournalEngine<S> {
         if !call.admit(kind, &cursor.costs) {
             return Ok(Step::Yield);
         }
-        // Close/revocation remain I/O-free while storage reads await. Keep the
-        // original collector's mark check before its first write in a call;
-        // it fails the call rather than one session.
-        if phase == Phase::Release
-            && call.released == 0
-            && self.local.lock()?.root_epoch != cursor.epoch
-        {
-            cursor.mark = None;
-            return Err(conflict());
-        }
+        // No epoch check here: close, renew and revocation (the only changes
+        // possible under the held gate) only remove protection, any write to
+        // this session fails the batch's fence, and the lease filter runs
+        // before every apply.
         let started = Instant::now();
         call.units += 1;
         let session = cursor.mark.as_ref().expect("mark").session.clone();
@@ -600,10 +717,29 @@ impl<S: JournalStorage> JournalEngine<S> {
         observe(&mut cursor.costs, kind, started.elapsed());
         match result {
             Err(error) if error.metadata.get("journal_collection_contract").is_some() => Err(error),
+            Err(error)
+                if error
+                    .metadata
+                    .get("journal_collection_cursor_capacity")
+                    .is_some() =>
+            {
+                Self::skip_over_capacity(cursor, call, failures, session);
+                Ok(Step::Continue)
+            }
+            // A page conflict under an unchanged fence is a physical change
+            // (repack/compaction) that rejected the continuation: restart the
+            // session's mark rather than skipping it for the pass.
+            Err(error)
+                if matches!(phase, Phase::Pins | Phase::Inventory) && page_restart(&error) =>
+            {
+                cursor.mark = None;
+                Self::restart(cursor, call, failures, session);
+                Ok(Step::Continue)
+            }
             result => {
                 if failures.isolate(&session, result)?.is_none() {
                     cursor.mark = None;
-                    cursor.after = Some(session);
+                    Self::advance(cursor, session);
                 }
                 Ok(Step::Continue)
             }
@@ -829,6 +965,11 @@ impl<S: JournalStorage> JournalEngine<S> {
                     mark.frontier
                         .extend(links.into_iter().map(|(id, e)| Frontier::Edge(id, e)));
                     mark.visited.entry(id).or_default().push(expected);
+                    // Bound workspace inside the unit too: one batch of wide
+                    // sequence nodes can add far more than the cap.
+                    if mark.charge() > call.cap {
+                        return Err(over_capacity());
+                    }
                 }
                 Frontier::PinRoot(id) => {
                     let object = JournalObject {
@@ -851,9 +992,19 @@ impl<S: JournalStorage> JournalEngine<S> {
         Ok(())
     }
 
+    fn lease_ids(local: &super::transition::State, session: &SessionId) -> BTreeSet<u64> {
+        local
+            .leases
+            .iter()
+            .filter(|(_, lease)| &lease.session == session)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     fn lease_unit(&self, cursor: &mut CollectionCursor) -> Result<(), RuntimeError> {
         let mark = cursor.mark.as_mut().expect("mark");
         let local = self.local.lock()?;
+        mark.leases = Some(Self::lease_ids(&local, &mark.session));
         for lease in local
             .leases
             .values()
@@ -938,7 +1089,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                     failures.unreadable.insert(source.clone());
                 }
                 cursor.mark = None;
-                cursor.after = Some(source);
+                Self::advance(cursor, source);
             }
             Ok(())
         })
@@ -1018,7 +1169,8 @@ impl<S: JournalStorage> JournalEngine<S> {
                 max_units,
             };
             match self.storage.prepare_collection_apply(&plan).await? {
-                JournalCollectionPreflight::Fits { .. } => break plan,
+                JournalCollectionPreflight::Fits { units } if units <= max_units => break plan,
+                JournalCollectionPreflight::Fits { .. } => return Err(contract_violation()),
                 JournalCollectionPreflight::Split { max_release }
                     if (max_release as usize) < take && max_release > 0 =>
                 {
@@ -1030,7 +1182,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         let complete = take == remaining;
         let written = plan.write.record.clone();
         let release = plan.write.release.clone();
-        let receipt = self.apply_collection(plan, &session).await?;
+        let receipt = self.apply_collection(plan, &session).await?.receipt;
         report.deleted += receipt.reclaimed_objects;
         report.reclaimed_bytes += receipt.reclaimed_bytes;
         let mark = cursor.mark.as_mut().expect("mark");
@@ -1042,7 +1194,6 @@ impl<S: JournalStorage> JournalEngine<S> {
         if !release.is_empty() {
             if call.released == 0 {
                 local.advance_root_epoch()?;
-                cursor.epoch = local.root_epoch;
             }
             if let Some(record) = local.sessions.get_mut(&session) {
                 for id in &release {
@@ -1053,6 +1204,8 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         drop(local);
         if complete || take == limit {
+            // Only a budget that released something asks for another pass.
+            cursor.partial |= !complete && take > 0;
             Self::finish_session(cursor);
         }
         Ok(())
@@ -1062,23 +1215,11 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         plan: JournalCollectionPlan,
         session: &SessionId,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         crate::journal_profile_scope!("rt.engine.storage_apply", {
-            // Even a lost acknowledgement may have released membership. Preserve
-            // unaffected validation evidence, trimming only released cache bodies.
-            if !plan.write.release.is_empty() {
-                self.memo
-                    .lock()
-                    .map_err(|_| host_failure())?
-                    .release(session, &plan.write.release);
-            }
-            match self.storage.apply_collection(plan).await {
-                Ok(receipt) => Ok(receipt),
-                Err(error) => {
-                    self.invalidate(session)?;
-                    Err(error)
-                }
-            }
+            let release = plan.write.release.clone();
+            self.guarded_apply(session, &release, self.storage.apply_collection(plan))
+                .await
         })
     }
 }

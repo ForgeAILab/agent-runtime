@@ -114,7 +114,9 @@ where
     let mut paged = member_ids(&items);
     paged.sort();
     assert_eq!(paged, members);
-    let (pins, _) = pages(&*storage, d, s, JournalCollectionPageKind::Pins, fence, 1).await;
+    // Several pins, one per page: a defect that drops pins from a page is the
+    // one page defect that would free live bodies.
+    let (pins, pin_calls) = pages(&*storage, d, s, JournalCollectionPageKind::Pins, fence, 1).await;
     let paged_pins: Vec<_> = pins
         .into_iter()
         .flat_map(|items| match items {
@@ -126,6 +128,11 @@ where
         paged_pins,
         storage.pins(d, s).await.unwrap(),
         "pin pages in pin order"
+    );
+    assert!(paged_pins.len() >= 2, "the case seeds several pins");
+    assert!(
+        pin_calls >= paged_pins.len(),
+        "one-item pin pages are bounded"
     );
 
     // A changed generation rejects both a fresh request and an old continuation.
@@ -201,8 +208,11 @@ where
     };
     let before = storage.load(d, s).await.unwrap();
     let preflight = storage.prepare_collection_apply(&plan).await.unwrap();
+    let JournalCollectionPreflight::Fits { units: declared } = preflight else {
+        panic!("a small release fits: {preflight:?}");
+    };
     assert!(
-        matches!(preflight, JournalCollectionPreflight::Fits { units } if units <= limits.max_apply_units),
+        declared <= limits.max_apply_units,
         "a small release fits: {preflight:?}"
     );
     assert_eq!(
@@ -219,7 +229,12 @@ where
         .apply_collection(not_collect)
         .await
         .expect_err("only collection writes use the collection apply");
-    storage.apply_collection(plan.clone()).await.unwrap();
+    let receipt = storage.apply_collection(plan.clone()).await.unwrap();
+    assert!(
+        receipt.rewritten_units <= declared,
+        "an apply rewrites at most its declared units ({} > {declared})",
+        receipt.rewritten_units
+    );
     let mut after = storage.members(d, s).await.unwrap();
     after.sort();
     let expected: Vec<_> = members

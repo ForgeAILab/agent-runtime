@@ -277,11 +277,12 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
     ) -> Result<JournalCollectionPreflight, RuntimeError>;
     /// Applies the complete plan as one atomic fenced transaction, with the
     /// same acknowledgement/ambiguity contract and exact receipts as `apply`.
-    /// A plan that no longer fits `max_units` fails without effect.
+    /// A plan that no longer fits `max_units` fails without effect. The
+    /// receipt reports the physical units actually rewritten.
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError>;
+    ) -> Result<JournalCollectionReceipt, RuntimeError>;
 }
 impl std::hash::Hash for JournalDomain {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

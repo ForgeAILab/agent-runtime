@@ -154,7 +154,7 @@ impl JournalStorage for Reopen {
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         self.storage(false).apply_collection(plan).await
     }
 }

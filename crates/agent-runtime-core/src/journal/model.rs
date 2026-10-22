@@ -681,6 +681,15 @@ pub struct JournalGcReport {
     /// Bounded work units started by this call.
     #[serde(default)]
     pub work_units: u64,
+    /// Consecutive calls, including this one, that started no work unit (for
+    /// example because the membership-release budget was already spent). A
+    /// host may back off while it grows; zero means this call progressed.
+    #[serde(default)]
+    pub zero_work_calls: u64,
+    /// Sessions whose mark exceeded the engine's cursor workspace cap in this
+    /// call. Each is skipped with its dirty state retained; sorted and unique.
+    #[serde(default)]
+    pub over_capacity_sessions: Vec<SessionId>,
 }
 
 impl JournalGcReport {
@@ -693,9 +702,14 @@ impl JournalGcReport {
         self.deleted += next.deleted;
         self.reclaimed_bytes += next.reclaimed_bytes;
         self.work_units += next.work_units;
+        self.zero_work_calls = next.zero_work_calls;
         self.unreadable_sessions.extend(next.unreadable_sessions);
         self.unreadable_sessions.sort();
         self.unreadable_sessions.dedup();
+        self.over_capacity_sessions
+            .extend(next.over_capacity_sessions);
+        self.over_capacity_sessions.sort();
+        self.over_capacity_sessions.dedup();
         self.progress = next.progress;
         self.has_more = next.has_more;
     }

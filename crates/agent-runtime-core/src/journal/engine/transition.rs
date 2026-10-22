@@ -1594,6 +1594,8 @@ impl Transition {
             progress: Some(JournalGcProgress::Complete),
             has_more: false,
             work_units: 0,
+            zero_work_calls: 0,
+            over_capacity_sessions: Vec::new(),
         })
     }
 }

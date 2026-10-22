@@ -22,6 +22,8 @@ enum Defect {
     UnboundedPage,
     StaleCollectionPage,
     PartialCollectionApply,
+    UnderReportedUnits,
+    DroppedPinPage,
 }
 trait Fault: std::fmt::Debug + Send + Sync + 'static {
     const DEFECT: Defect;
@@ -33,7 +35,7 @@ macro_rules! faults {
         impl Fault for $name { const DEFECT: Defect = Defect::$name; }
     )*};
 }
-faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; UnboundedPage; StaleCollectionPage; PartialCollectionApply; }
+faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; UnboundedPage; StaleCollectionPage; PartialCollectionApply; UnderReportedUnits; DroppedPinPage; }
 
 type CacheKey = (String, u8, SessionId, JournalObjectId);
 type AdmittedKey = (String, u8);
@@ -250,18 +252,34 @@ impl<F: Fault> JournalStorage for Broken<F> {
                 next,
             });
         }
+        if F::DEFECT == Defect::DroppedPinPage
+            && request.kind == JournalCollectionPageKind::Pins
+            && request.after.is_some()
+        {
+            // The only defect: continued pin pages lose their pins.
+            let mut page = self.inner().collection_page(d, s, request).await?;
+            page.items = JournalCollectionItems::Pins(vec![]);
+            return Ok(page);
+        }
         self.inner().collection_page(d, s, request).await
     }
     async fn prepare_collection_apply(
         &self,
         plan: &JournalCollectionPlan,
     ) -> Result<JournalCollectionPreflight, RuntimeError> {
-        self.inner().prepare_collection_apply(plan).await
+        let preflight = self.inner().prepare_collection_apply(plan).await?;
+        if F::DEFECT == Defect::UnderReportedUnits {
+            // The only defect: claim the apply rewrites nothing.
+            if let JournalCollectionPreflight::Fits { .. } = preflight {
+                return Ok(JournalCollectionPreflight::Fits { units: 0 });
+            }
+        }
+        Ok(preflight)
     }
     async fn apply_collection(
         &self,
         mut plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         if plan.write.kind != JournalWriteKind::Collect {
             return self.inner().apply_collection(plan).await;
         }
@@ -272,7 +290,10 @@ impl<F: Fault> JournalStorage for Broken<F> {
             plan.write.catalog.truncate(keep);
         }
         // Route through this adapter's apply so every write defect applies.
-        self.apply(plan.write).await
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
     }
     async fn apply(&self, mut write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         match F::DEFECT {
@@ -533,6 +554,16 @@ async fn stale_collection_page_fails_bounded_collection_protocol() {
 async fn partial_collection_apply_fails_bounded_collection_protocol() {
     let message = rejects::<PartialCollectionApply>("bounded_collection_protocol").await;
     assert!(message.contains("the complete declared release batch applies"));
+}
+#[tokio::test]
+async fn under_reported_preflight_units_fail_bounded_collection_protocol() {
+    let message = rejects::<UnderReportedUnits>("bounded_collection_protocol").await;
+    assert!(message.contains("an apply rewrites at most its declared units"));
+}
+#[tokio::test]
+async fn dropped_pin_pages_fail_bounded_collection_protocol() {
+    let message = rejects::<DroppedPinPage>("bounded_collection_protocol").await;
+    assert!(message.contains("pin pages in pin order"));
 }
 #[tokio::test]
 async fn non_retryable_lost_acknowledgement_fails_atomic_apply_cuts() {

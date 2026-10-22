@@ -98,7 +98,7 @@ impl<S: JournalStorage> JournalStorage for Unreadable<S> {
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         self.inner.apply_collection(plan).await
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {

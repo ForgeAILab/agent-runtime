@@ -3,6 +3,7 @@
 //! adversarial adapters, each compared with an unbounded reference drain.
 use super::*;
 use crate::error::{ErrorKind, FailureClass, UnsupportedCapability};
+use crate::journal::JOURNAL_FANOUT;
 use crate::metadata::MetaValue;
 
 type Engine = JournalEngine<LostAcknowledgement>;
@@ -213,6 +214,7 @@ struct Drain {
     reclaimed_bytes: u64,
     restarted: u64,
     unreadable: BTreeSet<SessionId>,
+    over_capacity: BTreeSet<SessionId>,
 }
 async fn call(
     engine: &Engine,
@@ -241,6 +243,7 @@ async fn drain(engine: &Engine, budget: JournalGcBudget, max_objects: u64) -> Dr
         total.reclaimed_bytes += report.reclaimed_bytes;
         total.restarted += u64::from(report.progress == Some(JournalGcProgress::Restarted));
         total.unreadable.extend(report.unreadable_sessions);
+        total.over_capacity.extend(report.over_capacity_sessions);
         if !report.has_more {
             return total;
         }
@@ -481,42 +484,109 @@ async fn an_ambiguous_apply_discards_speculative_progress_and_a_later_drain_comp
     assert_eq!(retained(&bounded).await, retained(&reference).await);
 }
 
-#[tokio::test]
-async fn a_mark_over_the_cursor_cap_is_a_typed_refusal_that_retains_everything() {
-    let bounded = world(4).await;
-    let before = retained(&bounded).await;
-    bounded.engine.set_collection_cursor_cap(1024).unwrap();
-    let mut refused = None;
-    for _ in 0..10_000 {
-        match call(&bounded.engine, one_unit(), u64::MAX).await {
-            Err(error) => {
-                refused = Some(error);
-                break;
-            }
-            Ok(report) => assert!(report.has_more),
-        }
+// Ordinary commits whose snapshot histories have the given lengths.
+async fn histories(engine: &Engine, session: &str, lengths: &[usize]) {
+    let session = SessionId::new(session);
+    let lease = engine
+        .open(&session, writer(session.as_str()))
+        .await
+        .unwrap();
+    let mut known = BTreeSet::new();
+    let mut head: Option<JournalHead> = None;
+    for (index, length) in lengths.iter().enumerate() {
+        let mut snapshot = ext_snapshot(&session, &format!("{}-{index}", session.as_str()));
+        snapshot.history = (0..*length)
+            .map(|i| crate::content::Message::user(format!("{} {index} {i}", session.as_str())))
+            .collect();
+        let commit = full_commit(
+            &session,
+            lease.writer_epoch().unwrap(),
+            head.as_ref(),
+            &format!("{}-op-{index}", session.as_str()),
+            snapshot,
+            &mut known,
+        );
+        head = Some(engine.commit(&lease, commit).await.unwrap());
     }
-    let error = refused.expect("the first large mark exceeds 1 KiB");
-    assert!(matches!(
-        error.class,
-        FailureClass::UnsupportedCapability {
-            capability: UnsupportedCapability::JournalCollection,
-            ..
-        }
-    ));
+    engine.close(lease).await.unwrap();
+}
+
+// "a" and "z" are small; "w" has a live 4096-message history, whose 64
+// interior sequence nodes are traced in one 256-item unit.
+async fn wide_world() -> (Arc<LostAcknowledgement>, Engine) {
+    let storage = Arc::new(LostAcknowledgement::default());
+    let engine = ordinary_over(&storage);
+    histories(&engine, "a", &[3, 4, 5]).await;
+    histories(&engine, "w", &[2, JOURNAL_FANOUT * JOURNAL_FANOUT]).await;
+    histories(&engine, "z", &[3, 4, 5]).await;
+    (storage, engine)
+}
+
+async fn durable_dirty(storage: &LostAcknowledgement, engine: &Engine) -> Vec<SessionId> {
+    storage
+        .inner
+        .dirty_sessions(&engine.domain, None, 100)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_over_capacity_session_is_skipped_while_the_others_are_collected() {
+    const CAP: usize = 64 * 1024;
+    let (storage, engine) = wide_world().await;
+    let (reference_storage, reference) = wide_world().await;
+    let wide = SessionId::new("w");
+    let before = storage.inner.members(&engine.domain, &wide).await.unwrap();
+    engine.set_collection_cursor_cap(CAP).unwrap();
+    let report = drain(&engine, JournalGcBudget::default(), u64::MAX).await;
+    assert_eq!(report.over_capacity, BTreeSet::from([wide.clone()]));
+    assert!(report.deleted > 0, "the other sessions were collected");
+    assert_eq!(durable_dirty(&storage, &engine).await, vec![wide.clone()]);
     assert_eq!(
-        error.metadata.get("journal_collection_cursor_capacity"),
-        Some(&MetaValue::Bool(true))
+        storage.inner.members(&engine.domain, &wide).await.unwrap(),
+        before,
+        "the skipped session keeps everything"
     );
-    assert_eq!(retained(&bounded).await, before, "nothing was released");
-    bounded
-        .engine
+    assert!(
+        engine.dirty.lock().unwrap().contains(&wide),
+        "its hint survives"
+    );
+    // The cap is enforced inside a trace unit: one unit of 64 interior nodes
+    // would add 4096 frontier edges (~0.5 MiB) before an after-unit check.
+    let peak = engine.collection.lock().unwrap().peak_skip_charge;
+    assert!(
+        peak > CAP && peak <= CAP + 16 * 1024,
+        "skipped at {peak} bytes"
+    );
+    drain(&reference, JournalGcBudget::default(), u64::MAX).await;
+    for session in ["a", "z"].map(SessionId::new) {
+        assert_eq!(
+            storage
+                .inner
+                .members(&engine.domain, &session)
+                .await
+                .unwrap(),
+            reference_storage
+                .inner
+                .members(&reference.domain, &session)
+                .await
+                .unwrap()
+        );
+    }
+    // With room again, the skipped session is collected like the reference.
+    engine
         .set_collection_cursor_cap(collection::CURSOR_CAP_BYTES)
         .unwrap();
-    drain(&bounded.engine, one_unit(), u64::MAX).await;
-    let reference = world(4).await;
-    drain(&reference.engine, JournalGcBudget::default(), u64::MAX).await;
-    assert_eq!(retained(&bounded).await, retained(&reference).await);
+    drain(&engine, JournalGcBudget::default(), u64::MAX).await;
+    assert!(durable_dirty(&storage, &engine).await.is_empty());
+    assert_eq!(
+        storage.inner.members(&engine.domain, &wide).await.unwrap(),
+        reference_storage
+            .inner
+            .members(&reference.domain, &wide)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -613,33 +683,101 @@ async fn many_dirty_sessions_and_an_unreadable_one_progress_fairly() {
 }
 
 #[tokio::test]
-async fn a_contended_gate_yields_without_starting_work() {
+async fn sustained_gate_contention_still_starts_one_unit_per_call() {
     let bounded = world(4).await;
-    let gate = bounded.engine.gate.clone();
-    let (held, ready) = tokio::sync::oneshot::channel();
-    let holder = tokio::spawn(async move {
-        let _guard = gate.lock().await;
-        held.send(()).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    });
-    ready.await.unwrap();
-    let report = call(
-        &bounded.engine,
-        JournalGcBudget {
-            target_millis: 5,
-            ..Default::default()
-        },
-        u64::MAX,
-    )
-    .await
-    .unwrap();
-    holder.await.unwrap();
-    assert_eq!(report.progress, Some(JournalGcProgress::Yielded));
-    assert!(report.has_more);
+    for _ in 0..3 {
+        let gate = bounded.engine.gate.clone();
+        let (held, ready) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let _guard = gate.lock().await;
+            held.send(()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        });
+        ready.await.unwrap();
+        // The gate wait alone exceeds the 5 ms target.
+        let report = call(
+            &bounded.engine,
+            JournalGcBudget {
+                target_millis: 5,
+                ..Default::default()
+            },
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        holder.await.unwrap();
+        assert_eq!(report.work_units, 1, "exactly the first unit runs");
+        assert_eq!(report.zero_work_calls, 0);
+        assert!(report.has_more);
+    }
+    let reference = world(4).await;
+    drain(&bounded.engine, JournalGcBudget::default(), u64::MAX).await;
+    drain(&reference.engine, JournalGcBudget::default(), u64::MAX).await;
+    assert_eq!(retained(&bounded).await, retained(&reference).await);
+}
+
+#[tokio::test]
+async fn unrelated_session_churn_never_restarts_a_long_mark() {
+    let bounded = world(30).await;
+    let mut previous = None;
+    let mut restarted = 0;
+    // Commit, close and reopen another session between every one-unit call.
+    for index in 0..150 {
+        previous = Some(
+            publish(
+                &bounded.engine,
+                "u",
+                previous.take(),
+                1,
+                &format!("u-{index}"),
+            )
+            .await,
+        );
+        let report = call(&bounded.engine, one_unit(), u64::MAX).await.unwrap();
+        restarted += u64::from(report.progress == Some(JournalGcProgress::Restarted));
+    }
     assert_eq!(
-        (report.work_units, report.examined, report.deleted),
-        (0, 0, 0)
+        restarted, 0,
+        "only a session's own changes restart its mark"
     );
+    let tail = drain(&bounded.engine, one_unit(), u64::MAX).await;
+    assert_eq!(tail.restarted, 0);
+    let reference = world(30).await;
+    drain(&reference.engine, JournalGcBudget::default(), u64::MAX).await;
+    assert_eq!(retained(&bounded).await, retained(&reference).await);
+}
+
+#[tokio::test]
+async fn a_churning_session_rotates_behind_the_rest_of_the_pass() {
+    let bounded = world(4).await;
+    let a = SessionId::new("a");
+    let mut head = bounded.heads["a"].clone();
+    // "a" sorts first and commits between every call, so its mark always
+    // restarts; every other session must still be collected.
+    for index in 0..400 {
+        head = publish(&bounded.engine, "a", Some(head), 1, &format!("a-{index}")).await;
+        call(&bounded.engine, one_unit(), u64::MAX).await.unwrap();
+    }
+    let dirty = retained(&bounded).await.dirty;
+    assert!(
+        dirty.iter().all(|s| s == &a),
+        "only the churning session is still dirty: {dirty:?}"
+    );
+    drain(&bounded.engine, JournalGcBudget::default(), u64::MAX).await;
+    assert!(retained(&bounded).await.dirty.is_empty());
+}
+
+#[tokio::test]
+async fn a_release_budget_drain_leaves_nothing_dirty() {
+    // Every session has more garbage than one release: each call stops a
+    // session part-way, including the last one of a pass.
+    let bounded = world(4).await;
+    let report = drain(&bounded.engine, JournalGcBudget::default(), 1).await;
+    assert!(report.calls > 2);
+    let reference = world(4).await;
+    drain(&reference.engine, JournalGcBudget::default(), u64::MAX).await;
+    assert_eq!(retained(&bounded).await, retained(&reference).await);
+    assert!(retained(&bounded).await.dirty.is_empty());
 }
 
 // Adapters for the engine-side protocol checks.
@@ -648,6 +786,7 @@ enum Mode {
     Unsupported,
     UnboundedPage,
     AlwaysSplit,
+    OverFits,
 }
 #[derive(Debug)]
 struct Adapter {
@@ -720,10 +859,15 @@ impl JournalStorage for Adapter {
         self.inner.compact(d).await
     }
     fn collection_capability(&self) -> JournalCollectionCapability {
-        if self.mode == Mode::Unsupported {
-            JournalCollectionCapability::Unsupported
-        } else {
-            self.inner.collection_capability()
+        match (self.mode, self.inner.collection_capability()) {
+            (Mode::Unsupported, _) => JournalCollectionCapability::Unsupported,
+            (Mode::OverFits, JournalCollectionCapability::Bounded(limits)) => {
+                JournalCollectionCapability::Bounded(JournalCollectionLimits {
+                    max_apply_units: 8,
+                    ..limits
+                })
+            }
+            (_, capability) => capability,
         }
     }
     async fn collection_page(
@@ -741,6 +885,11 @@ impl JournalStorage for Adapter {
         &self,
         plan: &JournalCollectionPlan,
     ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        if self.mode == Mode::OverFits {
+            return Ok(JournalCollectionPreflight::Fits {
+                units: plan.max_units + 1,
+            });
+        }
         if self.mode == Mode::AlwaysSplit && plan.write.release.len() > 1 {
             self.splits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -753,7 +902,7 @@ impl JournalStorage for Adapter {
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         if self.mode == Mode::AlwaysSplit && plan.write.release.len() > 1 {
             return Err(conflict());
         }
@@ -868,6 +1017,49 @@ async fn a_page_over_its_bound_fails_the_call_before_any_release() {
 }
 
 #[tokio::test]
+async fn a_preflight_over_max_units_is_a_contract_violation_before_any_release() {
+    let (storage, engine) = adapter_world(Mode::OverFits).await;
+    let session = SessionId::new("a");
+    let before = storage
+        .inner
+        .members(&engine.domain, &session)
+        .await
+        .unwrap();
+    let mut error = None;
+    for _ in 0..1000 {
+        match call_on(&engine).await {
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+            Ok(report) => assert!(report.has_more),
+        }
+    }
+    let error = error.expect("Fits over max_units violates the protocol");
+    assert_eq!(
+        error.metadata.get("journal_collection_contract"),
+        Some(&MetaValue::Bool(true))
+    );
+    assert_eq!(
+        storage
+            .inner
+            .members(&engine.domain, &session)
+            .await
+            .unwrap(),
+        before
+    );
+}
+async fn call_on(engine: &JournalEngine<Adapter>) -> Result<JournalGcReport, RuntimeError> {
+    engine
+        .collect(JournalGcRequest::new(
+            engine.storage_id(),
+            engine.root_epoch().unwrap(),
+            u64::MAX,
+        ))
+        .await
+}
+
+#[tokio::test]
 async fn split_preflights_release_complete_smaller_batches_with_equal_results() {
     let (split, split_engine) = adapter_world(Mode::AlwaysSplit).await;
     let (whole, whole_engine) = adapter_world(Mode::AlwaysSplit).await;
@@ -917,4 +1109,27 @@ async fn split_preflights_release_complete_smaller_batches_with_equal_results() 
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn a_cancelled_call_restores_the_hints_it_took() {
+    let bounded = world(4).await;
+    let before = bounded.engine.dirty.lock().unwrap().clone();
+    assert!(!before.is_empty());
+    let (reached, ready) = tokio::sync::oneshot::channel();
+    let (_resume, wait) = tokio::sync::oneshot::channel::<()>();
+    *bounded.storage.pause_load.lock().unwrap() = Some((reached, wait));
+    let engine = bounded.engine.clone();
+    let task =
+        tokio::spawn(async move { call(&engine, JournalGcBudget::default(), u64::MAX).await });
+    ready.await.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let after = bounded.engine.dirty.lock().unwrap().clone();
+    assert!(after.is_superset(&before), "{before:?} -> {after:?}");
+    *bounded.storage.pause_load.lock().unwrap() = None;
+    let reference = world(4).await;
+    drain(&bounded.engine, JournalGcBudget::default(), u64::MAX).await;
+    drain(&reference.engine, JournalGcBudget::default(), u64::MAX).await;
+    assert_eq!(retained(&bounded).await, retained(&reference).await);
 }

@@ -539,22 +539,34 @@ impl<S: JournalStorage> JournalEngine<S> {
         session: &SessionId,
     ) -> Result<JournalApplyReceipt, RuntimeError> {
         crate::journal_profile_scope!("rt.engine.storage_apply", {
-            // Even a lost acknowledgement may have released membership. Preserve
-            // unaffected validation evidence, trimming only released cache bodies.
-            if !write.release.is_empty() {
-                self.memo
-                    .lock()
-                    .map_err(|_| host_failure())?
-                    .release(session, &write.release);
-            }
-            match self.storage.apply(write).await {
-                Ok(receipt) => Ok(receipt),
-                Err(error) => {
-                    self.invalidate(session)?;
-                    Err(error)
-                }
-            }
+            let release = write.release.clone();
+            self.guarded_apply(session, &release, self.storage.apply(write))
+                .await
         })
+    }
+    /// Shared memo/invalidation discipline of every storage write (plain and
+    /// collection applies): even a lost acknowledgement may have released
+    /// membership, so released cache bodies are trimmed first, and any error
+    /// discards the session's cached views before it propagates.
+    pub(super) async fn guarded_apply<T>(
+        &self,
+        session: &SessionId,
+        release: &[JournalObjectId],
+        apply: impl std::future::Future<Output = Result<T, RuntimeError>>,
+    ) -> Result<T, RuntimeError> {
+        if !release.is_empty() {
+            self.memo
+                .lock()
+                .map_err(|_| host_failure())?
+                .release(session, release);
+        }
+        match apply.await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.invalidate(session)?;
+                Err(error)
+            }
+        }
     }
     pub(super) fn invalidate(&self, session: &SessionId) -> Result<(), RuntimeError> {
         self.memo

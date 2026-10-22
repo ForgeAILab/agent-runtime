@@ -185,9 +185,12 @@ impl JournalStorage for LostAcknowledgement {
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         // Route through this wrapper's apply so its fault/pause hooks apply.
-        self.apply(plan.write).await
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.count("apply", &write.session);
@@ -1000,26 +1003,24 @@ async fn collection_rechecks_the_mark_after_awaited_storage_reads() {
         .expect("close suspended")
         .unwrap();
     resume.send(()).unwrap();
-    let error = task.await.unwrap().unwrap_err();
-    assert!(matches!(
-        error.class,
-        crate::error::FailureClass::StateConflict {
-            stage: crate::error::FailureStage::PreProvider,
-            component: crate::error::FailureComponent::Checkpoint
-        }
-    ));
+    // Close only removes protection, so it never fails or discards the
+    // suspended call: the mark proceeds and the orphan is collected.
+    let mut report = task.await.unwrap().unwrap();
+    let mut deleted = report.deleted;
+    let mut reclaimed = report.reclaimed_bytes;
+    while report.has_more {
+        report = sweep(&engine, u64::MAX).await;
+        deleted += report.deleted;
+        reclaimed += report.reclaimed_bytes;
+    }
+    assert_eq!((deleted, reclaimed), (1, leaf.bytes.len() as u64));
     assert!(
         storage
             .inner
             .objects(&engine.domain, &session, std::slice::from_ref(&leaf.id))
             .await
             .unwrap()[0]
-            .is_some()
-    );
-    let retry = sweep(&engine, u64::MAX).await;
-    assert_eq!(
-        (retry.deleted, retry.reclaimed_bytes),
-        (1, leaf.bytes.len() as u64)
+            .is_none()
     );
 }
 
@@ -2402,9 +2403,12 @@ impl JournalStorage for PausedApply {
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         // Route through this wrapper's apply so its pause hook applies.
-        self.apply(plan.write).await
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         let pause = {

@@ -35,8 +35,10 @@ pub enum JournalCollectionCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum JournalCollectionPageKind {
-    /// Membership ids of the session in a storage-defined order that is stable
-    /// while the fence is unchanged. Every member appears exactly once.
+    /// Membership ids of the session in a storage-defined order. Every member
+    /// appears exactly once across a page sequence. A physical change without
+    /// a fence change (repack, compaction) may reject a continuation with a
+    /// state conflict; it must never make a continuation silently skip an id.
     Members,
     /// Durable pin records ordered by pin id.
     Pins,
@@ -155,10 +157,20 @@ pub struct JournalCollectionPlan {
     pub max_units: u32,
 }
 
+/// Acknowledged collection apply: exact physical receipts plus the number of
+/// physical units (sealed packs/segments written or deleted) it rewrote, which
+/// must not exceed the units its preflight declared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalCollectionReceipt {
+    pub receipt: JournalApplyReceipt,
+    pub rewritten_units: u32,
+}
+
 /// Result of a read-only, no-effect collection preflight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalCollectionPreflight {
-    /// The complete plan fits in `units` physical units.
+    /// The complete plan fits in `units` physical units, at most the plan's
+    /// `max_units`; the engine rejects a larger claim as a contract violation.
     Fits { units: u32 },
     /// The plan does not fit; retry with at most `max_release` release ids.
     /// Nothing was changed.

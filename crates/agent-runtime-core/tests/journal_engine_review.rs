@@ -701,9 +701,12 @@ impl JournalStorage for ParkedApply {
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         // Route through this wrapper's apply so its pause hook applies.
-        self.apply(plan.write).await
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
     }
 }
 
@@ -1064,7 +1067,7 @@ async fn review_public_error_transcript() {
         "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
         "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
         conflict.clone(),
-        "JournalGcReport { root_epoch: 35, examined: 16, deleted: 2, reclaimed_bytes: 1445, unreadable_sessions: [], progress: Some(Complete), has_more: false, work_units: 0 }".to_string(),
+        "JournalGcReport { root_epoch: 35, examined: 16, deleted: 2, reclaimed_bytes: 1445, unreadable_sessions: [], progress: Some(Complete), has_more: false, work_units: 0, zero_work_calls: 0, over_capacity_sessions: [] }".to_string(),
     ];
     assert_eq!(t, expected);
 }

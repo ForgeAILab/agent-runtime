@@ -588,11 +588,14 @@ impl JournalStorage for VolatileJournalStorage {
     async fn apply_collection(
         &self,
         plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         if plan.write.kind != JournalWriteKind::Collect || plan.max_units == 0 {
             return Err(conflict());
         }
-        self.apply(plan.write).await
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
     }
 }
 
