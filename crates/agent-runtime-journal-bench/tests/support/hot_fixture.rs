@@ -350,7 +350,13 @@ impl JournalProjectionPolicy for Conservative {
         let mut delta = delta.clone();
         delta
             .extension_updates
-            .remove("bench.optional_sensitive_diagnostic");
+            .insert("bench.optional_sensitive_diagnostic".to_owned(), None);
+        if delta
+            .extension_references
+            .contains_key("bench.optional_sensitive_diagnostic")
+        {
+            return Ok(agent_runtime_core::journal::JournalDeltaProjection::FullProjectionRequired);
+        }
         Ok(agent_runtime_core::journal::JournalDeltaProjection::Projected(Box::new(delta)))
     }
     fn project(&self, mut s: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
