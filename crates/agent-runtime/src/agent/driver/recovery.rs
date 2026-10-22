@@ -53,7 +53,9 @@ impl<'a> TurnMachine<'a> {
                 self.driver.clock.now(),
             );
         }
-        let external_interrupted = self.driver.interrupts_external_checkpoint(&checkpoint);
+        let external_interrupted = self
+            .driver
+            .interrupts_external_checkpoint(&checkpoint.materialize());
         if activation_changed || external_interrupted {
             if external_interrupted {
                 if let Some(abilities) = &self.execution.abilities {
@@ -142,7 +144,11 @@ impl<'a> TurnMachine<'a> {
     /// The model response that requested the calls is already canonical, so
     /// a turn that ends without closing them leaves an exchange the context
     /// planner rejects as `invalid_pairing` on every later turn.
-    pub(super) fn close_unanswered_tool_calls(&self, checkpoint: &TurnCheckpoint, reason: &str) {
+    pub(super) fn close_unanswered_tool_calls(
+        &self,
+        checkpoint: &agent_runtime_core::checkpoint::JournalCheckpoint,
+        reason: &str,
+    ) {
         let known = match &checkpoint.state {
             TurnState::AwaitingApproval { slots, .. }
             | TurnState::AwaitingInteraction { slots, .. }
@@ -173,7 +179,8 @@ impl<'a> TurnMachine<'a> {
             let result = known.get(&call.id).cloned().unwrap_or_else(|| {
                 crate::tool::executor::error_block(&call, reason, self.driver.config.output_limit)
             });
-            state.history.push(Message::tool_result(result.clone()));
+            self.execution
+                .append_history(&mut state, [Message::tool_result(result.clone())]);
             self.emitter.emit(
                 Some(self.turn_id.clone()),
                 RuntimeEvent::ToolCallCompleted {
@@ -212,13 +219,16 @@ impl<'a> TurnMachine<'a> {
 
         // Use the same interrupt branch as ResumeOrInterrupt: no backend,
         // prepared tool, approval, interaction, or commit hook is replayed.
-        if self.driver.interrupts_external_checkpoint(&checkpoint) {
+        if self
+            .driver
+            .interrupts_external_checkpoint(&checkpoint.materialize())
+        {
             // Boxed: external interruption must not inline another large recovery future.
             Box::pin(self.abandon(false)).await;
             return;
         }
 
-        match checkpoint.state {
+        match checkpoint.state.clone() {
             #[cfg(feature = "external-agent")]
             TurnState::ExternalToolCall { .. } => {
                 // Boxed: external interruption must not inline another large recovery future.
@@ -604,7 +614,8 @@ impl<'a> TurnMachine<'a> {
                         return;
                     }
                 }
-                self.driver.drain_injected(&self.state, &self.inbox);
+                self.driver
+                    .drain_injected(&self.state, &self.inbox, &self.execution);
                 boxed(|| {
                     self.resume_after_tool_boundary(
                         checkpoint.active_history_start,
@@ -621,7 +632,7 @@ impl<'a> TurnMachine<'a> {
                 provider_error_kind,
             } => {
                 if checkpoint.internal_input.is_none()
-                    && checkpoint.active_history_start == checkpoint.snapshot.history.len()
+                    && checkpoint.active_history_start == checkpoint.snapshot.history_len()
                 {
                     if let Err(error) = boxed(|| self.complete_local(finish)).await {
                         self.emit_non_durable_failure(error, false);
@@ -931,11 +942,10 @@ impl<'a> TurnMachine<'a> {
                 );
             }
             if !parts.is_empty() {
-                self.state
-                    .lock()
-                    .expect("session state poisoned")
-                    .history
-                    .push(Message::assistant(parts));
+                self.execution.append_history(
+                    &mut self.state.lock().expect("session state poisoned"),
+                    [Message::assistant(parts)],
+                );
             }
         }
 

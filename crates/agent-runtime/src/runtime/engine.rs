@@ -1772,6 +1772,7 @@ impl Runtime {
                 abilities.discard_uncommitted_activation();
             }
         }
+        execution.live_snapshot.lock().expect("live snapshot poisoned").enable();
         let persist_gate = execution.persist_gate();
 
         let inner = Arc::new(SessionInner {

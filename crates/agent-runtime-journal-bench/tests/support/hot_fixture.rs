@@ -352,6 +352,27 @@ fn runtime<S: SessionStore + CheckpointStore + 'static>(
 #[derive(Debug)]
 struct Conservative;
 impl JournalProjectionPolicy for Conservative {
+    fn revision(&self) -> Option<u64> {
+        Some(1)
+    }
+    fn project_delta(
+        &self,
+        _base: &agent_runtime_core::journal::JournalSnapshotView,
+        delta: &agent_runtime_core::journal::JournalTransitionDelta,
+        _revision: u64,
+    ) -> Result<agent_runtime_core::journal::JournalDeltaProjection, RuntimeError> {
+        let mut delta = delta.clone();
+        delta
+            .extension_updates
+            .insert("bench.optional_sensitive_diagnostic".to_owned(), None);
+        if delta
+            .extension_references
+            .contains_key("bench.optional_sensitive_diagnostic")
+        {
+            return Ok(agent_runtime_core::journal::JournalDeltaProjection::FullProjectionRequired);
+        }
+        Ok(agent_runtime_core::journal::JournalDeltaProjection::Projected(Box::new(delta)))
+    }
     fn project(&self, mut s: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
         s.extension_state
             .remove("bench.optional_sensitive_diagnostic");
@@ -499,7 +520,9 @@ pub(crate) struct Parameters<'a> {
 }
 pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, LegacyRow) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
+    let fixture_directory = reporter.directory.join("fixtures");
+    std::fs::create_dir_all(&fixture_directory).unwrap();
+    let path = fixture_directory.join(format!(
         "hot-path-{}-{}.sqlite",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -756,7 +779,7 @@ pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, Le
         .unwrap();
     let (legacy, legacy_snapshot) = legacy_run(reporter, &key, &p, &id, &mut operations).await;
     assert_eq!(legacy_snapshot.history, snapshot.history);
-    let import_path = std::env::temp_dir().join(format!(
+    let import_path = fixture_directory.join(format!(
         "hot-import-{}-{}.sqlite",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -801,7 +824,7 @@ pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, Le
     drop(import_store);
     drop(import_file);
     let case = Case {
-        profile_revision: "p0-v4",
+        profile_revision: "p1-round2-live-v1",
         fixture: p.name.into(),
         n: p.n,
         tools: p.tools,
@@ -824,7 +847,7 @@ pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, Le
         final_messages: snapshot.history.len(),
         pack_bytes: storage.pack_write_bytes().unwrap(),
         memory_snapshots,
-        missing_metrics: json!({"allocator_heap":{"value":null,"reason":"no allocator hook; canonical memo charge is not heap"},"cursor_frontier":{"value":0,"reason":"v0.9.0 has no resumable cursor"},"persistent_version_depth":{"value":null,"reason":"v0.9.0 owned snapshots; no persistent semantic version"},"writer_working_state_bytes":{"value":null,"reason":"no non-invasive allocator instrumentation"},"shared_proof_retention_heap":{"value":null,"reason":"external proof reference counts and estimated memo charge are exposed; allocator heap is not"},"storage_cache_allocator_heap":{"value":null,"reason":"canonical body bytes and estimated location index bytes are exposed separately"},"semantic_nodes_copied":{"value":null,"reason":"Clone and PartialEq traversals have no per-node hooks"},"preflight_pages_yields_restarts":{"value":null,"reason":"P4 is not implemented"}}),
+        missing_metrics: json!({"allocator_heap":{"value":null,"reason":"no allocator hook; canonical memo charge is not heap"},"cursor_frontier":{"value":0,"reason":"v0.9.0 has no resumable cursor"},"persistent_version_depth":{"value":null,"reason":"persistent views have no linked version chain; exact per-writer depth telemetry is not instrumented"},"writer_working_state_bytes":{"value":null,"reason":"no non-invasive allocator instrumentation"},"shared_proof_retention_heap":{"value":null,"reason":"external proof reference counts and estimated memo charge are exposed; allocator heap is not"},"storage_cache_allocator_heap":{"value":null,"reason":"canonical body bytes and estimated location index bytes are exposed separately"},"semantic_nodes_copied":{"value":null,"reason":"targeted index/mutation work is counted; generic clone/API traversal and allocator-byte instrumentation remain incomplete"},"preflight_pages_yields_restarts":{"value":null,"reason":"P4 is not implemented"}}),
     };
     drop(store);
     drop(storage);
@@ -1107,4 +1130,205 @@ pub(crate) fn attribute(samples: &[Sample], wall: u64) -> BTreeMap<String, u64> 
         .zip(elapsed)
         .map(|(key, value)| (key.to_owned(), value))
         .collect()
+}
+
+/// Isolates preparation on the unchanged A/B seed corpus. DTO capture is
+/// setup, so this is a lower bound on the Runtime's fixed-delta work.
+pub(crate) async fn fixed_delta_work(directory: &std::path::Path) {
+    use agent_runtime_core::journal::{
+        JournalSnapshotView, JournalWriterAssembler, VolatileJournalStorage,
+    };
+    let mut rows = Vec::new();
+    for name in ["A", "B"] {
+        for n in [1000usize, 4000] {
+            let snapshot = SessionSnapshot {
+                id: SessionId::new(format!("fixed-delta-{name}-{n}")),
+                history: seed(n, name != "A"),
+                usage: Default::default(),
+                identity: Default::default(),
+                manifests: Vec::new(),
+                extension_state: Default::default(),
+                updated: Timestamp(100),
+            };
+            let fingerprint = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&snapshot.history).unwrap())
+            );
+            let journal = JournalEngine::protected(
+                Arc::new(VolatileJournalStorage::default()),
+                JournalStorageId::new("fixed-delta"),
+                JournalEngineConfig {
+                    validated_root_memo_bytes: 128 * 1024 * 1024,
+                    ..Default::default()
+                },
+            );
+            let lease = journal
+                .open(
+                    &snapshot.id,
+                    JournalOpen {
+                        root: JournalRootSelection::Latest,
+                        expected_revision: None,
+                        operation: JournalOperationId::new("open"),
+                        pin: JournalPinId::new("writer"),
+                        intent: JournalOpenIntent::ExclusiveWriter,
+                    },
+                )
+                .await
+                .unwrap();
+            let checkpoint = TurnCheckpoint::session_boundary(snapshot.clone(), 1).unwrap();
+            let mut assembler = JournalWriterAssembler::default();
+            let (roots, mut cache) = assembler.snapshot_cached(&snapshot, 0, None, None).unwrap();
+            let refs = assembler.checkpoint(&checkpoint, roots.clone()).unwrap();
+            cache.finish_preparation(&assembler);
+            let boundary = JournalBoundary {
+                version: 1,
+                session: snapshot.id.clone(),
+                turn: Some(checkpoint.turn.clone()),
+                checkpoint_sequence: 1,
+                planned_step_count: 0,
+            };
+            let mut delta = JournalTransitionDelta {
+                boundary: boundary.clone(),
+                bootstrap: Some(Box::new(snapshot.clone())),
+                history_append: vec![],
+                usage_append: vec![],
+                extension_updates: Default::default(),
+                extension_references: Default::default(),
+                manifests_append: vec![],
+                manifest_references: vec![],
+            };
+            let mut commit = JournalCommit {
+                batch: JournalBatch {
+                    session: snapshot.id.clone(),
+                    sequence: 1,
+                    predecessor: None,
+                    expected_revision: None,
+                    writer_epoch: 1,
+                    operation: JournalOperationId::new("base"),
+                    boundary,
+                    snapshot: roots,
+                    checkpoint: Some(
+                        JournalObject::encode(JournalObjectKind::Checkpoint, &refs)
+                            .unwrap()
+                            .id,
+                    ),
+                },
+                digest: journal_history_chain(std::iter::empty()),
+                objects: assembler.objects.values().cloned().collect(),
+                delta: delta.clone(),
+                checkpoint: Some(refs),
+            };
+            commit.digest = commit.input_digest().unwrap();
+            let head = journal
+                .commit_prepared(&lease, commit, assembler.preparation_hints())
+                .await
+                .unwrap();
+            let known = assembler.objects.keys().cloned().collect::<BTreeSet<_>>();
+            let view = JournalSnapshotView::from_snapshot(snapshot.clone()).unwrap();
+            let appended = Message::user("fixed delta payload");
+            let mut next = snapshot.clone();
+            next.history.push(appended.clone());
+            next.identity.event += 1;
+            let mut checkpoint = checkpoint;
+            checkpoint.snapshot = next.clone();
+            checkpoint.state_revision += 1;
+            checkpoint.watermark.checkpoint_sequence += 1;
+            delta.bootstrap = None;
+            delta.history_append.push(appended);
+            delta.boundary.checkpoint_sequence = 2;
+            let observer = profile::Observer::default();
+            let result = observer
+                .run(async {
+                    let mut assembler = JournalWriterAssembler::default();
+                    let (roots, _) = assembler
+                        .snapshot_view_cached(&next, 0, Some(&view), Some(&cache))
+                        .unwrap();
+                    let refs = assembler.checkpoint(&checkpoint, roots.clone()).unwrap();
+                    let mut commit = JournalCommit {
+                        batch: JournalBatch {
+                            session: next.id.clone(),
+                            sequence: 2,
+                            predecessor: Some(JournalDigest::parse(head.batch.as_str()).unwrap()),
+                            expected_revision: Some(head.revision),
+                            writer_epoch: 1,
+                            operation: JournalOperationId::new("fixed-delta"),
+                            boundary: delta.boundary.clone(),
+                            snapshot: roots,
+                            checkpoint: Some(
+                                JournalObject::encode(JournalObjectKind::Checkpoint, &refs)
+                                    .unwrap()
+                                    .id,
+                            ),
+                        },
+                        digest: journal_history_chain(std::iter::empty()),
+                        objects: assembler
+                            .objects
+                            .values()
+                            .filter(|o| !known.contains(&o.id))
+                            .cloned()
+                            .collect(),
+                        delta,
+                        checkpoint: Some(refs),
+                    };
+                    commit.digest = commit.input_digest().unwrap();
+                    journal
+                        .commit_prepared(&lease, commit, assembler.preparation_hints())
+                        .await
+                        .unwrap()
+                })
+                .await;
+            let mut counts = BTreeMap::<String, u64>::new();
+            for sample in observer.drain().unwrap() {
+                if sample.label.starts_with("rt.work.") {
+                    *counts.entry(sample.label.to_owned()).or_default() += sample.units;
+                }
+            }
+            assert_eq!(
+                result.snapshot,
+                JournalWriterAssembler::default()
+                    .snapshot(&next, 0)
+                    .unwrap()
+            );
+            let read = journal
+                .open(
+                    &next.id,
+                    JournalOpen {
+                        root: JournalRootSelection::Latest,
+                        expected_revision: None,
+                        operation: JournalOperationId::new("read"),
+                        pin: JournalPinId::new("read"),
+                        intent: JournalOpenIntent::ReadOnly,
+                    },
+                )
+                .await
+                .unwrap();
+            let actual = JournalReader::new(
+                &journal,
+                &read,
+                JournalReadLimits {
+                    objects: 4_000_000,
+                    encoded_bytes: 4 * 1024 * 1024 * 1024,
+                    entries: 16_000_000,
+                },
+            )
+            .unwrap()
+            .checkpoint()
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                canonical_journal_json(&actual).unwrap(),
+                canonical_journal_json(&checkpoint).unwrap()
+            );
+            journal.close(read).await.unwrap();
+            journal.close(lease).await.unwrap();
+            rows.push(json!({"fixture":name,"n":n,"base":"protected seed only; DTO capture excluded","seed_bytes_sha256":fingerprint,"counts":counts}));
+        }
+    }
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("fixed-delta-work.json"),
+        serde_json::to_vec_pretty(&rows).unwrap(),
+    )
+    .unwrap();
 }

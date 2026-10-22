@@ -127,6 +127,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                     state.retirement_authorizations.remove(session);
                 }
                 if previous.current == record.current {
+                    record.exact = previous.exact;
                     record.ordinary_snapshot = previous.ordinary_snapshot;
                     record.ordinary_encoding = previous.ordinary_encoding;
                     record.protected_snapshot = previous.protected_snapshot;
@@ -162,6 +163,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             let mut scratch = self.local.clone();
             scratch.state = Arc::new(Mutex::new(state));
             scratch.cut = Arc::new(Mutex::new(None));
+            scratch.admissions = Arc::new(Mutex::new(BTreeSet::new()));
             Ok((scratch, stored))
         })
     }
@@ -574,6 +576,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             .map_err(|_| host_failure())?
             .remove_session(session);
         if let Some(record) = self.local.lock()?.sessions.get_mut(session) {
+            record.exact = None;
             record.ordinary_snapshot = None;
             record.ordinary_encoding = None;
             record.protected_snapshot = None;
@@ -601,6 +604,17 @@ impl<S: JournalStorage> JournalEngine<S> {
             .cloned()
             .ok_or_else(conflict)?;
         let active = local.sessions.get(session).and_then(|r| r.active_writer);
+        // A close/revoke (or a replacement writer) that ran while this
+        // operation awaited storage owns the working views now; never
+        // resurrect the views it cleared.
+        if record.active_writer.is_some() && active != record.active_writer && new_handle.is_none()
+        {
+            record.exact = None;
+            record.ordinary_snapshot = None;
+            record.ordinary_encoding = None;
+            record.protected_snapshot = None;
+            record.protected_encoding = None;
+        }
         record.active_writer = if let Some(handle) = new_handle {
             if prepared
                 .leases
@@ -646,6 +660,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         lease: &JournalLease,
         commit: Box<JournalCommit>,
+        hints: JournalPreparationHints,
     ) -> Result<JournalHead, RuntimeError> {
         crate::journal_profile_scope!("rt.persistence.commit_inner", {
             let _gate = self.write_gate().await;
@@ -673,29 +688,57 @@ impl<S: JournalStorage> JournalEngine<S> {
                     Err(conflict())
                 };
             }
-            let (scratch, stored) = self.hydrate(lease.session()).await?;
+            let (mut scratch, stored) = self.hydrate(lease.session()).await?;
+            scratch.preparation = Arc::new(hints);
             let lease_record = self.local.live_lease(&*self.local.lock()?, lease)?;
             // Only the stored head's closure is guaranteed membership (D4). Cached
             // bodies outside it may have been released by another engine; any
             // the new head references are rechecked before the write below.
-            let (mut objects, verified) =
-                match stored.as_ref().and_then(|record| record.head.as_ref()) {
-                    Some(root) => match self.memoized_root(lease.session(), &root.id)? {
-                        Some(entry) => (entry.objects.clone(), Some(entry.closure.clone())),
-                        None => (ObjectStore::default(), None),
-                    },
-                    None => (ObjectStore::default(), None),
-                };
-            let ids: Vec<_> = lease_record
-                .reachable
-                .layers
-                .iter()
-                .flat_map(|layer| layer.iter().cloned())
-                .filter(|id| objects.get(id).is_none())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            let fetched: BTreeSet<_> = ids.iter().cloned().collect();
+            let entry = match stored.as_ref().and_then(|record| record.head.as_ref()) {
+                Some(root) => self.memoized_root(lease.session(), &root.id)?,
+                None => None,
+            };
+            let covered = entry
+                .as_ref()
+                .is_some_and(|entry| entry.covers_lease_bodies(&lease_record.reachable));
+            let (mut objects, verified) = entry.map_or_else(
+                || (ObjectStore::default(), None),
+                |entry| (entry.objects.clone(), Some(entry.closure.clone())),
+            );
+            let base_exact = match verified.clone() {
+                Some(base) => Some(base),
+                None => scratch
+                    .lock()?
+                    .sessions
+                    .get(lease.session())
+                    .and_then(|record| record.exact.clone()),
+            };
+            let ids: Vec<_> = if covered {
+                Vec::new()
+            } else {
+                #[cfg(feature = "test-support")]
+                crate::journal::profile::event(
+                    "rt.work.lease_cache_ids_considered",
+                    lease_record
+                        .reachable
+                        .layers
+                        .iter()
+                        .map(|layer| layer.len() as u64)
+                        .sum(),
+                    0,
+                );
+                lease_record
+                    .reachable
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.iter().cloned())
+                    .filter(|id| objects.get(id).is_none())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            };
+            let mut fetched = BTreeSet::new();
+            let mut cache_complete = true;
             if !ids.is_empty() {
                 let bodies = self
                     .storage
@@ -706,7 +749,20 @@ impl<S: JournalStorage> JournalEngine<S> {
                 }
                 objects.begin_layer();
                 for (id, body) in ids.into_iter().zip(bodies) {
-                    objects.insert_new(id, body.ok_or_else(conflict)?.to_vec())?;
+                    let Some(body) = body else {
+                        if base_exact.as_ref().is_none_or(|base| base.contains(&id)) {
+                            return Err(conflict());
+                        }
+                        cache_complete = false;
+                        continue;
+                    };
+                    let object = JournalObject {
+                        id: id.clone(),
+                        bytes: body.to_vec(),
+                    };
+                    object.kind()?;
+                    fetched.insert(id.clone());
+                    objects.insert_new(id, object.bytes)?;
                 }
             }
             scratch.lock()?.objects = objects;
@@ -742,7 +798,8 @@ impl<S: JournalStorage> JournalEngine<S> {
                             .sessions
                             .get_mut(lease.session())
                             .ok_or_else(conflict)?;
-                        record.ordinary_snapshot = Some(Arc::new(snapshot));
+                        record.ordinary_snapshot =
+                            Some(Arc::new(JournalSnapshotView::from_snapshot(snapshot)?));
                         record.ordinary_encoding = encoding;
                     }
                 }
@@ -768,18 +825,20 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .dependencies
                 .sessions
                 .clone();
-            let (root, entry) = self.commit_memo_entry(&scratch, lease.session())?;
-            // A body already in `objects` is never rewritten. Each one the new
-            // head references outside the stored closure must still be a member.
+            let (root, entry) =
+                self.commit_memo_entry(&scratch, lease.session(), cache_complete)?;
+            // Cached bytes outside the stored closure do not attest membership.
+            // Only explicitly admitted data may restore a missing membership.
             let unverified: Vec<_> = match &verified {
                 Some(closure) => {
                     let state = scratch.lock()?;
                     let written = state.objects.layers.last().ok_or_else(conflict)?;
                     entry
                         .closure
+                        .entered
                         .iter()
                         .filter(|id| {
-                            !closure.contains(*id)
+                            !closure.contains(id)
                                 && !fetched.contains(*id)
                                 && !written.contains_key(*id)
                         })
@@ -788,13 +847,45 @@ impl<S: JournalStorage> JournalEngine<S> {
                 }
                 None => Vec::new(),
             };
-            let released = !unverified.is_empty() && {
+            let mut readmissions = Vec::new();
+            let mut released = false;
+            if !unverified.is_empty() {
                 let bodies = self
                     .storage
                     .objects(&self.domain, lease.session(), &unverified)
                     .await?;
-                bodies.len() != unverified.len() || bodies.iter().any(Option::is_none)
-            };
+                if bodies.len() != unverified.len() {
+                    return Err(conflict());
+                }
+                for (id, body) in unverified.iter().zip(bodies) {
+                    if body.is_some() {
+                        continue;
+                    }
+                    if !scratch
+                        .admissions
+                        .lock()
+                        .map_err(|_| host_failure())?
+                        .contains(id)
+                    {
+                        released = true;
+                        continue;
+                    }
+                    let object = JournalObject {
+                        id: id.clone(),
+                        bytes: scratch
+                            .lock()?
+                            .objects
+                            .get(id)
+                            .cloned()
+                            .ok_or_else(conflict)?,
+                    };
+                    readmissions.push(JournalStoredObject {
+                        id: id.clone(),
+                        kind: object.kind()?,
+                        bytes: Arc::from(object.bytes),
+                    });
+                }
+            }
             if released || self.retired_dependency(&dependencies).await? {
                 // The reference validates dependencies after the batch cut and
                 // before the pin cut: an earlier cut wins, a later one stays armed.
@@ -815,6 +906,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                     None => Err(conflict()),
                 };
             }
+            let entry = self.certify_commit_entry(&scratch, lease.session(), entry)?;
             let mut write = self.write(
                 &scratch,
                 lease.session(),
@@ -855,6 +947,11 @@ impl<S: JournalStorage> JournalEngine<S> {
                         })?,
                     }));
             }
+            write.objects.objects.extend(readmissions);
+            write
+                .objects
+                .objects
+                .sort_by(|left, right| left.id.cmp(&right.id));
             write.operation = Some(JournalOperationRecord {
                 operation,
                 digest,

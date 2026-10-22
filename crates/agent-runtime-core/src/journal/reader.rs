@@ -655,22 +655,17 @@ impl<'a> JournalReader<'a> {
                     .await?,
             );
         }
-        request.validate_cache_identity().map_err(|_| conflict())?;
         Ok(request)
     }
 
-    async fn state(&mut self, id: &JournalObjectId) -> Result<TurnState, RuntimeError> {
+    async fn state(
+        &mut self,
+        id: &JournalObjectId,
+    ) -> Result<(TurnState, ReferencedTurnState), RuntimeError> {
         let refs: ReferencedTurnState = self.object(id, JournalObjectKind::TurnState).await?;
-        if refs.fields.len() > JOURNAL_FANOUT || refs.fields.contains_key("state") {
-            return Err(conflict());
-        }
         let mut fields = serde_json::Map::new();
         fields.insert("state".to_owned(), Value::String(refs.tag.clone()));
-        for (name, reference) in refs.fields {
-            let request_field = refs.tag == "calling_model" && name == "request";
-            if request_field != matches!(&reference, JournalStateValue::Request { .. }) {
-                return Err(conflict());
-            }
+        for (name, reference) in refs.fields.clone() {
             let value = match reference {
                 JournalStateValue::Object { object } => {
                     let value = self
@@ -705,7 +700,7 @@ impl<'a> JournalReader<'a> {
         if serde_json::to_value(&state).map_err(|_| conflict())? != value {
             return Err(conflict());
         }
-        Ok(state)
+        Ok((state, refs))
     }
 
     /// Reads one extension of the pinned head, preserving its stored sensitivity.
@@ -937,17 +932,65 @@ impl<'a> JournalReader<'a> {
     /// Validates a protected head/checkpoint against a snapshot already
     /// reconstructed and root-checked by the committing backend. This avoids
     /// decoding an unchanged snapshot closure a second time at every commit.
-    pub(crate) async fn validate_checkpoint_with_snapshot(
+    pub(crate) async fn validate_checkpoint_with_view(
         &mut self,
-        snapshot: SessionSnapshot,
+        snapshot: &super::JournalSnapshotView,
+        preparation: &super::JournalPreparationHints,
     ) -> Result<(), RuntimeError> {
         let head = self.lease.head().cloned().ok_or_else(conflict)?;
-        if snapshot.id != head.session {
+        if snapshot.session() != &head.session {
             return Err(conflict());
         }
         self.batch(&head).await?;
-        if head.checkpoint.is_some() {
-            self.checkpoint_with_snapshot(&head, snapshot).await?;
+        if let Some(id) = &head.checkpoint {
+            let refs: ReferencedTurnCheckpoint =
+                self.object(id, JournalObjectKind::Checkpoint).await?;
+            self.validate_checkpoint_refs(&head, &refs).await?;
+            if let Some(state) = preparation.states.get(&refs.state) {
+                let encoded = self.journal.read(self.lease, &refs.state).await?;
+                if encoded != state.encoded {
+                    return Err(conflict());
+                }
+                let shape: ReferencedTurnState = JournalObject {
+                    id: refs.state.clone(),
+                    bytes: encoded,
+                }
+                .decode(JournalObjectKind::TurnState)?;
+                let input: Option<InternalTurnInput> = match &refs.internal_input {
+                    Some(id) => Some(self.object(id, JournalObjectKind::InternalInput).await?),
+                    None => None,
+                };
+                return crate::checkpoint::CheckpointEvidence {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    transition_revision: refs.transition_revision,
+                    session: &refs.session,
+                    turn: &refs.turn,
+                    state_revision: refs.state_revision,
+                    operation_fingerprint: &refs.operation_fingerprint,
+                    active_history_start: refs.active_history_start,
+                    internal_input: input.as_ref(),
+                    visible_output: refs.visible_output,
+                    state: &state.value,
+                    watermark: &refs.watermark,
+                    state_fingerprint: Some(&state.fingerprint),
+                    state_shape: Some(&shape),
+                }
+                .validate(snapshot)
+                .map_err(|_| conflict());
+            }
+            let empty = SessionSnapshot {
+                id: snapshot.session().clone(),
+                history: vec![],
+                usage: Default::default(),
+                identity: Default::default(),
+                manifests: vec![],
+                extension_state: Default::default(),
+                updated: head.updated,
+            };
+            self.checkpoint_candidate(&head, empty)
+                .await?
+                .validate_with_evidence(snapshot)
+                .map_err(|_| conflict())?;
         }
         Ok(())
     }
@@ -957,24 +1000,20 @@ impl<'a> JournalReader<'a> {
         head: &JournalHead,
         snapshot: SessionSnapshot,
     ) -> Result<TurnCheckpoint, RuntimeError> {
-        if head.role != JournalRole::Protected {
-            return Err(conflict());
-        }
+        let checkpoint = self.checkpoint_candidate(head, snapshot).await?;
+        checkpoint.validate().map_err(|_| conflict())?;
+        Ok(checkpoint)
+    }
+
+    async fn checkpoint_candidate(
+        &mut self,
+        head: &JournalHead,
+        snapshot: SessionSnapshot,
+    ) -> Result<TurnCheckpoint, RuntimeError> {
         let id = head.checkpoint.as_ref().ok_or_else(conflict)?;
         let refs: ReferencedTurnCheckpoint = self.object(id, JournalObjectKind::Checkpoint).await?;
-        if refs.schema_version != JOURNAL_SCHEMA_VERSION
-            || refs.transition_revision != TURN_TRANSITION_REVISION
-            || refs.session != head.session
-            || refs.snapshot != head.snapshot
-        {
-            return Err(conflict());
-        }
-        let batch = self.batch(head).await?;
-        if batch.boundary.turn.as_ref() != Some(&refs.turn)
-            || batch.boundary.checkpoint_sequence != refs.watermark.checkpoint_sequence
-        {
-            return Err(conflict());
-        }
+        self.validate_checkpoint_refs(head, &refs).await?;
+        let (state, shape) = self.state(&refs.state).await?;
         let internal_input: Option<InternalTurnInput> = match &refs.internal_input {
             Some(id) => Some(self.object(id, JournalObjectKind::InternalInput).await?),
             None => None,
@@ -991,14 +1030,38 @@ impl<'a> JournalReader<'a> {
             active_history_start: refs.active_history_start,
             internal_input,
             visible_output: refs.visible_output,
-            state: self.state(&refs.state).await?,
+            state,
             snapshot,
             deadline: refs.deadline,
             watermark: refs.watermark,
             updated: refs.updated,
         };
-        checkpoint.validate().map_err(|_| conflict())?;
+        let mut evidence = checkpoint.validation_evidence(None);
+        evidence.state_shape = Some(&shape);
+        evidence.validate_state().map_err(|_| conflict())?;
         Ok(checkpoint)
+    }
+
+    async fn validate_checkpoint_refs(
+        &mut self,
+        head: &JournalHead,
+        refs: &ReferencedTurnCheckpoint,
+    ) -> Result<(), RuntimeError> {
+        if head.role != JournalRole::Protected
+            || refs.schema_version != JOURNAL_SCHEMA_VERSION
+            || refs.transition_revision != TURN_TRANSITION_REVISION
+            || refs.session != head.session
+            || refs.snapshot != head.snapshot
+        {
+            return Err(conflict());
+        }
+        let batch = self.batch(head).await?;
+        if batch.boundary.turn.as_ref() != Some(&refs.turn)
+            || batch.boundary.checkpoint_sequence != refs.watermark.checkpoint_sequence
+        {
+            return Err(conflict());
+        }
+        Ok(())
     }
 }
 

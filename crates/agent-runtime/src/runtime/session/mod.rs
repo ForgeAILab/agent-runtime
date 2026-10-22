@@ -12,7 +12,8 @@ use tokio::task::AbortHandle;
 use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::cancel::{CancelReason, Cancellation};
 use agent_runtime_core::checkpoint::{
-    CacheOperationCheckpoint, CacheOperationResultCheckpoint, TurnCheckpoint, TurnState,
+    CacheOperationCheckpoint, CacheOperationResultCheckpoint, JournalCheckpoint, TurnCheckpoint,
+    TurnState,
 };
 use agent_runtime_core::clock::Deadline;
 use agent_runtime_core::content::{
@@ -275,7 +276,7 @@ pub struct SessionHandle {
 #[derive(Debug)]
 struct SessionCacheStartBarrier {
     session: SessionHandle,
-    checkpoint: Arc<AsyncMutex<Option<TurnCheckpoint>>>,
+    checkpoint: Arc<AsyncMutex<Option<JournalCheckpoint>>>,
 }
 
 struct CacheActivityGuard {

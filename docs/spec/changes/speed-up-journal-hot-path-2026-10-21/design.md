@@ -759,3 +759,22 @@ depends on ownership and review; no parallel staffing is assumed.
 | OQ6. Is 250 ms universal? | Soft target; every measured collect call and gate hold must be <1 s. Declare bounded units, expose outliers and never cancel ambiguous atomic writes. |
 | OQ7. Plain C and old maximum? | Accepted default: original tool C unchanged; labeled N/2-turn C-plain-supplement, 32 manifests, fresh baseline, isolated/full-matrix contexts. |
 | OQ8. Import timing/migration? | Superseded: Forge background conversion removes first-open user wait; runtime import speed is non-gating. Keep correctness and diagnostic timings. |
+
+### OQ9. Incremental operation fingerprint (P1 round 2)
+
+The persisted `TurnState::operation_fingerprint` still serializes the complete
+state, including a frozen provider request. The round-1 HEAD diagnostic at
+B/4000 measured 16.164 ms plain / 34.660 ms tool across 27 / 55 calls and
+10,072,981 / 20,330,205 serialized bytes. The final round-2 diagnostic measured
+15.554 / 31.648 ms over the same 27 / 55 calls and byte counts.
+These inclusive timers cover serialization and hashing,
+not hashing in isolation; they overlap checkpoint and writer spans.
+
+An immutable request/message/tool tree could cache subtree digests and prepare
+a new state fingerprint in O(D log N), but replacing today's serialized-state
+contribution changes persisted fingerprint bytes. Recommend a separately
+approved transition-revision change, explicit old-checkpoint validation and
+recovery compatibility, and differential tests across the revision boundary.
+P1 retains the existing format and transition revision. Caching the exact
+existing fingerprint for an unchanged immutable state is format-preserving,
+but the first hash of each newly assembled request remains O(request bytes).

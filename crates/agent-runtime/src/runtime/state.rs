@@ -83,6 +83,7 @@ pub struct ActiveTurn {
 pub struct SessionExecutionContext {
     /// Persistence mode selected once before this live session was built.
     pub(crate) persistence: Arc<SessionPersistence>,
+    pub(crate) live_snapshot: Mutex<super::snapshot::LiveSnapshot>,
     history_generations: Mutex<super::history::HistoryGenerations>,
     /// Volatile backend observations, deliberately outside all snapshot state.
     #[cfg(feature = "external-agent")]
@@ -93,11 +94,11 @@ pub struct SessionExecutionContext {
     /// is enabled.
     pub(crate) abilities: Option<SessionAbilities>,
     /// Namespaced state for ordered harness components.
-    pub(crate) extension_state: Mutex<BTreeMap<String, VersionedSessionState>>,
+    pub(crate) extension_state: Mutex<super::extensions::ExtensionState>,
     /// Extension state staged for an in-flight internal acceptance checkpoint.
     /// Turn checkpoints include this overlay, while ordinary SessionStore
     /// snapshots intentionally exclude it until the acceptance hook commits.
-    staged_extension_state: Mutex<BTreeMap<String, VersionedSessionState>>,
+    staged_extension_state: Mutex<super::extensions::ExtensionState>,
     /// Per-session serialization boundary shared by every SessionStore save,
     /// including AgentDriver's terminal publication.
     pub(crate) persist_gate: Arc<AsyncMutex<()>>,
@@ -158,10 +159,11 @@ impl SessionExecutionContext {
             #[cfg(feature = "external-agent")]
             backend_tool_observations: Mutex::new(Default::default()),
             planner,
+            live_snapshot: Mutex::new(Default::default()),
             history_generations: Mutex::new(super::history::HistoryGenerations::default()),
             abilities,
-            extension_state: Mutex::new(extension_state),
-            staged_extension_state: Mutex::new(BTreeMap::new()),
+            extension_state: Mutex::new(extension_state.into()),
+            staged_extension_state: Mutex::new(Default::default()),
             persist_gate: Arc::new(AsyncMutex::new(())),
             current_turn: Mutex::new(None),
             tool_result_commit_hooks: Mutex::new(ToolResultCommitHooks::default()),
@@ -346,27 +348,40 @@ impl SessionExecutionContext {
     /// Captures exact extension state, including runtime-owned activation
     /// epochs that ordinary component state does not mutate directly.
     pub(crate) fn snapshot_extension_state(&self) -> BTreeMap<String, VersionedSessionState> {
+        self.snapshot_extension_state_inner(true)
+    }
+    fn snapshot_extension_state_inner(
+        &self,
+        include_previous: bool,
+    ) -> BTreeMap<String, VersionedSessionState> {
         #[cfg(feature = "test-support")]
         let _profile =
             agent_runtime_core::journal::profile::enter_sync("rt.runtime.snapshot_extension_state");
-        let mut state = self
+        let state = self
             .extension_state
             .lock()
             .expect("session extension state poisoned")
-            .clone();
+            .iter()
+            .filter(|(key, _)| key.as_str() != PREVIOUS_CACHE_STATE_NAMESPACE)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        self.snapshot_generated_state(state, include_previous)
+    }
+    fn snapshot_generated_state(
+        &self,
+        mut state: BTreeMap<String, VersionedSessionState>,
+        include_previous: bool,
+    ) -> BTreeMap<String, VersionedSessionState> {
         if let Some(abilities) = &self.abilities {
             state.insert(
                 ACTIVATION_STATE_NAMESPACE.to_owned(),
                 abilities.persisted_state(),
             );
         }
-        if let Some(cache) = self.planner.persisted_previous_cache() {
-            state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
-        } else {
-            // Retirement is a durable state transition. Do not let a stale
-            // baseline survive in the copied extension map and reappear after
-            // a later snapshot/restart.
-            state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
+        if include_previous {
+            if let Some(cache) = self.planner.persisted_previous_cache() {
+                state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
+            }
         }
         if let Some(request) = self.returned_interaction_value() {
             state.insert(
@@ -398,24 +413,37 @@ impl SessionExecutionContext {
         state
     }
 
-    /// Captures a turn checkpoint view, including extension state staged for
-    /// the turn's acceptance boundary.
-    pub(crate) fn snapshot_extension_state_with_staged(
+    pub(crate) fn snapshot_extension_state_for_journal(
         &self,
-    ) -> BTreeMap<String, VersionedSessionState> {
-        crate::journal_profile_sync!("rt.runtime.snapshot_extension_state_with_staged", {
-            let mut state = self.snapshot_extension_state();
+        include_staged: bool,
+    ) -> BTreeMap<String, Arc<VersionedSessionState>> {
+        let mut state = self
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .shared();
+        state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
+        state.remove(ARTIFACT_REFERENCES_STATE_NAMESPACE);
+        state.extend(
+            self.snapshot_generated_state(BTreeMap::new(), false)
+                .into_iter()
+                .map(|(key, value)| (key, Arc::new(value))),
+        );
+        if let Some(cache) = self.planner.persisted_previous_cache_shared() {
+            state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
+        }
+        if include_staged {
             state.extend(
                 self.staged_extension_state
                     .lock()
                     .expect("staged session extension state poisoned")
-                    .clone(),
+                    .shared(),
             );
-            if self.planner.persisted_previous_cache().is_none() {
-                state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
-            }
-            state
-        })
+        }
+        if !self.planner.has_previous_cache() {
+            state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
+        }
+        state
     }
 
     pub(crate) fn stage_extension_state(
@@ -439,7 +467,7 @@ impl SessionExecutionContext {
             .expect("session extension state poisoned");
         for namespace in namespaces {
             if let Some(state) = staged.remove(namespace) {
-                extension.insert(namespace.clone(), state);
+                extension.insert_shared(namespace.clone(), state);
             }
         }
     }

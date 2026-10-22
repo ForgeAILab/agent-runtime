@@ -9,6 +9,7 @@ pub mod builder;
 pub mod command;
 pub mod emitter;
 pub mod engine;
+mod extensions;
 pub(crate) mod fork;
 pub mod goal;
 pub(crate) mod history;
@@ -16,6 +17,7 @@ pub mod inject;
 pub(crate) mod journal;
 pub(crate) mod manifests;
 pub mod session;
+mod snapshot;
 pub mod state;
 pub(crate) mod steer;
 

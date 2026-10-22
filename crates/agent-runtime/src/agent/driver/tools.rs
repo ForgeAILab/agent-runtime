@@ -453,7 +453,8 @@ impl<'a> TurnMachine<'a> {
                         return Err(error);
                     }
                 }
-                self.driver.drain_injected(&self.state, &self.inbox);
+                self.driver
+                    .drain_injected(&self.state, &self.inbox, &self.execution);
                 return Ok(());
             }
 
@@ -520,7 +521,8 @@ impl<'a> TurnMachine<'a> {
             prepared_batch.calls.len(),
             "every prepared or rejected tool call must produce one result"
         );
-        self.driver.drain_injected(&self.state, &self.inbox);
+        self.driver
+            .drain_injected(&self.state, &self.inbox, &self.execution);
         Ok(())
     }
 

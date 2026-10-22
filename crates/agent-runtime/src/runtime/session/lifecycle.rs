@@ -296,10 +296,42 @@ impl SessionHandle {
         self.inner.shared.manifest_window
     }
 
-    pub(super) fn checkpoint_snapshot(&self) -> Result<SessionSnapshot, RuntimeError> {
-        let mut snapshot = self.snapshot();
-        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
-        Ok(snapshot)
+    pub(super) fn checkpoint_snapshot(
+        &self,
+    ) -> Result<agent_runtime_core::journal::JournalSnapshotView, RuntimeError> {
+        self.journal_snapshot(false)
+    }
+
+    pub(super) fn journal_snapshot(
+        &self,
+        include_manifests: bool,
+    ) -> Result<agent_runtime_core::journal::JournalSnapshotView, RuntimeError> {
+        let state = self.inner.state.lock().expect("session state poisoned");
+        let mut extensions = self
+            .inner
+            .execution
+            .snapshot_extension_state_for_journal(false);
+        if let Some(cache) = self.inner.shared.cache.persisted_session(&self.inner.id) {
+            extensions.insert(
+                crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),
+                Arc::new(cache),
+            );
+        }
+        self.inner
+            .execution
+            .live_snapshot
+            .lock()
+            .expect("live snapshot poisoned")
+            .capture(
+                &self.inner.id,
+                &state,
+                extensions,
+                self.inner
+                    .minter
+                    .snapshot(self.inner.emitter.next_sequence()),
+                self.inner.shared.clock.now(),
+                include_manifests,
+            )
     }
 
     /// A snapshot of the session's canonical state with recent diagnostics.
@@ -350,7 +382,7 @@ impl SessionHandle {
         self.inner
             .execution
             .persistence
-            .save_snapshot(&self.snapshot())
+            .save_snapshot_view(&self.journal_snapshot(true)?)
             .await
     }
 
@@ -384,12 +416,16 @@ impl SessionHandle {
             }
             previous
         };
-        let result = self
-            .inner
-            .execution
-            .persistence
-            .save_snapshot(&self.snapshot())
-            .await;
+        let result = match self.journal_snapshot(true) {
+            Ok(snapshot) => {
+                self.inner
+                    .execution
+                    .persistence
+                    .save_snapshot_view(&snapshot)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             let mut extensions = self
                 .inner
@@ -497,12 +533,16 @@ impl SessionHandle {
 
         self.inner.emitter.emit(None, RuntimeEvent::SessionShutdown);
         let _persist_gate = self.inner.persist_gate.lock().await;
-        let save_result = self
-            .inner
-            .execution
-            .persistence
-            .save_snapshot(&self.snapshot())
-            .await;
+        let save_result = match self.journal_snapshot(true) {
+            Ok(snapshot) => {
+                self.inner
+                    .execution
+                    .persistence
+                    .save_snapshot_view(&snapshot)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         let close_result = self.inner.execution.persistence.close().await;
         *shutdown_complete = true;
         self.inner.active_session_lease.release();

@@ -116,6 +116,62 @@ pub(super) fn interaction_state_valid(
             })
         && request.validate().is_ok()
 }
+pub(crate) trait SnapshotEvidence {
+    fn session_id(&self) -> &SessionId;
+    fn history_len(&self) -> usize;
+    fn history_message(&self, index: usize) -> Option<&crate::content::Message>;
+    #[cfg(feature = "test-support")]
+    fn record_count(&self) -> usize;
+    #[cfg(feature = "external-agent")]
+    fn has_tool_call(&self, call: &ToolCall) -> bool;
+}
+impl SnapshotEvidence for SessionSnapshot {
+    fn session_id(&self) -> &SessionId {
+        &self.id
+    }
+    fn history_len(&self) -> usize {
+        self.history.len()
+    }
+    fn history_message(&self, index: usize) -> Option<&crate::content::Message> {
+        self.history.get(index)
+    }
+    #[cfg(feature = "test-support")]
+    fn record_count(&self) -> usize {
+        self.history.len()
+            + self.usage.records().len()
+            + self.manifests.len()
+            + self.extension_state.len()
+    }
+    #[cfg(feature = "external-agent")]
+    fn has_tool_call(&self, call: &ToolCall) -> bool {
+        self.history
+            .iter()
+            .any(|m| m.tool_calls().any(|c| c == call))
+    }
+}
+impl SnapshotEvidence for crate::journal::JournalSnapshotView {
+    fn session_id(&self) -> &SessionId {
+        self.session()
+    }
+    fn history_len(&self) -> usize {
+        self.history_len()
+    }
+    fn history_message(&self, index: usize) -> Option<&crate::content::Message> {
+        self.message(index)
+    }
+    #[cfg(feature = "test-support")]
+    fn record_count(&self) -> usize {
+        self.history_len() + self.usage_len() + self.manifest_len() + self.extension_state.len()
+    }
+    #[cfg(feature = "external-agent")]
+    fn has_tool_call(&self, call: &ToolCall) -> bool {
+        (0..self.history_len()).any(|i| {
+            self.message(i)
+                .is_some_and(|m| m.tool_calls().any(|c| c == call))
+        })
+    }
+}
+
 impl TurnCheckpoint {
     /// Legacy session-wide event-journal truncation boundary.
     ///
@@ -481,6 +537,236 @@ impl TurnCheckpoint {
 
     /// Validates schema compatibility, identity, and operation fingerprints.
     pub fn validate(&self) -> Result<(), RuntimeError> {
+        self.validate_with_evidence(&self.snapshot)
+    }
+
+    pub(crate) fn validate_with_evidence(
+        &self,
+        snapshot: &impl SnapshotEvidence,
+    ) -> Result<(), RuntimeError> {
+        self.validation_evidence(None).validate(snapshot)
+    }
+    pub(crate) fn validation_evidence<'a>(
+        &'a self,
+        state_fingerprint: Option<&'a Fingerprint>,
+    ) -> CheckpointEvidence<'a> {
+        CheckpointEvidence {
+            schema_version: self.schema_version,
+            transition_revision: self.transition_revision,
+            session: &self.session,
+            turn: &self.turn,
+            state_revision: self.state_revision,
+            operation_fingerprint: &self.operation_fingerprint,
+            active_history_start: self.active_history_start,
+            internal_input: self.internal_input.as_ref(),
+            visible_output: self.visible_output,
+            state: &self.state,
+            watermark: &self.watermark,
+            state_fingerprint,
+            state_shape: None,
+        }
+    }
+
+    /// Validates that `next` is the one immediate successor of `self`.
+    ///
+    /// Stores use this before replacing their latest record so a caller
+    /// cannot splice a separately valid checkpoint across requests, steps, or
+    /// transition revisions.
+    pub fn validate_successor(&self, next: &Self) -> Result<(), RuntimeError> {
+        self.validate()?;
+        next.validate()?;
+        if self.session != next.session || self.turn != next.turn {
+            return Err(RuntimeError::conflict(
+                "checkpoint successor belongs to another session or turn",
+            ));
+        }
+        if self.schema_version != next.schema_version
+            || self.transition_revision != next.transition_revision
+        {
+            return Err(RuntimeError::conflict(
+                "checkpoint successor changed schema or transition revision",
+            ));
+        }
+        if self.deadline != next.deadline
+            || self.active_history_start != next.active_history_start
+            || self.internal_input != next.internal_input
+        {
+            return Err(RuntimeError::conflict(
+                "checkpoint successor changed immutable turn progress",
+            ));
+        }
+        if self.visible_output && !next.visible_output {
+            return Err(RuntimeError::conflict(
+                "checkpoint successor regressed committed visible output",
+            ));
+        }
+        if next.state_revision != self.state_revision.saturating_add(1)
+            || next.watermark.checkpoint_sequence
+                != self.watermark.checkpoint_sequence.saturating_add(1)
+        {
+            return Err(RuntimeError::conflict(
+                "checkpoint successor skipped or repeated a state revision",
+            ));
+        }
+        if next.watermark.event_sequence < self.watermark.event_sequence {
+            return Err(RuntimeError::conflict(
+                "checkpoint successor regressed its event watermark",
+            ));
+        }
+        if !self.state.can_transition_to(&next.state) {
+            return Err(RuntimeError::conflict(format!(
+                "invalid checkpoint successor from {} to {}",
+                state_name(&self.state),
+                state_name(&next.state)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl TurnCheckpoint {
+    /// Recomputes the operation fingerprint after a test edits the state in
+    /// place, so only the edit under test can make the checkpoint invalid.
+    pub(crate) fn reseal_operation_fingerprint(&mut self) {
+        self.operation_fingerprint = checkpoint_operation_fingerprint(
+            &self.state,
+            self.active_history_start,
+            self.internal_input.as_ref(),
+            self.visible_output,
+        );
+    }
+}
+
+pub(super) fn checkpoint_operation_fingerprint(
+    state: &TurnState,
+    active_history_start: usize,
+    internal_input: Option<&InternalTurnInput>,
+    visible_output: bool,
+) -> Fingerprint {
+    checkpoint_operation_fingerprint_from_state(
+        || state.operation_fingerprint(),
+        active_history_start,
+        internal_input,
+        visible_output,
+    )
+}
+
+fn checkpoint_operation_fingerprint_from_state(
+    state_fingerprint: impl FnOnce() -> Fingerprint,
+    active_history_start: usize,
+    internal_input: Option<&InternalTurnInput>,
+    visible_output: bool,
+) -> Fingerprint {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.checkpoint.fingerprint");
+
+    let mut hasher = FingerprintHasher::new();
+    hasher
+        .field("turn_checkpoint_operation")
+        .field(TURN_TRANSITION_REVISION.to_string())
+        .field(active_history_start.to_string())
+        .field(if visible_output {
+            "visible"
+        } else {
+            "not_visible"
+        })
+        .nested(&state_fingerprint());
+    match internal_input {
+        Some(input) => hasher.field(
+            serde_json::to_vec(input).expect("validated internal turn input must serialize"),
+        ),
+        None => hasher.field([]),
+    };
+    hasher.finish()
+}
+
+pub(super) fn state_name(state: &TurnState) -> &'static str {
+    match state {
+        TurnState::Accepted { .. } => "accepted",
+        TurnState::InternalAccepted { .. } => "internal_accepted",
+        TurnState::LocalActionAccepted { .. } => "local_action_accepted",
+        TurnState::LocalActionPrepared { .. } => "local_action_prepared",
+        TurnState::LocalActionExecuting { .. } => "local_action_executing",
+        TurnState::LocalActionOutcomeReady { .. } => "local_action_outcome_ready",
+        TurnState::LocalActionResultReady { .. } => "local_action_result_ready",
+        TurnState::Planning { .. } => "planning",
+        TurnState::CallingModel { .. } => "calling_model",
+        TurnState::ModelResponseReady { .. } => "model_response_ready",
+        #[cfg(feature = "external-agent")]
+        TurnState::ExternalToolCall { .. } => "external_tool_call",
+        TurnState::AwaitingApproval { .. } => "awaiting_approval",
+        TurnState::AwaitingInteraction { .. } => "awaiting_interaction",
+        TurnState::ToolOutcomeReady { .. } => "tool_outcome_ready",
+        TurnState::ExecutingTools { .. } => "executing_tools",
+        TurnState::Completing { .. } => "completing",
+        TurnState::PublishingTerminal { .. } => "publishing_terminal",
+        TurnState::Terminal { .. } => "terminal",
+        TurnState::CacheOperationPrepared { .. } => "cache_operation_prepared",
+        TurnState::CacheOperationStarted { .. } => "cache_operation_started",
+        TurnState::CacheOperationResultReady { .. } => "cache_operation_result_ready",
+        TurnState::CacheOperationTerminal { .. } => "cache_operation_terminal",
+    }
+}
+
+pub(crate) struct CheckpointEvidence<'a> {
+    pub(crate) schema_version: u32,
+    pub(crate) transition_revision: u32,
+    pub(crate) session: &'a SessionId,
+    pub(crate) turn: &'a TurnId,
+    pub(crate) state_revision: u64,
+    pub(crate) operation_fingerprint: &'a Fingerprint,
+    pub(crate) active_history_start: usize,
+    pub(crate) internal_input: Option<&'a InternalTurnInput>,
+    pub(crate) visible_output: bool,
+    pub(crate) state: &'a TurnState,
+    pub(crate) watermark: &'a CheckpointWatermark,
+    pub(crate) state_fingerprint: Option<&'a Fingerprint>,
+    pub(crate) state_shape: Option<&'a crate::journal::ReferencedTurnState>,
+}
+impl CheckpointEvidence<'_> {
+    pub(crate) fn validate_state(&self) -> Result<(), RuntimeError> {
+        if let TurnState::CallingModel { request, .. } = self.state {
+            request
+                .validate_cache_identity()
+                .map_err(RuntimeError::conflict)?;
+        }
+        if let Some(shape) = self.state_shape {
+            use crate::journal::{JOURNAL_FANOUT, JournalStateValue};
+            let raw = match self.state {
+                TurnState::CallingModel {
+                    request_id, step, ..
+                } => {
+                    serde_json::json!({"state":"calling_model", "request_id":request_id,"step":step,"request":null})
+                }
+                state => serde_json::to_value(state)?,
+            };
+            let fields = raw
+                .as_object()
+                .ok_or_else(|| RuntimeError::conflict("turn state is not an object"))?;
+            if shape.fields.len() > JOURNAL_FANOUT
+                || shape.fields.len() + 1 != fields.len()
+                || fields.get("state").and_then(serde_json::Value::as_str)
+                    != Some(shape.tag.as_str())
+                || shape.fields.iter().any(|(name, reference)| {
+                    let Some(value) = fields.get(name).filter(|_| name.as_str() != "state") else {
+                        return true;
+                    };
+                    let request = shape.tag == "calling_model" && name == "request";
+                    request != matches!(reference, JournalStateValue::Request { .. })
+                        || (!request
+                            && value.is_array()
+                                != matches!(reference, JournalStateValue::Sequence { .. }))
+                })
+            {
+                return Err(RuntimeError::conflict(
+                    "checkpoint state tag or field shape mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn validate(&self, snapshot: &impl SnapshotEvidence) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.checkpoint.validate");
         #[cfg(feature = "test-support")]
@@ -488,13 +774,11 @@ impl TurnCheckpoint {
         #[cfg(feature = "test-support")]
         crate::journal::profile::event(
             "rt.work.checkpoint_snapshot_records",
-            (self.snapshot.history.len()
-                + self.snapshot.usage.records().len()
-                + self.snapshot.manifests.len()
-                + self.snapshot.extension_state.len()) as u64,
+            snapshot.record_count() as u64,
             0,
         );
 
+        self.validate_state()?;
         if self.schema_version != CHECKPOINT_SCHEMA_VERSION {
             return Err(RuntimeError::conflict(format!(
                 "unsupported checkpoint schema {}; expected {}",
@@ -520,7 +804,7 @@ impl TurnCheckpoint {
                 | TurnState::CacheOperationTerminal { .. }
         );
         match (cache_state, self.watermark.journal_turn.as_ref()) {
-            (true, Some(turn)) if turn == &self.turn => {}
+            (true, Some(turn)) if turn == self.turn => {}
             (true, _) => {
                 return Err(RuntimeError::conflict(
                     "cache checkpoint watermark must be scoped to its synthetic turn",
@@ -545,19 +829,17 @@ impl TurnCheckpoint {
                 "only an accepted checkpoint may have state revision zero",
             ));
         }
-        if self.snapshot.id != self.session {
+        if snapshot.session_id() != self.session {
             return Err(RuntimeError::conflict(
                 "checkpoint snapshot/session identity mismatch",
             ));
         }
         let internal_turn = self.internal_input.is_some();
-        if let Some(input) = &self.internal_input {
+        if let Some(input) = self.internal_input {
             input.validate()?;
         }
-        match &self.state {
-            TurnState::InternalAccepted { input }
-                if self.internal_input.as_ref() != Some(input) =>
-            {
+        match self.state {
+            TurnState::InternalAccepted { input } if self.internal_input != Some(input) => {
                 return Err(RuntimeError::conflict(
                     "internal accepted state does not match checkpoint input",
                 ));
@@ -585,7 +867,7 @@ impl TurnCheckpoint {
                     | TurnState::LocalActionExecuting { .. }
                     | TurnState::LocalActionOutcomeReady { .. }
                     | TurnState::LocalActionResultReady { .. }
-            ) || (self.active_history_start == self.snapshot.history.len()
+            ) || (self.active_history_start == snapshot.history_len()
                 && matches!(
                     self.state,
                     TurnState::Completing { .. }
@@ -593,30 +875,30 @@ impl TurnCheckpoint {
                         | TurnState::Terminal { .. }
                 )));
         if cache_operation {
-            if self.active_history_start != self.snapshot.history.len() {
+            if self.active_history_start != snapshot.history_len() {
                 return Err(RuntimeError::conflict(
                     "cache-operation checkpoint changed canonical history",
                 ));
             }
         } else if local_action {
-            if self.active_history_start != self.snapshot.history.len() {
+            if self.active_history_start != snapshot.history_len() {
                 return Err(RuntimeError::conflict(
                     "local-action checkpoint changed canonical history",
                 ));
             }
         } else if internal_turn {
-            if self.active_history_start > self.snapshot.history.len() {
+            if self.active_history_start > snapshot.history_len() {
                 return Err(RuntimeError::conflict(
                     "internal-turn history boundary exceeds canonical history",
                 ));
             }
-        } else if self.active_history_start >= self.snapshot.history.len() {
+        } else if self.active_history_start >= snapshot.history_len() {
             return Err(RuntimeError::conflict(
                 "checkpoint active history boundary is outside canonical history",
             ));
         }
-        if let TurnState::Accepted { input } = &self.state {
-            if self.snapshot.history.get(self.active_history_start)
+        if let TurnState::Accepted { input } = self.state {
+            if snapshot.history_message(self.active_history_start)
                 != Some(&input.clone().into_message())
             {
                 return Err(RuntimeError::conflict(
@@ -624,15 +906,10 @@ impl TurnCheckpoint {
                 ));
             }
         }
-        match &self.state {
+        match self.state {
             #[cfg(feature = "external-agent")]
             TurnState::ExternalToolCall { call, .. } => {
-                if !self
-                    .snapshot
-                    .history
-                    .iter()
-                    .any(|message| message.tool_calls().any(|recorded| recorded == call))
-                {
+                if !snapshot.has_tool_call(call) {
                     return Err(RuntimeError::conflict(
                         "external tool checkpoint has no canonical call",
                     ));
@@ -673,7 +950,7 @@ impl TurnCheckpoint {
             | TurnState::CacheOperationTerminal { operation, .. } => operation.validate()?,
         }
         if matches!(
-            &self.state,
+            self.state,
             TurnState::CacheOperationStarted { operation }
                 if operation.preflight_rejection.is_some()
         ) {
@@ -681,7 +958,7 @@ impl TurnCheckpoint {
                 "cache checkpoint rejection crossed the provider-start boundary",
             ));
         }
-        match &self.state {
+        match self.state {
             TurnState::CacheOperationResultReady { operation, result }
             | TurnState::CacheOperationTerminal { operation, result } => {
                 result.validate()?;
@@ -744,10 +1021,10 @@ impl TurnCheckpoint {
         }
         if let TurnState::CacheOperationStarted { operation }
         | TurnState::CacheOperationResultReady { operation, .. }
-        | TurnState::CacheOperationTerminal { operation, .. } = &self.state
+        | TurnState::CacheOperationTerminal { operation, .. } = self.state
         {
             let rejected_result = matches!(
-                &self.state,
+                self.state,
                 TurnState::CacheOperationResultReady { result, .. }
                     | TurnState::CacheOperationTerminal { result, .. }
                     if result.outcome == CacheOperationOutcome::Rejected
@@ -761,7 +1038,7 @@ impl TurnCheckpoint {
                 ));
             }
         }
-        if let TurnState::CacheOperationPrepared { operation } = &self.state {
+        if let TurnState::CacheOperationPrepared { operation } = self.state {
             if operation.attempt.is_some() {
                 return Err(RuntimeError::conflict(
                     "prepared cache checkpoint crossed the start attribution boundary",
@@ -769,7 +1046,7 @@ impl TurnCheckpoint {
             }
         }
         if matches!(
-            &self.state,
+            self.state,
             TurnState::ModelResponseReady { response, .. }
                 if !response.text.is_empty() && !self.visible_output
         ) {
@@ -779,7 +1056,7 @@ impl TurnCheckpoint {
         }
         if let TurnState::Completing { visible_output, .. }
         | TurnState::PublishingTerminal { visible_output, .. }
-        | TurnState::Terminal { visible_output, .. } = &self.state
+        | TurnState::Terminal { visible_output, .. } = self.state
         {
             if *visible_output != self.visible_output {
                 return Err(RuntimeError::conflict(
@@ -787,11 +1064,15 @@ impl TurnCheckpoint {
                 ));
             }
         }
-        if self.operation_fingerprint
-            != checkpoint_operation_fingerprint(
-                &self.state,
+        if *self.operation_fingerprint
+            != checkpoint_operation_fingerprint_from_state(
+                || {
+                    self.state_fingerprint
+                        .cloned()
+                        .unwrap_or_else(|| self.state.operation_fingerprint())
+                },
                 self.active_history_start,
-                self.internal_input.as_ref(),
+                self.internal_input,
                 self.visible_output,
             )
         {
@@ -813,7 +1094,7 @@ impl TurnCheckpoint {
             source_calls,
             slots,
             ..
-        } = &self.state
+        } = self.state
         {
             if !slots_correspond(source_calls, slots) {
                 return Err(RuntimeError::conflict(
@@ -830,7 +1111,7 @@ impl TurnCheckpoint {
             source_calls,
             completed,
             ..
-        } = &self.state
+        } = self.state
         {
             if !results_form_prefix(source_calls, completed) {
                 return Err(RuntimeError::conflict(
@@ -843,7 +1124,7 @@ impl TurnCheckpoint {
             completed,
             outcome_index,
             ..
-        } = &self.state
+        } = self.state
         {
             if *outcome_index != completed.len() || source_calls.get(*outcome_index).is_none() {
                 return Err(RuntimeError::conflict(
@@ -859,7 +1140,7 @@ impl TurnCheckpoint {
             request,
             response,
             ..
-        } = &self.state
+        } = self.state
         {
             if !interaction_state_valid(source_calls, slots, completed, *interaction_index, request)
             {
@@ -867,8 +1148,7 @@ impl TurnCheckpoint {
                     "checkpoint interaction state is not aligned with its source call",
                 ));
             }
-            if request.origin().session() != &self.session || request.origin().turn() != &self.turn
-            {
+            if request.origin().session() != self.session || request.origin().turn() != self.turn {
                 return Err(RuntimeError::conflict(
                     "checkpoint interaction belongs to another session or turn",
                 ));
@@ -878,118 +1158,5 @@ impl TurnCheckpoint {
             }
         }
         Ok(())
-    }
-
-    /// Validates that `next` is the one immediate successor of `self`.
-    ///
-    /// Stores use this before replacing their latest record so a caller
-    /// cannot splice a separately valid checkpoint across requests, steps, or
-    /// transition revisions.
-    pub fn validate_successor(&self, next: &Self) -> Result<(), RuntimeError> {
-        self.validate()?;
-        next.validate()?;
-        if self.session != next.session || self.turn != next.turn {
-            return Err(RuntimeError::conflict(
-                "checkpoint successor belongs to another session or turn",
-            ));
-        }
-        if self.schema_version != next.schema_version
-            || self.transition_revision != next.transition_revision
-        {
-            return Err(RuntimeError::conflict(
-                "checkpoint successor changed schema or transition revision",
-            ));
-        }
-        if self.deadline != next.deadline
-            || self.active_history_start != next.active_history_start
-            || self.internal_input != next.internal_input
-        {
-            return Err(RuntimeError::conflict(
-                "checkpoint successor changed immutable turn progress",
-            ));
-        }
-        if self.visible_output && !next.visible_output {
-            return Err(RuntimeError::conflict(
-                "checkpoint successor regressed committed visible output",
-            ));
-        }
-        if next.state_revision != self.state_revision.saturating_add(1)
-            || next.watermark.checkpoint_sequence
-                != self.watermark.checkpoint_sequence.saturating_add(1)
-        {
-            return Err(RuntimeError::conflict(
-                "checkpoint successor skipped or repeated a state revision",
-            ));
-        }
-        if next.watermark.event_sequence < self.watermark.event_sequence {
-            return Err(RuntimeError::conflict(
-                "checkpoint successor regressed its event watermark",
-            ));
-        }
-        if !self.state.can_transition_to(&next.state) {
-            return Err(RuntimeError::conflict(format!(
-                "invalid checkpoint successor from {} to {}",
-                state_name(&self.state),
-                state_name(&next.state)
-            )));
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn checkpoint_operation_fingerprint(
-    state: &TurnState,
-    active_history_start: usize,
-    internal_input: Option<&InternalTurnInput>,
-    visible_output: bool,
-) -> Fingerprint {
-    #[cfg(feature = "test-support")]
-    let _profile = crate::journal::profile::enter_sync("rt.checkpoint.fingerprint");
-
-    let mut hasher = FingerprintHasher::new();
-    hasher
-        .field("turn_checkpoint_operation")
-        .field(TURN_TRANSITION_REVISION.to_string())
-        .field(active_history_start.to_string())
-        .field(if visible_output {
-            "visible"
-        } else {
-            "not_visible"
-        })
-        .nested(&state.operation_fingerprint());
-    match internal_input {
-        Some(input) => hasher.field(
-            serde_json::to_vec(input).expect("validated internal turn input must serialize"),
-        ),
-        None => hasher.field([]),
-    };
-    hasher.finish()
-}
-
-pub(super) fn state_name(state: &TurnState) -> &'static str {
-    match state {
-        TurnState::Accepted { .. } => "accepted",
-        TurnState::InternalAccepted { .. } => "internal_accepted",
-        TurnState::LocalActionAccepted { .. } => "local_action_accepted",
-        TurnState::LocalActionPrepared { .. } => "local_action_prepared",
-        TurnState::LocalActionExecuting { .. } => "local_action_executing",
-        TurnState::LocalActionOutcomeReady { .. } => "local_action_outcome_ready",
-        TurnState::LocalActionResultReady { .. } => "local_action_result_ready",
-        TurnState::Planning { .. } => "planning",
-        TurnState::CallingModel { .. } => "calling_model",
-        TurnState::ModelResponseReady { .. } => "model_response_ready",
-        #[cfg(feature = "external-agent")]
-        TurnState::ExternalToolCall { .. } => "external_tool_call",
-        TurnState::AwaitingApproval { .. } => "awaiting_approval",
-        TurnState::AwaitingInteraction { .. } => "awaiting_interaction",
-        TurnState::ToolOutcomeReady { .. } => "tool_outcome_ready",
-        TurnState::ExecutingTools { .. } => "executing_tools",
-        TurnState::Completing { .. } => "completing",
-        TurnState::PublishingTerminal { .. } => "publishing_terminal",
-        TurnState::Terminal { .. } => "terminal",
-        TurnState::CacheOperationPrepared { .. } => "cache_operation_prepared",
-        TurnState::CacheOperationStarted { .. } => "cache_operation_started",
-        TurnState::CacheOperationResultReady { .. } => "cache_operation_result_ready",
-        TurnState::CacheOperationTerminal { .. } => "cache_operation_terminal",
     }
 }

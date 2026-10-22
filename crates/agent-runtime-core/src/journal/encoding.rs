@@ -93,7 +93,7 @@ digest_type!(
 );
 
 /// Explicit type domain of a journal object envelope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalObjectKind {
     /// One canonical message (possibly signed reasoning).
@@ -185,15 +185,17 @@ pub fn canonical_journal_json<T: Serialize>(value: &T) -> Result<Vec<u8>, Runtim
 /// canonical value. Object member order does not change a compact encoding's
 /// length, and serde_json writes keys, strings and numbers with the same
 /// formatter in both paths. Not valid for values containing `f32` fields or
-/// duplicate map keys (the value path widens/deduplicates them); memo sizing
-/// asserts equality with the full encoding in debug builds.
+/// duplicate map keys (the value path widens/deduplicates them); the differential sizing tests compare it with the full encoding.
 pub(crate) fn canonical_journal_json_len<T: Serialize>(value: &T) -> Result<usize, RuntimeError> {
     #[cfg(feature = "test-support")]
     let _profile = crate::journal::profile::enter_sync("rt.encoding.canonical_journal_json_len");
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 += bytes.len();
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("canonical journal length overflow"))?;
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -244,6 +246,9 @@ pub fn journal_json_can_inline(value: &Value) -> Result<bool, RuntimeError> {
 /// objects differ. Encoding caches must use this exact identity so a cache hit
 /// never commits another value's spelling.
 pub fn journal_json_identical(left: &Value, right: &Value) -> bool {
+    if std::ptr::eq(left, right) {
+        return true;
+    }
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
             left == right
@@ -448,8 +453,20 @@ impl JournalObject {
 pub fn journal_history_chain<'a>(
     items: impl IntoIterator<Item = &'a JournalObjectId>,
 ) -> JournalDigest {
-    let mut digest: [u8; 32] =
-        Sha256::digest(b"agent-runtime/session-journal/history\0journal-json-1\0").into();
+    journal_history_chain_append(
+        &JournalDigest::from_bytes(
+            Sha256::digest(b"agent-runtime/session-journal/history\0journal-json-1\0").into(),
+        ),
+        items,
+    )
+}
+
+/// Continues the frozen history fold from a validated prefix digest.
+pub fn journal_history_chain_append<'a>(
+    base: &JournalDigest,
+    items: impl IntoIterator<Item = &'a JournalObjectId>,
+) -> JournalDigest {
+    let mut digest = base.to_bytes();
     for item in items {
         let mut hash = Sha256::new();
         hash.update(b"agent-runtime/session-journal/history-step\0");
@@ -485,4 +502,37 @@ impl JournalCommit {
         hash_field(&mut hash, &bytes);
         Ok(JournalDigest::from_bytes(hash.finalize().into()))
     }
+}
+
+/// Counts opaque JSON with an explicit stack. Container width and nesting do
+/// not consume call stack; only scalar formatting uses serde's formatter.
+pub(crate) fn canonical_journal_value_len(value: &Value) -> Result<usize, RuntimeError> {
+    let mut bytes = 0usize;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        let add = match value {
+            Value::Array(values) => {
+                pending.extend(values);
+                2usize
+                    .checked_add(values.len().saturating_sub(1))
+                    .ok_or_else(conflict)?
+            }
+            Value::Object(values) => {
+                let mut size = 2usize
+                    .checked_add(values.len().saturating_sub(1))
+                    .ok_or_else(conflict)?;
+                for (key, value) in values {
+                    size = size
+                        .checked_add(canonical_journal_json_len(key)?)
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or_else(conflict)?;
+                    pending.push(value);
+                }
+                size
+            }
+            scalar => canonical_journal_json_len(scalar)?,
+        };
+        bytes = bytes.checked_add(add).ok_or_else(conflict)?;
+    }
+    Ok(bytes)
 }

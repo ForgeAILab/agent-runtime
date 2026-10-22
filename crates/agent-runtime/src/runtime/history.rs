@@ -71,7 +71,7 @@ impl HistoryGenerations {
 // serde_json floating numbers compare -0.0 and +0.0 as equal. Preserve exact
 // tool arguments without allocating/serializing old history on every capture.
 // Also compare object iteration order when a host enables preserve_order.
-fn messages_match(left: &[Message], right: &[Message]) -> bool {
+pub(crate) fn messages_match(left: &[Message], right: &[Message]) -> bool {
     left == right
         && left
             .iter()

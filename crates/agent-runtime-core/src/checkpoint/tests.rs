@@ -135,10 +135,6 @@ fn checkpoint_round_trips_and_verifies() {
 
 #[test]
 fn pre_existing_checkpoint_states_validate_with_head_versions() {
-    use crate::content::{InternalTurnSensitivity, InternalTurnSource};
-    use crate::ids::{InteractionRequestId, QuestionId};
-    use crate::interaction::{InteractionOrigin, InteractionSensitivity, Question, Questionnaire};
-
     fn verify(checkpoint: &TurnCheckpoint) {
         let wire = serde_json::to_value(checkpoint).unwrap();
         // Pinned to HEAD before ExternalToolCall was added, rather than to
@@ -149,8 +145,24 @@ fn pre_existing_checkpoint_states_validate_with_head_versions() {
         restored.validate().unwrap();
         assert_eq!(&restored, checkpoint);
     }
+    let corpus = checkpoint_corpus();
+    assert_eq!(corpus.len(), 21);
+    for checkpoint in &corpus {
+        verify(checkpoint);
+    }
+}
 
-    fn advance(checkpoint: &TurnCheckpoint, state: TurnState) -> TurnCheckpoint {
+/// One valid checkpoint for every pre-existing state family: model/tool
+/// loop, approval, interaction, terminal, internal, local-action and
+/// cache-operation turns.
+pub(crate) fn checkpoint_corpus() -> Vec<TurnCheckpoint> {
+    use crate::content::{InternalTurnSensitivity, InternalTurnSource};
+    use crate::ids::{InteractionRequestId, QuestionId};
+    use crate::interaction::{InteractionOrigin, InteractionSensitivity, Question, Questionnaire};
+
+    let corpus = std::cell::RefCell::new(Vec::new());
+    let verify = |checkpoint: &TurnCheckpoint| corpus.borrow_mut().push(checkpoint.clone());
+    let advance = |checkpoint: &TurnCheckpoint, state: TurnState| -> TurnCheckpoint {
         let next = checkpoint
             .transition(
                 state,
@@ -161,7 +173,7 @@ fn pre_existing_checkpoint_states_validate_with_head_versions() {
             .unwrap();
         verify(&next);
         next
-    }
+    };
 
     let accepted = accepted();
     verify(&accepted);
@@ -350,6 +362,7 @@ fn pre_existing_checkpoint_states_validate_with_head_versions() {
     ] {
         checkpoint = advance(&checkpoint, state);
     }
+    corpus.into_inner()
 }
 
 fn external_tool_call_wire() -> serde_json::Value {

@@ -17,6 +17,8 @@ mod assembler;
 mod dependencies;
 mod draft;
 mod encoding_cache;
+mod evidence;
+use evidence::*;
 mod links;
 mod projection;
 mod staged;
@@ -25,7 +27,7 @@ pub(super) use dependencies::*;
 pub(super) use draft::*;
 pub(super) use encoding_cache::*;
 pub(super) use links::*;
-pub use projection::{IdentityJournalProjection, JournalProjectionPolicy};
+pub use projection::{IdentityJournalProjection, JournalDeltaProjection, JournalProjectionPolicy};
 pub(super) use staged::*;
 
 mod transition;
@@ -282,9 +284,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                     entry = self.writer_memo(session, root, entry)?;
                     self.seed_memo(&scratch, session, root, &entry)?;
                 }
-                validated = Some(ReachableSet {
-                    layers: vec![entry.closure.clone()],
-                });
+                validated = Some(ReachableSet::from_evidence(entry.closure.clone()));
             }
             let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
             let fenced_head = stored
@@ -358,7 +358,18 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         commit: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
         crate::journal_profile_scope!("rt.mod.commit", {
-            Box::pin(self.commit_inner(lease, Box::new(commit))).await
+            Box::pin(self.commit_inner(lease, Box::new(commit), JournalPreparationHints::default()))
+                .await
+        })
+    }
+    async fn commit_prepared(
+        &self,
+        lease: &JournalLease,
+        commit: JournalCommit,
+        hints: JournalPreparationHints,
+    ) -> Result<JournalHead, RuntimeError> {
+        crate::journal_profile_scope!("rt.mod.commit", {
+            Box::pin(self.commit_inner(lease, Box::new(commit), hints)).await
         })
     }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
@@ -384,7 +395,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                         .get_mut(&self.local.token(lease)?.handle)
                         .ok_or_else(conflict)?;
                     if !record.reachable.contains(&object.id) {
-                        record.reachable.layers.push(entry.closure.clone());
+                        record.reachable.push_evidence(entry.closure.clone());
                     }
                     record.roots.extend([object.id.clone()].into());
                     record.dependencies.extend(&dependencies);
@@ -430,3 +441,6 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod incremental_tests;

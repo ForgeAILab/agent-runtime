@@ -590,9 +590,13 @@ pub struct TurnCheckpoint {
 mod store;
 mod transition;
 mod validation;
+mod view;
+#[doc(hidden)]
+pub use view::{CheckpointMetadata, JournalCheckpoint};
 
 pub use store::CheckpointStore;
+pub(crate) use validation::CheckpointEvidence;
 use validation::*;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

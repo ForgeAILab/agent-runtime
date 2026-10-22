@@ -10,7 +10,7 @@ pub(in crate::journal) fn stored_object(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::journal) enum ExpectedLeaf {
     Kind(JournalObjectKind),
     Extension,
@@ -19,7 +19,7 @@ pub(in crate::journal) enum ExpectedLeaf {
     JsonObjectEntry,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::journal) enum ExpectedObject {
     Leaf(ExpectedLeaf),
     Sequence(ExpectedLeaf),
@@ -34,6 +34,7 @@ pub(in crate::journal) struct CachedLinks {
 
 /// Exact closure with immutable, expected-kind-scoped parsed edges. Validation
 /// still runs on every new (id, expected kind); old edges need no JSON reparse.
+#[cfg(test)]
 pub(in crate::journal) fn memoized_closure(
     objects: &mut ObjectStore,
     root: &JournalObjectId,
@@ -42,14 +43,16 @@ pub(in crate::journal) fn memoized_closure(
     #[cfg(feature = "test-support")]
     let _profile = crate::journal::profile::enter_sync("rt.links.memoized_closure");
     let mut closure = BTreeSet::new();
+    let mut visited = BTreeSet::new();
     let mut pending = vec![(root.clone(), expected)];
     let mut added: BTreeMap<JournalObjectId, Vec<CachedLinks>> = BTreeMap::new();
     while let Some((id, expected)) = pending.pop() {
         #[cfg(feature = "test-support")]
         crate::journal::profile::event("rt.work.closure_edge_checked", 1, 0);
-        if !closure.insert(id.clone()) {
+        if !visited.insert((id.clone(), expected)) {
             continue;
         }
+        closure.insert(id.clone());
         let bytes = objects.get(&id).ok_or_else(conflict)?;
         let cached = added
             .get(&id)
@@ -83,9 +86,10 @@ pub(in crate::journal) fn memoized_closure(
         pending.extend(children.iter().cloned());
     }
     if !added.is_empty() {
-        let cached = Arc::make_mut(&mut objects.links);
         for (id, variants) in added {
-            cached.entry(id).or_default().extend(variants);
+            let mut existing = objects.links.get(&id).cloned().unwrap_or_default();
+            existing.extend(variants);
+            objects.cache_links(id, existing)?;
         }
     }
     #[cfg(feature = "test-support")]
@@ -526,7 +530,9 @@ pub(in crate::journal) fn reachable_closure(
         if !reachable.insert(id.clone()) {
             continue;
         }
-        if trusted.is_some_and(|trusted| trusted.contains(&id)) {
+        if trusted.is_some_and(|trusted| trusted.contains(&id))
+            && admitted.is_none_or(|admitted| !admitted.contains(&id))
+        {
             continue;
         }
         let object = JournalObject {
