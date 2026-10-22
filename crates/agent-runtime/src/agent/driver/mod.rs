@@ -1057,7 +1057,8 @@ impl Driver {
         checkpoint: TurnCheckpoint,
     ) {
         let turn_id = checkpoint.turn.clone();
-        TurnMachine::from_checkpoint(
+        let failed = (emitter.clone(), turn_id.clone());
+        let machine = match TurnMachine::from_checkpoint(
             self,
             TurnMachineContext {
                 state,
@@ -1071,9 +1072,14 @@ impl Driver {
                 acceptance: None,
             },
             checkpoint,
-        )
-        .resume()
-        .await;
+        ) {
+            Ok(machine) => machine,
+            Err(error) => {
+                failed.0.emit(Some(failed.1), RuntimeEvent::Error { error });
+                return;
+            }
+        };
+        machine.resume().await;
     }
 
     /// External conversations cannot be re-entered mid-turn. Local actions and
@@ -1120,7 +1126,8 @@ impl Driver {
         activation_changed: bool,
     ) {
         let turn_id = checkpoint.turn.clone();
-        TurnMachine::from_checkpoint(
+        let failed = (emitter.clone(), turn_id.clone());
+        let machine = match TurnMachine::from_checkpoint(
             self,
             TurnMachineContext {
                 state,
@@ -1134,9 +1141,14 @@ impl Driver {
                 acceptance: None,
             },
             checkpoint,
-        )
-        .abandon(activation_changed)
-        .await;
+        ) {
+            Ok(machine) => machine,
+            Err(error) => {
+                failed.0.emit(Some(failed.1), RuntimeEvent::Error { error });
+                return;
+            }
+        };
+        machine.abandon(activation_changed).await;
     }
 }
 

@@ -48,7 +48,8 @@ impl<'a> TurnMachine<'a> {
         driver: &'a Driver,
         context: TurnMachineContext,
         checkpoint: TurnCheckpoint,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
+        let restored = agent_runtime_core::checkpoint::JournalCheckpoint::for_restore(checkpoint)?;
         let TurnMachineContext {
             state,
             execution,
@@ -60,8 +61,8 @@ impl<'a> TurnMachine<'a> {
             turn_id,
             acceptance: _,
         } = context;
-        debug_assert_eq!(turn_id, checkpoint.turn);
-        Self {
+        debug_assert_eq!(turn_id, restored.turn);
+        Ok(Self {
             driver,
             state,
             execution,
@@ -72,15 +73,12 @@ impl<'a> TurnMachine<'a> {
             steer_mailbox,
             turn_id,
             acceptance: None,
-            checkpoint: Some(
-                agent_runtime_core::checkpoint::JournalCheckpoint::for_restore(checkpoint)
-                    .expect("representable restored snapshot"),
-            ),
+            checkpoint: Some(restored),
             ordinary_lcm_intent_saved: false,
             ordinary_lcm_hard_admitted: false,
             #[cfg(feature = "external-agent")]
             external_call: None,
-        }
+        })
     }
 
     fn capture_view(
@@ -504,12 +502,11 @@ impl<'a> TurnMachine<'a> {
         if self.ordinary_lcm_hard_admitted && self.execution.persistence.has_session_store() {
             let persist_gate = self.execution.persist_gate();
             let _persist_gate = persist_gate.lock().await;
-            if let Err(error) = self
-                .execution
-                .persistence
-                .save_snapshot_view(&self.capture_view(true).expect("runtime snapshot encoding"))
-                .await
-            {
+            let saved = match self.capture_view(true) {
+                Ok(view) => self.execution.persistence.save_snapshot_view(&view).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = saved {
                 self.emit_non_durable_failure(error, visible_output);
                 return;
             }
@@ -551,7 +548,14 @@ impl<'a> TurnMachine<'a> {
         );
         let persist_gate = self.execution.persist_gate();
         let _persist_gate = persist_gate.lock().await;
-        let terminal_view = self.capture_view(true).expect("runtime snapshot encoding");
+        let terminal_view = match self.capture_view(true) {
+            Ok(view) => view,
+            Err(error) => {
+                self.emitter
+                    .emit(Some(self.turn_id.clone()), RuntimeEvent::Error { error });
+                return;
+            }
+        };
         if self.execution.persistence.has_session_store() {
             if let Err(error) = self
                 .execution
@@ -568,22 +572,25 @@ impl<'a> TurnMachine<'a> {
             }
         }
 
-        if let Err(error) = self
-            .transition_with_view(
-                TurnState::Terminal {
-                    finish: finish.clone(),
-                    visible_output,
-                },
-                {
-                    let mut mutation = terminal_view.mutation();
-                    mutation.retain_manifests(0);
-                    mutation
-                        .finish(terminal_view.identity().clone(), terminal_view.updated())
-                        .expect("checkpoint snapshot")
-                },
-            )
-            .await
-        {
+        let checkpoint_view = {
+            let mut mutation = terminal_view.mutation();
+            mutation.retain_manifests(0);
+            mutation.finish(terminal_view.identity().clone(), terminal_view.updated())
+        };
+        let transitioned = match checkpoint_view {
+            Ok(view) => {
+                self.transition_with_view(
+                    TurnState::Terminal {
+                        finish: finish.clone(),
+                        visible_output,
+                    },
+                    view,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = transitioned {
             self.emitter
                 .emit(Some(self.turn_id.clone()), RuntimeEvent::Error { error });
             return;
@@ -756,7 +763,7 @@ impl<'a> TurnMachine<'a> {
             let _persist_gate = persist_gate.lock().await;
             self.execution
                 .persistence
-                .save_snapshot_view(&self.capture_view(true).expect("runtime snapshot encoding"))
+                .save_snapshot_view(&self.capture_view(true)?)
                 .await?;
             self.ordinary_lcm_intent_saved = retry_admission;
             self.ordinary_lcm_hard_admitted = true;
@@ -1939,7 +1946,8 @@ mod manifest_tests {
                 acceptance: None,
             },
             checkpoint.clone(),
-        );
+        )
+        .unwrap();
         machine
             .transition_with_snapshot(planning.clone(), bounded.clone())
             .await
