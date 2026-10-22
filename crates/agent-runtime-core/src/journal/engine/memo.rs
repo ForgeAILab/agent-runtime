@@ -436,6 +436,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             .bytes
             .saturating_sub(saving)
             .saturating_sub(entry.coverage_charge());
+        next.cached_lease_bodies = None;
         let next = Arc::new(next);
         self.remember_root(session, root, next.clone())?;
         Ok(next)

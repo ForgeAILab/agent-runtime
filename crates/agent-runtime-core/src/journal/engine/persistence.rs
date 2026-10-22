@@ -163,6 +163,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             let mut scratch = self.local.clone();
             scratch.state = Arc::new(Mutex::new(state));
             scratch.cut = Arc::new(Mutex::new(None));
+            scratch.admissions = Arc::new(Mutex::new(BTreeSet::new()));
             Ok((scratch, stored))
         })
     }
@@ -716,6 +717,17 @@ impl<S: JournalStorage> JournalEngine<S> {
             .cloned()
             .ok_or_else(conflict)?;
         let active = local.sessions.get(session).and_then(|r| r.active_writer);
+        // A close/revoke (or a replacement writer) that ran while this
+        // operation awaited storage owns the working views now; never
+        // resurrect the views it cleared.
+        if record.active_writer.is_some() && active != record.active_writer && new_handle.is_none()
+        {
+            record.exact = None;
+            record.ordinary_snapshot = None;
+            record.ordinary_encoding = None;
+            record.protected_snapshot = None;
+            record.protected_encoding = None;
+        }
         record.active_writer = if let Some(handle) = new_handle {
             if prepared
                 .leases
