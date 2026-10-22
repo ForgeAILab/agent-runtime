@@ -155,6 +155,9 @@ struct SessionMark {
     phase: Phase,
     // Validated (id, expected kind) pairs; their ids are live.
     visited: BTreeMap<JournalObjectId, Vec<ExpectedObject>>,
+    // Total expected kinds across `visited`, kept with every push so the
+    // per-object cap check stays O(1) instead of walking the map.
+    visited_kinds: usize,
     // Validated non-head pin roots and live lease roots.
     extra: BTreeSet<JournalObjectId>,
     frontier: Vec<Frontier>,
@@ -185,6 +188,7 @@ impl SessionMark {
             fence,
             phase: Phase::Pins,
             visited: BTreeMap::new(),
+            visited_kinds: 0,
             extra: BTreeSet::new(),
             frontier: Vec::new(),
             dependencies: BTreeSet::new(),
@@ -216,7 +220,7 @@ impl SessionMark {
             + self.dependencies.len()
             + chain)
             * ID_CHARGE
-            + self.visited.values().map(Vec::len).sum::<usize>() * 8
+            + self.visited_kinds * 8
             + self.pin_bytes
     }
     fn live(&self, id: &JournalObjectId) -> bool {
@@ -984,6 +988,10 @@ impl<S: JournalStorage> JournalEngine<S> {
             }
         }
         if batch.is_empty() {
+            debug_assert_eq!(
+                mark.visited_kinds,
+                mark.visited.values().map(Vec::len).sum::<usize>()
+            );
             mark.phase = Phase::Leases;
             return Ok(());
         }
@@ -998,9 +1006,8 @@ impl<S: JournalStorage> JournalEngine<S> {
             objects.insert(id, body.ok_or_else(conflict)?);
         }
         let mark = cursor.mark.as_mut().expect("mark");
-        // Diagnostics: objects traced and map entries walked by cap checks.
+        // Diagnostics: objects traced by this unit.
         let mut traced = 0u64;
-        let mut walked = 0u64;
         for item in batch {
             match item {
                 Frontier::Edge(id, expected) => {
@@ -1022,12 +1029,12 @@ impl<S: JournalStorage> JournalEngine<S> {
                     mark.frontier
                         .extend(links.into_iter().map(|(id, e)| Frontier::Edge(id, e)));
                     mark.visited.entry(id).or_default().push(expected);
+                    mark.visited_kinds += 1;
                     traced += 1;
-                    walked += mark.visited.len() as u64;
                     // Bound workspace inside the unit too: one batch of wide
                     // sequence nodes can add far more than the cap.
                     if mark.charge() > call.cap {
-                        diag("rt.gc.trace.objects", traced, walked);
+                        diag("rt.gc.trace.objects", traced, 0);
                         return Err(over_capacity());
                     }
                 }
@@ -1049,7 +1056,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 }
             }
         }
-        diag("rt.gc.trace.objects", traced, walked);
+        diag("rt.gc.trace.objects", traced, 0);
         Ok(())
     }
 
