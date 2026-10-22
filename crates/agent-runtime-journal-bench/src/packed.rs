@@ -26,9 +26,12 @@ struct State {
     loaded_sessions: BTreeSet<String>,
     version: i64,
     operations: BTreeMap<OperationKey, JournalOperationRecord>,
-    // Bumped on every pack rewrite/cache refresh. Member page positions are
-    // (pack, slot) and stay valid only while no pack is rewritten.
+    // Bumped on every cache refresh (another connection's commit).
     physical: u64,
+    // Bumped when a session's own packs are rewritten. Member page positions
+    // are (pack, slot) and stay valid only while both are unchanged; a
+    // rewrite elsewhere never invalidates this session's continuation.
+    session_physical: HashMap<String, u64>,
 }
 
 #[cfg(test)]
@@ -127,7 +130,10 @@ impl State {
     }
     fn update(&mut self, session: &SessionId, updates: Updates) {
         if !updates.is_empty() {
-            self.physical += 1;
+            *self
+                .session_physical
+                .entry(session.as_str().to_owned())
+                .or_default() += 1;
         }
         for id in updates.keys() {
             if let Some(old) = self.packs.remove(id) {
@@ -210,6 +216,7 @@ impl PackedSqliteJournalStorage {
                 version: -1,
                 operations: BTreeMap::new(),
                 physical: 0,
+                session_physical: HashMap::new(),
             })),
         };
         storage.lock()?.refresh()?;
@@ -239,7 +246,7 @@ impl PackedSqliteJournalStorage {
             return Err(conflict());
         }
         let mut updates = Updates::new();
-        repack(&tx, packs, &mut updates, session, false)?;
+        repack(&tx, packs, &mut updates, session, false, None)?;
         tx.commit().map_err(commit_failure)?;
         state.update(session, updates);
         Ok(())
@@ -574,6 +581,7 @@ fn repack(
     updates: &mut Updates,
     session: &SessionId,
     base: bool,
+    limit: Option<usize>,
 ) -> Result<(), RuntimeError> {
     #[cfg(feature = "journal-profile")]
     let _profile = agent_runtime_core::journal::profile::enter_sync("rt.storage.repack");
@@ -617,6 +625,17 @@ fn repack(
                     .get(pid)
                     .is_some_and(|p| pack_bytes(p) < SMALL_PACK_CAP)
         });
+        if let Some(limit) = limit {
+            // Bounded collection: packs this apply already rewrote, plus at
+            // most `limit` further small packs.
+            let mut extra = 0;
+            ids.retain(|pid| {
+                updates.contains_key(pid) || {
+                    extra += 1;
+                    extra <= limit
+                }
+            });
+        }
         if ids.len() > 1 {
             merge(tx, packs, updates, session, &ids)?;
         }
@@ -790,8 +809,10 @@ const COLLECTION_LIMITS: JournalCollectionLimits = JournalCollectionLimits {
     max_apply_units: 32,
 };
 
-// Members in (pack id, slot) order. The position also binds the physical
-// pack epoch: a repack between pages rejects the continuation. Each step
+// Members in (pack id, slot) order. The position also binds the cache epoch
+// and this session's physical pack version: a repack or compaction of this
+// session between pages rejects the continuation (never skips an id); other
+// sessions' rewrites do not affect it. Each step
 // decodes at most one bounded pack (cached packs are reused, never the whole
 // session's index).
 fn members_page(
@@ -805,14 +826,15 @@ fn members_page(
     let (mut pid, mut slot) = match after {
         None => (i64::MIN, 0usize),
         Some(position) => {
-            let position: [u8; 20] = position.try_into().map_err(|_| conflict())?;
+            let position: [u8; 28] = position.try_into().map_err(|_| conflict())?;
             let physical = u64::from_le_bytes(position[..8].try_into().expect("8 bytes"));
-            if physical != state.physical {
+            let version = u64::from_le_bytes(position[8..16].try_into().expect("8 bytes"));
+            if physical != state.physical || version != session_version(state, s) {
                 return Err(conflict());
             }
             (
-                i64::from_le_bytes(position[8..16].try_into().expect("8 bytes")),
-                u32::from_le_bytes(position[16..].try_into().expect("4 bytes")) as usize + 1,
+                i64::from_le_bytes(position[16..24].try_into().expect("8 bytes")),
+                u32::from_le_bytes(position[24..].try_into().expect("4 bytes")) as usize + 1,
             )
         }
     };
@@ -868,6 +890,7 @@ fn members_page(
     let next = match (more, last) {
         (true, Some((pid, slot))) => {
             let mut position = state.physical.to_le_bytes().to_vec();
+            position.extend(session_version(state, s).to_le_bytes());
             position.extend(pid.to_le_bytes());
             position.extend((slot as u32).to_le_bytes());
             Some(JournalCollectionContinuation::new(
@@ -886,6 +909,14 @@ fn members_page(
         items: JournalCollectionItems::Members(ids),
         next,
     })
+}
+
+fn session_version(state: &State, s: &SessionId) -> u64 {
+    state
+        .session_physical
+        .get(s.as_str())
+        .copied()
+        .unwrap_or_default()
 }
 
 fn pins_page(
@@ -968,39 +999,91 @@ fn preflight(
             }
         }
     }
-    // Splitting the release list bounds only the packs it touches; forced
-    // purge of a retired session and the base repack are counted but not split.
-    let splittable = touched.len();
+    let cap = plan.max_units.min(COLLECTION_LIMITS.max_apply_units) as usize;
+    if touched.len() > cap && write.release.len() > 1 {
+        return Ok(JournalCollectionPreflight::Split {
+            max_release: (write.release.len() / 2) as u64,
+        });
+    }
     let owned: Vec<i64> = {
         let mut st = state
             .conn
-            .prepare("SELECT pack_id FROM pack WHERE owner=?")
+            .prepare("SELECT pack_id FROM pack WHERE owner=? ORDER BY pack_id")
             .map_err(failure)?;
         st.query_map([s.as_str()], |r| r.get(0))
             .map_err(failure)?
             .collect::<Result<_, _>>()
             .map_err(failure)?
     };
-    if load(&state.conn, d, s)?.is_some_and(|r| r.retirement.is_some()) {
-        touched.extend(owned.iter().copied());
-    }
-    if config.repack_on_collection {
-        touched.extend(owned.iter().copied().filter(|pid| {
+    let retired = write.record.retirement.is_some();
+    let maintenance = MaintenancePlan::new(
+        &touched,
+        &owned,
+        retired,
+        config.repack_on_collection,
+        |pid| {
             state
                 .packs
-                .get(pid)
+                .get(&pid)
                 .is_some_and(|p| pack_bytes(p) < SMALL_PACK_CAP)
-        }));
-    }
+        },
+        cap,
+    );
     state.consistent()?;
-    let units = u32::try_from(touched.len()).unwrap_or(u32::MAX);
-    let cap = plan.max_units.min(COLLECTION_LIMITS.max_apply_units) as usize;
-    if splittable <= cap || write.release.len() <= 1 {
-        return Ok(JournalCollectionPreflight::Fits { units });
-    }
-    Ok(JournalCollectionPreflight::Split {
-        max_release: (write.release.len() / 2) as u64,
+    Ok(JournalCollectionPreflight::Fits {
+        units: u32::try_from(maintenance.units).unwrap_or(u32::MAX),
     })
+}
+
+// Bounded physical maintenance of one collection apply: the packs a release
+// touches, then at most the remaining unit allowance of a retired session's
+// forced purge, then of base-repack candidates. Work left over stays for a
+// later apply (a retired session stays dirty until it is purged).
+struct MaintenancePlan {
+    forced: Vec<i64>,
+    forced_left: bool,
+    repack_limit: usize,
+    units: usize,
+}
+impl MaintenancePlan {
+    fn new(
+        touched: &BTreeSet<i64>,
+        owned: &[i64],
+        retired: bool,
+        repack: bool,
+        small: impl Fn(i64) -> bool,
+        cap: usize,
+    ) -> Self {
+        let mut room = cap.saturating_sub(touched.len());
+        let mut forced = Vec::new();
+        let mut forced_left = false;
+        if retired {
+            for pid in owned.iter().copied().filter(|pid| !touched.contains(pid)) {
+                if room == 0 {
+                    forced_left = true;
+                    break;
+                }
+                forced.push(pid);
+                room -= 1;
+            }
+        }
+        let base = if repack {
+            owned
+                .iter()
+                .copied()
+                .filter(|pid| !touched.contains(pid) && !forced.contains(pid) && small(*pid))
+                .count()
+                .min(room)
+        } else {
+            0
+        };
+        Self {
+            units: touched.len() + forced.len() + base,
+            forced,
+            forced_left,
+            repack_limit: room,
+        }
+    }
 }
 
 #[async_trait]
@@ -1218,6 +1301,61 @@ impl JournalStorage for PackedSqliteJournalStorage {
         })
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
+        Ok(self.apply_bounded(write, None).await?.0)
+    }
+    async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
+        self.compact_domain(domain).await
+    }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        JournalCollectionCapability::Bounded(COLLECTION_LIMITS)
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        crate::journal_profile_scope!("rt.storage.prepare_collection", {
+            let mut state = self.lock()?;
+            preflight(&mut state, &self.config, plan)
+        })
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        let cap = plan.max_units.min(COLLECTION_LIMITS.max_apply_units) as usize;
+        {
+            let mut state = self.lock()?;
+            if !matches!(
+                preflight(&mut state, &self.config, &plan)?,
+                JournalCollectionPreflight::Fits { .. }
+            ) {
+                return Err(conflict());
+            }
+        }
+        let (receipt, rewritten_units) = self.apply_bounded(plan.write, Some(cap)).await?;
+        Ok(JournalCollectionReceipt {
+            receipt,
+            rewritten_units,
+        })
+    }
+}
+
+impl PackedSqliteJournalStorage {
+    // One atomic fenced apply. `cap` bounds the physical units a collection
+    // write may rewrite (None keeps the unbounded maintenance of plain applies).
+    async fn apply_bounded(
+        &self,
+        write: JournalWrite,
+        cap: Option<usize>,
+    ) -> Result<(JournalApplyReceipt, u32), RuntimeError> {
         crate::journal_profile_scope!("rt.storage.apply", {
             #[cfg(feature = "journal-profile")]
             agent_runtime_core::journal::profile::event(
@@ -1450,23 +1588,64 @@ impl JournalStorage for PackedSqliteJournalStorage {
             }
             let retired = write.kind == JournalWriteKind::Collect
                 && load(&tx, d, s)?.is_some_and(|r| r.retirement.is_some());
-            if retired {
-                let mut st = tx
-                    .prepare("SELECT pack_id FROM pack WHERE owner=?")
-                    .map_err(failure)?;
-                touched.extend(
+            let mut repack_limit = None;
+            if retired || cap.is_some() {
+                let owned: Vec<i64> = {
+                    let mut st = tx
+                        .prepare("SELECT pack_id FROM pack WHERE owner=? ORDER BY pack_id")
+                        .map_err(failure)?;
                     st.query_map([s.as_str()], |r| r.get::<_, i64>(0))
                         .map_err(failure)?
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(failure)?,
-                );
+                        .map_err(failure)?
+                };
+                match cap {
+                    None => touched.extend(owned),
+                    Some(cap) => {
+                        let plan = MaintenancePlan::new(
+                            &touched,
+                            &owned,
+                            retired,
+                            self.config.repack_on_collection,
+                            |_| true,
+                            cap,
+                        );
+                        touched.extend(plan.forced.iter().copied());
+                        repack_limit = Some(plan.repack_limit);
+                        if plan.forced_left {
+                            // The rest of the retired purge is a later apply's
+                            // work: keep the session dirty until it is done.
+                            let mut r = write.record.clone();
+                            r.collection_dirty = true;
+                            tx.execute(
+                                "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?,?)",
+                                params![
+                                    d.storage_id.as_str(),
+                                    role(d),
+                                    s.as_str(),
+                                    r.revision.0,
+                                    r.writer_epoch,
+                                    r.collection_dirty,
+                                    r.generation.to_le_bytes().as_slice(),
+                                    codec::encode(&metadata::Record::from(&r))?,
+                                    [0u8; 24].as_slice()
+                                ],
+                            )
+                            .map_err(failure)?;
+                        }
+                    }
+                }
             }
             #[cfg(feature = "journal-profile")]
             drop(release_timer);
             let receipt = purge(&tx, packs, &mut updates, &touched, retired)?;
             if self.config.repack_on_collection && write.kind == JournalWriteKind::Collect {
-                repack(&tx, packs, &mut updates, s, true)?;
+                repack(&tx, packs, &mut updates, s, true, repack_limit)?;
             }
+            // Pre-existing sealed packs rewritten or deleted (merge outputs
+            // are the rewrite of their inputs, not extra units).
+            let rewritten = updates.keys().filter(|pid| packs.contains_key(pid)).count();
+            let rewritten = u32::try_from(rewritten).unwrap_or(u32::MAX);
             {
                 #[cfg(feature = "journal-profile")]
                 let _commit = agent_runtime_core::journal::profile::enter_sync("rt.storage.commit");
@@ -1493,10 +1672,10 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 ));
             }
             fail(&write, JournalCommitFailurePoint::AfterCommit)?;
-            Ok(receipt)
+            Ok((receipt, rewritten))
         })
     }
-    async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
+    async fn compact_domain(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
         crate::journal_profile_scope!("rt.storage.compact", {
             let mut state = self.lock()?;
             let sessions: Vec<SessionId> = {
@@ -1529,7 +1708,7 @@ impl JournalStorage for PackedSqliteJournalStorage {
             let mut changes = Vec::new();
             for session in sessions {
                 let mut updates = Updates::new();
-                repack(&tx, packs, &mut updates, &session, true)?;
+                repack(&tx, packs, &mut updates, &session, true, None)?;
                 changes.push((session, updates));
             }
             tx.commit().map_err(commit_failure)?;
@@ -1544,10 +1723,7 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 .map_err(failure)
         })
     }
-    fn collection_capability(&self) -> JournalCollectionCapability {
-        JournalCollectionCapability::Bounded(COLLECTION_LIMITS)
-    }
-    async fn collection_page(
+    async fn page(
         &self,
         d: &JournalDomain,
         s: &SessionId,
@@ -1573,29 +1749,5 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 _ => Err(conflict()),
             }
         })
-    }
-    async fn prepare_collection_apply(
-        &self,
-        plan: &JournalCollectionPlan,
-    ) -> Result<JournalCollectionPreflight, RuntimeError> {
-        crate::journal_profile_scope!("rt.storage.prepare_collection", {
-            let mut state = self.lock()?;
-            preflight(&mut state, &self.config, plan)
-        })
-    }
-    async fn apply_collection(
-        &self,
-        plan: JournalCollectionPlan,
-    ) -> Result<JournalApplyReceipt, RuntimeError> {
-        {
-            let mut state = self.lock()?;
-            if !matches!(
-                preflight(&mut state, &self.config, &plan)?,
-                JournalCollectionPreflight::Fits { .. }
-            ) {
-                return Err(conflict());
-            }
-        }
-        self.apply(plan.write).await
     }
 }

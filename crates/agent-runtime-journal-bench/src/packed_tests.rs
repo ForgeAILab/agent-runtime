@@ -466,3 +466,124 @@ async fn member_pages_are_bounded_and_reject_a_repack_between_pages() {
         .collect();
     assert_eq!(seen, members);
 }
+
+// Pages `session`'s members after `first`, collecting every id exactly once.
+async fn page_rest(
+    storage: &PackedSqliteJournalStorage,
+    domain: &JournalDomain,
+    session: &SessionId,
+    fence: JournalFence,
+    first: JournalCollectionPage,
+) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
+    let mut seen: BTreeSet<_> = match first.items {
+        JournalCollectionItems::Members(ids) => ids.into_iter().collect(),
+        _ => unreachable!(),
+    };
+    let mut after = first.next;
+    while let Some(next) = after {
+        let page = storage
+            .collection_page(
+                domain,
+                session,
+                JournalCollectionPageRequest {
+                    kind: JournalCollectionPageKind::Members,
+                    fence,
+                    after: Some(next),
+                    max_items: 5,
+                },
+            )
+            .await?;
+        if let JournalCollectionItems::Members(ids) = page.items {
+            for id in ids {
+                assert!(seen.insert(id), "a member appears exactly once");
+            }
+        }
+        after = page.next;
+    }
+    Ok(seen)
+}
+
+#[tokio::test]
+async fn member_pages_survive_other_sessions_writes_and_never_skip_across_compaction() {
+    let db = TestDb::new();
+    let (storage, engine) = bounded_scenario(&db.0, true).await;
+    let domain = JournalDomain {
+        storage_id: engine.storage_id(),
+        role: JournalRole::Protected,
+    };
+    let session = SessionId::new("bounded-0");
+    let fence = storage
+        .load(&domain, &session)
+        .await
+        .unwrap()
+        .unwrap()
+        .fence();
+    let members: BTreeSet<_> = storage
+        .members(&domain, &session)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    let first = || async {
+        storage
+            .collection_page(
+                &domain,
+                &session,
+                JournalCollectionPageRequest {
+                    kind: JournalCollectionPageKind::Members,
+                    fence,
+                    after: None,
+                    max_items: 5,
+                },
+            )
+            .await
+            .unwrap()
+    };
+    // Another session writes new packs between two pages of this session:
+    // the continuation is bound to this session's packs only.
+    let page = first().await;
+    let other = SessionId::new("bounded-1");
+    let lease = engine
+        .open(
+            &other,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new("w2"),
+                pin: JournalPinId::new("w2"),
+                intent: JournalOpenIntent::ExclusiveWriter,
+            },
+        )
+        .await
+        .unwrap();
+    let objects = (0..8)
+        .map(|i| {
+            JournalObject::encode(
+                JournalObjectKind::Message,
+                &Message::user(format!("other extra {i}")),
+            )
+            .unwrap()
+        })
+        .collect();
+    engine
+        .stage_leaves(&lease, JournalPinId::new("extra"), objects)
+        .await
+        .unwrap();
+    engine.close(lease).await.unwrap();
+    let seen = page_rest(&storage, &domain, &session, fence, page)
+        .await
+        .expect("another session's write never rejects this continuation");
+    assert_eq!(seen, members);
+    // Compaction may rewrite this session's packs under the same fence: the
+    // continuation may then be rejected, but must never skip an id.
+    let page = first().await;
+    storage.compact(&domain).await.unwrap();
+    match page_rest(&storage, &domain, &session, fence, page).await {
+        Ok(seen) => assert_eq!(seen, members),
+        Err(error) => assert_eq!(error.kind, ErrorKind::Conflict),
+    }
+    let seen = page_rest(&storage, &domain, &session, fence, first().await)
+        .await
+        .unwrap();
+    assert_eq!(seen, members);
+}
