@@ -630,7 +630,7 @@ impl<'a> TurnMachine<'a> {
                 provider_error_kind,
             } => {
                 if checkpoint.internal_input.is_none()
-                    && checkpoint.active_history_start == checkpoint.snapshot.history_len()
+                    && checkpoint.active_history_start == checkpoint.snapshot().history_len()
                 {
                     if let Err(error) = boxed(|| self.complete_local(finish)).await {
                         self.emit_non_durable_failure(error, false);

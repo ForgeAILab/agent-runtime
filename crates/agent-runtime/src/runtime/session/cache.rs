@@ -290,7 +290,7 @@ impl SessionHandle {
                         .begin_cache_events_for_turn(cache_turn.clone());
                     let checkpoint_result = result.checkpoint_result();
                     let usage = self.cache_usage_for_snapshot(
-                        &checkpoint.snapshot,
+                        checkpoint.snapshot(),
                         &operation,
                         &checkpoint_result,
                     )?;

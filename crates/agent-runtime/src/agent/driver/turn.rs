@@ -429,19 +429,19 @@ impl<'a> TurnMachine<'a> {
             .checkpoint
             .as_ref()
             .ok_or_else(|| RuntimeError::internal("turn has no accepted checkpoint"))?;
-        let normalized = if current.snapshot.manifest_len() == 0
-            && current
-                .snapshot
-                .extension(crate::runtime::MANIFEST_BOUNDARY_NAMESPACE)
-                .is_some()
-        {
-            None
-        } else {
-            let mut normalized = current.clone();
-            normalized.snapshot =
-                crate::runtime::manifests::normalize_checkpoint_view(&current.snapshot)?;
-            Some(normalized)
-        };
+        let normalized =
+            if current.snapshot().manifest_len() == 0
+                && current
+                    .snapshot()
+                    .extension(crate::runtime::MANIFEST_BOUNDARY_NAMESPACE)
+                    .is_some()
+            {
+                None
+            } else {
+                Some(current.with_snapshot(
+                    crate::runtime::manifests::normalize_checkpoint_view(current.snapshot())?,
+                )?)
+            };
         let current = normalized.as_ref().unwrap_or(current);
         let visible_output = current.visible_output
             || matches!(
@@ -608,7 +608,7 @@ impl<'a> TurnMachine<'a> {
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
         let history = self.execution.shared_history(
             self.emitter.session(),
-            &self.state.lock().expect("session state poisoned").history(),
+            self.state.lock().expect("session state poisoned").history(),
             self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
@@ -792,7 +792,7 @@ impl<'a> TurnMachine<'a> {
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
         let history = self.execution.shared_history(
             self.emitter.session(),
-            &self.state.lock().expect("session state poisoned").history(),
+            self.state.lock().expect("session state poisoned").history(),
             self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
@@ -1278,7 +1278,7 @@ impl<'a> TurnMachine<'a> {
 
             let history = execution.shared_history(
                 emitter.session(),
-                &state.lock().expect("session state poisoned").history(),
+                state.lock().expect("session state poisoned").history(),
                 driver.history_lcm.as_ref(),
             );
             let mut planned_request = match driver

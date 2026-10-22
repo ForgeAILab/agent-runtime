@@ -695,7 +695,7 @@ impl SessionPersistence {
                     let mut domain = domain.lock().await;
                     match Box::pin(commit_domain_view(
                         &mut domain,
-                        &checkpoint.snapshot,
+                        checkpoint.snapshot(),
                         Some(checkpoint),
                         CommitPurpose::Transition,
                     ))
@@ -737,7 +737,7 @@ impl SessionPersistence {
                     Some(domain) => {
                         Box::pin(commit_domain_view(
                             &mut *domain.lock().await,
-                            &checkpoint.snapshot,
+                            checkpoint.snapshot(),
                             Some(checkpoint),
                             CommitPurpose::Transition,
                         ))

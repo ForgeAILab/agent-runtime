@@ -1686,7 +1686,7 @@ impl Runtime {
             (events, repaired)
         } else if let Some(coordinator) = self.shared.lcm.as_ref() {
             let initialized = coordinator
-                .claim_session(&session_id, &state.history(), request.lcm_policy, false)
+                .claim_session(&session_id, state.history(), request.lcm_policy, false)
                 .await?;
             state.replace_history(initialized.history);
             if let Some(lcm_state) = initialized.state {

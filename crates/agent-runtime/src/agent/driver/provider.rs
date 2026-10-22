@@ -699,7 +699,7 @@ impl Driver {
                     .expect("session extension state poisoned");
                 let count = crate::runtime::manifests::planned_steps(
                     extensions.get(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE),
-                    &state.manifests(),
+                    state.manifests(),
                 )
                 .map_err(manifest_boundary_error)?
                 .checked_add(1)

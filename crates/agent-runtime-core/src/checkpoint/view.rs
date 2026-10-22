@@ -27,7 +27,7 @@ pub struct CheckpointMetadata {
 #[derive(Debug, Clone, PartialEq)]
 pub struct JournalCheckpoint {
     metadata: Arc<CheckpointMetadata>,
-    pub snapshot: JournalSnapshotView,
+    snapshot: JournalSnapshotView,
 }
 impl std::ops::Deref for JournalCheckpoint {
     type Target = CheckpointMetadata;
@@ -36,6 +36,19 @@ impl std::ops::Deref for JournalCheckpoint {
     }
 }
 impl JournalCheckpoint {
+    /// The validated semantic snapshot; it cannot be swapped after validation.
+    pub fn snapshot(&self) -> &JournalSnapshotView {
+        &self.snapshot
+    }
+    /// The same metadata over another snapshot, validated as a whole.
+    pub fn with_snapshot(&self, snapshot: JournalSnapshotView) -> Result<Self, RuntimeError> {
+        let next = Self {
+            metadata: self.metadata.clone(),
+            snapshot,
+        };
+        next.validate()?;
+        Ok(next)
+    }
     pub(crate) fn metadata_arc(&self) -> Arc<CheckpointMetadata> {
         self.metadata.clone()
     }
@@ -88,18 +101,6 @@ impl JournalCheckpoint {
             metadata: Arc::new(metadata),
             snapshot: JournalSnapshotView::from_snapshot(snapshot)?,
         })
-    }
-    pub fn from_checkpoint_view(
-        checkpoint: TurnCheckpoint,
-        snapshot: JournalSnapshotView,
-    ) -> Result<Self, RuntimeError> {
-        let (metadata, _) = Self::parts(checkpoint);
-        let next = Self {
-            metadata: Arc::new(metadata),
-            snapshot,
-        };
-        next.validate()?;
-        Ok(next)
     }
     pub fn materialize(&self) -> TurnCheckpoint {
         #[cfg(feature = "test-support")]

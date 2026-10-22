@@ -68,7 +68,7 @@ impl SessionHandle {
                 ),
                 TurnState::CacheOperationResultReady { operation, result } => {
                     let usage =
-                        self.cache_usage_for_snapshot(&checkpoint.snapshot, &operation, &result)?;
+                        self.cache_usage_for_snapshot(checkpoint.snapshot(), &operation, &result)?;
                     let result_value = self.cache_result_from_checkpoint(&operation, &result);
                     self.inner
                         .shared
@@ -114,7 +114,7 @@ impl SessionHandle {
             let record = self.append_recovered_cache_usage(&operation)?;
             Some(record)
         } else {
-            self.cache_usage_for_snapshot(&checkpoint.snapshot, &operation, &result_checkpoint)?
+            self.cache_usage_for_snapshot(checkpoint.snapshot(), &operation, &result_checkpoint)?
         };
         let result_state = TurnState::CacheOperationResultReady {
             operation: operation.clone(),

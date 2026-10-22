@@ -88,7 +88,7 @@ impl SessionHandle {
                 "idle LCM progress requires a terminal checkpoint",
             ));
         }
-        let predecessor = previous.snapshot.usage_fingerprint()?;
+        let predecessor = previous.snapshot().usage_fingerprint()?;
         self.inner
             .execution
             .extension_state
@@ -366,7 +366,7 @@ impl SessionHandle {
             (
                 self.inner.execution.shared_history(
                     &self.inner.id,
-                    &state.history(),
+                    state.history(),
                     self.inner.shared.lcm.as_ref(),
                 ),
                 Arc::from(state.usage().records().to_vec().into_boxed_slice()),

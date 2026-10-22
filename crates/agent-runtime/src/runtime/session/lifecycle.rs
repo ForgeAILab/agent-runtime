@@ -140,7 +140,7 @@ impl SessionHandle {
     /// short synchronous projection — a tail scan, not a blocking wait.
     pub fn with_history<R>(&self, f: impl FnOnce(&[Message]) -> R) -> R {
         let state = self.inner.state.lock().expect("session state poisoned");
-        f(&state.history())
+        f(state.history())
     }
 
     /// Expands one opaque LCM node through the host-authorized coordinator.
@@ -289,7 +289,7 @@ impl SessionHandle {
     /// `snapshot().manifests`. Empty does not imply no provider activity.
     pub fn recent_manifests(&self) -> Vec<agent_runtime_core::store::TurnManifest> {
         let state = self.inner.state.lock().expect("session state poisoned");
-        crate::runtime::manifests::recent(&state.manifests(), self.inner.shared.manifest_window)
+        crate::runtime::manifests::recent(state.manifests(), self.inner.shared.manifest_window)
     }
 
     pub(crate) fn manifest_window(&self) -> std::num::NonZeroUsize {
@@ -352,7 +352,7 @@ impl SessionHandle {
             history: state.history().to_vec(),
             usage: state.usage().clone(),
             manifests: crate::runtime::manifests::recent(
-                &state.manifests(),
+                state.manifests(),
                 self.inner.shared.manifest_window,
             ),
             identity: self
