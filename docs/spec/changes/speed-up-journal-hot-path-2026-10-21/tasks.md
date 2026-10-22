@@ -80,6 +80,14 @@ retired purge/base repack in the packed adapter, member continuations bound to
 the session's own pack version, `has_more` after a partial release, cancel-safe
 hints and one shared apply helper. Evidence: `/Volumes/Data/tmp/refactor/rt-p4/fix-report.md`.
 
+Drain-cost round: the in-unit cap check walked the whole mark (quadratic
+tracing); the charge is now maintained incrementally. C/4000 isolated full
+drains: 874 s / 4,675 calls before, 369 s / 2,676 calls after (one-call
+collector 396 s; P4 381 s), 1001/1001 drains with equal receipts and pack
+writes, zero restarts. `journal-profile` runs record per-call `rt.gc.*`
+diagnostics in `collect.jsonl`. Evidence:
+`/Volumes/Data/tmp/refactor/rt-p4-drain/report.md`.
+
 ## 5. Combined Validation and Release Handoff
 
 - [ ] 5.1 Run every existing core journal, testkit protected/ordinary/storage/collection/broken-adapter, packed configuration and runtime session-journal equivalence/import/crash suite without weakening cases.

@@ -448,7 +448,9 @@ storage maintenance continuation. Limit units by both ids and encoded bytes;
 one huge JSON object or pin cannot count as one cheap unit. Include cumulative
 cursor charge and cap additional workspace at 16 MiB per engine; on eviction abandon speculative work and retain
 dirty state. The cap is checked inside a trace unit after every object, not
-only after a unit. A session whose unchanged mark cannot fit the configured
+only after a unit, so the charge is maintained incrementally and each check
+is O(1); a check that walks the mark makes tracing quadratic in mark size
+(C/4000: 2.3x full-drain collect time for identical work). A session whose unchanged mark cannot fit the configured
 capacity is a per-session skip: its speculative state is dropped, its durable
 dirty flag and local hint are retained, it is reported in
 `over_capacity_sessions` and excluded from `has_more` for that pass, and later
