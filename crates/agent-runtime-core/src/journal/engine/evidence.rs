@@ -27,9 +27,6 @@ impl ClosureEvidence {
     pub(in crate::journal) fn iter(&self) -> impl Iterator<Item = &JournalObjectId> {
         self.members.keys()
     }
-    pub(super) fn member_set(&self) -> Arc<BTreeSet<JournalObjectId>> {
-        Arc::new(self.iter().cloned().collect())
-    }
     pub(super) fn without_changes(&self) -> Self {
         Self {
             root: self.root.clone(),

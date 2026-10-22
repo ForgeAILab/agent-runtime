@@ -915,7 +915,7 @@ fn cached_json_lengths_and_bytes_match_complete_encodings_after_rewrites() {
         let mut warm = JournalWriterAssembler::default();
         let cache = warm
             .json_value_cached(&value, prior.as_ref().map(|(v, c)| (v, c)))
-            .unwrap();
+            .unwrap_or_else(|error| panic!("array length {len}: {error:?}"));
         accumulated.extend(warm.objects);
         let mut cold = JournalWriterAssembler::default();
         let oracle = cold.json_value_cached(&value, None).unwrap();

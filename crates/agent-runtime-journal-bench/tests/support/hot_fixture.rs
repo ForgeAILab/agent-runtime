@@ -496,7 +496,9 @@ pub(crate) struct Parameters<'a> {
 }
 pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, LegacyRow) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
+    let fixture_directory = reporter.directory.join("fixtures");
+    std::fs::create_dir_all(&fixture_directory).unwrap();
+    let path = fixture_directory.join(format!(
         "hot-path-{}-{}.sqlite",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -753,7 +755,7 @@ pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, Le
         .unwrap();
     let (legacy, legacy_snapshot) = legacy_run(reporter, &key, &p, &id, &mut operations).await;
     assert_eq!(legacy_snapshot.history, snapshot.history);
-    let import_path = std::env::temp_dir().join(format!(
+    let import_path = fixture_directory.join(format!(
         "hot-import-{}-{}.sqlite",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -798,7 +800,7 @@ pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, Le
     drop(import_store);
     drop(import_file);
     let case = Case {
-        profile_revision: "p1-incremental-v2",
+        profile_revision: "p1-round2-live-v1",
         fixture: p.name.into(),
         n: p.n,
         tools: p.tools,
@@ -821,7 +823,7 @@ pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, Le
         final_messages: snapshot.history.len(),
         pack_bytes: storage.pack_write_bytes().unwrap(),
         memory_snapshots,
-        missing_metrics: json!({"allocator_heap":{"value":null,"reason":"no allocator hook; canonical memo charge is not heap"},"cursor_frontier":{"value":0,"reason":"v0.9.0 has no resumable cursor"},"persistent_version_depth":{"value":null,"reason":"v0.9.0 owned snapshots; no persistent semantic version"},"writer_working_state_bytes":{"value":null,"reason":"no non-invasive allocator instrumentation"},"shared_proof_retention_heap":{"value":null,"reason":"external proof reference counts and estimated memo charge are exposed; allocator heap is not"},"storage_cache_allocator_heap":{"value":null,"reason":"canonical body bytes and estimated location index bytes are exposed separately"},"semantic_nodes_copied":{"value":null,"reason":"Clone and PartialEq traversals have no per-node hooks"},"preflight_pages_yields_restarts":{"value":null,"reason":"P4 is not implemented"}}),
+        missing_metrics: json!({"allocator_heap":{"value":null,"reason":"no allocator hook; canonical memo charge is not heap"},"cursor_frontier":{"value":0,"reason":"v0.9.0 has no resumable cursor"},"persistent_version_depth":{"value":null,"reason":"persistent views have no linked version chain; exact per-writer depth telemetry is not instrumented"},"writer_working_state_bytes":{"value":null,"reason":"no non-invasive allocator instrumentation"},"shared_proof_retention_heap":{"value":null,"reason":"external proof reference counts and estimated memo charge are exposed; allocator heap is not"},"storage_cache_allocator_heap":{"value":null,"reason":"canonical body bytes and estimated location index bytes are exposed separately"},"semantic_nodes_copied":{"value":null,"reason":"targeted index/mutation work is counted; generic clone/API traversal and allocator-byte instrumentation remain incomplete"},"preflight_pages_yields_restarts":{"value":null,"reason":"P4 is not implemented"}}),
     };
     drop(store);
     drop(storage);

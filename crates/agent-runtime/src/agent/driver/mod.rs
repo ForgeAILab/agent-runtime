@@ -53,9 +53,9 @@ use agent_runtime_core::provider::{
 };
 use agent_runtime_core::provider_credential::ProviderCredentialRecovery;
 use agent_runtime_core::steer::{SteerDiscardReason, SteerLimits};
-use agent_runtime_core::store::{
-    SessionSnapshot, SessionStore, TurnManifest, VersionedSessionState,
-};
+#[cfg(test)]
+use agent_runtime_core::store::SessionSnapshot;
+use agent_runtime_core::store::{SessionStore, TurnManifest, VersionedSessionState};
 use agent_runtime_core::tool::ToolOutcome;
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
@@ -808,7 +808,12 @@ impl Driver {
     /// Appends any safe-boundary injected content to the history. Called only
     /// at provider/tool boundaries — at turn start and after a tool step —
     /// never while a provider stream is in flight.
-    fn drain_injected(&self, state: &Arc<Mutex<SessionState>>, inbox: &Arc<Mutex<InjectionQueue>>) {
+    fn drain_injected(
+        &self,
+        state: &Arc<Mutex<SessionState>>,
+        inbox: &Arc<Mutex<InjectionQueue>>,
+        execution: &SessionExecutionContext,
+    ) {
         let messages = inbox
             .lock()
             .expect("session inbox poisoned")
@@ -817,7 +822,7 @@ impl Driver {
             return;
         }
         let mut guard = state.lock().expect("session state poisoned");
-        guard.history.extend(messages);
+        execution.append_history(&mut guard, messages);
     }
 
     /// Takes the injected content a turn's acceptance boundary introduces.
@@ -832,12 +837,13 @@ impl Driver {
 
     /// Publishes a turn's staged messages to live history once its
     /// acceptance checkpoint has committed.
-    fn publish_accepted(&self, state: &Arc<Mutex<SessionState>>, staged: Vec<Message>) {
-        state
-            .lock()
-            .expect("session state poisoned")
-            .history
-            .extend(staged);
+    fn publish_accepted(
+        &self,
+        state: &Arc<Mutex<SessionState>>,
+        staged: Vec<Message>,
+        execution: &SessionExecutionContext,
+    ) {
+        execution.append_history(&mut state.lock().expect("session state poisoned"), staged);
     }
 
     /// Settles a turn whose acceptance checkpoint failed and returns the
@@ -881,7 +887,7 @@ impl Driver {
                 error
             }
             AcceptanceSaveError::Unresolved(error) => {
-                self.publish_accepted(state, staged);
+                self.publish_accepted(state, staged, execution);
                 execution.hold_unresolved_injections(UnresolvedInjections {
                     turn: turn.clone(),
                     items: injected,
@@ -904,6 +910,11 @@ impl Driver {
         turn_id: TurnId,
         input: UserInput,
     ) {
+        execution
+            .live_snapshot
+            .lock()
+            .expect("live snapshot poisoned")
+            .disable();
         let context = TurnMachineContext {
             state,
             execution,
@@ -1157,7 +1168,7 @@ struct TurnMachine<'a> {
     steer_mailbox: Option<Arc<SteerMailbox>>,
     turn_id: TurnId,
     acceptance: Option<Arc<TurnAcceptance>>,
-    checkpoint: Option<TurnCheckpoint>,
+    checkpoint: Option<agent_runtime_core::checkpoint::JournalCheckpoint>,
     /// An ordinary-only hard intent whose successor still needs publication.
     ordinary_lcm_intent_saved: bool,
     /// This turn crossed an ordinary hard-admission durability barrier.

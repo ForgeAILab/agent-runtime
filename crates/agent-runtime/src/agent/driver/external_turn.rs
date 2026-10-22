@@ -129,7 +129,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .checkpoint_accepted(accepted_input, active_history_start, turn_deadline, &staged)
             .await
         {
-            Ok(()) => driver.publish_accepted(&state, staged),
+            Ok(()) => driver.publish_accepted(&state, staged, &execution),
             Err(failure) => {
                 // No backend work has begun. A protected store failure is
                 // observable and fails closed before external I/O.
@@ -207,7 +207,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .await
         {
             Ok(()) => {
-                driver.publish_accepted(&self.machine.state, staged);
+                driver.publish_accepted(&self.machine.state, staged, &self.machine.execution);
                 self.machine.resolve_acceptance(Ok(()));
             }
             Err(failure) => {
@@ -427,12 +427,10 @@ impl<'a> ExternalTurnMachine<'a> {
                 },
                 delta: usage,
             };
-            self.machine
-                .state
-                .lock()
-                .expect("session state poisoned")
-                .usage
-                .record(record.clone());
+            self.machine.execution.record_usage(
+                &mut self.machine.state.lock().expect("session state poisoned"),
+                record.clone(),
+            );
             emitter.emit(turn.clone(), RuntimeEvent::Usage { record });
         }
 
@@ -445,11 +443,10 @@ impl<'a> ExternalTurnMachine<'a> {
             if completed {
                 let parts = output.take_parts(&execution);
                 if !parts.is_empty() {
-                    state
-                        .lock()
-                        .expect("session state poisoned")
-                        .history
-                        .push(Message::assistant(parts));
+                    execution.append_history(
+                        &mut state.lock().expect("session state poisoned"),
+                        [Message::assistant(parts)],
+                    );
                 }
             }
             visible_output
@@ -556,11 +553,10 @@ impl TurnMachine<'_> {
         };
         let prefix = parts.clone();
         parts.push(ContentPart::ToolCall(call.clone()));
-        self.state
-            .lock()
-            .expect("session state poisoned")
-            .history
-            .push(Message::assistant(parts));
+        self.execution.append_history(
+            &mut self.state.lock().expect("session state poisoned"),
+            [Message::assistant(parts)],
+        );
         if let Err(error) = self
             .transition(TurnState::ExternalToolCall {
                 request_id: request_id.clone(),
@@ -569,11 +565,8 @@ impl TurnMachine<'_> {
             })
             .await
         {
-            self.state
-                .lock()
-                .expect("session state poisoned")
-                .history
-                .pop();
+            self.execution
+                .pop_history(&mut self.state.lock().expect("session state poisoned"));
             let mut output = output.lock().expect("external output poisoned");
             for part in prefix {
                 match part {

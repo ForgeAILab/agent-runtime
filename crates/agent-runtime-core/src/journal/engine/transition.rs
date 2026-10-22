@@ -110,29 +110,106 @@ pub(in crate::journal) struct DurablePin {
     pub(in crate::journal) dependencies: DependencyRoots,
 }
 
-#[derive(Debug, Clone, Default)]
-pub(in crate::journal) struct ReachableSet {
-    pub(in crate::journal) layers: Vec<Arc<BTreeSet<JournalObjectId>>>,
+#[derive(Debug, Clone)]
+pub(in crate::journal) enum ReachableLayer {
+    Members(BTreeSet<JournalObjectId>),
+    Evidence(Arc<ClosureEvidence>),
 }
-
-impl ReachableSet {
-    pub(in crate::journal) fn from_set(objects: BTreeSet<JournalObjectId>) -> Self {
-        Self {
-            layers: (!objects.is_empty())
-                .then(|| Arc::new(objects))
-                .into_iter()
-                .collect(),
+impl ReachableLayer {
+    pub(in crate::journal) fn contains(&self, id: &JournalObjectId) -> bool {
+        match self {
+            Self::Members(set) => set.contains(id),
+            Self::Evidence(proof) => proof.contains(id),
         }
     }
+    pub(in crate::journal) fn len(&self) -> usize {
+        match self {
+            Self::Members(set) => set.len(),
+            Self::Evidence(proof) => proof.len(),
+        }
+    }
+    pub(in crate::journal) fn iter(&self) -> impl Iterator<Item = &JournalObjectId> {
+        let (set, evidence) = match self {
+            Self::Members(set) => (Some(set), None),
+            Self::Evidence(proof) => (None, Some(proof)),
+        };
+        set.into_iter()
+            .flat_map(|set| set.iter())
+            .chain(evidence.into_iter().flat_map(|proof| proof.iter()))
+    }
+    pub(super) fn charge(&self) -> usize {
+        match self {
+            Self::Members(set) => {
+                std::mem::size_of::<BTreeSet<JournalObjectId>>()
+                    + set.len().saturating_mul(
+                        std::mem::size_of::<JournalObjectId>()
+                            + 64
+                            + 3 * std::mem::size_of::<usize>(),
+                    )
+            }
+            Self::Evidence(proof) => proof.charge(),
+        }
+    }
+}
 
+#[derive(Debug, Clone, Default)]
+pub(in crate::journal) struct ReachableSet {
+    pub(in crate::journal) layers: Vec<Arc<ReachableLayer>>,
+}
+impl ReachableSet {
+    pub(in crate::journal) fn from_set(objects: BTreeSet<JournalObjectId>) -> Self {
+        let mut next = Self::default();
+        next.extend(objects);
+        next
+    }
+    pub(in crate::journal) fn from_evidence(proof: Arc<ClosureEvidence>) -> Self {
+        let mut next = Self::default();
+        next.push_evidence(proof);
+        next
+    }
+    pub(in crate::journal) fn push_evidence(&mut self, proof: Arc<ClosureEvidence>) {
+        if proof.len() != 0 {
+            self.extend_layer(Arc::new(ReachableLayer::Evidence(proof)));
+        }
+    }
     pub(in crate::journal) fn contains(&self, id: &JournalObjectId) -> bool {
         self.layers.iter().rev().any(|layer| layer.contains(id))
     }
-
     pub(in crate::journal) fn extend(&mut self, objects: BTreeSet<JournalObjectId>) {
         if !objects.is_empty() {
-            self.layers.push(Arc::new(objects));
-            merge_layers(&mut self.layers);
+            self.extend_layer(Arc::new(ReachableLayer::Members(objects)));
+        }
+    }
+    pub(in crate::journal) fn extend_layer(&mut self, layer: Arc<ReachableLayer>) {
+        if self.layers.iter().any(|old| {
+            Arc::ptr_eq(old, &layer)
+                || match (old.as_ref(), layer.as_ref()) {
+                    (ReachableLayer::Evidence(a), ReachableLayer::Evidence(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                }
+        }) {
+            return;
+        }
+        self.layers.push(layer);
+        while self.layers.len() >= 2 {
+            let top = self.layers.len() - 1;
+            if !matches!(self.layers[top].as_ref(), ReachableLayer::Members(_))
+                || !matches!(self.layers[top - 1].as_ref(), ReachableLayer::Members(_))
+                || self.layers[top].len() < self.layers[top - 1].len()
+            {
+                break;
+            }
+            let newer = self.layers.pop().expect("two layers");
+            let ReachableLayer::Members(older) =
+                Arc::make_mut(self.layers.last_mut().expect("two layers"))
+            else {
+                unreachable!()
+            };
+            match Arc::try_unwrap(newer) {
+                Ok(ReachableLayer::Members(newer)) => older.extend(newer),
+                Ok(ReachableLayer::Evidence(_)) => unreachable!(),
+                Err(newer) => older.extend(newer.iter().cloned()),
+            }
         }
     }
 }
@@ -336,16 +413,22 @@ impl ObjectStore {
         Ok(())
     }
     pub(super) fn retain_cached(&self, keep: &BTreeSet<JournalObjectId>) -> Self {
+        self.retain_cached_where(|id| keep.contains(id))
+    }
+    pub(super) fn retain_evidence(&self, keep: &ClosureEvidence) -> Self {
+        self.retain_cached_where(|id| keep.contains(id))
+    }
+    fn retain_cached_where(&self, contains: impl Fn(&JournalObjectId) -> bool) -> Self {
         let mut next = Self::from_shared(
             self.entries()
                 .into_iter()
-                .filter(|(id, _)| keep.contains(id))
+                .filter(|(id, _)| contains(id))
                 .collect(),
         );
         next.links = Arc::new(
             self.links
                 .iter()
-                .filter(|(id, _)| keep.contains(*id))
+                .filter(|(id, _)| contains(id))
                 .map(|(id, links)| (id.clone(), links.clone()))
                 .collect(),
         );
@@ -556,7 +639,7 @@ impl Transition {
             existing.roots.extend(layer.iter().cloned());
         }
         for layer in record.reachable.layers {
-            existing.reachable.extend(layer.as_ref().clone());
+            existing.reachable.extend_layer(layer);
         }
         if let Some(root) = current_root.filter(|root| existing.roots.contains(root)) {
             existing.memo_roots.insert(root);
@@ -889,6 +972,7 @@ impl Transition {
                 }
                 _ => return Err(conflict()),
             };
+            snapshot.advance_version();
             snapshot.identity = commit.batch.snapshot.identity.clone();
             snapshot.updated = commit.batch.snapshot.updated;
             Ok(snapshot)
@@ -1433,7 +1517,7 @@ impl Transition {
                 pin.roots.extend(layer.iter().cloned());
             }
             for layer in &staged_lease.reachable.layers {
-                pin.reachable.extend(layer.as_ref().clone());
+                pin.reachable.extend_layer(Arc::clone(layer));
             }
         }
         self.fail_if_armed(JournalCommitFailurePoint::AfterPin)?;
@@ -1734,5 +1818,72 @@ impl Transition {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map(|n| n + 1)
             .map_err(|_| conflict())
+    }
+}
+
+#[cfg(test)]
+mod reachable_layer_tests {
+    use super::*;
+
+    #[test]
+    fn shared_closure_layers_preserve_membership_iteration_and_version_isolation() {
+        let object = JournalObject::encode(
+            JournalObjectKind::Message,
+            &crate::content::Message::user("base"),
+        )
+        .unwrap();
+        let mut objects =
+            ObjectStore::from_shared([(object.id.clone(), Arc::new(object.bytes))].into());
+        let proof = Arc::new(
+            ClosureEvidence::update(
+                None,
+                &mut objects,
+                object.id.clone(),
+                ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Message)),
+            )
+            .unwrap(),
+        );
+        let base = ReachableSet::from_evidence(proof.clone());
+        let mut next = base.clone();
+        let mut expected = BTreeSet::from([object.id.clone()]);
+        for i in 0..200 {
+            let id = JournalObject::encode(
+                JournalObjectKind::Message,
+                &crate::content::Message::user(i.to_string()),
+            )
+            .unwrap()
+            .id;
+            next.extend(BTreeSet::from([id.clone()]));
+            expected.insert(id);
+            next.push_evidence(proof.clone());
+        }
+        assert!(next.layers.len() <= 16);
+        assert_eq!(
+            next.layers
+                .iter()
+                .flat_map(|layer| layer.iter().cloned())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert!(expected.iter().all(|id| next.contains(id)));
+        assert_eq!(
+            base.layers.iter().map(|layer| layer.len()).sum::<usize>(),
+            1
+        );
+        assert!(
+            matches!(next.layers[0].as_ref(), ReachableLayer::Evidence(actual) if Arc::ptr_eq(actual, &proof))
+        );
+        let mut frozen = ReachableSet::default();
+        for layer in &next.layers {
+            frozen.extend_layer(layer.clone());
+        }
+        assert_eq!(
+            frozen
+                .layers
+                .iter()
+                .flat_map(|layer| layer.iter().cloned())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
     }
 }

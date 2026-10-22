@@ -71,11 +71,16 @@ impl SessionHandle {
         turn: agent_runtime_core::ids::TurnId,
         operation: agent_runtime_core::checkpoint::CacheOperationCheckpoint,
         deadline: Deadline,
-    ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+    ) -> Result<Option<JournalCheckpoint>, RuntimeError> {
         if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(None);
         }
-        let checkpoint_sequence = match self.inner.execution.persistence.latest_checkpoint().await?
+        let checkpoint_sequence = match self
+            .inner
+            .execution
+            .persistence
+            .latest_checkpoint_view()
+            .await?
         {
             None => 1,
             Some(previous) if previous.state.is_terminal() => {
@@ -89,7 +94,7 @@ impl SessionHandle {
         };
         let snapshot = self.checkpoint_snapshot()?;
         let event_sequence = self.inner.emitter.begin_checkpoint_barrier();
-        let checkpoint = TurnCheckpoint::cache_operation(
+        let checkpoint = JournalCheckpoint::cache_operation(
             turn,
             operation,
             snapshot,
@@ -109,7 +114,7 @@ impl SessionHandle {
             .inner
             .execution
             .persistence
-            .save_checkpoint(&checkpoint)
+            .save_checkpoint_view(&checkpoint)
             .await;
         self.inner.emitter.end_checkpoint_barrier();
         save?;
@@ -118,9 +123,9 @@ impl SessionHandle {
 
     pub(super) async fn advance_cache_checkpoint(
         &self,
-        checkpoint: TurnCheckpoint,
+        checkpoint: JournalCheckpoint,
         state: TurnState,
-    ) -> Result<TurnCheckpoint, RuntimeError> {
+    ) -> Result<JournalCheckpoint, RuntimeError> {
         let _persist_gate = self.inner.persist_gate.lock().await;
         self.advance_cache_checkpoint_locked(checkpoint, state)
             .await
@@ -132,9 +137,9 @@ impl SessionHandle {
     /// respect to ordinary persistence.
     async fn advance_cache_checkpoint_locked(
         &self,
-        checkpoint: TurnCheckpoint,
+        checkpoint: JournalCheckpoint,
         state: TurnState,
-    ) -> Result<TurnCheckpoint, RuntimeError> {
+    ) -> Result<JournalCheckpoint, RuntimeError> {
         let snapshot = self.checkpoint_snapshot()?;
         let event_sequence = self.inner.emitter.begin_checkpoint_barrier();
         let next = match checkpoint.transition(
@@ -154,7 +159,7 @@ impl SessionHandle {
                 .inner
                 .execution
                 .persistence
-                .save_checkpoint(&next)
+                .save_checkpoint_view(&next)
                 .await;
             self.inner.emitter.end_checkpoint_barrier();
             save?;
@@ -170,7 +175,7 @@ impl SessionHandle {
     /// ResultReady is protected.
     async fn finalize_cache_checkpoint_locked(
         &self,
-        checkpoint: TurnCheckpoint,
+        checkpoint: JournalCheckpoint,
         result: &CacheOperationResult,
         operation: &agent_runtime_core::checkpoint::CacheOperationCheckpoint,
         cache_events: Option<CacheEventBatch>,
@@ -247,7 +252,12 @@ impl SessionHandle {
         if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(());
         }
-        let Some(mut checkpoint) = self.inner.execution.persistence.latest_checkpoint().await?
+        let Some(mut checkpoint) = self
+            .inner
+            .execution
+            .persistence
+            .latest_checkpoint_view()
+            .await?
         else {
             return Err(RuntimeError::conflict(
                 "cache result has no protected checkpoint to repair",
@@ -279,8 +289,8 @@ impl SessionHandle {
                         .emitter
                         .begin_cache_events_for_turn(cache_turn.clone());
                     let checkpoint_result = result.checkpoint_result();
-                    let usage = self.cache_usage_for_checkpoint(
-                        &checkpoint.snapshot.usage,
+                    let usage = self.cache_usage_for_snapshot(
+                        &checkpoint.snapshot,
                         &operation,
                         &checkpoint_result,
                     )?;
@@ -419,11 +429,10 @@ impl SessionHandle {
     }
 
     fn restore_pending_cache_usage(&self, usage: UsageLedger) {
-        self.inner
-            .state
-            .lock()
-            .expect("session state poisoned")
-            .usage = usage;
+        self.inner.execution.replace_usage(
+            &mut self.inner.state.lock().expect("session state poisoned"),
+            usage,
+        );
     }
 
     /// Dispatches one conformance-gated synthetic cache operation through the
@@ -455,7 +464,8 @@ impl SessionHandle {
             .lock()
             .expect("session state poisoned")
             .usage
-            .clone();
+            .records()
+            .len();
         let request_id = self.inner.minter.request();
         let attempt_id = self.inner.minter.attempt();
         let operation_fingerprint = operation.fingerprint();
@@ -520,7 +530,11 @@ impl SessionHandle {
             .cache
             .operation_reserved(&self.inner.id, operation.operation());
         let prepared_retry_checkpoint = if self.inner.execution.persistence.has_checkpoint_store() {
-            self.inner.execution.persistence.latest_checkpoint().await?
+            self.inner
+                .execution
+                .persistence
+                .latest_checkpoint_view()
+                .await?
         } else {
             None
         };
@@ -653,11 +667,10 @@ impl SessionHandle {
                             operation.operation(),
                             cache_snapshot.clone(),
                         );
-                        self.inner
-                            .state
-                            .lock()
-                            .expect("session state poisoned")
-                            .usage = usage_snapshot.clone();
+                        self.inner.execution.truncate_usage(
+                            &mut self.inner.state.lock().expect("session state poisoned"),
+                            usage_snapshot,
+                        );
                         return Err(error);
                     }
                     Err(CacheFinalizeError::Terminal(error)) => {
@@ -784,6 +797,12 @@ impl SessionHandle {
             Ok(result) => result,
             Err(error) => return Err(error),
         };
+        self.inner
+            .execution
+            .live_snapshot
+            .lock()
+            .expect("live snapshot poisoned")
+            .usage_changed(usage_snapshot);
         let checkpoint = if let Some(slot) = checkpoint_slot {
             slot.lock().await.take()
         } else {
@@ -814,11 +833,10 @@ impl SessionHandle {
                         operation.operation(),
                         cache_snapshot,
                     );
-                    self.inner
-                        .state
-                        .lock()
-                        .expect("session state poisoned")
-                        .usage = usage_snapshot;
+                    self.inner.execution.truncate_usage(
+                        &mut self.inner.state.lock().expect("session state poisoned"),
+                        usage_snapshot,
+                    );
                     return Err(error);
                 }
                 Err(CacheFinalizeError::Terminal(error)) => {
@@ -929,7 +947,8 @@ impl SessionHandle {
             .lock()
             .expect("session state poisoned")
             .usage
-            .clone();
+            .records()
+            .len();
         let request_id = self.inner.minter.request();
         let attempt_id = self.inner.minter.attempt();
         let operation_fingerprint = operation.fingerprint();
@@ -994,7 +1013,11 @@ impl SessionHandle {
             .cache
             .operation_reserved(&self.inner.id, operation.operation());
         let prepared_retry_checkpoint = if self.inner.execution.persistence.has_checkpoint_store() {
-            self.inner.execution.persistence.latest_checkpoint().await?
+            self.inner
+                .execution
+                .persistence
+                .latest_checkpoint_view()
+                .await?
         } else {
             None
         };
@@ -1138,11 +1161,10 @@ impl SessionHandle {
                             operation.operation(),
                             cache_snapshot.clone(),
                         );
-                        self.inner
-                            .state
-                            .lock()
-                            .expect("session state poisoned")
-                            .usage = usage_snapshot.clone();
+                        self.inner.execution.truncate_usage(
+                            &mut self.inner.state.lock().expect("session state poisoned"),
+                            usage_snapshot,
+                        );
                         return Err(error);
                     }
                     Err(CacheFinalizeError::Terminal(error)) => {
@@ -1245,6 +1267,12 @@ impl SessionHandle {
             Ok(result) => result,
             Err(error) => return Err(error),
         };
+        self.inner
+            .execution
+            .live_snapshot
+            .lock()
+            .expect("live snapshot poisoned")
+            .usage_changed(usage_snapshot);
         let checkpoint = if let Some(slot) = checkpoint_slot {
             slot.lock().await.take()
         } else {
@@ -1275,11 +1303,10 @@ impl SessionHandle {
                         operation.operation(),
                         cache_snapshot,
                     );
-                    self.inner
-                        .state
-                        .lock()
-                        .expect("session state poisoned")
-                        .usage = usage_snapshot;
+                    self.inner.execution.truncate_usage(
+                        &mut self.inner.state.lock().expect("session state poisoned"),
+                        usage_snapshot,
+                    );
                     return Err(error);
                 }
                 Err(CacheFinalizeError::Terminal(error)) => {

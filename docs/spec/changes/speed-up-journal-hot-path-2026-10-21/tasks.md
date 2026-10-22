@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-22T07:42:03Z
+updated_at: 2026-10-22T12:28:05Z
 completed_at:
 ---
 
@@ -84,12 +84,20 @@ The specification validation result and docs-only scope receipt are recorded in
 
 ## P1 Receipt (partial)
 
-Tasks 1.3–1.7 are implemented and verified. Tasks 1.1–1.2 remain partial:
-semantic sequence/map versions and canonical encoding witnesses are shared,
-but Runtime-owned mutation provenance and persistent JSON array indexes are
-not complete. Owned DTO capture and prefix discovery still perform O(N) work.
-Task 1.8 remains unchecked until numeric/work/matrix acceptance is established.
-A clean release preflight was blocked by other matching processes after the
-requested retry. Full evidence, initial failures/retries and any subsequent
-measurement status are recorded in `/Volumes/Data/tmp/refactor/rt-p1/report.md`.
-No P2/P3/P4 task or persisted schema is changed by this receipt.
+Tasks 1.3–1.7 remain implemented. Round 2 adds Runtime-owned immutable live
+views, mutation recording, shared internal checkpoints, identity-bound writer
+hints, persistent JSON item/branch indexes, typed JSON construction proofs,
+direct closure-evidence layers and shared request/component-state owners.
+Public DTO fields and journal/checkpoint/transition formats are unchanged.
+
+Tasks 1.1–1.2 remain unchecked for complete acceptance: JSON-array and request
+source ingress still inspect unchanged positions, namespace key tables are
+visited, and some runtime component export functions still create their full
+payload. The full fixed-delta zero-prefix gate is not met. Task 1.8 remains
+open: single-sample B diagnostics do not replace the complete matrix/work gates.
+
+Round-2 implementation, final-source verification, per-step B/4000 diagnostics,
+P0/fresh-round-1/final comparisons, fingerprint design note and the phase-4
+representation seam are recorded in
+`/Volumes/Data/tmp/refactor/rt-p1b2/report.md`. The phase-4 worktree was read
+only. Collection optimization and P2/P4 acceptance are not claimed here.

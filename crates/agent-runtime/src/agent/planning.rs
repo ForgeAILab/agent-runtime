@@ -105,6 +105,12 @@ impl RunRevisions {
     }
 }
 
+#[derive(Debug)]
+struct CommittedCachePlan {
+    plan: CachePlan,
+    persisted: std::sync::OnceLock<std::sync::Arc<VersionedSessionState>>,
+}
+
 /// A frozen, run-scoped planner. One per session.
 #[derive(Debug)]
 pub struct RunPlanner {
@@ -122,7 +128,7 @@ pub struct RunPlanner {
     /// The previous turn's cache plan, so a stable prefix can be compared
     /// across turns. Behind a lock because turns run serially but share the
     /// planner.
-    previous_cache: Mutex<Option<CachePlan>>,
+    previous_cache: Mutex<Option<std::sync::Arc<CommittedCachePlan>>>,
     input_cap: Option<u32>,
     /// The exact immutable plan that crossed the provider-start boundary for
     /// the latest turn. It is retained only as a Runtime-owned maintenance
@@ -259,7 +265,10 @@ impl RunPlanner {
         *self
             .previous_cache
             .lock()
-            .expect("cache plan lock poisoned") = Some(cache);
+            .expect("cache plan lock poisoned") = Some(std::sync::Arc::new(CommittedCachePlan {
+            plan: cache,
+            persisted: Default::default(),
+        }));
         Ok(PreviousCacheRestore::Restored)
     }
 
@@ -267,16 +276,48 @@ impl RunPlanner {
         #[cfg(feature = "test-support")]
         let _profile =
             agent_runtime_core::journal::profile::enter_sync("rt.runtime.persisted_previous_cache");
+        self.persisted_previous_cache_shared()
+            .map(|value| value.as_ref().clone())
+    }
+    pub(crate) fn persisted_previous_cache_shared(
+        &self,
+    ) -> Option<std::sync::Arc<VersionedSessionState>> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.previous_cache_shared");
         let cache = self
             .previous_cache
             .lock()
             .expect("cache plan lock poisoned")
             .clone()?;
-        let value = serde_json::to_value(cache).expect("cache plan is JSON serializable");
         Some(
-            VersionedSessionState::new(RegistryRevision::new(PREVIOUS_CACHE_STATE_REVISION), value)
-                .redaction_safe(),
+            cache
+                .persisted
+                .get_or_init(|| {
+                    #[cfg(feature = "test-support")]
+                    agent_runtime_core::journal::profile::event(
+                        "rt.work.previous_cache_serializations",
+                        1,
+                        0,
+                    );
+                    let value =
+                        serde_json::to_value(&cache.plan).expect("cache plan is JSON serializable");
+                    std::sync::Arc::new(
+                        VersionedSessionState::new(
+                            RegistryRevision::new(PREVIOUS_CACHE_STATE_REVISION),
+                            value,
+                        )
+                        .redaction_safe(),
+                    )
+                })
+                .clone(),
         )
+    }
+    pub(crate) fn has_previous_cache(&self) -> bool {
+        self.previous_cache
+            .lock()
+            .expect("cache plan lock poisoned")
+            .is_some()
     }
 
     /// Commits a cache plan only once its corresponding provider request has
@@ -287,7 +328,10 @@ impl RunPlanner {
         *self
             .previous_cache
             .lock()
-            .expect("cache plan lock poisoned") = Some(cache_plan.clone());
+            .expect("cache plan lock poisoned") = Some(std::sync::Arc::new(CommittedCachePlan {
+            plan: cache_plan.clone(),
+            persisted: Default::default(),
+        }));
     }
 
     /// Commits the exact plan that crossed the provider-start boundary and
@@ -500,7 +544,7 @@ impl RunPlanner {
                 .as_ref()
                 .map(|compactor| compactor as &dyn agent_runtime_context::Compactor),
             &self.cache_capability,
-            previous.as_ref(),
+            previous.as_ref().map(|previous| &previous.plan),
             self.plan_inputs(revisions),
         )?;
 

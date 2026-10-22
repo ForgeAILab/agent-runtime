@@ -15,7 +15,13 @@ impl SessionHandle {
         if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(true);
         }
-        let Some(checkpoint) = self.inner.execution.persistence.latest_checkpoint().await? else {
+        let Some(checkpoint) = self
+            .inner
+            .execution
+            .persistence
+            .latest_checkpoint_view()
+            .await?
+        else {
             return Ok(true);
         };
         checkpoint.validate()?;
@@ -30,7 +36,12 @@ impl SessionHandle {
         if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(());
         }
-        let previous = self.inner.execution.persistence.latest_checkpoint().await?;
+        let previous = self
+            .inner
+            .execution
+            .persistence
+            .latest_checkpoint_view()
+            .await?;
         let snapshot = self.checkpoint_snapshot()?;
         let sequence = self.inner.emitter.begin_checkpoint_barrier();
         let result = async {
@@ -41,23 +52,14 @@ impl SessionHandle {
                             "session boundary requires an idle terminal checkpoint",
                         ));
                     }
-                    let mut next = previous.clone();
-                    next.state_revision =
-                        previous.state_revision.checked_add(1).ok_or_else(|| {
-                            RuntimeError::conflict("session checkpoint revision exhausted")
-                        })?;
-                    next.watermark = previous.watermark.clone().next(sequence);
-                    next.snapshot = snapshot;
-                    next.updated = self.inner.shared.clock.now();
-                    previous.validate_successor(&next)?;
-                    next
+                    previous.refresh_terminal(snapshot, sequence, self.inner.shared.clock.now())?
                 }
-                None => TurnCheckpoint::session_boundary(snapshot, sequence)?,
+                None => JournalCheckpoint::session_boundary(snapshot, sequence)?,
             };
             self.inner
                 .execution
                 .persistence
-                .save_checkpoint(&next)
+                .save_checkpoint_view(&next)
                 .await
         }
         .await;
@@ -72,7 +74,13 @@ impl SessionHandle {
         if !self.inner.execution.persistence.has_checkpoint_store() {
             return Ok(false);
         }
-        let Some(previous) = self.inner.execution.persistence.latest_checkpoint().await? else {
+        let Some(previous) = self
+            .inner
+            .execution
+            .persistence
+            .latest_checkpoint_view()
+            .await?
+        else {
             return Ok(false);
         };
         if !previous.state.is_terminal() {
@@ -80,8 +88,7 @@ impl SessionHandle {
                 "idle LCM progress requires a terminal checkpoint",
             ));
         }
-        let predecessor =
-            agent_runtime_registry::Fingerprint::of(serde_json::to_vec(&previous.snapshot.usage)?);
+        let predecessor = previous.snapshot.usage_fingerprint()?;
         self.inner
             .execution
             .extension_state
@@ -96,22 +103,14 @@ impl SessionHandle {
                 .redaction_safe(),
             );
         let snapshot = self.checkpoint_snapshot()?;
-        let state_revision = previous
-            .state_revision
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::conflict("idle checkpoint revision exhausted"))?;
         let sequence = self.inner.emitter.begin_checkpoint_barrier();
-        let mut next = previous.clone();
-        next.state_revision = state_revision;
-        next.watermark = previous.watermark.clone().next(sequence);
-        next.snapshot = snapshot;
-        next.updated = self.inner.shared.clock.now();
         let result = async {
-            previous.validate_successor(&next)?;
+            let next =
+                previous.refresh_terminal(snapshot, sequence, self.inner.shared.clock.now())?;
             self.inner
                 .execution
                 .persistence
-                .save_checkpoint(&next)
+                .save_checkpoint_view(&next)
                 .await
         }
         .await;
@@ -143,9 +142,11 @@ impl SessionHandle {
         };
         let previous_usage = {
             let mut state = self.inner.state.lock().expect("session state poisoned");
-            let previous = state.usage.clone();
+            let previous = state.usage.records().len();
             for record in &batch.usage_records {
-                state.usage.record(record.clone());
+                self.inner
+                    .execution
+                    .record_usage(&mut state, record.clone());
             }
             previous
         };
@@ -179,11 +180,10 @@ impl SessionHandle {
                     }
                 }
             }
-            self.inner
-                .state
-                .lock()
-                .expect("session state poisoned")
-                .usage = previous_usage;
+            self.inner.execution.truncate_usage(
+                &mut self.inner.state.lock().expect("session state poisoned"),
+                previous_usage,
+            );
         };
         // Nothing from this batch may stay in memory without a saved
         // counterpart: a failed exact checkpoint rolls back the extension
@@ -195,12 +195,16 @@ impl SessionHandle {
                 return Err(error);
             }
         };
-        let result = self
-            .inner
-            .execution
-            .persistence
-            .save_snapshot(&self.snapshot())
-            .await;
+        let result = match self.journal_snapshot(true) {
+            Ok(snapshot) => {
+                self.inner
+                    .execution
+                    .persistence
+                    .save_snapshot_view(&snapshot)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         // Once exact progress is durable, keep it on ordinary-save failure:
         // the exact checkpoint is its saved counterpart, and cold restore
         // rolls the ordinary ledger forward from its fenced predecessor. An
@@ -376,7 +380,7 @@ impl SessionHandle {
             .extension_state
             .lock()
             .expect("session extension state poisoned")
-            .clone();
+            .materialize();
         let committed_at = self.inner.shared.clock.now();
         let view = TurnCommitView {
             session: self.inner.id.clone(),
@@ -433,7 +437,7 @@ impl SessionHandle {
             .extension_state
             .lock()
             .expect("session extension state poisoned")
-            .clone();
+            .materialize();
         let second_usage = self
             .inner
             .state
@@ -869,24 +873,20 @@ impl SessionHandle {
         let next = component.apply_host_command(current, command, created_id, now, usage_cursor)?;
 
         let _persist_gate = self.inner.persist_gate.lock().await;
-        let mut snapshot = self.snapshot();
-        snapshot.updated = now;
-        match &next {
-            Some(goal) => {
-                snapshot.extension_state.insert(
-                    GoalComponent::namespace().to_owned(),
-                    component.state_patch(goal)?.into_state(),
-                );
-            }
-            None => {
-                snapshot.extension_state.remove(GoalComponent::namespace());
-            }
-        }
+        let snapshot = self.journal_snapshot(true)?;
+        let mut mutation = snapshot.mutation();
+        mutation.set_extension(
+            GoalComponent::namespace().to_owned(),
+            next.as_ref()
+                .map(|goal| component.state_patch(goal).map(|state| state.into_state()))
+                .transpose()?,
+        );
+        let snapshot = mutation.finish(snapshot.identity().clone(), now)?;
         if self.inner.execution.persistence.has_session_store() {
             self.inner
                 .execution
                 .persistence
-                .save_snapshot(&snapshot)
+                .save_snapshot_view(&snapshot)
                 .await?;
         }
 

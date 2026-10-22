@@ -272,9 +272,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                     entry = self.writer_memo(session, root, entry)?;
                     self.seed_memo(&scratch, session, root, &entry)?;
                 }
-                validated = Some(ReachableSet {
-                    layers: vec![entry.closure.member_set()],
-                });
+                validated = Some(ReachableSet::from_evidence(entry.closure.clone()));
             }
             let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
             let fenced_head = stored
@@ -385,7 +383,7 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
                         .get_mut(&self.local.token(lease)?.handle)
                         .ok_or_else(conflict)?;
                     if !record.reachable.contains(&object.id) {
-                        record.reachable.layers.push(entry.closure.member_set());
+                        record.reachable.push_evidence(entry.closure.clone());
                     }
                     record.roots.extend([object.id.clone()].into());
                     record.dependencies.extend(&dependencies);

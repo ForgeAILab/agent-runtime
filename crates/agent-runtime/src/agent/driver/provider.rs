@@ -709,6 +709,14 @@ impl Driver {
                     crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
                     crate::runtime::manifests::boundary_record(count),
                 );
+                execution
+                    .live_snapshot
+                    .lock()
+                    .expect("live snapshot poisoned")
+                    .manifest_appended(
+                        turn_manifest.clone(),
+                        self.manifest_window.get().min(state.manifests.len() + 1),
+                    );
                 state.manifests.push(turn_manifest);
                 crate::runtime::manifests::trim(&mut state.manifests, self.manifest_window);
             }
@@ -865,6 +873,7 @@ impl Driver {
         turn: &Option<TurnId>,
         turn_deadline: Deadline,
         state: &Arc<Mutex<SessionState>>,
+        execution: &SessionExecutionContext,
     ) -> ProviderTurnOutcome {
         let mut attempt_index: u32 = 0;
         let mut credential_recovery_used = false;
@@ -1210,11 +1219,10 @@ impl Driver {
                     },
                     delta: usage.clone(),
                 };
-                state
-                    .lock()
-                    .expect("session state poisoned")
-                    .usage
-                    .record(record.clone());
+                execution.record_usage(
+                    &mut state.lock().expect("session state poisoned"),
+                    record.clone(),
+                );
                 emitter.emit(turn.clone(), RuntimeEvent::Usage { record });
             }
 

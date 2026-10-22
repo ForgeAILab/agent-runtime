@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_runtime_core::checkpoint::{CheckpointStore, TurnCheckpoint};
+use agent_runtime_core::checkpoint::{CheckpointStore, JournalCheckpoint, TurnCheckpoint};
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::ids::SessionId;
 use agent_runtime_core::journal::{
@@ -50,6 +50,43 @@ pub(crate) struct SessionPersistence {
     /// stores do or do not have, so every later publication from it is
     /// refused; the host reopens the session from the stores instead.
     fenced: AtomicBool,
+}
+
+pub(crate) enum CheckpointPredecessor {
+    Owned(Box<TurnCheckpoint>),
+    Shared(Box<JournalCheckpoint>),
+}
+impl CheckpointPredecessor {
+    pub(crate) fn turn(&self) -> &agent_runtime_core::ids::TurnId {
+        match self {
+            Self::Owned(checkpoint) => &checkpoint.turn,
+            Self::Shared(checkpoint) => &checkpoint.turn,
+        }
+    }
+    pub(crate) fn state(&self) -> &agent_runtime_core::checkpoint::TurnState {
+        match self {
+            Self::Owned(checkpoint) => &checkpoint.state,
+            Self::Shared(checkpoint) => &checkpoint.state,
+        }
+    }
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            Self::Owned(checkpoint) => checkpoint.state.is_terminal(),
+            Self::Shared(checkpoint) => checkpoint.state.is_terminal(),
+        }
+    }
+    pub(crate) fn sequence(&self) -> u64 {
+        match self {
+            Self::Owned(checkpoint) => checkpoint.watermark.checkpoint_sequence,
+            Self::Shared(checkpoint) => checkpoint.watermark.checkpoint_sequence,
+        }
+    }
+    pub(crate) fn materialize(&self) -> TurnCheckpoint {
+        match self {
+            Self::Owned(checkpoint) => checkpoint.as_ref().clone(),
+            Self::Shared(checkpoint) => checkpoint.materialize(),
+        }
+    }
 }
 
 /// A failed acceptance checkpoint, classified by what the protected store
@@ -109,7 +146,7 @@ struct NativeDomain {
     /// checkpoint existed (its batch boundary names a turn). Such a head
     /// without any protected head means the exact domain lost its data.
     follows_protected: bool,
-    checkpoint: Option<TurnCheckpoint>,
+    checkpoint: Option<JournalCheckpoint>,
     /// Typed object IDs and roots for the preceding candidate. Unchanged
     /// records reuse these directly instead of serializing/hash-walking the
     /// complete materialized snapshot again.
@@ -400,6 +437,7 @@ impl SessionPersistence {
                         protected.as_mut().expect("native pair checked above"),
                         &checkpoint.snapshot,
                         Some(checkpoint),
+                        None,
                         CommitPurpose::Import,
                     ))
                     .await?;
@@ -409,6 +447,7 @@ impl SessionPersistence {
                         ordinary.as_mut().expect("native pair checked above"),
                         snapshot,
                         legacy_checkpoint.as_ref(),
+                        None,
                         CommitPurpose::Import,
                     ))
                     .await?;
@@ -437,9 +476,12 @@ impl SessionPersistence {
             // checkpoint (the import never writes the exact domain then),
             // means the native session has advanced and stale v3 evidence
             // must never be overlaid onto it.
-            let exact = protected
-                .as_ref()
-                .and_then(|domain| domain.checkpoint.clone());
+            let exact = protected.as_ref().and_then(|domain| {
+                domain
+                    .checkpoint
+                    .as_ref()
+                    .map(JournalCheckpoint::materialize)
+            });
             if legacy_checkpoint
                 .as_ref()
                 .is_none_or(|legacy| exact.as_ref().is_none_or(|native| native != legacy))
@@ -461,6 +503,7 @@ impl SessionPersistence {
                         .as_ref()
                         .expect("partial import checked above"),
                     exact.as_ref(),
+                    None,
                     CommitPurpose::Import,
                 ))
                 .await
@@ -504,9 +547,12 @@ impl SessionPersistence {
                 .as_ref()
                 .map(JournalSnapshotView::materialize)
         });
-        let checkpoint = protected
-            .as_ref()
-            .and_then(|domain| domain.checkpoint.clone());
+        let checkpoint = protected.as_ref().and_then(|domain| {
+            domain
+                .checkpoint
+                .as_ref()
+                .map(JournalCheckpoint::materialize)
+        });
         Ok(OpenedSessionPersistence {
             persistence: Arc::new(Self {
                 session,
@@ -538,6 +584,53 @@ impl SessionPersistence {
                 None => Ok(None),
             },
             PersistenceMode::Native(native) => match &native.protected {
+                Some(domain) => Ok(domain
+                    .lock()
+                    .await
+                    .checkpoint
+                    .as_ref()
+                    .map(JournalCheckpoint::materialize)),
+                None => Ok(None),
+            },
+        }
+    }
+
+    pub(crate) async fn latest_checkpoint_predecessor(
+        &self,
+    ) -> Result<Option<CheckpointPredecessor>, RuntimeError> {
+        match &self.mode {
+            PersistenceMode::Legacy => match &self.checkpoint_store {
+                Some(store) => Ok(store
+                    .load_latest(&self.session)
+                    .await?
+                    .map(|checkpoint| CheckpointPredecessor::Owned(Box::new(checkpoint)))),
+                None => Ok(None),
+            },
+            PersistenceMode::Native(native) => match &native.protected {
+                Some(domain) => Ok(domain
+                    .lock()
+                    .await
+                    .checkpoint
+                    .clone()
+                    .map(|checkpoint| CheckpointPredecessor::Shared(Box::new(checkpoint)))),
+                None => Ok(None),
+            },
+        }
+    }
+
+    pub(crate) async fn latest_checkpoint_view(
+        &self,
+    ) -> Result<Option<JournalCheckpoint>, RuntimeError> {
+        match &self.mode {
+            PersistenceMode::Legacy => match &self.checkpoint_store {
+                Some(store) => store
+                    .load_latest(&self.session)
+                    .await?
+                    .map(JournalCheckpoint::from_checkpoint)
+                    .transpose(),
+                None => Ok(None),
+            },
+            PersistenceMode::Native(native) => match &native.protected {
                 Some(domain) => Ok(domain.lock().await.checkpoint.clone()),
                 None => Ok(None),
             },
@@ -565,10 +658,10 @@ impl SessionPersistence {
     /// write landed (success). Anything else is unresolved, and the session's
     /// persistence is fenced so no later publication can pair the live state
     /// with a protected head it does not match.
-    pub(crate) async fn save_acceptance_checkpoint(
+    pub(crate) async fn save_acceptance_checkpoint_view(
         &self,
-        checkpoint: &TurnCheckpoint,
-        predecessor: Option<&TurnCheckpoint>,
+        checkpoint: &JournalCheckpoint,
+        predecessor: Option<&CheckpointPredecessor>,
     ) -> Result<(), AcceptanceSaveError> {
         self.ensure_not_fenced()
             .map_err(AcceptanceSaveError::NotCommitted)?;
@@ -579,22 +672,28 @@ impl SessionPersistence {
         }
         let outcome = match &self.mode {
             PersistenceMode::Legacy => match &self.checkpoint_store {
-                Some(store) => match store.save(checkpoint).await {
-                    Ok(()) => Ok(()),
-                    Err(error) => match store.load_latest(&self.session).await {
-                        Ok(latest) if latest.as_ref() == predecessor => {
-                            Err(AcceptanceSaveError::NotCommitted(error))
-                        }
-                        Ok(Some(latest)) if latest == *checkpoint => Ok(()),
-                        _ => Err(AcceptanceSaveError::Unresolved(error)),
-                    },
-                },
+                Some(store) => {
+                    let owned = checkpoint.materialize();
+                    match store.save(&owned).await {
+                        Ok(()) => Ok(()),
+                        Err(error) => match store.load_latest(&self.session).await {
+                            Ok(latest)
+                                if latest
+                                    == predecessor.map(CheckpointPredecessor::materialize) =>
+                            {
+                                Err(AcceptanceSaveError::NotCommitted(error))
+                            }
+                            Ok(Some(latest)) if latest == owned => Ok(()),
+                            _ => Err(AcceptanceSaveError::Unresolved(error)),
+                        },
+                    }
+                }
                 None => Ok(()),
             },
             PersistenceMode::Native(native) => match &native.protected {
                 Some(domain) => {
                     let mut domain = domain.lock().await;
-                    match Box::pin(commit_domain(
+                    match Box::pin(commit_domain_view(
                         &mut domain,
                         &checkpoint.snapshot,
                         Some(checkpoint),
@@ -618,9 +717,9 @@ impl SessionPersistence {
         outcome
     }
 
-    pub(crate) async fn save_checkpoint(
+    pub(crate) async fn save_checkpoint_view(
         &self,
-        checkpoint: &TurnCheckpoint,
+        checkpoint: &JournalCheckpoint,
     ) -> Result<(), RuntimeError> {
         crate::journal_profile_scope!("rt.writer.checkpoint_submission", {
             self.ensure_not_fenced()?;
@@ -631,12 +730,12 @@ impl SessionPersistence {
             }
             match &self.mode {
                 PersistenceMode::Legacy => match &self.checkpoint_store {
-                    Some(store) => store.save(checkpoint).await,
+                    Some(store) => store.save(&checkpoint.materialize()).await,
                     None => Ok(()),
                 },
                 PersistenceMode::Native(native) => match &native.protected {
                     Some(domain) => {
-                        Box::pin(commit_domain(
+                        Box::pin(commit_domain_view(
                             &mut *domain.lock().await,
                             &checkpoint.snapshot,
                             Some(checkpoint),
@@ -654,16 +753,33 @@ impl SessionPersistence {
         &self,
         snapshot: &SessionSnapshot,
     ) -> Result<(), RuntimeError> {
+        self.ensure_not_fenced()?;
+        match &self.mode {
+            PersistenceMode::Legacy => match &self.session_store {
+                Some(store) => store.save(snapshot).await,
+                None => Ok(()),
+            },
+            PersistenceMode::Native(_) => {
+                self.save_snapshot_view(&JournalSnapshotView::from_snapshot(snapshot.clone())?)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn save_snapshot_view(
+        &self,
+        snapshot: &JournalSnapshotView,
+    ) -> Result<(), RuntimeError> {
         crate::journal_profile_scope!("rt.writer.snapshot_submission", {
             self.ensure_not_fenced()?;
-            if snapshot.id != self.session {
+            if snapshot.session() != &self.session {
                 return Err(RuntimeError::conflict(
                     "snapshot belongs to another session",
                 ));
             }
             match &self.mode {
                 PersistenceMode::Legacy => match &self.session_store {
-                    Some(store) => store.save(snapshot).await,
+                    Some(store) => store.save(&snapshot.materialize()).await,
                     None => Ok(()),
                 },
                 PersistenceMode::Native(native) => match &native.ordinary {
@@ -675,7 +791,7 @@ impl SessionPersistence {
                             ),
                             None => None,
                         };
-                        Box::pin(commit_domain(
+                        Box::pin(commit_domain_view(
                             &mut *domain.lock().await,
                             snapshot,
                             checkpoint.as_ref(),
@@ -742,7 +858,11 @@ impl Drop for SessionPersistence {
 
 impl NativeDomain {
     async fn close(&mut self) -> Result<(), RuntimeError> {
-        match self.lease.take() {
+        let lease = self.lease.take();
+        self.candidate = None;
+        self.encoding = None;
+        self.known_candidates.clear();
+        match lease {
             Some(lease) => self.journal.close(lease).await,
             None => Ok(()),
         }
@@ -986,7 +1106,9 @@ async fn open_domain(
             },
             candidate_submitted: false,
             follows_protected,
-            checkpoint,
+            checkpoint: checkpoint
+                .map(JournalCheckpoint::from_checkpoint)
+                .transpose()?,
             encoding,
             known_candidates,
             unresolved_failure: false,
@@ -998,6 +1120,24 @@ async fn commit_domain(
     domain: &mut NativeDomain,
     snapshot: &SessionSnapshot,
     checkpoint: Option<&TurnCheckpoint>,
+    shared: Option<&JournalSnapshotView>,
+    purpose: CommitPurpose,
+) -> Result<(), RuntimeError> {
+    let view = shared
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| JournalSnapshotView::from_snapshot(snapshot.clone()))?;
+    let checkpoint = checkpoint
+        .cloned()
+        .map(JournalCheckpoint::from_checkpoint)
+        .transpose()?;
+    commit_domain_view(domain, &view, checkpoint.as_ref(), purpose).await
+}
+
+async fn commit_domain_view(
+    domain: &mut NativeDomain,
+    snapshot: &JournalSnapshotView,
+    checkpoint: Option<&JournalCheckpoint>,
     purpose: CommitPurpose,
 ) -> Result<(), RuntimeError> {
     crate::journal_profile_scope!("rt.writer.commit_domain", {
@@ -1018,9 +1158,9 @@ async fn commit_domain(
         let writer_epoch = lease
             .writer_epoch()
             .ok_or_else(|| RuntimeError::conflict("native journal writer is not fenced"))?;
-        let planned_step_count = crate::runtime::manifests::snapshot_planned_steps(snapshot)?;
+        let planned_step_count = crate::runtime::manifests::view_planned_steps(snapshot)?;
         let mut assembler = ObjectAssembler::default();
-        let (roots, mut encoding) = assembler.snapshot_view_cached(
+        let (roots, mut encoding) = assembler.snapshot_shared_cached(
             snapshot,
             planned_step_count,
             domain.candidate.as_ref(),
@@ -1029,7 +1169,7 @@ async fn commit_domain(
         let referenced_checkpoint = if domain.role == JournalRole::Protected {
             Some(
                 assembler
-                    .checkpoint(checkpoint.expect("protected checked above"), roots.clone())?,
+                    .checkpoint_view(checkpoint.expect("protected checked above"), roots.clone())?,
             )
         } else {
             None
@@ -1043,41 +1183,33 @@ async fn commit_domain(
         let checkpoint_hint = checkpoint;
         let boundary = JournalBoundary {
             version: 1,
-            session: snapshot.id.clone(),
+            session: snapshot.session().clone(),
             turn: checkpoint_hint.map(|checkpoint| checkpoint.turn.clone()),
             checkpoint_sequence: checkpoint_hint
                 .map_or(0, |checkpoint| checkpoint.watermark.checkpoint_sequence),
             planned_step_count,
         };
         let current = domain.head.as_ref();
-        let delta = transition_delta_view(
+        let candidate = encoding.snapshot_view();
+        let delta = transition_delta_shared(
             domain.candidate.as_ref(),
             domain.candidate_submitted,
-            snapshot,
+            &candidate,
             boundary.clone(),
             &encoding,
         )?;
         #[cfg(feature = "test-support")]
         let _profile_filter =
             agent_runtime_core::journal::profile::timer("rt.writer.known_candidates");
-        let mut objects = if domain.role == JournalRole::Ordinary {
-            if delta.bootstrap.is_some() {
-                Vec::new()
-            } else {
-                assembler
-                    .structured
-                    .iter()
-                    .filter(|id| !domain.known_candidates.contains(*id))
-                    .filter_map(|id| assembler.objects.get(id).cloned())
-                    .collect::<Vec<_>>()
-            }
+        let mut objects = if domain.role == JournalRole::Ordinary && delta.bootstrap.is_some() {
+            Vec::new()
         } else {
-            assembler
-                .objects
-                .values()
-                .filter(|object| !domain.known_candidates.contains(&object.id))
-                .cloned()
-                .collect::<Vec<_>>()
+            assembler.reachable_drafts(
+                &roots,
+                referenced_checkpoint.as_ref(),
+                &domain.known_candidates,
+                domain.role == JournalRole::Ordinary,
+            )?
         };
         // Canonical map order already gives stable commit digests; make the order
         // explicit for adapters that retain the submitted vector verbatim.
@@ -1103,7 +1235,7 @@ async fn commit_domain(
             CommitPurpose::Import => format!("runtime-import-v3-{role}-{}", fingerprint.as_str()),
         });
         let batch = JournalBatch {
-            session: snapshot.id.clone(),
+            session: snapshot.session().clone(),
             sequence: current.map_or(1, |head| head.batch_sequence.saturating_add(1)),
             predecessor: current
                 .map(|head| JournalDigest::parse(head.batch.as_str()))
@@ -1123,8 +1255,6 @@ async fn commit_domain(
             checkpoint: referenced_checkpoint,
         };
         commit.digest = commit.input_digest()?;
-        let candidate = encoding.snapshot_view();
-
         let old_revision = current.map(|head| head.revision);
         domain.unresolved_failure = false;
         #[cfg(feature = "test-support")]
@@ -1178,7 +1308,7 @@ async fn commit_domain(
         #[cfg(feature = "test-support")]
         let _profile_publication =
             agent_runtime_core::journal::profile::timer("rt.writer.candidate_publication");
-        if head.role != domain.role || head.session != snapshot.id {
+        if head.role != domain.role || &head.session != snapshot.session() {
             domain.unresolved_failure = true;
             return Err(incompatible_store());
         }
@@ -1187,8 +1317,7 @@ async fn commit_domain(
         agent_runtime_core::journal::profile::event(
             "rt.work.writer_snapshot_nodes_copied",
             if delta.bootstrap.is_some() {
-                (snapshot.history.len() + snapshot.usage.records().len() + snapshot.manifests.len())
-                    as u64
+                (snapshot.history_len() + snapshot.usage_len() + snapshot.manifest_len()) as u64
             } else {
                 (delta.history_append.len()
                     + delta.usage_append.len()
@@ -1205,7 +1334,11 @@ async fn commit_domain(
         // This live writer lease pins every closure it has published, so objects
         // from an earlier boundary remain valid candidates until close. A fresh
         // runtime rebuilds this set from only its newly pinned current head.
-        domain.known_candidates = assembler.objects.keys().cloned().collect();
+        domain.known_candidates = commit
+            .objects
+            .iter()
+            .map(|object| object.id.clone())
+            .collect();
         if let Some(checkpoint_id) = checkpoint_id {
             domain.known_candidates.insert(checkpoint_id);
         }
@@ -1247,6 +1380,7 @@ fn transition_delta(
     transition_delta_view(view.as_ref(), previous_submitted, next, boundary, encoding)
 }
 
+#[cfg(test)]
 fn transition_delta_view(
     previous: Option<&JournalSnapshotView>,
     previous_submitted: bool,
@@ -1372,6 +1506,140 @@ fn transition_delta_view(
         bootstrap: None,
         history_append: next.history[previous.history_len()..].to_vec(),
         usage_append: next_usage[previous_usage_len..].to_vec(),
+        extension_updates,
+        extension_references,
+        manifests_append: Vec::new(),
+        manifest_references,
+    })
+}
+
+fn transition_delta_shared(
+    previous: Option<&JournalSnapshotView>,
+    previous_submitted: bool,
+    next: &JournalSnapshotView,
+    boundary: JournalBoundary,
+    encoding: &SnapshotEncodingCache,
+) -> Result<JournalTransitionDelta, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = agent_runtime_core::journal::profile::enter_sync("rt.writer.transition_delta");
+    let Some(previous) = previous else {
+        return Ok(JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(next.materialize())),
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        });
+    };
+    if previous.session() != next.session() {
+        return Err(RuntimeError::conflict(
+            "native journal history did not advance by append",
+        ));
+    }
+    if previous.history_len() > next.history_len() {
+        // A shorter history can never be an append. It is reached when the
+        // stored projection ran ahead of the exact boundary (an input saved
+        // after a failed terminal publication) and terminal republication
+        // restores the boundary's canonical history, exactly as a legacy
+        // `SessionStore::save` overwrites it. Submit it as one complete
+        // replacement instead of refusing it, which would wedge the session
+        // at a non-terminal checkpoint on every resume.
+        return Ok(JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(next.materialize())),
+            history_append: Vec::new(),
+            usage_append: Vec::new(),
+            extension_updates: BTreeMap::new(),
+            extension_references: BTreeMap::new(),
+            manifests_append: Vec::new(),
+            manifest_references: Vec::new(),
+        });
+    }
+    let prefix = next.history_messages().take(previous.history_len());
+    let verified_append = encoding.append_starts(previous);
+    let appended = if verified_append.is_some() {
+        true
+    } else if previous_submitted {
+        previous.history_messages().zip(prefix).all(|(a, b)| {
+            crate::runtime::history::messages_match(
+                std::slice::from_ref(a),
+                std::slice::from_ref(b),
+            )
+        })
+    } else {
+        previous
+            .history_messages()
+            .zip(prefix)
+            .all(|(stored, live)| stored.role == live.role)
+    };
+    if !appended {
+        return Err(RuntimeError::conflict(
+            "native journal history was rewritten rather than appended",
+        ));
+    }
+    let previous_usage_len = previous.usage_len();
+    let next_usage_len = next.usage_len();
+    if previous_usage_len > next_usage_len
+        || (verified_append.is_none()
+            && !previous
+                .usage_records()
+                .eq(next.usage_records().take(previous_usage_len)))
+    {
+        return Err(RuntimeError::conflict(
+            "native journal usage prefix changed",
+        ));
+    }
+    let mut extension_updates = BTreeMap::new();
+    let mut extension_references = BTreeMap::new();
+    let changed = encoding
+        .extension_changes(previous)
+        .map(|keys| keys.cloned().collect::<BTreeSet<_>>());
+    let keys = changed.as_ref().map_or_else(
+        || {
+            previous
+                .extensions()
+                .map(|(key, _)| key.clone())
+                .chain(next.extensions().map(|(key, _)| key.clone()))
+                .collect::<BTreeSet<_>>()
+        },
+        Clone::clone,
+    );
+    for key in &keys {
+        if changed.is_some() || !state_identical(previous.extension(key), next.extension(key)) {
+            if key == RUNTIME_PREVIOUS_CACHE_NAMESPACE {
+                let value = next
+                    .extension(key)
+                    .map(|_| {
+                        encoding.extension_id(key).cloned().ok_or_else(|| {
+                            RuntimeError::conflict(
+                                "native journal extension encoding cache is incomplete",
+                            )
+                        })
+                    })
+                    .transpose()?;
+                extension_references.insert(key.clone(), value);
+            } else {
+                extension_updates.insert(key.clone(), next.extension(key).cloned());
+            }
+        }
+    }
+    let overlap = encoding.manifest_overlap(previous).unwrap_or_else(|| {
+        retained_overlap_view(
+            previous,
+            &(0..next.manifest_len())
+                .filter_map(|i| next.manifest(i).cloned())
+                .collect::<Vec<_>>(),
+        )
+    });
+    let manifest_references = encoding.manifest_ids()[overlap..].to_vec();
+    Ok(JournalTransitionDelta {
+        boundary,
+        bootstrap: None,
+        history_append: next.history_from(previous.history_len()).cloned().collect(),
+        usage_append: next.usage_from(previous_usage_len).cloned().collect(),
         extension_updates,
         extension_references,
         manifests_append: Vec::new(),
@@ -2012,6 +2280,7 @@ mod tests {
             &mut domain,
             &snapshot(vec![Message::user("native")]),
             None,
+            None,
             CommitPurpose::Transition,
         )
         .await
@@ -2075,7 +2344,7 @@ mod tests {
         for step in 0..40 {
             live.history.push(Message::user(format!("message {step}")));
             live.updated = Timestamp(step + 2);
-            commit_domain(&mut domain, &live, None, CommitPurpose::Transition)
+            commit_domain(&mut domain, &live, None, None, CommitPurpose::Transition)
                 .await
                 .unwrap();
             sizes.push(domain.known_candidates.len());

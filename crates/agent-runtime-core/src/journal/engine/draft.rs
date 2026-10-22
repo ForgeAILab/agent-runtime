@@ -8,6 +8,7 @@ pub(in crate::journal) struct DraftReader<'a> {
     pub(in crate::journal) stored: &'a ObjectStore,
     pub(in crate::journal) supplied: &'a BTreeMap<JournalObjectId, Vec<u8>>,
     pub(in crate::journal) reachable: &'a ReachableSet,
+    json_witnesses: Option<&'a BTreeMap<JournalObjectId, Arc<crate::journal::writer::JsonWitness>>>,
 }
 
 pub(in crate::journal) fn draft_json_branch_children(
@@ -51,14 +52,28 @@ impl<'a> DraftReader<'a> {
             stored,
             supplied,
             reachable,
+            json_witnesses: None,
         }
     }
 
-    pub(in crate::journal) fn object<T: serde::de::DeserializeOwned + Serialize>(
+    pub(in crate::journal) fn with_json_witnesses(
+        mut self,
+        nodes: &'a BTreeMap<JournalObjectId, Arc<crate::journal::writer::JsonWitness>>,
+    ) -> Self {
+        self.json_witnesses = Some(nodes);
+        self
+    }
+
+    pub(in crate::journal) fn object<
+        T: serde::de::DeserializeOwned + Serialize + Clone + Send + Sync + 'static,
+    >(
         &self,
         id: &JournalObjectId,
         kind: JournalObjectKind,
     ) -> Result<T, RuntimeError> {
+        if let Some(node) = self.json_witnesses.and_then(|nodes| nodes.get(id)) {
+            return node.decode(kind);
+        }
         let bytes = self
             .supplied
             .get(id)
@@ -235,13 +250,16 @@ impl<'a> DraftReader<'a> {
         if depth > JOURNAL_MAX_TREE_HEIGHT {
             return Err(conflict());
         }
-        let object = self.encoded_object(id)?;
-        if object.kind()? == JournalObjectKind::JsonInline {
-            let inline: JournalJsonInline = object.decode(JournalObjectKind::JsonInline)?;
+        let kind = match self.json_witnesses.and_then(|nodes| nodes.get(id)) {
+            Some(node) => node.kind(),
+            None => self.encoded_object(id)?.kind()?,
+        };
+        if kind == JournalObjectKind::JsonInline {
+            let inline: JournalJsonInline = self.object(id, JournalObjectKind::JsonInline)?;
             validate_inline_json(&inline.0, depth, u64::MAX)?;
             return Ok(inline.0);
         }
-        match object.decode::<JournalJsonValue>(JournalObjectKind::JsonValue)? {
+        match self.object::<JournalJsonValue>(id, JournalObjectKind::JsonValue)? {
             JournalJsonValue::Scalar { scalar } => {
                 if scalar.is_array() || scalar.is_object() {
                     return Err(conflict());

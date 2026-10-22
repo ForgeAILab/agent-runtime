@@ -7,15 +7,11 @@ use crate::provider::ProviderRequest;
 use crate::store::{SessionSnapshot, TurnManifest, VersionedSessionState};
 use serde::Serialize;
 use serde_json::Value;
+use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-macro_rules! writer_profile {
-    ($label:expr,$body:block) => {{
-        #[cfg(feature = "test-support")]
-        let _profile = crate::journal::profile::enter_sync($label);
-        $body
-    }};
-}
+use std::sync::{Arc, OnceLock};
+mod source;
+use source::{ArraySource, JsonSource};
 #[derive(Clone, Default)]
 pub struct JournalPreparationHints {
     pub(crate) manifests: BTreeMap<JournalObjectId, Arc<ManifestEvidence>>,
@@ -30,8 +26,22 @@ impl std::fmt::Debug for JournalPreparationHints {
             .finish()
     }
 }
+#[derive(Clone)]
+pub(crate) enum StateValueView {
+    Owned(Arc<TurnState>),
+    Checkpoint(Arc<crate::checkpoint::CheckpointMetadata>),
+}
+impl std::ops::Deref for StateValueView {
+    type Target = TurnState;
+    fn deref(&self) -> &TurnState {
+        match self {
+            Self::Owned(state) => state,
+            Self::Checkpoint(metadata) => &metadata.state,
+        }
+    }
+}
 pub(crate) struct StateEvidence {
-    pub(crate) value: Arc<TurnState>,
+    pub(crate) value: StateValueView,
     pub(crate) fingerprint: agent_runtime_registry::Fingerprint,
     pub(crate) encoded: Vec<u8>,
 }
@@ -164,10 +174,25 @@ pub struct JournalWriterEncoding {
 }
 
 #[derive(Clone)]
+enum RequestSource {
+    Checkpoint(Arc<crate::checkpoint::CheckpointMetadata>),
+    Owned(Arc<ProviderRequest>),
+}
+impl RequestSource {
+    fn request(&self) -> &ProviderRequest {
+        match self {
+            Self::Checkpoint(metadata) => match &metadata.state {
+                TurnState::CallingModel { request, .. } => request,
+                _ => unreachable!(),
+            },
+            Self::Owned(request) => request,
+        }
+    }
+}
+#[derive(Clone)]
 struct RequestEncodingCache {
-    messages: super::semantic::Sequence<Message>,
+    source: Arc<RequestSource>,
     message_view: JournalSequenceView,
-    tools: super::semantic::Sequence<crate::provider::ToolSchema>,
     tool_view: JournalSequenceView,
 }
 #[derive(Clone)]
@@ -178,13 +203,42 @@ struct JournalWriterMutationHint {
     manifest_overlap: usize,
     extension_changes: BTreeSet<String>,
 }
+enum TypedJsonSource {
+    Manifest(Arc<TurnManifest>),
+    State {
+        namespace: String,
+        value: Arc<VersionedSessionState>,
+    },
+}
+// This proof binds private typed construction to one immutable input/encoding
+// pair. It conveys semantic equality only, never storage membership or authority.
+struct TypedJsonProof {
+    source: TypedJsonSource,
+    root: JournalObjectId,
+    node: Arc<JsonEncodingNode>,
+    witness: Arc<JsonWitness>,
+    canonical_len: usize,
+    depth: u32,
+}
+impl TypedJsonProof {
+    fn binds(&self, encoding: &JournalJsonEncoding) -> bool {
+        self.root == encoding.root
+            && self.root == encoding.witness.object.id
+            && Arc::ptr_eq(&self.node, &encoding.node)
+            && Arc::ptr_eq(&self.witness, &encoding.witness)
+            && self.canonical_len == encoding.canonical_len
+            && self.depth == encoding.depth
+    }
+}
+
 #[derive(Clone)]
 pub struct JournalJsonEncoding {
     root: JournalObjectId,
     node: Arc<JsonEncodingNode>,
     witness: Arc<JsonWitness>,
-    value: Option<Arc<Value>>,
     canonical_len: usize,
+    typed: Option<Arc<TypedJsonProof>>,
+    depth: u32,
 }
 
 #[derive(Clone)]
@@ -200,10 +254,12 @@ enum JsonEncodingNode {
 
 #[derive(Clone)]
 struct JsonArrayEncodingCache {
-    items: Vec<JsonItemEncodingCache>,
-    levels: Vec<Vec<JournalSequence>>,
+    items: super::persistent::Map<usize, JsonItemEncodingCache>,
+    levels: super::persistent::Map<(usize, usize), JournalSequence>,
+    level_counts: Vec<usize>,
     root: JournalJsonArray,
     canonical_len: usize,
+    depth_counts: BTreeMap<u32, usize>,
 }
 
 #[derive(Clone)]
@@ -215,7 +271,7 @@ struct JsonObjectEntryEncodingCache {
 
 #[derive(Clone)]
 enum JsonItemEncodingCache {
-    Inline { bytes: usize },
+    Inline { bytes: usize, depth: u32 },
     Reference(Arc<JournalJsonEncoding>),
 }
 
@@ -227,6 +283,7 @@ pub struct JournalWriterAssembler {
     hints: JournalPreparationHints,
     json_witnesses: BTreeMap<JournalObjectId, Arc<JsonWitness>>,
     request_cache: Option<Arc<RequestEncodingCache>>,
+    checkpoint_source: Option<Arc<crate::checkpoint::CheckpointMetadata>>,
 }
 
 impl JournalWriterAssembler {
@@ -285,8 +342,15 @@ impl JournalWriterAssembler {
             .into_iter()
             .map(|(id, _)| self.json_witnesses.get(&id).cloned().ok_or_else(conflict))
             .collect::<Result<Vec<_>, _>>()?;
-        self.json_witnesses
-            .insert(id.clone(), Arc::new(JsonWitness { object, children }));
+        self.json_witnesses.insert(
+            id.clone(),
+            Arc::new(JsonWitness {
+                object,
+                children,
+                kind,
+                decoded: OnceLock::new(),
+            }),
+        );
         self.structured.insert(id.clone());
         Ok(id)
     }
@@ -343,167 +407,205 @@ impl JournalWriterAssembler {
         values: &[Value],
         previous: Option<(&[Value], &JsonArrayEncodingCache)>,
     ) -> Result<(JournalJsonArray, JsonArrayEncodingCache, bool), RuntimeError> {
+        self.structured_sequence_inputs_cached(
+            ArraySource::Values(values),
+            previous.map(|(values, cache)| (ArraySource::Values(values), cache)),
+        )
+    }
+    fn structured_sequence_inputs_cached(
+        &mut self,
+        values: ArraySource<'_>,
+        previous: Option<(ArraySource<'_>, &JsonArrayEncodingCache)>,
+    ) -> Result<(JournalJsonArray, JsonArrayEncodingCache, bool), RuntimeError> {
+        use super::persistent::Map;
         let previous = previous.filter(|(values, cache)| values.len() == cache.items.len());
-        let mut canonical_len = 2usize
-            .checked_add(values.len().saturating_sub(1))
-            .ok_or_else(conflict)?;
-        if values.is_empty() {
-            let root = JournalJsonArray {
-                len: 0,
-                height: 0,
-                node: JournalSequenceNode::JsonLeaf { items: Vec::new() },
-            };
-            let unchanged =
-                previous.is_some_and(|(values, cache)| values.is_empty() && cache.root == root);
-            return Ok((
-                root.clone(),
-                JsonArrayEncodingCache {
-                    items: Vec::new(),
-                    levels: Vec::new(),
-                    root,
-                    canonical_len,
-                },
-                unchanged,
-            ));
+        #[cfg(feature = "test-support")]
+        if let Some((prior, _)) = previous {
+            crate::journal::profile::event(
+                "rt.work.unchanged_json_array_items_considered",
+                prior.len().min(values.len()) as u64,
+                0,
+            );
         }
-
-        let mut item_caches = Vec::with_capacity(values.len());
-        if values.len() <= JOURNAL_FANOUT {
-            let mut items = Vec::with_capacity(values.len());
-            let mut unchanged =
-                previous.is_some_and(|(prior_values, _)| prior_values.len() == values.len());
-            for (index, value) in values.iter().enumerate() {
-                let prior = previous.and_then(|(prior_values, cache)| {
-                    Some((prior_values.get(index)?, cache.items.get(index)?))
-                });
-                let (item, cache, same) = self.json_array_item_cached(value, prior)?;
-                items.push(item);
-                canonical_len = canonical_len
+        let old = previous.map(|(_, cache)| cache);
+        let mut items = old.map_or_else(Map::default, |c| c.items.clone());
+        let mut depth_counts = old.map_or_else(BTreeMap::new, |cache| cache.depth_counts.clone());
+        let mut item_bytes =
+            old.map_or(0, |c| c.canonical_len - 2 - c.items.len().saturating_sub(1));
+        let removed = items
+            .iter_from(&values.len())
+            .map(|(index, item)| (*index, item.value_len()))
+            .collect::<Vec<_>>();
+        for (index, bytes) in removed {
+            adjust_depth(
+                &mut depth_counts,
+                items.get(&index).ok_or_else(conflict)?.depth(),
+                false,
+            )?;
+            items.remove(&index);
+            item_bytes = item_bytes.checked_sub(bytes).ok_or_else(conflict)?;
+        }
+        let mut dirty = BTreeSet::new();
+        for index in 0..values.len() {
+            let prior = previous.and_then(|(values, cache)| {
+                (index < values.len())
+                    .then(|| cache.items.get(&index))
+                    .flatten()
+                    .map(|cache| (values, cache))
+            });
+            let unchanged = prior.filter(|(old, _)| values.same_typed(old, index));
+            let (cache, same) =
+                if let Some((_, cache @ JsonItemEncodingCache::Reference(reference))) = unchanged {
+                    self.register_witness(&reference.witness);
+                    (cache.clone(), true)
+                } else {
+                    let value = values.value(index)?;
+                    let prior_value = prior.map(|(source, _)| source.value(index)).transpose()?;
+                    let (_, cache, same) = self.json_array_item_cached(
+                        value.as_ref(),
+                        prior_value
+                            .as_ref()
+                            .zip(prior)
+                            .map(|(value, (_, cache))| (value.as_ref(), cache)),
+                    )?;
+                    (cache, same)
+                };
+            if !same || !items.contains_key(&index) {
+                if let Some(old) = items.get(&index) {
+                    adjust_depth(&mut depth_counts, old.depth(), false)?;
+                    item_bytes = item_bytes
+                        .checked_sub(old.value_len())
+                        .ok_or_else(conflict)?;
+                }
+                item_bytes = item_bytes
                     .checked_add(cache.value_len())
                     .ok_or_else(conflict)?;
-                item_caches.push(cache);
-                unchanged &= same;
+                adjust_depth(&mut depth_counts, cache.depth(), true)?;
+                items.insert(index, cache);
+                dirty.insert(index / 2);
             }
+        }
+        let canonical_len = 2usize
+            .checked_add(values.len().saturating_sub(1))
+            .and_then(|n| n.checked_add(item_bytes))
+            .ok_or_else(conflict)?;
+        let array_item = |index: usize| -> Result<JournalJsonItem, RuntimeError> {
+            match items.get(&index).ok_or_else(conflict)? {
+                JsonItemEncodingCache::Reference(cache) => Ok(JournalJsonItem::Reference {
+                    object: cache.root.clone(),
+                }),
+                JsonItemEncodingCache::Inline { .. } => Err(conflict()),
+            }
+        };
+        if values.len() <= JOURNAL_FANOUT {
             let root = JournalJsonArray {
                 len: values.len() as u64,
                 height: 0,
-                node: JournalSequenceNode::JsonLeaf { items },
+                node: JournalSequenceNode::JsonLeaf {
+                    items: (0..values.len())
+                        .map(array_item)
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
             };
-            unchanged &= previous.is_some_and(|(_, cache)| cache.root == root);
+            let unchanged = old.is_some_and(|cache| cache.root == root);
             return Ok((
                 root.clone(),
                 JsonArrayEncodingCache {
-                    items: item_caches,
-                    levels: Vec::new(),
+                    items,
+                    levels: Map::default(),
+                    level_counts: vec![],
                     root,
                     canonical_len,
+                    depth_counts,
                 },
                 unchanged,
             ));
         }
-
-        let mut bottom = Vec::with_capacity(values.len().div_ceil(2));
-        for (chunk_index, chunk) in values.chunks(2).enumerate() {
-            let mut items = Vec::with_capacity(chunk.len());
-            let mut unchanged = previous.is_some();
-            for (offset, value) in chunk.iter().enumerate() {
-                let index = chunk_index * 2 + offset;
-                let prior = previous.and_then(|(prior_values, cache)| {
-                    Some((prior_values.get(index)?, cache.items.get(index)?))
-                });
-                let (item, cache, same) = self.json_array_item_cached(value, prior)?;
-                items.push(item);
-                canonical_len = canonical_len
-                    .checked_add(cache.value_len())
-                    .ok_or_else(conflict)?;
-                item_caches.push(cache);
-                unchanged &= same;
-            }
-            // Reuse only a cached bottom node of exactly this width: a prior
-            // array that was a single leaf has no bottom level, and a tail
-            // chunk that shrank from two items to one must not keep both.
-            let cached = previous
-                .filter(|_| unchanged)
-                .and_then(|(_, cache)| cache.levels.first()?.get(chunk_index))
-                .filter(|tree| tree.len == chunk.len() as u64)
-                .cloned();
-            let tree = match cached {
-                Some(tree) => tree,
-                None => {
-                    let root = self.add_structured(
-                        JournalObjectKind::Sequence,
-                        &JournalSequenceNode::JsonValueBranch { items },
-                    )?;
-                    JournalSequence {
-                        root: Some(root),
-                        len: chunk.len() as u64,
-                        height: 1,
-                    }
-                }
+        let reusable = old.filter(|c| c.root.len > JOURNAL_FANOUT as u64);
+        let mut levels = reusable.map_or_else(Map::default, |c| c.levels.clone());
+        let mut level_counts = Vec::new();
+        let mut count = values.len().div_ceil(2);
+        if reusable.is_none() {
+            dirty.extend(0..count);
+        }
+        if old.is_some_and(|c| c.items.len() != values.len()) {
+            dirty.insert(values.len().saturating_sub(1) / 2);
+        }
+        dirty.retain(|index| *index < count);
+        for &index in &dirty {
+            let start = index * 2;
+            let leaves = (start..values.len().min(start + 2))
+                .map(array_item)
+                .collect::<Result<Vec<_>, _>>()?;
+            let root = self.add_structured(
+                JournalObjectKind::Sequence,
+                &JournalSequenceNode::JsonValueBranch { items: leaves },
+            )?;
+            let tree = JournalSequence {
+                root: Some(root),
+                len: (values.len() - start).min(2) as u64,
+                height: 1,
             };
-            bottom.push(tree);
-        }
-
-        let mut levels = vec![bottom];
-        while levels.last().is_some_and(|level| level.len() > 2) {
-            let level_index = levels.len() - 1;
-            let current = levels.last().expect("level exists");
-            if current[0].height >= JOURNAL_MAX_TREE_HEIGHT {
-                return Err(RuntimeError::conflict(
-                    "structured journal sequence exceeds the supported persistent index",
-                ));
+            if levels.get(&(0, index)) != Some(&tree) {
+                levels.insert((0, index), tree);
             }
-            let mut parents = Vec::with_capacity(current.len().div_ceil(2));
-            for (group, children) in current.chunks(2).enumerate() {
-                // A cached parent is reusable only when it was built from
-                // exactly these children: the prior group at this position
-                // must have the same width, not merely a matching prefix.
-                let cached = previous.and_then(|(_, cache)| {
-                    let level = cache.levels.get(level_index)?;
-                    let start = group * 2;
-                    let prior = level.get(start..level.len().min(start + 2))?;
-                    if prior != children {
-                        return None;
-                    }
-                    cache.levels.get(level_index + 1)?.get(group).cloned()
-                });
-                let tree = if let Some(tree) = cached {
-                    tree
-                } else {
-                    let child_roots = children
-                        .iter()
-                        .map(|child| {
-                            child
-                                .root
-                                .as_ref()
-                                .map(JournalCompactObjectId::from_object)
-                                .ok_or_else(|| {
-                                    RuntimeError::conflict(
-                                        "structured journal branch has an empty child",
-                                    )
-                                })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let root = self.add_structured(
-                        JournalObjectKind::JsonBranch,
-                        &JournalJsonBranch(child_roots),
-                    )?;
-                    JournalSequence {
-                        root: Some(root),
-                        len: children.iter().map(|child| child.len).sum(),
-                        height: children[0].height.checked_add(1).ok_or_else(|| {
-                            RuntimeError::conflict("journal sequence height overflow")
-                        })?,
-                    }
+        }
+        let mut level = 0usize;
+        loop {
+            level_counts.push(count);
+            if count <= 2 {
+                break;
+            }
+            if level >= JOURNAL_MAX_TREE_HEIGHT as usize {
+                return Err(conflict());
+            }
+            let mut parents = dirty.iter().map(|index| index / 2).collect::<BTreeSet<_>>();
+            let old_count = reusable
+                .and_then(|cache| cache.level_counts.get(level + 1))
+                .copied()
+                .unwrap_or(0);
+            parents.extend(old_count..count.div_ceil(2));
+            for &index in &parents {
+                let start = index * 2;
+                let children = (start..count.min(start + 2))
+                    .map(|i| levels.get(&(level, i)).cloned().ok_or_else(conflict))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let roots = children
+                    .iter()
+                    .map(|child| {
+                        child
+                            .root
+                            .as_ref()
+                            .map(JournalCompactObjectId::from_object)
+                            .ok_or_else(conflict)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let root =
+                    self.add_structured(JournalObjectKind::JsonBranch, &JournalJsonBranch(roots))?;
+                let tree = JournalSequence {
+                    root: Some(root),
+                    len: children.iter().map(|child| child.len).sum(),
+                    height: children[0].height.checked_add(1).ok_or_else(conflict)?,
                 };
-                parents.push(tree);
+                if levels.get(&(level + 1, index)) != Some(&tree) {
+                    levels.insert((level + 1, index), tree);
+                }
             }
-            levels.push(parents);
+            dirty = parents;
+            count = count.div_ceil(2);
+            level += 1;
         }
-        let children = levels
-            .last()
-            .filter(|level| !level.is_empty())
-            .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))?;
+        if let Some(old) = reusable {
+            for (level, &old_count) in old.level_counts.iter().enumerate() {
+                let keep = level_counts.get(level).copied().unwrap_or(0);
+                for index in keep..old_count {
+                    levels.remove(&(level, index));
+                }
+            }
+        }
+        let children = (0..count)
+            .map(|i| levels.get(&(level, i)).cloned().ok_or_else(conflict))
+            .collect::<Result<Vec<_>, _>>()?;
         let child_roots = children
             .iter()
             .map(|child| {
@@ -511,31 +613,26 @@ impl JournalWriterAssembler {
                     .root
                     .as_ref()
                     .map(JournalCompactObjectId::from_object)
-                    .ok_or_else(|| {
-                        RuntimeError::conflict("structured journal branch has an empty child")
-                    })
+                    .ok_or_else(conflict)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let root = JournalJsonArray {
             len: values.len() as u64,
-            height: children[0]
-                .height
-                .checked_add(1)
-                .ok_or_else(|| RuntimeError::conflict("journal sequence height overflow"))?,
+            height: children[0].height.checked_add(1).ok_or_else(conflict)?,
             node: JournalSequenceNode::JsonBranch {
                 children: child_roots,
             },
         };
-        let unchanged = previous.is_some_and(|(prior_values, cache)| {
-            prior_values.len() == values.len() && cache.root == root
-        });
+        let unchanged = old.is_some_and(|cache| cache.root == root);
         Ok((
             root.clone(),
             JsonArrayEncodingCache {
-                items: item_caches,
+                items,
                 levels,
+                level_counts,
                 root,
                 canonical_len,
+                depth_counts,
             },
             unchanged,
         ))
@@ -592,6 +689,14 @@ impl JournalWriterAssembler {
         value: &Value,
         previous: Option<(&Value, &JournalJsonEncoding)>,
     ) -> Result<JournalJsonEncoding, RuntimeError> {
+        json_depth(value)?;
+        self.json_value_cached_inner(value, previous)
+    }
+    fn json_value_cached_inner(
+        &mut self,
+        value: &Value,
+        previous: Option<(&Value, &JournalJsonEncoding)>,
+    ) -> Result<JournalJsonEncoding, RuntimeError> {
         if let Some((prior, cache)) = previous {
             self.register_witness(&cache.witness);
             if journal_json_identical(prior, value) {
@@ -621,6 +726,7 @@ impl JournalWriterAssembler {
                     )?
                 };
                 let canonical_len = cache.canonical_len;
+                let depth = cache.depth()?;
                 Ok(JournalJsonEncoding {
                     witness: self
                         .json_witnesses
@@ -629,7 +735,8 @@ impl JournalWriterAssembler {
                         .ok_or_else(conflict)?,
                     root,
                     node: Arc::new(JsonEncodingNode::Array(cache)),
-                    value: None,
+                    typed: None,
+                    depth,
                     canonical_len,
                 })
             }
@@ -716,6 +823,7 @@ impl JournalWriterAssembler {
                         },
                     )?
                 };
+                let depth = container_depth(entries.iter().map(|entry| entry.item.depth()))?;
                 Ok(JournalJsonEncoding {
                     witness: self
                         .json_witnesses
@@ -724,7 +832,8 @@ impl JournalWriterAssembler {
                         .ok_or_else(conflict)?,
                     root,
                     node: Arc::new(JsonEncodingNode::Object { entries, sequence }),
-                    value: None,
+                    typed: None,
+                    depth,
                     canonical_len,
                 })
             }
@@ -753,7 +862,8 @@ impl JournalWriterAssembler {
                         .ok_or_else(conflict)?,
                     root,
                     node: Arc::new(JsonEncodingNode::Scalar),
-                    value: None,
+                    typed: None,
+                    depth: 0,
                     canonical_len: encoding::canonical_journal_json_len(scalar)?,
                 })
             }
@@ -776,6 +886,7 @@ impl JournalWriterAssembler {
                 },
                 JsonItemEncodingCache::Inline {
                     bytes: encoding::canonical_journal_value_len(value)?,
+                    depth: json_depth(value)?,
                 },
                 unchanged,
             ));
@@ -786,7 +897,7 @@ impl JournalWriterAssembler {
             };
             Some((value, cache.as_ref()))
         });
-        let cache = self.json_value_cached(value, prior)?;
+        let cache = self.json_value_cached_inner(value, prior)?;
         let unchanged = prior.is_some_and(|(_, prior)| prior.root == cache.root);
         Ok((
             JournalJsonItem::Reference {
@@ -842,8 +953,9 @@ impl JournalWriterAssembler {
                     .ok_or_else(conflict)?,
                 root,
                 node: Arc::new(JsonEncodingNode::Inline),
-                value: None,
+                typed: None,
                 canonical_len: encoding::canonical_journal_value_len(value)?,
+                depth: json_depth(value)?,
             }
         };
         Ok((
@@ -861,6 +973,15 @@ impl JournalWriterAssembler {
         value: &crate::store::VersionedSessionState,
         previous: Option<(&crate::store::VersionedSessionState, &JournalJsonEncoding)>,
     ) -> Result<(JournalObjectId, Option<JournalJsonEncoding>), RuntimeError> {
+        self.extension_shared_cached(namespace, Arc::new(value.clone()), previous)
+    }
+    fn extension_shared_cached(
+        &mut self,
+        namespace: &str,
+        source: Arc<crate::store::VersionedSessionState>,
+        previous: Option<(&crate::store::VersionedSessionState, &JournalJsonEncoding)>,
+    ) -> Result<(JournalObjectId, Option<JournalJsonEncoding>), RuntimeError> {
+        let value = source.as_ref();
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.writer.previous_cache");
         if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE {
@@ -871,24 +992,50 @@ impl JournalWriterAssembler {
                 "runtime previous-cache state is not redaction-safe",
             ));
         }
-        let value_json = serde_json::to_value(value)?;
-        let previous_json = match previous {
-            Some((_, cache)) => cache.value.as_ref().map(|value| (Arc::clone(value), cache)),
-            None => None,
-        };
-        let mut cache = self.json_value_cached(
-            &value_json,
-            previous_json
+        let certified = previous.is_some_and(|(previous, cache)| {
+            previous.revision == value.revision && previous.sensitivity == value.sensitivity
+                && cache.typed.as_ref().is_some_and(|proof| proof.binds(cache) && matches!(&proof.source,
+                    TypedJsonSource::State { namespace: bound, value: old } if bound == namespace && std::ptr::eq(old.as_ref(), previous)))
+        });
+        let input = JsonSource::state(value)?;
+        let prior_input = previous
+            .map(|(value, _)| JsonSource::state(value))
+            .transpose()?;
+        let mut cache = self.source_cached(
+            &input,
+            prior_input
                 .as_ref()
-                .map(|(value, cache)| (value.as_ref(), *cache)),
+                .zip(previous)
+                .map(|(input, (_, cache))| (input, cache)),
         )?;
-        cache.value = Some(Arc::new(value_json));
         self.register_witness(&cache.witness);
-        let bound_value = Arc::new(value.clone());
-        check_json_roundtrip::<VersionedSessionState>(
-            cache.value.as_deref().ok_or_else(conflict)?,
-            &cache.witness,
-        )?;
+        if cache.root != cache.witness.object.id {
+            return Err(conflict());
+        }
+        if !certified {
+            let (bytes, depth) = check_typed_json_roundtrip(value, &cache.witness)?;
+            if cache.depth != depth || cache.canonical_len != bytes {
+                return Err(conflict());
+            }
+        }
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            "rt.work.typed_json_certified_compositions",
+            u64::from(certified),
+            0,
+        );
+        cache.typed = Some(Arc::new(TypedJsonProof {
+            source: TypedJsonSource::State {
+                namespace: namespace.to_owned(),
+                value: source.clone(),
+            },
+            root: cache.root.clone(),
+            node: cache.node.clone(),
+            witness: cache.witness.clone(),
+            canonical_len: cache.canonical_len,
+            depth: cache.depth,
+        }));
+        let bound_value = source;
         let id = self.add_structured(
             JournalObjectKind::ExtensionReference,
             &ReferencedSessionState {
@@ -913,26 +1060,75 @@ impl JournalWriterAssembler {
         manifest: &TurnManifest,
         previous: Option<(&TurnManifest, &JournalJsonEncoding)>,
     ) -> Result<(JournalObjectId, JournalJsonEncoding), RuntimeError> {
+        self.manifest_shared_cached(Arc::new(manifest.clone()), previous)
+    }
+    fn manifest_shared_cached(
+        &mut self,
+        source: Arc<TurnManifest>,
+        previous: Option<(&TurnManifest, &JournalJsonEncoding)>,
+    ) -> Result<(JournalObjectId, JournalJsonEncoding), RuntimeError> {
+        let manifest = source.as_ref();
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.writer.manifest_cached");
-        let value = writer_profile!("rt.writer.manifest_to_value", {
-            serde_json::to_value(manifest)
-        })?;
-        let previous_value = previous
-            .and_then(|(_, cache)| cache.value.as_ref().map(|value| (Arc::clone(value), cache)));
-        let mut cache = self.json_value_cached(
-            &value,
-            previous_value
+        let certified = manifest.manifest.schema_version
+            == crate::manifest::MANIFEST_SCHEMA_VERSION
+            && previous.is_some_and(|(previous, cache)| {
+                cache.typed.as_ref().is_some_and(|proof| {
+                    proof.binds(cache)
+                        && matches!(&proof.source,
+                TypedJsonSource::Manifest(old) if old.manifest.schema_version == crate::manifest::MANIFEST_SCHEMA_VERSION && std::ptr::eq(old.as_ref(), previous))
+                })
+            });
+        let trusted_identity = if certified {
+            previous.and_then(|(old, _)| old.manifest.cache_identity.as_ref())
+        } else {
+            None
+        };
+        let input = JsonSource::manifest(manifest, trusted_identity)?;
+        let prior_input = previous
+            .map(|(manifest, _)| {
+                JsonSource::manifest(
+                    manifest,
+                    if certified {
+                        manifest.manifest.cache_identity.as_ref()
+                    } else {
+                        None
+                    },
+                )
+            })
+            .transpose()?;
+        let mut cache = self.source_cached(
+            &input,
+            prior_input
                 .as_ref()
-                .map(|(value, cache)| (value.as_ref(), *cache)),
+                .zip(previous)
+                .map(|(input, (_, cache))| (input, cache)),
         )?;
-        cache.value = Some(Arc::new(value));
         self.register_witness(&cache.witness);
-        let bound_value = Arc::new(manifest.clone());
-        check_json_roundtrip::<TurnManifest>(
-            cache.value.as_deref().ok_or_else(conflict)?,
-            &cache.witness,
-        )?;
+        if cache.root != cache.witness.object.id {
+            return Err(conflict());
+        }
+        if !certified {
+            let (bytes, depth) = check_typed_json_roundtrip(manifest, &cache.witness)?;
+            if cache.depth != depth || cache.canonical_len != bytes {
+                return Err(conflict());
+            }
+        }
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            "rt.work.typed_json_certified_compositions",
+            u64::from(certified),
+            0,
+        );
+        cache.typed = Some(Arc::new(TypedJsonProof {
+            source: TypedJsonSource::Manifest(source.clone()),
+            root: cache.root.clone(),
+            node: cache.node.clone(),
+            witness: cache.witness.clone(),
+            canonical_len: cache.canonical_len,
+            depth: cache.depth,
+        }));
+        let bound_value = source;
         let id = self.add_structured(
             JournalObjectKind::ManifestReference,
             &ReferencedTurnManifest {
@@ -1241,6 +1437,7 @@ impl JournalWriterAssembler {
                 view.extension_state
                     .set(key.clone(), snapshot.extension_state.get(key).cloned())?;
             }
+            view.advance_version();
             view.identity = snapshot.identity.clone();
             view.updated = snapshot.updated;
             view
@@ -1264,34 +1461,253 @@ impl JournalWriterAssembler {
         ))
     }
 
+    #[doc(hidden)]
+    pub fn snapshot_shared_cached(
+        &mut self,
+        snapshot: &JournalSnapshotView,
+        planned_step_count: u64,
+        previous: Option<&JournalSnapshotView>,
+        previous_encoding: Option<&JournalWriterEncoding>,
+    ) -> Result<(JournalSnapshotRoots, JournalWriterEncoding), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.writer.snapshot_cached");
+        let previous = previous
+            .zip(previous_encoding)
+            .filter(|(previous, encoding)| {
+                previous.session() == snapshot.session()
+                    && encoding.view.same_version(previous)
+                    && encoding.roots.history.len == previous.history_len() as u64
+                    && encoding.roots.usage.len == previous.usage_len() as u64
+                    && encoding.manifest_ids.len() == previous.manifest_len()
+                    && encoding.manifest_json.len() == previous.manifest_len()
+                    && encoding.extension_ids.len() == previous.extension_len()
+            });
+
+        self.request_cache = previous.and_then(|(_, cache)| cache.request_cache.clone());
+
+        let history_prefix = previous.filter(|(prior, _)| {
+            prior.history.is_prefix_with(&snapshot.history, |a, b| {
+                messages_match(std::slice::from_ref(a), std::slice::from_ref(b))
+            })
+        });
+        let history_start = history_prefix.map_or(0, |(prior, _)| prior.history_len());
+        let appended = snapshot
+            .history
+            .iter_from(history_start)
+            .map(|message| self.add(JournalObjectKind::Message, message))
+            .collect::<Result<Vec<_>, _>>()?;
+        let history_chain = history_prefix.map_or_else(
+            || journal_history_chain(&appended),
+            |(_, cache)| journal_history_chain_append(&cache.roots.history_chain, &appended),
+        );
+        let (history_view, objects) = history_prefix.map_or_else(
+            || JournalSequenceView::from_items(appended.clone()),
+            |(_, cache)| cache.history_view.append(&appended),
+        )?;
+        for object in objects {
+            self.objects.insert(object.id.clone(), object);
+        }
+        let history = history_view.sequence();
+        let usage_prefix = previous
+            .filter(|(prior, _)| prior.usage.is_prefix_with(&snapshot.usage, PartialEq::eq));
+        let usage_start = usage_prefix.map_or(0, |(prior, _)| prior.usage_len());
+        let appended = snapshot
+            .usage
+            .iter_from(usage_start)
+            .map(|record| self.add(JournalObjectKind::UsageRecord, record))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (usage_view, objects) = usage_prefix.map_or_else(
+            || JournalSequenceView::from_items(appended.clone()),
+            |(_, cache)| cache.usage_view.append(&appended),
+        )?;
+        for object in objects {
+            self.objects.insert(object.id.clone(), object);
+        }
+        let usage = usage_view.sequence();
+
+        let overlap = previous.map_or(0, |(previous, _)| {
+            (0..=previous.manifest_len().min(snapshot.manifest_len()))
+                .rev()
+                .find(|overlap| {
+                    (0..*overlap).all(|i| {
+                        previous.manifests.shared_position(
+                            previous.manifest_len() - overlap + i,
+                            &snapshot.manifests,
+                            i,
+                        ) || previous.manifest(previous.manifest_len() - overlap + i)
+                            == snapshot.manifest(i)
+                    })
+                })
+                .unwrap_or(0)
+        });
+        let mut manifest_ids = previous.map_or_else(Vec::new, |(previous, encoding)| {
+            encoding.manifest_ids[previous.manifest_len() - overlap..].to_vec()
+        });
+        let mut manifest_json = previous.map_or_else(Vec::new, |(previous, encoding)| {
+            encoding.manifest_json[previous.manifest_len() - overlap..].to_vec()
+        });
+        for absolute in overlap..snapshot.manifest_len() {
+            let prior = if absolute > 0 {
+                Some((
+                    snapshot.manifest(absolute - 1).expect("prior manifest"),
+                    &manifest_json[absolute - 1],
+                ))
+            } else {
+                previous.and_then(|(previous, encoding)| {
+                    Some((
+                        previous.manifest(previous.manifest_len().checked_sub(1)?)?,
+                        encoding.manifest_json.last()?,
+                    ))
+                })
+            };
+            let (id, cache) = self.manifest_shared_cached(
+                snapshot.manifests.shared(absolute).ok_or_else(conflict)?,
+                prior,
+            )?;
+            manifest_ids.push(id);
+            manifest_json.push(cache);
+        }
+        let manifests = previous
+            .filter(|(previous, _)| {
+                previous.manifests.same(&snapshot.manifests)
+                    || (overlap == snapshot.manifest_len()
+                        && previous.manifest_len() == snapshot.manifest_len())
+            })
+            .map_or_else(
+                || self.sequence(manifest_ids.clone()),
+                |(_, encoding)| Ok(encoding.roots.manifests.clone()),
+            )?;
+        if planned_step_count < manifests.len {
+            return Err(RuntimeError::conflict(
+                "journal planned-step counter trails its retained window",
+            ));
+        }
+
+        let mut extension_ids = BTreeMap::new();
+        let mut extension_json = BTreeMap::new();
+        for (key, value) in snapshot.extension_state.iter() {
+            let (id, json) = match previous {
+                Some((previous, encoding))
+                    if previous
+                        .extension_state
+                        .same_value(key, &snapshot.extension_state)
+                        || state_identical(previous.extension(key), Some(value)) =>
+                {
+                    (
+                        encoding.extension_ids.get(key).cloned().ok_or_else(|| {
+                            RuntimeError::conflict(
+                                "native journal extension encoding cache is incomplete",
+                            )
+                        })?,
+                        encoding.extension_json.get(key).cloned(),
+                    )
+                }
+                _ => self.extension_shared_cached(
+                    key,
+                    snapshot.extension_shared(key).ok_or_else(conflict)?,
+                    previous.and_then(|(previous, encoding)| {
+                        Some((previous.extension(key)?, encoding.extension_json.get(key)?))
+                    }),
+                )?,
+            };
+            if let Some(json) = json {
+                extension_json.insert(key.clone(), json);
+            }
+            extension_ids.insert(key.clone(), id);
+        }
+        let extension_entries = extension_ids
+            .iter()
+            .map(|(key, value)| JournalMapEntry {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        let extensions = previous
+            .filter(|(_, encoding)| encoding.extension_ids == extension_ids)
+            .map_or_else(
+                || self.map(extension_entries),
+                |(_, encoding)| Ok(encoding.roots.extensions.clone()),
+            )?;
+        let roots = JournalSnapshotRoots {
+            history,
+            history_chain,
+            usage,
+            extensions,
+            manifests,
+            planned_step_count,
+            identity: snapshot.identity.clone(),
+            updated: snapshot.updated,
+        };
+        let mutation_hint = previous
+            .filter(|_| history_prefix.is_some() && usage_prefix.is_some())
+            .map(|(base, _)| {
+                let extension_changes = base
+                    .extensions()
+                    .map(|(key, _)| key)
+                    .chain(snapshot.extension_state.iter().map(|(key, _)| key))
+                    .filter(|key| {
+                        !base
+                            .extension_state
+                            .same_value(key, &snapshot.extension_state)
+                            && !state_identical(
+                                base.extension(key),
+                                snapshot.extension_state.get(key),
+                            )
+                    })
+                    .cloned()
+                    .collect();
+                JournalWriterMutationHint {
+                    base: base.clone(),
+                    history_start,
+                    usage_start,
+                    manifest_overlap: overlap,
+                    extension_changes,
+                }
+            });
+        let view = snapshot.clone();
+        Ok((
+            roots.clone(),
+            JournalWriterEncoding {
+                roots,
+                view,
+                history_view,
+                usage_view,
+                manifest_ids,
+                extension_ids,
+                manifest_json,
+                extension_json,
+                mutation_hint,
+                request_cache: self.request_cache.clone(),
+            },
+        ))
+    }
+
     fn request(&mut self, request: &ProviderRequest) -> Result<JournalObjectId, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.writer.request");
-        use super::semantic::Sequence;
         let previous = self.request_cache.clone();
         let message_base = previous.as_ref().filter(|cache| {
-            cache.messages.len() <= request.messages.len()
+            cache.source.request().messages.len() <= request.messages.len()
                 && cache
+                    .source
+                    .request()
                     .messages
                     .iter()
-                    .zip(&request.messages[..cache.messages.len()])
+                    .zip(&request.messages[..cache.source.request().messages.len()])
                     .all(|(a, b)| messages_match(std::slice::from_ref(a), std::slice::from_ref(b)))
         });
         #[cfg(feature = "test-support")]
         if let Some(cache) = &previous {
             crate::journal::profile::event(
                 "rt.work.unchanged_request_prefix_nodes",
-                cache.messages.len() as u64,
+                cache.source.request().messages.len() as u64,
                 0,
             );
         }
-        let message_start = message_base.map_or(0, |cache| cache.messages.len());
-        let mut semantic_messages =
-            message_base.map_or_else(Sequence::default, |cache| cache.messages.clone());
+        let message_start = message_base.map_or(0, |cache| cache.source.request().messages.len());
         let mut added = Vec::new();
         for message in &request.messages[message_start..] {
             added.push(self.add(JournalObjectKind::Message, message)?);
-            semantic_messages.push(message.clone())?;
         }
         let (message_view, objects) = message_base.map_or_else(
             || JournalSequenceView::from_items(added.clone()),
@@ -1301,22 +1717,21 @@ impl JournalWriterAssembler {
             self.objects.insert(object.id.clone(), object);
         }
         let tool_base = previous.as_ref().filter(|cache| {
-            cache.tools.len() <= request.tools.len()
+            cache.source.request().tools.len() <= request.tools.len()
                 && cache
+                    .source
+                    .request()
                     .tools
                     .iter()
-                    .zip(&request.tools[..cache.tools.len()])
+                    .zip(&request.tools[..cache.source.request().tools.len()])
                     .all(|(a, b)| {
                         a == b && journal_json_identical(&a.input_schema, &b.input_schema)
                     })
         });
-        let tool_start = tool_base.map_or(0, |cache| cache.tools.len());
-        let mut semantic_tools =
-            tool_base.map_or_else(Sequence::default, |cache| cache.tools.clone());
+        let tool_start = tool_base.map_or(0, |cache| cache.source.request().tools.len());
         let mut added = Vec::new();
         for tool in &request.tools[tool_start..] {
             added.push(self.add(JournalObjectKind::ToolSchema, tool)?);
-            semantic_tools.push(tool.clone())?;
         }
         let (tool_view, objects) = tool_base.map_or_else(
             || JournalSequenceView::from_items(added.clone()),
@@ -1327,10 +1742,12 @@ impl JournalWriterAssembler {
         }
         let messages = message_view.sequence();
         let tools = tool_view.sequence();
+        let source = self.checkpoint_source.as_ref().filter(|metadata| {
+            matches!(&metadata.state, TurnState::CallingModel { request: bound, .. } if std::ptr::eq(bound, request))
+        }).map_or_else(|| RequestSource::Owned(Arc::new(request.clone())), |metadata| RequestSource::Checkpoint(metadata.clone()));
         self.request_cache = Some(Arc::new(RequestEncodingCache {
-            messages: semantic_messages,
+            source: Arc::new(source),
             message_view,
-            tools: semantic_tools,
             tool_view,
         }));
         let settings = ProviderRequest {
@@ -1418,7 +1835,14 @@ impl JournalWriterAssembler {
         self.hints.states.insert(
             id.clone(),
             Arc::new(StateEvidence {
-                value: Arc::new(state.clone()),
+                value: self
+                    .checkpoint_source
+                    .as_ref()
+                    .filter(|source| std::ptr::eq(&source.state, state))
+                    .map_or_else(
+                        || StateValueView::Owned(Arc::new(state.clone())),
+                        |source| StateValueView::Checkpoint(source.clone()),
+                    ),
                 fingerprint,
                 encoded: self.objects.get(&id).ok_or_else(conflict)?.bytes.clone(),
             }),
@@ -1433,11 +1857,28 @@ impl JournalWriterAssembler {
     ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.writer.checkpoint");
+        self.checkpoint_source = None;
         let state_fingerprint = checkpoint.state.operation_fingerprint();
         checkpoint
             .validation_evidence(Some(&state_fingerprint))
             .validate(&checkpoint.snapshot)?;
         self.checkpoint_references(checkpoint, roots, state_fingerprint)
+    }
+
+    #[doc(hidden)]
+    pub fn checkpoint_view(
+        &mut self,
+        checkpoint: &crate::checkpoint::JournalCheckpoint,
+        roots: JournalSnapshotRoots,
+    ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.writer.checkpoint");
+        self.checkpoint_source = Some(checkpoint.metadata_arc());
+        let fingerprint = checkpoint.state.operation_fingerprint();
+        checkpoint
+            .validation_evidence(Some(&fingerprint))
+            .validate(&checkpoint.snapshot)?;
+        self.checkpoint_view_references(checkpoint, roots, fingerprint)
     }
 
     /// Encodes a checkpoint the way a buggy host would submit it, without the
@@ -1448,6 +1889,7 @@ impl JournalWriterAssembler {
         checkpoint: &TurnCheckpoint,
         roots: JournalSnapshotRoots,
     ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
+        self.checkpoint_source = None;
         let state_fingerprint = checkpoint.state.operation_fingerprint();
         self.checkpoint_references(checkpoint, roots, state_fingerprint)
     }
@@ -1455,6 +1897,33 @@ impl JournalWriterAssembler {
     fn checkpoint_references(
         &mut self,
         checkpoint: &TurnCheckpoint,
+        roots: JournalSnapshotRoots,
+        state_fingerprint: agent_runtime_registry::Fingerprint,
+    ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
+        Ok(ReferencedTurnCheckpoint {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            transition_revision: checkpoint.transition_revision,
+            session: checkpoint.session.clone(),
+            turn: checkpoint.turn.clone(),
+            state_revision: checkpoint.state_revision,
+            operation_fingerprint: checkpoint.operation_fingerprint.clone(),
+            active_history_start: checkpoint.active_history_start,
+            internal_input: checkpoint
+                .internal_input
+                .as_ref()
+                .map(|input| self.add(JournalObjectKind::InternalInput, input))
+                .transpose()?,
+            visible_output: checkpoint.visible_output,
+            state: self.state(&checkpoint.state, state_fingerprint)?,
+            snapshot: roots,
+            deadline: checkpoint.deadline,
+            watermark: checkpoint.watermark.clone(),
+            updated: checkpoint.updated,
+        })
+    }
+    fn checkpoint_view_references(
+        &mut self,
+        checkpoint: &crate::checkpoint::JournalCheckpoint,
         roots: JournalSnapshotRoots,
         state_fingerprint: agent_runtime_registry::Fingerprint,
     ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
@@ -1502,6 +1971,46 @@ impl JournalWriterAssembler {
     pub fn preparation_hints(&self) -> JournalPreparationHints {
         self.hints.clone()
     }
+    #[doc(hidden)]
+    pub fn reachable_drafts(
+        &self,
+        roots: &JournalSnapshotRoots,
+        checkpoint: Option<&ReferencedTurnCheckpoint>,
+        known: &BTreeSet<JournalObjectId>,
+        structured_only: bool,
+    ) -> Result<Vec<JournalObject>, RuntimeError> {
+        use super::engine::{ExpectedLeaf, ExpectedObject, object_links, snapshot_links};
+        let mut pending = snapshot_links(roots);
+        if let Some(checkpoint) = checkpoint {
+            pending.push((
+                checkpoint.state.clone(),
+                ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::TurnState)),
+            ));
+            if let Some(input) = &checkpoint.internal_input {
+                pending.push((
+                    input.clone(),
+                    ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::InternalInput)),
+                ));
+            }
+        }
+        let mut visited = BTreeSet::new();
+        let mut retained = BTreeSet::new();
+        while let Some((id, expected)) = pending.pop() {
+            if known.contains(&id) || !visited.insert((id.clone(), expected)) {
+                continue;
+            }
+            let Some(object) = self.objects.get(&id) else {
+                continue;
+            };
+            retained.insert(id);
+            pending.extend(object_links(object, expected)?);
+        }
+        Ok(retained
+            .into_iter()
+            .filter(|id| !structured_only || self.structured.contains(id))
+            .filter_map(|id| self.objects.get(&id).cloned())
+            .collect())
+    }
 }
 impl std::fmt::Debug for JournalWriterEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1525,13 +2034,9 @@ impl std::fmt::Debug for JournalWriterAssembler {
 
 impl JournalWriterEncoding {
     fn bound_hint(&self, base: &JournalSnapshotView) -> Option<&JournalWriterMutationHint> {
-        self.mutation_hint.as_ref().filter(|h| {
-            h.base.session() == base.session()
-                && h.base.history.same(&base.history)
-                && h.base.usage.same(&base.usage)
-                && h.base.manifests.same(&base.manifests)
-                && h.base.extension_state.same(&base.extension_state)
-        })
+        self.mutation_hint
+            .as_ref()
+            .filter(|h| h.base.same_version(base))
     }
     #[doc(hidden)]
     pub fn append_starts(&self, base: &JournalSnapshotView) -> Option<(usize, usize)> {
@@ -1554,7 +2059,7 @@ impl JournalWriterEncoding {
 impl JsonItemEncodingCache {
     fn value_len(&self) -> usize {
         match self {
-            Self::Inline { bytes } => *bytes,
+            Self::Inline { bytes, .. } => *bytes,
             Self::Reference(cache) => cache.canonical_len,
         }
     }
@@ -1576,9 +2081,37 @@ impl JournalWriterEncoding {
 
 // The immutable graph binds the typed Arc to the encoder's intended bodies.
 // Engine validation stops at the base closure, never at lease/cache membership.
-struct JsonWitness {
+pub(in crate::journal) struct JsonWitness {
     object: JournalObject,
     children: Vec<Arc<JsonWitness>>,
+    kind: JournalObjectKind,
+    decoded: OnceLock<(JournalObjectKind, TypeId, Box<dyn Any + Send + Sync>)>,
+}
+impl JsonWitness {
+    pub(in crate::journal) fn kind(&self) -> JournalObjectKind {
+        self.kind
+    }
+    pub(in crate::journal) fn decode<T>(&self, kind: JournalObjectKind) -> Result<T, RuntimeError>
+    where
+        T: serde::de::DeserializeOwned + Serialize + Clone + Send + Sync + 'static,
+    {
+        if let Some((cached_kind, ty, value)) = self.decoded.get() {
+            if *cached_kind == kind && *ty == TypeId::of::<T>() {
+                return value.downcast_ref::<T>().cloned().ok_or_else(conflict);
+            }
+        }
+        let value = self.object.decode::<T>(kind)?;
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            "rt.work.writer_json_objects_decoded",
+            1,
+            self.object.bytes.len() as u64,
+        );
+        let _ = self
+            .decoded
+            .set((kind, TypeId::of::<T>(), Box::new(value.clone())));
+        Ok(value)
+    }
 }
 impl JournalWriterAssembler {
     fn register_witness(&mut self, root: &Arc<JsonWitness>) {
@@ -1592,15 +2125,12 @@ impl JournalWriterAssembler {
         }
     }
 }
-fn check_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
-    value: &Value,
-    witness: &Arc<JsonWitness>,
-) -> Result<(), RuntimeError> {
-    let mut bodies = BTreeMap::new();
+fn witness_value(witness: &Arc<JsonWitness>) -> Result<Value, RuntimeError> {
+    let mut nodes = BTreeMap::new();
     let mut pending = vec![witness];
     while let Some(node) = pending.pop() {
-        if bodies
-            .insert(node.object.id.clone(), node.object.bytes.clone())
+        if nodes
+            .insert(node.object.id.clone(), Arc::clone(node))
             .is_none()
         {
             pending.extend(&node.children);
@@ -1608,12 +2138,39 @@ fn check_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
     }
     let stored = super::engine::ObjectStore::default();
     let reachable = super::engine::ReachableSet::default();
-    let drafts = super::engine::DraftReader::new(&stored, &bodies, &reachable);
-    let encoded_value = drafts.json_value(&witness.object.id, 0)?;
-    if canonical_journal_json(&encoded_value)? != canonical_journal_json(value)? {
+    let bodies = BTreeMap::new();
+    super::engine::DraftReader::new(&stored, &bodies, &reachable)
+        .with_json_witnesses(&nodes)
+        .json_value(&witness.object.id, 0)
+}
+fn check_typed_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
+    source: &T,
+    witness: &Arc<JsonWitness>,
+) -> Result<(usize, u32), RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.writer.json_roundtrip");
+    let expected = canonical_journal_json(source)?;
+    let encoded = witness_value(witness)?;
+    let depth = json_depth(&encoded)?;
+    if canonical_journal_json(&encoded)? != expected {
         return Err(conflict());
     }
-    let decoded: T = serde_json::from_value(encoded_value).map_err(|_| conflict())?;
+    let decoded: T = serde_json::from_value(encoded).map_err(|_| conflict())?;
+    if canonical_journal_json(&decoded)? != expected {
+        return Err(conflict());
+    }
+    Ok((expected.len(), depth))
+}
+#[cfg(test)]
+fn check_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
+    value: &Value,
+    witness: &Arc<JsonWitness>,
+) -> Result<(), RuntimeError> {
+    let encoded = witness_value(witness)?;
+    if canonical_journal_json(&encoded)? != canonical_journal_json(value)? {
+        return Err(conflict());
+    }
+    let decoded: T = serde_json::from_value(encoded).map_err(|_| conflict())?;
     if canonical_journal_json(&decoded)? != canonical_journal_json(value)? {
         return Err(conflict());
     }
@@ -1709,6 +2266,62 @@ impl JournalWriterAssembler {
     }
 }
 
+fn json_depth(value: &Value) -> Result<u32, RuntimeError> {
+    let mut pending = vec![(value, 0u32)];
+    let mut maximum = 0;
+    while let Some((value, depth)) = pending.pop() {
+        if depth > JOURNAL_MAX_TREE_HEIGHT {
+            return Err(conflict());
+        }
+        maximum = maximum.max(depth);
+        match value {
+            Value::Array(values) => pending.extend(values.iter().map(|value| (value, depth + 1))),
+            Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)))
+            }
+            _ => {}
+        }
+    }
+    Ok(maximum)
+}
+fn container_depth(values: impl Iterator<Item = u32>) -> Result<u32, RuntimeError> {
+    let depth = values.max().map_or(0, |depth| depth + 1);
+    if depth > JOURNAL_MAX_TREE_HEIGHT {
+        return Err(conflict());
+    }
+    Ok(depth)
+}
+fn adjust_depth(
+    counts: &mut BTreeMap<u32, usize>,
+    depth: u32,
+    add: bool,
+) -> Result<(), RuntimeError> {
+    if add {
+        let count = counts.entry(depth).or_default();
+        *count = count.checked_add(1).ok_or_else(conflict)?;
+    } else {
+        let count = counts.get_mut(&depth).ok_or_else(conflict)?;
+        *count = count.checked_sub(1).ok_or_else(conflict)?;
+        if *count == 0 {
+            counts.remove(&depth);
+        }
+    }
+    Ok(())
+}
+impl JsonItemEncodingCache {
+    fn depth(&self) -> u32 {
+        match self {
+            Self::Inline { depth, .. } => *depth,
+            Self::Reference(value) => value.depth,
+        }
+    }
+}
+impl JsonArrayEncodingCache {
+    fn depth(&self) -> Result<u32, RuntimeError> {
+        container_depth(self.depth_counts.keys().copied())
+    }
+}
+
 #[cfg(test)]
 mod review_tests {
     use super::*;
@@ -1745,11 +2358,252 @@ mod review_tests {
         )
     }
     fn cached(value: &Value) -> JournalJsonEncoding {
-        let mut cache = JournalWriterAssembler::default()
+        JournalWriterAssembler::default()
             .json_value_cached(value, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn typed_provenance_matches_complete_readers_and_refuses_rebound_sources() {
+        use crate::manifest::ContextSegmentRecord;
+        use crate::provider::{
+            CacheEndpointIdentity, CacheIdentity, CacheIdentityFragment, CacheIdentityTool,
+        };
+        let mut previous: Option<(Arc<TurnManifest>, JournalJsonEncoding)> = None;
+        for len in [0, 1, 63, 64, 65, 127, 128, 129, 257, 1025, 257, 65, 0] {
+            let mut current = manifest(len);
+            current.manifest.segments = (0..len)
+                .map(|i| {
+                    ContextSegmentRecord::new(
+                        format!("history:{i}"),
+                        "history",
+                        crate::manifest::SegmentSensitivity::Internal,
+                        Fingerprint::of(i.to_string()),
+                        i as u32,
+                    )
+                })
+                .collect();
+            let fragments = (0..len.min(4096))
+                .map(|i| {
+                    CacheIdentityFragment::new(
+                        format!("history:{i}"),
+                        Fingerprint::of(i.to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            current.manifest.cache_identity = Some(
+                CacheIdentity::builder(
+                    "p",
+                    ModelId::new("m"),
+                    CacheEndpointIdentity::from_opaque("endpoint", RegistryRevision::new("r")),
+                    RegistryRevision::new("r"),
+                    Fingerprint::of("profile"),
+                )
+                .stable_prefix(fragments.clone())
+                .stable_history(fragments)
+                .tools([CacheIdentityTool::new("tool", "description", "{}", 0)])
+                .build(),
+            );
+            let current = Arc::new(current);
+            let mut writer = JournalWriterAssembler::default();
+            let (root, cache) = writer
+                .manifest_shared_cached(
+                    current.clone(),
+                    previous.as_ref().map(|(v, c)| (v.as_ref(), c)),
+                )
+                .unwrap();
+            check_typed_json_roundtrip(current.as_ref(), &cache.witness).unwrap();
+            assert_eq!(
+                cache.canonical_len,
+                super::super::semantic::SemanticLength::semantic_len(current.as_ref()).unwrap()
+            );
+            let mut cold = JournalWriterAssembler::default();
+            let (oracle, _) = cold.manifest_shared_cached(current.clone(), None).unwrap();
+            assert_eq!(root, oracle, "length {len}");
+            if let Some((old, old_cache)) = &previous {
+                assert!(old_cache.typed.as_ref().unwrap().binds(old_cache));
+                let other = Arc::new(manifest(9_999));
+                assert!(
+                    !matches!(&old_cache.typed.as_ref().unwrap().source, TypedJsonSource::Manifest(source) if std::ptr::eq(source.as_ref(), other.as_ref()))
+                );
+                let mut forged = old_cache.clone();
+                forged.root = cache.root.clone();
+                if forged.root != old_cache.root {
+                    assert!(!forged.typed.as_ref().unwrap().binds(&forged));
+                }
+                let mut invalid = current.as_ref().clone();
+                invalid.manifest.cache_identity = Some(
+                    CacheIdentity::builder(
+                        "",
+                        ModelId::new("m"),
+                        CacheEndpointIdentity::from_opaque("endpoint", RegistryRevision::new("r")),
+                        RegistryRevision::new("r"),
+                        Fingerprint::of("profile"),
+                    )
+                    .build(),
+                );
+                assert!(
+                    JournalWriterAssembler::default()
+                        .manifest_shared_cached(Arc::new(invalid), Some((old.as_ref(), old_cache)))
+                        .is_err()
+                );
+                let rebound = manifest(9_999);
+                assert!(
+                    JournalWriterAssembler::default()
+                        .manifest_shared_cached(
+                            Arc::new(rebound.clone()),
+                            Some((&rebound, old_cache))
+                        )
+                        .is_err()
+                );
+            }
+            previous = Some((current, cache));
+        }
+        let mut previous: Option<(Arc<VersionedSessionState>, JournalJsonEncoding)> = None;
+        for len in [0, 1, 64, 65, 128, 129, 513, 65, 0] {
+            let state = Arc::new(VersionedSessionState::new(RegistryRevision::new("r"), serde_json::json!({"items": (0..len).map(|i| serde_json::json!({"i": i, "n": if i%2 == 0 { -0.0 } else { 0.0 }})).collect::<Vec<_>>()})).redaction_safe());
+            let mut writer = JournalWriterAssembler::default();
+            let (root, cache) = writer
+                .extension_shared_cached(
+                    RUNTIME_PREVIOUS_CACHE_NAMESPACE,
+                    state.clone(),
+                    previous.as_ref().map(|(s, c)| (s.as_ref(), c)),
+                )
+                .unwrap();
+            let cache = cache.unwrap();
+            check_typed_json_roundtrip(state.as_ref(), &cache.witness).unwrap();
+            let (oracle, _) = JournalWriterAssembler::default()
+                .extension_shared_cached(RUNTIME_PREVIOUS_CACHE_NAMESPACE, state.clone(), None)
+                .unwrap();
+            assert_eq!(root, oracle);
+            assert_eq!(
+                cache.canonical_len,
+                super::super::semantic::SemanticLength::semantic_len(state.as_ref()).unwrap()
+            );
+            previous = Some((state, cache));
+        }
+    }
+
+    #[test]
+    fn certified_composition_preserves_the_complete_readers_depth_limit() {
+        let base = Arc::new(
+            VersionedSessionState::new(RegistryRevision::new("r"), Value::Null).redaction_safe(),
+        );
+        let cache = JournalWriterAssembler::default()
+            .extension_shared_cached(RUNTIME_PREVIOUS_CACHE_NAMESPACE, base.clone(), None)
+            .unwrap()
+            .1
             .unwrap();
-        cache.value = Some(Arc::new(value.clone()));
-        cache
+        for empty in [false, true] {
+            for depth in 0..36 {
+                let mut value = if empty {
+                    serde_json::json!([])
+                } else {
+                    Value::Null
+                };
+                for _ in 0..depth {
+                    value = Value::Array(vec![value]);
+                }
+                let current = Arc::new(
+                    VersionedSessionState::new(RegistryRevision::new("r"), value).redaction_safe(),
+                );
+                let warm = JournalWriterAssembler::default().extension_shared_cached(
+                    RUNTIME_PREVIOUS_CACHE_NAMESPACE,
+                    current.clone(),
+                    Some((base.as_ref(), &cache)),
+                );
+                let mut complete = super::super::engine::ObjectAssembler::default();
+                let root = complete
+                    .json_value(&serde_json::to_value(current.as_ref()).unwrap())
+                    .unwrap();
+                let stored = super::super::engine::ObjectStore::default();
+                let reachable = super::super::engine::ReachableSet::default();
+                let oracle =
+                    super::super::engine::DraftReader::new(&stored, &complete.objects, &reachable)
+                        .json_value(&root, 0);
+                assert_eq!(warm.is_ok(), oracle.is_ok(), "depth {depth}, empty {empty}");
+                if let Ok((_, Some(encoded))) = warm {
+                    check_typed_json_roundtrip(current.as_ref(), &encoded.witness).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_requests_share_the_checkpoint_owner_instead_of_copying_messages() {
+        let owned = crate::checkpoint::tests::checkpoint_corpus()
+            .into_iter()
+            .find(|c| matches!(c.state, TurnState::CallingModel { .. }))
+            .unwrap();
+        let shared = crate::checkpoint::JournalCheckpoint::from_checkpoint(owned.clone()).unwrap();
+        let mut writer = JournalWriterAssembler::default();
+        let roots = writer
+            .snapshot_shared_cached(&shared.snapshot, 0, None, None)
+            .unwrap()
+            .0;
+        let refs = writer.checkpoint_view(&shared, roots.clone()).unwrap();
+        let request = writer.request_cache.as_ref().unwrap();
+        assert!(
+            matches!(request.source.as_ref(), RequestSource::Checkpoint(owner) if Arc::ptr_eq(owner, &shared.metadata_arc()))
+        );
+        assert!(writer.hints.states.values().any(|state| matches!(&state.value, StateValueView::Checkpoint(owner) if Arc::ptr_eq(owner, &shared.metadata_arc()))));
+        let mut complete = JournalWriterAssembler::default();
+        assert_eq!(refs, complete.checkpoint(&owned, roots).unwrap());
+    }
+
+    #[test]
+    fn typed_witness_decoding_preserves_full_roundtrips_and_expected_types() {
+        let mut previous: Option<(Value, JournalJsonEncoding)> = None;
+        for len in [0, 1, 64, 65, 128, 129, 257, 513, 65, 0] {
+            let value = serde_json::json!({"items": (0..len).map(|i| serde_json::json!({"index": i, "n": if i % 2 == 0 { -0.0 } else { 0.0 }, "escaped": "\"\n😀"})).collect::<Vec<_>>()});
+            let mut assembler = JournalWriterAssembler::default();
+            let cache = assembler
+                .json_value_cached(&value, previous.as_ref().map(|(v, c)| (v, c)))
+                .unwrap();
+            check_json_roundtrip::<Value>(&value, &cache.witness).unwrap();
+            check_json_roundtrip::<Value>(&value, &cache.witness).unwrap();
+            let mut bodies = BTreeMap::new();
+            let mut pending = vec![&cache.witness];
+            while let Some(node) = pending.pop() {
+                if bodies
+                    .insert(node.object.id.clone(), node.object.bytes.clone())
+                    .is_none()
+                {
+                    pending.extend(&node.children);
+                }
+            }
+            let stored = super::super::engine::ObjectStore::default();
+            let reachable = super::super::engine::ReachableSet::default();
+            let complete = super::super::engine::DraftReader::new(&stored, &bodies, &reachable)
+                .json_value(&cache.root, 0)
+                .unwrap();
+            assert_eq!(
+                canonical_journal_json(&complete).unwrap(),
+                canonical_journal_json(&value).unwrap()
+            );
+            assert!(
+                cache
+                    .witness
+                    .decode::<JournalJsonInline>(JournalObjectKind::JsonInline)
+                    .is_err()
+            );
+            let decoded = cache
+                .witness
+                .decode::<Value>(JournalObjectKind::JsonValue)
+                .unwrap();
+            let typed = cache
+                .witness
+                .decode::<JournalJsonValue>(JournalObjectKind::JsonValue)
+                .unwrap();
+            assert_eq!(
+                canonical_journal_json(&decoded).unwrap(),
+                canonical_journal_json(&typed).unwrap()
+            );
+            let mut tampered = value.clone();
+            tampered["changed"] = Value::Bool(true);
+            assert!(check_json_roundtrip::<Value>(&tampered, &cache.witness).is_err());
+            previous = Some((value, cache));
+        }
     }
 
     // M1: a cached encoding that claims one value but holds another value's
@@ -1759,8 +2613,7 @@ mod review_tests {
         let honest = manifest(1);
         let honest_json = serde_json::to_value(&honest).unwrap();
         let other_json = serde_json::to_value(manifest(2)).unwrap();
-        let mut forged = cached(&other_json);
-        forged.value = Some(Arc::new(honest_json.clone()));
+        let forged = cached(&other_json);
         assert!(
             JournalWriterAssembler::default()
                 .manifest_cached(&honest, Some((&honest, &forged)))
@@ -1778,8 +2631,7 @@ mod review_tests {
             state
         };
         let (honest, other) = (state("honest"), state("other"));
-        let mut forged = cached(&serde_json::to_value(&other).unwrap());
-        forged.value = Some(Arc::new(serde_json::to_value(&honest).unwrap()));
+        let forged = cached(&serde_json::to_value(&other).unwrap());
         assert!(
             JournalWriterAssembler::default()
                 .extension_cached(

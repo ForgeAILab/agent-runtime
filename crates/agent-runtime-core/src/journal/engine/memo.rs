@@ -29,18 +29,7 @@ impl ValidatedRoot {
     }
     fn coverage_charge(&self) -> usize {
         self.cached_lease_bodies.as_ref().map_or(0, |covered| {
-            covered
-                .layers
-                .iter()
-                .map(|layer| {
-                    std::mem::size_of::<BTreeSet<JournalObjectId>>()
-                        + layer.len().saturating_mul(
-                            std::mem::size_of::<JournalObjectId>()
-                                + 64
-                                + 3 * std::mem::size_of::<usize>(),
-                        )
-                })
-                .sum()
+            covered.layers.iter().map(|layer| layer.charge()).sum()
         })
     }
 }
@@ -423,9 +412,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             return Ok(entry);
         }
         let mut next = (*entry).clone();
-        next.objects = entry
-            .objects
-            .retain_cached(&entry.closure.iter().cloned().collect());
+        next.objects = entry.objects.retain_evidence(&entry.closure);
         let id_bytes =
             std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
         let saving = entry.objects.bytes - next.objects.bytes

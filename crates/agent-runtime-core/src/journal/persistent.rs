@@ -208,6 +208,58 @@ impl<K: Ord + Clone, V: Clone> Map<K, V> {
         iter.descend(self.0.as_deref());
         iter
     }
+    pub(crate) fn iter_from(&self, first: &K) -> Iter<'_, K, V> {
+        let mut iter = Iter { stack: Vec::new() };
+        let mut node = self.0.as_deref();
+        while let Some(current) = node {
+            if current.key < *first {
+                node = current.right.as_deref();
+            } else {
+                iter.stack.push(current);
+                node = current.left.as_deref();
+            }
+        }
+        iter
+    }
+
+    pub(crate) fn shared_before(
+        &self,
+        other: &Self,
+        end: &K,
+        same: impl Fn(&V, &V) -> bool,
+    ) -> bool {
+        fn visit<K: Ord, V>(
+            node: &Option<Arc<Node<K, V>>>,
+            other: &Option<Arc<Node<K, V>>>,
+            end: &K,
+            same: &impl Fn(&V, &V) -> bool,
+        ) -> bool {
+            let Some(node) = node else {
+                return true;
+            };
+            let mut matching = other.as_ref();
+            while let Some(candidate) = matching {
+                match node.key.cmp(&candidate.key) {
+                    std::cmp::Ordering::Less => matching = candidate.left.as_ref(),
+                    std::cmp::Ordering::Greater => matching = candidate.right.as_ref(),
+                    std::cmp::Ordering::Equal => break,
+                }
+            }
+            if matching.is_some_and(|candidate| Arc::ptr_eq(node, candidate)) {
+                return true;
+            }
+            if !visit(&node.left, other, end, same) {
+                return false;
+            }
+            if node.key >= *end {
+                return true;
+            }
+            matching.is_some_and(|candidate| same(&node.value, &candidate.value))
+                && visit(&node.right, other, end, same)
+        }
+        visit(&self.0, &other.0, end, &same)
+    }
+
     pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
         self.iter().map(|(_, v)| v)
     }
@@ -277,5 +329,41 @@ mod tests {
                 oracle.into_iter().collect::<Vec<_>>()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    #[test]
+    fn shared_prefix_comparison_visits_only_changed_paths() {
+        let mut base = Map::default();
+        for i in 0..4000 {
+            base.insert(i, Arc::new(i));
+        }
+        let mut next = base.clone();
+        next.insert(4000, Arc::new(4000));
+        let visits = std::cell::Cell::new(0);
+        assert!(base.shared_before(&next, &4000, |a, b| {
+            visits.set(visits.get() + 1);
+            Arc::ptr_eq(a, b)
+        }));
+        assert!(
+            visits.get() <= 32,
+            "unchanged prefix was walked: {}",
+            visits.get()
+        );
+        for i in [0, 1, 31, 32, 3999] {
+            let mut rewritten = next.clone();
+            rewritten.insert(i, Arc::new(i + 1));
+            assert!(!base.shared_before(&rewritten, &4000, |a, b| a == b));
+        }
+        next.remove(&31);
+        assert!(!base.shared_before(&next, &4000, |a, b| a == b));
+        assert_eq!(
+            base.iter_from(&3997).map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![3997, 3998, 3999]
+        );
     }
 }

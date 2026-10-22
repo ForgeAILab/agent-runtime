@@ -142,8 +142,45 @@ impl<T> Sequence<T> {
             .get(&self.start.checked_add(index)?)
             .map(|v| v.value.as_ref())
     }
+    pub(crate) fn shared(&self, index: usize) -> Option<Arc<T>> {
+        self.items
+            .get(&self.start.checked_add(index)?)
+            .map(|value| value.value.clone())
+    }
+    pub(crate) fn shared_position(&self, index: usize, other: &Self, other_index: usize) -> bool {
+        self.items
+            .get(&self.start.saturating_add(index))
+            .zip(other.items.get(&other.start.saturating_add(other_index)))
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    }
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.items.values().map(|v| v.value.as_ref())
+    }
+    pub(crate) fn iter_from(&self, index: usize) -> impl Iterator<Item = &T> {
+        self.items
+            .iter_from(&self.start.saturating_add(index))
+            .map(|(_, v)| v.value.as_ref())
+    }
+    pub(crate) fn is_prefix_with(&self, other: &Self, same: impl Fn(&T, &T) -> bool) -> bool {
+        self.start == other.start
+            && self.len() <= other.len()
+            && self.items.shared_before(
+                &other.items,
+                &self.start.saturating_add(self.len()),
+                |a, b| Arc::ptr_eq(a, b) || same(&a.value, &b.value),
+            )
+    }
+    pub(crate) fn truncate(&mut self, keep: usize) -> Result<(), crate::error::RuntimeError> {
+        while self.len() > keep {
+            let index = self
+                .start
+                .checked_add(self.len() - 1)
+                .ok_or_else(conflict)?;
+            let value = self.items.get(&index).ok_or_else(conflict)?;
+            self.bytes = self.bytes.checked_sub(value.bytes).ok_or_else(conflict)?;
+            self.items.remove(&index);
+        }
+        Ok(())
     }
     pub(crate) fn push_shared(
         &mut self,
@@ -220,6 +257,21 @@ impl Extensions {
     pub(crate) fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
+    pub(crate) fn same_value(&self, key: &str, other: &Self) -> bool {
+        match (
+            self.values.get(&key.to_owned()),
+            other.values.get(&key.to_owned()),
+        ) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    fn shared(&self, key: &str) -> Option<Arc<VersionedSessionState>> {
+        self.values
+            .get(&key.to_owned())
+            .map(|value| value.value.clone())
+    }
     pub(crate) fn get(&self, key: &str) -> Option<&VersionedSessionState> {
         self.values.get(&key.to_owned()).map(|v| v.value.as_ref())
     }
@@ -288,6 +340,7 @@ impl Serialize for Extensions {
 /// Owned DTOs are materialized only at explicit API and full-policy boundaries.
 #[derive(Clone)]
 pub struct JournalSnapshotView {
+    version: Arc<()>,
     pub(crate) id: crate::ids::SessionId,
     pub(crate) history: Sequence<Message>,
     pub(crate) usage: Sequence<UsageRecord>,
@@ -304,6 +357,7 @@ impl JournalSnapshotView {
             extension_state.set(key, Some(value))?;
         }
         Ok(Self {
+            version: Arc::new(()),
             id: snapshot.id,
             history: Sequence::from_values(snapshot.history)?,
             usage: Sequence::from_values(snapshot.usage.records().iter().cloned())?,
@@ -359,6 +413,10 @@ impl JournalSnapshotView {
     pub fn extension(&self, namespace: &str) -> Option<&VersionedSessionState> {
         self.extension_state.get(namespace)
     }
+    #[doc(hidden)]
+    pub fn extension_shared(&self, namespace: &str) -> Option<Arc<VersionedSessionState>> {
+        self.extension_state.shared(namespace)
+    }
     /// Iterates history in canonical order without allocating a vector.
     pub fn history_messages(&self) -> impl Iterator<Item = &Message> {
         self.history.iter()
@@ -380,25 +438,48 @@ impl JournalSnapshotView {
         self.extension_state.len()
     }
     pub(crate) fn same_version(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.identity == other.identity
-            && self.updated == other.updated
-            && self.history.same(&other.history)
-            && self.usage.same(&other.usage)
-            && self.manifests.same(&other.manifests)
-            && self.extension_state.same(&other.extension_state)
+        Arc::ptr_eq(&self.version, &other.version)
+    }
+    #[doc(hidden)]
+    pub fn history_from(&self, start: usize) -> impl Iterator<Item = &Message> {
+        self.history.iter_from(start)
+    }
+    #[doc(hidden)]
+    pub fn usage_fingerprint(
+        &self,
+    ) -> Result<agent_runtime_registry::Fingerprint, crate::error::RuntimeError> {
+        Ok(agent_runtime_registry::Fingerprint::of(serde_json::to_vec(
+            &self.usage,
+        )?))
+    }
+    #[doc(hidden)]
+    pub fn usage_from(&self, start: usize) -> impl Iterator<Item = &UsageRecord> {
+        self.usage.iter_from(start)
+    }
+    #[doc(hidden)]
+    pub fn identity(&self) -> &SessionIdentityState {
+        &self.identity
+    }
+    #[doc(hidden)]
+    pub fn updated(&self) -> crate::clock::Timestamp {
+        self.updated
     }
     /// Starts a mutation bound to this immutable semantic version.
     #[doc(hidden)]
     pub fn mutation(&self) -> JournalSnapshotMutation {
         JournalSnapshotMutation {
             base: self.clone(),
+            history_keep: None,
+            usage_keep: None,
             history_append: vec![],
             usage_append: vec![],
             manifests_append: vec![],
             retained_manifests: None,
             extension_updates: Default::default(),
         }
+    }
+    pub(crate) fn advance_version(&mut self) {
+        self.version = Arc::new(());
     }
     pub(crate) fn persistent_overhead(&self) -> usize {
         self.history
@@ -464,13 +545,21 @@ impl Serialize for JournalSnapshotView {
 #[derive(Debug)]
 pub struct JournalSnapshotMutation {
     base: JournalSnapshotView,
+    history_keep: Option<usize>,
+    usage_keep: Option<usize>,
     history_append: Vec<Message>,
     usage_append: Vec<UsageRecord>,
     manifests_append: Vec<TurnManifest>,
     retained_manifests: Option<usize>,
-    extension_updates: std::collections::BTreeMap<String, Option<VersionedSessionState>>,
+    extension_updates: std::collections::BTreeMap<String, Option<Arc<VersionedSessionState>>>,
 }
 impl JournalSnapshotMutation {
+    pub fn truncate_history(&mut self, keep: usize) {
+        self.history_keep = Some(keep);
+    }
+    pub fn truncate_usage(&mut self, keep: usize) {
+        self.usage_keep = Some(keep);
+    }
     /// Adds canonical history positions.
     pub fn append_history(&mut self, values: impl IntoIterator<Item = Message>) {
         self.history_append.extend(values);
@@ -489,7 +578,10 @@ impl JournalSnapshotMutation {
     }
     /// Replaces or removes one opaque namespace.
     pub fn set_extension(&mut self, key: String, value: Option<VersionedSessionState>) {
-        self.extension_updates.insert(key, value);
+        self.extension_updates.insert(key, value.map(Arc::new));
+    }
+    pub fn set_extension_shared(&mut self, key: String, value: Arc<VersionedSessionState>) {
+        self.extension_updates.insert(key, Some(value));
     }
     /// Applies changes to their captured base and updates scalar boundary data.
     pub fn finish(
@@ -498,6 +590,12 @@ impl JournalSnapshotMutation {
         updated: crate::clock::Timestamp,
     ) -> Result<JournalSnapshotView, crate::error::RuntimeError> {
         let mut next = self.base;
+        if let Some(keep) = self.history_keep {
+            next.history.truncate(keep)?;
+        }
+        if let Some(keep) = self.usage_keep {
+            next.usage.truncate(keep)?;
+        }
         for value in self.history_append {
             next.history.push(value)?;
         }
@@ -511,8 +609,14 @@ impl JournalSnapshotMutation {
             next.manifests.truncate_front(count)?;
         }
         for (key, value) in self.extension_updates {
-            next.extension_state.set(key, value)?;
+            if let Some(value) = value {
+                let bytes = value.semantic_len()?;
+                next.extension_state.set_shared(key, value, bytes)?;
+            } else {
+                next.extension_state.set(key, None)?;
+            }
         }
+        next.version = Arc::new(());
         next.identity = identity;
         next.updated = updated;
         Ok(next)
@@ -527,5 +631,21 @@ impl std::fmt::Debug for JournalSnapshotView {
             .field("manifests", &self.manifest_len())
             .field("extensions", &self.extension_len())
             .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for JournalSnapshotView {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_version(other)
+            || (self.id == other.id
+                && self.identity == other.identity
+                && self.updated == other.updated
+                && (self.history.same(&other.history)
+                    || self.history.iter().eq(other.history.iter()))
+                && (self.usage.same(&other.usage) || self.usage.iter().eq(other.usage.iter()))
+                && (self.manifests.same(&other.manifests)
+                    || self.manifests.iter().eq(other.manifests.iter()))
+                && (self.extension_state.same(&other.extension_state)
+                    || self.extension_state.iter().eq(other.extension_state.iter())))
     }
 }
