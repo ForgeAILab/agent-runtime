@@ -45,8 +45,8 @@ NOT substitute for Forge's real D10 storage/adoption gate.
 
 #### Scenario: Consumer adoption is evaluated
 
-- **WHEN** the runtime phase benchmarks pass but Forge D10 still misses turn, import, write or physical disk thresholds
-- **THEN** Forge adoption remains blocked by those unchanged checks
+- **WHEN** the runtime phase benchmarks pass but Forge D10 still misses the owner-approved fixed turn-overhead, collection, write or physical disk thresholds
+- **THEN** Forge adoption remains blocked by those checks; runtime import speed is non-gating under Forge background conversion
 - **AND** no benchmark-only storage model, budget increase or deferred collection slice is presented as a production pass
 
 #### Scenario: A supported consumer cannot compile the new collection contract

@@ -132,7 +132,8 @@ part of the complete live union.
 
 ### Requirement: Writer initialization consumes an authority-checked validated view
 
-The runtime SHALL use an available optional canonical validated writer view
+If the deferred optional P3 phase is built, the runtime SHALL use an available
+optional canonical validated writer view
 to initialize semantic state,
 checkpoint and encoding without materialize-then-re-derive work. The operation
 MUST preserve final D-1 authority and lease checks, domain/session/root identity,

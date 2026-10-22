@@ -543,6 +543,8 @@ impl<'a> JournalReader<'a> {
     }
 
     async fn manifest(&mut self, id: &JournalObjectId) -> Result<TurnManifest, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.manifest_decoded", 1, 0);
         let object = self.encoded_object(id).await?;
         match object.kind()? {
             JournalObjectKind::Manifest => object.decode(JournalObjectKind::Manifest),
@@ -718,30 +720,32 @@ impl<'a> JournalReader<'a> {
         &mut self,
         namespace: &str,
     ) -> Result<Option<VersionedSessionState>, RuntimeError> {
-        let Some(operation) = self.journal.begin_read(self.lease)? else {
-            return Box::pin(self.extension_inner(namespace)).await;
-        };
-        let view = OperationJournal {
-            storage_id: self.journal.storage_id(),
-            operation: futures_util::lock::Mutex::new(operation),
-        };
-        let mut attempt = JournalReader {
-            journal: &view,
-            lease: self.lease,
-            limits: self.limits,
-            reads: self.reads,
-            bytes: self.bytes,
-        };
-        let result = Box::pin(attempt.extension_inner(namespace)).await;
-        let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
-        let result = if retry {
-            (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
-            Box::pin(attempt.extension_inner(namespace)).await
-        } else {
+        crate::journal_profile_scope!("rt.reader.extension", {
+            let Some(operation) = self.journal.begin_read(self.lease)? else {
+                return Box::pin(self.extension_inner(namespace)).await;
+            };
+            let view = OperationJournal {
+                storage_id: self.journal.storage_id(),
+                operation: futures_util::lock::Mutex::new(operation),
+            };
+            let mut attempt = JournalReader {
+                journal: &view,
+                lease: self.lease,
+                limits: self.limits,
+                reads: self.reads,
+                bytes: self.bytes,
+            };
+            let result = Box::pin(attempt.extension_inner(namespace)).await;
+            let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
+            let result = if retry {
+                (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
+                Box::pin(attempt.extension_inner(namespace)).await
+            } else {
+                result
+            };
+            (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
             result
-        };
-        (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
-        result
+        })
     }
     async fn extension_inner(
         &mut self,
@@ -843,30 +847,32 @@ impl<'a> JournalReader<'a> {
     /// Materializes the selected stored view, preserving ordinary redaction.
     /// `None` means an absent-head reservation; it never scans legacy records.
     pub async fn snapshot(&mut self) -> Result<Option<SessionSnapshot>, RuntimeError> {
-        let Some(operation) = self.journal.begin_read(self.lease)? else {
-            return Box::pin(self.snapshot_inner()).await;
-        };
-        let view = OperationJournal {
-            storage_id: self.journal.storage_id(),
-            operation: futures_util::lock::Mutex::new(operation),
-        };
-        let mut attempt = JournalReader {
-            journal: &view,
-            lease: self.lease,
-            limits: self.limits,
-            reads: self.reads,
-            bytes: self.bytes,
-        };
-        let result = Box::pin(attempt.snapshot_inner()).await;
-        let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
-        let result = if retry {
-            (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
-            Box::pin(attempt.snapshot_inner()).await
-        } else {
+        crate::journal_profile_scope!("rt.reader.snapshot", {
+            let Some(operation) = self.journal.begin_read(self.lease)? else {
+                return Box::pin(self.snapshot_inner()).await;
+            };
+            let view = OperationJournal {
+                storage_id: self.journal.storage_id(),
+                operation: futures_util::lock::Mutex::new(operation),
+            };
+            let mut attempt = JournalReader {
+                journal: &view,
+                lease: self.lease,
+                limits: self.limits,
+                reads: self.reads,
+                bytes: self.bytes,
+            };
+            let result = Box::pin(attempt.snapshot_inner()).await;
+            let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
+            let result = if retry {
+                (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
+                Box::pin(attempt.snapshot_inner()).await
+            } else {
+                result
+            };
+            (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
             result
-        };
-        (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
-        result
+        })
     }
     async fn snapshot_inner(&mut self) -> Result<Option<SessionSnapshot>, RuntimeError> {
         let Some(head) = self.lease.head().cloned() else {
@@ -887,30 +893,32 @@ impl<'a> JournalReader<'a> {
     /// The result carries [`CHECKPOINT_SCHEMA_VERSION`], like any other
     /// materialized checkpoint.
     pub async fn checkpoint(&mut self) -> Result<Option<TurnCheckpoint>, RuntimeError> {
-        let Some(operation) = self.journal.begin_read(self.lease)? else {
-            return Box::pin(self.checkpoint_inner()).await;
-        };
-        let view = OperationJournal {
-            storage_id: self.journal.storage_id(),
-            operation: futures_util::lock::Mutex::new(operation),
-        };
-        let mut attempt = JournalReader {
-            journal: &view,
-            lease: self.lease,
-            limits: self.limits,
-            reads: self.reads,
-            bytes: self.bytes,
-        };
-        let result = Box::pin(attempt.checkpoint_inner()).await;
-        let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
-        let result = if retry {
-            (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
-            Box::pin(attempt.checkpoint_inner()).await
-        } else {
+        crate::journal_profile_scope!("rt.reader.checkpoint", {
+            let Some(operation) = self.journal.begin_read(self.lease)? else {
+                return Box::pin(self.checkpoint_inner()).await;
+            };
+            let view = OperationJournal {
+                storage_id: self.journal.storage_id(),
+                operation: futures_util::lock::Mutex::new(operation),
+            };
+            let mut attempt = JournalReader {
+                journal: &view,
+                lease: self.lease,
+                limits: self.limits,
+                reads: self.reads,
+                bytes: self.bytes,
+            };
+            let result = Box::pin(attempt.checkpoint_inner()).await;
+            let retry = result.is_ok() && !view.operation.lock().await.finish().await?;
+            let result = if retry {
+                (attempt.reads, attempt.bytes) = (self.reads, self.bytes);
+                Box::pin(attempt.checkpoint_inner()).await
+            } else {
+                result
+            };
+            (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
             result
-        };
-        (self.reads, self.bytes) = (attempt.reads, attempt.bytes);
-        result
+        })
     }
     async fn checkpoint_inner(&mut self) -> Result<Option<TurnCheckpoint>, RuntimeError> {
         let Some(head) = self.lease.head().cloned() else {

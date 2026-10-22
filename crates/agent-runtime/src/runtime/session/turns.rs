@@ -680,7 +680,7 @@ impl SessionHandle {
             completion: completion.clone(),
             acceptance: acceptance.clone(),
         };
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(crate::journal_profile_inherit!(async move {
             let _active = active;
             let _turn = inner.turn_gate.lock().await;
             {
@@ -722,7 +722,7 @@ impl SessionHandle {
                     inner.emitter.emit(None, RuntimeEvent::Error { error });
                 }
             }
-        });
+        }));
         turns.aborts.push(task.abort_handle());
         drop(turns);
         Ok(InternalTurnAdmission::Accepted(TurnHandle {
@@ -1051,7 +1051,7 @@ impl SessionHandle {
             completion: completion.clone(),
             acceptance: acceptance.clone(),
         };
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(crate::journal_profile_inherit!(async move {
             let _active = active;
             loop {
                 let ready = inner.turn_ready.notified();
@@ -1105,7 +1105,7 @@ impl SessionHandle {
                     inner.emitter.emit(None, RuntimeEvent::Error { error });
                 }
             }
-        });
+        }));
         turns.aborts.push(task.abort_handle());
         drop(turns);
         Ok(TurnHandle {
@@ -1168,7 +1168,7 @@ impl SessionHandle {
             completion: completion.clone(),
             acceptance: Arc::new(TurnAcceptance::accepted()),
         };
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(crate::journal_profile_inherit!(async move {
             let _active = active;
             loop {
                 let ready = inner.turn_ready.notified();
@@ -1220,7 +1220,7 @@ impl SessionHandle {
                     inner.emitter.emit(None, RuntimeEvent::Error { error });
                 }
             }
-        });
+        }));
         turns.aborts.push(task.abort_handle());
         drop(turns);
         Ok(TurnHandle {

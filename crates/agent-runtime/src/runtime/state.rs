@@ -346,6 +346,9 @@ impl SessionExecutionContext {
     /// Captures exact extension state, including runtime-owned activation
     /// epochs that ordinary component state does not mutate directly.
     pub(crate) fn snapshot_extension_state(&self) -> BTreeMap<String, VersionedSessionState> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.snapshot_extension_state");
         let mut state = self
             .extension_state
             .lock()
@@ -400,17 +403,19 @@ impl SessionExecutionContext {
     pub(crate) fn snapshot_extension_state_with_staged(
         &self,
     ) -> BTreeMap<String, VersionedSessionState> {
-        let mut state = self.snapshot_extension_state();
-        state.extend(
-            self.staged_extension_state
-                .lock()
-                .expect("staged session extension state poisoned")
-                .clone(),
-        );
-        if self.planner.persisted_previous_cache().is_none() {
-            state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
-        }
-        state
+        crate::journal_profile_sync!("rt.runtime.snapshot_extension_state_with_staged", {
+            let mut state = self.snapshot_extension_state();
+            state.extend(
+                self.staged_extension_state
+                    .lock()
+                    .expect("staged session extension state poisoned")
+                    .clone(),
+            );
+            if self.planner.persisted_previous_cache().is_none() {
+                state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
+            }
+            state
+        })
     }
 
     pub(crate) fn stage_extension_state(

@@ -17,7 +17,7 @@ Evidence read for this proposal:
 | `/Volumes/Data/tmp/refactor/c3-profile/report.md`, especially sections 1, 3, 5 and Ranked options | Component measurements and conditional estimates; no optimization was implemented. |
 | `/Volumes/Data/tmp/refactor/c3-profile/runtime-timers.patch` | Timer labels and nesting on a copy of this exact core tag. The temporary git dependency override is experiment wiring, not part of the proposed instrumentation. |
 | `/Volumes/Data/tmp/refactor/c3-t24-25/report.md` | Full Forge A/B/C gate matrix, production cadence, failed checks and missing memo telemetry. |
-| `/Volumes/Data/codes/ai/open-forge-p3/docs/spec/changes/adopt-session-journal-2026-10-19/design.md`, D1/D3/D8/D10 and Q0/Q2/Q3/Q4/Q5 | Consumer ownership, authority, conservative projection, memo budget and unchanged adoption thresholds. |
+| `/Volumes/Data/codes/ai/open-forge-p3/docs/spec/changes/adopt-session-journal-2026-10-19/design.md`, D1/D3/D8/D10 and Q0/Q2/Q3/Q4/Q5 | Consumer ownership, authority, conservative projection, memo budget and historical adoption thresholds (superseded below by the owner decisions). |
 
 The profile's instrumented B last-turn measurements are the component
 baseline below. P/T means plain/tool. All times are wall milliseconds;
@@ -328,7 +328,10 @@ all that calculation or explain the old 2.99 s maximum. It does not accelerate
 first import. **Size: M/L, 5–10 engineering days** including pin/epoch and
 dependency tests. P2 is internal, with no mandatory public API/format change.
 
-## P3: Writer Open from a Validated Snapshot View
+## P3: Writer Open from a Validated Snapshot View (Deferred / Optional)
+
+P3 is retained as an optional follow-up. It is not required for the Forge gate
+or the approved P1/P2/P4 implementation sequence. Its criteria apply only if built.
 
 ### Data structures and algorithm
 
@@ -443,7 +446,7 @@ set, shared proof handles, iterative cold-trace stack/visited index, membership
 page/difference position, dependency-index progress, pending release batch and
 storage maintenance continuation. Limit units by both ids and encoded bytes;
 one huge JSON object or pin cannot count as one cheap unit. Include cumulative
-cursor charge and cap it; on eviction abandon speculative work and retain
+cursor charge and cap additional workspace at 16 MiB per engine; on eviction abandon speculative work and retain
 dirty state. If unchanged work cannot fit the configured capacity, return typed
 unsupported while retaining content rather than repeatedly yielding/restarting
 without progress. Avoid recursive drop of a long chain of persistent versions.
@@ -610,96 +613,115 @@ it does not retroactively change the v0.9.0 extraction receipt. Update CHANGELOG
 testkit builders/wrappers, volatile and packed adapters, and supported Smith,
 Nyx and Forge integration contracts before the release. Forge D1/D3 needs
 optional policy/view forwarding; D8 needs the cursor/storage capability; D10
-keeps its thresholds and full production-cadence denominator. P3 preserves
+uses the fixed owner-approved budgets below and full production-cadence denominator. P3 preserves
 Runtime lifetime, so Forge's warm-runtime redesign non-goal need not change.
-No consumer file or immutable release pin is edited by this spec-only task.
+No consumer file or immutable release pin is edited by this change.
+
+## Owner Decisions — 2026-10-21
+
+The owner approved the following decisions and accepted all other recommendations
+as defaults unless they conflict with these decisions:
+
+- Forge D10's relative latency gates are replaced by fixed budgets: native
+  journal overhead per turn ≤ approximately 250 ms over legacy at N=4000 and
+  ≤ approximately 50 ms over legacy at N=100, for B plain and tool fixtures,
+  release builds and per-turn cadence as measured by Forge. Every single
+  `collect` call and engine gate hold must be <1 s; <250 ms is the soft target.
+  Disk must be ≤2.0× L2 on the Forge side, handled by Forge body sharing.
+  Import becomes background conversion on the Forge side, so no user waits
+  on first open and runtime import speed is not gating.
+- Build P1, P2 and P4. Keep P3 (validated writer view) in the spec as deferred,
+  optional work, not required for the Forge gate.
+- Accept phases independently. Use revisioned conservative/identity incremental
+  projection with complete fallback. Do not change Runtime lifetime or public
+  snapshot fields; use an additive opaque view. Release P4's breaking API and
+  storage changes in a coordinated pre-1.0 breaking release. Use an engine-local
+  disposable cursor with a 16 MiB additional workspace cap. Treat 250 ms as a
+  soft target and <1 s as acceptance.
+
+These decisions supersede conflicting historical D10/Q3 recommendations in
+this runtime proposal. Forge owns recording/integrating its changed gate,
+background conversion and body sharing; this change does not modify Forge.
 
 ## Forge D10 Reachability
 
-These are conditional arithmetic envelopes, not observed optimized results.
-Keep the profile run's numbers together; do not substitute the original gate's
-201.71/377.46 ms legacy turns or 27.53/32.04 ms resumes into its component
-subtractions. P3's writer-open benefit is outside B's last-turn timing. P4's
-full drain is still charged. Do not add storage-body caching to P2's avoided
-storage reads, or add nested manifest/memo-closure timers to P1.
+These are conditional arithmetic envelopes, not measured optimized results.
+P1/P2/P4 are required; deferred P3 does not help B's timed last turn, which
+keeps its writer open. P4 slices holds but all drain work remains charged and
+may add up to its declared 15% collection overhead. Nested manifest/closure
+spans are already included in their parents and cannot be added as savings.
 
-At B/4000:
+At B/4000, the profile's legacy turns are 204.32/374.67 ms plain/tool, so the
+new absolute charged-turn budgets are **454.32/624.67 ms**. The native turns
+are 1,589.28/2,499.27 ms. Required reductions are **1,134.96/1,874.60 ms**
+(71.4%/75.0%). The targeted engine sum is 601.75/1,118.88 ms. Reducing it
+50–75%, plus a conditional 50–75% reduction in the 216.04/395.88 ms writer
+remainder, saves 408.90–613.34/757.38–1,136.07 ms. P2's disjoint collection
+saving is estimated at 450–570/500–640 ms. Together, before P4 overhead,
+remaining turns are **405.94–730.39/723.20–1,241.89 ms**, or journal overhead
+**201.62–526.07/348.53–867.22 ms over legacy**.
 
-- Engine targeted sum P/T = `392.99 + 149.52 + 59.24 = 601.75` /
-  `677.75 + 322.47 + 118.66 = 1,118.88` ms.
-- At 50–75%, plus the conditional 50–75% writer remainder improvement, P1
-  saves `300.88..451.31 + 108.02..162.03 = 408.90..613.34` ms P and
-  `559.44..839.16 + 197.94..296.91 = 757.38..1,136.07` ms T.
-- Adding P2's **disjoint collection phase** saving, estimated remaining turns
-  are `1,589.28 - (408.90..613.34) - (450..570)` = **405.94–730.39 ms P**,
-  and `2,499.27 - (757.38..1,136.07) - (500..640)` = **723.20–1,241.89 ms T**.
-  These exclude any P4 drain overhead. Without the unproven writer-remainder
-  savings the range is worse, about 568–838 / 1,020–1,440 ms.
-- Below legacy requires removing more than `1,589.28 - 204.32 = 1,384.96`
-  ms P (87.1%) and `2,499.27 - 374.67 = 2,124.60` ms T (85.0%). Even the
-  optimistic envelope still needs **more than 201.62 / 348.53 ms** extra
-  reduction. The phase acceptance percentages alone do not achieve this.
-- The report's zero-cost-hot-stage thought experiment is
-  `1,589.28 - 392.99 - 149.52 - 59.24 - 21.06 - 620.46 = 346.01` ms P;
-  T is `2,499.27 - 677.75 - 322.47 - 118.66 - 25.01 - 713.47 = 641.91` ms.
-  This still exceeds legacy before touching outside-commit writer work.
-  Removing that whole 216.04/395.88 ms remainder as well gives 129.97/246.03 ms,
-  so there is no mathematical impossibility claim for a much more complete
-  runtime optimization. Zero-cost components are not realizable estimates.
+Therefore **P1+P2+P4 is not estimated to reliably meet both N=4000 budgets**.
+Plain fits only at the optimistic edge, with 48.38 ms margin before P4
+collection overhead (up to about 7.57 ms at that edge); pessimistic plain
+needs another 276.07 ms. Even optimistic tool needs **98.53 ms** more,
+rising to 617.22 ms at the pessimistic edge, before P4 overhead. Without the
+unproven writer saving, remaining turns are roughly 568–838/1,020–1,440 ms.
+Direct writer attribution in phase 0 must identify achievable reuse in
+manifest/request/previous-cache assembly, semantic delta construction, known-id
+filtering and checkpoint/candidate publication. Closing the gap needs deeper
+reuse in those paths and remaining commit/write/publish/closure work; fixed
+provider/context work must be reported separately. P3 is not the missing B lever.
 
-For import, P3 alone estimates 2.3–2.6 / 2.7–3.0 seconds. Even optimistically
-subtracting P1's 331.38–497.06 / 387.92–581.88 ms import engine saving from
-those figures gives **1,803–2,269 / 2,118–2,612 ms**, if those scopes prove
-disjoint. P1's import writer work is not individually timed and is not added.
-The target is `2 × 30.98 = 61.96` / `2 × 31.58 = 63.16` ms. Native storage
-trait calls alone cost 361.25/409.85 ms in the import profile, about 5.8/6.5
-times those caps even if all runtime computation disappeared. This runtime
-change offers no evidence of the required storage/conversion speedup.
+At N=100 the historical B turns are 83.96/154.36 ms and legacy is
+6.99/12.40 ms, so the new budgets are **56.99/62.40 ms**. Native needs at least
+**26.97/91.96 ms** reduction (32.1%/59.6%). No component profile establishes
+those savings: **the ≤50 ms overhead gate is plausible but unproven, not an
+estimated pass**. Measure unchanged N=100 fixtures and fixed per-boundary costs;
+N=4000 percentages cannot certify this budget.
 
-| D10 check | Evidence and effect of P1–P4 | Reachability / further work |
-| --- | --- | --- |
-| N=100 turn ≤ legacy ×1.10 | Original B is 83.96/154.36 ms against caps 7.689/13.640 ms; needs 90.8%/91.2% reduction. A is also failing. No N=100 component profile supports an extrapolated pass. | **Unproven; not promised.** Run the unchanged N=100 smoke and paired timings. Profile fixed per-boundary costs, policy/codec dispatch and Runtime setup; larger-N savings do not establish this check. |
-| N=1000 turn below legacy | Profile B legacy is 47.47/91.95 ms. P1 plus the inferred P2 envelope leaves about 128–213/240–375 ms including conditional writer savings. A lacks equivalent component attribution. | **Not supported by current estimates.** Continue through remaining writer/engine scans and fixed publication costs; measure A separately. |
-| N=4000 turn below legacy | B envelope 406–730/723–1,242 ms versus 204.32/374.67 ms. P3 does not help the timed B turn; P4 may add overhead. | **Not supported by current estimates.** Broader writer/provider manifest/context assembly and remaining commit/write/publish/closure work need direct attribution and near-complete reuse. C may benefit substantially from P3, but it has different state and no quantitative pass prediction. |
-| First import ≤2× one legacy resume | Profile B 3,382.46/3,905.95 ms versus caps 61.96/63.16 ms; even the optimistic combined estimate remains seconds. N=1000 caps are 15.94/17.44 ms and also unproved. | **Not reachable by the estimated P1–P4 effects.** Investigate cold graph/conversion representation, redundant adapter admission validation and bounded bulk import; measure the storage floor. Background conversion changes Q3/user wait location, not this gate. A separate conversion budget requires owner approval and a consumer spec change. |
-| Longest collect call <1 s, including 100 dirty sessions and C/4000 | Original C 2,992.811 ms; 100 small dirty sessions already pass at 779.05/705.70 ms. P2 reduces tracing; P4 explicitly budgets every mark/storage unit. | **Reachable target, unmeasured.** Require all runtime calls <1 s and target <250 ms; Forge must implement bounded storage units and remeasure its full-matrix stall. A deadline alone cannot bound a stalled atomic I/O. |
-| N≥1000 delta pack writes ≤10% legacy, full cadence | B/4000 7.658%/5.440% and C/4000 3.214% pass. B/1000 10.675%/10.492%, C/1000 11.035%, A/1000 about 50% and A/4000 about 12.5% fail. | **Existing large-B/C passes can be preserved; remaining checks unresolved.** Canonical unchanged-state sharing reduces CPU, not those encoded bytes. Measure bounded-collection amplification and pursue separately scoped packing/admission/representation work. |
-| B/4000 physical disk ≤2.0× L2, aim 1.5× | Current 2.84036×/3.23235×; these phases retain object format and domain copies. | **Unchanged failure.** Separate host body-sharing estimate is 1.615×/1.797× (reference 1.605×/1.791×); needs host format/AAD work. Aim 1.5× likely needs representation work. Neither is included here. |
+| Owner-approved check | P1/P2/P4 reachability / remaining work |
+| --- | --- |
+| B/4000 overhead ≤approximately 250 ms, plain/tool | Plain optimistic edge fits; tool estimate misses by at least 98.53 ms before P4 overhead. Direct writer attribution and more complete preparation/commit reuse are required; measure real Forge cadence. |
+| B/100 overhead ≤approximately 50 ms, plain/tool | Unproven. Required reductions are 26.97/91.96 ms; phase-0 fixed-cost profiles and then paired measurements decide. |
+| Every collect call and engine gate hold <1 s, soft target <250 ms | Reachable design target through P2/P4, unmeasured. Bound cold marking and every storage unit, preserve both C contexts and 100-dirty-session cases. P4 bounds collection; cold open/commit/import gate holds also require measurement and, if they exceed 1 s, additional fenced preparation outside the gate or bounded publication work. Total import speed being non-gating does not waive a gate-hold limit. Stalled atomic I/O cannot safely be cancelled by a timer. |
+| Disk ≤2.0× L2 | Forge-owned body sharing. Current independent-domain 2.84036×/3.23235× fails; sharing estimate 1.615×/1.797× supports feasibility but is not a production pass. Runtime phases do not change formats. |
+| Import speed | Non-gating: Forge performs background conversion, with no first-open user wait. Retain timing, exactness/recovery and runtime regression diagnostics; no claim of a measured import speedup. |
+| Delta writes, complete cadence | Preserve existing B/4000 7.658%/5.440% and C/4000 3.214% passes. Smaller-N/A failures and collection amplification remain reported under existing write criteria; no changed write denominator is authorized. |
 
-No phase may weaken exactness/redaction, raise Q5's memo budget, omit collection
-drain work, change the legacy denominator or claim a reference adapter is Forge
-real AEAD in order to turn these rows into passes. A tagged runtime release and
-the real Forge rerun remain required independently of runtime bench acceptance.
+N=1000 remains a scaling/regression diagnostic, with the prior estimated
+128–213/240–375 ms turns versus 47.47/91.95 ms legacy; it has no replacement
+relative latency gate. A/C remain required runtime coverage without inventing
+B-equivalent gains. No phase may weaken exactness/redaction, raise the memo
+budget, omit drains or call the modeled adapter Forge's real storage. Independent
+phase acceptance and a released runtime do not substitute for a real Forge rerun.
 
 ## Sequencing and Size
 
 Build the bench/instrumentation prerequisite first (S/M, 2–4 engineering days),
 including builder attribution and a frozen paired baseline. P1 establishes the
-shared view and proof representation. P2 and P3 then use that representation
-and can be accepted independently. P4 follows P2 so the cold/proof marking paths
+shared view and proof representation. P2 then uses that representation
+and is accepted independently. Deferred P3 is optional. P4 follows P2 so the cold/proof marking paths
 share one cursor protocol; it must still bound the proof-miss path. Each phase
 reruns all existing relevant conformance and its focused negative controls.
-After all four, run the combined matrix and consumer compatibility gates.
+After required P1/P2/P4, run the combined matrix and consumer compatibility gates.
 
 Sizes include focused conformance but are engineering estimates rather than
 delivery commitments: P1 1–3 weeks; P2 5–10 days; P3 5–10 days; P4 5–10 days or
 more (2–3 weeks with metadata/purge redesign). Sequential aggregate is roughly
-**22–49 engineering days**, rising to **27–54 days** with the larger P4 case,
+**17–39 engineering days** for required P0/P1/P2/P4, rising to **22–44 days** with the larger P4 case,
 before consumer adapter work or subsequent D10-missing levers. Calendar time
 depends on ownership and review; no parallel staffing is assumed.
 
-## Open Questions
+## Open Questions (Resolved 2026-10-21)
 
-| Owner question | Recommendation |
+| Question | Owner decision / accepted default |
 | --- | --- |
-| OQ1. Is this a runtime performance prerequisite or a promise to pass all Forge adoption checks? | Approve four runtime phases with their own measurable acceptance. Keep Forge D10 unchanged and blocked until real measurements pass; commission separate import/disk/small-N work rather than equate phase completion with adoption. |
-| OQ2. Which ordinary policies may opt into incremental projection, and how do configuration changes invalidate it? | Start with explicit identity plus a conservative test policy equivalent to Forge Q4; require a revisioned opt-in and differential full-policy tests. Leave generic closures on complete projection. Forge owns its integration and redaction examples. |
-| OQ3. Should P3 require a long-lived Runtime or public persistent snapshot fields? | Keep both out of this change. Use an additive opaque validated view and internal sharing; preserve per-turn Runtime replacement and public DTOs. Document full materialization costs where callers request owned values. |
-| OQ4. Accept a pre-1.0 P4 API/storage break or retain an unbounded compatibility mode? | Accept the listed coordinated break and capability refusal for unsupported storage. Provide constructors/testkit helpers, default serde fields and migration notes; do not describe an unbounded fallback as bounded collection. |
-| OQ5. Where does resumable collection state live and how much memory may it retain? | Use disposable engine-local cursors, charge shared proof references and frontier state, and cap additional cursor workspace (initial proposal: 16 MiB per engine, separate from unchanged 128 MiB memo). On exhaustion retain dirty state; return typed unsupported for unchanged over-capacity work rather than loop forever. Spill needs a separately reviewed design; verify that all target fixtures finish within the cap. |
-| OQ6. Is the 250 ms budget a guarantee for arbitrary storage? | Treat it as a soft target with a <1 s measured release gate on supported fixtures/adapters. Require declared bounded storage units and report outliers; never cancel an ambiguous atomic write or hide its time. Forge's busy/transaction behavior needs its own bounded integration. |
-| OQ7. How should plain C and the original 2.99 s observation be compared? | Keep the original N/4 tool C unchanged and rerun both isolated/full-matrix contexts. Add a clearly labeled plain C supplement using the same content generator/seeds, N/2 two-message turns and 32 manifests; do not invent a historical plain-C baseline or compare its timing to tool C. |
-| OQ8. If import still misses by orders of magnitude, may the acceptance or migration timing change? | First profile bulk conversion and adapter validation under the same semantics. Keep Q3 lazy import and the current cap until the owner separately approves a one-time conversion budget or background migration. Those are product/spec decisions, not measured speedups. |
-
-These recommendations are proposed defaults for review. This document records
-no owner answers and authorizes no implementation by itself.
+| OQ1. Runtime prerequisite or adoption promise? | Accept phases independently; build P1/P2/P4, defer optional P3. Forge uses the fixed budgets in Owner Decisions and still needs real measurements. |
+| OQ2. Incremental projection policies/configuration? | Accept revisioned identity/conservative opt-ins, differential tests and complete fallback for general/global policies. Forge owns production policy integration. |
+| OQ3. Runtime lifetime/public snapshot fields? | No changes; additive opaque view and internal sharing. P3 is optional, retaining full materialization accounting. |
+| OQ4. P4 API/storage compatibility? | Accept coordinated pre-1.0 breaking release, explicit unsupported-storage refusal, constructors/default serde/migration documentation. |
+| OQ5. Cursor ownership/capacity? | Disposable engine-local cursor, 16 MiB additional workspace cap, separate from 128 MiB memo. Retain dirty data and report typed unsupported when unchanged work cannot fit; no endless successful restarts. |
+| OQ6. Is 250 ms universal? | Soft target; every measured collect call and gate hold must be <1 s. Declare bounded units, expose outliers and never cancel ambiguous atomic writes. |
+| OQ7. Plain C and old maximum? | Accepted default: original tool C unchanged; labeled N/2-turn C-plain-supplement, 32 manifests, fresh baseline, isolated/full-matrix contexts. |
+| OQ8. Import timing/migration? | Superseded: Forge background conversion removes first-open user wait; runtime import speed is non-gating. Keep correctness and diagnostic timings. |

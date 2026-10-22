@@ -188,6 +188,8 @@ pub fn canonical_journal_json<T: Serialize>(value: &T) -> Result<Vec<u8>, Runtim
 /// duplicate map keys (the value path widens/deduplicates them); memo sizing
 /// asserts equality with the full encoding in debug builds.
 pub(crate) fn canonical_journal_json_len<T: Serialize>(value: &T) -> Result<usize, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.encoding.canonical_journal_json_len");
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -200,6 +202,8 @@ pub(crate) fn canonical_journal_json_len<T: Serialize>(value: &T) -> Result<usiz
     }
     let mut count = Count(0);
     serde_json::to_writer(&mut count, value).map_err(|_| conflict())?;
+    #[cfg(feature = "test-support")]
+    crate::journal::profile::event("rt.work.canonical_length_bytes", 1, count.0 as u64);
     Ok(count.0)
 }
 

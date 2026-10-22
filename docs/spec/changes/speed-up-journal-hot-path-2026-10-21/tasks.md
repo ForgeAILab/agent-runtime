@@ -1,21 +1,22 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-22T01:05:48Z
+updated_at: 2026-10-22T04:11:39Z
 completed_at:
 ---
 
 # Implementation tasks after proposal approval
 
-All tasks are future work. This spec-only change implements none of them.
+Phase 0 is authorized by the owner. P1/P2/P4 are required future phases;
+P3 is deferred and not required for the Forge gate.
 Each phase requires its own before/after artifacts and acceptance; complete
 phase acceptance does not imply Forge D10 adoption readiness.
 
 ## 0. Bench and Instrumentation Prerequisite
 
-- [ ] 0.1 Record the v0.9.0 fixture/source hashes and generated-content fingerprints; preserve all three seeds, clock 100, scripts, word list, cache assertions and original C tool cadence.
-- [ ] 0.2 Add non-default core/runtime test-support and bench journal-profile feature wiring without copying the temporary dependency override or adding production bench dependencies.
-- [ ] 0.3 Add scoped async-safe observers with every supplied patch label/alias, writer builders, final authority, gate wait/hold, storage units, complete drains and memory/work counters from bench.md.
-- [ ] 0.4 Add the named ignored release target, N=100 smoke, A/B N=1000/4000 plain/tool, original C tool and separately approved/labeled C-plain-supplement coverage with fresh baselines.
+- [x] 0.1 Record the v0.9.0 fixture/source hashes and generated-content fingerprints; preserve all three seeds, clock 100, scripts, word list, cache assertions and original C tool cadence.
+- [x] 0.2 Add non-default core/runtime test-support and bench journal-profile feature wiring without copying the temporary dependency override or adding production bench dependencies.
+- [x] 0.3 Add scoped async-safe observers with every supplied patch label/alias, writer builders, final authority, gate wait/hold, storage units, complete drains and memory/work counters from bench.md.
+- [x] 0.4 Add the named ignored release target, N=100 smoke, A/B N=1000/4000 plain/tool, original C tool and separately approved/labeled C-plain-supplement coverage with fresh baselines.
 - [ ] 0.5 Capture frozen instrumented baselines and observer-off/calibration controls; directly attribute the 216/396 ms B writer remainder and import preparation before estimating their gains.
 - [ ] 0.6 Preserve full-matrix and isolated C contexts plus 100 unrelated/dirty-session diagnostics; record every raw run, failure, call maximum and missing metric.
 
@@ -38,7 +39,7 @@ phase acceptance does not imply Forge D10 adoption readiness.
 - [ ] 2.4 Add head/retirement/epoch races, release-and-recreate pin, writer-pin freeze, FromIndex/shared-object and zero-budget cases; prove pin-presence-only and ignored-epoch negative controls fail.
 - [ ] 2.5 Run all preserved collection/storage cases and P2 matrix; require zero warm closure body reads/old-edge validation and B collection time at most 30% of pre-P2 while reporting inventory/apply/purge separately.
 
-## 3. P3 Validated Writer-Open View
+## 3. P3 Validated Writer-Open View (Deferred / Optional)
 
 - [ ] 3.1 Add optional object-safe validated_writer_view with default decline, opaque immutable proof fields and a shared core canonical-encoding seam usable by the runtime writer.
 - [ ] 3.2 Initialize NativeDomain from canonical semantic/checkpoint/encoding views without materialize-then-re-derive; preserve projected ordinary id separation and exact candidate replacement behavior.
@@ -64,11 +65,19 @@ phase acceptance does not imply Forge D10 adoption readiness.
 - [ ] 5.3 Run the combined paired release bench at both sizes/shapes and N=100 diagnostics; publish JSON/JSONL/Markdown, fixture equality, per-phase/cumulative effects, memory/work charge and uncorrected timer overhead.
 - [ ] 5.4 Update runtime development/bench docs and CHANGELOG with exact P4 API/behavior breaks, any adapter metadata migration, remaining O(N) work and the measured limits; retain journal/checkpoint object schemas.
 - [ ] 5.5 Coordinate Smith/Nyx/Forge compatibility updates and immutable released-runtime prerequisite; Forge owns its policy/view forwarding and bounded-storage/D8 integration.
-- [ ] 5.6 Request a separate real Forge D10 rerun with unchanged seeds, production policy, L2, full cadence and all continuations; report every turn/import/write/disk/hold verdict and leave failed adoption gates blocked.
+- [ ] 5.6 Request a separate real Forge D10 rerun with unchanged seeds, production policy, L2, full cadence and all continuations; report every turn/write/disk/hold verdict and non-gating import diagnostic and leave failed adoption gates blocked.
+
+## Phase 0 Receipt
+
+Implemented 0.1–0.4. Tasks 0.5–0.6 remain open: raw A/B baselines and direct
+attribution are recorded, but the final instrumentation capture overlaps an
+uncancellable earlier diagnostic worker, and the required complete C replicate
+sets do not fit this run. No phase/adoption performance acceptance is claimed.
+See `/Volumes/Data/tmp/refactor/rt-hotpath-p0/report.md` for versioned evidence,
+missing metrics, process-control limits and the exact NOT MET list.
 
 ## Spec Validation Receipt
 
 The specification validation result and docs-only scope receipt are recorded in
-`/Volumes/Data/tmp/refactor/rt-hotpath-spec/report.md`. Runtime tests and
-benchmarks are intentionally future implementation tasks, not results of this
-spec-only work.
+`/Volumes/Data/tmp/refactor/rt-hotpath-spec/report.md`. Phase-0 implementation and verification are recorded in
+`/Volumes/Data/tmp/refactor/rt-hotpath-p0/report.md`; later phase checks remain future work.

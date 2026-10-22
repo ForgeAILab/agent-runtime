@@ -68,138 +68,142 @@ impl<S: JournalStorage> JournalEngine<S> {
         session: &SessionId,
         retirement: bool,
     ) -> Result<(Transition, Option<JournalSessionRecord>), RuntimeError> {
-        let stored = self.storage.load(&self.domain, session).await?;
-        let pins = self.storage.pins(&self.domain, session).await?;
-        let mut state = {
-            let local = self.local.lock()?;
-            if retirement {
-                // Cross-session durable state comes from the candidate index,
-                // not a clone of every cached session. All local leases must
-                // still participate in dependency/unresolved-intent checks.
-                let mut state = State {
-                    root_epoch: local.root_epoch,
-                    collection_enabled: local.collection_enabled,
-                    leases: local.leases.clone(),
-                    ..Default::default()
-                };
-                if let Some(record) = local.sessions.get(session) {
-                    state.sessions.insert(
-                        session.clone(),
-                        SessionRecord {
-                            active_writer: record.active_writer,
+        crate::journal_profile_scope!("rt.persistence.hydrate_state", {
+            let stored = self.storage.load(&self.domain, session).await?;
+            let pins = self.storage.pins(&self.domain, session).await?;
+            let mut state = {
+                let local = self.local.lock()?;
+                if retirement {
+                    // Cross-session durable state comes from the candidate index,
+                    // not a clone of every cached session. All local leases must
+                    // still participate in dependency/unresolved-intent checks.
+                    let mut state = State {
+                        root_epoch: local.root_epoch,
+                        collection_enabled: local.collection_enabled,
+                        leases: local.leases.clone(),
+                        ..Default::default()
+                    };
+                    if let Some(record) = local.sessions.get(session) {
+                        state.sessions.insert(
+                            session.clone(),
+                            SessionRecord {
+                                active_writer: record.active_writer,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    state
+                } else {
+                    local.clone()
+                }
+            };
+            state.objects = ObjectStore::default();
+            let previous = state.sessions.get(session).cloned().unwrap_or_default();
+            let mut record = SessionRecord {
+                active_writer: previous.active_writer,
+                ..Default::default()
+            };
+            if let Some(stored) = &stored {
+                let metadata: Metadata = decode(&stored.engine)?;
+                record.current = stored
+                    .head
+                    .as_ref()
+                    .map(|o| {
+                        Ok::<_, RuntimeError>((
+                            o.id.clone(),
+                            o.decode::<JournalHead>(JournalObjectKind::Head)?,
+                        ))
+                    })
+                    .transpose()?;
+                record.last_writer_epoch = stored.writer_epoch;
+                record.retirement = stored.retirement.clone();
+                record.checkpoint_floor = metadata.checkpoint_floor;
+                record.dependencies = metadata.dependencies;
+                if let Some(grant) = metadata.authorization {
+                    state
+                        .retirement_authorizations
+                        .insert(session.clone(), grant);
+                } else {
+                    state.retirement_authorizations.remove(session);
+                }
+                if previous.current == record.current {
+                    record.ordinary_snapshot = previous.ordinary_snapshot;
+                    record.ordinary_encoding = previous.ordinary_encoding;
+                    record.protected_snapshot = previous.protected_snapshot;
+                    record.protected_encoding = previous.protected_encoding;
+                    record.retained_heads = previous.retained_heads;
+                }
+                if let Some((root, _)) = &record.current {
+                    record
+                        .retained_heads
+                        .insert(root.clone(), record.dependencies.clone());
+                }
+            }
+            state.sessions.insert(session.clone(), record);
+            state.durable_pins.retain(|(s, _), _| s != session);
+            for pin in pins {
+                let metadata: PinMetadata = decode(&pin.engine)?;
+                state.durable_pins.insert(
+                    (session.clone(), pin.pin),
+                    DurablePin {
+                        memo_roots: metadata.memo_roots,
+                        reachable: ReachableSet::default(),
+                        roots: pin.roots.into_iter().collect(),
+                        writer_epochs: metadata.writer_epochs,
+                        blocks_retirement: pin.blocks_retirement,
+                        dependencies: DependencyRoots {
+                            sessions: metadata.dependencies.sessions,
+                            unresolved: metadata.dependencies.unresolved,
                             ..Default::default()
                         },
-                    );
-                }
-                state
-            } else {
-                local.clone()
-            }
-        };
-        state.objects = ObjectStore::default();
-        let previous = state.sessions.get(session).cloned().unwrap_or_default();
-        let mut record = SessionRecord {
-            active_writer: previous.active_writer,
-            ..Default::default()
-        };
-        if let Some(stored) = &stored {
-            let metadata: Metadata = decode(&stored.engine)?;
-            record.current = stored
-                .head
-                .as_ref()
-                .map(|o| {
-                    Ok::<_, RuntimeError>((
-                        o.id.clone(),
-                        o.decode::<JournalHead>(JournalObjectKind::Head)?,
-                    ))
-                })
-                .transpose()?;
-            record.last_writer_epoch = stored.writer_epoch;
-            record.retirement = stored.retirement.clone();
-            record.checkpoint_floor = metadata.checkpoint_floor;
-            record.dependencies = metadata.dependencies;
-            if let Some(grant) = metadata.authorization {
-                state
-                    .retirement_authorizations
-                    .insert(session.clone(), grant);
-            } else {
-                state.retirement_authorizations.remove(session);
-            }
-            if previous.current == record.current {
-                record.ordinary_snapshot = previous.ordinary_snapshot;
-                record.ordinary_encoding = previous.ordinary_encoding;
-                record.protected_snapshot = previous.protected_snapshot;
-                record.protected_encoding = previous.protected_encoding;
-                record.retained_heads = previous.retained_heads;
-            }
-            if let Some((root, _)) = &record.current {
-                record
-                    .retained_heads
-                    .insert(root.clone(), record.dependencies.clone());
-            }
-        }
-        state.sessions.insert(session.clone(), record);
-        state.durable_pins.retain(|(s, _), _| s != session);
-        for pin in pins {
-            let metadata: PinMetadata = decode(&pin.engine)?;
-            state.durable_pins.insert(
-                (session.clone(), pin.pin),
-                DurablePin {
-                    memo_roots: metadata.memo_roots,
-                    reachable: ReachableSet::default(),
-                    roots: pin.roots.into_iter().collect(),
-                    writer_epochs: metadata.writer_epochs,
-                    blocks_retirement: pin.blocks_retirement,
-                    dependencies: DependencyRoots {
-                        sessions: metadata.dependencies.sessions,
-                        unresolved: metadata.dependencies.unresolved,
-                        ..Default::default()
                     },
-                },
-            );
-        }
-        let mut scratch = self.local.clone();
-        scratch.state = Arc::new(Mutex::new(state));
-        scratch.cut = Arc::new(Mutex::new(None));
-        Ok((scratch, stored))
+                );
+            }
+            let mut scratch = self.local.clone();
+            scratch.state = Arc::new(Mutex::new(state));
+            scratch.cut = Arc::new(Mutex::new(None));
+            Ok((scratch, stored))
+        })
     }
     pub(super) async fn closure_objects(
         &self,
         session: &SessionId,
         root: &JournalObjectId,
     ) -> Result<BTreeMap<JournalObjectId, Vec<u8>>, RuntimeError> {
-        let mut objects = BTreeMap::new();
-        let mut pending = vec![(
-            root.clone(),
-            ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
-        )];
-        while !pending.is_empty() {
-            let batch = std::mem::take(&mut pending);
-            let batch: BTreeMap<_, _> = batch
-                .into_iter()
-                .filter(|(id, _)| !objects.contains_key(id))
-                .collect();
-            let ids: Vec<_> = batch.keys().cloned().collect();
-            if ids.is_empty() {
-                break;
-            }
-            let bodies = self.storage.objects(&self.domain, session, &ids).await?;
-            if bodies.len() != ids.len() {
-                return Err(conflict());
-            }
-            for ((id, expected), bytes) in batch.into_iter().zip(bodies) {
-                let object = JournalObject {
-                    id: id.clone(),
-                    bytes: bytes.ok_or_else(conflict)?.to_vec(),
-                };
-                if !expected_matches(expected, object.kind().map_err(invalid_state)?) {
-                    return Err(invalid_state(conflict()));
+        crate::journal_profile_scope!("rt.persistence.closure_objects", {
+            let mut objects = BTreeMap::new();
+            let mut pending = vec![(
+                root.clone(),
+                ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
+            )];
+            while !pending.is_empty() {
+                let batch = std::mem::take(&mut pending);
+                let batch: BTreeMap<_, _> = batch
+                    .into_iter()
+                    .filter(|(id, _)| !objects.contains_key(id))
+                    .collect();
+                let ids: Vec<_> = batch.keys().cloned().collect();
+                if ids.is_empty() {
+                    break;
                 }
-                pending.extend(object_links(&object, expected).map_err(invalid_state)?);
-                objects.insert(id, object.bytes);
+                let bodies = self.storage.objects(&self.domain, session, &ids).await?;
+                if bodies.len() != ids.len() {
+                    return Err(conflict());
+                }
+                for ((id, expected), bytes) in batch.into_iter().zip(bodies) {
+                    let object = JournalObject {
+                        id: id.clone(),
+                        bytes: bytes.ok_or_else(conflict)?.to_vec(),
+                    };
+                    if !expected_matches(expected, object.kind().map_err(invalid_state)?) {
+                        return Err(invalid_state(conflict()));
+                    }
+                    pending.extend(object_links(&object, expected).map_err(invalid_state)?);
+                    objects.insert(id, object.bytes);
+                }
             }
-        }
-        Ok(objects)
+            Ok(objects)
+        })
     }
     /// `DependencyRoots::validate` sees only sessions this process has
     /// loaded. Retirement tombstones are durable, so a restarted engine must
@@ -227,54 +231,56 @@ impl<S: JournalStorage> JournalEngine<S> {
         stored: Option<&JournalSessionRecord>,
         catalog: &mut BTreeMap<JournalObjectId, Option<CatalogMetadata>>,
     ) -> Result<(BTreeSet<JournalObjectId>, DependencyRoots), RuntimeError> {
-        let metadata: PinMetadata = decode(&pin.engine)?;
-        let mut dependencies = DependencyRoots {
-            sessions: metadata.dependencies.sessions,
-            unresolved: metadata.dependencies.unresolved,
-            ..Default::default()
-        };
-        let mut pending = pin.roots.clone();
-        if let Some(record) = stored {
-            if metadata.writer_epochs.contains(&record.writer_epoch) {
-                if let Some(head) = &record.head {
-                    // Issuing an epoch at open does not mean it published.
-                    // Only follow that epoch's own tip; selected roots are
-                    // already recorded in the pin.
-                    if head
-                        .decode::<JournalHead>(JournalObjectKind::Head)
-                        .map_err(invalid_state)?
-                        .writer_epoch
-                        == record.writer_epoch
-                    {
-                        pending.push(head.id.clone());
+        crate::journal_profile_scope!("rt.persistence.pin_roots", {
+            let metadata: PinMetadata = decode(&pin.engine)?;
+            let mut dependencies = DependencyRoots {
+                sessions: metadata.dependencies.sessions,
+                unresolved: metadata.dependencies.unresolved,
+                ..Default::default()
+            };
+            let mut pending = pin.roots.clone();
+            if let Some(record) = stored {
+                if metadata.writer_epochs.contains(&record.writer_epoch) {
+                    if let Some(head) = &record.head {
+                        // Issuing an epoch at open does not mean it published.
+                        // Only follow that epoch's own tip; selected roots are
+                        // already recorded in the pin.
+                        if head
+                            .decode::<JournalHead>(JournalObjectKind::Head)
+                            .map_err(invalid_state)?
+                            .writer_epoch
+                            == record.writer_epoch
+                        {
+                            pending.push(head.id.clone());
+                        }
                     }
                 }
             }
-        }
-        let mut roots = BTreeSet::new();
-        while let Some(root) = pending.pop() {
-            if !roots.insert(root.clone()) {
-                continue;
-            }
-            if !catalog.contains_key(&root) {
-                let entry = self.storage.catalog(&self.domain, session, &root).await?;
-                catalog.insert(
-                    root.clone(),
-                    entry.map(|entry| decode(&entry.engine)).transpose()?,
-                );
-            }
-            if let Some(entry) = &catalog[&root] {
-                dependencies.extend(&entry.dependencies);
-                if entry
-                    .writer_epoch
-                    .is_some_and(|epoch| metadata.writer_epochs.contains(&epoch))
-                {
-                    pending.extend(entry.previous.iter().cloned());
-                    pending.extend(entry.staged_roots.iter().cloned());
+            let mut roots = BTreeSet::new();
+            while let Some(root) = pending.pop() {
+                if !roots.insert(root.clone()) {
+                    continue;
+                }
+                if !catalog.contains_key(&root) {
+                    let entry = self.storage.catalog(&self.domain, session, &root).await?;
+                    catalog.insert(
+                        root.clone(),
+                        entry.map(|entry| decode(&entry.engine)).transpose()?,
+                    );
+                }
+                if let Some(entry) = &catalog[&root] {
+                    dependencies.extend(&entry.dependencies);
+                    if entry
+                        .writer_epoch
+                        .is_some_and(|epoch| metadata.writer_epochs.contains(&epoch))
+                    {
+                        pending.extend(entry.previous.iter().cloned());
+                        pending.extend(entry.staged_roots.iter().cloned());
+                    }
                 }
             }
-        }
-        Ok((roots, dependencies))
+            Ok((roots, dependencies))
+        })
     }
 
     async fn pin_closure(
@@ -283,37 +289,39 @@ impl<S: JournalStorage> JournalEngine<S> {
         root: &JournalObjectId,
         memo: &mut BTreeMap<JournalObjectId, BTreeSet<JournalObjectId>>,
     ) -> Result<(), RuntimeError> {
-        if memo.contains_key(root) {
-            return Ok(());
-        }
-        let body = self
-            .storage
-            .objects(&self.domain, session, std::slice::from_ref(root))
-            .await?;
-        if body.len() != 1 {
-            return Err(conflict());
-        }
-        let object = JournalObject {
-            id: root.clone(),
-            bytes: body
-                .into_iter()
-                .next()
-                .flatten()
-                .ok_or_else(conflict)?
-                .to_vec(),
-        };
-        let kind = object.kind().map_err(invalid_state)?;
-        let closure = if kind == JournalObjectKind::Head {
-            self.closure_objects(session, root)
-                .await?
-                .into_keys()
-                .collect()
-        } else {
-            validate_leaf(&object, kind).map_err(invalid_state)?;
-            [root.clone()].into()
-        };
-        memo.insert(root.clone(), closure);
-        Ok(())
+        crate::journal_profile_scope!("rt.persistence.pin_closure", {
+            if memo.contains_key(root) {
+                return Ok(());
+            }
+            let body = self
+                .storage
+                .objects(&self.domain, session, std::slice::from_ref(root))
+                .await?;
+            if body.len() != 1 {
+                return Err(conflict());
+            }
+            let object = JournalObject {
+                id: root.clone(),
+                bytes: body
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or_else(conflict)?
+                    .to_vec(),
+            };
+            let kind = object.kind().map_err(invalid_state)?;
+            let closure = if kind == JournalObjectKind::Head {
+                self.closure_objects(session, root)
+                    .await?
+                    .into_keys()
+                    .collect()
+            } else {
+                validate_leaf(&object, kind).map_err(invalid_state)?;
+                [root.clone()].into()
+            };
+            memo.insert(root.clone(), closure);
+            Ok(())
+        })
     }
 
     pub(super) async fn collection_live(
@@ -321,55 +329,57 @@ impl<S: JournalStorage> JournalEngine<S> {
         session: &SessionId,
         stored: Option<&JournalSessionRecord>,
     ) -> Result<(BTreeSet<JournalObjectId>, BTreeSet<SessionId>), RuntimeError> {
-        let unsupported = || {
-            RuntimeError::unsupported_capability(
-                crate::error::UnsupportedCapability::JournalCollection,
-            )
-        };
-        let mut live = BTreeSet::new();
-        let mut dependencies = BTreeSet::new();
-        let mut memo = BTreeMap::new();
-        let mut catalog = BTreeMap::new();
-        if let Some(stored) = stored {
-            let metadata: Metadata = decode(&stored.engine)?;
-            if stored.head.is_some() && metadata.dependencies.unresolved {
-                return Err(unsupported());
+        crate::journal_profile_scope!("rt.persistence.collection_live", {
+            let unsupported = || {
+                RuntimeError::unsupported_capability(
+                    crate::error::UnsupportedCapability::JournalCollection,
+                )
+            };
+            let mut live = BTreeSet::new();
+            let mut dependencies = BTreeSet::new();
+            let mut memo = BTreeMap::new();
+            let mut catalog = BTreeMap::new();
+            if let Some(stored) = stored {
+                let metadata: Metadata = decode(&stored.engine)?;
+                if stored.head.is_some() && metadata.dependencies.unresolved {
+                    return Err(unsupported());
+                }
+                if stored.head.is_some() {
+                    dependencies.extend(metadata.dependencies.sessions);
+                }
+                if let Some(root) = &stored.head {
+                    let closure: BTreeSet<_> = self
+                        .closure_objects(session, &root.id)
+                        .await?
+                        .into_keys()
+                        .collect();
+                    live.extend(closure.iter().cloned());
+                    memo.insert(root.id.clone(), closure);
+                }
             }
-            if stored.head.is_some() {
-                dependencies.extend(metadata.dependencies.sessions);
+            for pin in self.storage.pins(&self.domain, session).await? {
+                let (roots, indexed) = self.pin_roots(session, &pin, stored, &mut catalog).await?;
+                if indexed.unresolved {
+                    return Err(unsupported());
+                }
+                dependencies.extend(indexed.sessions);
+                for root in roots {
+                    self.pin_closure(session, &root, &mut memo).await?;
+                    live.extend(memo[&root].iter().cloned());
+                }
             }
-            if let Some(root) = &stored.head {
-                let closure: BTreeSet<_> = self
-                    .closure_objects(session, &root.id)
-                    .await?
-                    .into_keys()
-                    .collect();
-                live.extend(closure.iter().cloned());
-                memo.insert(root.id.clone(), closure);
+            let local = self.local.lock()?;
+            for lease in local
+                .leases
+                .values()
+                .filter(|lease| &lease.session == session)
+            {
+                for layer in &lease.reachable.layers {
+                    live.extend(layer.iter().cloned());
+                }
             }
-        }
-        for pin in self.storage.pins(&self.domain, session).await? {
-            let (roots, indexed) = self.pin_roots(session, &pin, stored, &mut catalog).await?;
-            if indexed.unresolved {
-                return Err(unsupported());
-            }
-            dependencies.extend(indexed.sessions);
-            for root in roots {
-                self.pin_closure(session, &root, &mut memo).await?;
-                live.extend(memo[&root].iter().cloned());
-            }
-        }
-        let local = self.local.lock()?;
-        for lease in local
-            .leases
-            .values()
-            .filter(|lease| &lease.session == session)
-        {
-            for layer in &lease.reachable.layers {
-                live.extend(layer.iter().cloned());
-            }
-        }
-        Ok((live, dependencies))
+            Ok((live, dependencies))
+        })
     }
 
     /// Before a source becomes clean, persist it as a candidate on every
@@ -381,23 +391,25 @@ impl<S: JournalStorage> JournalEngine<S> {
         dependencies: BTreeSet<SessionId>,
         failures: &mut super::controls::CollectionFailures,
     ) -> Result<bool, RuntimeError> {
-        for target in dependencies {
-            if &target == source {
-                continue;
-            }
-            if !failures.skipped.contains(&target) {
-                let result = self.index_retirement_dependency(source, &target).await;
-                failures.isolate(&target, result)?;
-            }
-            if failures.skipped.contains(&target) {
-                failures.skipped.insert(source.clone());
-                if failures.unreadable.contains(&target) {
-                    failures.unreadable.insert(source.clone());
+        crate::journal_profile_scope!("rt.collection.dependencies", {
+            for target in dependencies {
+                if &target == source {
+                    continue;
                 }
-                return Ok(false);
+                if !failures.skipped.contains(&target) {
+                    let result = self.index_retirement_dependency(source, &target).await;
+                    failures.isolate(&target, result)?;
+                }
+                if failures.skipped.contains(&target) {
+                    failures.skipped.insert(source.clone());
+                    if failures.unreadable.contains(&target) {
+                        failures.unreadable.insert(source.clone());
+                    }
+                    return Ok(false);
+                }
             }
-        }
-        Ok(true)
+            Ok(true)
+        })
     }
 
     async fn index_retirement_dependency(
@@ -588,6 +600,8 @@ impl<S: JournalStorage> JournalEngine<S> {
         stored: Option<&JournalSessionRecord>,
         kind: JournalWriteKind,
     ) -> Result<JournalWrite, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.persistence.write");
         let state = scratch.lock()?;
         let record = state.sessions.get(session).ok_or_else(conflict)?;
         let metadata = Metadata {
@@ -649,21 +663,23 @@ impl<S: JournalStorage> JournalEngine<S> {
         write: JournalWrite,
         session: &SessionId,
     ) -> Result<JournalApplyReceipt, RuntimeError> {
-        // Even a lost acknowledgement may have released membership. Preserve
-        // unaffected validation evidence, trimming only released cache bodies.
-        if !write.release.is_empty() {
-            self.memo
-                .lock()
-                .map_err(|_| host_failure())?
-                .release(session, &write.release);
-        }
-        match self.storage.apply(write).await {
-            Ok(receipt) => Ok(receipt),
-            Err(error) => {
-                self.invalidate(session)?;
-                Err(error)
+        crate::journal_profile_scope!("rt.engine.storage_apply", {
+            // Even a lost acknowledgement may have released membership. Preserve
+            // unaffected validation evidence, trimming only released cache bodies.
+            if !write.release.is_empty() {
+                self.memo
+                    .lock()
+                    .map_err(|_| host_failure())?
+                    .release(session, &write.release);
             }
-        }
+            match self.storage.apply(write).await {
+                Ok(receipt) => Ok(receipt),
+                Err(error) => {
+                    self.invalidate(session)?;
+                    Err(error)
+                }
+            }
+        })
     }
     fn invalidate(&self, session: &SessionId) -> Result<(), RuntimeError> {
         self.memo
@@ -688,6 +704,8 @@ impl<S: JournalStorage> JournalEngine<S> {
         writer_handle: Option<u64>,
         advance_epoch: bool,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.persistence.publish");
         let prepared = scratch.lock()?;
         let mut local = self.local.lock()?;
         let mut record = prepared
@@ -742,268 +760,270 @@ impl<S: JournalStorage> JournalEngine<S> {
         lease: &JournalLease,
         commit: Box<JournalCommit>,
     ) -> Result<JournalHead, RuntimeError> {
-        let _gate = self.write_gate().await;
-        // Same order as the reference transition: only a live writer may reach
-        // the idempotency index, even for an identical replay.
-        if self
-            .local
-            .live_lease(&*self.local.lock()?, lease)?
-            .writer_epoch
-            .is_none()
-        {
-            return Err(conflict());
-        }
-        self.local.validate_commit_request(lease, &commit)?;
-        if let Some(existing) = self
-            .storage
-            .operation(&self.domain, lease.session(), &commit.batch.operation)
-            .await?
-        {
-            return if existing.digest == commit.digest {
-                Ok(existing.result)
-            } else {
-                Err(conflict())
-            };
-        }
-        let (scratch, stored) = self.hydrate(lease.session()).await?;
-        let lease_record = self.local.live_lease(&*self.local.lock()?, lease)?;
-        // Only the stored head's closure is guaranteed membership (D4). Cached
-        // bodies outside it may have been released by another engine; any
-        // the new head references are rechecked before the write below.
-        let (mut objects, verified) = match stored.as_ref().and_then(|record| record.head.as_ref())
-        {
-            Some(root) => match self.memoized_root(lease.session(), &root.id)? {
-                Some(entry) => (entry.objects.clone(), Some(entry.closure.clone())),
-                None => (ObjectStore::default(), None),
-            },
-            None => (ObjectStore::default(), None),
-        };
-        let ids: Vec<_> = lease_record
-            .reachable
-            .layers
-            .iter()
-            .flat_map(|layer| layer.iter().cloned())
-            .filter(|id| objects.get(id).is_none())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let fetched: BTreeSet<_> = ids.iter().cloned().collect();
-        if !ids.is_empty() {
-            let bodies = self
-                .storage
-                .objects(&self.domain, lease.session(), &ids)
-                .await?;
-            if bodies.len() != ids.len() {
+        crate::journal_profile_scope!("rt.persistence.commit_inner", {
+            let _gate = self.write_gate().await;
+            #[cfg(feature = "test-support")]
+            let _profile_gate = crate::journal::profile::timer("rt.gate.hold");
+            // Same order as the reference transition: only a live writer may reach
+            // the idempotency index, even for an identical replay.
+            if self
+                .local
+                .live_lease(&*self.local.lock()?, lease)?
+                .writer_epoch
+                .is_none()
+            {
                 return Err(conflict());
             }
-            objects.begin_layer();
-            for (id, body) in ids.into_iter().zip(bodies) {
-                objects.insert_new(id, body.ok_or_else(conflict)?.to_vec())?;
-            }
-        }
-        scratch.lock()?.objects = objects;
-        // A storage error invalidates cached records. On a cold ordinary
-        // record, recover the projected base from its immutable published root
-        // before replaying an advisory transition delta.
-        if self.domain.role == JournalRole::Ordinary {
-            let mut state = scratch.lock()?;
-            let record = state.sessions.get(lease.session()).ok_or_else(conflict)?;
-            if record.ordinary_snapshot.is_none() {
-                if let Some((root, head)) = &record.current {
-                    let closure = reachable_closure(&state.objects, root, None, None)?;
-                    let snapshot = materialize_staged_snapshot(
-                        &self.domain.storage_id,
-                        head,
-                        &state.objects,
-                        &closure,
-                        &ReachableSet::default(),
-                    )?;
-                    let mut assembler = ObjectAssembler::default();
-                    let encoding = assembler
-                        .snapshot_cached(
-                            &snapshot,
-                            head.snapshot.planned_step_count,
-                            None,
-                            None,
-                            None,
-                        )
-                        .ok()
-                        .filter(|(roots, _)| roots == &head.snapshot)
-                        .map(|(_, encoding)| Arc::new(encoding));
-                    let record = state
-                        .sessions
-                        .get_mut(lease.session())
-                        .ok_or_else(conflict)?;
-                    record.ordinary_snapshot = Some(Arc::new(snapshot));
-                    record.ordinary_encoding = encoding;
-                }
-            }
-        }
-        let operation = commit.batch.operation.clone();
-        let digest = commit.digest.clone();
-        let head = match scratch.commit(lease, *commit) {
-            Ok(head) => head,
-            Err(error) => {
-                // The original cut precedes any validation error discovered
-                // later in preparation. Nothing has been written in this case.
-                if scratch.cut.lock().map_err(|_| host_failure())?.is_some() {
-                    return Err(injected_failure());
-                }
-                return Err(error);
-            }
-        };
-        let dependencies = scratch
-            .lock()?
-            .sessions
-            .get(lease.session())
-            .ok_or_else(conflict)?
-            .dependencies
-            .sessions
-            .clone();
-        let (root, entry) = self.commit_memo_entry(&scratch, lease.session())?;
-        // A body already in `objects` is never rewritten. Each one the new
-        // head references outside the stored closure must still be a member.
-        let unverified: Vec<_> = match &verified {
-            Some(closure) => {
-                let state = scratch.lock()?;
-                let written = state.objects.layers.last().ok_or_else(conflict)?;
-                entry
-                    .closure
-                    .iter()
-                    .filter(|id| {
-                        !closure.contains(*id)
-                            && !fetched.contains(*id)
-                            && !written.contains_key(*id)
-                    })
-                    .cloned()
-                    .collect()
-            }
-            None => Vec::new(),
-        };
-        let released = !unverified.is_empty() && {
-            let bodies = self
+            self.local.validate_commit_request(lease, &commit)?;
+            if let Some(existing) = self
                 .storage
-                .objects(&self.domain, lease.session(), &unverified)
-                .await?;
-            bodies.len() != unverified.len() || bodies.iter().any(Option::is_none)
-        };
-        if released || self.retired_dependency(&dependencies).await? {
-            // The reference validates dependencies after the batch cut and
-            // before the pin cut: an earlier cut wins, a later one stays armed.
-            let cut = scratch.cut.lock().map_err(|_| host_failure())?.take();
-            return match cut {
-                Some(
-                    JournalCommitFailurePoint::AfterObjects
-                    | JournalCommitFailurePoint::AfterCheckpoint
-                    | JournalCommitFailurePoint::AfterBatch,
-                ) => Err(injected_failure()),
-                Some(later) => {
-                    let mut armed = self.local.failure.lock().map_err(|_| host_failure())?;
-                    if armed.is_none() {
-                        *armed = Some(later);
-                    }
+                .operation(&self.domain, lease.session(), &commit.batch.operation)
+                .await?
+            {
+                return if existing.digest == commit.digest {
+                    Ok(existing.result)
+                } else {
                     Err(conflict())
-                }
-                None => Err(conflict()),
-            };
-        }
-        let mut write = self.write(
-            &scratch,
-            lease.session(),
-            stored.as_ref(),
-            JournalWriteKind::Commit,
-        )?;
-        {
-            let state = scratch.lock()?;
-            let layer = state.objects.layers.last().ok_or_else(conflict)?;
-            write.objects.objects = layer
+                };
+            }
+            let (scratch, stored) = self.hydrate(lease.session()).await?;
+            let lease_record = self.local.live_lease(&*self.local.lock()?, lease)?;
+            // Only the stored head's closure is guaranteed membership (D4). Cached
+            // bodies outside it may have been released by another engine; any
+            // the new head references are rechecked before the write below.
+            let (mut objects, verified) =
+                match stored.as_ref().and_then(|record| record.head.as_ref()) {
+                    Some(root) => match self.memoized_root(lease.session(), &root.id)? {
+                        Some(entry) => (entry.objects.clone(), Some(entry.closure.clone())),
+                        None => (ObjectStore::default(), None),
+                    },
+                    None => (ObjectStore::default(), None),
+                };
+            let ids: Vec<_> = lease_record
+                .reachable
+                .layers
                 .iter()
-                .map(|(id, b)| {
-                    let object = JournalObject {
-                        id: id.clone(),
-                        bytes: b.as_ref().clone(),
-                    };
-                    Ok(JournalStoredObject {
-                        id: id.clone(),
-                        kind: object.kind()?,
-                        bytes: Arc::from(object.bytes),
-                    })
-                })
-                .collect::<Result<Vec<_>, RuntimeError>>()?;
-            let root = write.record.head.as_ref().ok_or_else(conflict)?.id.clone();
-            let deps = &state.sessions[lease.session()].dependencies;
-            write
-                .catalog
-                .push(JournalCatalogChange::Put(JournalCatalogEntry {
-                    head: root,
-                    engine: encode(&CatalogMetadata {
-                        dependencies: deps.clone(),
-                        previous: stored
-                            .as_ref()
-                            .and_then(|record| record.head.as_ref())
-                            .map(|head| head.id.clone()),
-                        writer_epoch: Some(head.writer_epoch),
-                        staged_roots: lease_record.staged_roots.clone(),
-                    })?,
-                }));
-        }
-        write.operation = Some(JournalOperationRecord {
-            operation,
-            digest,
-            revision: head.revision,
-            result: head.clone(),
-        });
-        write.inject = scratch.cut.lock().map_err(|_| host_failure())?.take();
-        let after_commit = write.inject == Some(JournalCommitFailurePoint::AfterCommit);
-        let injected_before_commit = write.inject.is_some() && !after_commit;
-        let operation = write.operation.as_ref().ok_or_else(conflict)?.clone();
-        let applied = self.apply(write, lease.session()).await;
-        let acknowledged_on_reload = if applied.is_err() && !injected_before_commit && !after_commit
-        {
-            self.storage
-                .operation(&self.domain, lease.session(), &operation.operation)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|record| record == operation)
-        } else {
-            false
-        };
-        if applied.is_ok() || after_commit || acknowledged_on_reload {
-            self.publish(
+                .flat_map(|layer| layer.iter().cloned())
+                .filter(|id| objects.get(id).is_none())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let fetched: BTreeSet<_> = ids.iter().cloned().collect();
+            if !ids.is_empty() {
+                let bodies = self
+                    .storage
+                    .objects(&self.domain, lease.session(), &ids)
+                    .await?;
+                if bodies.len() != ids.len() {
+                    return Err(conflict());
+                }
+                objects.begin_layer();
+                for (id, body) in ids.into_iter().zip(bodies) {
+                    objects.insert_new(id, body.ok_or_else(conflict)?.to_vec())?;
+                }
+            }
+            scratch.lock()?.objects = objects;
+            // A storage error invalidates cached records. On a cold ordinary
+            // record, recover the projected base from its immutable published root
+            // before replaying an advisory transition delta.
+            if self.domain.role == JournalRole::Ordinary {
+                let mut state = scratch.lock()?;
+                let record = state.sessions.get(lease.session()).ok_or_else(conflict)?;
+                if record.ordinary_snapshot.is_none() {
+                    if let Some((root, head)) = &record.current {
+                        let closure = reachable_closure(&state.objects, root, None, None)?;
+                        let snapshot = materialize_staged_snapshot(
+                            &self.domain.storage_id,
+                            head,
+                            &state.objects,
+                            &closure,
+                            &ReachableSet::default(),
+                        )?;
+                        let mut assembler = ObjectAssembler::default();
+                        let encoding = assembler
+                            .snapshot_cached(
+                                &snapshot,
+                                head.snapshot.planned_step_count,
+                                None,
+                                None,
+                                None,
+                            )
+                            .ok()
+                            .filter(|(roots, _)| roots == &head.snapshot)
+                            .map(|(_, encoding)| Arc::new(encoding));
+                        let record = state
+                            .sessions
+                            .get_mut(lease.session())
+                            .ok_or_else(conflict)?;
+                        record.ordinary_snapshot = Some(Arc::new(snapshot));
+                        record.ordinary_encoding = encoding;
+                    }
+                }
+            }
+            let operation = commit.batch.operation.clone();
+            let digest = commit.digest.clone();
+            let head = match scratch.commit(lease, *commit) {
+                Ok(head) => head,
+                Err(error) => {
+                    // The original cut precedes any validation error discovered
+                    // later in preparation. Nothing has been written in this case.
+                    if scratch.cut.lock().map_err(|_| host_failure())?.is_some() {
+                        return Err(injected_failure());
+                    }
+                    return Err(error);
+                }
+            };
+            let dependencies = scratch
+                .lock()?
+                .sessions
+                .get(lease.session())
+                .ok_or_else(conflict)?
+                .dependencies
+                .sessions
+                .clone();
+            let (root, entry) = self.commit_memo_entry(&scratch, lease.session())?;
+            // A body already in `objects` is never rewritten. Each one the new
+            // head references outside the stored closure must still be a member.
+            let unverified: Vec<_> = match &verified {
+                Some(closure) => {
+                    let state = scratch.lock()?;
+                    let written = state.objects.layers.last().ok_or_else(conflict)?;
+                    entry
+                        .closure
+                        .iter()
+                        .filter(|id| {
+                            !closure.contains(*id)
+                                && !fetched.contains(*id)
+                                && !written.contains_key(*id)
+                        })
+                        .cloned()
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            let released = !unverified.is_empty() && {
+                let bodies = self
+                    .storage
+                    .objects(&self.domain, lease.session(), &unverified)
+                    .await?;
+                bodies.len() != unverified.len() || bodies.iter().any(Option::is_none)
+            };
+            if released || self.retired_dependency(&dependencies).await? {
+                // The reference validates dependencies after the batch cut and
+                // before the pin cut: an earlier cut wins, a later one stays armed.
+                let cut = scratch.cut.lock().map_err(|_| host_failure())?.take();
+                return match cut {
+                    Some(
+                        JournalCommitFailurePoint::AfterObjects
+                        | JournalCommitFailurePoint::AfterCheckpoint
+                        | JournalCommitFailurePoint::AfterBatch,
+                    ) => Err(injected_failure()),
+                    Some(later) => {
+                        let mut armed = self.local.failure.lock().map_err(|_| host_failure())?;
+                        if armed.is_none() {
+                            *armed = Some(later);
+                        }
+                        Err(conflict())
+                    }
+                    None => Err(conflict()),
+                };
+            }
+            let mut write = self.write(
                 &scratch,
                 lease.session(),
-                None,
-                Some(self.local.token(lease)?.handle),
-                true,
+                stored.as_ref(),
+                JournalWriteKind::Commit,
             )?;
-            // A busy session retains its current proof plus proofs selected by
-            // live leases or durable pins, rather than every superseded head.
-            if let Some(previous) = stored.as_ref().and_then(|r| r.head.as_ref()) {
-                let state = self.local.lock()?;
-                let head: JournalHead = previous.decode(JournalObjectKind::Head)?;
-                let held = state.leases.values().any(|lease| {
-                    lease.session == head.session && lease.selected_head.as_ref() == Some(&head)
-                }) || scratch
-                    .lock()?
-                    .durable_pins
+            {
+                let state = scratch.lock()?;
+                let layer = state.objects.layers.last().ok_or_else(conflict)?;
+                write.objects.objects = layer
                     .iter()
-                    .any(|((session, _), pin)| {
-                        session == &head.session && pin.roots.contains(&previous.id)
-                    });
-                drop(state);
-                if !held {
-                    self.memo
-                        .lock()
-                        .map_err(|_| host_failure())?
-                        .remove_root(lease.session(), &previous.id);
-                }
+                    .map(|(id, b)| {
+                        let object = JournalObject {
+                            id: id.clone(),
+                            bytes: b.as_ref().clone(),
+                        };
+                        Ok(JournalStoredObject {
+                            id: id.clone(),
+                            kind: object.kind()?,
+                            bytes: Arc::from(object.bytes),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+                let root = write.record.head.as_ref().ok_or_else(conflict)?.id.clone();
+                let deps = &state.sessions[lease.session()].dependencies;
+                write
+                    .catalog
+                    .push(JournalCatalogChange::Put(JournalCatalogEntry {
+                        head: root,
+                        engine: encode(&CatalogMetadata {
+                            dependencies: deps.clone(),
+                            previous: stored
+                                .as_ref()
+                                .and_then(|record| record.head.as_ref())
+                                .map(|head| head.id.clone()),
+                            writer_epoch: Some(head.writer_epoch),
+                            staged_roots: lease_record.staged_roots.clone(),
+                        })?,
+                    }));
             }
-            self.remember_root(lease.session(), &root, entry)?;
-            self.mark_dirty(lease.session())?;
-        }
-        applied?;
-        Ok(head)
+            write.operation = Some(JournalOperationRecord {
+                operation,
+                digest,
+                revision: head.revision,
+                result: head.clone(),
+            });
+            write.inject = scratch.cut.lock().map_err(|_| host_failure())?.take();
+            let after_commit = write.inject == Some(JournalCommitFailurePoint::AfterCommit);
+            let injected_before_commit = write.inject.is_some() && !after_commit;
+            let operation = write.operation.as_ref().ok_or_else(conflict)?.clone();
+            let applied = self.apply(write, lease.session()).await;
+            let acknowledged_on_reload =
+                if applied.is_err() && !injected_before_commit && !after_commit {
+                    self.storage
+                        .operation(&self.domain, lease.session(), &operation.operation)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|record| record == operation)
+                } else {
+                    false
+                };
+            if applied.is_ok() || after_commit || acknowledged_on_reload {
+                self.publish(
+                    &scratch,
+                    lease.session(),
+                    None,
+                    Some(self.local.token(lease)?.handle),
+                    true,
+                )?;
+                // A busy session retains its current proof plus proofs selected by
+                // live leases or durable pins, rather than every superseded head.
+                if let Some(previous) = stored.as_ref().and_then(|r| r.head.as_ref()) {
+                    let state = self.local.lock()?;
+                    let head: JournalHead = previous.decode(JournalObjectKind::Head)?;
+                    let held = state.leases.values().any(|lease| {
+                        lease.session == head.session && lease.selected_head.as_ref() == Some(&head)
+                    }) || scratch.lock()?.durable_pins.iter().any(
+                        |((session, _), pin)| {
+                            session == &head.session && pin.roots.contains(&previous.id)
+                        },
+                    );
+                    drop(state);
+                    if !held {
+                        self.memo
+                            .lock()
+                            .map_err(|_| host_failure())?
+                            .remove_root(lease.session(), &previous.id);
+                    }
+                }
+                self.remember_root(lease.session(), &root, entry)?;
+                self.mark_dirty(lease.session())?;
+            }
+            applied?;
+            Ok(head)
+        })
     }
 }
 /// `fenced_head` is the stored head this write's `expect` fence observed.

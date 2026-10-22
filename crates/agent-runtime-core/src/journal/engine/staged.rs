@@ -36,7 +36,10 @@ impl SessionJournal for StagedClosure<'_> {
         if !self.closure.contains(object) && !self.trusted.contains(object) {
             return Err(conflict());
         }
-        self.objects.get(object).cloned().ok_or_else(conflict)
+        let bytes = self.objects.get(object).cloned().ok_or_else(conflict)?;
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.validation_body_bytes", 1, bytes.len() as u64);
+        Ok(bytes)
     }
 
     async fn commit(
@@ -79,6 +82,8 @@ pub(in crate::journal) fn materialize_staged_checkpoint(
     trusted: &ReachableSet,
     snapshot: SessionSnapshot,
 ) -> Result<(), RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.staged.materialize_staged_checkpoint");
     let view = StagedClosure {
         storage_id,
         objects,
@@ -117,6 +122,8 @@ pub(in crate::journal) fn materialize_staged_snapshot(
     closure: &BTreeSet<JournalObjectId>,
     trusted: &ReachableSet,
 ) -> Result<SessionSnapshot, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.staged.materialize_staged_snapshot");
     let view = StagedClosure {
         storage_id,
         objects,

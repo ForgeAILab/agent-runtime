@@ -217,3 +217,42 @@ pub mod prelude {
     pub use crate::tool::{SealedToolRegistry, SecurityConfig, ToolExecutor, ToolRegistry};
     pub use agent_runtime_core::prelude::*;
 }
+
+// Disabled expansions preserve the original body, including return/await boundaries.
+#[cfg(not(feature = "test-support"))]
+macro_rules! journal_profile_scope {
+    ($label:expr, $body:block) => {
+        $body
+    };
+}
+#[cfg(feature = "test-support")]
+macro_rules! journal_profile_scope {
+    ($label:expr, $body:block) => { agent_runtime_core::journal::profile::instrument($label, Box::pin(async $body)).await };
+}
+#[cfg(not(feature = "test-support"))]
+macro_rules! journal_profile_sync {
+    ($label:expr, $body:block) => {
+        $body
+    };
+}
+#[cfg(feature = "test-support")]
+macro_rules! journal_profile_sync {
+    ($label:expr, $body:block) => {
+        agent_runtime_core::journal::profile::synchronous($label, || $body)
+    };
+}
+
+#[cfg(not(feature = "test-support"))]
+macro_rules! journal_profile_inherit {
+    ($future:expr) => {
+        $future
+    };
+}
+#[cfg(feature = "test-support")]
+macro_rules! journal_profile_inherit {
+    ($future:expr) => {
+        agent_runtime_core::journal::profile::inherit(Box::pin($future))
+    };
+}
+
+pub(crate) use {journal_profile_inherit, journal_profile_scope, journal_profile_sync};

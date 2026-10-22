@@ -481,6 +481,20 @@ impl TurnCheckpoint {
 
     /// Validates schema compatibility, identity, and operation fingerprints.
     pub fn validate(&self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.checkpoint.validate");
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.checkpoint_root_fields_considered", 14, 0);
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            "rt.work.checkpoint_snapshot_records",
+            (self.snapshot.history.len()
+                + self.snapshot.usage.records().len()
+                + self.snapshot.manifests.len()
+                + self.snapshot.extension_state.len()) as u64,
+            0,
+        );
+
         if self.schema_version != CHECKPOINT_SCHEMA_VERSION {
             return Err(RuntimeError::conflict(format!(
                 "unsupported checkpoint schema {}; expected {}",
@@ -929,6 +943,9 @@ pub(super) fn checkpoint_operation_fingerprint(
     internal_input: Option<&InternalTurnInput>,
     visible_output: bool,
 ) -> Fingerprint {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.checkpoint.fingerprint");
+
     let mut hasher = FingerprintHasher::new();
     hasher
         .field("turn_checkpoint_operation")

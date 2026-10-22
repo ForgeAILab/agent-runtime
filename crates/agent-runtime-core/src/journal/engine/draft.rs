@@ -308,6 +308,10 @@ impl<'a> DraftReader<'a> {
         &self,
         id: &JournalObjectId,
     ) -> Result<crate::store::TurnManifest, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.draft.manifest");
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.manifest_decoded", 1, 0);
         let reference: ReferencedTurnManifest =
             self.object(id, JournalObjectKind::ManifestReference)?;
         let value = self.json_value(&reference.value, 0)?;

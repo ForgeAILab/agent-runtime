@@ -41,6 +41,9 @@ impl HistoryGenerations {
     }
 
     pub(crate) fn capture(&mut self, history: &[Message]) -> Arc<HistoryGeneration> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.history_capture");
         let previous = self.current.as_ref();
         if let Some(previous) = previous {
             if messages_match(&previous.history, history) {

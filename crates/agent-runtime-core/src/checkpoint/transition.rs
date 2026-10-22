@@ -571,10 +571,22 @@ impl TurnState {
     /// Fingerprint of the external operation or committed state represented by
     /// this state. It is stable across process restarts.
     pub fn operation_fingerprint(&self) -> Fingerprint {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.checkpoint.state_fingerprint");
+
         Fingerprint::of_fields([
             b"turn_state_operation".as_slice(),
             TURN_TRANSITION_REVISION.to_string().as_bytes(),
-            &serde_json::to_vec(self).unwrap_or_default(),
+            &{
+                let encoded = serde_json::to_vec(self).unwrap_or_default();
+                #[cfg(feature = "test-support")]
+                crate::journal::profile::event(
+                    "rt.work.checkpoint_fingerprint_bytes",
+                    1,
+                    encoded.len() as u64,
+                );
+                encoded
+            },
         ])
     }
 

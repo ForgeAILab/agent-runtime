@@ -63,7 +63,7 @@ N=100 and isolated/full-matrix C diagnostics remain required.
 
 ### Requirement: Each journal phase has independent numeric and structural acceptance
 
-P1–P4 SHALL satisfy the phase-specific numeric, work, correctness and regression
+Required P1/P2/P4 and, if implemented, optional deferred P3 SHALL satisfy the phase-specific numeric, work, correctness and regression
 criteria in bench.md at the required sizes/shapes. Estimates in design.md are
 conditional planning evidence; the report MUST distinguish measurements,
 acceptance thresholds, unsupported/fallback cases and unmet criteria.
@@ -102,7 +102,7 @@ Reports SHALL include the configured 128 MiB per-engine comparison memo budget,
 memo/work/cursor/cache metrics, per-operation timings, maxima and calibration
 specified in bench.md. They MUST distinguish estimated charge, allocator heap
 and process memory, report unavailable metrics as unavailable, and preserve the
-unchanged Forge D10 denominators and verdicts.
+Forge D10 denominators and the owner-approved fixed budgets in design.md.
 
 #### Scenario: A shared proof or collection cursor is retained
 
@@ -111,9 +111,9 @@ unchanged Forge D10 denominators and verdicts.
 - **AND** leaked superseded versions or uncharged unbounded cursors fail acceptance
 - **AND** RSS or canonical byte charge is not labeled measured memo heap
 
-#### Scenario: Runtime acceptance passes while consumer import is slow
+#### Scenario: Runtime acceptance passes while consumer turn overhead is too high
 
 - **WHEN** evaluating the final combined result
-- **THEN** the report includes the design's arithmetic against Forge turn/import/collection/write/disk gates
+- **THEN** the report includes the design's arithmetic against Forge fixed turn-overhead/collection/write/disk gates and non-gating import diagnostics
 - **AND** it states remaining failures and further work rather than changing workload, denominator, projection or threshold
 - **AND** a modeled runtime adapter is not described as Forge's real encrypted storage

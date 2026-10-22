@@ -312,6 +312,9 @@ pub(crate) fn validate_legacy_import_records(
     flat_summary: bool,
     lcm: Option<&LcmCoordinator>,
 ) -> Result<(), RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = agent_runtime_core::journal::profile::enter_sync("rt.runtime.import_validation");
+
     fn validate_strategy_namespaces(
         snapshot: &SessionSnapshot,
         flat_summary: bool,
@@ -1358,16 +1361,18 @@ impl Runtime {
         &self,
         request: StartSession,
     ) -> Result<SessionHandle, RuntimeError> {
-        if request.mode == StartSessionMode::Ephemeral {
-            let mut shared = (*self.shared).clone();
-            shared.driver = shared.driver.without_persistence();
-            shared.session_store = None;
-            shared.checkpoint_store = None;
-            return Self::from_shared(Arc::new(shared))
-                .start_session_with_parent(request, None, false)
-                .await;
-        }
-        self.start_session_with_parent(request, None, false).await
+        crate::journal_profile_scope!("rt.runtime.start_session", {
+            if request.mode == StartSessionMode::Ephemeral {
+                let mut shared = (*self.shared).clone();
+                shared.driver = shared.driver.without_persistence();
+                shared.session_store = None;
+                shared.checkpoint_store = None;
+                return Self::from_shared(Arc::new(shared))
+                    .start_session_with_parent(request, None, false)
+                    .await;
+            }
+            self.start_session_with_parent(request, None, false).await
+        })
     }
 
     /// Starts a delegated child session attributed to `parent`.
@@ -1452,6 +1457,8 @@ impl Runtime {
         // Boxed: this body is ~30 KB as a future, and every session start and
         // child spawn awaits it; inline, debug builds overflow 2 MiB stacks.
         let startup_result = Box::pin(async move {
+        #[cfg(feature = "test-support")]
+        let _profile_restore = agent_runtime_core::journal::profile::timer("rt.runtime.restore_context");
 
         // Resume only when the caller explicitly supplied the identity. A
         // freshly minted id must never silently load an older snapshot.

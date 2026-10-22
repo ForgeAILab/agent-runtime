@@ -12,6 +12,8 @@ impl ObjectAssembler {
         value: &T,
     ) -> Result<JournalObjectId, RuntimeError> {
         let object = JournalObject::encode(kind, value)?;
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.encoded_objects", 1, object.bytes.len() as u64);
         self.objects
             .entry(object.id.clone())
             .or_insert(object.bytes);
@@ -66,6 +68,8 @@ impl ObjectAssembler {
         &mut self,
         values: &[serde_json::Value],
     ) -> Result<JournalJsonArray, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.assembler.structured_sequence");
         if values.is_empty() {
             return Ok(JournalJsonArray {
                 len: 0,
@@ -334,6 +338,8 @@ impl ObjectAssembler {
         &mut self,
         manifest: &crate::store::TurnManifest,
     ) -> Result<JournalObjectId, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.assembler.manifest");
         let value = serde_json::to_value(manifest).map_err(|_| conflict())?;
         let value = self.json_value(&value)?;
         self.add(
@@ -360,6 +366,8 @@ impl ObjectAssembler {
         previous_encoding: Option<&SnapshotEncodingCache>,
         overrides: Option<&JournalTransitionDelta>,
     ) -> Result<(JournalSnapshotRoots, SnapshotEncodingCache), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.assembler.snapshot_cached");
         let previous = previous
             .zip(previous_encoding)
             .filter(|(previous, encoding)| {
@@ -371,15 +379,29 @@ impl ObjectAssembler {
             });
 
         let (history_ids, history, history_chain) = match previous {
-            Some((previous, encoding)) if previous.history == snapshot.history => (
-                encoding.history_ids.clone(),
-                encoding.roots.history.clone(),
-                encoding.roots.history_chain.clone(),
-            ),
+            Some((previous, encoding)) if previous.history == snapshot.history => {
+                #[cfg(feature = "test-support")]
+                crate::journal::profile::event(
+                    "rt.work.unchanged_history_prefix_nodes",
+                    previous.history.len() as u64,
+                    0,
+                );
+                (
+                    encoding.history_ids.clone(),
+                    encoding.roots.history.clone(),
+                    encoding.roots.history_chain.clone(),
+                )
+            }
             Some((previous, encoding))
                 if previous.history.len() <= snapshot.history.len()
                     && previous.history == snapshot.history[..previous.history.len()] =>
             {
+                #[cfg(feature = "test-support")]
+                crate::journal::profile::event(
+                    "rt.work.unchanged_history_prefix_nodes",
+                    previous.history.len() as u64,
+                    0,
+                );
                 let mut ids = encoding.history_ids.clone();
                 ids.extend(
                     snapshot.history[previous.history.len()..]

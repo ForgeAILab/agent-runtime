@@ -304,6 +304,9 @@ impl SessionHandle {
 
     /// A snapshot of the session's canonical state with recent diagnostics.
     pub fn snapshot(&self) -> SessionSnapshot {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.public_snapshot");
         let state = self.inner.state.lock().expect("session state poisoned");
         let mut extension_state = self.inner.execution.snapshot_extension_state();
         if let Some(cache) = self.inner.shared.cache.persisted_session(&self.inner.id) {

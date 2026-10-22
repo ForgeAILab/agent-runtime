@@ -39,10 +39,14 @@ pub(in crate::journal) fn memoized_closure(
     root: &JournalObjectId,
     expected: ExpectedObject,
 ) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.links.memoized_closure");
     let mut closure = BTreeSet::new();
     let mut pending = vec![(root.clone(), expected)];
     let mut added: BTreeMap<JournalObjectId, Vec<CachedLinks>> = BTreeMap::new();
     while let Some((id, expected)) = pending.pop() {
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.closure_edge_checked", 1, 0);
         if !closure.insert(id.clone()) {
             continue;
         }
@@ -54,6 +58,12 @@ pub(in crate::journal) fn memoized_closure(
             .flat_map(|variants| variants.iter())
             .find(|entry| entry.expected == expected);
         let children = if let Some(entry) = cached {
+            #[cfg(feature = "test-support")]
+            crate::journal::profile::event(
+                "rt.work.closure_edges_reused",
+                entry.children.len() as u64,
+                0,
+            );
             entry.children.clone()
         } else {
             let object = JournalObject {
@@ -78,6 +88,8 @@ pub(in crate::journal) fn memoized_closure(
             cached.entry(id).or_default().extend(variants);
         }
     }
+    #[cfg(feature = "test-support")]
+    crate::journal::profile::event("rt.work.exact_set_inserts", closure.len() as u64, 0);
     Ok(closure)
 }
 
@@ -460,9 +472,13 @@ pub(in crate::journal) fn draft_reachable_closure(
     reachable: &ReachableSet,
     roots: Vec<(JournalObjectId, ExpectedObject)>,
 ) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.links.draft_reachable_closure");
     let mut closure = BTreeSet::new();
     let mut pending = roots;
     while let Some((id, expected)) = pending.pop() {
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.closure_edge_checked", 1, 0);
         if !closure.insert(id.clone()) {
             continue;
         }
@@ -481,6 +497,8 @@ pub(in crate::journal) fn draft_reachable_closure(
         }
         pending.extend(object_links(&object, expected)?);
     }
+    #[cfg(feature = "test-support")]
+    crate::journal::profile::event("rt.work.exact_set_inserts", closure.len() as u64, 0);
     Ok(closure)
 }
 
@@ -490,12 +508,16 @@ pub(in crate::journal) fn reachable_closure(
     admitted: Option<&BTreeSet<JournalObjectId>>,
     trusted: Option<&ReachableSet>,
 ) -> Result<BTreeSet<JournalObjectId>, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::journal::profile::enter_sync("rt.links.reachable_closure");
     let mut reachable = BTreeSet::new();
     let mut pending = vec![(
         root.clone(),
         ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
     )];
     while let Some((id, expected)) = pending.pop() {
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.closure_edge_checked", 1, 0);
         if admitted.is_some_and(|admitted| !admitted.contains(&id))
             && trusted.is_none_or(|trusted| !trusted.contains(&id))
         {
@@ -516,6 +538,8 @@ pub(in crate::journal) fn reachable_closure(
         }
         pending.extend(object_links(&object, expected)?);
     }
+    #[cfg(feature = "test-support")]
+    crate::journal::profile::event("rt.work.exact_set_inserts", reachable.len() as u64, 0);
     Ok(reachable)
 }
 

@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
+test-support = []
 # Temporary, opt-in export for the unpublished physical-disk harness.
 external-agent = []
 

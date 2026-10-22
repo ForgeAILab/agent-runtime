@@ -3,11 +3,10 @@
 ## Target and Isolation
 
 Extend the existing unpublished `agent-runtime-journal-bench` crate with a
-named ignored release target, proposed as `tests/hot_path.rs` /
+named ignored release target, as `tests/hot_path.rs` /
 `journal_hot_path_release_report`, plus a small non-ignored N=100 smoke and
 deterministic work-count/conformance tests. The existing physical report stays
-available. This is a target specification; no target or instrumentation is
-implemented by this change.
+available. Phase 0 implements this prerequisite before P1/P2/P4.
 
 Add non-default `test-support` features in core and runtime, with runtime
 forwarding core's feature, and a non-default bench `journal-profile` feature
@@ -62,15 +61,14 @@ identities when checking roots byte-for-byte.
 Keep the original C tool case intact. The plain supplement changes only the
 turn-count rule needed to reach N messages and the existing plain script
 branch; label it `C-plain-supplement` in every output. Do not compare its timing
-to a historical C tool number. The review must approve that extension before
-implementation; it supplies the requested plain coverage without mislabeling
+to a historical C tool number. The owner accepted this extension on 2026-10-21; it supplies the requested plain coverage without mislabeling
 Forge's existing C evidence.
 
 Use one shared engine per storage/domain and new Runtime instances at the
 same boundaries as the original fixtures. Configure 128 MiB estimated memo
 charge per engine in comparison runs, zero/tiny/oversize modes separately, and
 collection enabled/disabled diagnostics. Report cursor charge independently;
-proposed additional workspace cap is 16 MiB per engine, subject to owner review.
+accepted additional workspace cap is 16 MiB per engine.
 The runtime reference adapter models sealing lengths and can share bodies
 within the session; it is not Forge's sqlx/real-AEAD independent-domain layout.
 Freeze and report the adapter/sharing/repack configuration for every comparison.
@@ -199,7 +197,7 @@ limit applies to the collection portion; any exception needs an owner decision.
 | --- | --- | --- |
 | P1 | Candidate, manifest, memo proof/charge, checkpoint validation and additive writer preparation in A/B and C variants | In supported warm cases, each engine stage and the disjoint candidate+memo+checkpoint sum ≤50% of baseline; aim ≤25%. Attributed writer preparation ≤50%. Fallbacks are separately reported and excluded from delta-scaling claims, with no hidden correctness failures. |
 | P2 | Warm certified-root collection and cold/uncertified fallback, both domains, every fixture | Certified roots cause zero old-body closure fetches and zero old-edge revalidation. B's combined collections ≤30% of pre-P2 time. Inventory/physical work remains measured; A/C use the same proof counters and report latency without inventing B-equivalent gains. |
-| P3 | Full warm/cold Runtime resume and every C writer change, both domains | Warm writer root derivation and unchanged body reads are zero. Full warm resume ≤25% of pre-P3 median for each shape; B/4000 additionally ≤150 ms plain / ≤200 ms tool. Cold/import ≤110% of pre-P3. |
+| P3 (deferred/optional) | Full warm/cold Runtime resume and every C writer change, both domains | Warm writer root derivation and unchanged body reads are zero. Full warm resume ≤25% of pre-P3 median for each shape; B/4000 additionally ≤150 ms plain / ≤200 ms tool. Cold/import ≤110% of pre-P3. |
 | P4 | Every collect call/gate interval, cold proof miss and warm hit, no-garbage graph, 100 dirty sessions, isolated/full-matrix C | Target every call/hold <250 ms; hard acceptance every call/hold <1,000 ms. All quiescent drains with positive budgets and sufficient capacity terminate with reference-equivalent state and receipts. Default-budget full-drain time and pack-write bytes ≤115% of pre-P4; report the entire drain in charged turns. |
 
 A and C include phases without a qualifying manifest/checkpoint operation;
@@ -247,4 +245,5 @@ safe minimum-stack tests appropriate to the implementation.
 Finally rerun Forge D10 only in its own consumer work: real sqlx/AEAD, unchanged
 conservative projection, independent domains, fixed fixtures, legacy L2,
 production cadence and full drains. A runtime bench pass is evidence about
-mechanism; it is not a Forge adoption pass or a new D10 threshold.
+mechanism; it is not a Forge adoption pass. Apply the owner-approved fixed budgets in
+design.md; runtime import speed is non-gating with Forge background conversion.

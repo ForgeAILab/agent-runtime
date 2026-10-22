@@ -34,6 +34,25 @@ struct MemoNode {
     newer: Option<Key>,
 }
 impl RootMemo {
+    #[cfg(feature = "test-support")]
+    pub(super) fn profile_details(&self) -> (usize, usize, usize) {
+        (
+            self.entries
+                .values()
+                .map(|n| n.entry.objects.layers.len())
+                .max()
+                .unwrap_or(0),
+            self.entries.values().map(|n| n.entry.closure.len()).sum(),
+            self.entries
+                .values()
+                .map(|n| Arc::strong_count(&n.entry).saturating_sub(1))
+                .sum(),
+        )
+    }
+    #[cfg(feature = "test-support")]
+    pub(super) fn profile_entries(&self) -> usize {
+        self.entries.len()
+    }
     #[cfg(test)]
     pub(super) fn entry_count_for_test(&self) -> usize {
         self.entries.len()
@@ -52,7 +71,19 @@ impl RootMemo {
         session: &SessionId,
         root: &JournalObjectId,
     ) -> Option<Arc<ValidatedRoot>> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.memo.get");
         let key = (session.clone(), root.clone());
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            if self.entries.contains_key(&key) {
+                "rt.memo.hit"
+            } else {
+                "rt.memo.miss"
+            },
+            1,
+            0,
+        );
         let entry = self.entries.get(&key)?.entry.clone();
         self.unlink(&key);
         self.append(&key);
@@ -64,7 +95,11 @@ impl RootMemo {
         root: &JournalObjectId,
         entry: Arc<ValidatedRoot>,
     ) {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.memo.insert");
         if entry.bytes > self.budget {
+            #[cfg(feature = "test-support")]
+            crate::journal::profile::event("rt.memo.oversize", 1, entry.bytes as u64);
             return;
         }
         let key = (session.clone(), root.clone());
@@ -73,6 +108,8 @@ impl RootMemo {
             let Some(old) = self.oldest.clone() else {
                 break;
             };
+            #[cfg(feature = "test-support")]
+            crate::journal::profile::event("rt.memo.eviction", 1, 0);
             self.remove(&old);
         }
         self.bytes += entry.bytes;
@@ -85,6 +122,13 @@ impl RootMemo {
             },
         );
         self.append(&key);
+
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            "rt.memo.estimated_charge",
+            self.entries.len() as u64,
+            self.bytes as u64,
+        );
     }
     pub(super) fn remove_root(&mut self, session: &SessionId, root: &JournalObjectId) {
         self.remove(&(session.clone(), root.clone()));
@@ -126,6 +170,8 @@ impl RootMemo {
     // roots that lost a member are evicted; released cache-only bodies are
     // trimmed so they can never suppress later membership admission.
     pub(super) fn release(&mut self, session: &SessionId, released: &[JournalObjectId]) {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.memo.release");
         let released: BTreeSet<_> = released.iter().cloned().collect();
         let keys: Vec<_> = self
             .entries
@@ -202,6 +248,8 @@ impl<S: JournalStorage> JournalEngine<S> {
         root: &JournalObjectId,
         full: bool,
     ) -> Result<Arc<ValidatedRoot>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.memo.memo_entry");
         let state = scratch.lock()?;
         let object = JournalObject {
             id: root.clone(),
@@ -315,6 +363,8 @@ impl<S: JournalStorage> JournalEngine<S> {
         root: &JournalObjectId,
         entry: Arc<ValidatedRoot>,
     ) -> Result<Arc<ValidatedRoot>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.memo.writer_memo");
         if entry.objects.len == entry.closure.len() {
             return Ok(entry);
         }
@@ -338,6 +388,8 @@ impl<S: JournalStorage> JournalEngine<S> {
         root: &JournalObjectId,
         entry: &ValidatedRoot,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.memo.seed_memo");
         let mut state = scratch.lock()?;
         state.objects = entry.objects.clone();
         let record = state.sessions.get_mut(session).ok_or_else(conflict)?;
@@ -364,17 +416,19 @@ impl<S: JournalStorage> JournalEngine<S> {
         session: &SessionId,
         root: &JournalObjectId,
     ) -> Result<Arc<ValidatedRoot>, RuntimeError> {
-        let entry = if let Some(entry) = self.memoized_root(session, root)? {
-            entry
-        } else {
-            let objects = self.closure_objects(session, root).await?;
-            scratch.lock()?.objects = ObjectStore::from_map(objects);
-            let entry = self.memo_entry(scratch, session, root, true)?;
-            self.remember_root(session, root, entry.clone())?;
-            entry
-        };
-        self.seed_memo(scratch, session, root, &entry)?;
-        Ok(entry)
+        crate::journal_profile_scope!("rt.memo.validated_root", {
+            let entry = if let Some(entry) = self.memoized_root(session, root)? {
+                entry
+            } else {
+                let objects = self.closure_objects(session, root).await?;
+                scratch.lock()?.objects = ObjectStore::from_map(objects);
+                let entry = self.memo_entry(scratch, session, root, true)?;
+                self.remember_root(session, root, entry.clone())?;
+                entry
+            };
+            self.seed_memo(scratch, session, root, &entry)?;
+            Ok(entry)
+        })
     }
     /// Validation evidence for the head a prepared commit publishes. It is
     /// remembered only after that head is known to be durable.
@@ -383,6 +437,8 @@ impl<S: JournalStorage> JournalEngine<S> {
         scratch: &Transition,
         session: &SessionId,
     ) -> Result<(JournalObjectId, Arc<ValidatedRoot>), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.memo.commit_memo_entry");
         let root = scratch
             .lock()?
             .sessions
@@ -485,37 +541,46 @@ impl<S: JournalStorage> JournalReadOperation for ReadOperation<'_, S> {
         Ok(encoded.bytes)
     }
     async fn finish(&mut self) -> Result<bool, RuntimeError> {
-        let held = if !self.served {
-            true
-        } else if self.current {
-            self.engine
-                .storage
-                .load(&self.engine.domain, self.lease.session())
-                .await?
-                .and_then(|r| r.head)
-                .map(|h| h.id)
-                == self.root
-        } else {
-            let root = self.root.as_ref().ok_or_else(conflict)?;
-            let mut held = false;
-            for pin in self
-                .engine
-                .storage
-                .pins(&self.engine.domain, self.lease.session())
-                .await?
+        crate::journal_profile_scope!("rt.authority.final", {
+            #[cfg(feature = "test-support")]
+            crate::journal::profile::event("rt.work.authority_checks", 1, 0);
+            let held = if !self.served {
+                true
+            } else if self.current {
+                self.engine
+                    .storage
+                    .load(&self.engine.domain, self.lease.session())
+                    .await?
+                    .and_then(|r| r.head)
+                    .map(|h| h.id)
+                    == self.root
+            } else {
+                let root = self.root.as_ref().ok_or_else(conflict)?;
+                let mut held = false;
+                for pin in self
+                    .engine
+                    .storage
+                    .pins(&self.engine.domain, self.lease.session())
+                    .await?
+                {
+                    held |= persistence::pin_memo_holds(&pin, root)?;
+                }
+                held
+            };
             {
-                held |= persistence::pin_memo_holds(&pin, root)?;
+                #[cfg(feature = "test-support")]
+                let _profile_final_lease =
+                    crate::journal::profile::timer("rt.authority.final_lease");
+                self.engine
+                    .local
+                    .checked_lease(&*self.engine.local.lock()?, self.lease)?;
             }
-            held
-        };
-        self.engine
-            .local
-            .checked_lease(&*self.engine.local.lock()?, self.lease)?;
-        if !held {
-            self.entry = None;
-            self.served = false;
-        }
-        Ok(held)
+            if !held {
+                self.entry = None;
+                self.served = false;
+            }
+            Ok(held)
+        })
     }
 }
 

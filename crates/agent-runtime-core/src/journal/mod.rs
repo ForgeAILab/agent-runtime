@@ -127,3 +127,6 @@ pub trait JournalReadOperation: Send {
     async fn read(&mut self, object: &JournalObjectId) -> Result<Vec<u8>, RuntimeError>;
     async fn finish(&mut self) -> Result<bool, RuntimeError>;
 }
+
+#[cfg(feature = "test-support")]
+pub mod profile;

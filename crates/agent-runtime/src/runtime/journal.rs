@@ -626,64 +626,71 @@ impl SessionPersistence {
         &self,
         checkpoint: &TurnCheckpoint,
     ) -> Result<(), RuntimeError> {
-        self.ensure_not_fenced()?;
-        if checkpoint.session != self.session {
-            return Err(RuntimeError::conflict(
-                "checkpoint belongs to another session",
-            ));
-        }
-        match &self.mode {
-            PersistenceMode::Legacy => match &self.checkpoint_store {
-                Some(store) => store.save(checkpoint).await,
-                None => Ok(()),
-            },
-            PersistenceMode::Native(native) => match &native.protected {
-                Some(domain) => {
-                    Box::pin(commit_domain(
-                        &mut *domain.lock().await,
-                        &checkpoint.snapshot,
-                        Some(checkpoint),
-                        CommitPurpose::Transition,
-                    ))
-                    .await
-                }
-                None => Ok(()),
-            },
-        }
+        crate::journal_profile_scope!("rt.writer.checkpoint_submission", {
+            self.ensure_not_fenced()?;
+            if checkpoint.session != self.session {
+                return Err(RuntimeError::conflict(
+                    "checkpoint belongs to another session",
+                ));
+            }
+            match &self.mode {
+                PersistenceMode::Legacy => match &self.checkpoint_store {
+                    Some(store) => store.save(checkpoint).await,
+                    None => Ok(()),
+                },
+                PersistenceMode::Native(native) => match &native.protected {
+                    Some(domain) => {
+                        Box::pin(commit_domain(
+                            &mut *domain.lock().await,
+                            &checkpoint.snapshot,
+                            Some(checkpoint),
+                            CommitPurpose::Transition,
+                        ))
+                        .await
+                    }
+                    None => Ok(()),
+                },
+            }
+        })
     }
 
     pub(crate) async fn save_snapshot(
         &self,
         snapshot: &SessionSnapshot,
     ) -> Result<(), RuntimeError> {
-        self.ensure_not_fenced()?;
-        if snapshot.id != self.session {
-            return Err(RuntimeError::conflict(
-                "snapshot belongs to another session",
-            ));
-        }
-        match &self.mode {
-            PersistenceMode::Legacy => match &self.session_store {
-                Some(store) => store.save(snapshot).await,
-                None => Ok(()),
-            },
-            PersistenceMode::Native(native) => match &native.ordinary {
-                Some(domain) => {
-                    let checkpoint = match &native.protected {
-                        Some(protected) => protected.lock().await.checkpoint.clone(),
-                        None => None,
-                    };
-                    Box::pin(commit_domain(
-                        &mut *domain.lock().await,
-                        snapshot,
-                        checkpoint.as_ref(),
-                        CommitPurpose::Transition,
-                    ))
-                    .await
-                }
-                None => Ok(()),
-            },
-        }
+        crate::journal_profile_scope!("rt.writer.snapshot_submission", {
+            self.ensure_not_fenced()?;
+            if snapshot.id != self.session {
+                return Err(RuntimeError::conflict(
+                    "snapshot belongs to another session",
+                ));
+            }
+            match &self.mode {
+                PersistenceMode::Legacy => match &self.session_store {
+                    Some(store) => store.save(snapshot).await,
+                    None => Ok(()),
+                },
+                PersistenceMode::Native(native) => match &native.ordinary {
+                    Some(domain) => {
+                        let checkpoint = match &native.protected {
+                            Some(protected) => crate::journal_profile_scope!(
+                                "rt.writer.boundary_checkpoint_clone",
+                                { protected.lock().await.checkpoint.clone() }
+                            ),
+                            None => None,
+                        };
+                        Box::pin(commit_domain(
+                            &mut *domain.lock().await,
+                            snapshot,
+                            checkpoint.as_ref(),
+                            CommitPurpose::Transition,
+                        ))
+                        .await
+                    }
+                    None => Ok(()),
+                },
+            }
+        })
     }
 
     /// Releases native pins/fences after the final persistence boundary.
@@ -752,18 +759,20 @@ async fn load_legacy_records(
     session_store: Option<&Arc<dyn SessionStore>>,
     checkpoint_store: Option<&Arc<dyn CheckpointStore>>,
 ) -> Result<(Option<SessionSnapshot>, Option<TurnCheckpoint>), RuntimeError> {
-    if !explicit_id {
-        return Ok((None, None));
-    }
-    let snapshot = match session_store {
-        Some(store) => store.load(session).await?,
-        None => None,
-    };
-    let checkpoint = match checkpoint_store {
-        Some(store) => store.load_latest(session).await?,
-        None => None,
-    };
-    Ok((snapshot, checkpoint))
+    crate::journal_profile_scope!("rt.writer.load_legacy_records", {
+        if !explicit_id {
+            return Ok((None, None));
+        }
+        let snapshot = match session_store {
+            Some(store) => store.load(session).await?,
+            None => None,
+        };
+        let checkpoint = match checkpoint_store {
+            Some(store) => store.load_latest(session).await?,
+            None => None,
+        };
+        Ok((snapshot, checkpoint))
+    })
 }
 
 async fn close_import_domains(
@@ -790,32 +799,35 @@ async fn reopen_after_import(
     ordinary: &mut Option<NativeDomain>,
     protected: &mut Option<NativeDomain>,
 ) -> Result<(), RuntimeError> {
-    let ordinary_journal = ordinary.as_ref().map(|domain| domain.journal.clone());
-    let protected_journal = protected.as_ref().map(|domain| domain.journal.clone());
-    close_import_domains(ordinary, protected).await?;
+    crate::journal_profile_scope!("rt.writer.reopen_after_import", {
+        let ordinary_journal = ordinary.as_ref().map(|domain| domain.journal.clone());
+        let protected_journal = protected.as_ref().map(|domain| domain.journal.clone());
+        close_import_domains(ordinary, protected).await?;
 
-    let mut reopened_protected = match protected_journal {
-        Some(journal) => {
-            Some(Box::pin(open_domain(journal, JournalRole::Protected, session)).await?)
-        }
-        None => None,
-    };
-    let reopened_ordinary = match ordinary_journal {
-        Some(journal) => match Box::pin(open_domain(journal, JournalRole::Ordinary, session)).await
-        {
-            Ok(domain) => Some(domain),
-            Err(error) => {
-                if let Some(domain) = reopened_protected.as_mut() {
-                    let _ = domain.close().await;
-                }
-                return Err(error);
+        let mut reopened_protected = match protected_journal {
+            Some(journal) => {
+                Some(Box::pin(open_domain(journal, JournalRole::Protected, session)).await?)
             }
-        },
-        None => None,
-    };
-    *ordinary = reopened_ordinary;
-    *protected = reopened_protected;
-    Ok(())
+            None => None,
+        };
+        let reopened_ordinary = match ordinary_journal {
+            Some(journal) => {
+                match Box::pin(open_domain(journal, JournalRole::Ordinary, session)).await {
+                    Ok(domain) => Some(domain),
+                    Err(error) => {
+                        if let Some(domain) = reopened_protected.as_mut() {
+                            let _ = domain.close().await;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
+        *ordinary = reopened_ordinary;
+        *protected = reopened_protected;
+        Ok(())
+    })
 }
 
 /// A read-only view of a store without a journal capability may use its
@@ -860,116 +872,124 @@ async fn open_domain(
     role: JournalRole,
     session: &SessionId,
 ) -> Result<NativeDomain, RuntimeError> {
-    let nonce = uuid::Uuid::new_v4();
-    let lease = journal
-        .open(
-            session,
-            JournalOpen {
-                root: JournalRootSelection::Latest,
-                expected_revision: None,
-                operation: JournalOperationId::new(format!("runtime-writer-{nonce}")),
-                pin: JournalPinId::new(format!("runtime-writer-{nonce}")),
-                intent: JournalOpenIntent::ExclusiveWriter,
-            },
-        )
-        .await?;
-    let head = lease.head().cloned();
-    if head.as_ref().is_some_and(|head| head.role != role) {
-        let _ = journal.close(lease).await;
-        return Err(incompatible_store());
-    }
+    crate::journal_profile_scope!("rt.writer.open_domain", {
+        let nonce = uuid::Uuid::new_v4();
+        let lease = journal
+            .open(
+                session,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new(format!("runtime-writer-{nonce}")),
+                    pin: JournalPinId::new(format!("runtime-writer-{nonce}")),
+                    intent: JournalOpenIntent::ExclusiveWriter,
+                },
+            )
+            .await?;
+        let head = lease.head().cloned();
+        if head.as_ref().is_some_and(|head| head.role != role) {
+            let _ = journal.close(lease).await;
+            return Err(incompatible_store());
+        }
 
-    let loaded = async {
-        let (candidate, checkpoint) = if head.is_some() {
-            let mut reader = JournalReader::new(journal.as_ref(), &lease, NATIVE_READ_LIMITS)?;
-            match role {
-                JournalRole::Protected => {
-                    let checkpoint = reader.checkpoint().await?;
-                    let snapshot = match &checkpoint {
-                        Some(checkpoint) => Some(checkpoint.snapshot.clone()),
-                        None => reader.snapshot().await?,
-                    };
-                    (snapshot, checkpoint)
+        let loaded = async {
+            let (candidate, checkpoint) = if head.is_some() {
+                let mut reader = JournalReader::new(journal.as_ref(), &lease, NATIVE_READ_LIMITS)?;
+                match role {
+                    JournalRole::Protected => {
+                        let checkpoint = reader.checkpoint().await?;
+                        let snapshot = match &checkpoint {
+                            Some(checkpoint) => Some(checkpoint.snapshot.clone()),
+                            None => reader.snapshot().await?,
+                        };
+                        (snapshot, checkpoint)
+                    }
+                    JournalRole::Ordinary => (reader.snapshot().await?, None),
                 }
-                JournalRole::Ordinary => (reader.snapshot().await?, None),
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
 
-        let mut known_candidates = BTreeSet::new();
-        let mut encoding = None;
-        if let (Some(head), Some(snapshot)) = (&head, &candidate) {
-            let mut assembler = ObjectAssembler::default();
-            let (roots, cache) = assembler.snapshot_cached(
-                snapshot,
-                head.snapshot.planned_step_count,
-                None,
-                None,
-            )?;
-            // The protected domain stores this writer's exact candidates, so
-            // a root it cannot re-derive is foreign or corrupt and fails
-            // closed (no released runtime wrote another representation). An
-            // ordinary backend owns its projected representation: only an
-            // exact match lets the writer omit already-stored drafts.
-            let representation_matches = roots == head.snapshot;
-            if role == JournalRole::Protected && !representation_matches {
-                return Err(incompatible_store());
-            }
-            if let Some(checkpoint) = &checkpoint {
-                let referenced = assembler.checkpoint(checkpoint, roots)?;
-                let checkpoint_object =
-                    JournalObject::encode(JournalObjectKind::Checkpoint, &referenced)?;
-                if head.checkpoint.as_ref() != Some(&checkpoint_object.id) {
+            let mut known_candidates = BTreeSet::new();
+            let mut encoding = None;
+            if let (Some(head), Some(snapshot)) = (&head, &candidate) {
+                #[cfg(feature = "test-support")]
+                agent_runtime_core::journal::profile::event(
+                    "rt.work.writer.root_derivation_passes",
+                    1,
+                    0,
+                );
+                let mut assembler = ObjectAssembler::default();
+                let (roots, cache) = assembler.snapshot_cached(
+                    snapshot,
+                    head.snapshot.planned_step_count,
+                    None,
+                    None,
+                )?;
+                // The protected domain stores this writer's exact candidates, so
+                // a root it cannot re-derive is foreign or corrupt and fails
+                // closed (no released runtime wrote another representation). An
+                // ordinary backend owns its projected representation: only an
+                // exact match lets the writer omit already-stored drafts.
+                let representation_matches = roots == head.snapshot;
+                if role == JournalRole::Protected && !representation_matches {
                     return Err(incompatible_store());
                 }
-                known_candidates.insert(checkpoint_object.id);
-            }
-            if representation_matches {
-                known_candidates.extend(assembler.objects.keys().cloned());
-            }
-            encoding = Some(cache);
-        }
-        let follows_protected = match (&head, role) {
-            (Some(head), JournalRole::Ordinary) => {
-                let bytes = journal.read(&lease, &head.batch).await?;
-                let batch: JournalBatch = JournalObject {
-                    id: head.batch.clone(),
-                    bytes,
+                if let Some(checkpoint) = &checkpoint {
+                    let referenced = assembler.checkpoint(checkpoint, roots)?;
+                    let checkpoint_object =
+                        JournalObject::encode(JournalObjectKind::Checkpoint, &referenced)?;
+                    if head.checkpoint.as_ref() != Some(&checkpoint_object.id) {
+                        return Err(incompatible_store());
+                    }
+                    known_candidates.insert(checkpoint_object.id);
                 }
-                .decode(JournalObjectKind::Batch)?;
-                batch.boundary.turn.is_some()
+                if representation_matches {
+                    known_candidates.extend(assembler.objects.keys().cloned());
+                }
+                encoding = Some(cache);
             }
-            _ => false,
+            let follows_protected = match (&head, role) {
+                (Some(head), JournalRole::Ordinary) => {
+                    let bytes = journal.read(&lease, &head.batch).await?;
+                    let batch: JournalBatch = JournalObject {
+                        id: head.batch.clone(),
+                        bytes,
+                    }
+                    .decode(JournalObjectKind::Batch)?;
+                    batch.boundary.turn.is_some()
+                }
+                _ => false,
+            };
+            Ok::<_, RuntimeError>((
+                candidate,
+                checkpoint,
+                encoding,
+                known_candidates,
+                follows_protected,
+            ))
+        }
+        .await;
+        let (candidate, checkpoint, encoding, known_candidates, follows_protected) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let _ = journal.close(lease).await;
+                return Err(error);
+            }
         };
-        Ok::<_, RuntimeError>((
+        Ok(NativeDomain {
+            role,
+            journal,
+            lease: Some(lease),
+            head,
             candidate,
+            candidate_submitted: false,
+            follows_protected,
             checkpoint,
             encoding,
             known_candidates,
-            follows_protected,
-        ))
-    }
-    .await;
-    let (candidate, checkpoint, encoding, known_candidates, follows_protected) = match loaded {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            let _ = journal.close(lease).await;
-            return Err(error);
-        }
-    };
-    Ok(NativeDomain {
-        role,
-        journal,
-        lease: Some(lease),
-        head,
-        candidate,
-        candidate_submitted: false,
-        follows_protected,
-        checkpoint,
-        encoding,
-        known_candidates,
-        unresolved_failure: false,
+            unresolved_failure: false,
+        })
     })
 }
 
@@ -979,172 +999,214 @@ async fn commit_domain(
     checkpoint: Option<&TurnCheckpoint>,
     purpose: CommitPurpose,
 ) -> Result<(), RuntimeError> {
-    // In the ordinary domain `checkpoint` is only a boundary hint; it is
-    // never stored or made reachable there.
-    if domain.role == JournalRole::Protected && checkpoint.is_none() {
-        return Err(RuntimeError::conflict(
-            "protected native persistence requires an exact checkpoint",
-        ));
-    }
-    let lease = domain
-        .lease
-        .as_ref()
-        .ok_or_else(|| RuntimeError::conflict("native journal writer is closed"))?;
-    let writer_epoch = lease
-        .writer_epoch()
-        .ok_or_else(|| RuntimeError::conflict("native journal writer is not fenced"))?;
-    let planned_step_count = crate::runtime::manifests::snapshot_planned_steps(snapshot)?;
-    let mut assembler = ObjectAssembler::default();
-    let (roots, encoding) = assembler.snapshot_cached(
-        snapshot,
-        planned_step_count,
-        domain.candidate.as_ref(),
-        domain.encoding.as_ref(),
-    )?;
-    let referenced_checkpoint = if domain.role == JournalRole::Protected {
-        Some(assembler.checkpoint(checkpoint.expect("protected checked above"), roots.clone())?)
-    } else {
-        None
-    };
-    let checkpoint_id = referenced_checkpoint
-        .as_ref()
-        .map(|checkpoint| JournalObject::encode(JournalObjectKind::Checkpoint, checkpoint))
-        .transpose()?
-        .map(|object| object.id);
-    let checkpoint_hint = checkpoint;
-    let boundary = JournalBoundary {
-        version: 1,
-        session: snapshot.id.clone(),
-        turn: checkpoint_hint.map(|checkpoint| checkpoint.turn.clone()),
-        checkpoint_sequence: checkpoint_hint
-            .map_or(0, |checkpoint| checkpoint.watermark.checkpoint_sequence),
-        planned_step_count,
-    };
-    let current = domain.head.as_ref();
-    let delta = transition_delta(
-        domain.candidate.as_ref(),
-        domain.candidate_submitted,
-        snapshot,
-        boundary.clone(),
-        &encoding,
-    )?;
-    let mut objects = if domain.role == JournalRole::Ordinary {
-        if delta.bootstrap.is_some() {
-            Vec::new()
+    crate::journal_profile_scope!("rt.writer.commit_domain", {
+        #[cfg(feature = "test-support")]
+        let _profile_preparation =
+            agent_runtime_core::journal::profile::timer("rt.writer.preparation");
+        // In the ordinary domain `checkpoint` is only a boundary hint; it is
+        // never stored or made reachable there.
+        if domain.role == JournalRole::Protected && checkpoint.is_none() {
+            return Err(RuntimeError::conflict(
+                "protected native persistence requires an exact checkpoint",
+            ));
+        }
+        let lease = domain
+            .lease
+            .as_ref()
+            .ok_or_else(|| RuntimeError::conflict("native journal writer is closed"))?;
+        let writer_epoch = lease
+            .writer_epoch()
+            .ok_or_else(|| RuntimeError::conflict("native journal writer is not fenced"))?;
+        let planned_step_count = crate::runtime::manifests::snapshot_planned_steps(snapshot)?;
+        let mut assembler = ObjectAssembler::default();
+        let (roots, encoding) = assembler.snapshot_cached(
+            snapshot,
+            planned_step_count,
+            domain.candidate.as_ref(),
+            domain.encoding.as_ref(),
+        )?;
+        let referenced_checkpoint = if domain.role == JournalRole::Protected {
+            Some(
+                assembler
+                    .checkpoint(checkpoint.expect("protected checked above"), roots.clone())?,
+            )
+        } else {
+            None
+        };
+        let checkpoint_id = referenced_checkpoint
+            .as_ref()
+            .map(|checkpoint| JournalObject::encode(JournalObjectKind::Checkpoint, checkpoint))
+            .transpose()?
+            .map(|object| object.id);
+        let checkpoint_hint = checkpoint;
+        let boundary = JournalBoundary {
+            version: 1,
+            session: snapshot.id.clone(),
+            turn: checkpoint_hint.map(|checkpoint| checkpoint.turn.clone()),
+            checkpoint_sequence: checkpoint_hint
+                .map_or(0, |checkpoint| checkpoint.watermark.checkpoint_sequence),
+            planned_step_count,
+        };
+        let current = domain.head.as_ref();
+        let delta = transition_delta(
+            domain.candidate.as_ref(),
+            domain.candidate_submitted,
+            snapshot,
+            boundary.clone(),
+            &encoding,
+        )?;
+        #[cfg(feature = "test-support")]
+        let _profile_filter =
+            agent_runtime_core::journal::profile::timer("rt.writer.known_candidates");
+        let mut objects = if domain.role == JournalRole::Ordinary {
+            if delta.bootstrap.is_some() {
+                Vec::new()
+            } else {
+                assembler
+                    .structured
+                    .iter()
+                    .filter(|id| !domain.known_candidates.contains(*id))
+                    .filter_map(|id| assembler.objects.get(id).cloned())
+                    .collect::<Vec<_>>()
+            }
         } else {
             assembler
-                .structured
-                .iter()
-                .filter(|id| !domain.known_candidates.contains(*id))
-                .filter_map(|id| assembler.objects.get(id).cloned())
+                .objects
+                .values()
+                .filter(|object| !domain.known_candidates.contains(&object.id))
+                .cloned()
                 .collect::<Vec<_>>()
-        }
-    } else {
-        assembler
-            .objects
-            .values()
-            .filter(|object| !domain.known_candidates.contains(&object.id))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    // Canonical map order already gives stable commit digests; make the order
-    // explicit for adapters that retain the submitted vector verbatim.
-    objects.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-    let operation_payload = serde_json::to_vec(&(
-        domain.role,
-        current.map(|head| head.revision),
-        &roots,
-        &referenced_checkpoint,
-    ))?;
-    let role = match domain.role {
-        JournalRole::Ordinary => "ordinary",
-        JournalRole::Protected => "protected",
-    };
-    let fingerprint = Fingerprint::of(operation_payload);
-    let operation = JournalOperationId::new(match purpose {
-        CommitPurpose::Transition => format!("runtime-{role}-{}", fingerprint.as_str()),
-        CommitPurpose::Import => format!("runtime-import-v3-{role}-{}", fingerprint.as_str()),
-    });
-    let batch = JournalBatch {
-        session: snapshot.id.clone(),
-        sequence: current.map_or(1, |head| head.batch_sequence.saturating_add(1)),
-        predecessor: current
-            .map(|head| JournalDigest::parse(head.batch.as_str()))
-            .transpose()?,
-        expected_revision: current.map(|head| head.revision),
-        writer_epoch,
-        operation,
-        boundary: boundary.clone(),
-        snapshot: roots,
-        checkpoint: checkpoint_id.clone(),
-    };
-    let mut commit = JournalCommit {
-        batch,
-        digest: JournalDigest::parse("0".repeat(64))?,
-        objects,
-        delta,
-        checkpoint: referenced_checkpoint,
-    };
-    commit.digest = commit.input_digest()?;
-    let old_revision = current.map(|head| head.revision);
-    domain.unresolved_failure = false;
-    let result = domain.journal.commit(lease, commit.clone()).await;
-    let head = match result {
-        Ok(head) => head,
-        Err(error) => {
-            let Ok(renewed) = domain.journal.renew(lease).await else {
-                // Without a live lease the head cannot be inspected: the
-                // commit may have landed.
-                domain.unresolved_failure = true;
-                return Err(error);
-            };
-            let advanced = renewed.head().map(|head| head.revision) > old_revision;
-            domain.lease = Some(renewed);
-            if !advanced {
-                // The renewed writer still owns the unchanged head, so this
-                // commit is proven absent.
-                return Err(error);
-            }
-            // Resolve a lost acknowledgement through the lifetime operation
-            // index. This cannot turn a pre-commit failure into success because
-            // the refreshed head must already have advanced.
-            match domain
-                .journal
-                .commit(
-                    domain.lease.as_ref().expect("renewed above"),
-                    commit.clone(),
-                )
-                .await
-            {
-                Ok(head) => head,
-                Err(error) => {
+        };
+        // Canonical map order already gives stable commit digests; make the order
+        // explicit for adapters that retain the submitted vector verbatim.
+        objects.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        #[cfg(feature = "test-support")]
+        drop(_profile_filter);
+        #[cfg(feature = "test-support")]
+        let _profile_digest =
+            agent_runtime_core::journal::profile::timer("rt.writer.digest_and_batch");
+        let operation_payload = serde_json::to_vec(&(
+            domain.role,
+            current.map(|head| head.revision),
+            &roots,
+            &referenced_checkpoint,
+        ))?;
+        let role = match domain.role {
+            JournalRole::Ordinary => "ordinary",
+            JournalRole::Protected => "protected",
+        };
+        let fingerprint = Fingerprint::of(operation_payload);
+        let operation = JournalOperationId::new(match purpose {
+            CommitPurpose::Transition => format!("runtime-{role}-{}", fingerprint.as_str()),
+            CommitPurpose::Import => format!("runtime-import-v3-{role}-{}", fingerprint.as_str()),
+        });
+        let batch = JournalBatch {
+            session: snapshot.id.clone(),
+            sequence: current.map_or(1, |head| head.batch_sequence.saturating_add(1)),
+            predecessor: current
+                .map(|head| JournalDigest::parse(head.batch.as_str()))
+                .transpose()?,
+            expected_revision: current.map(|head| head.revision),
+            writer_epoch,
+            operation,
+            boundary: boundary.clone(),
+            snapshot: roots,
+            checkpoint: checkpoint_id.clone(),
+        };
+        let mut commit = JournalCommit {
+            batch,
+            digest: JournalDigest::parse("0".repeat(64))?,
+            objects,
+            delta,
+            checkpoint: referenced_checkpoint,
+        };
+        commit.digest = commit.input_digest()?;
+        let old_revision = current.map(|head| head.revision);
+        domain.unresolved_failure = false;
+        #[cfg(feature = "test-support")]
+        drop(_profile_preparation);
+        #[cfg(feature = "test-support")]
+        drop(_profile_digest);
+        let result = domain
+            .journal
+            .commit(
+                lease,
+                crate::journal_profile_sync!("rt.writer.commit_submission", { commit.clone() }),
+            )
+            .await;
+        let head = match result {
+            Ok(head) => head,
+            Err(error) => {
+                let Ok(renewed) = domain.journal.renew(lease).await else {
+                    // Without a live lease the head cannot be inspected: the
+                    // commit may have landed.
                     domain.unresolved_failure = true;
                     return Err(error);
+                };
+                let advanced = renewed.head().map(|head| head.revision) > old_revision;
+                domain.lease = Some(renewed);
+                if !advanced {
+                    // The renewed writer still owns the unchanged head, so this
+                    // commit is proven absent.
+                    return Err(error);
+                }
+                // Resolve a lost acknowledgement through the lifetime operation
+                // index. This cannot turn a pre-commit failure into success because
+                // the refreshed head must already have advanced.
+                match domain
+                    .journal
+                    .commit(
+                        domain.lease.as_ref().expect("renewed above"),
+                        commit.clone(),
+                    )
+                    .await
+                {
+                    Ok(head) => head,
+                    Err(error) => {
+                        domain.unresolved_failure = true;
+                        return Err(error);
+                    }
                 }
             }
+        };
+        #[cfg(feature = "test-support")]
+        let _profile_publication =
+            agent_runtime_core::journal::profile::timer("rt.writer.candidate_publication");
+        if head.role != domain.role || head.session != snapshot.id {
+            domain.unresolved_failure = true;
+            return Err(incompatible_store());
         }
-    };
-    if head.role != domain.role || head.session != snapshot.id {
-        domain.unresolved_failure = true;
-        return Err(incompatible_store());
-    }
-    domain.head = Some(head);
-    domain.candidate = Some(snapshot.clone());
-    domain.candidate_submitted = true;
-    domain.encoding = Some(encoding);
-    if domain.role == JournalRole::Protected {
-        domain.checkpoint = checkpoint.cloned();
-    }
-    // This live writer lease pins every closure it has published, so objects
-    // from an earlier boundary remain valid candidates until close. A fresh
-    // runtime rebuilds this set from only its newly pinned current head.
-    domain
-        .known_candidates
-        .extend(assembler.objects.keys().cloned());
-    if let Some(checkpoint_id) = checkpoint_id {
-        domain.known_candidates.insert(checkpoint_id);
-    }
-    Ok(())
+        domain.head = Some(head);
+        #[cfg(feature = "test-support")]
+        agent_runtime_core::journal::profile::event(
+            "rt.work.writer_snapshot_nodes_copied",
+            (snapshot.history.len() + snapshot.usage.records().len() + snapshot.manifests.len())
+                as u64,
+            0,
+        );
+        domain.candidate = Some(snapshot.clone());
+        domain.candidate_submitted = true;
+        domain.encoding = Some(encoding);
+        if domain.role == JournalRole::Protected {
+            domain.checkpoint = checkpoint.cloned();
+        }
+        // This live writer lease pins every closure it has published, so objects
+        // from an earlier boundary remain valid candidates until close. A fresh
+        // runtime rebuilds this set from only its newly pinned current head.
+        domain
+            .known_candidates
+            .extend(assembler.objects.keys().cloned());
+        if let Some(checkpoint_id) = checkpoint_id {
+            domain.known_candidates.insert(checkpoint_id);
+        }
+        #[cfg(feature = "test-support")]
+        agent_runtime_core::journal::profile::event(
+            "rt.writer.known_candidate_count",
+            domain.known_candidates.len() as u64,
+            0,
+        );
+        Ok(())
+    })
 }
 
 /// Builds the semantic delta from the preceding candidate to `next`.
@@ -1167,6 +1229,8 @@ fn transition_delta(
     boundary: JournalBoundary,
     encoding: &SnapshotEncodingCache,
 ) -> Result<JournalTransitionDelta, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = agent_runtime_core::journal::profile::enter_sync("rt.writer.transition_delta");
     let Some(previous) = previous else {
         return Ok(JournalTransitionDelta {
             boundary,
@@ -1375,6 +1439,12 @@ impl ObjectAssembler {
         value: &T,
     ) -> Result<JournalObjectId, RuntimeError> {
         let object = JournalObject::encode(kind, value)?;
+        #[cfg(feature = "test-support")]
+        agent_runtime_core::journal::profile::event(
+            "rt.work.encoded_objects",
+            1,
+            object.bytes.len() as u64,
+        );
         match self.objects.get(&object.id) {
             Some(existing) if existing.bytes != object.bytes => Err(RuntimeError::conflict(
                 "journal object identity was reused for different bytes",
@@ -1900,6 +1970,8 @@ impl ObjectAssembler {
             &JsonEncodingCache,
         )>,
     ) -> Result<(JournalObjectId, Option<JsonEncodingCache>), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = agent_runtime_core::journal::profile::enter_sync("rt.writer.previous_cache");
         if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE {
             return Ok((self.add(JournalObjectKind::Extension, value)?, None));
         }
@@ -1931,9 +2003,19 @@ impl ObjectAssembler {
         manifest: &TurnManifest,
         previous: Option<(&TurnManifest, &JsonEncodingCache)>,
     ) -> Result<(JournalObjectId, JsonEncodingCache), RuntimeError> {
-        let value = serde_json::to_value(manifest)?;
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.writer.manifest_cached");
+        let value = crate::journal_profile_sync!("rt.writer.manifest_to_value", {
+            serde_json::to_value(manifest)
+        })?;
         let previous_value = match previous {
-            Some((manifest, cache)) => Some((serde_json::to_value(manifest)?, cache)),
+            Some((manifest, cache)) => Some((
+                crate::journal_profile_sync!("rt.writer.previous_manifest_to_value", {
+                    serde_json::to_value(manifest)
+                })?,
+                cache,
+            )),
             None => None,
         };
         let cache = self.json_value_cached(
@@ -2019,6 +2101,9 @@ impl ObjectAssembler {
         previous: Option<&SessionSnapshot>,
         previous_encoding: Option<&SnapshotEncodingCache>,
     ) -> Result<(JournalSnapshotRoots, SnapshotEncodingCache), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.writer.snapshot_cached");
         let previous = previous
             .zip(previous_encoding)
             .filter(|(previous, encoding)| {
@@ -2031,15 +2116,29 @@ impl ObjectAssembler {
             });
 
         let (history_ids, history, history_chain) = match previous {
-            Some((previous, encoding)) if previous.history == snapshot.history => (
-                encoding.history_ids.clone(),
-                encoding.roots.history.clone(),
-                encoding.roots.history_chain.clone(),
-            ),
+            Some((previous, encoding)) if previous.history == snapshot.history => {
+                #[cfg(feature = "test-support")]
+                agent_runtime_core::journal::profile::event(
+                    "rt.work.unchanged_history_prefix_nodes",
+                    previous.history.len() as u64,
+                    0,
+                );
+                (
+                    encoding.history_ids.clone(),
+                    encoding.roots.history.clone(),
+                    encoding.roots.history_chain.clone(),
+                )
+            }
             Some((previous, encoding))
                 if previous.history.len() <= snapshot.history.len()
                     && previous.history == snapshot.history[..previous.history.len()] =>
             {
+                #[cfg(feature = "test-support")]
+                agent_runtime_core::journal::profile::event(
+                    "rt.work.unchanged_history_prefix_nodes",
+                    previous.history.len() as u64,
+                    0,
+                );
                 let mut ids = encoding.history_ids.clone();
                 ids.extend(
                     snapshot.history[previous.history.len()..]
@@ -2201,6 +2300,8 @@ impl ObjectAssembler {
     }
 
     fn request(&mut self, request: &ProviderRequest) -> Result<JournalObjectId, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = agent_runtime_core::journal::profile::enter_sync("rt.writer.request");
         let messages = request
             .messages
             .iter()
@@ -2272,6 +2373,8 @@ impl ObjectAssembler {
         checkpoint: &TurnCheckpoint,
         roots: JournalSnapshotRoots,
     ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = agent_runtime_core::journal::profile::enter_sync("rt.writer.checkpoint");
         checkpoint.validate()?;
         Ok(ReferencedTurnCheckpoint {
             schema_version: JOURNAL_SCHEMA_VERSION,

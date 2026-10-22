@@ -81,6 +81,9 @@ impl<'a> TurnMachine<'a> {
     }
 
     fn capture_snapshot(&self, include_manifests: bool) -> SessionSnapshot {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.capture_snapshot");
         let state = self.state.lock().expect("session state poisoned");
         let mut extension_state = self.execution.snapshot_extension_state_with_staged();
         if let Some(cache) = self.driver.cache.persisted_session(self.emitter.session()) {

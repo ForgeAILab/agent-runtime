@@ -388,388 +388,396 @@ impl Driver {
         cancel: &Cancellation,
         deadline: Deadline,
     ) -> Result<PlannedProviderRequest, RequestBuildError> {
-        debug_assert_eq!(
-            execution.active_history_start(turn_id),
-            Some(active_history_start),
-            "the active turn boundary must remain stable across provider calls"
-        );
-        let internal_input = execution.active_internal_input(turn_id);
-        let interaction_ready = match execution.interaction_disposition {
-            InteractionDisposition::DirectHost => {
-                self.interaction_broker.readiness() == InteractionReadiness::Ready
-            }
-            InteractionDisposition::ReturnToParent => true,
-            InteractionDisposition::Unavailable => false,
-        };
-        let mut revisions = execution.planner.revisions().clone();
-        revisions.harness_pipeline = self.harness.fingerprint().clone();
-        let mut activation = Vec::new();
-        let mut contributed = Vec::new();
-        let summary_seed = execution
-            .extension_state
-            .lock()
-            .expect("session extension state poisoned")
-            .get(crate::runtime::fork::SUMMARY_SEED_NAMESPACE)
-            .cloned();
-        if let Some(fragment) = crate::runtime::fork::summary_fragment(summary_seed.as_ref())
-            .map_err(harness_context_error)?
-        {
-            contributed.push(fragment);
-        }
-        let schemas = if let (Some(runtime), Some(abilities)) =
-            (&self.live_abilities, &execution.abilities)
-        {
-            runtime.apply_pending(abilities, emitter, turn);
-            let user_text = internal_input
-                .as_ref()
-                .map(|input| input.content.clone())
-                .or_else(|| history.get(active_history_start).map(Message::joined_text))
-                .unwrap_or_default();
-            runtime
-                .ensure_initial_activation(abilities, &user_text, emitter, turn)
-                .map_err(harness_context_error)?;
-            let epoch = abilities.current_epoch();
-            revisions.registry_snapshot = runtime.snapshot_fingerprint();
-            revisions.scoped_view = abilities.view_fingerprint();
-            revisions.activation = epoch.fingerprint().clone();
-            activation = epoch
-                .activated()
-                .iter()
-                .map(|(id, revision)| ActivatedCapability::new(id.clone(), revision.clone()))
-                .collect();
-            let (mut schemas, instructions) =
-                abilities.materialized().map_err(harness_context_error)?;
-            if !interaction_ready {
-                schemas.retain(|schema| schema.name != QUESTIONNAIRE_TOOL_NAME);
-            }
-            contributed.extend(instructions);
-            schemas
-        } else {
-            self.registry.schemas_with_interaction(interaction_ready)
-        };
-
-        let history_view = history.clone();
-        let mut history_offset = 0usize;
-        let mut projected_active_start = active_history_start;
-        let mut semantic_provenance = Vec::new();
-        for projector in self.harness.history() {
-            let descriptor = projector.descriptor();
-            let component_state = execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned")
-                .get(descriptor.id().as_str())
-                .cloned();
-            let projection = await_harness_phase(
-                projector.project(&HistoryView {
-                    session: emitter.session().clone(),
-                    turn: turn_id.clone(),
-                    history: history_view.clone(),
-                    active_history_start,
-                    state: component_state,
-                }),
-                cancel,
-                deadline,
-                self.clock.clone(),
-                "projecting semantic history",
-            )
-            .await
-            .map_err(harness_context_error)?;
-            validate_history_projection(history, active_history_start, &projection)
-                .map_err(harness_context_error)?;
-            history_offset = projection.omit_prefix;
-            projected_active_start = active_history_start.saturating_sub(history_offset);
-            semantic_provenance = projection.provenance;
-            contributed.extend(projection.summaries);
-        }
-        let projected_history = &history[history_offset..];
-
-        if let Some(input) = &internal_input {
-            let rendered = serde_json::to_string(input).map_err(|error| {
-                ContextError::compaction(format!(
-                    "internal turn input could not be rendered: {error}"
-                ))
-            })?;
-            let sensitivity = match input.source.sensitivity {
-                InternalTurnSensitivity::Public => Sensitivity::Public,
-                InternalTurnSensitivity::Sensitive => Sensitivity::Sensitive,
-            };
-            contributed.push(
-                ContextFragment::new(
-                    format!("internal-turn:{}", turn_id.as_str()),
-                    FragmentKind::Continuation,
-                    FragmentSource::Host,
-                    RegistryRevision::from_content(rendered.as_bytes()),
-                    FragmentContent::Text(rendered),
-                )
-                .with_position(ContextPosition::new(ContextLane::TailContext, 0))
-                .with_cache_class(CacheClass::NoCache)
-                .with_sensitivity(sensitivity),
+        crate::journal_profile_scope!("rt.runtime.build_request", {
+            debug_assert_eq!(
+                execution.active_history_start(turn_id),
+                Some(active_history_start),
+                "the active turn boundary must remain stable across provider calls"
             );
-        }
-
-        let mut fragment_ids = std::collections::BTreeSet::new();
-        if self.config.system_prompt.is_some() {
-            fragment_ids.insert("system".to_owned());
-        }
-        fragment_ids.extend(schemas.iter().map(|schema| format!("tool:{}", schema.name)));
-        fragment_ids
-            .extend((history_offset..history.len()).map(|index| format!("history:{index}")));
-        for fragment in &contributed {
-            if !fragment_ids.insert(fragment.id.as_str().to_owned()) {
-                return Err(request_rejected(format!(
-                    "duplicate context fragment id `{}`",
-                    fragment.id
-                )));
-            }
-        }
-
-        for contributor in self.harness.context() {
-            let descriptor = contributor.descriptor();
-            let component_state = execution
+            let internal_input = execution.active_internal_input(turn_id);
+            let interaction_ready = match execution.interaction_disposition {
+                InteractionDisposition::DirectHost => {
+                    self.interaction_broker.readiness() == InteractionReadiness::Ready
+                }
+                InteractionDisposition::ReturnToParent => true,
+                InteractionDisposition::Unavailable => false,
+            };
+            let mut revisions = execution.planner.revisions().clone();
+            revisions.harness_pipeline = self.harness.fingerprint().clone();
+            let mut activation = Vec::new();
+            let mut contributed = Vec::new();
+            let summary_seed = execution
                 .extension_state
                 .lock()
                 .expect("session extension state poisoned")
-                .get(descriptor.id().as_str())
+                .get(crate::runtime::fork::SUMMARY_SEED_NAMESPACE)
                 .cloned();
-            let patch = await_harness_phase(
-                contributor.contribute(&ContextView {
-                    session: emitter.session().clone(),
-                    turn: turn_id.clone(),
-                    history: history_view.clone(),
-                    activation: revisions.activation.clone(),
-                    state: component_state,
-                }),
-                cancel,
-                deadline,
-                self.clock.clone(),
-                "running context contributor",
-            )
-            .await
-            .map_err(harness_context_error)?;
-            for fragment in patch.fragments {
-                validate_contributed_fragment(&fragment)?;
+            if let Some(fragment) = crate::runtime::fork::summary_fragment(summary_seed.as_ref())
+                .map_err(harness_context_error)?
+            {
+                contributed.push(fragment);
+            }
+            let schemas = if let (Some(runtime), Some(abilities)) =
+                (&self.live_abilities, &execution.abilities)
+            {
+                runtime.apply_pending(abilities, emitter, turn);
+                let user_text = internal_input
+                    .as_ref()
+                    .map(|input| input.content.clone())
+                    .or_else(|| history.get(active_history_start).map(Message::joined_text))
+                    .unwrap_or_default();
+                runtime
+                    .ensure_initial_activation(abilities, &user_text, emitter, turn)
+                    .map_err(harness_context_error)?;
+                let epoch = abilities.current_epoch();
+                revisions.registry_snapshot = runtime.snapshot_fingerprint();
+                revisions.scoped_view = abilities.view_fingerprint();
+                revisions.activation = epoch.fingerprint().clone();
+                activation = epoch
+                    .activated()
+                    .iter()
+                    .map(|(id, revision)| ActivatedCapability::new(id.clone(), revision.clone()))
+                    .collect();
+                let (mut schemas, instructions) =
+                    abilities.materialized().map_err(harness_context_error)?;
+                if !interaction_ready {
+                    schemas.retain(|schema| schema.name != QUESTIONNAIRE_TOOL_NAME);
+                }
+                contributed.extend(instructions);
+                schemas
+            } else {
+                self.registry.schemas_with_interaction(interaction_ready)
+            };
+
+            let history_view = history.clone();
+            let mut history_offset = 0usize;
+            let mut projected_active_start = active_history_start;
+            let mut semantic_provenance = Vec::new();
+            for projector in self.harness.history() {
+                let descriptor = projector.descriptor();
+                let component_state = execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .get(descriptor.id().as_str())
+                    .cloned();
+                let projection = await_harness_phase(
+                    projector.project(&HistoryView {
+                        session: emitter.session().clone(),
+                        turn: turn_id.clone(),
+                        history: history_view.clone(),
+                        active_history_start,
+                        state: component_state,
+                    }),
+                    cancel,
+                    deadline,
+                    self.clock.clone(),
+                    "projecting semantic history",
+                )
+                .await
+                .map_err(harness_context_error)?;
+                validate_history_projection(history, active_history_start, &projection)
+                    .map_err(harness_context_error)?;
+                history_offset = projection.omit_prefix;
+                projected_active_start = active_history_start.saturating_sub(history_offset);
+                semantic_provenance = projection.provenance;
+                contributed.extend(projection.summaries);
+            }
+            let projected_history = &history[history_offset..];
+
+            if let Some(input) = &internal_input {
+                let rendered = serde_json::to_string(input).map_err(|error| {
+                    ContextError::compaction(format!(
+                        "internal turn input could not be rendered: {error}"
+                    ))
+                })?;
+                let sensitivity = match input.source.sensitivity {
+                    InternalTurnSensitivity::Public => Sensitivity::Public,
+                    InternalTurnSensitivity::Sensitive => Sensitivity::Sensitive,
+                };
+                contributed.push(
+                    ContextFragment::new(
+                        format!("internal-turn:{}", turn_id.as_str()),
+                        FragmentKind::Continuation,
+                        FragmentSource::Host,
+                        RegistryRevision::from_content(rendered.as_bytes()),
+                        FragmentContent::Text(rendered),
+                    )
+                    .with_position(ContextPosition::new(ContextLane::TailContext, 0))
+                    .with_cache_class(CacheClass::NoCache)
+                    .with_sensitivity(sensitivity),
+                );
+            }
+
+            let mut fragment_ids = std::collections::BTreeSet::new();
+            if self.config.system_prompt.is_some() {
+                fragment_ids.insert("system".to_owned());
+            }
+            fragment_ids.extend(schemas.iter().map(|schema| format!("tool:{}", schema.name)));
+            fragment_ids
+                .extend((history_offset..history.len()).map(|index| format!("history:{index}")));
+            for fragment in &contributed {
                 if !fragment_ids.insert(fragment.id.as_str().to_owned()) {
                     return Err(request_rejected(format!(
                         "duplicate context fragment id `{}`",
                         fragment.id
                     )));
                 }
-                contributed.push(fragment);
             }
-        }
-        let planned = if internal_input.is_some() {
-            let active_suffix_start = (projected_active_start < projected_history.len())
-                .then_some(projected_active_start);
-            execution.planner.plan_internal_turn_from(
-                self.config.system_prompt.as_deref(),
-                projected_history,
-                history_offset,
-                &schemas,
-                &contributed,
-                active_suffix_start,
-                &semantic_provenance,
-                &revisions,
-                &activation,
-            )?
-        } else if history_offset == 0 {
-            execution.planner.plan_activated_turn_from(
-                self.config.system_prompt.as_deref(),
-                projected_history,
-                &schemas,
-                &contributed,
-                projected_active_start,
-                &revisions,
-                &activation,
-            )?
-        } else {
-            execution.planner.plan_projected_turn_from(
-                self.config.system_prompt.as_deref(),
-                projected_history,
-                history_offset,
-                &schemas,
-                &contributed,
-                projected_active_start,
-                &semantic_provenance,
-                &revisions,
-                &activation,
-            )?
-        };
 
-        let plan = &planned.plan;
-        if let Some(lcm) = &self.history_lcm {
-            let overhead = lcm.observe_plan(emitter.session(), plan.budget_report());
-            if let Some(state) = execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned")
-                .get_mut(crate::harness::LCM_COMPONENT_ID)
-            {
-                state.value["fixed_overhead_tokens"] = serde_json::json!(overhead);
+            for contributor in self.harness.context() {
+                let descriptor = contributor.descriptor();
+                let component_state = execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .get(descriptor.id().as_str())
+                    .cloned();
+                let patch = await_harness_phase(
+                    contributor.contribute(&ContextView {
+                        session: emitter.session().clone(),
+                        turn: turn_id.clone(),
+                        history: history_view.clone(),
+                        activation: revisions.activation.clone(),
+                        state: component_state,
+                    }),
+                    cancel,
+                    deadline,
+                    self.clock.clone(),
+                    "running context contributor",
+                )
+                .await
+                .map_err(harness_context_error)?;
+                for fragment in patch.fragments {
+                    validate_contributed_fragment(&fragment)?;
+                    if !fragment_ids.insert(fragment.id.as_str().to_owned()) {
+                        return Err(request_rejected(format!(
+                            "duplicate context fragment id `{}`",
+                            fragment.id
+                        )));
+                    }
+                    contributed.push(fragment);
+                }
             }
-        }
-        emitter.emit(
-            turn.clone(),
-            RuntimeEvent::ContextPlanned {
-                context: plan.fingerprint(),
-                cache_plan: plan
-                    .cache_plan()
-                    .map(CachePlan::fingerprint)
-                    .unwrap_or_else(|| plan.fingerprint()),
-                segment_count: plan.segments().len() as u32,
-                totals: segment_totals(plan),
-                input_tokens: plan.input_tokens(),
-                input_budget_tokens: plan.input_budget(),
-                reserved_tokens: plan
-                    .output_reserve()
-                    .saturating_add(plan.reasoning_reserve()),
-                confidence: map_confidence(plan.confidence()),
-                capability_overflow_tokens: plan.budget_report().capability_overflow_tokens,
-                images_text_only: plan.image_projection_report().text_only,
-                images_windowed: plan.image_projection_report().window,
-            },
-        );
+            let planned = if internal_input.is_some() {
+                let active_suffix_start = (projected_active_start < projected_history.len())
+                    .then_some(projected_active_start);
+                execution.planner.plan_internal_turn_from(
+                    self.config.system_prompt.as_deref(),
+                    projected_history,
+                    history_offset,
+                    &schemas,
+                    &contributed,
+                    active_suffix_start,
+                    &semantic_provenance,
+                    &revisions,
+                    &activation,
+                )?
+            } else if history_offset == 0 {
+                execution.planner.plan_activated_turn_from(
+                    self.config.system_prompt.as_deref(),
+                    projected_history,
+                    &schemas,
+                    &contributed,
+                    projected_active_start,
+                    &revisions,
+                    &activation,
+                )?
+            } else {
+                execution.planner.plan_projected_turn_from(
+                    self.config.system_prompt.as_deref(),
+                    projected_history,
+                    history_offset,
+                    &schemas,
+                    &contributed,
+                    projected_active_start,
+                    &semantic_provenance,
+                    &revisions,
+                    &activation,
+                )?
+            };
 
-        let compaction = plan.compaction_outcome();
-        if !compaction.is_noop() {
-            emitter.emit(
-                turn.clone(),
-                RuntimeEvent::ContextCompacted {
-                    context: plan.fingerprint(),
-                    reason: CompactionReason::BudgetExceeded,
-                    evicted: compaction
-                        .evicted
-                        .iter()
-                        .map(|fragment| SegmentId::new(fragment.as_str()))
-                        .collect(),
-                    summaries: compaction
-                        .summarized
-                        .iter()
-                        .map(|summary| {
-                            SummaryCoverage::new(
-                                SegmentId::new(summary.summary.as_str()),
-                                summary
-                                    .covers
-                                    .iter()
-                                    .map(|fragment| SegmentId::new(fragment.as_str()))
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                    reclaimed_tokens: compaction.reclaimed_tokens,
-                },
-            );
-        }
-
-        if let Some(cache_plan) = plan.cache_plan() {
-            emitter.emit(
-                turn.clone(),
-                RuntimeEvent::CachePlanChanged {
-                    cache_plan: cache_plan.fingerprint(),
-                    preserved_prefix_tokens: cache_plan.preserved_prefix_tokens,
-                    invalidated_prefix_tokens: cache_plan.invalidated_tokens,
-                    // The signal that matters for this event is prefix reuse:
-                    // an implicit-prefix provider that cannot honor a stray
-                    // ephemeral hint still reuses the stable prefix, and
-                    // reporting it as unsupported hid exactly the caching it
-                    // was doing. Unhonored classes remain observable through
-                    // the plan manifest.
-                    provider_cache_supported: cache_plan.provider_cache.capability.supports_stable,
-                    first_changed_fragment: cache_fragment_diagnostic(
-                        cache_plan.first_changed_fragment().map(|id| id.as_str()),
-                    ),
-                },
-            );
-        }
-
-        let internal = internal_input.is_some();
-        let mut turn_manifest = TurnManifest::new(turn_id.clone(), planned.manifest);
-        if let Some(input) = internal_input {
-            turn_manifest = turn_manifest.with_internal_source(input.source);
-        }
-        {
-            let mut state = state.lock().expect("session state poisoned");
-            let mut extensions = execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned");
-            let count = crate::runtime::manifests::planned_steps(
-                extensions.get(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE),
-                &state.manifests,
-            )
-            .map_err(manifest_boundary_error)?
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::conflict("manifest planned-step counter overflow"))
-            .map_err(manifest_boundary_error)?;
-            extensions.insert(
-                crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
-                crate::runtime::manifests::boundary_record(count),
-            );
-            state.manifests.push(turn_manifest);
-            crate::runtime::manifests::trim(&mut state.manifests, self.manifest_window);
-        }
-
-        let mut request = plan.to_provider_request(self.config.model.clone());
-        request.hosted_tools = self.config.hosted_tools.clone();
-        request.sampling = self.config.sampling.clone();
-        request.reasoning = self.config.reasoning.clone();
-        request.structured_output = self.config.structured_output.clone();
-        request.max_output_tokens = self.config.max_output_tokens;
-        for interceptor in self.harness.model() {
-            let descriptor = interceptor.descriptor();
-            let component_state = execution
-                .extension_state
-                .lock()
-                .expect("session extension state poisoned")
-                .get(descriptor.id().as_str())
-                .cloned();
-            let patch = await_harness_phase(
-                interceptor.before_model(&ModelView {
-                    session: emitter.session().clone(),
-                    turn: turn_id.clone(),
-                    step,
-                    internal,
-                    activation: revisions.activation.clone(),
-                    request: request.clone(),
-                    state: component_state,
-                }),
-                cancel,
-                deadline,
-                self.clock.clone(),
-                "running model interceptor",
-            )
-            .await
-            .map_err(harness_context_error)?;
-            patch.apply(&mut request);
-            match &request.tool_choice {
-                ToolChoice::Named(name)
-                    if !request.tools.iter().any(|schema| &schema.name == name) =>
+            let plan = &planned.plan;
+            if let Some(lcm) = &self.history_lcm {
+                let overhead = lcm.observe_plan(emitter.session(), plan.budget_report());
+                if let Some(state) = execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .get_mut(crate::harness::LCM_COMPONENT_ID)
                 {
-                    return Err(request_rejected(format!(
-                        "model interceptor selected inactive tool `{name}`"
-                    )));
+                    state.value["fixed_overhead_tokens"] = serde_json::json!(overhead);
                 }
-                ToolChoice::Required if request.tools.is_empty() => {
-                    return Err(request_rejected(
-                        "model interceptor requires a tool but the frozen activation has none",
-                    ));
-                }
-                _ => {}
             }
-        }
-        let cache = plan.cache_plan().map(|cache_plan| ProviderCacheProjection {
-            cache_plan: cache_plan.fingerprint(),
-            cache_identity: cache_plan.cache_identity.clone(),
-            expected_read_tokens: cache_plan.expected_read_tokens(),
-            confidence: map_confidence(plan.confidence()),
-            provider_cache_supported: cache_plan.provider_cache.capability.supports_stable,
-        });
-        let cache_plan = plan.cache_plan().cloned();
-        Ok(PlannedProviderRequest {
-            plan: plan.clone(),
-            request,
-            cache,
-            cache_plan,
+            emitter.emit(
+                turn.clone(),
+                RuntimeEvent::ContextPlanned {
+                    context: plan.fingerprint(),
+                    cache_plan: plan
+                        .cache_plan()
+                        .map(CachePlan::fingerprint)
+                        .unwrap_or_else(|| plan.fingerprint()),
+                    segment_count: plan.segments().len() as u32,
+                    totals: segment_totals(plan),
+                    input_tokens: plan.input_tokens(),
+                    input_budget_tokens: plan.input_budget(),
+                    reserved_tokens: plan
+                        .output_reserve()
+                        .saturating_add(plan.reasoning_reserve()),
+                    confidence: map_confidence(plan.confidence()),
+                    capability_overflow_tokens: plan.budget_report().capability_overflow_tokens,
+                    images_text_only: plan.image_projection_report().text_only,
+                    images_windowed: plan.image_projection_report().window,
+                },
+            );
+
+            let compaction = plan.compaction_outcome();
+            if !compaction.is_noop() {
+                emitter.emit(
+                    turn.clone(),
+                    RuntimeEvent::ContextCompacted {
+                        context: plan.fingerprint(),
+                        reason: CompactionReason::BudgetExceeded,
+                        evicted: compaction
+                            .evicted
+                            .iter()
+                            .map(|fragment| SegmentId::new(fragment.as_str()))
+                            .collect(),
+                        summaries: compaction
+                            .summarized
+                            .iter()
+                            .map(|summary| {
+                                SummaryCoverage::new(
+                                    SegmentId::new(summary.summary.as_str()),
+                                    summary
+                                        .covers
+                                        .iter()
+                                        .map(|fragment| SegmentId::new(fragment.as_str()))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                        reclaimed_tokens: compaction.reclaimed_tokens,
+                    },
+                );
+            }
+
+            if let Some(cache_plan) = plan.cache_plan() {
+                emitter.emit(
+                    turn.clone(),
+                    RuntimeEvent::CachePlanChanged {
+                        cache_plan: cache_plan.fingerprint(),
+                        preserved_prefix_tokens: cache_plan.preserved_prefix_tokens,
+                        invalidated_prefix_tokens: cache_plan.invalidated_tokens,
+                        // The signal that matters for this event is prefix reuse:
+                        // an implicit-prefix provider that cannot honor a stray
+                        // ephemeral hint still reuses the stable prefix, and
+                        // reporting it as unsupported hid exactly the caching it
+                        // was doing. Unhonored classes remain observable through
+                        // the plan manifest.
+                        provider_cache_supported: cache_plan
+                            .provider_cache
+                            .capability
+                            .supports_stable,
+                        first_changed_fragment: cache_fragment_diagnostic(
+                            cache_plan.first_changed_fragment().map(|id| id.as_str()),
+                        ),
+                    },
+                );
+            }
+
+            let internal = internal_input.is_some();
+            let mut turn_manifest = TurnManifest::new(turn_id.clone(), planned.manifest);
+            if let Some(input) = internal_input {
+                turn_manifest = turn_manifest.with_internal_source(input.source);
+            }
+            {
+                let mut state = state.lock().expect("session state poisoned");
+                let mut extensions = execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned");
+                let count = crate::runtime::manifests::planned_steps(
+                    extensions.get(crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE),
+                    &state.manifests,
+                )
+                .map_err(manifest_boundary_error)?
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::conflict("manifest planned-step counter overflow"))
+                .map_err(manifest_boundary_error)?;
+                extensions.insert(
+                    crate::runtime::manifests::MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
+                    crate::runtime::manifests::boundary_record(count),
+                );
+                state.manifests.push(turn_manifest);
+                crate::runtime::manifests::trim(&mut state.manifests, self.manifest_window);
+            }
+
+            let mut request =
+                crate::journal_profile_sync!("rt.runtime.provider_request_materialization", {
+                    plan.to_provider_request(self.config.model.clone())
+                });
+            request.hosted_tools = self.config.hosted_tools.clone();
+            request.sampling = self.config.sampling.clone();
+            request.reasoning = self.config.reasoning.clone();
+            request.structured_output = self.config.structured_output.clone();
+            request.max_output_tokens = self.config.max_output_tokens;
+            for interceptor in self.harness.model() {
+                let descriptor = interceptor.descriptor();
+                let component_state = execution
+                    .extension_state
+                    .lock()
+                    .expect("session extension state poisoned")
+                    .get(descriptor.id().as_str())
+                    .cloned();
+                let patch = await_harness_phase(
+                    interceptor.before_model(&ModelView {
+                        session: emitter.session().clone(),
+                        turn: turn_id.clone(),
+                        step,
+                        internal,
+                        activation: revisions.activation.clone(),
+                        request: request.clone(),
+                        state: component_state,
+                    }),
+                    cancel,
+                    deadline,
+                    self.clock.clone(),
+                    "running model interceptor",
+                )
+                .await
+                .map_err(harness_context_error)?;
+                patch.apply(&mut request);
+                match &request.tool_choice {
+                    ToolChoice::Named(name)
+                        if !request.tools.iter().any(|schema| &schema.name == name) =>
+                    {
+                        return Err(request_rejected(format!(
+                            "model interceptor selected inactive tool `{name}`"
+                        )));
+                    }
+                    ToolChoice::Required if request.tools.is_empty() => {
+                        return Err(request_rejected(
+                            "model interceptor requires a tool but the frozen activation has none",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let cache = plan.cache_plan().map(|cache_plan| ProviderCacheProjection {
+                cache_plan: cache_plan.fingerprint(),
+                cache_identity: cache_plan.cache_identity.clone(),
+                expected_read_tokens: cache_plan.expected_read_tokens(),
+                confidence: map_confidence(plan.confidence()),
+                provider_cache_supported: cache_plan.provider_cache.capability.supports_stable,
+            });
+            let cache_plan = plan.cache_plan().cloned();
+            Ok(PlannedProviderRequest {
+                plan: plan.clone(),
+                request,
+                cache,
+                cache_plan,
+            })
         })
     }
 

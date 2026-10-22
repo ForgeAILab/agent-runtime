@@ -914,3 +914,8 @@ pub(crate) fn objects(
     }
     out
 }
+
+#[cfg(feature = "journal-profile")]
+#[allow(dead_code)]
+#[path = "hot_fixture.rs"]
+pub(crate) mod hot;

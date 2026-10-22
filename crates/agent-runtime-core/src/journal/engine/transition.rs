@@ -765,6 +765,10 @@ impl Transition {
         stored: &ObjectStore,
         reachable: &ReachableSet,
     ) -> Result<ProjectedSnapshot, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.transition.project_snapshot");
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.full_candidate_materializations", 1, 0);
         if commit
             .delta
             .extension_updates
@@ -1105,6 +1109,8 @@ impl Transition {
         lease: &JournalLease,
         commit: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.transition.commit");
         let mut state = self.lock()?;
         let lease_record = self.live_lease(&state, lease)?;
         if lease_record.writer_epoch.is_none() {

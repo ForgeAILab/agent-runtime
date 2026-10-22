@@ -264,6 +264,9 @@ impl RunPlanner {
     }
 
     pub(crate) fn persisted_previous_cache(&self) -> Option<VersionedSessionState> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.persisted_previous_cache");
         let cache = self
             .previous_cache
             .lock()
