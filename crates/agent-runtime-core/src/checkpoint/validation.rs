@@ -563,6 +563,7 @@ impl TurnCheckpoint {
             state: &self.state,
             watermark: &self.watermark,
             state_fingerprint,
+            state_shape: None,
         }
     }
 
@@ -707,8 +708,50 @@ pub(crate) struct CheckpointEvidence<'a> {
     pub(crate) state: &'a TurnState,
     pub(crate) watermark: &'a CheckpointWatermark,
     pub(crate) state_fingerprint: Option<&'a Fingerprint>,
+    pub(crate) state_shape: Option<&'a crate::journal::ReferencedTurnState>,
 }
 impl CheckpointEvidence<'_> {
+    pub(crate) fn validate_state(&self) -> Result<(), RuntimeError> {
+        if let TurnState::CallingModel { request, .. } = self.state {
+            request
+                .validate_cache_identity()
+                .map_err(RuntimeError::conflict)?;
+        }
+        if let Some(shape) = self.state_shape {
+            use crate::journal::{JOURNAL_FANOUT, JournalStateValue};
+            let raw = match self.state {
+                TurnState::CallingModel {
+                    request_id, step, ..
+                } => {
+                    serde_json::json!({"state":"calling_model", "request_id":request_id,"step":step,"request":null})
+                }
+                state => serde_json::to_value(state)?,
+            };
+            let fields = raw
+                .as_object()
+                .ok_or_else(|| RuntimeError::conflict("turn state is not an object"))?;
+            if shape.fields.len() > JOURNAL_FANOUT
+                || shape.fields.len() + 1 != fields.len()
+                || fields.get("state").and_then(serde_json::Value::as_str)
+                    != Some(shape.tag.as_str())
+                || shape.fields.iter().any(|(name, reference)| {
+                    let Some(value) = fields.get(name).filter(|_| name.as_str() != "state") else {
+                        return true;
+                    };
+                    let request = shape.tag == "calling_model" && name == "request";
+                    request != matches!(reference, JournalStateValue::Request { .. })
+                        || (!request
+                            && value.is_array()
+                                != matches!(reference, JournalStateValue::Sequence { .. }))
+                })
+            {
+                return Err(RuntimeError::conflict(
+                    "checkpoint state tag or field shape mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn validate(&self, snapshot: &impl SnapshotEvidence) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.checkpoint.validate");
@@ -721,6 +764,7 @@ impl CheckpointEvidence<'_> {
             0,
         );
 
+        self.validate_state()?;
         if self.schema_version != CHECKPOINT_SCHEMA_VERSION {
             return Err(RuntimeError::conflict(format!(
                 "unsupported checkpoint schema {}; expected {}",

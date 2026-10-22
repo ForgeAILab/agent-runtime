@@ -114,9 +114,8 @@ struct NativeDomain {
     /// records reuse these directly instead of serializing/hash-walking the
     /// complete materialized snapshot again.
     encoding: Option<SnapshotEncodingCache>,
-    /// Candidate objects already submitted in this writer lineage. A backend
-    /// may store projected IDs in the ordinary domain; this set intentionally
-    /// tracks input drafts so an unchanged body is not submitted again.
+    /// Drafts emitted by the latest preparation. Older identical bodies may
+    /// be safely resupplied; retaining every prior state id is unnecessary.
     known_candidates: BTreeSet<JournalObjectId>,
     /// Whether the last failed commit may have landed: its acknowledgement
     /// was lost and neither renew nor the same-operation replay resolved it,
@@ -979,9 +978,12 @@ async fn open_domain(
             journal,
             lease: Some(lease),
             head,
-            candidate: candidate
-                .map(JournalSnapshotView::from_snapshot)
-                .transpose()?,
+            candidate: match &encoding {
+                Some(cache) => Some(cache.snapshot_view()),
+                None => candidate
+                    .map(JournalSnapshotView::from_snapshot)
+                    .transpose()?,
+            },
             candidate_submitted: false,
             follows_protected,
             checkpoint,
@@ -1121,18 +1123,7 @@ async fn commit_domain(
             checkpoint: referenced_checkpoint,
         };
         commit.digest = commit.input_digest()?;
-        let candidate = if let Some(previous) = domain.candidate.as_ref().filter(|previous| {
-            delta.bootstrap.is_none() && encoding.append_starts(previous).is_some()
-        }) {
-            assembler.preparation_hints().prepare_snapshot(
-                previous,
-                &delta,
-                snapshot,
-                encoding.manifest_overlap(previous),
-            )?
-        } else {
-            JournalSnapshotView::from_snapshot(snapshot.clone())?
-        };
+        let candidate = encoding.snapshot_view();
 
         let old_revision = current.map(|head| head.revision);
         domain.unresolved_failure = false;
@@ -1214,9 +1205,7 @@ async fn commit_domain(
         // This live writer lease pins every closure it has published, so objects
         // from an earlier boundary remain valid candidates until close. A fresh
         // runtime rebuilds this set from only its newly pinned current head.
-        domain
-            .known_candidates
-            .extend(assembler.objects.keys().cloned());
+        domain.known_candidates = assembler.objects.keys().cloned().collect();
         if let Some(checkpoint_id) = checkpoint_id {
             domain.known_candidates.insert(checkpoint_id);
         }

@@ -379,14 +379,24 @@ impl JournalSnapshotView {
     pub fn extension_len(&self) -> usize {
         self.extension_state.len()
     }
+    pub(crate) fn same_version(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.identity == other.identity
+            && self.updated == other.updated
+            && self.history.same(&other.history)
+            && self.usage.same(&other.usage)
+            && self.manifests.same(&other.manifests)
+            && self.extension_state.same(&other.extension_state)
+    }
     /// Starts a mutation bound to this immutable semantic version.
+    #[doc(hidden)]
     pub fn mutation(&self) -> JournalSnapshotMutation {
         JournalSnapshotMutation {
             base: self.clone(),
             history_append: vec![],
             usage_append: vec![],
             manifests_append: vec![],
-            retained_manifests: self.manifest_len(),
+            retained_manifests: None,
             extension_updates: Default::default(),
         }
     }
@@ -450,13 +460,14 @@ impl Serialize for JournalSnapshotView {
 
 /// Typed changes anchored to an immutable base. Its fields cannot substitute a
 /// different base after construction; applying it shares all unchanged nodes.
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct JournalSnapshotMutation {
     base: JournalSnapshotView,
     history_append: Vec<Message>,
     usage_append: Vec<UsageRecord>,
     manifests_append: Vec<TurnManifest>,
-    retained_manifests: usize,
+    retained_manifests: Option<usize>,
     extension_updates: std::collections::BTreeMap<String, Option<VersionedSessionState>>,
 }
 impl JournalSnapshotMutation {
@@ -474,7 +485,7 @@ impl JournalSnapshotMutation {
     }
     /// Sets the resulting number of retained diagnostic positions.
     pub fn retain_manifests(&mut self, count: usize) {
-        self.retained_manifests = count;
+        self.retained_manifests = Some(count);
     }
     /// Replaces or removes one opaque namespace.
     pub fn set_extension(&mut self, key: String, value: Option<VersionedSessionState>) {
@@ -496,7 +507,9 @@ impl JournalSnapshotMutation {
         for value in self.manifests_append {
             next.manifests.push(value)?;
         }
-        next.manifests.truncate_front(self.retained_manifests)?;
+        if let Some(count) = self.retained_manifests {
+            next.manifests.truncate_front(count)?;
+        }
         for (key, value) in self.extension_updates {
             next.extension_state.set(key, value)?;
         }

@@ -33,12 +33,17 @@ impl std::fmt::Debug for JournalPreparationHints {
 pub(crate) struct StateEvidence {
     pub(crate) value: Arc<TurnState>,
     pub(crate) fingerprint: agent_runtime_registry::Fingerprint,
+    pub(crate) encoded: Vec<u8>,
 }
 pub(crate) struct ManifestEvidence {
+    bound_value: Arc<TurnManifest>,
+    witness: Arc<JsonWitness>,
     pub(crate) value: Arc<TurnManifest>,
     pub(crate) bytes: usize,
 }
 pub(crate) struct ExtensionEvidence {
+    bound_value: Arc<VersionedSessionState>,
+    witness: Arc<JsonWitness>,
     pub(crate) namespace: String,
     pub(crate) value: Arc<VersionedSessionState>,
     pub(crate) bytes: usize,
@@ -71,10 +76,17 @@ fn retained_overlap_view(previous: &JournalSnapshotView, next: &[TurnManifest]) 
 
 pub(crate) fn messages_match(left: &[Message], right: &[Message]) -> bool {
     left == right
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| parts_match(&left.content, &right.content))
+        && left.iter().zip(right).all(|(left, right)| {
+            let Message {
+                role: _,
+                content: left,
+            } = left;
+            let Message {
+                role: _,
+                content: right,
+            } = right;
+            parts_match(left, right)
+        })
 }
 
 fn parts_match(left: &[ContentPart], right: &[ContentPart]) -> bool {
@@ -87,7 +99,33 @@ fn parts_match(left: &[ContentPart], right: &[ContentPart]) -> bool {
             (ContentPart::ToolResult(left), ContentPart::ToolResult(right)) => {
                 parts_match(&left.content, &right.content)
             }
-            _ => true,
+            (ContentPart::Text { text: _ }, ContentPart::Text { text: _ })
+            | (
+                ContentPart::Reasoning {
+                    text: _,
+                    redacted: _,
+                    signature: _,
+                    producer: _,
+                },
+                ContentPart::Reasoning {
+                    text: _,
+                    redacted: _,
+                    signature: _,
+                    producer: _,
+                },
+            )
+            | (
+                ContentPart::Image { url: _, detail: _ },
+                ContentPart::Image { url: _, detail: _ },
+            ) => true,
+            (
+                ContentPart::Text { .. }
+                | ContentPart::Reasoning { .. }
+                | ContentPart::Image { .. }
+                | ContentPart::ToolCall(_)
+                | ContentPart::ToolResult(_),
+                _,
+            ) => false,
         })
 }
 
@@ -114,6 +152,7 @@ fn numbers_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
 #[derive(Clone)]
 pub struct JournalWriterEncoding {
     roots: JournalSnapshotRoots,
+    view: JournalSnapshotView,
     history_view: JournalSequenceView,
     usage_view: JournalSequenceView,
     manifest_ids: Vec<JournalObjectId>,
@@ -143,6 +182,7 @@ struct JournalWriterMutationHint {
 pub struct JournalJsonEncoding {
     root: JournalObjectId,
     node: Arc<JsonEncodingNode>,
+    witness: Arc<JsonWitness>,
     value: Option<Arc<Value>>,
     canonical_len: usize,
 }
@@ -185,6 +225,7 @@ pub struct JournalWriterAssembler {
     /// Candidate structured metadata reachable from reference-only deltas.
     pub structured: BTreeSet<JournalObjectId>,
     hints: JournalPreparationHints,
+    json_witnesses: BTreeMap<JournalObjectId, Arc<JsonWitness>>,
     request_cache: Option<Arc<RequestEncodingCache>>,
 }
 
@@ -216,6 +257,36 @@ impl JournalWriterAssembler {
         value: &T,
     ) -> Result<JournalObjectId, RuntimeError> {
         let id = self.add(kind, value)?;
+        let object = self.objects.get(&id).ok_or_else(conflict)?.clone();
+        use super::engine::{ExpectedLeaf, ExpectedObject, object_links};
+        let expected = match kind {
+            JournalObjectKind::JsonValue | JournalObjectKind::JsonInline => {
+                ExpectedObject::Leaf(ExpectedLeaf::JsonValue)
+            }
+            JournalObjectKind::JsonObjectEntry => {
+                ExpectedObject::Leaf(ExpectedLeaf::JsonObjectEntry)
+            }
+            JournalObjectKind::ManifestReference => ExpectedObject::Leaf(ExpectedLeaf::Manifest),
+            JournalObjectKind::ExtensionReference => ExpectedObject::Leaf(ExpectedLeaf::Extension),
+            JournalObjectKind::JsonBranch => ExpectedObject::Sequence(ExpectedLeaf::JsonValue),
+            JournalObjectKind::Sequence => {
+                let node: JournalSequenceNode = object.decode(kind)?;
+                let leaf = match node {
+                    JournalSequenceNode::Leaf { .. } | JournalSequenceNode::Branch { .. } => {
+                        ExpectedLeaf::JsonObjectEntry
+                    }
+                    _ => ExpectedLeaf::JsonValue,
+                };
+                ExpectedObject::Sequence(leaf)
+            }
+            _ => return Err(conflict()),
+        };
+        let children = object_links(&object, expected)?
+            .into_iter()
+            .map(|(id, _)| self.json_witnesses.get(&id).cloned().ok_or_else(conflict))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.json_witnesses
+            .insert(id.clone(), Arc::new(JsonWitness { object, children }));
         self.structured.insert(id.clone());
         Ok(id)
     }
@@ -515,12 +586,14 @@ impl JournalWriterAssembler {
             .ok_or_else(|| RuntimeError::conflict("journal sequence is empty"))
     }
 
+    #[doc(hidden)]
     pub fn json_value_cached(
         &mut self,
         value: &Value,
         previous: Option<(&Value, &JournalJsonEncoding)>,
     ) -> Result<JournalJsonEncoding, RuntimeError> {
         if let Some((prior, cache)) = previous {
+            self.register_witness(&cache.witness);
             if journal_json_identical(prior, value) {
                 return Ok(cache.clone());
             }
@@ -549,6 +622,11 @@ impl JournalWriterAssembler {
                 };
                 let canonical_len = cache.canonical_len;
                 Ok(JournalJsonEncoding {
+                    witness: self
+                        .json_witnesses
+                        .get(&root)
+                        .cloned()
+                        .ok_or_else(conflict)?,
                     root,
                     node: Arc::new(JsonEncodingNode::Array(cache)),
                     value: None,
@@ -639,6 +717,11 @@ impl JournalWriterAssembler {
                     )?
                 };
                 Ok(JournalJsonEncoding {
+                    witness: self
+                        .json_witnesses
+                        .get(&root)
+                        .cloned()
+                        .ok_or_else(conflict)?,
                     root,
                     node: Arc::new(JsonEncodingNode::Object { entries, sequence }),
                     value: None,
@@ -663,6 +746,11 @@ impl JournalWriterAssembler {
                     )?
                 };
                 Ok(JournalJsonEncoding {
+                    witness: self
+                        .json_witnesses
+                        .get(&root)
+                        .cloned()
+                        .ok_or_else(conflict)?,
                     root,
                     node: Arc::new(JsonEncodingNode::Scalar),
                     value: None,
@@ -716,6 +804,7 @@ impl JournalWriterAssembler {
     ) -> Result<(JournalJsonItem, JsonItemEncodingCache, bool), RuntimeError> {
         if let Some((prior, JsonItemEncodingCache::Reference(cache))) = previous {
             if journal_json_identical(prior, value) {
+                self.register_witness(&cache.witness);
                 return Ok((
                     JournalJsonItem::Reference {
                         object: cache.root.clone(),
@@ -746,6 +835,11 @@ impl JournalWriterAssembler {
                 &JournalJsonInline(value.clone()),
             )?;
             JournalJsonEncoding {
+                witness: self
+                    .json_witnesses
+                    .get(&root)
+                    .cloned()
+                    .ok_or_else(conflict)?,
                 root,
                 node: Arc::new(JsonEncodingNode::Inline),
                 value: None,
@@ -789,6 +883,12 @@ impl JournalWriterAssembler {
                 .map(|(value, cache)| (value.as_ref(), *cache)),
         )?;
         cache.value = Some(Arc::new(value_json));
+        self.register_witness(&cache.witness);
+        let bound_value = Arc::new(value.clone());
+        check_json_roundtrip::<VersionedSessionState>(
+            cache.value.as_deref().ok_or_else(conflict)?,
+            &cache.witness,
+        )?;
         let id = self.add_structured(
             JournalObjectKind::ExtensionReference,
             &ReferencedSessionState {
@@ -798,8 +898,10 @@ impl JournalWriterAssembler {
         self.hints.extensions.insert(
             id.clone(),
             Arc::new(ExtensionEvidence {
+                bound_value: bound_value.clone(),
+                witness: self.json_witnesses.get(&id).cloned().ok_or_else(conflict)?,
                 namespace: namespace.to_owned(),
-                value: Arc::new(value.clone()),
+                value: bound_value,
                 bytes: cache.canonical_len,
             }),
         );
@@ -825,6 +927,12 @@ impl JournalWriterAssembler {
                 .map(|(value, cache)| (value.as_ref(), *cache)),
         )?;
         cache.value = Some(Arc::new(value));
+        self.register_witness(&cache.witness);
+        let bound_value = Arc::new(manifest.clone());
+        check_json_roundtrip::<TurnManifest>(
+            cache.value.as_deref().ok_or_else(conflict)?,
+            &cache.witness,
+        )?;
         let id = self.add_structured(
             JournalObjectKind::ManifestReference,
             &ReferencedTurnManifest {
@@ -834,7 +942,9 @@ impl JournalWriterAssembler {
         self.hints.manifests.insert(
             id.clone(),
             Arc::new(ManifestEvidence {
-                value: Arc::new(manifest.clone()),
+                bound_value: bound_value.clone(),
+                witness: self.json_witnesses.get(&id).cloned().ok_or_else(conflict)?,
+                value: bound_value,
                 bytes: cache.canonical_len,
             }),
         );
@@ -901,6 +1011,7 @@ impl JournalWriterAssembler {
             .map(|(roots, _)| roots)
     }
 
+    #[doc(hidden)]
     pub fn snapshot_cached(
         &mut self,
         snapshot: &SessionSnapshot,
@@ -909,17 +1020,14 @@ impl JournalWriterAssembler {
         previous_encoding: Option<&JournalWriterEncoding>,
     ) -> Result<(JournalSnapshotRoots, JournalWriterEncoding), RuntimeError> {
         let view = previous
-            .cloned()
-            .map(JournalSnapshotView::from_snapshot)
-            .transpose()?;
-        self.snapshot_view_cached(
-            snapshot,
-            planned_step_count,
-            view.as_ref(),
-            previous_encoding,
-        )
+            .zip(previous_encoding)
+            .and_then(|(snapshot, encoding)| {
+                (encoding.view.materialize() == *snapshot).then_some(&encoding.view)
+            });
+        self.snapshot_view_cached(snapshot, planned_step_count, view, previous_encoding)
     }
 
+    #[doc(hidden)]
     pub fn snapshot_view_cached(
         &mut self,
         snapshot: &SessionSnapshot,
@@ -929,17 +1037,19 @@ impl JournalWriterAssembler {
     ) -> Result<(JournalSnapshotRoots, JournalWriterEncoding), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.writer.snapshot_cached");
-        self.request_cache = previous_encoding.and_then(|cache| cache.request_cache.clone());
         let previous = previous
             .zip(previous_encoding)
             .filter(|(previous, encoding)| {
                 previous.session() == &snapshot.id
+                    && encoding.view.same_version(previous)
                     && encoding.roots.history.len == previous.history_len() as u64
                     && encoding.roots.usage.len == previous.usage_len() as u64
                     && encoding.manifest_ids.len() == previous.manifest_len()
                     && encoding.manifest_json.len() == previous.manifest_len()
                     && encoding.extension_ids.len() == previous.extension_len()
             });
+
+        self.request_cache = previous.and_then(|(_, cache)| cache.request_cache.clone());
 
         let history_prefix = previous.filter(|(prior, _)| {
             prior.history_len() <= snapshot.history.len()
@@ -1097,12 +1207,14 @@ impl JournalWriterAssembler {
         };
         let mutation_hint = previous
             .filter(|_| history_prefix.is_some() && usage_prefix.is_some())
-            .map(|(base, encoding)| {
-                let extension_changes = encoding
-                    .extension_ids
-                    .keys()
-                    .chain(extension_ids.keys())
-                    .filter(|key| encoding.extension_ids.get(*key) != extension_ids.get(*key))
+            .map(|(base, _)| {
+                let extension_changes = base
+                    .extensions()
+                    .map(|(key, _)| key)
+                    .chain(snapshot.extension_state.keys())
+                    .filter(|key| {
+                        !state_identical(base.extension(key), snapshot.extension_state.get(*key))
+                    })
                     .cloned()
                     .collect();
                 JournalWriterMutationHint {
@@ -1113,10 +1225,33 @@ impl JournalWriterAssembler {
                     extension_changes,
                 }
             });
+        let view = if let Some(hint) = &mutation_hint {
+            let mut view = hint.base.clone();
+            for message in &snapshot.history[history_start..] {
+                view.history.push(message.clone())?;
+            }
+            for record in &records[usage_start..] {
+                view.usage.push(record.clone())?;
+            }
+            view.manifests.truncate_front(overlap)?;
+            for manifest in &snapshot.manifests[overlap..] {
+                view.manifests.push(manifest.clone())?;
+            }
+            for key in &hint.extension_changes {
+                view.extension_state
+                    .set(key.clone(), snapshot.extension_state.get(key).cloned())?;
+            }
+            view.identity = snapshot.identity.clone();
+            view.updated = snapshot.updated;
+            view
+        } else {
+            JournalSnapshotView::from_snapshot(snapshot.clone())?
+        };
         Ok((
             roots.clone(),
             JournalWriterEncoding {
                 roots,
+                view,
                 history_view,
                 usage_view,
                 manifest_ids,
@@ -1285,6 +1420,7 @@ impl JournalWriterAssembler {
             Arc::new(StateEvidence {
                 value: Arc::new(state.clone()),
                 fingerprint,
+                encoded: self.objects.get(&id).ok_or_else(conflict)?.bytes.clone(),
             }),
         );
         Ok(id)
@@ -1325,6 +1461,10 @@ impl JournalWriterAssembler {
 }
 
 impl JournalWriterEncoding {
+    #[doc(hidden)]
+    pub fn snapshot_view(&self) -> JournalSnapshotView {
+        self.view.clone()
+    }
     pub fn manifest_ids(&self) -> &[JournalObjectId] {
         &self.manifest_ids
     }
@@ -1359,73 +1499,6 @@ impl std::fmt::Debug for JournalWriterAssembler {
         f.debug_struct("JournalWriterAssembler")
             .field("objects", &self.objects.len())
             .finish_non_exhaustive()
-    }
-}
-
-impl JournalPreparationHints {
-    /// Applies runtime-owned typed changes to their captured immutable base.
-    /// This produces semantic data only; publication still validates roots,
-    /// membership, policy, checkpoint evidence and durable fences.
-    #[doc(hidden)]
-    pub fn prepare_snapshot(
-        &self,
-        base: &JournalSnapshotView,
-        delta: &JournalTransitionDelta,
-        next: &SessionSnapshot,
-        overlap: Option<usize>,
-    ) -> Result<JournalSnapshotView, RuntimeError> {
-        if delta.bootstrap.is_some() {
-            return JournalSnapshotView::from_snapshot(next.clone());
-        }
-        let mut view = base.clone();
-        for value in &delta.history_append {
-            view.history.push(value.clone())?;
-        }
-        for value in &delta.usage_append {
-            view.usage.push(value.clone())?;
-        }
-        for value in &delta.manifests_append {
-            view.manifests.push(value.clone())?;
-        }
-        let overlap = overlap.unwrap_or_else(|| retained_overlap_view(base, &next.manifests));
-        if delta.manifest_references.len() != next.manifests.len() - overlap {
-            return Err(conflict());
-        }
-        for (index, id) in delta.manifest_references.iter().enumerate() {
-            if let Some(evidence) = self.manifests.get(id) {
-                view.manifests
-                    .push_shared(evidence.value.clone(), evidence.bytes)?;
-            } else {
-                view.manifests
-                    .push(next.manifests[overlap + index].clone())?;
-            }
-        }
-        view.manifests.truncate_front(next.manifests.len())?;
-        for key in delta
-            .extension_updates
-            .keys()
-            .chain(delta.extension_references.keys())
-        {
-            if let Some(evidence) = delta
-                .extension_references
-                .get(key)
-                .and_then(Option::as_ref)
-                .and_then(|id| self.extensions.get(id))
-                .filter(|e| e.namespace == *key)
-            {
-                view.extension_state.set_shared(
-                    key.clone(),
-                    evidence.value.clone(),
-                    evidence.bytes,
-                )?;
-            } else {
-                view.extension_state
-                    .set(key.clone(), next.extension_state.get(key).cloned())?;
-            }
-        }
-        view.identity = next.identity.clone();
-        view.updated = next.updated;
-        Ok(view)
     }
 }
 
@@ -1477,5 +1550,102 @@ impl JournalWriterEncoding {
     #[doc(hidden)]
     pub fn finish_preparation(&mut self, assembler: &JournalWriterAssembler) {
         self.request_cache = assembler.request_cache.clone();
+    }
+}
+
+// The immutable graph binds the typed Arc to the encoder's intended bodies.
+// Engine validation stops at the base closure, never at lease/cache membership.
+struct JsonWitness {
+    object: JournalObject,
+    children: Vec<Arc<JsonWitness>>,
+}
+impl JournalWriterAssembler {
+    fn register_witness(&mut self, root: &Arc<JsonWitness>) {
+        let mut pending = vec![root.clone()];
+        while let Some(node) = pending.pop() {
+            if self.json_witnesses.contains_key(&node.object.id) {
+                continue;
+            }
+            pending.extend(node.children.iter().cloned());
+            self.json_witnesses.insert(node.object.id.clone(), node);
+        }
+    }
+}
+fn check_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
+    value: &Value,
+    witness: &Arc<JsonWitness>,
+) -> Result<(), RuntimeError> {
+    let mut bodies = BTreeMap::new();
+    let mut pending = vec![witness];
+    while let Some(node) = pending.pop() {
+        if bodies
+            .insert(node.object.id.clone(), node.object.bytes.clone())
+            .is_none()
+        {
+            pending.extend(&node.children);
+        }
+    }
+    let stored = super::engine::ObjectStore::default();
+    let reachable = super::engine::ReachableSet::default();
+    let drafts = super::engine::DraftReader::new(&stored, &bodies, &reachable);
+    let encoded_value = drafts.json_value(&witness.object.id, 0)?;
+    if canonical_journal_json(&encoded_value)? != canonical_journal_json(value)? {
+        return Err(conflict());
+    }
+    let decoded: T = serde_json::from_value(encoded_value).map_err(|_| conflict())?;
+    if canonical_journal_json(&decoded)? != canonical_journal_json(value)? {
+        return Err(conflict());
+    }
+    Ok(())
+}
+impl JsonWitness {
+    fn validate(
+        &self,
+        drafts: &super::engine::DraftReader<'_>,
+        verified: &impl Fn(&JournalObjectId) -> bool,
+    ) -> Result<(), RuntimeError> {
+        let mut pending = vec![self];
+        let mut seen = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if verified(&node.object.id) || !seen.insert(&node.object.id) {
+                continue;
+            }
+            #[cfg(feature = "test-support")]
+            crate::journal::profile::event("rt.work.hint_json_nodes_checked", 1, 0);
+            if drafts.encoded_object(&node.object.id)?.bytes != node.object.bytes {
+                return Err(conflict());
+            }
+            pending.extend(node.children.iter().map(Arc::as_ref));
+        }
+        Ok(())
+    }
+}
+impl ManifestEvidence {
+    pub(in crate::journal) fn validate(
+        &self,
+        drafts: &super::engine::DraftReader<'_>,
+        verified: &impl Fn(&JournalObjectId) -> bool,
+    ) -> Result<(), RuntimeError> {
+        if !Arc::ptr_eq(&self.value, &self.bound_value) {
+            return Err(conflict());
+        }
+        self.witness.validate(drafts, verified)
+    }
+}
+impl ExtensionEvidence {
+    pub(in crate::journal) fn validate(
+        &self,
+        namespace: &str,
+        drafts: &super::engine::DraftReader<'_>,
+        verified: &impl Fn(&JournalObjectId) -> bool,
+    ) -> Result<(), RuntimeError> {
+        if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE
+            || self.namespace != namespace
+            || self.value.sensitivity != crate::store::SessionStateSensitivity::RedactionSafe
+            || !Arc::ptr_eq(&self.value, &self.bound_value)
+        {
+            return Err(conflict());
+        }
+        self.witness.validate(drafts, verified)
     }
 }

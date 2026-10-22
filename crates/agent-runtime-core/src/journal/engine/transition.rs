@@ -842,6 +842,12 @@ impl Transition {
                             .and_then(|id| self.preparation.extensions.get(id))
                             .filter(|e| e.namespace == *key)
                         {
+                            evidence.validate(key, &drafts, &|id| {
+                                current
+                                    .exact
+                                    .as_ref()
+                                    .is_some_and(|proof| proof.contains(id))
+                            })?;
                             snapshot.extension_state.set_shared(
                                 key.clone(),
                                 evidence.value.clone(),
@@ -862,6 +868,12 @@ impl Transition {
                     }
                     for id in &delta.manifest_references {
                         if let Some(evidence) = self.preparation.manifests.get(id) {
+                            evidence.validate(&drafts, &|id| {
+                                current
+                                    .exact
+                                    .as_ref()
+                                    .is_some_and(|proof| proof.contains(id))
+                            })?;
                             snapshot
                                 .manifests
                                 .push_shared(evidence.value.clone(), evidence.bytes)?;
@@ -926,6 +938,12 @@ impl Transition {
                             .extension_updates
                             .keys()
                             .any(|key| delta.extension_references.contains_key(key))
+                    {
+                        return Err(conflict());
+                    }
+                    if !commit.delta.manifest_references.is_empty()
+                        && canonical_journal_json(&delta.manifests_append)?
+                            != canonical_journal_json(&commit.delta.manifests_append)?
                     {
                         return Err(conflict());
                     }
