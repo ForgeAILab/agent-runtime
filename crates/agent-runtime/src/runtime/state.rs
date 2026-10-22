@@ -119,6 +119,10 @@ pub struct SessionExecutionContext {
     /// in-process registry prevents delegation from parsing model-facing
     /// marker text or lossy observability events.
     artifacts: Mutex<BTreeMap<TurnId, BTreeMap<ArtifactId, ArtifactRef>>>,
+    /// The persisted artifact-reference namespace for the current registry,
+    /// shared across journal captures until the next recorded artifact.
+    /// Locked only while `artifacts` is held.
+    artifacts_state: Mutex<Option<Arc<VersionedSessionState>>>,
     /// Injected content drained for an acceptance with an unresolved
     /// outcome, held for the host to restore on a reopened session.
     unresolved_injections: Mutex<Option<UnresolvedInjections>>,
@@ -171,6 +175,7 @@ impl SessionExecutionContext {
             interaction_disposition,
             returned_interaction: Mutex::new(returned_interaction),
             artifacts: Mutex::new(artifacts),
+            artifacts_state: Mutex::new(None),
             unresolved_injections: Mutex::new(None),
         })
     }
@@ -365,12 +370,13 @@ impl SessionExecutionContext {
             .filter(|(key, _)| key.as_str() != PREVIOUS_CACHE_STATE_NAMESPACE)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>();
-        self.snapshot_generated_state(state, include_previous)
+        self.snapshot_generated_state(state, include_previous, true)
     }
     fn snapshot_generated_state(
         &self,
         mut state: BTreeMap<String, VersionedSessionState>,
         include_previous: bool,
+        include_artifacts: bool,
     ) -> BTreeMap<String, VersionedSessionState> {
         if let Some(abilities) = &self.abilities {
             state.insert(
@@ -393,24 +399,45 @@ impl SessionExecutionContext {
                 ),
             );
         }
-        let artifacts = self.artifacts.lock().expect("session artifacts poisoned");
-        if artifacts.is_empty() {
-            state.remove(ARTIFACT_REFERENCES_STATE_NAMESPACE);
-        } else {
-            let turns = artifacts
-                .iter()
-                .map(|(turn, references)| (turn.clone(), references.values().cloned().collect()))
-                .collect();
-            state.insert(
-                ARTIFACT_REFERENCES_STATE_NAMESPACE.to_owned(),
-                VersionedSessionState::new(
-                    RegistryRevision::new(ARTIFACT_REFERENCES_STATE_REVISION),
-                    serde_json::to_value(PersistedArtifactReferences { turns })
-                        .expect("validated artifact references must serialize"),
-                ),
-            );
+        match self.artifacts_state().filter(|_| include_artifacts) {
+            Some(artifacts) => {
+                state.insert(
+                    ARTIFACT_REFERENCES_STATE_NAMESPACE.to_owned(),
+                    artifacts.as_ref().clone(),
+                );
+            }
+            None => {
+                state.remove(ARTIFACT_REFERENCES_STATE_NAMESPACE);
+            }
         }
         state
+    }
+
+    /// The persisted artifact-reference namespace, rebuilt only after an
+    /// artifact is recorded, so journal captures share one immutable value.
+    fn artifacts_state(&self) -> Option<Arc<VersionedSessionState>> {
+        let artifacts = self.artifacts.lock().expect("session artifacts poisoned");
+        if artifacts.is_empty() {
+            return None;
+        }
+        let mut cached = self
+            .artifacts_state
+            .lock()
+            .expect("session artifact state poisoned");
+        if let Some(state) = cached.as_ref() {
+            return Some(state.clone());
+        }
+        let turns = artifacts
+            .iter()
+            .map(|(turn, references)| (turn.clone(), references.values().cloned().collect()))
+            .collect();
+        let state = Arc::new(VersionedSessionState::new(
+            RegistryRevision::new(ARTIFACT_REFERENCES_STATE_REVISION),
+            serde_json::to_value(PersistedArtifactReferences { turns })
+                .expect("validated artifact references must serialize"),
+        ));
+        *cached = Some(state.clone());
+        Some(state)
     }
 
     pub(crate) fn snapshot_extension_state_for_journal(
@@ -425,10 +452,13 @@ impl SessionExecutionContext {
         state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
         state.remove(ARTIFACT_REFERENCES_STATE_NAMESPACE);
         state.extend(
-            self.snapshot_generated_state(BTreeMap::new(), false)
+            self.snapshot_generated_state(BTreeMap::new(), false, false)
                 .into_iter()
                 .map(|(key, value)| (key, Arc::new(value))),
         );
+        if let Some(artifacts) = self.artifacts_state() {
+            state.insert(ARTIFACT_REFERENCES_STATE_NAMESPACE.to_owned(), artifacts);
+        }
         if let Some(cache) = self.planner.persisted_previous_cache_shared() {
             state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
         }
@@ -571,6 +601,10 @@ impl SessionExecutionContext {
             return Ok(());
         }
         turn_artifacts.insert(reference.id.clone(), reference);
+        *self
+            .artifacts_state
+            .lock()
+            .expect("session artifact state poisoned") = None;
         Ok(())
     }
 
@@ -840,6 +874,63 @@ mod tests {
             ProviderCacheCapability::none(RegistryRevision::new("state-test-cache-1"), "fake"),
             crate::agent::planning::RunRevisions::empty(),
         )
+    }
+
+    // Round-2 L3: the artifact-reference namespace keeps one shared value
+    // across journal captures until another artifact is recorded.
+    #[test]
+    fn artifact_namespace_is_shared_until_an_artifact_is_recorded() {
+        use agent_runtime_core::artifact::{
+            ArtifactDigest, ArtifactProvenance, ArtifactRetention, ArtifactSensitivity,
+        };
+        let session = SessionId::new("state-test");
+        let context = SessionExecutionContext::new(
+            &session,
+            planner(),
+            InteractionDisposition::DirectHost,
+            BTreeMap::new(),
+            None,
+        )
+        .expect("execution context builds");
+        let turn = TurnId::new("turn-1");
+        let artifact = |id: &str| ArtifactRef {
+            id: ArtifactId::new(id).unwrap(),
+            digest: ArtifactDigest::new("sha256", "0".repeat(64)).unwrap(),
+            media_type: "text/plain".to_owned(),
+            byte_length: 1,
+            sensitivity: ArtifactSensitivity::Sensitive,
+            retention: ArtifactRetention::Session,
+            provenance: ArtifactProvenance::new(session.clone(), "test"),
+        };
+        let namespace = |context: &SessionExecutionContext| {
+            context
+                .snapshot_extension_state_for_journal(false)
+                .get(ARTIFACT_REFERENCES_STATE_NAMESPACE)
+                .cloned()
+        };
+        assert!(namespace(&context).is_none());
+        context
+            .record_artifact(&session, &turn, artifact("a"))
+            .unwrap();
+        let first = namespace(&context).unwrap();
+        assert!(Arc::ptr_eq(&first, &namespace(&context).unwrap()));
+        // Re-recording the same reference changes nothing.
+        context
+            .record_artifact(&session, &turn, artifact("a"))
+            .unwrap();
+        context
+            .record_artifact(&session, &turn, artifact("b"))
+            .unwrap();
+        let second = namespace(&context).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_ne!(first.value, second.value);
+        assert!(Arc::ptr_eq(&second, &namespace(&context).unwrap()));
+        assert_eq!(
+            context
+                .snapshot_extension_state()
+                .get(ARTIFACT_REFERENCES_STATE_NAMESPACE),
+            Some(second.as_ref())
+        );
     }
 
     #[test]
