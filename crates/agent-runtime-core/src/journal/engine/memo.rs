@@ -8,11 +8,41 @@ type Key = (SessionId, JournalObjectId);
 #[derive(Clone)]
 pub(super) struct ValidatedRoot {
     pub(super) objects: ObjectStore,
-    pub(super) closure: Arc<BTreeSet<JournalObjectId>>,
-    pub(super) snapshot: Arc<SessionSnapshot>,
+    pub(super) closure: Arc<ClosureEvidence>,
+    pub(super) snapshot: Arc<JournalSnapshotView>,
     pub(super) encoding: Option<Arc<SnapshotEncodingCache>>,
     pub(super) dependencies: DependencyRoots,
+    cached_lease_bodies: Option<ReachableSet>,
     bytes: usize,
+}
+
+impl ValidatedRoot {
+    pub(super) fn covers_lease_bodies(&self, reachable: &ReachableSet) -> bool {
+        self.cached_lease_bodies.as_ref().is_some_and(|covered| {
+            covered.layers.len() == reachable.layers.len()
+                && covered
+                    .layers
+                    .iter()
+                    .zip(&reachable.layers)
+                    .all(|(left, right)| Arc::ptr_eq(left, right))
+        })
+    }
+    fn coverage_charge(&self) -> usize {
+        self.cached_lease_bodies.as_ref().map_or(0, |covered| {
+            covered
+                .layers
+                .iter()
+                .map(|layer| {
+                    std::mem::size_of::<BTreeSet<JournalObjectId>>()
+                        + layer.len().saturating_mul(
+                            std::mem::size_of::<JournalObjectId>()
+                                + 64
+                                + 3 * std::mem::size_of::<usize>(),
+                        )
+                })
+                .sum()
+        })
+    }
 }
 
 pub(super) struct RootMemo {
@@ -195,11 +225,15 @@ impl RootMemo {
             let mut next = (*old).clone();
             let keep = entries.keys().cloned().collect();
             next.objects = old.objects.retain_cached(&keep);
+            next.cached_lease_bodies = None;
             let saving = old.objects.bytes - next.objects.bytes
                 + (old.objects.len - next.objects.len) * id_bytes
                 + old.objects.link_bytes()
                 - next.objects.link_bytes();
-            next.bytes = old.bytes.saturating_sub(saving);
+            next.bytes = old
+                .bytes
+                .saturating_sub(saving)
+                .saturating_sub(old.coverage_charge());
             self.bytes -= old.bytes - next.bytes;
             self.entries.get_mut(&key).expect("present entry").entry = Arc::new(next);
         }
@@ -263,11 +297,18 @@ impl<S: JournalStorage> JournalEngine<S> {
             return Err(conflict());
         }
         let mut objects = state.objects.clone();
-        let closure = memoized_closure(
+        let base = state.sessions.get(session).and_then(|r| r.exact.as_deref());
+        let closure = ClosureEvidence::update(
+            base,
             &mut objects,
-            root,
+            root.clone(),
             ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
         )?;
+        let closure = if full {
+            closure.without_changes()
+        } else {
+            closure
+        };
         let record = state.sessions.get(session).ok_or_else(conflict)?;
         let current = record.current.as_ref().is_some_and(|(id, _)| id == root);
         let (snapshot, encoding) = match self.domain.role {
@@ -287,12 +328,14 @@ impl<S: JournalStorage> JournalEngine<S> {
             self.local
                 .full_validations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(materialize_staged_snapshot(
-                &self.domain.storage_id,
-                &head,
-                &state.objects,
-                &closure,
-                &ReachableSet::default(),
+            Arc::new(JournalSnapshotView::from_snapshot(
+                materialize_staged_snapshot(
+                    &self.domain.storage_id,
+                    &head,
+                    &state.objects,
+                    &closure.iter().cloned().collect(),
+                    &ReachableSet::default(),
+                )?,
             )?)
         };
         let encoding = if !full && current && encoding.is_some() {
@@ -300,7 +343,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         } else {
             ObjectAssembler::default()
                 .snapshot_cached(
-                    &snapshot,
+                    &snapshot.materialize(),
                     head.snapshot.planned_step_count,
                     None,
                     None,
@@ -314,7 +357,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             .retained_heads
             .get(root)
             .cloned()
-            .unwrap_or_else(|| DependencyRoots::snapshot(&snapshot));
+            .unwrap_or_else(|| DependencyRoots::view(&snapshot));
         // Conservative encoded-byte estimate, including bodies, decoded value,
         // closure ids and encoding-cache ids/keys. Shared data is charged to
         // each entry; live writer working sets are independent of this budget.
@@ -322,18 +365,24 @@ impl<S: JournalStorage> JournalEngine<S> {
             std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
         // The canonical snapshot length, counted without allocating the
         // canonical value tree (the dominant per-commit sizing cost).
-        let snapshot_bytes = crate::journal::encoding::canonical_journal_json_len(&*snapshot)?;
-        debug_assert_eq!(
-            snapshot_bytes,
-            canonical_journal_json(&*snapshot)?.len(),
-            "memo snapshot sizing diverged from its canonical encoding"
-        );
+        #[cfg(debug_assertions)]
+        if full {
+            debug_assert_eq!(
+                snapshot.canonical_len()?,
+                canonical_journal_json(&*snapshot)?.len(),
+                "memo snapshot sizing diverged from its canonical encoding"
+            );
+        }
+        let snapshot_bytes = snapshot
+            .canonical_len()?
+            .checked_add(snapshot.persistent_overhead())
+            .ok_or_else(conflict)?;
         let mut bytes = objects
             .bytes
             .saturating_add(objects.len.saturating_mul(id_bytes))
             .saturating_add(objects.link_bytes())
             .saturating_add(snapshot_bytes)
-            .saturating_add(closure.len().saturating_mul(id_bytes));
+            .saturating_add(closure.charge());
         if let Some(cache) = &encoding {
             let ids = cache
                 .history_ids
@@ -341,7 +390,11 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .saturating_add(cache.usage_ids.len())
                 .saturating_add(cache.manifest_ids.len())
                 .saturating_add(cache.extension_ids.len());
-            bytes = bytes.saturating_add(ids.saturating_mul(id_bytes));
+            bytes = bytes
+                .saturating_add(ids.saturating_mul(id_bytes))
+                .saturating_add(cache.history_ids.persistent_overhead())
+                .saturating_add(cache.usage_ids.persistent_overhead())
+                .saturating_add(cache.manifest_ids.persistent_overhead());
             for key in cache.extension_ids.keys() {
                 bytes = bytes.saturating_add(key.len());
             }
@@ -352,6 +405,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             snapshot,
             encoding,
             dependencies,
+            cached_lease_bodies: None,
             bytes: bytes.saturating_add(std::mem::size_of::<ValidatedRoot>()),
         }))
     }
@@ -369,14 +423,19 @@ impl<S: JournalStorage> JournalEngine<S> {
             return Ok(entry);
         }
         let mut next = (*entry).clone();
-        next.objects = entry.objects.retain_cached(&entry.closure);
+        next.objects = entry
+            .objects
+            .retain_cached(&entry.closure.iter().cloned().collect());
         let id_bytes =
             std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
         let saving = entry.objects.bytes - next.objects.bytes
             + (entry.objects.len - next.objects.len) * id_bytes
             + entry.objects.link_bytes()
             - next.objects.link_bytes();
-        next.bytes = entry.bytes.saturating_sub(saving);
+        next.bytes = entry
+            .bytes
+            .saturating_sub(saving)
+            .saturating_sub(entry.coverage_charge());
         let next = Arc::new(next);
         self.remember_root(session, root, next.clone())?;
         Ok(next)
@@ -394,6 +453,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         state.objects = entry.objects.clone();
         let record = state.sessions.get_mut(session).ok_or_else(conflict)?;
         if record.current.as_ref().is_some_and(|(id, _)| id == root) {
+            record.exact = Some(entry.closure.clone());
             match self.domain.role {
                 JournalRole::Protected => {
                     record.protected_snapshot = Some(entry.snapshot.clone());
@@ -409,6 +469,22 @@ impl<S: JournalStorage> JournalEngine<S> {
             .retained_heads
             .insert(root.clone(), entry.dependencies.clone());
         Ok(())
+    }
+    pub(super) fn certify_commit_entry(
+        &self,
+        scratch: &Transition,
+        session: &SessionId,
+        mut entry: Arc<ValidatedRoot>,
+    ) -> Result<Arc<ValidatedRoot>, RuntimeError> {
+        let mutable = Arc::get_mut(&mut entry).ok_or_else(conflict)?;
+        mutable.closure = Arc::new(mutable.closure.without_changes());
+        scratch
+            .lock()?
+            .sessions
+            .get_mut(session)
+            .ok_or_else(conflict)?
+            .exact = Some(mutable.closure.clone());
+        Ok(entry)
     }
     pub(super) async fn validated_root(
         &self,
@@ -436,6 +512,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         scratch: &Transition,
         session: &SessionId,
+        cache_complete: bool,
     ) -> Result<(JournalObjectId, Arc<ValidatedRoot>), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.memo.commit_memo_entry");
@@ -446,7 +523,19 @@ impl<S: JournalStorage> JournalEngine<S> {
             .and_then(|r| r.current.as_ref())
             .map(|(root, _)| root.clone())
             .ok_or_else(conflict)?;
-        let entry = self.memo_entry(scratch, session, &root, false)?;
+        let mut entry = self.memo_entry(scratch, session, &root, false)?;
+        let covered = scratch
+            .lock()?
+            .leases
+            .values()
+            .find(|lease| lease.session == *session && lease.writer_epoch.is_some())
+            .map(|lease| lease.reachable.clone());
+        let mutable = Arc::get_mut(&mut entry).ok_or_else(conflict)?;
+        mutable.cached_lease_bodies = cache_complete.then_some(covered).flatten();
+        mutable.bytes = mutable
+            .bytes
+            .checked_add(mutable.coverage_charge())
+            .ok_or_else(conflict)?;
         Ok((root, entry))
     }
 }
@@ -602,18 +691,22 @@ mod tests {
         let entry = || {
             Arc::new(ValidatedRoot {
                 objects: ObjectStore::default(),
-                closure: Arc::new(BTreeSet::new()),
-                snapshot: Arc::new(SessionSnapshot {
-                    id: s.clone(),
-                    history: vec![],
-                    usage: Default::default(),
-                    identity: Default::default(),
-                    manifests: vec![],
-                    extension_state: Default::default(),
-                    updated: crate::clock::Timestamp(1),
-                }),
+                closure: Arc::new(ClosureEvidence::default()),
+                snapshot: Arc::new(
+                    JournalSnapshotView::from_snapshot(SessionSnapshot {
+                        id: s.clone(),
+                        history: vec![],
+                        usage: Default::default(),
+                        identity: Default::default(),
+                        manifests: vec![],
+                        extension_state: Default::default(),
+                        updated: crate::clock::Timestamp(1),
+                    })
+                    .unwrap(),
+                ),
                 encoding: None,
                 dependencies: Default::default(),
+                cached_lease_bodies: None,
                 bytes: 10,
             })
         };

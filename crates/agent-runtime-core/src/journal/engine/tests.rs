@@ -1010,7 +1010,11 @@ async fn engine_future_sizes_stay_bounded() {
         ("commit", boxed(&journal.commit(&lease, commit.clone()))),
         (
             "commit_inner",
-            std::mem::size_of_val(&engine.commit_inner(&lease, Box::new(commit))),
+            std::mem::size_of_val(&engine.commit_inner(
+                &lease,
+                Box::new(commit),
+                JournalPreparationHints::default(),
+            )),
         ),
         ("renew", boxed(&journal.renew(&lease))),
         (

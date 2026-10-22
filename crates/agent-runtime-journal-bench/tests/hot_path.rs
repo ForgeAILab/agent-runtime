@@ -84,7 +84,7 @@ async fn journal_hot_path_release_report() {
     let mut reporter = Reporter::new(&root());
     let mut cases = Vec::new();
     let mut legacy_holders = Vec::new();
-    std::fs::write(root().join("configuration.json"),serde_json::to_vec_pretty(&serde_json::json!({"profile_revision":"p0-v4","package":env!("CARGO_PKG_VERSION"),"debug_assertions":cfg!(debug_assertions),"opt_level":3,"lto":"thin","features":["journal-profile","test-support"],"adapter":"PackedSqliteJournalStorage","sealing":"modeled nonce/tag lengths; no real AEAD","sharing":"PerSession across domains","repack_on_collection":true,"memo_bytes_per_engine":128*1024*1024,"clock":100,"history_seed":"0xbadc0ffee1234567","script_seed":"0x12349876abcd5678","input_seed":"0x987612345678abcd","manifest_window":32,"collection_release_limit":20000,"cadence":"S2 and complete both-domain drains per turn plus shutdown","context":context,"historical_legacy_holders":context=="matrix","allocator_heap":null})).unwrap()).unwrap();
+    std::fs::write(root().join("configuration.json"),serde_json::to_vec_pretty(&serde_json::json!({"profile_revision":"p1-incremental-v2","package":env!("CARGO_PKG_VERSION"),"debug_assertions":cfg!(debug_assertions),"opt_level":3,"lto":"thin","features":["journal-profile","test-support"],"adapter":"PackedSqliteJournalStorage","sealing":"modeled nonce/tag lengths; no real AEAD","sharing":"PerSession across domains","repack_on_collection":true,"memo_bytes_per_engine":128*1024*1024,"clock":100,"history_seed":"0xbadc0ffee1234567","script_seed":"0x12349876abcd5678","input_seed":"0x987612345678abcd","manifest_window":32,"collection_release_limit":20000,"cadence":"S2 and complete both-domain drains per turn plus shutdown","context":context,"historical_legacy_holders":context=="matrix","allocator_heap":null})).unwrap()).unwrap();
     for name in names.split(',') {
         for n in sizes.split(',').map(|n| n.parse::<usize>().unwrap()) {
             let selected_name = if name == "C-plain-supplement" {
@@ -323,4 +323,13 @@ fn journal_profile_disjoint_attribution_handles_overlaps() {
     assert_eq!(result["writer_other"], 0);
     assert_eq!(result["unattributed"], 10);
     assert_eq!(result.values().sum::<u64>(), 130);
+}
+
+#[tokio::test]
+#[ignore = "release fixed-delta work diagnostic; reports unmet prefix gates separately"]
+async fn journal_hot_path_fixed_delta_work_report() {
+    if cfg!(debug_assertions) {
+        panic!("release work report requires --release");
+    }
+    hot::fixed_delta_work(&root()).await;
 }

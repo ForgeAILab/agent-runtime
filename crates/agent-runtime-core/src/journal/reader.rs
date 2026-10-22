@@ -937,22 +937,82 @@ impl<'a> JournalReader<'a> {
     /// Validates a protected head/checkpoint against a snapshot already
     /// reconstructed and root-checked by the committing backend. This avoids
     /// decoding an unchanged snapshot closure a second time at every commit.
-    pub(crate) async fn validate_checkpoint_with_snapshot(
+    pub(crate) async fn validate_checkpoint_with_view(
         &mut self,
-        snapshot: SessionSnapshot,
+        snapshot: &super::JournalSnapshotView,
+        preparation: &super::JournalPreparationHints,
     ) -> Result<(), RuntimeError> {
         let head = self.lease.head().cloned().ok_or_else(conflict)?;
-        if snapshot.id != head.session {
+        if snapshot.session() != &head.session {
             return Err(conflict());
         }
         self.batch(&head).await?;
-        if head.checkpoint.is_some() {
-            self.checkpoint_with_snapshot(&head, snapshot).await?;
+        if let Some(id) = &head.checkpoint {
+            let refs: ReferencedTurnCheckpoint =
+                self.object(id, JournalObjectKind::Checkpoint).await?;
+            if refs.schema_version != JOURNAL_SCHEMA_VERSION
+                || refs.transition_revision != TURN_TRANSITION_REVISION
+                || refs.session != head.session
+                || refs.snapshot != head.snapshot
+            {
+                return Err(conflict());
+            }
+            let batch = self.batch(&head).await?;
+            if batch.boundary.turn.as_ref() != Some(&refs.turn)
+                || batch.boundary.checkpoint_sequence != refs.watermark.checkpoint_sequence
+            {
+                return Err(conflict());
+            }
+            if let Some(state) = preparation.states.get(&refs.state) {
+                let input: Option<InternalTurnInput> = match &refs.internal_input {
+                    Some(id) => Some(self.object(id, JournalObjectKind::InternalInput).await?),
+                    None => None,
+                };
+                return crate::checkpoint::CheckpointEvidence {
+                    schema_version: CHECKPOINT_SCHEMA_VERSION,
+                    transition_revision: refs.transition_revision,
+                    session: &refs.session,
+                    turn: &refs.turn,
+                    state_revision: refs.state_revision,
+                    operation_fingerprint: &refs.operation_fingerprint,
+                    active_history_start: refs.active_history_start,
+                    internal_input: input.as_ref(),
+                    visible_output: refs.visible_output,
+                    state: &state.value,
+                    watermark: &refs.watermark,
+                    state_fingerprint: Some(&state.fingerprint),
+                }
+                .validate(snapshot)
+                .map_err(|_| conflict());
+            }
+            let empty = SessionSnapshot {
+                id: snapshot.session().clone(),
+                history: vec![],
+                usage: Default::default(),
+                identity: Default::default(),
+                manifests: vec![],
+                extension_state: Default::default(),
+                updated: head.updated,
+            };
+            self.checkpoint_candidate(&head, empty)
+                .await?
+                .validate_with_evidence(snapshot)
+                .map_err(|_| conflict())?;
         }
         Ok(())
     }
 
     async fn checkpoint_with_snapshot(
+        &mut self,
+        head: &JournalHead,
+        snapshot: SessionSnapshot,
+    ) -> Result<TurnCheckpoint, RuntimeError> {
+        let checkpoint = self.checkpoint_candidate(head, snapshot).await?;
+        checkpoint.validate().map_err(|_| conflict())?;
+        Ok(checkpoint)
+    }
+
+    async fn checkpoint_candidate(
         &mut self,
         head: &JournalHead,
         snapshot: SessionSnapshot,
@@ -997,7 +1057,6 @@ impl<'a> JournalReader<'a> {
             watermark: refs.watermark,
             updated: refs.updated,
         };
-        checkpoint.validate().map_err(|_| conflict())?;
         Ok(checkpoint)
     }
 }

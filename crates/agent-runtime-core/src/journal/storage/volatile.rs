@@ -190,6 +190,7 @@ impl VolatileJournalStorage {
             len: ids.len(),
             bytes,
             links: Default::default(),
+            cached_link_bytes: 0,
         })
     }
 }

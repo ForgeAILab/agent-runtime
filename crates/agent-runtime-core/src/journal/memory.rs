@@ -179,6 +179,14 @@ impl SessionJournal for InMemorySessionJournal {
     ) -> Result<JournalHead, RuntimeError> {
         self.0.commit(lease, batch).await
     }
+    async fn commit_prepared(
+        &self,
+        lease: &JournalLease,
+        commit: JournalCommit,
+        hints: JournalPreparationHints,
+    ) -> Result<JournalHead, RuntimeError> {
+        self.0.commit_prepared(lease, commit, hints).await
+    }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
         self.0.renew(lease).await
     }

@@ -14,7 +14,6 @@ use crate::error::{
     FailureClass, FailureComponent, FailureStage, RuntimeError, UnsupportedCapability,
 };
 use crate::ids::SessionId;
-use crate::store::SessionSnapshot;
 
 static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -73,9 +72,10 @@ pub(in crate::journal) struct SessionRecord {
     pub(in crate::journal) active_writer: Option<u64>,
     pub(in crate::journal) operations: BTreeMap<JournalOperationId, OperationRecord>,
     pub(in crate::journal) retained_heads: BTreeMap<JournalObjectId, DependencyRoots>,
-    pub(in crate::journal) ordinary_snapshot: Option<Arc<SessionSnapshot>>,
+    pub(in crate::journal) exact: Option<Arc<ClosureEvidence>>,
+    pub(in crate::journal) ordinary_snapshot: Option<Arc<JournalSnapshotView>>,
     pub(in crate::journal) ordinary_encoding: Option<Arc<SnapshotEncodingCache>>,
-    pub(in crate::journal) protected_snapshot: Option<Arc<SessionSnapshot>>,
+    pub(in crate::journal) protected_snapshot: Option<Arc<JournalSnapshotView>>,
     pub(in crate::journal) protected_encoding: Option<Arc<SnapshotEncodingCache>>,
     /// Latest published protected checkpoint, kept even when a later head
     /// carries none, so checkpoint progress stays monotonic per session.
@@ -228,7 +228,9 @@ pub(in crate::journal) struct ObjectStore {
     pub(in crate::journal) layers: Vec<Arc<BTreeMap<JournalObjectId, Arc<Vec<u8>>>>>,
     pub(in crate::journal) len: usize,
     pub(in crate::journal) bytes: usize,
-    pub(in crate::journal) links: Arc<BTreeMap<JournalObjectId, Vec<CachedLinks>>>,
+    pub(in crate::journal) links:
+        Arc<crate::journal::persistent::Map<JournalObjectId, Vec<CachedLinks>>>,
+    pub(in crate::journal) cached_link_bytes: usize,
 }
 
 impl ObjectStore {
@@ -252,6 +254,7 @@ impl ObjectStore {
         self.bytes = entries.values().map(|bytes| bytes.len()).sum();
         self.layers = vec![Arc::new(entries)];
         self.links = Default::default();
+        self.cached_link_bytes = 0;
     }
 
     pub(in crate::journal) fn get(&self, id: &JournalObjectId) -> Option<&Vec<u8>> {
@@ -297,26 +300,40 @@ impl ObjectStore {
             len,
             bytes,
             links: Default::default(),
+            cached_link_bytes: 0,
         }
     }
     pub(super) fn link_bytes(&self) -> usize {
+        self.cached_link_bytes
+    }
+    pub(super) fn variant_bytes(variants: &[CachedLinks]) -> usize {
         let id_bytes =
             std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
-        self.links
-            .values()
-            .map(|variants| {
-                id_bytes
-                    + variants
-                        .iter()
-                        .map(|entry| {
-                            std::mem::size_of::<CachedLinks>()
-                                + entry.children.len().saturating_mul(
-                                    id_bytes + std::mem::size_of::<ExpectedObject>(),
-                                )
-                        })
-                        .sum::<usize>()
-            })
-            .sum()
+        id_bytes
+            + variants
+                .iter()
+                .map(|entry| {
+                    std::mem::size_of::<CachedLinks>()
+                        + entry
+                            .children
+                            .len()
+                            .saturating_mul(id_bytes + std::mem::size_of::<ExpectedObject>())
+                })
+                .sum::<usize>()
+    }
+    pub(super) fn cache_links(
+        &mut self,
+        id: JournalObjectId,
+        variants: Vec<CachedLinks>,
+    ) -> Result<(), RuntimeError> {
+        let old = self.links.get(&id).map_or(0, |v| Self::variant_bytes(v));
+        self.cached_link_bytes = self
+            .cached_link_bytes
+            .checked_sub(old)
+            .and_then(|n| n.checked_add(Self::variant_bytes(&variants)))
+            .ok_or_else(conflict)?;
+        Arc::make_mut(&mut self.links).insert(id, variants);
+        Ok(())
     }
     pub(super) fn retain_cached(&self, keep: &BTreeSet<JournalObjectId>) -> Self {
         let mut next = Self::from_shared(
@@ -332,6 +349,7 @@ impl ObjectStore {
                 .map(|(id, links)| (id.clone(), links.clone()))
                 .collect(),
         );
+        next.cached_link_bytes = next.links.values().map(|v| Self::variant_bytes(v)).sum();
         next
     }
 }
@@ -366,6 +384,8 @@ pub(in crate::journal) struct Transition {
     pub(in crate::journal) storage_id: JournalStorageId,
     pub(in crate::journal) role: JournalRole,
     pub(in crate::journal) projection: Option<Arc<dyn JournalProjectionPolicy>>,
+    pub(in crate::journal) preparation: Arc<JournalPreparationHints>,
+    pub(in crate::journal) admissions: Arc<Mutex<BTreeSet<JournalObjectId>>>,
     pub(in crate::journal) state: Arc<Mutex<State>>,
     pub(in crate::journal) failure: Arc<Mutex<Option<JournalCommitFailurePoint>>>,
     pub(in crate::journal) cut: Arc<Mutex<Option<JournalCommitFailurePoint>>>,
@@ -394,6 +414,8 @@ impl Transition {
             storage_id,
             role,
             projection,
+            preparation: Arc::new(JournalPreparationHints::default()),
+            admissions: Arc::new(Mutex::new(BTreeSet::new())),
             state: Arc::new(Mutex::new(State::default())),
             failure: Arc::new(Mutex::new(None)),
             cut: Arc::new(Mutex::new(None)),
@@ -429,6 +451,11 @@ impl Transition {
         let mut state = self.lock()?;
         let record = state.sessions.get_mut(session).ok_or_else(conflict)?;
         let handle = record.active_writer.take().ok_or_else(conflict)?;
+        record.exact = None;
+        record.ordinary_snapshot = None;
+        record.ordinary_encoding = None;
+        record.protected_snapshot = None;
+        record.protected_encoding = None;
         if let Some(lease) = state.leases.remove(&handle) {
             state.active_pins.remove(&(lease.session, lease.pin));
         }
@@ -767,8 +794,6 @@ impl Transition {
     ) -> Result<ProjectedSnapshot, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.transition.project_snapshot");
-        #[cfg(feature = "test-support")]
-        crate::journal::profile::event("rt.work.full_candidate_materializations", 1, 0);
         if commit
             .delta
             .extension_updates
@@ -780,155 +805,205 @@ impl Transition {
         let drafts = DraftReader::new(stored, supplied, reachable);
         let (current_snapshot, current_encoding) = match self.role {
             JournalRole::Ordinary => (
-                current.ordinary_snapshot.as_ref(),
-                current.ordinary_encoding.as_ref(),
+                current.ordinary_snapshot.as_deref(),
+                current.ordinary_encoding.as_deref(),
             ),
             JournalRole::Protected => (
-                current.protected_snapshot.as_ref(),
-                current.protected_encoding.as_ref(),
+                current.protected_snapshot.as_deref(),
+                current.protected_encoding.as_deref(),
             ),
         };
-        let mut snapshot = match (current_snapshot, &commit.delta.bootstrap) {
-            // An initial bootstrap, or a complete replacement of an existing
-            // head (see `JournalTransitionDelta::bootstrap`).
-            (_, Some(snapshot))
-                if commit.delta.history_append.is_empty()
-                    && commit.delta.usage_append.is_empty()
-                    && commit.delta.extension_updates.is_empty()
-                    && commit.delta.extension_references.is_empty()
-                    && commit.delta.manifests_append.is_empty()
-                    && commit.delta.manifest_references.is_empty() =>
-            {
-                (**snapshot).clone()
-            }
-            (Some(snapshot), None) => {
-                let mut snapshot = snapshot.as_ref().clone();
-                snapshot
-                    .history
-                    .extend(commit.delta.history_append.iter().cloned());
-                for record in &commit.delta.usage_append {
-                    snapshot.usage.record(record.clone());
+        let replay = |delta: &JournalTransitionDelta| -> Result<JournalSnapshotView, RuntimeError> {
+            let mut snapshot = match (current_snapshot, &delta.bootstrap) {
+                (_, Some(snapshot))
+                    if delta.history_append.is_empty()
+                        && delta.usage_append.is_empty()
+                        && delta.extension_updates.is_empty()
+                        && delta.extension_references.is_empty()
+                        && delta.manifests_append.is_empty()
+                        && delta.manifest_references.is_empty() =>
+                {
+                    JournalSnapshotView::from_snapshot((**snapshot).clone())?
                 }
-                for (namespace, value) in &commit.delta.extension_updates {
-                    match value {
-                        Some(value) => {
-                            snapshot
-                                .extension_state
-                                .insert(namespace.clone(), value.clone());
-                        }
-                        None => {
-                            snapshot.extension_state.remove(namespace);
+                (Some(snapshot), None) => {
+                    let mut snapshot = snapshot.clone();
+                    for message in &delta.history_append {
+                        snapshot.history.push(message.clone())?;
+                    }
+                    for record in &delta.usage_append {
+                        snapshot.usage.push(record.clone())?;
+                    }
+                    for (key, value) in &delta.extension_updates {
+                        snapshot.extension_state.set(key.clone(), value.clone())?;
+                    }
+                    for (key, value) in &delta.extension_references {
+                        if let Some(evidence) = value
+                            .as_ref()
+                            .and_then(|id| self.preparation.extensions.get(id))
+                            .filter(|e| e.namespace == *key)
+                        {
+                            snapshot.extension_state.set_shared(
+                                key.clone(),
+                                evidence.value.clone(),
+                                evidence.bytes,
+                            )?;
+                        } else {
+                            snapshot.extension_state.set(
+                                key.clone(),
+                                value
+                                    .as_ref()
+                                    .map(|id| drafts.extension(key, id))
+                                    .transpose()?,
+                            )?;
                         }
                     }
-                }
-                for (namespace, value) in &commit.delta.extension_references {
-                    match value {
-                        Some(value) => {
+                    for manifest in &delta.manifests_append {
+                        snapshot.manifests.push(manifest.clone())?;
+                    }
+                    for id in &delta.manifest_references {
+                        if let Some(evidence) = self.preparation.manifests.get(id) {
                             snapshot
-                                .extension_state
-                                .insert(namespace.clone(), drafts.extension(namespace, value)?);
-                        }
-                        None => {
-                            snapshot.extension_state.remove(namespace);
+                                .manifests
+                                .push_shared(evidence.value.clone(), evidence.bytes)?;
+                        } else {
+                            snapshot.manifests.push(drafts.manifest(id)?)?;
                         }
                     }
+                    snapshot.manifests.truncate_front(
+                        usize::try_from(commit.batch.snapshot.manifests.len)
+                            .map_err(|_| conflict())?,
+                    )?;
+                    snapshot
                 }
-                snapshot
-                    .manifests
-                    .extend(commit.delta.manifests_append.iter().cloned());
-                for manifest in &commit.delta.manifest_references {
-                    snapshot.manifests.push(drafts.manifest(manifest)?);
-                }
-                let retained =
-                    usize::try_from(commit.batch.snapshot.manifests.len).map_err(|_| conflict())?;
-                if snapshot.manifests.len() < retained {
-                    return Err(conflict());
-                }
-                let evicted = snapshot.manifests.len() - retained;
-                snapshot.manifests.drain(..evicted);
-                snapshot
-            }
-            _ => return Err(conflict()),
+                _ => return Err(conflict()),
+            };
+            snapshot.identity = commit.batch.snapshot.identity.clone();
+            snapshot.updated = commit.batch.snapshot.updated;
+            Ok(snapshot)
         };
-        snapshot.identity = commit.batch.snapshot.identity.clone();
-        snapshot.updated = commit.batch.snapshot.updated;
-        // The base of an append is the previously *projected* view, which may
-        // have omitted Sensitive namespaces that the exact candidate roots still
-        // count. Extension cardinality is therefore comparable only on bootstrap;
-        // the ordered history/usage/manifest counts are policy-preserved.
+        let candidate = replay(&commit.delta)?;
         let bootstrap = commit.delta.bootstrap.is_some();
-        if &snapshot.id != session
-            || snapshot.history.len() as u64 != commit.batch.snapshot.history.len
-            || snapshot.usage.records().len() as u64 != commit.batch.snapshot.usage.len
+        if candidate.id != *session
+            || candidate.history.len() as u64 != commit.batch.snapshot.history.len
+            || candidate.usage.len() as u64 != commit.batch.snapshot.usage.len
             || (bootstrap
-                && snapshot.extension_state.len() as u64 != commit.batch.snapshot.extensions.len)
-            || snapshot.manifests.len() as u64 != commit.batch.snapshot.manifests.len
+                && candidate.extension_state.len() as u64 != commit.batch.snapshot.extensions.len)
+            || candidate.manifests.len() as u64 != commit.batch.snapshot.manifests.len
         {
             return Err(conflict());
         }
-
+        let dependencies =
+            DependencyRoots::transition_view(&current.dependencies, &commit.delta, &candidate);
+        let mut incremental =
+            !bootstrap && current_snapshot.is_some() && current_encoding.is_some();
+        let mut projected_delta = commit.delta.clone();
+        let mut revision = None;
+        let projected = if self.role == JournalRole::Ordinary {
+            let policy = self.projection.as_ref().ok_or_else(conflict)?;
+            revision = policy.revision();
+            let decision = if incremental
+                && revision.is_some()
+                && current_encoding.and_then(|c| c.policy_revision) == revision
+            {
+                policy.project_delta(
+                    current_snapshot.ok_or_else(conflict)?,
+                    &commit.delta,
+                    revision.ok_or_else(conflict)?,
+                )?
+            } else {
+                JournalDeltaProjection::FullProjectionRequired
+            };
+            match decision {
+                JournalDeltaProjection::Projected(delta) => {
+                    if delta.bootstrap.is_some()
+                        || delta.boundary != commit.delta.boundary
+                        || delta.history_append.len() != commit.delta.history_append.len()
+                        || delta.usage_append.len() != commit.delta.usage_append.len()
+                        || delta.manifests_append.len() != commit.delta.manifests_append.len()
+                        || delta.manifest_references != commit.delta.manifest_references
+                        || delta.extension_references != commit.delta.extension_references
+                        || delta
+                            .extension_updates
+                            .keys()
+                            .any(|key| delta.extension_references.contains_key(key))
+                    {
+                        return Err(conflict());
+                    }
+                    if *delta == commit.delta {
+                        candidate.clone()
+                    } else {
+                        let value = replay(&delta)?;
+                        projected_delta = *delta;
+                        value
+                    }
+                }
+                JournalDeltaProjection::FullProjectionRequired => {
+                    incremental = false;
+                    JournalSnapshotView::from_snapshot(policy.project(candidate.materialize())?)?
+                }
+            }
+        } else {
+            candidate.clone()
+        };
+        if projected.id != candidate.id
+            || projected.identity != candidate.identity
+            || projected.updated != candidate.updated
+            || projected.history.len() != candidate.history.len()
+            || projected.usage.len() != candidate.usage.len()
+            || projected.manifests.len() != candidate.manifests.len()
+        {
+            return Err(conflict());
+        }
         let structured_manifests = !commit.delta.manifest_references.is_empty()
-            || (bootstrap && !snapshot.manifests.is_empty());
-        let structured_previous_cache = commit
+            || (bootstrap && !candidate.manifests.is_empty());
+        let structured_cache = commit
             .delta
             .extension_references
             .contains_key(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
             || (bootstrap
-                && snapshot
-                    .extension_state
-                    .contains_key(RUNTIME_PREVIOUS_CACHE_NAMESPACE));
-        let expected_id = snapshot.id.clone();
-        let expected_identity = snapshot.identity.clone();
-        let expected_updated = snapshot.updated;
-        let expected_history_len = snapshot.history.len();
-        let expected_usage_len = snapshot.usage.records().len();
-        let expected_manifests_len = snapshot.manifests.len();
-        let expected_manifests = (self.role == JournalRole::Ordinary && structured_manifests)
-            .then(|| snapshot.manifests.clone());
-        let expected_previous_cache = structured_previous_cache
-            .then(|| {
-                snapshot
+                && candidate
                     .extension_state
                     .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
-                    .cloned()
-            })
-            .flatten();
-        let dependencies =
-            DependencyRoots::transition(&current.dependencies, &commit.delta, &snapshot);
-        let projected = match self.role {
-            JournalRole::Ordinary => self
-                .projection
-                .as_ref()
-                .ok_or_else(conflict)?
-                .project(snapshot)?,
-            JournalRole::Protected => snapshot,
-        };
-        if projected.id != expected_id
-            || projected.identity != expected_identity
-            || projected.updated != expected_updated
-            || projected.history.len() != expected_history_len
-            || projected.usage.records().len() != expected_usage_len
-            || projected.manifests.len() != expected_manifests_len
-            || expected_manifests
-                .as_ref()
-                .is_some_and(|expected| &projected.manifests != expected)
-            || (self.role == JournalRole::Ordinary
-                && structured_previous_cache
-                && projected
-                    .extension_state
-                    .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE)
-                    != expected_previous_cache.as_ref())
-        {
-            return Err(conflict());
+                    .is_some());
+        if self.role == JournalRole::Ordinary {
+            if !incremental
+                && structured_manifests
+                && canonical_journal_json(&projected.manifests)?
+                    != canonical_journal_json(&candidate.manifests)?
+            {
+                return Err(conflict());
+            }
+            if structured_cache {
+                match (
+                    candidate
+                        .extension_state
+                        .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE),
+                    projected
+                        .extension_state
+                        .get(RUNTIME_PREVIOUS_CACHE_NAMESPACE),
+                ) {
+                    (Some(a), Some(b)) if state_identical(a, b) => {}
+                    (None, None) => {}
+                    _ => return Err(conflict()),
+                }
+            }
+            if self.projection.as_ref().ok_or_else(conflict)?.revision() != revision {
+                return Err(conflict());
+            }
         }
         let mut assembler = ObjectAssembler::default();
-        let (roots, encoding) = assembler.snapshot_cached(
+        let previous = if incremental {
+            current_snapshot.zip(current_encoding)
+        } else {
+            None
+        };
+        let (roots, mut encoding) = assembler.snapshot_view(
             &projected,
             commit.batch.snapshot.planned_step_count,
-            current_snapshot.map(Arc::as_ref),
-            current_encoding.map(Arc::as_ref),
-            Some(&commit.delta),
+            previous,
+            incremental.then_some(&projected_delta),
         )?;
+        encoding.policy_revision = revision;
         let mut objects = assembler.objects;
         if self.role == JournalRole::Ordinary && !supplied.is_empty() {
             let mut roots = Vec::new();
@@ -938,8 +1013,7 @@ impl Transition {
             for id in &commit.delta.manifest_references {
                 roots.push((id.clone(), ExpectedObject::Leaf(ExpectedLeaf::Manifest)));
             }
-            let closure = draft_reachable_closure(stored, supplied, reachable, roots)?;
-            for id in closure {
+            for id in draft_reachable_closure(stored, supplied, reachable, roots)? {
                 if let Some(bytes) = supplied.get(&id) {
                     objects.insert(id, bytes.clone());
                 }
@@ -1288,7 +1362,8 @@ impl Transition {
                 &staged.objects,
                 &closure,
                 &lease_record.reachable,
-                snapshot.clone(),
+                snapshot,
+                &self.preparation,
             )?;
         } else if self.role == JournalRole::Protected {
             #[cfg(test)]
@@ -1316,7 +1391,11 @@ impl Transition {
                 )
                 .ok()
                 .filter(|(roots, _)| *roots == head.snapshot)
-                .map(|(_, encoding)| (snapshot, encoding));
+                .map(|(_, encoding)| {
+                    JournalSnapshotView::from_snapshot(snapshot)
+                        .map(|snapshot| (snapshot, encoding))
+                })
+                .transpose()?;
         }
 
         let token = self.token(lease)?;
@@ -1377,6 +1456,7 @@ impl Transition {
 
         staged.retirement_authorizations.remove(lease.session());
         staged.advance_root_epoch()?;
+        *self.admissions.lock().map_err(|_| host_failure())? = admitted;
         *state = staged;
         self.fail_if_armed(JournalCommitFailurePoint::AfterCommit)?;
         Ok(head)
@@ -1430,6 +1510,17 @@ impl Transition {
                 .get_mut(&record.session)
                 .ok_or_else(conflict)?
                 .active_writer = None;
+        }
+        if let Some(session) = state
+            .sessions
+            .get_mut(&record.session)
+            .filter(|s| s.active_writer.is_none())
+        {
+            session.exact = None;
+            session.ordinary_snapshot = None;
+            session.ordinary_encoding = None;
+            session.protected_snapshot = None;
+            session.protected_encoding = None;
         }
         state.advance_root_epoch()?;
         Ok(())
@@ -1508,6 +1599,7 @@ impl Transition {
             .ok_or_else(conflict)?;
         record.current = None;
         record.retirement = Some(retirement.clone());
+        record.exact = None;
         record.ordinary_snapshot = None;
         record.ordinary_encoding = None;
         record.protected_snapshot = None;

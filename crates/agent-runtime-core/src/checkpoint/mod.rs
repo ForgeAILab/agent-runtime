@@ -592,6 +592,7 @@ mod transition;
 mod validation;
 
 pub use store::CheckpointStore;
+pub(crate) use validation::CheckpointEvidence;
 use validation::*;
 
 #[cfg(test)]

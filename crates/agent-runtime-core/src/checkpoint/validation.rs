@@ -116,6 +116,62 @@ pub(super) fn interaction_state_valid(
             })
         && request.validate().is_ok()
 }
+pub(crate) trait SnapshotEvidence {
+    fn session_id(&self) -> &SessionId;
+    fn history_len(&self) -> usize;
+    fn history_message(&self, index: usize) -> Option<&crate::content::Message>;
+    #[cfg(feature = "test-support")]
+    fn record_count(&self) -> usize;
+    #[cfg(feature = "external-agent")]
+    fn has_tool_call(&self, call: &ToolCall) -> bool;
+}
+impl SnapshotEvidence for SessionSnapshot {
+    fn session_id(&self) -> &SessionId {
+        &self.id
+    }
+    fn history_len(&self) -> usize {
+        self.history.len()
+    }
+    fn history_message(&self, index: usize) -> Option<&crate::content::Message> {
+        self.history.get(index)
+    }
+    #[cfg(feature = "test-support")]
+    fn record_count(&self) -> usize {
+        self.history.len()
+            + self.usage.records().len()
+            + self.manifests.len()
+            + self.extension_state.len()
+    }
+    #[cfg(feature = "external-agent")]
+    fn has_tool_call(&self, call: &ToolCall) -> bool {
+        self.history
+            .iter()
+            .any(|m| m.tool_calls().any(|c| c == call))
+    }
+}
+impl SnapshotEvidence for crate::journal::JournalSnapshotView {
+    fn session_id(&self) -> &SessionId {
+        self.session()
+    }
+    fn history_len(&self) -> usize {
+        self.history_len()
+    }
+    fn history_message(&self, index: usize) -> Option<&crate::content::Message> {
+        self.message(index)
+    }
+    #[cfg(feature = "test-support")]
+    fn record_count(&self) -> usize {
+        self.history_len() + self.usage_len() + self.manifest_len() + self.extension_state.len()
+    }
+    #[cfg(feature = "external-agent")]
+    fn has_tool_call(&self, call: &ToolCall) -> bool {
+        (0..self.history_len()).any(|i| {
+            self.message(i)
+                .is_some_and(|m| m.tool_calls().any(|c| c == call))
+        })
+    }
+}
+
 impl TurnCheckpoint {
     /// Legacy session-wide event-journal truncation boundary.
     ///
@@ -481,403 +537,33 @@ impl TurnCheckpoint {
 
     /// Validates schema compatibility, identity, and operation fingerprints.
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        #[cfg(feature = "test-support")]
-        let _profile = crate::journal::profile::enter_sync("rt.checkpoint.validate");
-        #[cfg(feature = "test-support")]
-        crate::journal::profile::event("rt.work.checkpoint_root_fields_considered", 14, 0);
-        #[cfg(feature = "test-support")]
-        crate::journal::profile::event(
-            "rt.work.checkpoint_snapshot_records",
-            (self.snapshot.history.len()
-                + self.snapshot.usage.records().len()
-                + self.snapshot.manifests.len()
-                + self.snapshot.extension_state.len()) as u64,
-            0,
-        );
+        self.validate_with_evidence(&self.snapshot)
+    }
 
-        if self.schema_version != CHECKPOINT_SCHEMA_VERSION {
-            return Err(RuntimeError::conflict(format!(
-                "unsupported checkpoint schema {}; expected {}",
-                self.schema_version, CHECKPOINT_SCHEMA_VERSION
-            )));
+    pub(crate) fn validate_with_evidence(
+        &self,
+        snapshot: &impl SnapshotEvidence,
+    ) -> Result<(), RuntimeError> {
+        self.validation_evidence(None).validate(snapshot)
+    }
+    pub(crate) fn validation_evidence<'a>(
+        &'a self,
+        state_fingerprint: Option<&'a Fingerprint>,
+    ) -> CheckpointEvidence<'a> {
+        CheckpointEvidence {
+            schema_version: self.schema_version,
+            transition_revision: self.transition_revision,
+            session: &self.session,
+            turn: &self.turn,
+            state_revision: self.state_revision,
+            operation_fingerprint: &self.operation_fingerprint,
+            active_history_start: self.active_history_start,
+            internal_input: self.internal_input.as_ref(),
+            visible_output: self.visible_output,
+            state: &self.state,
+            watermark: &self.watermark,
+            state_fingerprint,
         }
-        if self.transition_revision != TURN_TRANSITION_REVISION {
-            return Err(RuntimeError::conflict(format!(
-                "unsupported turn transition revision {}; expected {}",
-                self.transition_revision, TURN_TRANSITION_REVISION
-            )));
-        }
-        if self.watermark.checkpoint_sequence == 0 {
-            return Err(RuntimeError::conflict(
-                "checkpoint sequence must start at one",
-            ));
-        }
-        let cache_state = matches!(
-            self.state,
-            TurnState::CacheOperationPrepared { .. }
-                | TurnState::CacheOperationStarted { .. }
-                | TurnState::CacheOperationResultReady { .. }
-                | TurnState::CacheOperationTerminal { .. }
-        );
-        match (cache_state, self.watermark.journal_turn.as_ref()) {
-            (true, Some(turn)) if turn == &self.turn => {}
-            (true, _) => {
-                return Err(RuntimeError::conflict(
-                    "cache checkpoint watermark must be scoped to its synthetic turn",
-                ));
-            }
-            (false, Some(_)) => {
-                return Err(RuntimeError::conflict(
-                    "ordinary checkpoint cannot carry a cache journal scope",
-                ));
-            }
-            (false, None) => {}
-        }
-        let initial = matches!(
-            self.state,
-            TurnState::Accepted { .. }
-                | TurnState::InternalAccepted { .. }
-                | TurnState::LocalActionAccepted { .. }
-                | TurnState::CacheOperationPrepared { .. }
-        );
-        if (self.state_revision == 0) != initial {
-            return Err(RuntimeError::conflict(
-                "only an accepted checkpoint may have state revision zero",
-            ));
-        }
-        if self.snapshot.id != self.session {
-            return Err(RuntimeError::conflict(
-                "checkpoint snapshot/session identity mismatch",
-            ));
-        }
-        let internal_turn = self.internal_input.is_some();
-        if let Some(input) = &self.internal_input {
-            input.validate()?;
-        }
-        match &self.state {
-            TurnState::InternalAccepted { input }
-                if self.internal_input.as_ref() != Some(input) =>
-            {
-                return Err(RuntimeError::conflict(
-                    "internal accepted state does not match checkpoint input",
-                ));
-            }
-            TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. } if internal_turn => {
-                return Err(RuntimeError::conflict(
-                    "ordinary accepted state cannot carry internal input",
-                ));
-            }
-            _ => {}
-        }
-        let cache_operation = matches!(
-            self.state,
-            TurnState::CacheOperationPrepared { .. }
-                | TurnState::CacheOperationStarted { .. }
-                | TurnState::CacheOperationResultReady { .. }
-                | TurnState::CacheOperationTerminal { .. }
-        );
-        let local_action = !internal_turn
-            && !cache_operation
-            && (matches!(
-                self.state,
-                TurnState::LocalActionAccepted { .. }
-                    | TurnState::LocalActionPrepared { .. }
-                    | TurnState::LocalActionExecuting { .. }
-                    | TurnState::LocalActionOutcomeReady { .. }
-                    | TurnState::LocalActionResultReady { .. }
-            ) || (self.active_history_start == self.snapshot.history.len()
-                && matches!(
-                    self.state,
-                    TurnState::Completing { .. }
-                        | TurnState::PublishingTerminal { .. }
-                        | TurnState::Terminal { .. }
-                )));
-        if cache_operation {
-            if self.active_history_start != self.snapshot.history.len() {
-                return Err(RuntimeError::conflict(
-                    "cache-operation checkpoint changed canonical history",
-                ));
-            }
-        } else if local_action {
-            if self.active_history_start != self.snapshot.history.len() {
-                return Err(RuntimeError::conflict(
-                    "local-action checkpoint changed canonical history",
-                ));
-            }
-        } else if internal_turn {
-            if self.active_history_start > self.snapshot.history.len() {
-                return Err(RuntimeError::conflict(
-                    "internal-turn history boundary exceeds canonical history",
-                ));
-            }
-        } else if self.active_history_start >= self.snapshot.history.len() {
-            return Err(RuntimeError::conflict(
-                "checkpoint active history boundary is outside canonical history",
-            ));
-        }
-        if let TurnState::Accepted { input } = &self.state {
-            if self.snapshot.history.get(self.active_history_start)
-                != Some(&input.clone().into_message())
-            {
-                return Err(RuntimeError::conflict(
-                    "accepted checkpoint input does not match canonical history",
-                ));
-            }
-        }
-        match &self.state {
-            #[cfg(feature = "external-agent")]
-            TurnState::ExternalToolCall { call, .. } => {
-                if !self
-                    .snapshot
-                    .history
-                    .iter()
-                    .any(|message| message.tool_calls().any(|recorded| recorded == call))
-                {
-                    return Err(RuntimeError::conflict(
-                        "external tool checkpoint has no canonical call",
-                    ));
-                }
-            }
-            TurnState::LocalActionPrepared { call, prepared, .. }
-            | TurnState::LocalActionExecuting { call, prepared, .. } => {
-                if !prepared_matches_call(prepared, call) {
-                    return Err(RuntimeError::conflict(
-                        "local-action preparation does not match its source call",
-                    ));
-                }
-            }
-            TurnState::LocalActionResultReady { call, result, .. } => {
-                if result.call_id != call.id || result.name != call.name {
-                    return Err(RuntimeError::conflict(
-                        "local-action result does not match its source call",
-                    ));
-                }
-            }
-            TurnState::LocalActionAccepted { .. }
-            | TurnState::LocalActionOutcomeReady { .. }
-            | TurnState::Accepted { .. }
-            | TurnState::InternalAccepted { .. }
-            | TurnState::Planning { .. }
-            | TurnState::CallingModel { .. }
-            | TurnState::ModelResponseReady { .. }
-            | TurnState::AwaitingApproval { .. }
-            | TurnState::AwaitingInteraction { .. }
-            | TurnState::ToolOutcomeReady { .. }
-            | TurnState::ExecutingTools { .. }
-            | TurnState::Completing { .. }
-            | TurnState::PublishingTerminal { .. }
-            | TurnState::Terminal { .. } => {}
-            TurnState::CacheOperationPrepared { operation }
-            | TurnState::CacheOperationStarted { operation }
-            | TurnState::CacheOperationResultReady { operation, .. }
-            | TurnState::CacheOperationTerminal { operation, .. } => operation.validate()?,
-        }
-        if matches!(
-            &self.state,
-            TurnState::CacheOperationStarted { operation }
-                if operation.preflight_rejection.is_some()
-        ) {
-            return Err(RuntimeError::conflict(
-                "cache checkpoint rejection crossed the provider-start boundary",
-            ));
-        }
-        match &self.state {
-            TurnState::CacheOperationResultReady { operation, result }
-            | TurnState::CacheOperationTerminal { operation, result } => {
-                result.validate()?;
-                match operation.preflight_rejection {
-                    Some(reason)
-                        if result.outcome != CacheOperationOutcome::Rejected
-                            || result.rejection_reason != Some(reason) =>
-                    {
-                        return Err(RuntimeError::conflict(
-                            "cache rejection result does not match its protected preflight reason",
-                        ));
-                    }
-                    None if result.outcome == CacheOperationOutcome::Rejected => {
-                        // A rejection that reached a protected result boundary
-                        // must retain its exact preflight reason in the
-                        // operation reservation. This prevents a crash from
-                        // turning an exact retry into a newly computed reason.
-                        return Err(RuntimeError::conflict(
-                            "cache rejection result is missing its protected preflight reason",
-                        ));
-                    }
-                    _ => {}
-                }
-                if let Some(evidence) = &result.evidence {
-                    let attribution_mismatch = match evidence.source {
-                        CacheEvidenceSource::ResourceOperation => {
-                            evidence.identity != operation.identity
-                                || evidence.request.is_some()
-                                || evidence.attempt.is_some()
-                                || evidence.operation.as_ref() != Some(&operation.operation)
-                        }
-                        CacheEvidenceSource::Stream => {
-                            evidence.identity != operation.identity
-                                || evidence.request != operation.request
-                                || evidence.attempt != operation.attempt
-                                || evidence.operation.is_some()
-                        }
-                        CacheEvidenceSource::CacheScopedError => {
-                            let stream_attribution = evidence.request.is_some()
-                                && evidence.attempt.is_some()
-                                && evidence.operation.is_none();
-                            let resource_attribution = evidence.request.is_none()
-                                && evidence.attempt.is_none()
-                                && evidence.operation.as_ref() == Some(&operation.operation);
-                            evidence.identity != operation.identity
-                                || !(stream_attribution
-                                    && evidence.request == operation.request
-                                    && evidence.attempt == operation.attempt
-                                    || resource_attribution)
-                        }
-                    };
-                    if attribution_mismatch {
-                        return Err(RuntimeError::conflict(
-                            "cache checkpoint evidence does not correlate with its operation",
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-        if let TurnState::CacheOperationStarted { operation }
-        | TurnState::CacheOperationResultReady { operation, .. }
-        | TurnState::CacheOperationTerminal { operation, .. } = &self.state
-        {
-            let rejected_result = matches!(
-                &self.state,
-                TurnState::CacheOperationResultReady { result, .. }
-                    | TurnState::CacheOperationTerminal { result, .. }
-                    if result.outcome == CacheOperationOutcome::Rejected
-            );
-            if operation.request.is_none()
-                || (!rejected_result && operation.attempt.is_none())
-                || (rejected_result && operation.attempt.is_some())
-            {
-                return Err(RuntimeError::conflict(
-                    "started cache checkpoint is missing request/attempt attribution",
-                ));
-            }
-        }
-        if let TurnState::CacheOperationPrepared { operation } = &self.state {
-            if operation.attempt.is_some() {
-                return Err(RuntimeError::conflict(
-                    "prepared cache checkpoint crossed the start attribution boundary",
-                ));
-            }
-        }
-        if matches!(
-            &self.state,
-            TurnState::ModelResponseReady { response, .. }
-                if !response.text.is_empty() && !self.visible_output
-        ) {
-            return Err(RuntimeError::conflict(
-                "durable visible model output is missing from checkpoint progress",
-            ));
-        }
-        if let TurnState::Completing { visible_output, .. }
-        | TurnState::PublishingTerminal { visible_output, .. }
-        | TurnState::Terminal { visible_output, .. } = &self.state
-        {
-            if *visible_output != self.visible_output {
-                return Err(RuntimeError::conflict(
-                    "terminal state and checkpoint visible-output progress disagree",
-                ));
-            }
-        }
-        if self.operation_fingerprint
-            != checkpoint_operation_fingerprint(
-                &self.state,
-                self.active_history_start,
-                self.internal_input.as_ref(),
-                self.visible_output,
-            )
-        {
-            return Err(RuntimeError::conflict(
-                "checkpoint operation fingerprint mismatch",
-            ));
-        }
-        if let TurnState::AwaitingApproval {
-            source_calls,
-            slots,
-            ..
-        }
-        | TurnState::ExecutingTools {
-            source_calls,
-            slots,
-            ..
-        }
-        | TurnState::ToolOutcomeReady {
-            source_calls,
-            slots,
-            ..
-        } = &self.state
-        {
-            if !slots_correspond(source_calls, slots) {
-                return Err(RuntimeError::conflict(
-                    "checkpoint tool slots do not correspond to their source calls",
-                ));
-            }
-        }
-        if let TurnState::ExecutingTools {
-            source_calls,
-            completed,
-            ..
-        }
-        | TurnState::ToolOutcomeReady {
-            source_calls,
-            completed,
-            ..
-        } = &self.state
-        {
-            if !results_form_prefix(source_calls, completed) {
-                return Err(RuntimeError::conflict(
-                    "checkpoint tool results are not an ordered source-call prefix",
-                ));
-            }
-        }
-        if let TurnState::ToolOutcomeReady {
-            source_calls,
-            completed,
-            outcome_index,
-            ..
-        } = &self.state
-        {
-            if *outcome_index != completed.len() || source_calls.get(*outcome_index).is_none() {
-                return Err(RuntimeError::conflict(
-                    "checkpoint raw tool outcome is not the next canonical source slot",
-                ));
-            }
-        }
-        if let TurnState::AwaitingInteraction {
-            source_calls,
-            slots,
-            completed,
-            interaction_index,
-            request,
-            response,
-            ..
-        } = &self.state
-        {
-            if !interaction_state_valid(source_calls, slots, completed, *interaction_index, request)
-            {
-                return Err(RuntimeError::conflict(
-                    "checkpoint interaction state is not aligned with its source call",
-                ));
-            }
-            if request.origin().session() != &self.session || request.origin().turn() != &self.turn
-            {
-                return Err(RuntimeError::conflict(
-                    "checkpoint interaction belongs to another session or turn",
-                ));
-            }
-            if let Some(response) = response {
-                response.validate_for(request)?;
-            }
-        }
-        Ok(())
     }
 
     /// Validates that `next` is the one immediate successor of `self`.
@@ -943,6 +629,20 @@ pub(super) fn checkpoint_operation_fingerprint(
     internal_input: Option<&InternalTurnInput>,
     visible_output: bool,
 ) -> Fingerprint {
+    checkpoint_operation_fingerprint_from_state(
+        || state.operation_fingerprint(),
+        active_history_start,
+        internal_input,
+        visible_output,
+    )
+}
+
+fn checkpoint_operation_fingerprint_from_state(
+    state_fingerprint: impl FnOnce() -> Fingerprint,
+    active_history_start: usize,
+    internal_input: Option<&InternalTurnInput>,
+    visible_output: bool,
+) -> Fingerprint {
     #[cfg(feature = "test-support")]
     let _profile = crate::journal::profile::enter_sync("rt.checkpoint.fingerprint");
 
@@ -956,7 +656,7 @@ pub(super) fn checkpoint_operation_fingerprint(
         } else {
             "not_visible"
         })
-        .nested(&state.operation_fingerprint());
+        .nested(&state_fingerprint());
     match internal_input {
         Some(input) => hasher.field(
             serde_json::to_vec(input).expect("validated internal turn input must serialize"),
@@ -991,5 +691,414 @@ pub(super) fn state_name(state: &TurnState) -> &'static str {
         TurnState::CacheOperationStarted { .. } => "cache_operation_started",
         TurnState::CacheOperationResultReady { .. } => "cache_operation_result_ready",
         TurnState::CacheOperationTerminal { .. } => "cache_operation_terminal",
+    }
+}
+
+pub(crate) struct CheckpointEvidence<'a> {
+    pub(crate) schema_version: u32,
+    pub(crate) transition_revision: u32,
+    pub(crate) session: &'a SessionId,
+    pub(crate) turn: &'a TurnId,
+    pub(crate) state_revision: u64,
+    pub(crate) operation_fingerprint: &'a Fingerprint,
+    pub(crate) active_history_start: usize,
+    pub(crate) internal_input: Option<&'a InternalTurnInput>,
+    pub(crate) visible_output: bool,
+    pub(crate) state: &'a TurnState,
+    pub(crate) watermark: &'a CheckpointWatermark,
+    pub(crate) state_fingerprint: Option<&'a Fingerprint>,
+}
+impl CheckpointEvidence<'_> {
+    pub(crate) fn validate(&self, snapshot: &impl SnapshotEvidence) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.checkpoint.validate");
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.checkpoint_root_fields_considered", 14, 0);
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            "rt.work.checkpoint_snapshot_records",
+            snapshot.record_count() as u64,
+            0,
+        );
+
+        if self.schema_version != CHECKPOINT_SCHEMA_VERSION {
+            return Err(RuntimeError::conflict(format!(
+                "unsupported checkpoint schema {}; expected {}",
+                self.schema_version, CHECKPOINT_SCHEMA_VERSION
+            )));
+        }
+        if self.transition_revision != TURN_TRANSITION_REVISION {
+            return Err(RuntimeError::conflict(format!(
+                "unsupported turn transition revision {}; expected {}",
+                self.transition_revision, TURN_TRANSITION_REVISION
+            )));
+        }
+        if self.watermark.checkpoint_sequence == 0 {
+            return Err(RuntimeError::conflict(
+                "checkpoint sequence must start at one",
+            ));
+        }
+        let cache_state = matches!(
+            self.state,
+            TurnState::CacheOperationPrepared { .. }
+                | TurnState::CacheOperationStarted { .. }
+                | TurnState::CacheOperationResultReady { .. }
+                | TurnState::CacheOperationTerminal { .. }
+        );
+        match (cache_state, self.watermark.journal_turn.as_ref()) {
+            (true, Some(turn)) if turn == self.turn => {}
+            (true, _) => {
+                return Err(RuntimeError::conflict(
+                    "cache checkpoint watermark must be scoped to its synthetic turn",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(RuntimeError::conflict(
+                    "ordinary checkpoint cannot carry a cache journal scope",
+                ));
+            }
+            (false, None) => {}
+        }
+        let initial = matches!(
+            self.state,
+            TurnState::Accepted { .. }
+                | TurnState::InternalAccepted { .. }
+                | TurnState::LocalActionAccepted { .. }
+                | TurnState::CacheOperationPrepared { .. }
+        );
+        if (self.state_revision == 0) != initial {
+            return Err(RuntimeError::conflict(
+                "only an accepted checkpoint may have state revision zero",
+            ));
+        }
+        if snapshot.session_id() != self.session {
+            return Err(RuntimeError::conflict(
+                "checkpoint snapshot/session identity mismatch",
+            ));
+        }
+        let internal_turn = self.internal_input.is_some();
+        if let Some(input) = self.internal_input {
+            input.validate()?;
+        }
+        match self.state {
+            TurnState::InternalAccepted { input } if self.internal_input != Some(input) => {
+                return Err(RuntimeError::conflict(
+                    "internal accepted state does not match checkpoint input",
+                ));
+            }
+            TurnState::Accepted { .. } | TurnState::LocalActionAccepted { .. } if internal_turn => {
+                return Err(RuntimeError::conflict(
+                    "ordinary accepted state cannot carry internal input",
+                ));
+            }
+            _ => {}
+        }
+        let cache_operation = matches!(
+            self.state,
+            TurnState::CacheOperationPrepared { .. }
+                | TurnState::CacheOperationStarted { .. }
+                | TurnState::CacheOperationResultReady { .. }
+                | TurnState::CacheOperationTerminal { .. }
+        );
+        let local_action = !internal_turn
+            && !cache_operation
+            && (matches!(
+                self.state,
+                TurnState::LocalActionAccepted { .. }
+                    | TurnState::LocalActionPrepared { .. }
+                    | TurnState::LocalActionExecuting { .. }
+                    | TurnState::LocalActionOutcomeReady { .. }
+                    | TurnState::LocalActionResultReady { .. }
+            ) || (self.active_history_start == snapshot.history_len()
+                && matches!(
+                    self.state,
+                    TurnState::Completing { .. }
+                        | TurnState::PublishingTerminal { .. }
+                        | TurnState::Terminal { .. }
+                )));
+        if cache_operation {
+            if self.active_history_start != snapshot.history_len() {
+                return Err(RuntimeError::conflict(
+                    "cache-operation checkpoint changed canonical history",
+                ));
+            }
+        } else if local_action {
+            if self.active_history_start != snapshot.history_len() {
+                return Err(RuntimeError::conflict(
+                    "local-action checkpoint changed canonical history",
+                ));
+            }
+        } else if internal_turn {
+            if self.active_history_start > snapshot.history_len() {
+                return Err(RuntimeError::conflict(
+                    "internal-turn history boundary exceeds canonical history",
+                ));
+            }
+        } else if self.active_history_start >= snapshot.history_len() {
+            return Err(RuntimeError::conflict(
+                "checkpoint active history boundary is outside canonical history",
+            ));
+        }
+        if let TurnState::Accepted { input } = self.state {
+            if snapshot.history_message(self.active_history_start)
+                != Some(&input.clone().into_message())
+            {
+                return Err(RuntimeError::conflict(
+                    "accepted checkpoint input does not match canonical history",
+                ));
+            }
+        }
+        match self.state {
+            #[cfg(feature = "external-agent")]
+            TurnState::ExternalToolCall { call, .. } => {
+                if !snapshot.has_tool_call(call) {
+                    return Err(RuntimeError::conflict(
+                        "external tool checkpoint has no canonical call",
+                    ));
+                }
+            }
+            TurnState::LocalActionPrepared { call, prepared, .. }
+            | TurnState::LocalActionExecuting { call, prepared, .. } => {
+                if !prepared_matches_call(prepared, call) {
+                    return Err(RuntimeError::conflict(
+                        "local-action preparation does not match its source call",
+                    ));
+                }
+            }
+            TurnState::LocalActionResultReady { call, result, .. } => {
+                if result.call_id != call.id || result.name != call.name {
+                    return Err(RuntimeError::conflict(
+                        "local-action result does not match its source call",
+                    ));
+                }
+            }
+            TurnState::LocalActionAccepted { .. }
+            | TurnState::LocalActionOutcomeReady { .. }
+            | TurnState::Accepted { .. }
+            | TurnState::InternalAccepted { .. }
+            | TurnState::Planning { .. }
+            | TurnState::CallingModel { .. }
+            | TurnState::ModelResponseReady { .. }
+            | TurnState::AwaitingApproval { .. }
+            | TurnState::AwaitingInteraction { .. }
+            | TurnState::ToolOutcomeReady { .. }
+            | TurnState::ExecutingTools { .. }
+            | TurnState::Completing { .. }
+            | TurnState::PublishingTerminal { .. }
+            | TurnState::Terminal { .. } => {}
+            TurnState::CacheOperationPrepared { operation }
+            | TurnState::CacheOperationStarted { operation }
+            | TurnState::CacheOperationResultReady { operation, .. }
+            | TurnState::CacheOperationTerminal { operation, .. } => operation.validate()?,
+        }
+        if matches!(
+            self.state,
+            TurnState::CacheOperationStarted { operation }
+                if operation.preflight_rejection.is_some()
+        ) {
+            return Err(RuntimeError::conflict(
+                "cache checkpoint rejection crossed the provider-start boundary",
+            ));
+        }
+        match self.state {
+            TurnState::CacheOperationResultReady { operation, result }
+            | TurnState::CacheOperationTerminal { operation, result } => {
+                result.validate()?;
+                match operation.preflight_rejection {
+                    Some(reason)
+                        if result.outcome != CacheOperationOutcome::Rejected
+                            || result.rejection_reason != Some(reason) =>
+                    {
+                        return Err(RuntimeError::conflict(
+                            "cache rejection result does not match its protected preflight reason",
+                        ));
+                    }
+                    None if result.outcome == CacheOperationOutcome::Rejected => {
+                        // A rejection that reached a protected result boundary
+                        // must retain its exact preflight reason in the
+                        // operation reservation. This prevents a crash from
+                        // turning an exact retry into a newly computed reason.
+                        return Err(RuntimeError::conflict(
+                            "cache rejection result is missing its protected preflight reason",
+                        ));
+                    }
+                    _ => {}
+                }
+                if let Some(evidence) = &result.evidence {
+                    let attribution_mismatch = match evidence.source {
+                        CacheEvidenceSource::ResourceOperation => {
+                            evidence.identity != operation.identity
+                                || evidence.request.is_some()
+                                || evidence.attempt.is_some()
+                                || evidence.operation.as_ref() != Some(&operation.operation)
+                        }
+                        CacheEvidenceSource::Stream => {
+                            evidence.identity != operation.identity
+                                || evidence.request != operation.request
+                                || evidence.attempt != operation.attempt
+                                || evidence.operation.is_some()
+                        }
+                        CacheEvidenceSource::CacheScopedError => {
+                            let stream_attribution = evidence.request.is_some()
+                                && evidence.attempt.is_some()
+                                && evidence.operation.is_none();
+                            let resource_attribution = evidence.request.is_none()
+                                && evidence.attempt.is_none()
+                                && evidence.operation.as_ref() == Some(&operation.operation);
+                            evidence.identity != operation.identity
+                                || !(stream_attribution
+                                    && evidence.request == operation.request
+                                    && evidence.attempt == operation.attempt
+                                    || resource_attribution)
+                        }
+                    };
+                    if attribution_mismatch {
+                        return Err(RuntimeError::conflict(
+                            "cache checkpoint evidence does not correlate with its operation",
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let TurnState::CacheOperationStarted { operation }
+        | TurnState::CacheOperationResultReady { operation, .. }
+        | TurnState::CacheOperationTerminal { operation, .. } = self.state
+        {
+            let rejected_result = matches!(
+                self.state,
+                TurnState::CacheOperationResultReady { result, .. }
+                    | TurnState::CacheOperationTerminal { result, .. }
+                    if result.outcome == CacheOperationOutcome::Rejected
+            );
+            if operation.request.is_none()
+                || (!rejected_result && operation.attempt.is_none())
+                || (rejected_result && operation.attempt.is_some())
+            {
+                return Err(RuntimeError::conflict(
+                    "started cache checkpoint is missing request/attempt attribution",
+                ));
+            }
+        }
+        if let TurnState::CacheOperationPrepared { operation } = self.state {
+            if operation.attempt.is_some() {
+                return Err(RuntimeError::conflict(
+                    "prepared cache checkpoint crossed the start attribution boundary",
+                ));
+            }
+        }
+        if matches!(
+            self.state,
+            TurnState::ModelResponseReady { response, .. }
+                if !response.text.is_empty() && !self.visible_output
+        ) {
+            return Err(RuntimeError::conflict(
+                "durable visible model output is missing from checkpoint progress",
+            ));
+        }
+        if let TurnState::Completing { visible_output, .. }
+        | TurnState::PublishingTerminal { visible_output, .. }
+        | TurnState::Terminal { visible_output, .. } = self.state
+        {
+            if *visible_output != self.visible_output {
+                return Err(RuntimeError::conflict(
+                    "terminal state and checkpoint visible-output progress disagree",
+                ));
+            }
+        }
+        if *self.operation_fingerprint
+            != checkpoint_operation_fingerprint_from_state(
+                || {
+                    self.state_fingerprint
+                        .cloned()
+                        .unwrap_or_else(|| self.state.operation_fingerprint())
+                },
+                self.active_history_start,
+                self.internal_input,
+                self.visible_output,
+            )
+        {
+            return Err(RuntimeError::conflict(
+                "checkpoint operation fingerprint mismatch",
+            ));
+        }
+        if let TurnState::AwaitingApproval {
+            source_calls,
+            slots,
+            ..
+        }
+        | TurnState::ExecutingTools {
+            source_calls,
+            slots,
+            ..
+        }
+        | TurnState::ToolOutcomeReady {
+            source_calls,
+            slots,
+            ..
+        } = self.state
+        {
+            if !slots_correspond(source_calls, slots) {
+                return Err(RuntimeError::conflict(
+                    "checkpoint tool slots do not correspond to their source calls",
+                ));
+            }
+        }
+        if let TurnState::ExecutingTools {
+            source_calls,
+            completed,
+            ..
+        }
+        | TurnState::ToolOutcomeReady {
+            source_calls,
+            completed,
+            ..
+        } = self.state
+        {
+            if !results_form_prefix(source_calls, completed) {
+                return Err(RuntimeError::conflict(
+                    "checkpoint tool results are not an ordered source-call prefix",
+                ));
+            }
+        }
+        if let TurnState::ToolOutcomeReady {
+            source_calls,
+            completed,
+            outcome_index,
+            ..
+        } = self.state
+        {
+            if *outcome_index != completed.len() || source_calls.get(*outcome_index).is_none() {
+                return Err(RuntimeError::conflict(
+                    "checkpoint raw tool outcome is not the next canonical source slot",
+                ));
+            }
+        }
+        if let TurnState::AwaitingInteraction {
+            source_calls,
+            slots,
+            completed,
+            interaction_index,
+            request,
+            response,
+            ..
+        } = self.state
+        {
+            if !interaction_state_valid(source_calls, slots, completed, *interaction_index, request)
+            {
+                return Err(RuntimeError::conflict(
+                    "checkpoint interaction state is not aligned with its source call",
+                ));
+            }
+            if request.origin().session() != self.session || request.origin().turn() != self.turn {
+                return Err(RuntimeError::conflict(
+                    "checkpoint interaction belongs to another session or turn",
+                ));
+            }
+            if let Some(response) = response {
+                response.validate_for(request)?;
+            }
+        }
+        Ok(())
     }
 }

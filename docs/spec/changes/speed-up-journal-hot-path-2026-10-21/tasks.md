@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-22T04:11:39Z
+updated_at: 2026-10-22T07:42:03Z
 completed_at:
 ---
 
@@ -24,11 +24,11 @@ phase acceptance does not imply Forge D10 adoption readiness.
 
 - [ ] 1.1 Introduce immutable semantic snapshot and persistent sequence/map/JSON views shared across writer, transition and validated memo; preserve public DTOs and canonical schema-4 encoding.
 - [ ] 1.2 Carry base-versioned runtime mutation hints into the writer, and reuse canonical subtree encodings and manifest/request/previous-cache prefixes; remove full-vector copies, repeated to_value and unchanged-prefix scans in supported writer and engine preparation.
-- [ ] 1.3 Add defaulted revisioned incremental projection capability with complete fallback; implement identity/conservative fixture opt-ins and differential global-policy/configuration cases.
-- [ ] 1.4 Maintain exact persistent closure evidence with correct typed-edge activation/removal and membership revalidation outside the base exact closure; retain complete tracing as the test oracle.
-- [ ] 1.5 Cache incremental canonical lengths/charge using iterative work; test negative zero, escaped strings, optional fields and normal 2 MiB Tokio debug stacks without reviving recursive sizing/drop failures.
-- [ ] 1.6 Validate protected checkpoint changed state and cross-field invariants against root-bound evidence; retain complete fallback for unprovable/advisory protected deltas and every recovery barrier.
-- [ ] 1.7 Add split-boundary, manifest eviction, multiple-parent, dropped/re-referenced-body, wrong-kind, missing-body and all failure-cut/replay regressions in both sharing modes and zero/tiny/oversize memo configurations.
+- [x] 1.3 Add defaulted revisioned incremental projection capability with complete fallback; implement identity/conservative fixture opt-ins and differential global-policy/configuration cases.
+- [x] 1.4 Maintain exact persistent closure evidence with correct typed-edge activation/removal and membership revalidation outside the base exact closure; retain complete tracing as the test oracle.
+- [x] 1.5 Cache incremental canonical lengths/charge using iterative work; test negative zero, escaped strings, optional fields and normal 2 MiB Tokio debug stacks without reviving recursive sizing/drop failures.
+- [x] 1.6 Validate protected checkpoint changed state and cross-field invariants against root-bound evidence; retain complete fallback for unprovable/advisory protected deltas and every recovery barrier.
+- [x] 1.7 Add split-boundary, manifest eviction, multiple-parent, dropped/re-referenced-body, wrong-kind, missing-body and all failure-cut/replay regressions in both sharing modes and zero/tiny/oversize memo configurations.
 - [ ] 1.8 Run preserved conformance plus P1 matrix/work gates; publish each-stage and additive writer measurements, 50% minimum reductions, fixed-delta scaling and all remaining O(N) costs.
 
 ## 2. P2 Proof Reuse in Collection
@@ -81,3 +81,15 @@ missing metrics, process-control limits and the exact NOT MET list.
 The specification validation result and docs-only scope receipt are recorded in
 `/Volumes/Data/tmp/refactor/rt-hotpath-spec/report.md`. Phase-0 implementation and verification are recorded in
 `/Volumes/Data/tmp/refactor/rt-hotpath-p0/report.md`; later phase checks remain future work.
+
+## P1 Receipt (partial)
+
+Tasks 1.3–1.7 are implemented and verified. Tasks 1.1–1.2 remain partial:
+semantic sequence/map versions and canonical encoding witnesses are shared,
+but Runtime-owned mutation provenance and persistent JSON array indexes are
+not complete. Owned DTO capture and prefix discovery still perform O(N) work.
+Task 1.8 remains unchecked until numeric/work/matrix acceptance is established.
+A clean release preflight was blocked by other matching processes after the
+requested retry. Full evidence, initial failures/retries and any subsequent
+measurement status are recorded in `/Volumes/Data/tmp/refactor/rt-p1/report.md`.
+No P2/P3/P4 task or persisted schema is changed by this receipt.

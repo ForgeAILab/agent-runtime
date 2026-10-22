@@ -19,6 +19,57 @@ pub(in crate::journal) struct DependencyRoots {
 }
 
 impl DependencyRoots {
+    pub(in crate::journal) fn view(snapshot: &JournalSnapshotView) -> Self {
+        Self::snapshot(&SessionSnapshot {
+            id: snapshot.id.clone(),
+            history: vec![],
+            usage: Default::default(),
+            identity: snapshot.identity.clone(),
+            manifests: vec![],
+            extension_state: [
+                "runtime.session.fork_pending",
+                "runtime.session.superseded",
+                "agent-runtime.delegation.children",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                snapshot
+                    .extension_state
+                    .get(key)
+                    .map(|v| (key.to_owned(), v.clone()))
+            })
+            .collect(),
+            updated: snapshot.updated,
+        })
+    }
+    pub(in crate::journal) fn transition_view(
+        current: &Self,
+        delta: &JournalTransitionDelta,
+        snapshot: &JournalSnapshotView,
+    ) -> Self {
+        let minimal = SessionSnapshot {
+            id: snapshot.id.clone(),
+            history: vec![],
+            usage: Default::default(),
+            identity: snapshot.identity.clone(),
+            manifests: vec![],
+            extension_state: [
+                "runtime.session.fork_pending",
+                "runtime.session.superseded",
+                "agent-runtime.delegation.children",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                snapshot
+                    .extension_state
+                    .get(key)
+                    .map(|v| (key.to_owned(), v.clone()))
+            })
+            .collect(),
+            updated: snapshot.updated,
+        };
+        Self::transition(current, delta, &minimal)
+    }
     pub(in crate::journal) fn snapshot(snapshot: &SessionSnapshot) -> Self {
         let mut roots = Self::default();
         if let Some(intent) = snapshot.extension_state.get("runtime.session.fork_pending") {
