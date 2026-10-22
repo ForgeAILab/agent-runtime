@@ -920,12 +920,12 @@ impl Transition {
                         snapshot.extension_state.set(key.clone(), value.clone())?;
                     }
                     for (key, value) in &delta.extension_references {
-                        if let Some(evidence) = value
+                        if let Some((id, evidence)) = value
                             .as_ref()
-                            .and_then(|id| self.preparation.extensions.get(id))
-                            .filter(|e| e.namespace == *key)
+                            .and_then(|id| Some((id, self.preparation.extensions.get(id)?)))
+                            .filter(|(_, e)| e.namespace == *key)
                         {
-                            evidence.validate(key, &drafts, &|id| {
+                            evidence.validate(key, id, &drafts, &|id| {
                                 current
                                     .exact
                                     .as_ref()
@@ -951,7 +951,7 @@ impl Transition {
                     }
                     for id in &delta.manifest_references {
                         if let Some(evidence) = self.preparation.manifests.get(id) {
-                            evidence.validate(&drafts, &|id| {
+                            evidence.validate(id, &drafts, &|id| {
                                 current
                                     .exact
                                     .as_ref()
