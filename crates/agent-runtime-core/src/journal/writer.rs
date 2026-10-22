@@ -1800,9 +1800,9 @@ mod review_tests {
         );
     }
 
-    // M2: under serde_json/preserve_order a key-order-only change keeps the
-    // canonical content id, but the value changed and must still be sent.
-    // Without that feature serde_json maps are sorted and nothing changes.
+    // M2: under serde_json/preserve_order a key-order-only change is a value
+    // change and must be sent and reflected in the writer's view. Without
+    // that feature serde_json maps are sorted and nothing changes.
     #[test]
     fn key_order_only_extension_changes_are_reported_and_viewed() {
         let mut first = serde_json::Map::new();
@@ -1812,20 +1812,26 @@ mod review_tests {
         second.insert("b".into(), 2.into());
         second.insert("a".into(), 1.into());
         let preserves_order = second.keys().next().map(String::as_str) == Some("b");
-        let state =
-            |value| VersionedSessionState::new(RegistryRevision::new("r"), Value::Object(value));
+        // The previous-cache namespace is stored as a structured JSON tree
+        // and referenced by id; the change set must follow value identity.
+        let ns = RUNTIME_PREVIOUS_CACHE_NAMESPACE;
+        let state = |value| {
+            let mut state =
+                VersionedSessionState::new(RegistryRevision::new("r"), Value::Object(value));
+            state.sensitivity = crate::store::SessionStateSensitivity::RedactionSafe;
+            state
+        };
         let mut base = snapshot();
-        base.extension_state.insert("ns".into(), state(first));
-        let (base_roots, base_encoding) = JournalWriterAssembler::default()
+        base.extension_state.insert(ns.into(), state(first));
+        let (_, base_encoding) = JournalWriterAssembler::default()
             .snapshot_view_cached(&base, 0, None, None)
             .unwrap();
         let base_view = base_encoding.snapshot_view();
         let mut next = base.clone();
-        next.extension_state.insert("ns".into(), state(second));
-        let (roots, encoding) = JournalWriterAssembler::default()
+        next.extension_state.insert(ns.into(), state(second));
+        let (_, encoding) = JournalWriterAssembler::default()
             .snapshot_view_cached(&next, 0, Some(&base_view), Some(&base_encoding))
             .unwrap();
-        assert_eq!(roots, base_roots, "canonical encoding ignores key order");
         let changes = encoding
             .extension_changes(&base_view)
             .expect("the encoding is bound to its base")
@@ -1833,7 +1839,7 @@ mod review_tests {
             .collect::<Vec<_>>();
         let keys = encoding
             .snapshot_view()
-            .extension("ns")
+            .extension(ns)
             .unwrap()
             .value
             .as_object()
@@ -1842,7 +1848,7 @@ mod review_tests {
             .cloned()
             .collect::<Vec<_>>();
         if preserves_order {
-            assert_eq!(changes, ["ns"]);
+            assert_eq!(changes, [ns]);
             assert_eq!(keys, ["b", "a"]);
         } else {
             assert!(changes.is_empty());
