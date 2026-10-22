@@ -112,7 +112,11 @@ impl<'a> ExternalTurnMachine<'a> {
             None => Deadline::never(),
         };
         let accepted_input = input.clone();
-        let active_history_start = state.lock().expect("session state poisoned").history.len();
+        let active_history_start = state
+            .lock()
+            .expect("session state poisoned")
+            .history()
+            .len();
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
         // The input and the injections it drains stay staged until the
         // acceptance checkpoint commits (see `Driver::settle_failed_acceptance`).
@@ -189,7 +193,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .state
             .lock()
             .expect("session state poisoned")
-            .history
+            .history()
             .len();
         self.machine.execution.begin_internal_turn(
             self.machine.turn_id.clone(),
@@ -646,7 +650,7 @@ impl TurnMachine<'_> {
                 .state
                 .lock()
                 .expect("session state poisoned")
-                .history
+                .history()
                 .iter()
                 .rev()
                 .flat_map(|message| &message.content)

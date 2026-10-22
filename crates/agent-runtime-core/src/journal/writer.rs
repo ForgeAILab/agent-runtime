@@ -2842,7 +2842,7 @@ mod review_tests {
         let shared = crate::checkpoint::JournalCheckpoint::from_checkpoint(owned.clone()).unwrap();
         let mut writer = JournalWriterAssembler::default();
         let roots = writer
-            .snapshot_shared_cached(&shared.snapshot(), 0, None, None)
+            .snapshot_shared_cached(shared.snapshot(), 0, None, None)
             .unwrap()
             .0;
         let refs = writer.checkpoint_view(&shared, roots.clone()).unwrap();
