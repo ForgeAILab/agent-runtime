@@ -160,6 +160,20 @@ impl Reporter {
             for call in samples.iter().filter(|s| s.label == "rt.mod.collect") {
                 let mut holds = Vec::new();
                 let mut waits = Vec::new();
+                // Per-call collection diagnostics: label -> [units, bytes].
+                let mut diag = BTreeMap::<&str, [u64; 2]>::new();
+                for event in samples.iter().filter(|s| s.label.starts_with("rt.gc.")) {
+                    let mut parent = event.parent;
+                    while let Some(id) = parent {
+                        if id == call.id {
+                            let slot = diag.entry(event.label).or_default();
+                            slot[0] += event.units;
+                            slot[1] += event.bytes;
+                            break;
+                        }
+                        parent = by_id.get(&id).and_then(|s| s.parent);
+                    }
+                }
                 for interval in &samples {
                     if !["rt.gate.hold", "rt.gate.wait"].contains(&interval.label) {
                         continue;
@@ -189,7 +203,7 @@ impl Reporter {
                         s.label == "bench.collect.examined_members" && s.parent == call.parent
                     })
                     .map(|s| s.units);
-                serde_json::to_writer(&mut self.collect,&json!({"case":case,"turn":turn,"boundary":boundary,"call":call,"held_intervals":holds,"wait_intervals":waits,"pack_write_bytes":physical,"examined_members":examined})).unwrap();
+                serde_json::to_writer(&mut self.collect,&json!({"case":case,"turn":turn,"boundary":boundary,"call":call,"held_intervals":holds,"wait_intervals":waits,"pack_write_bytes":physical,"examined_members":examined,"diag":diag})).unwrap();
                 self.collect.write_all(b"\n").unwrap();
             }
             self.collect.flush().unwrap();

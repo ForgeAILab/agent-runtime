@@ -52,6 +52,31 @@ enum Unit {
     Release,
 }
 const UNIT_KINDS: usize = 9;
+const UNIT_LABELS: [&str; UNIT_KINDS] = [
+    "rt.gc.unit.discover",
+    "rt.gc.unit.load",
+    "rt.gc.unit.pin_page",
+    "rt.gc.unit.pin_chain",
+    "rt.gc.unit.trace",
+    "rt.gc.unit.leases",
+    "rt.gc.unit.inventory",
+    "rt.gc.unit.dependency",
+    "rt.gc.unit.release",
+];
+
+// Per-drain diagnostics (benchmark observer only; a no-op without
+// `test-support` and outside an installed observer).
+#[cfg(feature = "test-support")]
+fn diag(label: &'static str, units: u64, bytes: u64) {
+    crate::journal::profile::event(label, units, bytes);
+}
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn diag(_label: &'static str, _units: u64, _bytes: u64) {}
+
+fn nanos(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
 
 #[derive(Debug, Default)]
 pub(super) struct CollectionState {
@@ -446,6 +471,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 };
                 report.zero_work_calls = cursor.zero_work;
             }
+            diag("rt.gc.call", call.units, u64::from(call.units == 0));
             {
                 let mut state = self.collection.lock().map_err(|_| host_failure())?;
                 state.cursor = kept;
@@ -479,6 +505,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 let started = Instant::now();
                 let loaded = self.storage.load(&self.domain, &session).await;
                 observe(&mut cursor.costs, Unit::Load, started.elapsed());
+                diag("rt.gc.fence_reload", 1, nanos(started.elapsed()));
                 match failures.isolate(&session, loaded)? {
                     Some(stored) => {
                         let fence = stored
@@ -496,6 +523,16 @@ impl<S: JournalStorage> JournalEngine<S> {
                                 .is_ok_and(|local| Self::lease_ids(&local, &session) != *taken)
                         });
                         if fence != mark.fence || leases_changed {
+                            diag(
+                                if fence != mark.fence {
+                                    "rt.gc.restart.fence"
+                                } else {
+                                    "rt.gc.restart.lease"
+                                },
+                                1,
+                                0,
+                            );
+                            diag("rt.gc.remarked", mark.live_count() as u64, 0);
                             cursor.mark = None;
                             Self::restart(cursor, call, failures, session);
                         }
@@ -553,6 +590,11 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .dirty_sessions(&self.domain, cursor.after.as_ref(), DISCOVERY_PAGE)
                 .await?;
             observe(&mut cursor.costs, Unit::Discover, started.elapsed());
+            diag(
+                UNIT_LABELS[Unit::Discover as usize],
+                1,
+                nanos(started.elapsed()),
+            );
             if page.len() > DISCOVERY_PAGE {
                 return Err(contract_violation());
             }
@@ -616,6 +658,11 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         .await;
         observe(&mut cursor.costs, Unit::Load, started.elapsed());
+        diag(
+            UNIT_LABELS[Unit::Load as usize],
+            1,
+            nanos(started.elapsed()),
+        );
         match failures.isolate(&session, read)? {
             Some(mark) => cursor.mark = Some(mark),
             None => Self::advance(cursor, session),
@@ -650,6 +697,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         if call.restarts.insert(session.clone()) {
             cursor.deferred.push_back(session);
         } else {
+            diag("rt.gc.skip.second_restart", 1, 0);
             failures.skipped.insert(session.clone());
             Self::advance(cursor, session);
         }
@@ -667,6 +715,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         if let Some(mark) = cursor.mark.take() {
             call.peak_skip_charge = call.peak_skip_charge.max(mark.charge());
         }
+        diag("rt.gc.skip.over_capacity", 1, 0);
         failures.skipped.insert(session.clone());
         call.over_capacity.insert(session.clone());
         Self::advance(cursor, session);
@@ -715,6 +764,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             Phase::Release => self.release_unit(request, cursor, call, report).await,
         };
         observe(&mut cursor.costs, kind, started.elapsed());
+        diag(UNIT_LABELS[kind as usize], 1, nanos(started.elapsed()));
         match result {
             Err(error) if error.metadata.get("journal_collection_contract").is_some() => Err(error),
             Err(error)
@@ -732,6 +782,10 @@ impl<S: JournalStorage> JournalEngine<S> {
             Err(error)
                 if matches!(phase, Phase::Pins | Phase::Inventory) && page_restart(&error) =>
             {
+                diag("rt.gc.restart.page", 1, 0);
+                if let Some(mark) = &cursor.mark {
+                    diag("rt.gc.remarked", mark.live_count() as u64, 0);
+                }
                 cursor.mark = None;
                 Self::restart(cursor, call, failures, session);
                 Ok(Step::Continue)
@@ -944,6 +998,9 @@ impl<S: JournalStorage> JournalEngine<S> {
             objects.insert(id, body.ok_or_else(conflict)?);
         }
         let mark = cursor.mark.as_mut().expect("mark");
+        // Diagnostics: objects traced and map entries walked by cap checks.
+        let mut traced = 0u64;
+        let mut walked = 0u64;
         for item in batch {
             match item {
                 Frontier::Edge(id, expected) => {
@@ -965,9 +1022,12 @@ impl<S: JournalStorage> JournalEngine<S> {
                     mark.frontier
                         .extend(links.into_iter().map(|(id, e)| Frontier::Edge(id, e)));
                     mark.visited.entry(id).or_default().push(expected);
+                    traced += 1;
+                    walked += mark.visited.len() as u64;
                     // Bound workspace inside the unit too: one batch of wide
                     // sequence nodes can add far more than the cap.
                     if mark.charge() > call.cap {
+                        diag("rt.gc.trace.objects", traced, walked);
                         return Err(over_capacity());
                     }
                 }
@@ -989,6 +1049,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 }
             }
         }
+        diag("rt.gc.trace.objects", traced, walked);
         Ok(())
     }
 
