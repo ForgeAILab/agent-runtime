@@ -1332,12 +1332,23 @@ async fn commit_domain_view(
             domain.checkpoint = checkpoint.cloned();
         }
         // This live writer lease pins every closure it has published, so objects
-        // from an earlier boundary remain valid candidates until close. A fresh
+        // from an earlier boundary remain valid candidates until close. Keep the
+        // objects this commit shipped plus earlier candidates this assembler
+        // rebuilt (skipped above because they were already known), so content
+        // re-encoded after a rollback is not resubmitted. Built objects that
+        // were never shipped stay out: they may not be in storage. A fresh
         // runtime rebuilds this set from only its newly pinned current head.
+        let reused = domain
+            .known_candidates
+            .iter()
+            .filter(|id| assembler.objects.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
         domain.known_candidates = commit
             .objects
             .iter()
             .map(|object| object.id.clone())
+            .chain(reused)
             .collect();
         if let Some(checkpoint_id) = checkpoint_id {
             domain.known_candidates.insert(checkpoint_id);
