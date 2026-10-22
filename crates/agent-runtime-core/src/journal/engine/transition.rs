@@ -1591,6 +1591,9 @@ impl Transition {
             deleted: deleted.len() as u64,
             reclaimed_bytes,
             unreadable_sessions: Vec::new(),
+            progress: Some(JournalGcProgress::Complete),
+            has_more: false,
+            work_units: 0,
         })
     }
 }

@@ -20,6 +20,8 @@ use super::journal::{self, *};
 
 #[path = "journal_storage_authority.rs"]
 mod authority;
+#[path = "journal_storage_collection.rs"]
+mod bounded;
 #[path = "journal_storage_isolation.rs"]
 mod isolation;
 
@@ -65,6 +67,11 @@ where
     named(
         "exact_membership_enumeration",
         authority::exact_membership_enumeration(&factory),
+    )
+    .await;
+    named(
+        "bounded_collection_protocol",
+        bounded::bounded_collection_protocol(&factory),
     )
     .await;
     named(
@@ -140,6 +147,30 @@ where
         }),
     )
     .await;
+}
+
+/// Host drain over bounded collection calls (P4): repeat with a refreshed
+/// epoch while the engine reports more work.
+async fn drain<S: JournalStorage>(engine: &JournalEngine<S>) -> JournalGcReport {
+    let mut total: Option<JournalGcReport> = None;
+    loop {
+        let report = engine
+            .collect(JournalGcRequest::new(
+                engine.storage_id(),
+                engine.root_epoch().unwrap(),
+                u64::MAX,
+            ))
+            .await
+            .unwrap();
+        let more = report.has_more;
+        match &mut total {
+            None => total = Some(report),
+            Some(total) => accumulate(total, report),
+        }
+        if !more {
+            return total.unwrap();
+        }
+    }
 }
 
 async fn named(name: &str, future: impl Future<Output = ()>) {
@@ -1141,14 +1172,7 @@ where
                 .unwrap()
                 .is_some()
         );
-        engine
-            .collect(JournalGcRequest {
-                storage_id: engine.storage_id(),
-                expected_root_epoch: engine.root_epoch().unwrap(),
-                max_objects: u64::MAX,
-            })
-            .await
-            .unwrap();
+        drain(&engine).await;
         let before = storage.load(&d, &session).await.unwrap();
         let members = storage.members(&d, &session).await.unwrap();
         let epoch = engine.root_epoch().unwrap();
@@ -1326,27 +1350,13 @@ where
         }
         // Finish the other holder's sweep first, so the retiring session's
         // collector cannot detect corruption by incidentally reading it.
-        second
-            .collect(JournalGcRequest {
-                storage_id: second.storage_id(),
-                expected_root_epoch: second.root_epoch().unwrap(),
-                max_objects: u64::MAX,
-            })
-            .await
-            .unwrap();
+        drain(&second).await;
         first
             .authorize_retirement(&a, heads[0].revision, Timestamp(2))
             .await
             .unwrap();
         first.retire(&a, heads[0].revision).await.unwrap();
-        first
-            .collect(JournalGcRequest {
-                storage_id: first.storage_id(),
-                expected_root_epoch: first.root_epoch().unwrap(),
-                max_objects: u64::MAX,
-            })
-            .await
-            .unwrap();
+        drain(&first).await;
         let fresh = if cross_domain {
             ordinary(storage.clone(), Arc::new(IdentityJournalProjection), true)
         } else {

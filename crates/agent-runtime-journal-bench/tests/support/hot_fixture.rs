@@ -389,28 +389,38 @@ impl Store {
         profile::instrument("bench.full_drain", async {
             for journal in [&self.ordinary, &self.protected] {
                 for step in 0..100_000 {
-                    profile::instrument("bench.collect.call", async {
-                        let before = self.storage.pack_write_bytes().unwrap();
-                        let report = journal
-                            .collect(JournalGcRequest {
-                                storage_id: journal.storage_id(),
-                                expected_root_epoch: journal.root_epoch().unwrap(),
-                                max_objects: 20_000,
-                            })
-                            .await
-                            .unwrap();
-                        profile::event(
-                            "bench.collect.pack_write_bytes",
-                            1,
-                            self.storage.pack_write_bytes().unwrap() - before,
-                        );
-                        profile::event(
-                            "bench.collect.examined_members",
-                            report.examined,
-                            report.reclaimed_bytes,
-                        );
-                    })
-                    .await;
+                    // Bounded calls (P4): continue the engine's pass while it
+                    // reports more work; each call is one measured collect.
+                    loop {
+                        let more = profile::instrument("bench.collect.call", async {
+                            let before = self.storage.pack_write_bytes().unwrap();
+                            let report = journal
+                                .collect(JournalGcRequest {
+                                    storage_id: journal.storage_id(),
+                                    expected_root_epoch: journal.root_epoch().unwrap(),
+                                    max_objects: 20_000,
+                                    work_budget: Default::default(),
+                                })
+                                .await
+                                .unwrap();
+                            profile::event(
+                                "bench.collect.pack_write_bytes",
+                                1,
+                                self.storage.pack_write_bytes().unwrap() - before,
+                            );
+                            profile::event(
+                                "bench.collect.examined_members",
+                                report.examined,
+                                report.reclaimed_bytes,
+                            );
+                            profile::event("bench.collect.deleted", report.deleted, 0);
+                            report.has_more
+                        })
+                        .await;
+                        if !more {
+                            break;
+                        }
+                    }
                     if self
                         .storage
                         .dirty_sessions(
@@ -964,15 +974,21 @@ pub(crate) async fn diagnostics(reporter: &mut Reporter) {
             true,
             async {
                 for engine in [&store.ordinary, &store.protected] {
-                    let report = engine
-                        .collect(JournalGcRequest {
-                            storage_id: engine.storage_id(),
-                            expected_root_epoch: engine.root_epoch().unwrap(),
-                            max_objects: 0,
-                        })
-                        .await
-                        .unwrap();
-                    assert_eq!(report.deleted, 0);
+                    loop {
+                        let report = engine
+                            .collect(JournalGcRequest {
+                                storage_id: engine.storage_id(),
+                                expected_root_epoch: engine.root_epoch().unwrap(),
+                                max_objects: 0,
+                                work_budget: Default::default(),
+                            })
+                            .await
+                            .unwrap();
+                        assert_eq!(report.deleted, 0);
+                        if !report.has_more {
+                            break;
+                        }
+                    }
                 }
             },
         )

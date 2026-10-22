@@ -2,40 +2,40 @@ use super::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Metadata {
+pub(super) struct Metadata {
     checkpoint_floor: Option<ReferencedTurnCheckpoint>,
-    dependencies: DependencyRoots,
+    pub(super) dependencies: DependencyRoots,
     authorization: Option<(JournalRevision, crate::clock::Timestamp)>,
     // Append-only candidates; retirement verifies their current records/pins.
     #[serde(default)]
     retirement_dependents: BTreeSet<SessionId>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PinMetadata {
+pub(super) struct PinMetadata {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     memo_roots: BTreeSet<JournalObjectId>,
-    dependencies: PinDependencies,
+    pub(super) dependencies: PinDependencies,
     #[serde(default)]
-    writer_epochs: BTreeSet<u64>,
+    pub(super) writer_epochs: BTreeSet<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PinDependencies {
-    sessions: BTreeSet<SessionId>,
-    unresolved: bool,
+pub(super) struct PinDependencies {
+    pub(super) sessions: BTreeSet<SessionId>,
+    pub(super) unresolved: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CatalogMetadata {
+pub(super) struct CatalogMetadata {
     #[serde(flatten)]
-    dependencies: DependencyRoots,
+    pub(super) dependencies: DependencyRoots,
     #[serde(default)]
-    previous: Option<JournalObjectId>,
+    pub(super) previous: Option<JournalObjectId>,
     #[serde(default)]
-    writer_epoch: Option<u64>,
+    pub(super) writer_epoch: Option<u64>,
     // Staging admitted by this writer since its preceding commit. These
     // leaves also entered the writer's lease closure, even if not referenced
     // by the published head. Record each staging delta only once.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    staged_roots: BTreeSet<JournalObjectId>,
+    pub(super) staged_roots: BTreeSet<JournalObjectId>,
 }
 fn encode<T: Serialize>(value: &T) -> Result<JournalEngineState, RuntimeError> {
     Ok(JournalEngineState {
@@ -45,7 +45,7 @@ fn encode<T: Serialize>(value: &T) -> Result<JournalEngineState, RuntimeError> {
 }
 // Preserve the existing public kind/class while distinguishing a proven
 // validation failure from a concurrent state change during collection.
-fn invalid_state(mut error: RuntimeError) -> RuntimeError {
+pub(super) fn invalid_state(mut error: RuntimeError) -> RuntimeError {
     error.metadata.insert("journal_invalid_state", true);
     error
 }
@@ -283,136 +283,11 @@ impl<S: JournalStorage> JournalEngine<S> {
         })
     }
 
-    async fn pin_closure(
-        &self,
-        session: &SessionId,
-        root: &JournalObjectId,
-        memo: &mut BTreeMap<JournalObjectId, BTreeSet<JournalObjectId>>,
-    ) -> Result<(), RuntimeError> {
-        crate::journal_profile_scope!("rt.persistence.pin_closure", {
-            if memo.contains_key(root) {
-                return Ok(());
-            }
-            let body = self
-                .storage
-                .objects(&self.domain, session, std::slice::from_ref(root))
-                .await?;
-            if body.len() != 1 {
-                return Err(conflict());
-            }
-            let object = JournalObject {
-                id: root.clone(),
-                bytes: body
-                    .into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or_else(conflict)?
-                    .to_vec(),
-            };
-            let kind = object.kind().map_err(invalid_state)?;
-            let closure = if kind == JournalObjectKind::Head {
-                self.closure_objects(session, root)
-                    .await?
-                    .into_keys()
-                    .collect()
-            } else {
-                validate_leaf(&object, kind).map_err(invalid_state)?;
-                [root.clone()].into()
-            };
-            memo.insert(root.clone(), closure);
-            Ok(())
-        })
-    }
-
-    pub(super) async fn collection_live(
-        &self,
-        session: &SessionId,
-        stored: Option<&JournalSessionRecord>,
-    ) -> Result<(BTreeSet<JournalObjectId>, BTreeSet<SessionId>), RuntimeError> {
-        crate::journal_profile_scope!("rt.persistence.collection_live", {
-            let unsupported = || {
-                RuntimeError::unsupported_capability(
-                    crate::error::UnsupportedCapability::JournalCollection,
-                )
-            };
-            let mut live = BTreeSet::new();
-            let mut dependencies = BTreeSet::new();
-            let mut memo = BTreeMap::new();
-            let mut catalog = BTreeMap::new();
-            if let Some(stored) = stored {
-                let metadata: Metadata = decode(&stored.engine)?;
-                if stored.head.is_some() && metadata.dependencies.unresolved {
-                    return Err(unsupported());
-                }
-                if stored.head.is_some() {
-                    dependencies.extend(metadata.dependencies.sessions);
-                }
-                if let Some(root) = &stored.head {
-                    let closure: BTreeSet<_> = self
-                        .closure_objects(session, &root.id)
-                        .await?
-                        .into_keys()
-                        .collect();
-                    live.extend(closure.iter().cloned());
-                    memo.insert(root.id.clone(), closure);
-                }
-            }
-            for pin in self.storage.pins(&self.domain, session).await? {
-                let (roots, indexed) = self.pin_roots(session, &pin, stored, &mut catalog).await?;
-                if indexed.unresolved {
-                    return Err(unsupported());
-                }
-                dependencies.extend(indexed.sessions);
-                for root in roots {
-                    self.pin_closure(session, &root, &mut memo).await?;
-                    live.extend(memo[&root].iter().cloned());
-                }
-            }
-            let local = self.local.lock()?;
-            for lease in local
-                .leases
-                .values()
-                .filter(|lease| &lease.session == session)
-            {
-                for layer in &lease.reachable.layers {
-                    live.extend(layer.iter().cloned());
-                }
-            }
-            Ok((live, dependencies))
-        })
-    }
-
-    /// Before a source becomes clean, persist it as a candidate on every
-    /// referenced session. A crash can leave an extra candidate, never a
-    /// missing blocker: the source stays dirty until its own sweep applies.
-    pub(super) async fn index_retirement_dependencies(
-        &self,
-        source: &SessionId,
-        dependencies: BTreeSet<SessionId>,
-        failures: &mut super::controls::CollectionFailures,
-    ) -> Result<bool, RuntimeError> {
-        crate::journal_profile_scope!("rt.collection.dependencies", {
-            for target in dependencies {
-                if &target == source {
-                    continue;
-                }
-                if !failures.skipped.contains(&target) {
-                    let result = self.index_retirement_dependency(source, &target).await;
-                    failures.isolate(&target, result)?;
-                }
-                if failures.skipped.contains(&target) {
-                    failures.skipped.insert(source.clone());
-                    if failures.unreadable.contains(&target) {
-                        failures.unreadable.insert(source.clone());
-                    }
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        })
-    }
-
-    async fn index_retirement_dependency(
+    /// Before a source becomes clean, collection persists it as a candidate on
+    /// every referenced session, one target per bounded unit. A crash can leave
+    /// an extra candidate, never a missing blocker: the source stays dirty
+    /// until its own sweep applies.
+    pub(super) async fn index_retirement_dependency(
         &self,
         source: &SessionId,
         target: &SessionId,
@@ -681,7 +556,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             }
         })
     }
-    fn invalidate(&self, session: &SessionId) -> Result<(), RuntimeError> {
+    pub(super) fn invalidate(&self, session: &SessionId) -> Result<(), RuntimeError> {
         self.memo
             .lock()
             .map_err(|_| host_failure())?

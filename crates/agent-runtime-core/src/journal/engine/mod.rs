@@ -34,6 +34,7 @@ pub(super) use transition::{
     DurablePin, ObjectStore, ReachableSet, SessionRecord, State, Transition, host_failure,
     injected_failure,
 };
+mod collection;
 mod controls;
 mod memo;
 mod persistence;
@@ -78,6 +79,9 @@ pub struct JournalEngine<S: JournalStorage> {
     // opens, whose root changes do not set storage's collection_dirty flag.
     dirty: Arc<Mutex<BTreeSet<SessionId>>>,
     memo: Arc<Mutex<memo::RootMemo>>,
+    // Private disposable collection cursor shared by clones; touched only
+    // under the write gate.
+    collection: Arc<Mutex<collection::CollectionState>>,
 }
 impl<S: JournalStorage> Clone for JournalEngine<S> {
     fn clone(&self) -> Self {
@@ -88,6 +92,7 @@ impl<S: JournalStorage> Clone for JournalEngine<S> {
             gate: self.gate.clone(),
             dirty: self.dirty.clone(),
             memo: self.memo.clone(),
+            collection: self.collection.clone(),
         }
     }
 }
@@ -140,6 +145,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             memo: Arc::new(Mutex::new(memo::RootMemo::new(
                 config.validated_root_memo_bytes,
             ))),
+            collection: Arc::new(Mutex::new(collection::CollectionState::new())),
         }
     }
     /// Estimated test-only retention, not allocator heap or process RSS.
@@ -165,8 +171,14 @@ impl<S: JournalStorage> JournalEngine<S> {
             external_proof_references: details.2,
             live_leases,
             local_dirty_sessions,
-            cursor_charge: 0,
+            cursor_charge: self.collection.lock().map_err(|_| host_failure())?.charge(),
         })
+    }
+    /// Test-only override of the 16 MiB collection cursor workspace cap.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_collection_cursor_cap(&self, bytes: usize) -> Result<(), RuntimeError> {
+        self.collection.lock().map_err(|_| host_failure())?.cap = bytes;
+        Ok(())
     }
     /// Arms one deterministic commit cut; it is consumed when that step is reached.
     pub fn fail_next_commit_at(

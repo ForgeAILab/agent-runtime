@@ -102,6 +102,7 @@ fn request(engine: &JournalEngine<PackedSqliteJournalStorage>) -> JournalGcReque
         storage_id: engine.storage_id(),
         expected_root_epoch: engine.root_epoch().unwrap(),
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     }
 }
 

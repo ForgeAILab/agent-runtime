@@ -157,6 +157,38 @@ impl JournalStorage for LostAcknowledgement {
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(d).await
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        // Collection pages carry the membership/pin fault points of the
+        // previous whole-session reads.
+        let name = match request.kind {
+            JournalCollectionPageKind::Pins => "pins",
+            _ => "members",
+        };
+        self.count(name, s);
+        self.fail(name, s)?;
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalApplyReceipt, RuntimeError> {
+        // Route through this wrapper's apply so its fault/pause hooks apply.
+        self.apply(plan.write).await
+    }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.count("apply", &write.session);
         if write.kind == JournalWriteKind::Collect {
@@ -520,15 +552,23 @@ async fn host_controls_preserve_the_original_epoch_transcript() {
         storage_id: engine.storage_id(),
         expected_root_epoch: epoch,
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     };
+    // `work_units` is the bounded collector's per-call diagnostic (P4); the
+    // reference collector has no units. Every original field still matches.
+    let collected = engine
+        .collect(request(engine.root_epoch().unwrap()))
+        .await
+        .unwrap();
+    assert!(collected.work_units > 0);
     assert_eq!(
         original
             .collect(request(original.root_epoch().unwrap()))
             .unwrap(),
-        engine
-            .collect(request(engine.root_epoch().unwrap()))
-            .await
-            .unwrap()
+        JournalGcReport {
+            work_units: 0,
+            ..collected
+        }
     );
     check();
     original
@@ -548,14 +588,18 @@ async fn host_controls_preserve_the_original_epoch_transcript() {
         .unwrap();
     check();
     for _ in 0..2 {
+        let collected = engine
+            .collect(request(engine.root_epoch().unwrap()))
+            .await
+            .unwrap();
         assert_eq!(
             original
                 .collect(request(original.root_epoch().unwrap()))
                 .unwrap(),
-            engine
-                .collect(request(engine.root_epoch().unwrap()))
-                .await
-                .unwrap()
+            JournalGcReport {
+                work_units: 0,
+                ..collected
+            }
         );
         check();
     }
@@ -634,6 +678,7 @@ async fn sweep<S: JournalStorage>(engine: &JournalEngine<S>, max_objects: u64) -
             storage_id: engine.storage_id(),
             expected_root_epoch: engine.root_epoch().unwrap(),
             max_objects,
+            work_budget: Default::default(),
         })
         .await
         .unwrap()
@@ -940,6 +985,7 @@ async fn collection_rechecks_the_mark_after_awaited_storage_reads() {
         storage_id: engine.storage_id(),
         expected_root_epoch: engine.root_epoch().unwrap(),
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     };
     let (reached, ready) = tokio::sync::oneshot::channel();
     let (resume, wait) = tokio::sync::oneshot::channel();
@@ -1000,6 +1046,7 @@ async fn engine_future_sizes_stay_bounded() {
         storage_id: engine.storage_id(),
         expected_root_epoch: 0,
         max_objects: 0,
+        work_budget: Default::default(),
     };
     let sizes = [
         ("open", boxed(&journal.open(&session, writer("x")))),
@@ -1129,7 +1176,8 @@ async fn memoized_writer_open_renew_and_commit_read_no_storage_objects() {
                 .collect(JournalGcRequest {
                     storage_id: engine.storage_id(),
                     expected_root_epoch: engine.root_epoch().unwrap(),
-                    max_objects: u64::MAX
+                    max_objects: u64::MAX,
+                    work_budget: Default::default(),
                 })
                 .await
                 .unwrap()
@@ -2334,6 +2382,30 @@ impl JournalStorage for PausedApply {
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(d).await
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalApplyReceipt, RuntimeError> {
+        // Route through this wrapper's apply so its pause hook applies.
+        self.apply(plan.write).await
+    }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         let pause = {
             let mut slot = self.pause.lock().unwrap();
@@ -2727,6 +2799,7 @@ async fn r3_collection_stays_healthy_after_the_released_pin_race() {
             storage_id: collector.storage_id(),
             expected_root_epoch: collector.root_epoch().unwrap(),
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await;
     let (_, fresh) = two_engines(&storage, 0);
@@ -2735,6 +2808,7 @@ async fn r3_collection_stays_healthy_after_the_released_pin_race() {
             storage_id: fresh.storage_id(),
             expected_root_epoch: fresh.root_epoch().unwrap(),
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await;
     assert!(
@@ -2843,6 +2917,7 @@ fn collect_all(engine: &JournalEngine<PausedApply>) -> JournalGcRequest {
         storage_id: engine.storage_id(),
         expected_root_epoch: engine.root_epoch().unwrap(),
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     }
 }
 

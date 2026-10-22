@@ -68,6 +68,7 @@ impl Collecting {
             storage_id: self.inner.storage_id(),
             expected_root_epoch: self.inner.root_epoch().unwrap(),
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         }
     }
 
@@ -77,14 +78,20 @@ impl Collecting {
     }
 
     async fn collect_current(&self) {
-        let marked = self.mark().await;
-        let expected_epoch = marked.expected_root_epoch;
-        let report = self
-            .inner
-            .collect(marked)
-            .await
-            .expect("a fresh mark under the schedule lock must collect successfully");
-        assert_eq!(report.root_epoch, expected_epoch);
+        // Bounded calls (P4): drain while the engine reports more work.
+        loop {
+            let marked = self.mark().await;
+            let expected_epoch = marked.expected_root_epoch;
+            let report = self
+                .inner
+                .collect(marked)
+                .await
+                .expect("a fresh mark under the schedule lock must collect successfully");
+            assert_eq!(report.root_epoch, expected_epoch);
+            if !report.has_more {
+                break;
+            }
+        }
         self.collections.fetch_add(1, Ordering::Relaxed);
     }
 

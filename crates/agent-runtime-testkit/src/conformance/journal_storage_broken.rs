@@ -19,6 +19,9 @@ enum Defect {
     PrefixLookup,
     MembersWithoutMembership,
     NonRetryableLostAck,
+    UnboundedPage,
+    StaleCollectionPage,
+    PartialCollectionApply,
 }
 trait Fault: std::fmt::Debug + Send + Sync + 'static {
     const DEFECT: Defect;
@@ -30,7 +33,7 @@ macro_rules! faults {
         impl Fault for $name { const DEFECT: Defect = Defect::$name; }
     )*};
 }
-faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; }
+faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; UnboundedPage; StaleCollectionPage; PartialCollectionApply; }
 
 type CacheKey = (String, u8, SessionId, JournalObjectId);
 type AdmittedKey = (String, u8);
@@ -179,6 +182,97 @@ impl<F: Fault> JournalStorage for Broken<F> {
     }
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner().compact(d).await
+    }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner().collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        mut request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        let current = self
+            .inner()
+            .load(d, s)
+            .await?
+            .map_or(JournalFence::default(), |record| record.fence());
+        if F::DEFECT == Defect::StaleCollectionPage && request.fence != current {
+            // The only defect: serve the current generation for a stale fence
+            // instead of rejecting the page (restarting its position).
+            request.fence = current;
+            request.after = None;
+        }
+        if F::DEFECT == Defect::UnboundedPage && request.kind == JournalCollectionPageKind::Members
+        {
+            // The only defect: ignore the page bound and return everything.
+            if request.fence != current {
+                return self.inner().collection_page(d, s, request).await;
+            }
+            let ids = self.members(d, s).await?;
+            return Ok(JournalCollectionPage {
+                fence: current,
+                bytes: ids.len() as u64 * 32,
+                items: JournalCollectionItems::Members(ids),
+                next: None,
+            });
+        }
+        if F::DEFECT == Defect::MembersWithoutMembership
+            && request.kind == JournalCollectionPageKind::Members
+            && request.fence == current
+        {
+            // Pages reflect the same defective membership enumeration, paged
+            // correctly by full id so only membership exactness is wrong.
+            let after = request
+                .after
+                .as_ref()
+                .map(|after| after.position(d, s, current, request.kind))
+                .transpose()?
+                .map(|position| JournalObjectId::from_bytes(position.try_into().unwrap()));
+            let mut ids = self.members(d, s).await?;
+            ids.sort();
+            ids.retain(|id| after.as_ref().is_none_or(|after| id > after));
+            let more = ids.len() > request.max_items as usize;
+            ids.truncate(request.max_items as usize);
+            let next = (more && !ids.is_empty()).then(|| {
+                JournalCollectionContinuation::new(
+                    d,
+                    s,
+                    current,
+                    request.kind,
+                    ids.last().unwrap().to_bytes().to_vec(),
+                )
+            });
+            return Ok(JournalCollectionPage {
+                fence: current,
+                bytes: ids.len() as u64 * 32,
+                items: JournalCollectionItems::Members(ids),
+                next,
+            });
+        }
+        self.inner().collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner().prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        mut plan: JournalCollectionPlan,
+    ) -> Result<JournalApplyReceipt, RuntimeError> {
+        if plan.write.kind != JournalWriteKind::Collect {
+            return self.inner().apply_collection(plan).await;
+        }
+        if F::DEFECT == Defect::PartialCollectionApply {
+            // The only defect: silently apply half of the declared batch.
+            let keep = plan.write.release.len().div_ceil(2);
+            plan.write.release.truncate(keep);
+            plan.write.catalog.truncate(keep);
+        }
+        // Route through this adapter's apply so every write defect applies.
+        self.apply(plan.write).await
     }
     async fn apply(&self, mut write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         match F::DEFECT {
@@ -424,6 +518,21 @@ async fn m14_members_without_membership_fails_in_both_scopes() {
         rejects_with_sharing::<MembersWithoutMembership>("exact_membership_enumeration", sharing)
             .await;
     }
+}
+#[tokio::test]
+async fn unbounded_member_page_fails_bounded_collection_protocol() {
+    let message = rejects::<UnboundedPage>("bounded_collection_protocol").await;
+    assert!(message.contains("a page must not exceed max_items"));
+}
+#[tokio::test]
+async fn stale_collection_page_fails_bounded_collection_protocol() {
+    let message = rejects::<StaleCollectionPage>("bounded_collection_protocol").await;
+    assert!(message.contains("must be rejected") || message.contains("bound to its"));
+}
+#[tokio::test]
+async fn partial_collection_apply_fails_bounded_collection_protocol() {
+    let message = rejects::<PartialCollectionApply>("bounded_collection_protocol").await;
+    assert!(message.contains("the complete declared release batch applies"));
 }
 #[tokio::test]
 async fn non_retryable_lost_acknowledgement_fails_atomic_apply_cuts() {

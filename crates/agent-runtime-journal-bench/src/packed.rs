@@ -26,6 +26,9 @@ struct State {
     loaded_sessions: BTreeSet<String>,
     version: i64,
     operations: BTreeMap<OperationKey, JournalOperationRecord>,
+    // Bumped on every pack rewrite/cache refresh. Member page positions are
+    // (pack, slot) and stay valid only while no pack is rewritten.
+    physical: u64,
 }
 
 #[cfg(test)]
@@ -45,6 +48,7 @@ impl State {
         self.operations.clear();
         self.loaded_sessions.clear();
         self.version = version;
+        self.physical += 1;
         Ok(())
     }
     // A session's index is lazy and independent. Opening a storage or reading
@@ -122,6 +126,9 @@ impl State {
         Ok(())
     }
     fn update(&mut self, session: &SessionId, updates: Updates) {
+        if !updates.is_empty() {
+            self.physical += 1;
+        }
         for id in updates.keys() {
             if let Some(old) = self.packs.remove(id) {
                 for object in &old.objects {
@@ -202,6 +209,7 @@ impl PackedSqliteJournalStorage {
                 loaded_sessions: BTreeSet::new(),
                 version: -1,
                 operations: BTreeMap::new(),
+                physical: 0,
             })),
         };
         storage.lock()?.refresh()?;
@@ -774,6 +782,227 @@ fn prune_operations(
     Ok(removed)
 }
 
+/// One page is at most 256 member ids; one collection apply rewrites at most
+/// 32 sealed packs of at most `LOGICAL_PACK_CAP` canonical bytes each.
+const COLLECTION_LIMITS: JournalCollectionLimits = JournalCollectionLimits {
+    max_page_items: 256,
+    max_unit_bytes: LOGICAL_PACK_CAP as u64,
+    max_apply_units: 32,
+};
+
+// Members in (pack id, slot) order. The position also binds the physical
+// pack epoch: a repack between pages rejects the continuation. Each step
+// decodes at most one bounded pack (cached packs are reused, never the whole
+// session's index).
+fn members_page(
+    state: &State,
+    d: &JournalDomain,
+    s: &SessionId,
+    fence: JournalFence,
+    after: Option<&[u8]>,
+    limit: usize,
+) -> Result<JournalCollectionPage, RuntimeError> {
+    let (mut pid, mut slot) = match after {
+        None => (i64::MIN, 0usize),
+        Some(position) => {
+            let position: [u8; 20] = position.try_into().map_err(|_| conflict())?;
+            let physical = u64::from_le_bytes(position[..8].try_into().expect("8 bytes"));
+            if physical != state.physical {
+                return Err(conflict());
+            }
+            (
+                i64::from_le_bytes(position[8..16].try_into().expect("8 bytes")),
+                u32::from_le_bytes(position[16..].try_into().expect("4 bytes")) as usize + 1,
+            )
+        }
+    };
+    let mut ids = Vec::new();
+    let mut last = None;
+    let mut more = false;
+    'packs: loop {
+        let row: Option<(i64, Vec<u8>)> = state
+            .conn
+            .query_row(
+                "SELECT pack_id,bits FROM membership WHERE storage=? AND role=? AND session=? AND pack_id>=? ORDER BY pack_id LIMIT 1",
+                params![d.storage_id.as_str(), role(d), s.as_str(), pid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(failure)?;
+        let Some((found, bits)) = row else {
+            break;
+        };
+        if found != pid {
+            slot = 0;
+        }
+        pid = found;
+        let decoded;
+        let pack = match state.packs.get(&pid) {
+            Some(pack) => pack.as_ref(),
+            None => {
+                let payload: Vec<u8> = state
+                    .conn
+                    .query_row("SELECT payload FROM pack WHERE pack_id=?", [pid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(failure)?;
+                decoded = Pack::decoded(&payload)?;
+                &decoded
+            }
+        };
+        while slot < pack.objects.len() {
+            if bit(&bits, slot) {
+                if ids.len() == limit {
+                    more = true;
+                    break 'packs;
+                }
+                ids.push(pack.objects[slot].id.clone());
+                last = Some((pid, slot));
+            }
+            slot += 1;
+        }
+        pid = pid.checked_add(1).ok_or_else(conflict)?;
+        slot = 0;
+    }
+    state.consistent()?;
+    let next = match (more, last) {
+        (true, Some((pid, slot))) => {
+            let mut position = state.physical.to_le_bytes().to_vec();
+            position.extend(pid.to_le_bytes());
+            position.extend((slot as u32).to_le_bytes());
+            Some(JournalCollectionContinuation::new(
+                d,
+                s,
+                fence,
+                JournalCollectionPageKind::Members,
+                position,
+            ))
+        }
+        _ => None,
+    };
+    Ok(JournalCollectionPage {
+        fence,
+        bytes: ids.len() as u64 * 32,
+        items: JournalCollectionItems::Members(ids),
+        next,
+    })
+}
+
+fn pins_page(
+    state: &State,
+    d: &JournalDomain,
+    s: &SessionId,
+    fence: JournalFence,
+    after: Option<&[u8]>,
+    limit: usize,
+) -> Result<JournalCollectionPage, RuntimeError> {
+    let after = after
+        .map(|position| std::str::from_utf8(position).map_err(|_| conflict()))
+        .transpose()?;
+    let mut st = state
+        .conn
+        .prepare(
+            "SELECT payload FROM pin WHERE storage=? AND role=? AND session=? AND (?4 IS NULL OR pin>?4) ORDER BY pin LIMIT ?5",
+        )
+        .map_err(failure)?;
+    let rows: Vec<Vec<u8>> = st
+        .query_map(
+            params![
+                d.storage_id.as_str(),
+                role(d),
+                s.as_str(),
+                after,
+                i64::try_from(limit + 1).unwrap_or(i64::MAX)
+            ],
+            |r| r.get(0),
+        )
+        .map_err(failure)?
+        .collect::<Result<_, _>>()
+        .map_err(failure)?;
+    let more = rows.len() > limit;
+    let mut bytes = 0;
+    let mut pins = Vec::new();
+    for raw in rows.into_iter().take(limit) {
+        bytes += raw.len() as u64;
+        pins.push(JournalPinRecord::from(codec::decode::<metadata::Pin>(
+            &raw,
+        )?));
+    }
+    let next = (more && !pins.is_empty()).then(|| {
+        JournalCollectionContinuation::new(
+            d,
+            s,
+            fence,
+            JournalCollectionPageKind::Pins,
+            pins.last().expect("pin").pin.as_str().as_bytes().to_vec(),
+        )
+    });
+    Ok(JournalCollectionPage {
+        fence,
+        bytes,
+        items: JournalCollectionItems::Pins(pins),
+        next,
+    })
+}
+
+// Read-only, no-effect count of the sealed packs a collection apply rewrites:
+// packs losing members (threshold purge), a retired session's forced purge
+// and the bounded base repack of small packs. A plan over the cap is split.
+fn preflight(
+    state: &mut State,
+    config: &PackedSqliteConfig,
+    plan: &JournalCollectionPlan,
+) -> Result<JournalCollectionPreflight, RuntimeError> {
+    let write = &plan.write;
+    if write.kind != JournalWriteKind::Collect {
+        return Err(conflict());
+    }
+    let (d, s) = (&write.domain, &write.session);
+    state.session(s)?;
+    let directory = directory(&state.conn, d, s)?;
+    let mut touched = BTreeSet::new();
+    for id in &write.release {
+        if let Some(&(pid, slot)) = state.locations.get(&(s.as_str().to_owned(), id.clone())) {
+            if directory.get(&pid).is_some_and(|bits| bit(bits, slot)) {
+                touched.insert(pid);
+            }
+        }
+    }
+    // Splitting the release list bounds only the packs it touches; forced
+    // purge of a retired session and the base repack are counted but not split.
+    let splittable = touched.len();
+    let owned: Vec<i64> = {
+        let mut st = state
+            .conn
+            .prepare("SELECT pack_id FROM pack WHERE owner=?")
+            .map_err(failure)?;
+        st.query_map([s.as_str()], |r| r.get(0))
+            .map_err(failure)?
+            .collect::<Result<_, _>>()
+            .map_err(failure)?
+    };
+    if load(&state.conn, d, s)?.is_some_and(|r| r.retirement.is_some()) {
+        touched.extend(owned.iter().copied());
+    }
+    if config.repack_on_collection {
+        touched.extend(owned.iter().copied().filter(|pid| {
+            state
+                .packs
+                .get(pid)
+                .is_some_and(|p| pack_bytes(p) < SMALL_PACK_CAP)
+        }));
+    }
+    state.consistent()?;
+    let units = u32::try_from(touched.len()).unwrap_or(u32::MAX);
+    let cap = plan.max_units.min(COLLECTION_LIMITS.max_apply_units) as usize;
+    if splittable <= cap || write.release.len() <= 1 {
+        return Ok(JournalCollectionPreflight::Fits { units });
+    }
+    Ok(JournalCollectionPreflight::Split {
+        max_release: (write.release.len() / 2) as u64,
+    })
+}
+
 #[async_trait]
 impl JournalStorage for PackedSqliteJournalStorage {
     fn sharing(&self) -> JournalBodySharing {
@@ -1295,5 +1524,59 @@ impl JournalStorage for PackedSqliteJournalStorage {
                 )
                 .map_err(failure)
         })
+    }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        JournalCollectionCapability::Bounded(COLLECTION_LIMITS)
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        crate::journal_profile_scope!("rt.storage.collection_page", {
+            let state = self.lock()?;
+            let fence = load(&state.conn, d, s)?.map_or(JournalFence::default(), |r| r.fence());
+            if fence != request.fence {
+                return Err(conflict());
+            }
+            let limit = request.max_items.min(COLLECTION_LIMITS.max_page_items) as usize;
+            let after = request
+                .after
+                .as_ref()
+                .map(|after| after.position(d, s, fence, request.kind))
+                .transpose()?;
+            match request.kind {
+                JournalCollectionPageKind::Members => {
+                    members_page(&state, d, s, fence, after, limit)
+                }
+                JournalCollectionPageKind::Pins => pins_page(&state, d, s, fence, after, limit),
+                _ => Err(conflict()),
+            }
+        })
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        crate::journal_profile_scope!("rt.storage.prepare_collection", {
+            let mut state = self.lock()?;
+            preflight(&mut state, &self.config, plan)
+        })
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalApplyReceipt, RuntimeError> {
+        {
+            let mut state = self.lock()?;
+            if !matches!(
+                preflight(&mut state, &self.config, &plan)?,
+                JournalCollectionPreflight::Fits { .. }
+            ) {
+                return Err(conflict());
+            }
+        }
+        self.apply(plan.write).await
     }
 }

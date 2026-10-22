@@ -105,6 +105,7 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
     ) -> Result<JournalRetirement, RuntimeError>;
     /// Traces live/retained/staged/transfer roots and pins; deletion transactionally
     /// rechecks the mark epoch. Unsupported collection must retain everything.
+    /// One call may yield (`has_more`); hosts loop with a refreshed epoch.
     async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError>;
 }
 
