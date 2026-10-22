@@ -299,13 +299,52 @@ unsupported adapters. After explicit `enable_collection`, a host can mark an
 epoch and request bounded deletion:
 
 ```rust
-let request = JournalGcRequest {
-    storage_id: journal.storage_id(),
-    expected_root_epoch: journal.root_epoch()?,
-    max_objects: 1_000,
-};
-let report = journal.collect(request).await?;
+// Collection is bounded per call: loop while the engine reports more work,
+// refreshing the epoch before each request.
+let mut total: Option<JournalGcReport> = None;
+loop {
+    let request = JournalGcRequest::new(journal.storage_id(), journal.root_epoch()?, 1_000);
+    let report = journal.collect(request).await?;
+    let more = report.has_more;
+    match &mut total {
+        None => total = Some(report),
+        Some(total) => total.accumulate(report),
+    }
+    if !more {
+        break;
+    }
+}
 ```
+
+Each call holds the write gate for a cooperative budget (`JournalGcBudget`:
+250 ms soft elapsed target counted from call entry including gate wait,
+work-unit and per-unit item limits; hosts may request less, never more). Before
+each bounded unit the engine reserves a decaying maximum of that unit kind's
+measured cost; the first unit of a call always starts, so a positive budget
+always progresses. Progress lives in an engine-local, disposable cursor shared
+by clones (discover 32 dirty sessions, load/authenticate, pin pages and
+catalog-chain steps, iterative typed-edge trace batches, lease roots, member
+inventory pages, one dependency index per unit, release batch). A session
+releases nothing until its whole live union is marked and its membership
+inventoried under one stored fence; a resumed call reloads the fence and
+restarts the mark on any change, and an unexplained root-epoch change
+restarts it as well (`JournalGcProgress::Restarted`). The cursor's additional
+workspace is capped at 16 MiB; a mark that cannot fit returns typed
+unsupported (`journal_collection_cursor_capacity`) and retains everything.
+`max_objects` still bounds membership releases per call (0 marks and releases
+nothing). Counts, receipts and unreadable sessions are per call; an unreadable
+session is attempted at most once per call and does not by itself request
+another pass.
+
+Storage serves collection only through the bounded protocol:
+`collection_capability` (required declaration; `Unsupported` refuses
+collection and retains everything), fence-bound `collection_page` (members or
+pins; at most `max_items`; a continuation is bound to domain, session, full
+fence and page kind), a read-only `prepare_collection_apply` that may request a
+smaller release set (`Split`), and `apply_collection`, which applies the
+complete plan as one atomic fenced transaction. The packed reference pages
+members by (pack, slot) under a physical pack epoch, decoding at most one
+bounded pack per step, and splits a release whose touched packs exceed 32.
 
 An intervening open, commit, renewal, close, host writer revocation, durable pin
 change, staging change or retirement invalidates that mark. A `StateConflict`

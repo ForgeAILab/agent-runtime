@@ -103,7 +103,13 @@ struct World {
 // historical retained root, released staging, an open writer and a retired
 // session.
 async fn world(chain: usize) -> World {
-    let storage = Arc::new(LostAcknowledgement::default());
+    shared_world(chain, JournalBodySharing::Global).await
+}
+async fn shared_world(chain: usize, sharing: JournalBodySharing) -> World {
+    let storage = Arc::new(LostAcknowledgement {
+        inner: VolatileJournalStorage::new(sharing),
+        ..Default::default()
+    });
     let engine = engine_over(&storage);
     let mut heads = BTreeMap::new();
     heads.insert("a", publish(&engine, "a", None, 5, "a").await);
@@ -244,25 +250,27 @@ async fn drain(engine: &Engine, budget: JournalGcBudget, max_objects: u64) -> Dr
 
 #[tokio::test]
 async fn one_unit_calls_drain_exactly_what_the_unbounded_collector_drains() {
-    let reference = world(30).await;
-    let full = drain(&reference.engine, JournalGcBudget::default(), u64::MAX).await;
-    let bounded = world(30).await;
-    let sliced = drain(&bounded.engine, one_unit(), u64::MAX).await;
-    assert_eq!(retained(&bounded).await, retained(&reference).await);
-    assert!(retained(&bounded).await.dirty.is_empty());
-    assert_eq!(
-        (sliced.deleted, sliced.reclaimed_bytes),
-        (full.deleted, full.reclaimed_bytes),
-        "physical receipts equal the unbounded drain"
-    );
-    assert!(full.deleted > 0);
-    assert_eq!(
-        bounded.engine.retained_bytes().await.unwrap(),
-        reference.engine.retained_bytes().await.unwrap()
-    );
-    // The transfer pin's 30-root catalog chain alone needs 30 lookups.
-    assert!(sliced.calls > 30 + full.calls, "{} calls", sliced.calls);
-    assert_eq!(sliced.restarted, 0, "a quiescent drain never restarts");
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        let reference = shared_world(30, sharing).await;
+        let full = drain(&reference.engine, JournalGcBudget::default(), u64::MAX).await;
+        let bounded = shared_world(30, sharing).await;
+        let sliced = drain(&bounded.engine, one_unit(), u64::MAX).await;
+        assert_eq!(retained(&bounded).await, retained(&reference).await);
+        assert!(retained(&bounded).await.dirty.is_empty());
+        assert_eq!(
+            (sliced.deleted, sliced.reclaimed_bytes),
+            (full.deleted, full.reclaimed_bytes),
+            "{sharing:?}: physical receipts equal the unbounded drain"
+        );
+        assert!(full.deleted > 0);
+        assert_eq!(
+            bounded.engine.retained_bytes().await.unwrap(),
+            reference.engine.retained_bytes().await.unwrap()
+        );
+        // The transfer pin's 30-root catalog chain alone needs 30 lookups.
+        assert!(sliced.calls > 30 + full.calls, "{} calls", sliced.calls);
+        assert_eq!(sliced.restarted, 0, "a quiescent drain never restarts");
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
