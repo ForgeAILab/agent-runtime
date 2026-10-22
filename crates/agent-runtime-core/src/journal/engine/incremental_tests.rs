@@ -650,11 +650,26 @@ fn checkpoint_commit(
     previous: Option<&JournalHead>,
     known: &mut BTreeSet<JournalObjectId>,
 ) -> (JournalCommit, JournalPreparationHints) {
+    checkpoint_commit_with(checkpoint, previous, known, true)
+}
+
+fn checkpoint_commit_with(
+    checkpoint: &crate::checkpoint::TurnCheckpoint,
+    previous: Option<&JournalHead>,
+    known: &mut BTreeSet<JournalObjectId>,
+    validate: bool,
+) -> (JournalCommit, JournalPreparationHints) {
     let mut assembler = JournalWriterAssembler::default();
     let (roots, _) = assembler
         .snapshot_cached(&checkpoint.snapshot, 0, None, None)
         .unwrap();
-    let referenced = assembler.checkpoint(checkpoint, roots.clone()).unwrap();
+    let referenced = if validate {
+        assembler.checkpoint(checkpoint, roots.clone()).unwrap()
+    } else {
+        assembler
+            .checkpoint_without_validation(checkpoint, roots.clone())
+            .unwrap()
+    };
     let checkpoint_id = JournalObject::encode(JournalObjectKind::Checkpoint, &referenced)
         .unwrap()
         .id;
@@ -1164,5 +1179,539 @@ async fn supplied_bodies_are_readmitted_after_release_even_when_the_bytes_are_ca
             cold.close(read).await.unwrap();
             engine.close(lease).await.unwrap();
         }
+    }
+}
+
+// --- Review fixes (rt-p1 review H1, M1, M3) -------------------------------
+
+const CHECKPOINT_ATTACKS: usize = 5;
+
+/// Edits one referenced checkpoint field while the state object id stays
+/// unchanged, so the prepared state hint still applies.
+fn tamper_checkpoint(commit: &mut JournalCommit, attack: usize) {
+    use crate::content::{InternalTurnInput, InternalTurnSensitivity, InternalTurnSource};
+    let mut extra = None;
+    let referenced = commit.checkpoint.as_mut().unwrap();
+    match attack {
+        // Revision zero belongs only to an accepted state; any other
+        // revision is free in a bootstrap, so the edit crosses that line.
+        0 => referenced.state_revision = u64::from(referenced.state_revision == 0),
+        1 => referenced.visible_output = !referenced.visible_output,
+        2 => {
+            referenced.internal_input = match referenced.internal_input.take() {
+                Some(_) => None,
+                None => {
+                    let input = InternalTurnInput::new(
+                        "forged",
+                        InternalTurnSource {
+                            kind: "goal".into(),
+                            id: "forged".into(),
+                            revision: RegistryRevision::new("forged"),
+                            sensitivity: InternalTurnSensitivity::Public,
+                            goal: None,
+                        },
+                    )
+                    .unwrap();
+                    let object =
+                        JournalObject::encode(JournalObjectKind::InternalInput, &input).unwrap();
+                    let id = object.id.clone();
+                    extra = Some(object);
+                    Some(id)
+                }
+            }
+        }
+        3 => {
+            referenced.watermark.journal_turn = match referenced.watermark.journal_turn.take() {
+                Some(_) => None,
+                None => Some(TurnId::new("forged")),
+            }
+        }
+        _ => referenced.active_history_start += 1,
+    }
+    commit.objects.extend(extra);
+    reseal_checkpoint(commit);
+}
+
+fn reseal_checkpoint(commit: &mut JournalCommit) {
+    commit.batch.checkpoint = Some(
+        JournalObject::encode(
+            JournalObjectKind::Checkpoint,
+            commit.checkpoint.as_ref().unwrap(),
+        )
+        .unwrap()
+        .id,
+    );
+    commit.digest = commit.input_digest().unwrap();
+}
+
+/// Runs one bootstrap commit through `commit_prepared` and `commit` on fresh
+/// engines; returns whether each accepted it.
+async fn prepared_and_full(
+    sharing: JournalBodySharing,
+    commit: &JournalCommit,
+    hints: &JournalPreparationHints,
+) -> (bool, bool) {
+    let session = commit.batch.session.clone();
+    let make = || {
+        JournalEngine::protected(
+            Arc::new(VolatileJournalStorage::new(sharing)),
+            JournalStorageId::new("checkpoint-differential"),
+            JournalEngineConfig::default(),
+        )
+    };
+    let (prepared, full) = (make(), make());
+    let a = prepared.open(&session, writer("a")).await.unwrap();
+    let b = full.open(&session, writer("b")).await.unwrap();
+    let left = prepared
+        .commit_prepared(&a, commit.clone(), hints.clone())
+        .await;
+    let right = full.commit(&b, commit.clone()).await;
+    if let (Ok(left), Ok(right)) = (&left, &right) {
+        assert_eq!(left, right);
+    }
+    prepared.close(a).await.unwrap();
+    full.close(b).await.unwrap();
+    (left.is_ok(), right.is_ok())
+}
+
+fn calling_with_cache_identity(model: &str) -> crate::checkpoint::TurnCheckpoint {
+    use crate::checkpoint::TurnState;
+    use crate::provider::{CacheIdentity, PromptCacheControl};
+    let mut checkpoint = crate::checkpoint::tests::checkpoint_corpus()
+        .into_iter()
+        .find(|c| matches!(c.state, TurnState::CallingModel { .. }))
+        .unwrap();
+    let TurnState::CallingModel { request, .. } = &mut checkpoint.state else {
+        unreachable!()
+    };
+    request.cache_identity = Some(CacheIdentity::legacy(
+        Fingerprint::of("profile"),
+        "fake",
+        ModelId::new(model),
+        Vec::new(),
+        PromptCacheControl::Implicit,
+    ));
+    checkpoint.reseal_operation_fingerprint();
+    checkpoint
+}
+
+// H1: a checkpoint whose cache identity does not match its request, or whose
+// referenced fields were edited while the state id stayed the same, fails on
+// both the prepared and the full commit path.
+#[tokio::test]
+async fn tampered_checkpoint_fields_and_cache_identity_fail_prepared_and_full_commits() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        let valid = calling_with_cache_identity("fake");
+        let (commit, hints) = checkpoint_commit_with(&valid, None, &mut BTreeSet::new(), true);
+        assert_eq!(
+            prepared_and_full(sharing, &commit, &hints).await,
+            (true, true)
+        );
+
+        let mut forged = hints.clone();
+        forged.forge_state_encodings();
+        assert_eq!(
+            prepared_and_full(sharing, &commit, &forged).await,
+            (false, true),
+            "a state hint is trusted only with the staged bytes it was encoded to"
+        );
+
+        let mismatched = calling_with_cache_identity("another-model");
+        assert!(mismatched.validate().is_err());
+        let (commit, hints) =
+            checkpoint_commit_with(&mismatched, None, &mut BTreeSet::new(), false);
+        assert_eq!(
+            prepared_and_full(sharing, &commit, &hints).await,
+            (false, false),
+            "mismatched cache identity"
+        );
+
+        let internal = crate::checkpoint::tests::checkpoint_corpus()
+            .into_iter()
+            .find(|c| c.internal_input.is_some())
+            .unwrap();
+        for base in [&valid, &internal] {
+            let (commit, hints) = checkpoint_commit_with(base, None, &mut BTreeSet::new(), true);
+            for attack in 0..CHECKPOINT_ATTACKS {
+                let mut bad = commit.clone();
+                tamper_checkpoint(&mut bad, attack);
+                assert_eq!(
+                    bad.checkpoint.as_ref().unwrap().state,
+                    commit.checkpoint.as_ref().unwrap().state
+                );
+                assert_eq!(
+                    prepared_and_full(sharing, &bad, &hints).await,
+                    (false, false),
+                    "attack {attack}"
+                );
+            }
+        }
+    }
+}
+
+// H1/M3: the prepared path accepts and rejects exactly what the full path
+// does, over every checkpoint state family and each field edit.
+#[tokio::test]
+async fn prepared_and_full_checkpoint_commits_agree_over_every_state_family() {
+    let mut corpus = crate::checkpoint::tests::checkpoint_corpus();
+    corpus.push(calling_with_cache_identity("fake"));
+    let mut rejected = 0;
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        for checkpoint in &corpus {
+            let (commit, hints) =
+                checkpoint_commit_with(checkpoint, None, &mut BTreeSet::new(), true);
+            assert_eq!(
+                prepared_and_full(sharing, &commit, &hints).await,
+                (true, true),
+                "{:?}",
+                checkpoint.state
+            );
+            for attack in 0..CHECKPOINT_ATTACKS {
+                let mut bad = commit.clone();
+                tamper_checkpoint(&mut bad, attack);
+                let (prepared, full) = prepared_and_full(sharing, &bad, &hints).await;
+                assert_eq!(prepared, full, "attack {attack} on {:?}", checkpoint.state);
+                rejected += usize::from(!full);
+            }
+        }
+    }
+    assert!(rejected > 0);
+}
+
+// M1: a manifest hint whose value is not the value its witness encodes is
+// refused by the engine; the honest hint over the same commit is accepted.
+#[tokio::test]
+async fn a_forged_manifest_hint_value_is_refused() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        for budget in [0, 128 * 1024 * 1024] {
+            let mut base = snapshot();
+            base.history.push(Message::user("seed"));
+            base.manifests.push(manifest(0));
+            let mut next = base.clone();
+            next.history.push(Message::user("next"));
+            next.manifests.push(manifest(1));
+            let mut first = JournalWriterAssembler::default();
+            let (base_roots, base_encoding) =
+                first.snapshot_view_cached(&base, 1, None, None).unwrap();
+            let base_view = base_encoding.snapshot_view();
+            let mut second = JournalWriterAssembler::default();
+            let (roots, encoding) = second
+                .snapshot_view_cached(&next, 2, Some(&base_view), Some(&base_encoding))
+                .unwrap();
+            let mut change = delta();
+            change.boundary.planned_step_count = 2;
+            change.history_append = vec![Message::user("next")];
+            change.manifest_references = vec![encoding.manifest_ids().last().unwrap().clone()];
+            let mut commit = JournalCommit {
+                batch: JournalBatch {
+                    session: next.id.clone(),
+                    sequence: 2,
+                    predecessor: None,
+                    expected_revision: None,
+                    writer_epoch: 1,
+                    operation: JournalOperationId::new("second"),
+                    boundary: change.boundary.clone(),
+                    snapshot: roots,
+                    checkpoint: None,
+                },
+                digest: journal_history_chain(std::iter::empty()),
+                objects: second.objects.values().cloned().collect(),
+                delta: change,
+                checkpoint: None,
+            };
+            let honest = second.preparation_hints();
+            let mut forged = honest.clone();
+            forged.forge_manifest_values(&manifest(7));
+            let mut accepted = Vec::new();
+            for hints in [forged, honest] {
+                let engine = JournalEngine::ordinary(
+                    Arc::new(VolatileJournalStorage::new(sharing)),
+                    JournalStorageId::new("forged-hint"),
+                    Arc::new(IdentityJournalProjection),
+                    JournalEngineConfig {
+                        validated_root_memo_bytes: budget,
+                        ..Default::default()
+                    },
+                );
+                let lease = engine.open(&next.id, writer("w")).await.unwrap();
+                let mut bootstrap = delta();
+                bootstrap.boundary.planned_step_count = 1;
+                bootstrap.bootstrap = Some(Box::new(base.clone()));
+                let mut seed = JournalCommit {
+                    batch: JournalBatch {
+                        session: base.id.clone(),
+                        sequence: 1,
+                        predecessor: None,
+                        expected_revision: None,
+                        writer_epoch: 1,
+                        operation: JournalOperationId::new("first"),
+                        boundary: bootstrap.boundary.clone(),
+                        snapshot: base_roots.clone(),
+                        checkpoint: None,
+                    },
+                    digest: journal_history_chain(std::iter::empty()),
+                    objects: first.objects.values().cloned().collect(),
+                    delta: bootstrap,
+                    checkpoint: None,
+                };
+                seed.digest = seed.input_digest().unwrap();
+                let head = engine
+                    .commit_prepared(&lease, seed, first.preparation_hints())
+                    .await
+                    .unwrap();
+                commit.batch.predecessor = Some(JournalDigest::parse(head.batch.as_str()).unwrap());
+                commit.batch.expected_revision = Some(head.revision);
+                commit.digest = commit.input_digest().unwrap();
+                accepted.push(
+                    engine
+                        .commit_prepared(&lease, commit.clone(), hints)
+                        .await
+                        .is_ok(),
+                );
+                engine.close(lease).await.unwrap();
+            }
+            assert_eq!(accepted, [false, true]);
+        }
+    }
+}
+
+// Review test 4: incremental closure evidence equals a complete typed trace
+// over random checkpoint DAGs in which one empty sequence node is reachable
+// both as a history sequence (Message) and as a state sequence (StateValue),
+// and either path is dropped independently.
+#[test]
+fn closure_evidence_matches_complete_traces_when_one_id_has_two_expected_kinds() {
+    use crate::checkpoint::TurnState;
+    let calling = crate::checkpoint::tests::checkpoint_corpus()
+        .into_iter()
+        .find(|c| matches!(c.state, TurnState::Planning { .. }))
+        .unwrap();
+    let (template, _) = checkpoint_commit(&calling, None, &mut BTreeSet::new());
+    let template = template.checkpoint.unwrap();
+    fn put<T: serde::Serialize>(
+        pool: &mut Vec<JournalObject>,
+        kind: JournalObjectKind,
+        value: &T,
+    ) -> JournalObjectId {
+        let object = JournalObject::encode(kind, value).unwrap();
+        pool.push(object.clone());
+        object.id
+    }
+    let mut pool = Vec::new();
+    let messages: Vec<_> = (0..3)
+        .map(|i| {
+            put(
+                &mut pool,
+                JournalObjectKind::Message,
+                &Message::user(format!("m{i}")),
+            )
+        })
+        .collect();
+    let values: Vec<_> = (0..3)
+        .map(|i| {
+            put(
+                &mut pool,
+                JournalObjectKind::StateValue,
+                &serde_json::json!({ "v": i }),
+            )
+        })
+        .collect();
+    let leaf = |items: Vec<JournalObjectId>| JournalSequenceNode::Leaf { items };
+    let shared_empty = put(&mut pool, JournalObjectKind::Sequence, &leaf(vec![]));
+    let history_roots = [
+        None,
+        Some(shared_empty.clone()),
+        Some(put(
+            &mut pool,
+            JournalObjectKind::Sequence,
+            &leaf(messages[..2].to_vec()),
+        )),
+        Some(put(
+            &mut pool,
+            JournalObjectKind::Sequence,
+            &leaf(messages[1..].to_vec()),
+        )),
+    ];
+    let state_sequences = [
+        Some(shared_empty.clone()),
+        Some(put(
+            &mut pool,
+            JournalObjectKind::Sequence,
+            &leaf(values[..2].to_vec()),
+        )),
+        None,
+    ];
+    let mut roots = Vec::new();
+    for history in &history_roots {
+        for sequence in &state_sequences {
+            for object in [None, Some(values[2].clone())] {
+                let mut fields = BTreeMap::new();
+                if let Some(root) = sequence {
+                    fields.insert(
+                        "list".to_owned(),
+                        JournalStateValue::Sequence {
+                            sequence: JournalSequence {
+                                root: Some(root.clone()),
+                                len: 0,
+                                height: 0,
+                            },
+                        },
+                    );
+                }
+                if let Some(object) = object {
+                    fields.insert("value".to_owned(), JournalStateValue::Object { object });
+                }
+                let state = put(
+                    &mut pool,
+                    JournalObjectKind::TurnState,
+                    &ReferencedTurnState {
+                        tag: "planning".into(),
+                        fields,
+                    },
+                );
+                let mut checkpoint = template.clone();
+                checkpoint.state = state;
+                checkpoint.snapshot.history = JournalSequence {
+                    root: history.clone(),
+                    len: 0,
+                    height: 0,
+                };
+                roots.push(put(&mut pool, JournalObjectKind::Checkpoint, &checkpoint));
+            }
+        }
+    }
+    let expected = ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Checkpoint));
+    let mut objects = ObjectStore::from_map(pool.into_iter().map(|o| (o.id, o.bytes)).collect());
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut evidence: Option<ClosureEvidence> = None;
+    let mut both_kinds = 0;
+    for _ in 0..400 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let root = &roots[(seed % roots.len() as u64) as usize];
+        let next = ClosureEvidence::update(evidence.as_ref(), &mut objects, root.clone(), expected)
+            .unwrap();
+        let oracle = complete_typed_trace(&objects, root, expected).unwrap();
+        assert_eq!(next.iter().cloned().collect::<BTreeSet<_>>(), oracle);
+        assert_eq!(next.contains(&shared_empty), oracle.contains(&shared_empty));
+        let index = roots.iter().position(|r| r == root).unwrap();
+        both_kinds += usize::from(index / 6 == 1 && (index / 2) % 3 == 0);
+        evidence = Some(next);
+    }
+    assert!(both_kinds > 0);
+}
+
+// Review test 5: with a zero memo budget no validated root is memoized, so
+// membership falls back to the session's exact closure. A body that another
+// engine released must still be refused unless it is resupplied.
+#[tokio::test]
+async fn zero_budget_membership_uses_the_exact_closure_and_refuses_released_bodies() {
+    for sharing in [JournalBodySharing::Global, JournalBodySharing::PerSession] {
+        let storage = Arc::new(VolatileJournalStorage::new(sharing));
+        let id = JournalStorageId::new("zero-budget-exact");
+        let engine = JournalEngine::protected(
+            storage.clone(),
+            id.clone(),
+            JournalEngineConfig {
+                validated_root_memo_bytes: 0,
+                ..Default::default()
+            },
+        );
+        let other = JournalEngine::protected(
+            storage,
+            id,
+            JournalEngineConfig {
+                collection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let mut owned = snapshot();
+        owned.manifests.push(manifest(0));
+        let a = VersionedSessionState::new(RegistryRevision::new("r"), serde_json::json!("body a"));
+        let b = VersionedSessionState::new(RegistryRevision::new("r"), serde_json::json!("body b"));
+        owned.extension_state.insert("k".into(), a.clone());
+        let lease = engine.open(&owned.id, writer("writer")).await.unwrap();
+        let mut known = BTreeSet::new();
+        let first = engine
+            .commit(&lease, random_commit(None, None, &owned, 0, &mut known))
+            .await
+            .unwrap();
+        let previous = owned.clone();
+        owned.extension_state.insert("k".into(), b);
+        let second = engine
+            .commit(
+                &lease,
+                random_commit(Some(&first), Some(&previous), &owned, 1, &mut known),
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.memo.lock().unwrap().bytes, 0);
+        assert!(
+            engine
+                .local
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&owned.id)
+                .unwrap()
+                .exact
+                .is_some(),
+            "the exact closure is the only membership certificate"
+        );
+        assert!(
+            other
+                .collect(JournalGcRequest {
+                    storage_id: other.storage_id(),
+                    expected_root_epoch: other.root_epoch().unwrap(),
+                    max_objects: u64::MAX
+                })
+                .await
+                .unwrap()
+                .deleted
+                > 0
+        );
+        let previous = owned.clone();
+        owned.extension_state.insert("k".into(), a);
+        let omitted = random_commit(Some(&second), Some(&previous), &owned, 2, &mut known);
+        assert!(engine.commit(&lease, omitted).await.is_err());
+        let resupplied = random_commit(
+            Some(&second),
+            Some(&previous),
+            &owned,
+            2,
+            &mut BTreeSet::new(),
+        );
+        engine.commit(&lease, resupplied).await.unwrap();
+        let read = engine
+            .open(
+                &owned.id,
+                JournalOpen {
+                    intent: JournalOpenIntent::ReadOnly,
+                    ..writer("read")
+                },
+            )
+            .await
+            .unwrap();
+        let actual = JournalReader::new(
+            &engine,
+            &read,
+            JournalReadLimits {
+                objects: u64::MAX,
+                encoded_bytes: u64::MAX,
+                entries: u64::MAX,
+            },
+        )
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            canonical_journal_json(&actual).unwrap(),
+            canonical_journal_json(&owned).unwrap()
+        );
+        engine.close(read).await.unwrap();
+        engine.close(lease).await.unwrap();
     }
 }

@@ -1437,6 +1437,27 @@ impl JournalWriterAssembler {
         checkpoint
             .validation_evidence(Some(&state_fingerprint))
             .validate(&checkpoint.snapshot)?;
+        self.checkpoint_references(checkpoint, roots, state_fingerprint)
+    }
+
+    /// Encodes a checkpoint the way a buggy host would submit it, without the
+    /// writer-side validation, so tests can prove the engine rejects it.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_without_validation(
+        &mut self,
+        checkpoint: &TurnCheckpoint,
+        roots: JournalSnapshotRoots,
+    ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
+        let state_fingerprint = checkpoint.state.operation_fingerprint();
+        self.checkpoint_references(checkpoint, roots, state_fingerprint)
+    }
+
+    fn checkpoint_references(
+        &mut self,
+        checkpoint: &TurnCheckpoint,
+        roots: JournalSnapshotRoots,
+        state_fingerprint: agent_runtime_registry::Fingerprint,
+    ) -> Result<ReferencedTurnCheckpoint, RuntimeError> {
         Ok(ReferencedTurnCheckpoint {
             schema_version: JOURNAL_SCHEMA_VERSION,
             transition_revision: checkpoint.transition_revision,
@@ -1647,5 +1668,232 @@ impl ExtensionEvidence {
             return Err(conflict());
         }
         self.witness.validate(drafts, verified)
+    }
+}
+
+#[cfg(test)]
+impl JournalPreparationHints {
+    /// Replaces every manifest hint value without its witness, as a buggy or
+    /// hostile in-crate producer would.
+    pub(crate) fn forge_manifest_values(&mut self, forged: &TurnManifest) {
+        for evidence in self.manifests.values_mut() {
+            *evidence = Arc::new(ManifestEvidence {
+                bound_value: evidence.bound_value.clone(),
+                witness: evidence.witness.clone(),
+                value: Arc::new(forged.clone()),
+                bytes: evidence.bytes,
+            });
+        }
+    }
+}
+#[cfg(test)]
+impl JournalPreparationHints {
+    /// Pairs every state hint with bytes other than the ones it was encoded
+    /// to, as a mixed-up preparation would.
+    pub(crate) fn forge_state_encodings(&mut self) {
+        for evidence in self.states.values_mut() {
+            let mut encoded = evidence.encoded.clone();
+            encoded.push(b' ');
+            *evidence = Arc::new(StateEvidence {
+                value: evidence.value.clone(),
+                fingerprint: evidence.fingerprint.clone(),
+                encoded,
+            });
+        }
+    }
+}
+#[cfg(test)]
+impl JournalWriterAssembler {
+    pub(crate) fn has_request_cache(&self) -> bool {
+        self.request_cache.is_some()
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::checkpoint::TurnCheckpoint;
+    use crate::clock::Timestamp;
+    use crate::ids::{SessionId, TurnId};
+    use crate::manifest::{CapabilityResolution, ModelResolution, RunManifest};
+    use crate::provider::ModelId;
+    use agent_runtime_registry::{Fingerprint, RegistryRevision};
+
+    fn snapshot() -> SessionSnapshot {
+        SessionSnapshot {
+            id: SessionId::new("session-1"),
+            history: vec![Message::user("hello")],
+            usage: Default::default(),
+            identity: Default::default(),
+            manifests: vec![],
+            extension_state: Default::default(),
+            updated: Timestamp(1),
+        }
+    }
+    fn manifest(index: usize) -> TurnManifest {
+        let fp = Fingerprint::of(index.to_string());
+        TurnManifest::new(
+            TurnId::new(format!("t{index}")),
+            RunManifest::new(
+                fp.clone(),
+                fp.clone(),
+                ModelResolution::new("p", ModelId::new("m"), fp.clone(), BTreeMap::new()),
+                CapabilityResolution::new(RegistryRevision::new("r")),
+                fp.clone(),
+                fp,
+            ),
+        )
+    }
+    fn cached(value: &Value) -> JournalJsonEncoding {
+        let mut cache = JournalWriterAssembler::default()
+            .json_value_cached(value, None)
+            .unwrap();
+        cache.value = Some(Arc::new(value.clone()));
+        cache
+    }
+
+    // M1: a cached encoding that claims one value but holds another value's
+    // bytes (a stale or buggy JSON cache) never becomes a hint.
+    #[test]
+    fn a_cached_encoding_whose_bytes_differ_from_its_value_is_refused() {
+        let honest = manifest(1);
+        let honest_json = serde_json::to_value(&honest).unwrap();
+        let other_json = serde_json::to_value(manifest(2)).unwrap();
+        let mut forged = cached(&other_json);
+        forged.value = Some(Arc::new(honest_json.clone()));
+        assert!(
+            JournalWriterAssembler::default()
+                .manifest_cached(&honest, Some((&honest, &forged)))
+                .is_err()
+        );
+        let (_, accepted) = JournalWriterAssembler::default()
+            .manifest_cached(&honest, Some((&honest, &cached(&honest_json))))
+            .unwrap();
+        assert_eq!(accepted.root, cached(&honest_json).root);
+
+        let state = |value| {
+            let mut state =
+                VersionedSessionState::new(RegistryRevision::new("r"), serde_json::json!(value));
+            state.sensitivity = crate::store::SessionStateSensitivity::RedactionSafe;
+            state
+        };
+        let (honest, other) = (state("honest"), state("other"));
+        let mut forged = cached(&serde_json::to_value(&other).unwrap());
+        forged.value = Some(Arc::new(serde_json::to_value(&honest).unwrap()));
+        assert!(
+            JournalWriterAssembler::default()
+                .extension_cached(
+                    RUNTIME_PREVIOUS_CACHE_NAMESPACE,
+                    &honest,
+                    Some((&honest, &forged))
+                )
+                .is_err()
+        );
+        assert!(
+            JournalWriterAssembler::default()
+                .extension_cached(
+                    RUNTIME_PREVIOUS_CACHE_NAMESPACE,
+                    &honest,
+                    Some((&honest, &cached(&serde_json::to_value(&honest).unwrap())))
+                )
+                .is_ok()
+        );
+    }
+
+    // M2: under serde_json/preserve_order a key-order-only change keeps the
+    // canonical content id, but the value changed and must still be sent.
+    // Without that feature serde_json maps are sorted and nothing changes.
+    #[test]
+    fn key_order_only_extension_changes_are_reported_and_viewed() {
+        let mut first = serde_json::Map::new();
+        first.insert("a".into(), 1.into());
+        first.insert("b".into(), 2.into());
+        let mut second = serde_json::Map::new();
+        second.insert("b".into(), 2.into());
+        second.insert("a".into(), 1.into());
+        let preserves_order = second.keys().next().map(String::as_str) == Some("b");
+        let state =
+            |value| VersionedSessionState::new(RegistryRevision::new("r"), Value::Object(value));
+        let mut base = snapshot();
+        base.extension_state.insert("ns".into(), state(first));
+        let (base_roots, base_encoding) = JournalWriterAssembler::default()
+            .snapshot_view_cached(&base, 0, None, None)
+            .unwrap();
+        let base_view = base_encoding.snapshot_view();
+        let mut next = base.clone();
+        next.extension_state.insert("ns".into(), state(second));
+        let (roots, encoding) = JournalWriterAssembler::default()
+            .snapshot_view_cached(&next, 0, Some(&base_view), Some(&base_encoding))
+            .unwrap();
+        assert_eq!(roots, base_roots, "canonical encoding ignores key order");
+        let changes = encoding
+            .extension_changes(&base_view)
+            .expect("the encoding is bound to its base")
+            .cloned()
+            .collect::<Vec<_>>();
+        let keys = encoding
+            .snapshot_view()
+            .extension("ns")
+            .unwrap()
+            .value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if preserves_order {
+            assert_eq!(changes, ["ns"]);
+            assert_eq!(keys, ["b", "a"]);
+        } else {
+            assert!(changes.is_empty());
+        }
+    }
+
+    // M4: a view is reused only with the encoding of that same version, and a
+    // request cache only from an accepted previous encoding.
+    #[test]
+    fn a_view_paired_with_another_versions_encoding_is_not_reused() {
+        let calling = crate::checkpoint::tests::checkpoint_corpus()
+            .into_iter()
+            .find(|c| matches!(c.state, TurnState::CallingModel { .. }))
+            .unwrap();
+        let encode = |snapshot: &SessionSnapshot, checkpoint: Option<&TurnCheckpoint>| {
+            let mut assembler = JournalWriterAssembler::default();
+            let (roots, mut encoding) = assembler
+                .snapshot_view_cached(snapshot, 0, None, None)
+                .unwrap();
+            if let Some(checkpoint) = checkpoint {
+                assembler.checkpoint(checkpoint, roots).unwrap();
+                encoding.finish_preparation(&assembler);
+            }
+            encoding
+        };
+        let mut a = snapshot();
+        a.history.push(Message::user("a"));
+        let mut b = snapshot();
+        b.history.push(Message::user("b"));
+        let view_a = encode(&a, None).snapshot_view();
+        let encoding_b = encode(&b, Some(&calling));
+        let view_b = encoding_b.snapshot_view();
+        let mut next = a.clone();
+        next.history.push(Message::user("next"));
+
+        let mut mismatched = JournalWriterAssembler::default();
+        let (roots, _) = mismatched
+            .snapshot_view_cached(&next, 0, Some(&view_a), Some(&encoding_b))
+            .unwrap();
+        let (expected, _) = JournalWriterAssembler::default()
+            .snapshot_view_cached(&next, 0, None, None)
+            .unwrap();
+        assert_eq!(roots, expected);
+        assert!(!mismatched.has_request_cache());
+
+        let mut matched = JournalWriterAssembler::default();
+        let mut next_b = b.clone();
+        next_b.history.push(Message::user("next"));
+        matched
+            .snapshot_view_cached(&next_b, 0, Some(&view_b), Some(&encoding_b))
+            .unwrap();
+        assert!(matched.has_request_cache());
     }
 }

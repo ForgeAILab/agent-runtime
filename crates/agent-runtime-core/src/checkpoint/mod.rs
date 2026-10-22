@@ -596,4 +596,4 @@ pub(crate) use validation::CheckpointEvidence;
 use validation::*;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

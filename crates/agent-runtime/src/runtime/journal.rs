@@ -2055,4 +2055,34 @@ mod tests {
         );
         assert_eq!(stale.loads.load(Ordering::SeqCst), 3);
     }
+
+    /// Review L6: the writer's known-candidate filter holds the latest
+    /// preparation's drafts, not every draft of the lineage.
+    #[tokio::test]
+    async fn known_candidates_stay_bounded_as_history_grows() {
+        use agent_runtime_core::journal::{
+            IdentityJournalProjection, InMemorySessionJournal, JournalStorageId,
+        };
+        let journal: Arc<dyn SessionJournal> = Arc::new(InMemorySessionJournal::ordinary(
+            JournalStorageId::new("known-candidates"),
+            Arc::new(IdentityJournalProjection),
+        ));
+        let mut live = snapshot(vec![Message::user("seed")]);
+        let mut domain = open_domain(journal, JournalRole::Ordinary, &live.id)
+            .await
+            .unwrap();
+        let mut sizes = Vec::new();
+        for step in 0..40 {
+            live.history.push(Message::user(format!("message {step}")));
+            live.updated = Timestamp(step + 2);
+            commit_domain(&mut domain, &live, None, CommitPurpose::Transition)
+                .await
+                .unwrap();
+            sizes.push(domain.known_candidates.len());
+        }
+        assert!(
+            sizes[39] <= 2 * sizes[4],
+            "known candidates grew with history: {sizes:?}"
+        );
+    }
 }

@@ -624,6 +624,20 @@ impl TurnCheckpoint {
     }
 }
 
+#[cfg(test)]
+impl TurnCheckpoint {
+    /// Recomputes the operation fingerprint after a test edits the state in
+    /// place, so only the edit under test can make the checkpoint invalid.
+    pub(crate) fn reseal_operation_fingerprint(&mut self) {
+        self.operation_fingerprint = checkpoint_operation_fingerprint(
+            &self.state,
+            self.active_history_start,
+            self.internal_input.as_ref(),
+            self.visible_output,
+        );
+    }
+}
+
 pub(super) fn checkpoint_operation_fingerprint(
     state: &TurnState,
     active_history_start: usize,

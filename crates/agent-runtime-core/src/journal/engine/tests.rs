@@ -2988,3 +2988,65 @@ async fn r3_a_stale_dependent_candidate_write_cannot_lose_retirement_authorizati
 
 #[path = "collection_isolation_tests.rs"]
 mod collection_isolation;
+
+// Review L3: a revoke that runs while a commit awaits storage clears the
+// session's working views; the commit's publication must not restore them.
+#[tokio::test]
+async fn a_revoke_during_a_commit_apply_keeps_working_views_cleared() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(PausedApply::default());
+        let (engine, _) = two_engines(&storage, budget);
+        let session = SessionId::new("revoke-during-apply");
+        let mut known = BTreeSet::new();
+        let lease = engine.open(&session, writer("w")).await.unwrap();
+        let first = engine
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        let views = |engine: &JournalEngine<PausedApply>| {
+            let local = engine.local.lock().unwrap();
+            let record = local.sessions.get(&session).unwrap();
+            (
+                record.exact.is_some(),
+                record.protected_snapshot.is_some(),
+                record.protected_encoding.is_some(),
+            )
+        };
+        assert!(views(&engine).1, "precondition: a working view exists");
+        let (resume, paused) = storage.pause_next(JournalWriteKind::Commit);
+        let (committed, ()) = tokio::join!(
+            engine.commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            ),
+            async {
+                paused.await.unwrap();
+                engine.revoke_writer(&session).unwrap();
+                resume.send(()).unwrap();
+            }
+        );
+        committed.unwrap();
+        assert_eq!(
+            views(&engine),
+            (false, false, false),
+            "budget {budget}: publication restored views a revoke cleared"
+        );
+    }
+}
