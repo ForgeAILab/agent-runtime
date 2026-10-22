@@ -68,7 +68,7 @@ impl SessionHandle {
                 ),
                 TurnState::CacheOperationResultReady { operation, result } => {
                     let usage =
-                        self.cache_usage_for_snapshot(&checkpoint.snapshot, &operation, &result)?;
+                        self.cache_usage_for_snapshot(checkpoint.snapshot(), &operation, &result)?;
                     let result_value = self.cache_result_from_checkpoint(&operation, &result);
                     self.inner
                         .shared
@@ -114,7 +114,7 @@ impl SessionHandle {
             let record = self.append_recovered_cache_usage(&operation)?;
             Some(record)
         } else {
-            self.cache_usage_for_snapshot(&checkpoint.snapshot, &operation, &result_checkpoint)?
+            self.cache_usage_for_snapshot(checkpoint.snapshot(), &operation, &result_checkpoint)?
         };
         let result_state = TurnState::CacheOperationResultReady {
             operation: operation.clone(),
@@ -252,7 +252,7 @@ impl SessionHandle {
             delta: UsageDelta::new(),
         };
         let mut state = self.inner.state.lock().expect("session state poisoned");
-        if state.usage.records().iter().any(|existing| {
+        if state.usage().records().iter().any(|existing| {
             existing.source == record.source
                 && existing.provenance.request == record.provenance.request
                 && existing.provenance.attempt == record.provenance.attempt
@@ -261,9 +261,7 @@ impl SessionHandle {
                 "started cache checkpoint already has an attempted usage record",
             ));
         }
-        self.inner
-            .execution
-            .record_usage(&mut state, record.clone());
+        state.record_usage(record.clone());
         Ok(record)
     }
 

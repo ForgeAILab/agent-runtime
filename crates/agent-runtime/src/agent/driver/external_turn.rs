@@ -112,7 +112,11 @@ impl<'a> ExternalTurnMachine<'a> {
             None => Deadline::never(),
         };
         let accepted_input = input.clone();
-        let active_history_start = state.lock().expect("session state poisoned").history.len();
+        let active_history_start = state
+            .lock()
+            .expect("session state poisoned")
+            .history()
+            .len();
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
         // The input and the injections it drains stay staged until the
         // acceptance checkpoint commits (see `Driver::settle_failed_acceptance`).
@@ -129,7 +133,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .checkpoint_accepted(accepted_input, active_history_start, turn_deadline, &staged)
             .await
         {
-            Ok(()) => driver.publish_accepted(&state, staged, &execution),
+            Ok(()) => driver.publish_accepted(&state, staged),
             Err(failure) => {
                 // No backend work has begun. A protected store failure is
                 // observable and fails closed before external I/O.
@@ -189,7 +193,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .state
             .lock()
             .expect("session state poisoned")
-            .history
+            .history()
             .len();
         self.machine.execution.begin_internal_turn(
             self.machine.turn_id.clone(),
@@ -207,7 +211,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .await
         {
             Ok(()) => {
-                driver.publish_accepted(&self.machine.state, staged, &self.machine.execution);
+                driver.publish_accepted(&self.machine.state, staged);
                 self.machine.resolve_acceptance(Ok(()));
             }
             Err(failure) => {
@@ -427,10 +431,11 @@ impl<'a> ExternalTurnMachine<'a> {
                 },
                 delta: usage,
             };
-            self.machine.execution.record_usage(
-                &mut self.machine.state.lock().expect("session state poisoned"),
-                record.clone(),
-            );
+            self.machine
+                .state
+                .lock()
+                .expect("session state poisoned")
+                .record_usage(record.clone());
             emitter.emit(turn.clone(), RuntimeEvent::Usage { record });
         }
 
@@ -443,10 +448,10 @@ impl<'a> ExternalTurnMachine<'a> {
             if completed {
                 let parts = output.take_parts(&execution);
                 if !parts.is_empty() {
-                    execution.append_history(
-                        &mut state.lock().expect("session state poisoned"),
-                        [Message::assistant(parts)],
-                    );
+                    state
+                        .lock()
+                        .expect("session state poisoned")
+                        .append_history([Message::assistant(parts)]);
                 }
             }
             visible_output
@@ -553,10 +558,10 @@ impl TurnMachine<'_> {
         };
         let prefix = parts.clone();
         parts.push(ContentPart::ToolCall(call.clone()));
-        self.execution.append_history(
-            &mut self.state.lock().expect("session state poisoned"),
-            [Message::assistant(parts)],
-        );
+        self.state
+            .lock()
+            .expect("session state poisoned")
+            .append_history([Message::assistant(parts)]);
         if let Err(error) = self
             .transition(TurnState::ExternalToolCall {
                 request_id: request_id.clone(),
@@ -565,8 +570,10 @@ impl TurnMachine<'_> {
             })
             .await
         {
-            self.execution
-                .pop_history(&mut self.state.lock().expect("session state poisoned"));
+            self.state
+                .lock()
+                .expect("session state poisoned")
+                .pop_history();
             let mut output = output.lock().expect("external output poisoned");
             for part in prefix {
                 match part {
@@ -643,7 +650,7 @@ impl TurnMachine<'_> {
                 .state
                 .lock()
                 .expect("session state poisoned")
-                .history
+                .history()
                 .iter()
                 .rev()
                 .flat_map(|message| &message.content)

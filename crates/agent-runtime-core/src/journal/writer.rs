@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 mod source;
 use source::{ArraySource, JsonSource};
 #[derive(Clone, Default)]
@@ -348,7 +348,7 @@ impl JournalWriterAssembler {
                 object,
                 children,
                 kind,
-                decoded: OnceLock::new(),
+                decoded: Mutex::new(None),
             }),
         );
         self.structured.insert(id.clone());
@@ -1001,23 +1001,24 @@ impl JournalWriterAssembler {
         let prior_input = previous
             .map(|(value, _)| JsonSource::state(value))
             .transpose()?;
-        let mut cache = self.source_cached(
-            &input,
-            prior_input
-                .as_ref()
-                .zip(previous)
-                .map(|(input, (_, cache))| (input, cache)),
-        )?;
-        self.register_witness(&cache.witness);
-        if cache.root != cache.witness.object.id {
-            return Err(conflict());
-        }
-        if !certified {
-            let (bytes, depth) = check_typed_json_roundtrip(value, &cache.witness)?;
-            if cache.depth != depth || cache.canonical_len != bytes {
-                return Err(conflict());
+        let composed = self
+            .source_cached(
+                &input,
+                prior_input
+                    .as_ref()
+                    .zip(previous)
+                    .map(|(input, (_, cache))| (input, cache)),
+            )
+            .and_then(|cache| self.check_composed(value, cache, certified));
+        let mut cache = match composed {
+            Ok(cache) => cache,
+            // An uncertified prior pairing that does not describe its value
+            // takes the complete path instead of failing the preparation.
+            Err(_) if previous.is_some() && !certified => {
+                return self.extension_shared_cached(namespace, source, None);
             }
-        }
+            Err(error) => return Err(error),
+        };
         #[cfg(feature = "test-support")]
         crate::journal::profile::event(
             "rt.work.typed_json_certified_compositions",
@@ -1097,23 +1098,24 @@ impl JournalWriterAssembler {
                 )
             })
             .transpose()?;
-        let mut cache = self.source_cached(
-            &input,
-            prior_input
-                .as_ref()
-                .zip(previous)
-                .map(|(input, (_, cache))| (input, cache)),
-        )?;
-        self.register_witness(&cache.witness);
-        if cache.root != cache.witness.object.id {
-            return Err(conflict());
-        }
-        if !certified {
-            let (bytes, depth) = check_typed_json_roundtrip(manifest, &cache.witness)?;
-            if cache.depth != depth || cache.canonical_len != bytes {
-                return Err(conflict());
+        let composed = self
+            .source_cached(
+                &input,
+                prior_input
+                    .as_ref()
+                    .zip(previous)
+                    .map(|(input, (_, cache))| (input, cache)),
+            )
+            .and_then(|cache| self.check_composed(manifest, cache, certified));
+        let mut cache = match composed {
+            Ok(cache) => cache,
+            // An uncertified prior pairing that does not describe its value
+            // takes the complete path instead of failing the preparation.
+            Err(_) if previous.is_some() && !certified => {
+                return self.manifest_shared_cached(source, None);
             }
-        }
+            Err(error) => return Err(error),
+        };
         #[cfg(feature = "test-support")]
         crate::journal::profile::event(
             "rt.work.typed_json_certified_compositions",
@@ -1145,6 +1147,30 @@ impl JournalWriterAssembler {
             }),
         );
         Ok((id, cache))
+    }
+
+    /// Registers a composed typed encoding and checks it against its value.
+    ///
+    /// Certified compositions skip the round trip in release builds; debug
+    /// and test builds always run it, so a hand-mirrored serde attribute that
+    /// drifts from the typed source fails loudly instead of diverging ids.
+    fn check_composed<T: serde::de::DeserializeOwned + Serialize>(
+        &mut self,
+        value: &T,
+        cache: JournalJsonEncoding,
+        certified: bool,
+    ) -> Result<JournalJsonEncoding, RuntimeError> {
+        self.register_witness(&cache.witness);
+        if cache.root != cache.witness.object.id {
+            return Err(conflict());
+        }
+        if !certified || cfg!(any(test, debug_assertions)) {
+            let (bytes, depth) = check_typed_json_roundtrip(value, &cache.witness)?;
+            if cache.depth != depth || cache.canonical_len != bytes {
+                return Err(conflict());
+            }
+        }
+        Ok(cache)
     }
 
     pub fn map(&mut self, entries: Vec<JournalMapEntry>) -> Result<JournalMap, RuntimeError> {
@@ -1877,7 +1903,7 @@ impl JournalWriterAssembler {
         let fingerprint = checkpoint.state.operation_fingerprint();
         checkpoint
             .validation_evidence(Some(&fingerprint))
-            .validate(&checkpoint.snapshot)?;
+            .validate(checkpoint.snapshot())?;
         self.checkpoint_view_references(checkpoint, roots, fingerprint)
     }
 
@@ -2085,7 +2111,8 @@ pub(in crate::journal) struct JsonWitness {
     object: JournalObject,
     children: Vec<Arc<JsonWitness>>,
     kind: JournalObjectKind,
-    decoded: OnceLock<(JournalObjectKind, TypeId, Box<dyn Any + Send + Sync>)>,
+    // Lives only for one round-trip check; see `release_decoded`.
+    decoded: Mutex<Option<DecodedJson>>,
 }
 impl JsonWitness {
     pub(in crate::journal) fn kind(&self) -> JournalObjectKind {
@@ -2095,7 +2122,9 @@ impl JsonWitness {
     where
         T: serde::de::DeserializeOwned + Serialize + Clone + Send + Sync + 'static,
     {
-        if let Some((cached_kind, ty, value)) = self.decoded.get() {
+        if let Some((cached_kind, ty, value)) =
+            self.decoded.lock().map_err(|_| conflict())?.as_ref()
+        {
             if *cached_kind == kind && *ty == TypeId::of::<T>() {
                 return value.downcast_ref::<T>().cloned().ok_or_else(conflict);
             }
@@ -2107,9 +2136,8 @@ impl JsonWitness {
             1,
             self.object.bytes.len() as u64,
         );
-        let _ = self
-            .decoded
-            .set((kind, TypeId::of::<T>(), Box::new(value.clone())));
+        *self.decoded.lock().map_err(|_| conflict())? =
+            Some((kind, TypeId::of::<T>(), Box::new(value.clone())));
         Ok(value)
     }
 }
@@ -2150,7 +2178,11 @@ fn check_typed_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
     #[cfg(feature = "test-support")]
     let _profile = crate::journal::profile::enter_sync("rt.writer.json_roundtrip");
     let expected = canonical_journal_json(source)?;
-    let encoded = witness_value(witness)?;
+    let encoded = witness_value(witness);
+    // Witnesses outlive this check in JSON caches, proofs and hints; the
+    // decoded copies must not.
+    release_decoded(witness);
+    let encoded = encoded?;
     let depth = json_depth(&encoded)?;
     if canonical_journal_json(&encoded)? != expected {
         return Err(conflict());
@@ -2160,6 +2192,20 @@ fn check_typed_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
         return Err(conflict());
     }
     Ok((expected.len(), depth))
+}
+type DecodedJson = (JournalObjectKind, TypeId, Box<dyn Any + Send + Sync>);
+fn release_decoded(root: &Arc<JsonWitness>) {
+    let mut pending = vec![root.as_ref()];
+    let mut seen = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(&node.object.id) {
+            continue;
+        }
+        if let Ok(mut decoded) = node.decoded.lock() {
+            decoded.take();
+        }
+        pending.extend(node.children.iter().map(Arc::as_ref));
+    }
 }
 #[cfg(test)]
 fn check_json_roundtrip<T: serde::de::DeserializeOwned + Serialize>(
@@ -2201,10 +2247,11 @@ impl JsonWitness {
 impl ManifestEvidence {
     pub(in crate::journal) fn validate(
         &self,
+        id: &JournalObjectId,
         drafts: &super::engine::DraftReader<'_>,
         verified: &impl Fn(&JournalObjectId) -> bool,
     ) -> Result<(), RuntimeError> {
-        if !Arc::ptr_eq(&self.value, &self.bound_value) {
+        if self.witness.object.id != *id || !Arc::ptr_eq(&self.value, &self.bound_value) {
             return Err(conflict());
         }
         self.witness.validate(drafts, verified)
@@ -2214,10 +2261,12 @@ impl ExtensionEvidence {
     pub(in crate::journal) fn validate(
         &self,
         namespace: &str,
+        id: &JournalObjectId,
         drafts: &super::engine::DraftReader<'_>,
         verified: &impl Fn(&JournalObjectId) -> bool,
     ) -> Result<(), RuntimeError> {
-        if namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE
+        if self.witness.object.id != *id
+            || namespace != RUNTIME_PREVIOUS_CACHE_NAMESPACE
             || self.namespace != namespace
             || self.value.sensitivity != crate::store::SessionStateSensitivity::RedactionSafe
             || !Arc::ptr_eq(&self.value, &self.bound_value)
@@ -2238,6 +2287,21 @@ impl JournalPreparationHints {
                 bound_value: evidence.bound_value.clone(),
                 witness: evidence.witness.clone(),
                 value: Arc::new(forged.clone()),
+                bytes: evidence.bytes,
+            });
+        }
+    }
+}
+#[cfg(test)]
+impl JournalPreparationHints {
+    /// Keeps every manifest hint value but swaps its witness for the witness
+    /// of the referenced JSON root, whose id differs from the hint's key.
+    pub(crate) fn forge_manifest_witness_roots(&mut self) {
+        for evidence in self.manifests.values_mut() {
+            *evidence = Arc::new(ManifestEvidence {
+                bound_value: evidence.bound_value.clone(),
+                witness: evidence.witness.children[0].clone(),
+                value: evidence.value.clone(),
                 bytes: evidence.bytes,
             });
         }
@@ -2447,15 +2511,16 @@ mod review_tests {
                         .manifest_shared_cached(Arc::new(invalid), Some((old.as_ref(), old_cache)))
                         .is_err()
                 );
-                let rebound = manifest(9_999);
-                assert!(
-                    JournalWriterAssembler::default()
-                        .manifest_shared_cached(
-                            Arc::new(rebound.clone()),
-                            Some((&rebound, old_cache))
-                        )
-                        .is_err()
-                );
+                // L11: a mismatched prior pairing falls back to the complete
+                // path and yields the cold encoding.
+                let rebound = Arc::new(manifest(9_999));
+                let (rebound_root, _) = JournalWriterAssembler::default()
+                    .manifest_shared_cached(rebound.clone(), Some((rebound.as_ref(), old_cache)))
+                    .unwrap();
+                let (rebound_oracle, _) = JournalWriterAssembler::default()
+                    .manifest_shared_cached(rebound, None)
+                    .unwrap();
+                assert_eq!(rebound_root, rebound_oracle);
             }
             previous = Some((current, cache));
         }
@@ -2481,6 +2546,245 @@ mod review_tests {
                 super::super::semantic::SemanticLength::semantic_len(state.as_ref()).unwrap()
             );
             previous = Some((state, cache));
+        }
+    }
+
+    /// Every optional manifest field toggled between consecutive certified
+    /// compositions encodes exactly as the complete `to_value` path (M1).
+    #[test]
+    fn certified_manifest_chain_with_toggled_optional_fields_matches_complete_path() {
+        use crate::content::{InternalTurnSensitivity, InternalTurnSource};
+        use crate::manifest::{
+            ActivatedCapability, ContextSegmentRecord, ManifestReason, SegmentSensitivity,
+            SummaryCoverage,
+        };
+        use crate::provider::{CacheEndpointIdentity, CacheIdentity, CacheIdentityFragment};
+        use agent_runtime_registry::RegistryId;
+        const FIELDS: u32 = 6;
+        let build = |mask: u32, step: usize| {
+            let mut value = manifest(step);
+            let on = |bit: u32| mask & (1 << bit) != 0;
+            if on(0) {
+                value.manifest.activation = vec![ActivatedCapability::new(
+                    RegistryId::skill("s"),
+                    RegistryRevision::new(format!("r{step}")),
+                )];
+            }
+            if on(1) {
+                value.manifest.segments = (0..(step % 70 + 1))
+                    .map(|i| {
+                        ContextSegmentRecord::new(
+                            format!("history:{i}"),
+                            "history",
+                            SegmentSensitivity::Internal,
+                            Fingerprint::of(format!("{step}:{i}")),
+                            i as u32,
+                        )
+                    })
+                    .collect();
+            }
+            if on(2) {
+                value.manifest.summaries = vec![SummaryCoverage::new(
+                    crate::manifest::SegmentId::new("summary"),
+                    vec![crate::manifest::SegmentId::new("history:0")],
+                )];
+            }
+            if on(3) {
+                let fragments = (0..(step % 5 + 1))
+                    .map(|i| {
+                        CacheIdentityFragment::new(format!("h{i}"), Fingerprint::of(i.to_string()))
+                    })
+                    .collect::<Vec<_>>();
+                value.manifest.cache_identity = Some(
+                    CacheIdentity::builder(
+                        "p",
+                        ModelId::new("m"),
+                        CacheEndpointIdentity::from_opaque("endpoint", RegistryRevision::new("r")),
+                        RegistryRevision::new("r"),
+                        Fingerprint::of("profile"),
+                    )
+                    .stable_prefix(fragments.clone())
+                    .stable_history(fragments)
+                    .build(),
+                );
+            }
+            if on(4) {
+                value.manifest.reasons = vec![ManifestReason::Filtered {
+                    subject: RegistryId::skill("f"),
+                    detail: format!("d{step}"),
+                }];
+            }
+            if on(5) {
+                value.internal_source = Some(InternalTurnSource {
+                    kind: "goal".into(),
+                    id: format!("g{step}"),
+                    revision: RegistryRevision::new("r"),
+                    sensitivity: InternalTurnSensitivity::Public,
+                    goal: None,
+                });
+            }
+            Arc::new(value)
+        };
+        // Start with every field present (so only certified compositions see
+        // empty fields), then Gray-code order toggles one field per step, then
+        // every mask is visited again in reverse.
+        let masks = std::iter::once((1u32 << FIELDS) - 1)
+            .chain((0..(1u32 << FIELDS)).map(|i| i ^ (i >> 1)))
+            .chain((0..(1u32 << FIELDS)).rev())
+            .collect::<Vec<_>>();
+        let mut previous: Option<(Arc<TurnManifest>, JournalJsonEncoding)> = None;
+        let mut certified = 0;
+        for (step, mask) in masks.into_iter().enumerate() {
+            let current = build(mask, step);
+            certified += usize::from(previous.as_ref().is_some_and(|(_, cache)| {
+                cache.typed.as_ref().is_some_and(|proof| proof.binds(cache))
+            }));
+            let (_, cache) = JournalWriterAssembler::default()
+                .manifest_shared_cached(
+                    current.clone(),
+                    previous.as_ref().map(|(v, c)| (v.as_ref(), c)),
+                )
+                .unwrap();
+            let mut complete = super::super::engine::ObjectAssembler::default();
+            let oracle = complete
+                .json_value(&serde_json::to_value(current.as_ref()).unwrap())
+                .unwrap();
+            assert_eq!(cache.root, oracle, "mask {mask:06b} step {step}");
+            assert_eq!(
+                cache.canonical_len,
+                canonical_journal_json(current.as_ref()).unwrap().len()
+            );
+            previous = Some((current, cache));
+        }
+        assert!(certified > 100);
+    }
+
+    /// Typed segment arrays under random mid-array edits, inserts and
+    /// deletes encode exactly as the complete path, chained through both
+    /// certified and uncertified compositions.
+    #[test]
+    fn typed_segment_arrays_match_complete_path_under_random_edits() {
+        use crate::manifest::{ContextSegmentRecord, SegmentSensitivity};
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound.max(1) as u64) as usize
+        };
+        let segment = |label: usize| {
+            ContextSegmentRecord::new(
+                format!("history:{label}"),
+                "history",
+                SegmentSensitivity::Internal,
+                Fingerprint::of(label.to_string()),
+                label as u32,
+            )
+        };
+        let mut segments = (0..150).map(segment).collect::<Vec<_>>();
+        let mut label = 1_000;
+        let mut previous: Option<(Arc<TurnManifest>, JournalJsonEncoding)> = None;
+        for step in 0..160 {
+            for _ in 0..(1 + next(4)) {
+                label += 1;
+                match next(4) {
+                    0 if !segments.is_empty() => {
+                        let at = next(segments.len());
+                        segments[at] = segment(label);
+                    }
+                    1 => {
+                        let at = next(segments.len() + 1);
+                        segments.insert(at, segment(label));
+                    }
+                    2 if !segments.is_empty() => {
+                        let at = next(segments.len());
+                        segments.remove(at);
+                    }
+                    _ => {
+                        let from = next(segments.len() + 1);
+                        let to = (from + next(70)).min(segments.len());
+                        segments.drain(from..to);
+                    }
+                }
+            }
+            if step % 37 == 0 {
+                segments.extend((0..130).map(|i| segment(label + i + 1)));
+                label += 131;
+            }
+            let mut value = manifest(step);
+            value.manifest.segments = segments.clone();
+            let current = Arc::new(value);
+            // Every fifth step drops the pairing to exercise uncertified
+            // composition from the same cache.
+            let prior = previous
+                .as_ref()
+                .filter(|_| step % 5 != 0)
+                .map(|(v, c)| (v.as_ref(), c));
+            let (_, cache) = JournalWriterAssembler::default()
+                .manifest_shared_cached(current.clone(), prior)
+                .unwrap();
+            let mut complete = super::super::engine::ObjectAssembler::default();
+            let oracle = complete
+                .json_value(&serde_json::to_value(current.as_ref()).unwrap())
+                .unwrap();
+            assert_eq!(cache.root, oracle, "step {step} len {}", segments.len());
+            previous = Some((current, cache));
+        }
+    }
+
+    /// Witness decode caches never outlive a round-trip check (M3).
+    #[test]
+    fn retained_witnesses_hold_no_decoded_copies() {
+        fn assert_released(root: &Arc<JsonWitness>) {
+            let mut pending = vec![root.clone()];
+            while let Some(node) = pending.pop() {
+                assert!(node.decoded.lock().unwrap().is_none());
+                pending.extend(node.children.iter().cloned());
+            }
+        }
+        let mut previous: Option<(Arc<TurnManifest>, JournalJsonEncoding)> = None;
+        let mut writer = JournalWriterAssembler::default();
+        for step in 0..8 {
+            let mut value = manifest(step);
+            value.manifest.segments = (0..(step * 20))
+                .map(|i| {
+                    crate::manifest::ContextSegmentRecord::new(
+                        format!("history:{i}"),
+                        "history",
+                        crate::manifest::SegmentSensitivity::Internal,
+                        Fingerprint::of(i.to_string()),
+                        i as u32,
+                    )
+                })
+                .collect();
+            let current = Arc::new(value);
+            // Alternate certified and uncertified (unpaired) compositions.
+            let prior = previous
+                .as_ref()
+                .filter(|_| step % 2 == 0)
+                .map(|(v, c)| (v.as_ref(), c));
+            let (_, cache) = writer
+                .manifest_shared_cached(current.clone(), prior)
+                .unwrap();
+            assert_released(&cache.witness);
+            previous = Some((current, cache));
+        }
+        let state = Arc::new(
+            VersionedSessionState::new(
+                RegistryRevision::new("r"),
+                serde_json::json!({"items": (0..300).collect::<Vec<_>>()}),
+            )
+            .redaction_safe(),
+        );
+        let (_, cache) = writer
+            .extension_shared_cached(RUNTIME_PREVIOUS_CACHE_NAMESPACE, state, None)
+            .unwrap();
+        assert_released(&cache.unwrap().witness);
+        for witness in writer.json_witnesses.values() {
+            assert_released(witness);
+        }
+        for evidence in writer.hints.manifests.values() {
+            assert_released(&evidence.witness);
         }
     }
 
@@ -2538,7 +2842,7 @@ mod review_tests {
         let shared = crate::checkpoint::JournalCheckpoint::from_checkpoint(owned.clone()).unwrap();
         let mut writer = JournalWriterAssembler::default();
         let roots = writer
-            .snapshot_shared_cached(&shared.snapshot, 0, None, None)
+            .snapshot_shared_cached(shared.snapshot(), 0, None, None)
             .unwrap()
             .0;
         let refs = writer.checkpoint_view(&shared, roots.clone()).unwrap();
@@ -2607,18 +2911,19 @@ mod review_tests {
     }
 
     // M1: a cached encoding that claims one value but holds another value's
-    // bytes (a stale or buggy JSON cache) never becomes a hint.
+    // bytes (a stale or buggy JSON cache) never becomes a hint; since round-2
+    // L11 the writer re-encodes through the complete path instead of failing.
     #[test]
     fn a_cached_encoding_whose_bytes_differ_from_its_value_is_refused() {
         let honest = manifest(1);
         let honest_json = serde_json::to_value(&honest).unwrap();
         let other_json = serde_json::to_value(manifest(2)).unwrap();
         let forged = cached(&other_json);
-        assert!(
-            JournalWriterAssembler::default()
-                .manifest_cached(&honest, Some((&honest, &forged)))
-                .is_err()
-        );
+        let (_, recovered) = JournalWriterAssembler::default()
+            .manifest_cached(&honest, Some((&honest, &forged)))
+            .unwrap();
+        assert_eq!(recovered.root, cached(&honest_json).root);
+        assert_ne!(recovered.root, forged.root);
         let (_, accepted) = JournalWriterAssembler::default()
             .manifest_cached(&honest, Some((&honest, &cached(&honest_json))))
             .unwrap();
@@ -2632,14 +2937,18 @@ mod review_tests {
         };
         let (honest, other) = (state("honest"), state("other"));
         let forged = cached(&serde_json::to_value(&other).unwrap());
-        assert!(
-            JournalWriterAssembler::default()
-                .extension_cached(
-                    RUNTIME_PREVIOUS_CACHE_NAMESPACE,
-                    &honest,
-                    Some((&honest, &forged))
-                )
-                .is_err()
+        let (_, recovered) = JournalWriterAssembler::default()
+            .extension_cached(
+                RUNTIME_PREVIOUS_CACHE_NAMESPACE,
+                &honest,
+                Some((&honest, &forged)),
+            )
+            .unwrap();
+        let recovered = recovered.unwrap();
+        assert_ne!(recovered.root, forged.root);
+        assert_eq!(
+            recovered.root,
+            cached(&serde_json::to_value(&honest).unwrap()).root
         );
         assert!(
             JournalWriterAssembler::default()

@@ -33,6 +33,24 @@ impl ClosureEvidence {
     pub(in crate::journal) fn iter(&self) -> impl Iterator<Item = &JournalObjectId> {
         self.members.keys()
     }
+    /// The member set alone, sharing its persistent structure, without the
+    /// activation map that only incremental updates need.
+    pub(super) fn membership_only(&self) -> Self {
+        Self {
+            root: None,
+            active: Map::default(),
+            members: self.members.clone(),
+            entered: BTreeSet::new(),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn is_membership_only(&self) -> bool {
+        self.root.is_none() && self.active.is_empty()
+    }
+    /// Whether both proofs share one immutable member set.
+    pub(super) fn shares_members(&self, other: &Self) -> bool {
+        self.members.ptr_eq(&other.members)
+    }
     pub(super) fn without_changes(&self) -> Self {
         Self {
             root: self.root.clone(),

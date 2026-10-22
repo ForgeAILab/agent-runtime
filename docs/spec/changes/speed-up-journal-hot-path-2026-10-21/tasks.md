@@ -159,3 +159,11 @@ thresholds, owner overhead/hold results and every remaining NOT MET item are
 reported in `/Volumes/Data/tmp/refactor/rt-p2/report.md`; raw fixtures are
 removed after summary extraction. No full P1/P4 or Forge adoption acceptance
 is implied.
+
+Round-2 review fixes (`/Volumes/Data/tmp/refactor/rt-p1b-review/report.md`):
+`runtime::SessionState` fields are private (breaking, see CHANGELOG) and every
+mutation records its changed suffix; debug/test builds compare each incremental
+capture and each certified typed JSON composition with the complete path.
+Reachable sets fold above 16 layers and durable pins keep closure membership
+only. Results are in `/Volumes/Data/tmp/refactor/rt-p1b-fix/`. No measurement
+was rerun for these fixes.

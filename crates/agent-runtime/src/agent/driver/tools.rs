@@ -453,8 +453,7 @@ impl<'a> TurnMachine<'a> {
                         return Err(error);
                     }
                 }
-                self.driver
-                    .drain_injected(&self.state, &self.inbox, &self.execution);
+                self.driver.drain_injected(&self.state, &self.inbox);
                 return Ok(());
             }
 
@@ -521,8 +520,7 @@ impl<'a> TurnMachine<'a> {
             prepared_batch.calls.len(),
             "every prepared or rejected tool call must produce one result"
         );
-        self.driver
-            .drain_injected(&self.state, &self.inbox, &self.execution);
+        self.driver.drain_injected(&self.state, &self.inbox);
         Ok(())
     }
 
@@ -1153,7 +1151,7 @@ impl<'a> TurnMachine<'a> {
             .state
             .lock()
             .expect("session state poisoned")
-            .history
+            .history()
             .len();
         self.execution
             .begin_turn(self.turn_id.clone(), history_start, self.driver.clock.now());

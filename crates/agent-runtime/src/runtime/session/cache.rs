@@ -290,7 +290,7 @@ impl SessionHandle {
                         .begin_cache_events_for_turn(cache_turn.clone());
                     let checkpoint_result = result.checkpoint_result();
                     let usage = self.cache_usage_for_snapshot(
-                        &checkpoint.snapshot,
+                        checkpoint.snapshot(),
                         &operation,
                         &checkpoint_result,
                     )?;
@@ -336,7 +336,7 @@ impl SessionHandle {
                     .state
                     .lock()
                     .expect("session state poisoned")
-                    .usage
+                    .usage()
                     .clone();
                 let usage = self.cache_usage_for_checkpoint(
                     &usage_ledger,
@@ -420,7 +420,7 @@ impl SessionHandle {
             .state
             .lock()
             .expect("session state poisoned")
-            .usage
+            .usage()
             .clone();
         self.inner
             .shared
@@ -429,10 +429,11 @@ impl SessionHandle {
     }
 
     fn restore_pending_cache_usage(&self, usage: UsageLedger) {
-        self.inner.execution.replace_usage(
-            &mut self.inner.state.lock().expect("session state poisoned"),
-            usage,
-        );
+        self.inner
+            .state
+            .lock()
+            .expect("session state poisoned")
+            .replace_usage(usage);
     }
 
     /// Dispatches one conformance-gated synthetic cache operation through the
@@ -463,7 +464,7 @@ impl SessionHandle {
             .state
             .lock()
             .expect("session state poisoned")
-            .usage
+            .usage()
             .records()
             .len();
         let request_id = self.inner.minter.request();
@@ -667,10 +668,11 @@ impl SessionHandle {
                             operation.operation(),
                             cache_snapshot.clone(),
                         );
-                        self.inner.execution.truncate_usage(
-                            &mut self.inner.state.lock().expect("session state poisoned"),
-                            usage_snapshot,
-                        );
+                        self.inner
+                            .state
+                            .lock()
+                            .expect("session state poisoned")
+                            .truncate_usage(usage_snapshot);
                         return Err(error);
                     }
                     Err(CacheFinalizeError::Terminal(error)) => {
@@ -797,12 +799,6 @@ impl SessionHandle {
             Ok(result) => result,
             Err(error) => return Err(error),
         };
-        self.inner
-            .execution
-            .live_snapshot
-            .lock()
-            .expect("live snapshot poisoned")
-            .usage_changed(usage_snapshot);
         let checkpoint = if let Some(slot) = checkpoint_slot {
             slot.lock().await.take()
         } else {
@@ -833,10 +829,11 @@ impl SessionHandle {
                         operation.operation(),
                         cache_snapshot,
                     );
-                    self.inner.execution.truncate_usage(
-                        &mut self.inner.state.lock().expect("session state poisoned"),
-                        usage_snapshot,
-                    );
+                    self.inner
+                        .state
+                        .lock()
+                        .expect("session state poisoned")
+                        .truncate_usage(usage_snapshot);
                     return Err(error);
                 }
                 Err(CacheFinalizeError::Terminal(error)) => {
@@ -946,7 +943,7 @@ impl SessionHandle {
             .state
             .lock()
             .expect("session state poisoned")
-            .usage
+            .usage()
             .records()
             .len();
         let request_id = self.inner.minter.request();
@@ -1161,10 +1158,11 @@ impl SessionHandle {
                             operation.operation(),
                             cache_snapshot.clone(),
                         );
-                        self.inner.execution.truncate_usage(
-                            &mut self.inner.state.lock().expect("session state poisoned"),
-                            usage_snapshot,
-                        );
+                        self.inner
+                            .state
+                            .lock()
+                            .expect("session state poisoned")
+                            .truncate_usage(usage_snapshot);
                         return Err(error);
                     }
                     Err(CacheFinalizeError::Terminal(error)) => {
@@ -1267,12 +1265,6 @@ impl SessionHandle {
             Ok(result) => result,
             Err(error) => return Err(error),
         };
-        self.inner
-            .execution
-            .live_snapshot
-            .lock()
-            .expect("live snapshot poisoned")
-            .usage_changed(usage_snapshot);
         let checkpoint = if let Some(slot) = checkpoint_slot {
             slot.lock().await.take()
         } else {
@@ -1303,10 +1295,11 @@ impl SessionHandle {
                         operation.operation(),
                         cache_snapshot,
                     );
-                    self.inner.execution.truncate_usage(
-                        &mut self.inner.state.lock().expect("session state poisoned"),
-                        usage_snapshot,
-                    );
+                    self.inner
+                        .state
+                        .lock()
+                        .expect("session state poisoned")
+                        .truncate_usage(usage_snapshot);
                     return Err(error);
                 }
                 Err(CacheFinalizeError::Terminal(error)) => {

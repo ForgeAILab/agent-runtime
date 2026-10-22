@@ -43,6 +43,15 @@ contain breaking changes and are coordinated with consumer proposals.
   preflight units and dropped pin pages. Collection
   conformance fixtures drain explicitly.
 
+- `runtime::SessionState` fields are private. Read them through `history()`,
+  `usage()` and `manifests()`; construct with `SessionState::with_history` or
+  `Default`. Runtime-owned mutation now records every changed suffix, so the
+  live journal snapshot view cannot reuse a stale prefix, and the public
+  `run_turn` no longer turns that view off.
+- The hidden internal `checkpoint::JournalCheckpoint` drops
+  `from_checkpoint_view`; its snapshot is read through `snapshot()` and
+  replaced only through the validating `with_snapshot`.
+
 ## [0.9.0] - 2026-10-20
 
 ### Breaking

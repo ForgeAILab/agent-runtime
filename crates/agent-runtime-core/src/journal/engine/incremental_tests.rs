@@ -1388,7 +1388,8 @@ async fn prepared_and_full_checkpoint_commits_agree_over_every_state_family() {
     assert!(rejected > 0);
 }
 
-// M1: a manifest hint whose value is not the value its witness encodes is
+// M1: a manifest hint whose value is not the value its witness encodes, or
+// whose witness is rooted at an object other than its key (round-2 L12), is
 // refused by the engine; the honest hint over the same commit is accepted.
 #[tokio::test]
 async fn a_forged_manifest_hint_value_is_refused() {
@@ -1432,8 +1433,11 @@ async fn a_forged_manifest_hint_value_is_refused() {
             let honest = second.preparation_hints();
             let mut forged = honest.clone();
             forged.forge_manifest_values(&manifest(7));
+            // L12: the honest value under a witness rooted at another object.
+            let mut rerooted = honest.clone();
+            rerooted.forge_manifest_witness_roots();
             let mut accepted = Vec::new();
-            for hints in [forged, honest] {
+            for hints in [forged, rerooted, honest] {
                 let engine = JournalEngine::ordinary(
                     Arc::new(VolatileJournalStorage::new(sharing)),
                     JournalStorageId::new("forged-hint"),
@@ -1480,7 +1484,7 @@ async fn a_forged_manifest_hint_value_is_refused() {
                 );
                 engine.close(lease).await.unwrap();
             }
-            assert_eq!(accepted, [false, true]);
+            assert_eq!(accepted, [false, false, true]);
         }
     }
 }

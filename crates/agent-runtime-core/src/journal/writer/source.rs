@@ -260,27 +260,33 @@ impl<'a> JsonSource<'a> {
                 if values.len() > JOURNAL_FANOUT {
                     return Ok(None);
                 }
-                let mut out = Vec::new();
+                // Inlinability only tightens as items are added (depth,
+                // fanout and canonical length are monotone), so reject an
+                // oversized item early and check the whole value once.
+                let mut out = Vec::with_capacity(values.len());
                 for index in 0..values.len() {
-                    out.push(values.value(index)?.into_owned());
-                    if !journal_json_can_inline(&Value::Array(out.clone()))? {
+                    let item = values.value(index)?.into_owned();
+                    if !journal_json_can_inline(&item)? {
                         return Ok(None);
                     }
+                    out.push(item);
                 }
-                Ok(Some(Value::Array(out)))
+                let out = Value::Array(out);
+                Ok(journal_json_can_inline(&out)?.then_some(out))
             }
             Self::Object(fields) => {
+                if fields.len() > JOURNAL_FANOUT {
+                    return Ok(None);
+                }
                 let mut out = serde_json::Map::new();
                 for (key, value) in fields {
                     let Some(value) = value.inline()? else {
                         return Ok(None);
                     };
                     out.insert(key.clone(), value);
-                    if !journal_json_can_inline(&Value::Object(out.clone()))? {
-                        return Ok(None);
-                    }
                 }
-                Ok(Some(Value::Object(out)))
+                let out = Value::Object(out);
+                Ok(journal_json_can_inline(&out)?.then_some(out))
             }
         }
     }

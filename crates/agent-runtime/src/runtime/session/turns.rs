@@ -88,7 +88,7 @@ impl SessionHandle {
                 "idle LCM progress requires a terminal checkpoint",
             ));
         }
-        let predecessor = previous.snapshot.usage_fingerprint()?;
+        let predecessor = previous.snapshot().usage_fingerprint()?;
         self.inner
             .execution
             .extension_state
@@ -142,11 +142,9 @@ impl SessionHandle {
         };
         let previous_usage = {
             let mut state = self.inner.state.lock().expect("session state poisoned");
-            let previous = state.usage.records().len();
+            let previous = state.usage().records().len();
             for record in &batch.usage_records {
-                self.inner
-                    .execution
-                    .record_usage(&mut state, record.clone());
+                state.record_usage(record.clone());
             }
             previous
         };
@@ -180,10 +178,11 @@ impl SessionHandle {
                     }
                 }
             }
-            self.inner.execution.truncate_usage(
-                &mut self.inner.state.lock().expect("session state poisoned"),
-                previous_usage,
-            );
+            self.inner
+                .state
+                .lock()
+                .expect("session state poisoned")
+                .truncate_usage(previous_usage);
         };
         // Nothing from this batch may stay in memory without a saved
         // counterpart: a failed exact checkpoint rolls back the extension
@@ -360,17 +359,17 @@ impl SessionHandle {
         let (history, usage, boundary_turn) = {
             let state = self.inner.state.lock().expect("session state poisoned");
             let boundary_turn = state
-                .manifests
+                .manifests()
                 .last()
                 .map(|manifest| manifest.turn.clone())
                 .unwrap_or_else(|| TurnId::new("idle-compaction-boundary"));
             (
                 self.inner.execution.shared_history(
                     &self.inner.id,
-                    &state.history,
+                    state.history(),
                     self.inner.shared.lcm.as_ref(),
                 ),
-                Arc::from(state.usage.records().to_vec().into_boxed_slice()),
+                Arc::from(state.usage().records().to_vec().into_boxed_slice()),
                 boundary_turn,
             )
         };
@@ -443,7 +442,7 @@ impl SessionHandle {
             .state
             .lock()
             .expect("session state poisoned")
-            .usage
+            .usage()
             .records()
             .to_vec();
         let second_view = TurnCommitView {
@@ -863,7 +862,7 @@ impl SessionHandle {
             .state
             .lock()
             .expect("session state poisoned")
-            .usage
+            .usage()
             .records()
             .len();
         let created_id = agent_runtime_core::ids::GoalId::new(format!(

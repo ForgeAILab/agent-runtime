@@ -808,12 +808,7 @@ impl Driver {
     /// Appends any safe-boundary injected content to the history. Called only
     /// at provider/tool boundaries — at turn start and after a tool step —
     /// never while a provider stream is in flight.
-    fn drain_injected(
-        &self,
-        state: &Arc<Mutex<SessionState>>,
-        inbox: &Arc<Mutex<InjectionQueue>>,
-        execution: &SessionExecutionContext,
-    ) {
+    fn drain_injected(&self, state: &Arc<Mutex<SessionState>>, inbox: &Arc<Mutex<InjectionQueue>>) {
         let messages = inbox
             .lock()
             .expect("session inbox poisoned")
@@ -822,7 +817,7 @@ impl Driver {
             return;
         }
         let mut guard = state.lock().expect("session state poisoned");
-        execution.append_history(&mut guard, messages);
+        guard.append_history(messages);
     }
 
     /// Takes the injected content a turn's acceptance boundary introduces.
@@ -837,13 +832,11 @@ impl Driver {
 
     /// Publishes a turn's staged messages to live history once its
     /// acceptance checkpoint has committed.
-    fn publish_accepted(
-        &self,
-        state: &Arc<Mutex<SessionState>>,
-        staged: Vec<Message>,
-        execution: &SessionExecutionContext,
-    ) {
-        execution.append_history(&mut state.lock().expect("session state poisoned"), staged);
+    fn publish_accepted(&self, state: &Arc<Mutex<SessionState>>, staged: Vec<Message>) {
+        state
+            .lock()
+            .expect("session state poisoned")
+            .append_history(staged);
     }
 
     /// Settles a turn whose acceptance checkpoint failed and returns the
@@ -887,7 +880,7 @@ impl Driver {
                 error
             }
             AcceptanceSaveError::Unresolved(error) => {
-                self.publish_accepted(state, staged, execution);
+                self.publish_accepted(state, staged);
                 execution.hold_unresolved_injections(UnresolvedInjections {
                     turn: turn.clone(),
                     items: injected,
@@ -910,11 +903,6 @@ impl Driver {
         turn_id: TurnId,
         input: UserInput,
     ) {
-        execution
-            .live_snapshot
-            .lock()
-            .expect("live snapshot poisoned")
-            .disable();
         let context = TurnMachineContext {
             state,
             execution,
@@ -1069,7 +1057,8 @@ impl Driver {
         checkpoint: TurnCheckpoint,
     ) {
         let turn_id = checkpoint.turn.clone();
-        TurnMachine::from_checkpoint(
+        let failed = (emitter.clone(), turn_id.clone());
+        let machine = match TurnMachine::from_checkpoint(
             self,
             TurnMachineContext {
                 state,
@@ -1083,9 +1072,14 @@ impl Driver {
                 acceptance: None,
             },
             checkpoint,
-        )
-        .resume()
-        .await;
+        ) {
+            Ok(machine) => machine,
+            Err(error) => {
+                failed.0.emit(Some(failed.1), RuntimeEvent::Error { error });
+                return;
+            }
+        };
+        machine.resume().await;
     }
 
     /// External conversations cannot be re-entered mid-turn. Local actions and
@@ -1132,7 +1126,8 @@ impl Driver {
         activation_changed: bool,
     ) {
         let turn_id = checkpoint.turn.clone();
-        TurnMachine::from_checkpoint(
+        let failed = (emitter.clone(), turn_id.clone());
+        let machine = match TurnMachine::from_checkpoint(
             self,
             TurnMachineContext {
                 state,
@@ -1146,9 +1141,14 @@ impl Driver {
                 acceptance: None,
             },
             checkpoint,
-        )
-        .abandon(activation_changed)
-        .await;
+        ) {
+            Ok(machine) => machine,
+            Err(error) => {
+                failed.0.emit(Some(failed.1), RuntimeEvent::Error { error });
+                return;
+            }
+        };
+        machine.abandon(activation_changed).await;
     }
 }
 
