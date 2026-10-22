@@ -174,6 +174,11 @@ async fn session_failures_are_isolated_and_only_non_conflicts_are_reported() {
                         .unwrap(),
                     sessions
                 );
+                // This fault exercises cold body reads; a warm certified head
+                // intentionally does not call objects during collection.
+                if method == "objects" {
+                    engine.memo.lock().unwrap().remove_session(&sessions[1]);
+                }
                 let before = durable(&storage, &engine, &sessions[1]).await;
                 let before_bytes = engine.retained_bytes().await.unwrap();
                 *storage.failure.lock().unwrap() = Some((sessions[1].clone(), method, error));

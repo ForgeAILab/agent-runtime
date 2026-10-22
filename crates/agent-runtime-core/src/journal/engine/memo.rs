@@ -1,5 +1,24 @@
 use super::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Cursor-held exact proofs share the memo's fixed budget, even after their
+/// cache entry is evicted. Dropping a cursor releases its reservations.
+#[derive(Debug)]
+pub(super) struct ProofRetention {
+    owner: Arc<AtomicUsize>,
+    bytes: usize,
+}
+impl ProofRetention {
+    pub(super) fn belongs_to(&self, memo: &RootMemo) -> bool {
+        Arc::ptr_eq(&self.owner, &memo.retained_proof_bytes)
+    }
+}
+impl Drop for ProofRetention {
+    fn drop(&mut self) {
+        self.owner.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 type Key = (SessionId, JournalObjectId);
 
@@ -37,6 +56,7 @@ impl ValidatedRoot {
 pub(super) struct RootMemo {
     pub(super) budget: usize,
     pub(super) bytes: usize,
+    retained_proof_bytes: Arc<AtomicUsize>,
     entries: HashMap<Key, MemoNode>,
     oldest: Option<Key>,
     newest: Option<Key>,
@@ -53,6 +73,25 @@ struct MemoNode {
     newer: Option<Key>,
 }
 impl RootMemo {
+    pub(super) fn total_charge(&self) -> usize {
+        self.bytes
+            .saturating_add(self.retained_proof_bytes.load(Ordering::Relaxed))
+    }
+    pub(super) fn retain_collection_proof(&mut self, bytes: usize) -> Option<ProofRetention> {
+        if bytes > self.budget {
+            return None;
+        }
+        while self.total_charge().saturating_add(bytes) > self.budget {
+            let oldest = self.oldest.clone()?;
+            self.remove(&oldest);
+        }
+        self.retained_proof_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        Some(ProofRetention {
+            owner: self.retained_proof_bytes.clone(),
+            bytes,
+        })
+    }
     #[cfg(feature = "test-support")]
     pub(super) fn profile_details(&self) -> (usize, usize, usize) {
         (
@@ -65,7 +104,8 @@ impl RootMemo {
             self.entries
                 .values()
                 .map(|n| Arc::strong_count(&n.entry).saturating_sub(1))
-                .sum(),
+                .sum::<usize>()
+                + Arc::strong_count(&self.retained_proof_bytes).saturating_sub(1),
         )
     }
     #[cfg(feature = "test-support")]
@@ -80,6 +120,7 @@ impl RootMemo {
         Self {
             budget,
             bytes: 0,
+            retained_proof_bytes: Arc::new(AtomicUsize::new(0)),
             entries: HashMap::new(),
             oldest: None,
             newest: None,
@@ -116,14 +157,18 @@ impl RootMemo {
     ) {
         #[cfg(feature = "test-support")]
         let _profile = crate::journal::profile::enter_sync("rt.memo.insert");
-        if entry.bytes > self.budget {
+        if entry.bytes
+            > self
+                .budget
+                .saturating_sub(self.retained_proof_bytes.load(Ordering::Relaxed))
+        {
             #[cfg(feature = "test-support")]
             crate::journal::profile::event("rt.memo.oversize", 1, entry.bytes as u64);
             return;
         }
         let key = (session.clone(), root.clone());
         self.remove(&key);
-        while entry.bytes > self.budget - self.bytes {
+        while entry.bytes > self.budget.saturating_sub(self.total_charge()) {
             let Some(old) = self.oldest.clone() else {
                 break;
             };
@@ -146,7 +191,7 @@ impl RootMemo {
         crate::journal::profile::event(
             "rt.memo.estimated_charge",
             self.entries.len() as u64,
-            self.bytes as u64,
+            self.total_charge() as u64,
         );
     }
     pub(super) fn remove_root(&mut self, session: &SessionId, root: &JournalObjectId) {
@@ -202,7 +247,7 @@ impl RootMemo {
             std::mem::size_of::<JournalObjectId>() + 64 + 3 * std::mem::size_of::<usize>();
         for key in keys {
             let old = self.entries[&key].entry.clone();
-            if old.closure.iter().any(|id| released.contains(id)) {
+            if released.iter().any(|id| old.closure.contains(id)) {
                 self.remove(&key);
                 continue;
             }
@@ -707,6 +752,24 @@ mod tests {
         assert_eq!(memo.bytes, 20);
         memo.remove_session(&s);
         assert_eq!(memo.bytes, 0);
+        let held = memo.retain_collection_proof(15).unwrap();
+        assert_eq!(memo.total_charge(), 15);
+        memo.insert(&s, &roots[0], entry());
+        assert!(
+            memo.get(&s, &roots[0]).is_none(),
+            "held proofs leave only five bytes for memo entries"
+        );
+        drop(held);
+        memo.insert(&s, &roots[0], entry());
+        assert_eq!(memo.total_charge(), 10);
+        let held = memo.retain_collection_proof(15).unwrap();
+        assert!(
+            memo.get(&s, &roots[0]).is_none(),
+            "proof reservations evict LRU entries rather than exceed the budget"
+        );
+        assert_eq!(memo.total_charge(), 15);
+        drop(held);
+        assert_eq!(memo.total_charge(), 0);
     }
 
     #[test]

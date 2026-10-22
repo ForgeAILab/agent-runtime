@@ -18,6 +18,12 @@ pub(in crate::journal) struct ClosureEvidence {
     pub(super) entered: BTreeSet<JournalObjectId>,
 }
 impl ClosureEvidence {
+    pub(super) fn is_head_root(&self, root: &JournalObjectId) -> bool {
+        self.root.as_ref().is_some_and(|(id, expected)| {
+            id == root
+                && *expected == ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head))
+        })
+    }
     pub(in crate::journal) fn len(&self) -> usize {
         self.members.len()
     }

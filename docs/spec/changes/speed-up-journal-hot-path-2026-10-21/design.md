@@ -276,14 +276,17 @@ catalog predecessor/staged-leaf deltas and transfer/dependency roots exactly as
 today. Check the requested mark epoch before using proofs and again before
 release. A pin without a valid certificate, an evicted/oversize proof, a cold
 engine, or an uncertified leaf/staging root is traced with the existing typed,
-membership-scoped walker. Deduplicate roots within the operation.
+membership-scoped walker. Deduplicate roots within the operation. Invalid
+root-bound cached evidence is evicted and takes the same cold fallback.
 
 Represent the live union as shared exact-set references with membership tests;
 do not flatten every cached proof back into a new O(N) set merely to reuse it.
 Enumerate the session's members to find `members - live`, retain the existing
 live-subset-of-members integrity check, and index retirement dependencies
-before clearing source dirty state. P4 later pages these operations; P2 alone
-does not provide a call-time bound.
+before clearing source dirty state. The implemented P4 cursor pages these
+operations. A warm current proof seeds the load unit as a reference; pin proofs
+join the same shared union after their paged certificates and catalog roots
+are resolved. Inventory remains bounded by P4's member pages.
 
 ### Complexity, safety and conformance
 
@@ -296,8 +299,12 @@ unprovable roots remain O(graph). No claim that warm collection is O(1).
 A matched monotonic current head continuously protects its exact closure.
 Historical certificates establish the stronger pin history required by D-1;
 pin existence alone does not. Before each apply, the full session fence and
-root/pin epoch protect the authenticated live union. Epoch change while a
-metadata await is in flight aborts/discards the stale mark. A collection may
+root/pin epoch protect the authenticated live union. An epoch change while a
+metadata/preflight await is in flight rechecks the marked session's lease set
+and working-proof identity before mutation; affected protection discards the
+mark. On resume, one local snapshot authenticates those identities alongside
+the freshly loaded full fence before adopting the new epoch. Unrelated-session
+churn never restarts the mark, preserving P4's accepted restart rule. A collection may
 invalidate only affected historical proofs on acknowledged release and must
 trim released cache-only bodies; re-admission must still occur later.
 
@@ -308,6 +315,28 @@ authority change during a paused read or pre-apply boundary. Add a negative
 control that accepts pin presence without its certificate, and one that ignores
 an epoch change. Preserve unreadable-session isolation and unknown transfer
 revision behavior; proof reuse cannot hide unreadable authority metadata.
+
+### Implementation in the bounded collector
+
+`AuthenticatedClosure` retains an immutable exact proof and dependency summary,
+with engine identity supplied by its memo reservation owner and explicit
+domain/session/root, current-or-certified-pin source, full fence and epoch.
+Temporary retention reserves a conservative proof/summary charge against the
+same configured memo budget, evicting LRU cache entries or declining reuse;
+RAII releases the reservation on completion, restart, skip, cancellation or
+cursor disposal. Producer memo admission includes outstanding reservations.
+The 16 MiB cursor cap charges handle/layer references and metadata, without
+charging or copying every proof member into cursor workspace.
+
+The collector deduplicates and appends both member and evidence layer Arcs
+without using the writer's member-layer coalescing helper: COW coalescing would
+allocate a new member set in cursor workspace. Membership pages test each
+retained layer once per id and count it independently, preserving the full
+live-subset integrity check without materializing their union. A failed subset
+check silently skips the session with dirty state retained; it is distinct from
+a physical continuation conflict and cannot trigger an endless one-unit
+restart loop. The lease filter and atomic storage fence still guard every
+apply, and only acknowledged collector writes advance the cursor's fence.
 
 ### Acceptance, estimated effect and size
 

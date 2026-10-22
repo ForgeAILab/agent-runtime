@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-22T12:28:05Z
+updated_at: 2026-10-22T14:32:43Z
 completed_at:
 ---
 
@@ -33,10 +33,10 @@ phase acceptance does not imply Forge D10 adoption readiness.
 
 ## 2. P2 Proof Reuse in Collection
 
-- [ ] 2.1 Bind collector proof handles to engine/domain/session/root, authority source, full session fence and mark epoch; charge temporary proof retention under unchanged memo policy.
-- [ ] 2.2 Authenticate current heads and certified historical pins, resolve dynamic writer tips/staged/transfer/catalog dependencies, and reuse exact proofs without flattening them into a fresh full set.
-- [ ] 2.3 Keep cold/uncertified/evicted-root tracing, complete membership integrity checks, retirement dependency indexing, session isolation and acknowledged-release memo trimming.
-- [ ] 2.4 Add head/retirement/epoch races, release-and-recreate pin, writer-pin freeze, FromIndex/shared-object and zero-budget cases; prove pin-presence-only and ignored-epoch negative controls fail.
+- [x] 2.1 Bind collector proof handles to engine/domain/session/root, authority source, full session fence and mark epoch; charge temporary proof retention under unchanged memo policy.
+- [x] 2.2 Authenticate current heads and certified historical pins, resolve dynamic writer tips/staged/transfer/catalog dependencies, and reuse exact proofs without flattening them into a fresh full set.
+- [x] 2.3 Keep cold/uncertified/evicted-root tracing, complete membership integrity checks, retirement dependency indexing, session isolation and acknowledged-release memo trimming.
+- [x] 2.4 Add head/retirement/epoch races, release-and-recreate pin, writer-pin freeze, FromIndex/shared-object and zero-budget cases; prove pin-presence-only and ignored-epoch negative controls fail.
 - [ ] 2.5 Run all preserved collection/storage cases and P2 matrix; require zero warm closure body reads/old-edge validation and B collection time at most 30% of pre-P2 while reporting inventory/apply/purge separately.
 
 ## 3. P3 Validated Writer-Open View (Deferred / Optional)
@@ -131,3 +131,31 @@ P0/fresh-round-1/final comparisons, fingerprint design note and the phase-4
 representation seam are recorded in
 `/Volumes/Data/tmp/refactor/rt-p1b2/report.md`. The phase-4 worktree was read
 only. Collection optimization and P2/P4 acceptance are not claimed here.
+
+## P2 Receipt (partial acceptance)
+
+Tasks 2.1–2.4 are implemented over the integrated P1/P4 representation and
+bounded cursor. Current and head-certified historical roots reuse immutable
+exact closure references, authenticated by engine/domain/session/root,
+authority source, full fence and mark epoch. Temporary cache-derived proof
+retention shares the unchanged configured memo budget. Collector lease/proof
+layers retain their original Arcs without member coalescing; membership pages
+count each layer independently and perform one lookup per layer/member.
+Cold, zero-budget, evicted, uncertified and invalid-root paths retain tracing.
+A failed live-subset check skips the session instead of restarting a physical
+page continuation indefinitely. Working-proof clearing also restarts marks
+with otherwise unchanged fences and lease ids.
+
+Final-source core journal tests: 133 passed, including 14 new P2 cases.
+All 14 supplied P4 fail-without controls and three P2 controls (pin-presence-only,
+ignored epoch and member coalescing) fail their targeted tests with the guard
+removed. Source bytes are restored before final validation. Preserved runtime,
+storage/conformance, packed, feature/parity, formatting and clippy checks pass.
+
+Task 2.5 remains unchecked for complete acceptance: the requested release
+B/1000/4000 plain/tool, N=100 and isolated C/1000 capture plus A warm-work
+diagnostics do not replace the full spec replicate/context matrix. Numeric
+thresholds, owner overhead/hold results and every remaining NOT MET item are
+reported in `/Volumes/Data/tmp/refactor/rt-p2/report.md`; raw fixtures are
+removed after summary extraction. No full P1/P4 or Forge adoption acceptance
+is implied.

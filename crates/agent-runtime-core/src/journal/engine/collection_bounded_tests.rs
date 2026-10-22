@@ -536,6 +536,9 @@ async fn an_over_capacity_session_is_skipped_while_the_others_are_collected() {
     let (storage, engine) = wide_world().await;
     let (reference_storage, reference) = wide_world().await;
     let wide = SessionId::new("w");
+    // Keep this a cold-trace cap test; warm proofs have their own reference
+    // cap and memo-budget tests.
+    engine.memo.lock().unwrap().remove_session(&wide);
     let before = storage.inner.members(&engine.domain, &wide).await.unwrap();
     engine.set_collection_cursor_cap(CAP).unwrap();
     let report = drain(&engine, JournalGcBudget::default(), u64::MAX).await;

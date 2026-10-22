@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-22T04:11:39Z
+updated_at: 2026-10-22T14:32:43Z
 ---
 
 # Proposal: Speed up journal commit, collection and writer open
@@ -75,7 +75,10 @@ accepted phases (P1/P2/P4), plus deferred optional P3, corresponding to profilin
 ## Review Status
 
 Owner decisions are recorded in [design.md](design.md#owner-decisions--2026-10-21).
-Other recommendations are accepted defaults. Phase 0 is authorized for implementation;
-P1/P2/P4 remain future implementation work and P3 is deferred/not required.
+Other recommendations are accepted defaults. The owner authorized P1/P4
+integration and P2 implementation on 2026-10-22. P2 functional tasks 2.1–2.4
+are implemented; performance acceptance remains partial. Phase 0/P1/P4 partial
+receipts and the P2 measurement scope are tracked in tasks.md. P3 remains
+deferred/not required.
 The [resolved questions](design.md#open-questions-resolved-2026-10-21) and
 [task checklist](tasks.md) track scope and evidence.

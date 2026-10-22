@@ -156,7 +156,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         let (memo_charge, memo_budget, memo_entries, details) = {
             let memo = self.memo.lock().map_err(|_| host_failure())?;
             (
-                memo.bytes,
+                memo.total_charge(),
                 memo.budget,
                 memo.profile_entries(),
                 memo.profile_details(),

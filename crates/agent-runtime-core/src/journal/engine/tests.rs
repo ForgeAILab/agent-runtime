@@ -51,6 +51,7 @@ struct LostAcknowledgement {
     lose: std::sync::atomic::AtomicBool,
     calls: Mutex<BTreeMap<(&'static str, SessionId), usize>>,
     pause_load: Mutex<Option<LoadPause>>,
+    pause_preflight: Mutex<Option<LoadPause>>,
     pin_writes: Mutex<Vec<(JournalWriteKind, usize)>>,
     failure: Mutex<Option<(SessionId, &'static str, RuntimeError)>>,
     hide_unreadable: std::sync::atomic::AtomicBool,
@@ -180,7 +181,13 @@ impl JournalStorage for LostAcknowledgement {
         &self,
         plan: &JournalCollectionPlan,
     ) -> Result<JournalCollectionPreflight, RuntimeError> {
-        self.inner.prepare_collection_apply(plan).await
+        let prepared = self.inner.prepare_collection_apply(plan).await?;
+        let pause = self.pause_preflight.lock().unwrap().take();
+        if let Some((ready, resume)) = pause {
+            ready.send(()).unwrap();
+            resume.await.unwrap();
+        }
+        Ok(prepared)
     }
     async fn apply_collection(
         &self,
@@ -734,14 +741,13 @@ async fn incremental_sweep_never_reads_ten_clean_sessions() {
         (("load", dirty.clone()), 1),
         (("pins", dirty.clone()), 1),
         (("members", dirty.clone()), 1),
-        (("objects", dirty.clone()), 2),
         (("apply", dirty), 1),
         (("dirty_sessions", SessionId::new("")), 2),
     ]
     .into();
     assert_eq!(
         calls, expected,
-        "clean sessions must receive no storage calls"
+        "clean sessions receive no storage calls and the warm dirty closure needs no body reads"
     );
     eprintln!("INCREMENTAL CALLS: {calls:?}; report: {report:?}");
     storage.calls.lock().unwrap().clear();
@@ -3131,3 +3137,6 @@ async fn a_revoke_during_a_commit_apply_keeps_working_views_cleared() {
         );
     }
 }
+
+#[path = "collection_proof_tests.rs"]
+mod collection_proof;

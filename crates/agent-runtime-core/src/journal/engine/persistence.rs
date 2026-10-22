@@ -13,7 +13,7 @@ pub(super) struct Metadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PinMetadata {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    memo_roots: BTreeSet<JournalObjectId>,
+    pub(super) memo_roots: BTreeSet<JournalObjectId>,
     pub(super) dependencies: PinDependencies,
     #[serde(default)]
     pub(super) writer_epochs: BTreeSet<u64>,

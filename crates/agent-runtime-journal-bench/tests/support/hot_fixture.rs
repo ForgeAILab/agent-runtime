@@ -824,7 +824,7 @@ pub(crate) async fn run(reporter: &mut Reporter, p: Parameters<'_>) -> (Case, Le
     drop(import_store);
     drop(import_file);
     let case = Case {
-        profile_revision: "p1-round2-live-v1",
+        profile_revision: "p2-authenticated-closure-v1",
         fixture: p.name.into(),
         n: p.n,
         tools: p.tools,

@@ -1001,18 +1001,23 @@ async fn released_body_references_are_revalidated_in_every_sharing_and_memo_mode
                 )
                 .await
                 .unwrap();
-            assert!(
-                other
+            let mut deleted = 0;
+            loop {
+                let report = other
                     .collect(JournalGcRequest {
                         storage_id: other.storage_id(),
                         expected_root_epoch: other.root_epoch().unwrap(),
-                        max_objects: u64::MAX
+                        max_objects: u64::MAX,
+                        work_budget: Default::default(),
                     })
                     .await
-                    .unwrap()
-                    .deleted
-                    > 0
-            );
+                    .unwrap();
+                deleted += report.deleted;
+                if !report.has_more {
+                    break;
+                }
+            }
+            assert!(deleted > 0);
             let previous = owned.clone();
             owned.extension_state.insert("k".into(), a);
             assert!(
@@ -1117,18 +1122,23 @@ async fn supplied_bodies_are_readmitted_after_release_even_when_the_bytes_are_ca
                 .iter()
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            assert!(
-                other
+            let mut deleted = 0;
+            loop {
+                let report = other
                     .collect(JournalGcRequest {
                         storage_id: other.storage_id(),
                         expected_root_epoch: other.root_epoch().unwrap(),
-                        max_objects: u64::MAX
+                        max_objects: u64::MAX,
+                        work_budget: Default::default(),
                     })
                     .await
-                    .unwrap()
-                    .deleted
-                    > 0
-            );
+                    .unwrap();
+                deleted += report.deleted;
+                if !report.has_more {
+                    break;
+                }
+            }
+            assert!(deleted > 0);
             let previous = owned.clone();
             owned.extension_state.insert("k".into(), a);
             let commit = random_commit(
@@ -1659,18 +1669,23 @@ async fn zero_budget_membership_uses_the_exact_closure_and_refuses_released_bodi
                 .is_some(),
             "the exact closure is the only membership certificate"
         );
-        assert!(
-            other
+        let mut deleted = 0;
+        loop {
+            let report = other
                 .collect(JournalGcRequest {
                     storage_id: other.storage_id(),
                     expected_root_epoch: other.root_epoch().unwrap(),
-                    max_objects: u64::MAX
+                    max_objects: u64::MAX,
+                    work_budget: Default::default(),
                 })
                 .await
-                .unwrap()
-                .deleted
-                > 0
-        );
+                .unwrap();
+            deleted += report.deleted;
+            if !report.has_more {
+                break;
+            }
+        }
+        assert!(deleted > 0);
         let previous = owned.clone();
         owned.extension_state.insert("k".into(), a);
         let omitted = random_commit(Some(&second), Some(&previous), &owned, 2, &mut known);

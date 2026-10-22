@@ -23,6 +23,7 @@
 //!   Close, renew and revocation only remove protection.
 use super::controls::CollectionFailures;
 use super::persistence::{CatalogMetadata, Metadata, PinMetadata, decode, invalid_state};
+use super::transition::ReachableLayer;
 use super::*;
 use crate::error::UnsupportedCapability;
 use std::collections::VecDeque;
@@ -148,6 +149,27 @@ enum Phase {
 }
 
 #[derive(Debug)]
+enum AuthoritySource {
+    Current,
+    CertifiedPin(JournalPinId),
+}
+
+/// Authority belongs to this mark, not to the cached graph alone. The budget
+/// reservation outlives cache eviction and is released with the cursor.
+#[derive(Debug)]
+struct AuthenticatedClosure {
+    domain: JournalDomain,
+    session: SessionId,
+    root: JournalObjectId,
+    authority: AuthoritySource,
+    fence: JournalFence,
+    epoch: u64,
+    closure: Arc<ClosureEvidence>,
+    dependencies: DependencyRoots,
+    retention: super::memo::ProofRetention,
+}
+
+#[derive(Debug)]
 struct SessionMark {
     session: SessionId,
     stored: Option<JournalSessionRecord>,
@@ -160,6 +182,12 @@ struct SessionMark {
     visited_kinds: usize,
     // Validated non-head pin roots and live lease roots.
     extra: BTreeSet<JournalObjectId>,
+    // Immutable lease/proof layers stay shared across cursor yields.
+    shared: ReachableSet,
+    proofs: BTreeMap<JournalObjectId, AuthenticatedClosure>,
+    certificates: BTreeMap<JournalObjectId, JournalPinId>,
+    epoch: u64,
+    shared_members: Vec<usize>,
     frontier: Vec<Frontier>,
     dependencies: BTreeSet<SessionId>,
     pins_done: bool,
@@ -175,6 +203,8 @@ struct SessionMark {
     dep_queue: VecDeque<SessionId>,
     // This session's lease ids when its lease roots were added to the mark.
     leases: Option<BTreeSet<u64>>,
+    // A writer can clear/replace its working proof without changing lease ids.
+    working: Option<std::sync::Weak<ClosureEvidence>>,
 }
 
 impl SessionMark {
@@ -190,6 +220,11 @@ impl SessionMark {
             visited: BTreeMap::new(),
             visited_kinds: 0,
             extra: BTreeSet::new(),
+            shared: ReachableSet::default(),
+            proofs: BTreeMap::new(),
+            certificates: BTreeMap::new(),
+            epoch: 0,
+            shared_members: Vec::new(),
             frontier: Vec::new(),
             dependencies: BTreeSet::new(),
             pins_done: false,
@@ -204,6 +239,7 @@ impl SessionMark {
             garbage: VecDeque::new(),
             dep_queue: VecDeque::new(),
             leases: None,
+            working: None,
         }
     }
     fn charge(&self) -> usize {
@@ -218,13 +254,28 @@ impl SessionMark {
             + self.garbage.len()
             + self.dep_queue.len()
             + self.dependencies.len()
+            + 2 * self.certificates.len()
             + chain)
             * ID_CHARGE
             + self.visited_kinds * 8
             + self.pin_bytes
+            + self.proofs.len() * (std::mem::size_of::<AuthenticatedClosure>() + 4 * ID_CHARGE)
+            + self.shared.layers.len() * std::mem::size_of::<Arc<ReachableLayer>>()
+            + self.shared_members.len() * std::mem::size_of::<usize>()
     }
-    fn live(&self, id: &JournalObjectId) -> bool {
-        self.visited.contains_key(id) || self.extra.contains(id)
+    // Collector workspace retains references. The writer's extend_layer can
+    // coalesce member layers through COW, allocating a new full member set.
+    fn share_layer(&mut self, layer: Arc<ReachableLayer>) {
+        if self.shared.layers.iter().any(|held| {
+            Arc::ptr_eq(held, &layer)
+                || match (held.as_ref(), layer.as_ref()) {
+                    (ReachableLayer::Evidence(a), ReachableLayer::Evidence(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                }
+        }) {
+            return;
+        }
+        self.shared.layers.push(layer);
     }
     fn live_count(&self) -> usize {
         self.visited.len()
@@ -301,6 +352,10 @@ fn unsupported() -> RuntimeError {
 pub(super) fn page_restart(error: &RuntimeError) -> bool {
     !error.retryable
         && error.metadata.get("journal_invalid_state").is_none()
+        && error
+            .metadata
+            .get("journal_collection_incomplete_members")
+            .is_none()
         && matches!(
             error.class,
             crate::error::FailureClass::StateConflict { .. }
@@ -521,11 +576,20 @@ impl<S: JournalStorage> JournalEngine<S> {
                         // lease roots were taken. Added leases are also
                         // filtered before every apply; a closed one would only
                         // keep garbage until the next pass.
-                        let leases_changed = mark.leases.as_ref().is_some_and(|taken| {
-                            self.local
-                                .lock()
-                                .is_ok_and(|local| Self::lease_ids(&local, &session) != *taken)
-                        });
+                        let (leases_changed, epoch) = {
+                            let local = self.local.lock()?;
+                            let leases_changed = mark
+                                .leases
+                                .as_ref()
+                                .is_some_and(|taken| Self::lease_ids(&local, &session) != *taken);
+                            let working_changed = local
+                                .sessions
+                                .get(&session)
+                                .and_then(|record| record.exact.as_ref())
+                                .map(Arc::as_ptr)
+                                != mark.working.as_ref().map(std::sync::Weak::as_ptr);
+                            (leases_changed || working_changed, local.root_epoch)
+                        };
                         if fence != mark.fence || leases_changed {
                             diag(
                                 if fence != mark.fence {
@@ -539,6 +603,10 @@ impl<S: JournalStorage> JournalEngine<S> {
                             diag("rt.gc.remarked", mark.live_count() as u64, 0);
                             cursor.mark = None;
                             Self::restart(cursor, call, failures, session);
+                        } else {
+                            // The fence and local protection snapshot authenticate
+                            // adopting this epoch. A later close gets a newer epoch.
+                            Self::adopt_mark_epoch(cursor.mark.as_mut().expect("mark"), epoch);
                         }
                     }
                     None => {
@@ -548,6 +616,14 @@ impl<S: JournalStorage> JournalEngine<S> {
                 }
             }
             loop {
+                if let Some(mark) = cursor.mark.as_mut() {
+                    if !self.refresh_mark_epoch(mark)? {
+                        let session = mark.session.clone();
+                        cursor.mark = None;
+                        Self::restart(cursor, call, failures, session);
+                        continue;
+                    }
+                }
                 let step = if cursor.mark.is_some() {
                     self.mark_step(request, cursor, call, report, failures)
                         .await?
@@ -642,9 +718,24 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         let started = Instant::now();
         call.units += 1;
+        let (epoch, leases, working) = {
+            let local = self.local.lock()?;
+            (
+                local.root_epoch,
+                Self::lease_ids(&local, &session),
+                local
+                    .sessions
+                    .get(&session)
+                    .and_then(|r| r.exact.as_ref())
+                    .map(Arc::downgrade),
+            )
+        };
         let read = async {
             let stored = self.storage.load(&self.domain, &session).await?;
             let mut mark = SessionMark::new(session.clone(), stored);
+            mark.working = working;
+            mark.epoch = epoch;
+            mark.leases = Some(leases);
             if let Some(stored) = &mark.stored {
                 let metadata: Metadata = decode(&stored.engine)?;
                 if let Some(head) = &stored.head {
@@ -652,10 +743,13 @@ impl<S: JournalStorage> JournalEngine<S> {
                         return Err(unsupported());
                     }
                     mark.dependencies.extend(metadata.dependencies.sessions);
-                    mark.frontier.push(Frontier::Edge(
-                        head.id.clone(),
-                        ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
-                    ));
+                    let root = head.id.clone();
+                    if !self.reuse_proof(&mut mark, &root)? {
+                        mark.frontier.push(Frontier::Edge(
+                            root,
+                            ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
+                        ));
+                    }
                 }
             }
             Ok(mark)
@@ -770,6 +864,16 @@ impl<S: JournalStorage> JournalEngine<S> {
         observe(&mut cursor.costs, kind, started.elapsed());
         diag(UNIT_LABELS[kind as usize], 1, nanos(started.elapsed()));
         match result {
+            Err(error)
+                if error
+                    .metadata
+                    .get("journal_collection_mark_changed")
+                    .is_some() =>
+            {
+                cursor.mark = None;
+                Self::restart(cursor, call, failures, session);
+                Ok(Step::Continue)
+            }
             Err(error) if error.metadata.get("journal_collection_contract").is_some() => Err(error),
             Err(error)
                 if error
@@ -850,6 +954,11 @@ impl<S: JournalStorage> JournalEngine<S> {
         if mark.chain.is_none() {
             if let Some(pin) = mark.pins.pop_front() {
                 let metadata: PinMetadata = decode(&pin.engine)?;
+                for root in &pin.roots {
+                    if metadata.memo_roots.contains(root) {
+                        mark.certificates.insert(root.clone(), pin.pin.clone());
+                    }
+                }
                 let mut pending = pin.roots.clone();
                 if let Some(record) = &mark.stored {
                     if metadata.writer_epochs.contains(&record.writer_epoch) {
@@ -961,10 +1070,25 @@ impl<S: JournalStorage> JournalEngine<S> {
         let mark = cursor.mark.as_mut().expect("mark");
         let mut batch = Vec::new();
         let mut ids = BTreeSet::new();
-        while batch.len() < call.unit_items {
+        let mut inspected = 0;
+        while inspected < call.unit_items {
             let Some(item) = mark.frontier.pop() else {
                 break;
             };
+            inspected += 1;
+            let proof_root = match &item {
+                Frontier::PinRoot(id) => Some(id),
+                Frontier::Edge(
+                    id,
+                    ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
+                ) => Some(id),
+                _ => None,
+            };
+            if let Some(root) = proof_root {
+                if self.reuse_proof(mark, root)? {
+                    continue;
+                }
+            }
             let fresh = match &item {
                 Frontier::Edge(id, expected) => mark
                     .visited
@@ -992,11 +1116,14 @@ impl<S: JournalStorage> JournalEngine<S> {
                 mark.visited_kinds,
                 mark.visited.values().map(Vec::len).sum::<usize>()
             );
-            mark.phase = Phase::Leases;
+            if mark.frontier.is_empty() {
+                mark.phase = Phase::Leases;
+            }
             return Ok(());
         }
         let ids: Vec<_> = ids.into_iter().collect();
         let session = mark.session.clone();
+        diag("rt.gc.body_fetch", ids.len() as u64, 0);
         let bodies = self.storage.objects(&self.domain, &session, &ids).await?;
         if bodies.len() != ids.len() {
             return Err(conflict());
@@ -1060,6 +1187,148 @@ impl<S: JournalStorage> JournalEngine<S> {
         Ok(())
     }
 
+    // Global epoch changes are examined, but only this session's changed
+    // protection discards work. Other sessions cannot invalidate its proof.
+    fn refresh_mark_epoch(&self, mark: &mut SessionMark) -> Result<bool, RuntimeError> {
+        let local = self.local.lock()?;
+        if local.root_epoch != mark.epoch {
+            let changed = mark
+                .leases
+                .as_ref()
+                .is_some_and(|taken| Self::lease_ids(&local, &mark.session) != *taken)
+                || local
+                    .sessions
+                    .get(&mark.session)
+                    .and_then(|r| r.exact.as_ref())
+                    .map(Arc::as_ptr)
+                    != mark.working.as_ref().map(std::sync::Weak::as_ptr);
+            if changed {
+                diag("rt.gc.restart.epoch", 1, 0);
+                return Ok(false);
+            }
+            Self::adopt_mark_epoch(mark, local.root_epoch);
+        }
+        Ok(true)
+    }
+
+    fn adopt_mark_epoch(mark: &mut SessionMark, epoch: u64) {
+        mark.epoch = epoch;
+        for proof in mark.proofs.values_mut() {
+            proof.epoch = epoch;
+        }
+    }
+
+    fn reuse_proof(
+        &self,
+        mark: &mut SessionMark,
+        root: &JournalObjectId,
+    ) -> Result<bool, RuntimeError> {
+        if mark.proofs.contains_key(root) {
+            return Ok(true);
+        }
+        if self.local.lock()?.root_epoch != mark.epoch {
+            return Ok(false);
+        }
+        let authority = if mark.stored.as_ref().is_some_and(|record| {
+            record.retirement.is_none() && record.head.as_ref().is_some_and(|h| &h.id == root)
+        }) {
+            let head: JournalHead = mark
+                .stored
+                .as_ref()
+                .and_then(|r| r.head.as_ref())
+                .ok_or_else(conflict)?
+                .decode(JournalObjectKind::Head)
+                .map_err(invalid_state)?;
+            if head.storage_id != self.domain.storage_id
+                || head.role != self.domain.role
+                || head.session != mark.session
+                || head.retirement.is_some()
+            {
+                return Err(invalid_state(conflict()));
+            }
+            AuthoritySource::Current
+        } else if let Some(pin) = mark.certificates.get(root) {
+            AuthoritySource::CertifiedPin(pin.clone())
+        } else {
+            return Ok(false);
+        };
+        let mut memo = self.memo.lock().map_err(|_| host_failure())?;
+        let Some(entry) = memo.get(&mark.session, root) else {
+            return Ok(false);
+        };
+        if !entry.closure.is_head_root(root) {
+            memo.remove_root(&mark.session, root);
+            return Ok(false);
+        }
+        let bytes = entry
+            .closure
+            .charge()
+            .saturating_add(std::mem::size_of::<DependencyRoots>())
+            .saturating_add(
+                (entry.dependencies.sessions.len() + entry.dependencies.catalog_sessions.len() + 4)
+                    * ID_CHARGE,
+            );
+        let Some(retention) = memo.retain_collection_proof(bytes) else {
+            return Ok(false);
+        };
+        let closure = entry.closure.clone();
+        let dependencies = entry.dependencies.clone();
+        if dependencies.unresolved {
+            return Err(unsupported());
+        }
+        mark.dependencies
+            .extend(dependencies.sessions.iter().cloned());
+        mark.shared.push_evidence(closure.clone());
+        diag("rt.gc.proof.roots", 1, bytes as u64);
+        diag(
+            "rt.gc.proof.retained",
+            1,
+            (memo.total_charge() - memo.bytes) as u64,
+        );
+        diag("rt.gc.proof.members", closure.len() as u64, 0);
+        mark.proofs.insert(
+            root.clone(),
+            AuthenticatedClosure {
+                domain: self.domain.clone(),
+                session: mark.session.clone(),
+                root: root.clone(),
+                authority,
+                fence: mark.fence,
+                epoch: mark.epoch,
+                closure,
+                dependencies,
+                retention,
+            },
+        );
+        Ok(true)
+    }
+
+    fn check_proof_bindings(&self, mark: &SessionMark) -> Result<(), RuntimeError> {
+        let memo = self.memo.lock().map_err(|_| host_failure())?;
+        for (root, proof) in &mark.proofs {
+            let held = match &proof.authority {
+                AuthoritySource::Current => mark.stored.as_ref().is_some_and(|record| {
+                    record.retirement.is_none()
+                        && record.head.as_ref().is_some_and(|h| &h.id == root)
+                }),
+                AuthoritySource::CertifiedPin(pin) => mark.certificates.get(root) == Some(pin),
+            };
+            if !held
+                || !proof.retention.belongs_to(&memo)
+                || proof.domain != self.domain
+                || proof.session != mark.session
+                || &proof.root != root
+                || proof.fence != mark.fence
+                || proof.epoch != mark.epoch
+                || !proof.closure.is_head_root(root)
+                || proof.dependencies.unresolved
+            {
+                return Err(conflict());
+            }
+        }
+        Ok(())
+    }
+
     fn lease_ids(local: &super::transition::State, session: &SessionId) -> BTreeSet<u64> {
         local
             .leases
@@ -1071,17 +1340,19 @@ impl<S: JournalStorage> JournalEngine<S> {
 
     fn lease_unit(&self, cursor: &mut CollectionCursor) -> Result<(), RuntimeError> {
         let mark = cursor.mark.as_mut().expect("mark");
+        let session = mark.session.clone();
         let local = self.local.lock()?;
-        mark.leases = Some(Self::lease_ids(&local, &mark.session));
+        mark.leases = Some(Self::lease_ids(&local, &session));
         for lease in local
             .leases
             .values()
-            .filter(|lease| lease.session == mark.session)
+            .filter(|lease| lease.session == session)
         {
             for layer in &lease.reachable.layers {
-                mark.extra.extend(layer.iter().cloned());
+                mark.share_layer(Arc::clone(layer));
             }
         }
+        mark.shared_members = vec![0; mark.shared.layers.len()];
         mark.phase = Phase::Inventory;
         Ok(())
     }
@@ -1096,8 +1367,21 @@ impl<S: JournalStorage> JournalEngine<S> {
     ) -> Result<(), RuntimeError> {
         let mark = cursor.mark.as_mut().expect("mark");
         if mark.members_started && mark.member_after.is_none() {
-            if mark.live_members != mark.live_count() {
-                return Err(conflict());
+            if mark.live_members != mark.live_count()
+                || mark
+                    .shared
+                    .layers
+                    .iter()
+                    .zip(&mark.shared_members)
+                    .any(|(layer, members)| layer.len() != *members)
+            {
+                // This is a failed live-subset check, not a rejected physical
+                // continuation. Retrying the same mark cannot repair it.
+                let mut error = conflict();
+                error
+                    .metadata
+                    .insert("journal_collection_incomplete_members", true);
+                return Err(error);
             }
             mark.dep_queue = std::mem::take(&mut mark.dependencies).into_iter().collect();
             mark.phase = Phase::Dependencies;
@@ -1117,9 +1401,17 @@ impl<S: JournalStorage> JournalEngine<S> {
         if let JournalCollectionItems::Members(ids) = page.items {
             report.examined += ids.len() as u64;
             for id in ids {
-                if mark.live(&id) {
+                let mut live = mark.visited.contains_key(&id) || mark.extra.contains(&id);
+                if live {
                     mark.live_members += 1;
-                } else {
+                }
+                for (layer, members) in mark.shared.layers.iter().zip(&mut mark.shared_members) {
+                    if layer.contains(&id) {
+                        *members += 1;
+                        live = true;
+                    }
+                }
+                if !live {
                     mark.garbage.push_back(id);
                 }
             }
@@ -1247,6 +1539,14 @@ impl<S: JournalStorage> JournalEngine<S> {
                 _ => return Err(unsupported()),
             }
         };
+        if !self.refresh_mark_epoch(mark)? {
+            let mut error = conflict();
+            error
+                .metadata
+                .insert("journal_collection_mark_changed", true);
+            return Err(error);
+        }
+        self.check_proof_bindings(mark)?;
         let complete = take == remaining;
         let written = plan.write.record.clone();
         let release = plan.write.release.clone();
@@ -1255,6 +1555,9 @@ impl<S: JournalStorage> JournalEngine<S> {
         report.reclaimed_bytes += receipt.reclaimed_bytes;
         let mark = cursor.mark.as_mut().expect("mark");
         mark.fence = written.fence();
+        for proof in mark.proofs.values_mut() {
+            proof.fence = mark.fence;
+        }
         mark.stored = Some(written);
         mark.garbage.drain(..take);
         let mut local = self.local.lock()?;
