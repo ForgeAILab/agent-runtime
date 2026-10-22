@@ -184,7 +184,9 @@ impl ReachableSet {
         if self.layers.iter().any(|old| {
             Arc::ptr_eq(old, &layer)
                 || match (old.as_ref(), layer.as_ref()) {
-                    (ReachableLayer::Evidence(a), ReachableLayer::Evidence(b)) => Arc::ptr_eq(a, b),
+                    (ReachableLayer::Evidence(a), ReachableLayer::Evidence(b)) => {
+                        Arc::ptr_eq(a, b) || a.shares_members(b)
+                    }
                     _ => false,
                 }
         }) {
@@ -211,8 +213,39 @@ impl ReachableSet {
                 Err(newer) => older.extend(newer.iter().cloned()),
             }
         }
+        // Evidence layers never merge with their neighbours, so repeated
+        // renews against heads written by others would grow the stack (and
+        // every `contains`) without bound. Fold the older half into one
+        // member-set layer once the cap is reached; the cost amortizes over
+        // the following half-cap pushes.
+        if self.layers.len() > MAX_REACHABLE_LAYERS {
+            let folded = self
+                .layers
+                .drain(..=MAX_REACHABLE_LAYERS / 2)
+                .flat_map(|layer| layer.iter().cloned().collect::<Vec<_>>())
+                .collect::<BTreeSet<_>>();
+            self.layers
+                .insert(0, Arc::new(ReachableLayer::Members(folded)));
+        }
+    }
+    /// Copies this set's layers into a durable pin. Member layers are shared;
+    /// closure evidence keeps only its persistent member set, so a pin never
+    /// retains a closure's activation map after the memo evicts it.
+    pub(super) fn copy_into_pin(&self, pin: &mut ReachableSet) {
+        for layer in &self.layers {
+            match layer.as_ref() {
+                ReachableLayer::Members(_) => pin.extend_layer(Arc::clone(layer)),
+                ReachableLayer::Evidence(proof) => {
+                    pin.push_evidence(Arc::new(proof.membership_only()))
+                }
+            }
+        }
     }
 }
+
+/// Above this many layers the older half of a reachable set is folded into
+/// one member-set layer.
+pub(in crate::journal) const MAX_REACHABLE_LAYERS: usize = 16;
 
 /// One immutable copy-on-write layer of the object store or a pin closure.
 trait Layer: Clone {
@@ -638,9 +671,7 @@ impl Transition {
         for layer in record.roots.layers {
             existing.roots.extend(layer.iter().cloned());
         }
-        for layer in record.reachable.layers {
-            existing.reachable.extend_layer(layer);
-        }
+        record.reachable.copy_into_pin(&mut existing.reachable);
         if let Some(root) = current_root.filter(|root| existing.roots.contains(root)) {
             existing.memo_roots.insert(root);
         }
@@ -1516,9 +1547,7 @@ impl Transition {
             for layer in &staged_lease.roots.layers {
                 pin.roots.extend(layer.iter().cloned());
             }
-            for layer in &staged_lease.reachable.layers {
-                pin.reachable.extend_layer(Arc::clone(layer));
-            }
+            staged_lease.reachable.copy_into_pin(&mut pin.reachable);
         }
         self.fail_if_armed(JournalCommitFailurePoint::AfterPin)?;
 
@@ -1884,6 +1913,92 @@ mod reachable_layer_tests {
                 .flat_map(|layer| layer.iter().cloned())
                 .collect::<BTreeSet<_>>(),
             expected
+        );
+    }
+
+    fn message_closure(i: usize) -> Arc<ClosureEvidence> {
+        let object = JournalObject::encode(
+            JournalObjectKind::Message,
+            &crate::content::Message::user(format!("head {i}")),
+        )
+        .unwrap();
+        let mut objects =
+            ObjectStore::from_shared([(object.id.clone(), Arc::new(object.bytes))].into());
+        Arc::new(
+            ClosureEvidence::update(
+                None,
+                &mut objects,
+                object.id,
+                ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Message)),
+            )
+            .unwrap(),
+        )
+    }
+
+    // Round-2 L7: renews against 300 distinct heads written by others keep
+    // the layer stack bounded and every member reachable.
+    #[test]
+    fn distinct_head_renews_keep_the_layer_count_bounded() {
+        let mut lease = ReachableSet::default();
+        let mut expected = BTreeSet::new();
+        for i in 0..300 {
+            let proof = message_closure(i);
+            expected.extend(proof.iter().cloned());
+            lease.push_evidence(proof);
+            if i % 7 == 0 {
+                let own = JournalObject::encode(
+                    JournalObjectKind::Message,
+                    &crate::content::Message::user(format!("own {i}")),
+                )
+                .unwrap()
+                .id;
+                expected.insert(own.clone());
+                lease.extend(BTreeSet::from([own]));
+            }
+            assert!(lease.layers.len() <= MAX_REACHABLE_LAYERS, "renew {i}");
+        }
+        assert!(expected.iter().all(|id| lease.contains(id)));
+        assert_eq!(
+            lease
+                .layers
+                .iter()
+                .flat_map(|layer| layer.iter().cloned())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
+
+    // Round-2 L8: a durable pin keeps closure membership only, and copying
+    // the same lease again adds no layers.
+    #[test]
+    fn pins_keep_membership_only_and_copy_idempotently() {
+        let mut lease = ReachableSet::default();
+        for i in 0..5 {
+            lease.push_evidence(message_closure(i));
+        }
+        lease.extend(BTreeSet::from([JournalObject::encode(
+            JournalObjectKind::Message,
+            &crate::content::Message::user("own"),
+        )
+        .unwrap()
+        .id]));
+        let mut pin = ReachableSet::default();
+        lease.copy_into_pin(&mut pin);
+        let layers = pin.layers.len();
+        for _ in 0..50 {
+            lease.copy_into_pin(&mut pin);
+        }
+        assert_eq!(pin.layers.len(), layers);
+        for layer in &pin.layers {
+            if let ReachableLayer::Evidence(proof) = layer.as_ref() {
+                assert!(proof.is_membership_only());
+            }
+        }
+        assert!(
+            lease
+                .layers
+                .iter()
+                .all(|layer| layer.iter().all(|id| pin.contains(id)))
         );
     }
 }
