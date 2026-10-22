@@ -18,7 +18,12 @@ contain breaking changes and are coordinated with consumer proposals.
   `expected_root_epoch` before each call, and may sum reports with
   `JournalGcReport::accumulate`. Counts, receipts and unreadable sessions are
   per call. A stale `expected_root_epoch` still conflicts; `max_objects` still
-  bounds membership releases per call.
+  bounds membership releases per call. Reports also carry
+  `zero_work_calls` and `over_capacity_sessions` (a session over the 16 MiB
+  cursor cap is skipped and reported instead of failing the call).
+- `JournalStorage::apply_collection` returns `JournalCollectionReceipt`
+  (`receipt` plus `rewritten_units`); a preflight `Fits { units }` above the
+  plan's `max_units` is rejected by the engine.
 - `JournalStorage` requires `collection_capability`, `collection_page`,
   `prepare_collection_apply` and `apply_collection` with no default bodies.
   Every adapter and wrapper must declare bounded support or
@@ -34,7 +39,8 @@ contain breaking changes and are coordinated with consumer proposals.
 - Storage conformance adds `bounded_collection_protocol` (fence-bound one-item
   pages, stale-fence and cross-scope continuation rejection, no-effect
   preflight, complete atomic apply, stale-plan rejection) with broken-adapter
-  controls for unbounded pages, stale pages and partial applies. Collection
+  controls for unbounded pages, stale pages, partial applies, under-reported
+  preflight units and dropped pin pages. Collection
   conformance fixtures drain explicitly.
 
 ## [0.9.0] - 2026-10-20

@@ -447,9 +447,13 @@ page/difference position, dependency-index progress, pending release batch and
 storage maintenance continuation. Limit units by both ids and encoded bytes;
 one huge JSON object or pin cannot count as one cheap unit. Include cumulative
 cursor charge and cap additional workspace at 16 MiB per engine; on eviction abandon speculative work and retain
-dirty state. If unchanged work cannot fit the configured capacity, return typed
-unsupported while retaining content rather than repeatedly yielding/restarting
-without progress. Avoid recursive drop of a long chain of persistent versions.
+dirty state. The cap is checked inside a trace unit after every object, not
+only after a unit. A session whose unchanged mark cannot fit the configured
+capacity is a per-session skip: its speculative state is dropped, its durable
+dirty flag and local hint are retained, it is reported in
+`over_capacity_sessions` and excluded from `has_more` for that pass, and later
+sessions keep progressing. It is never a call-level error and never an endless
+restart. Avoid recursive drop of a long chain of persistent versions.
 
 The cursor is process-local, bounded, and disposable. Durable dirty marks,
 session generations, pin/catalog records, membership and acknowledged writes
@@ -500,20 +504,35 @@ unit; one dependency target per unit; one release batch per session of up to
 unbounded collector), split by storage preflight; the packed adapter splits a
 release that touches more than 32 sealed packs. Instead of fixed 64-edge
 steps, every unit reserves a decaying maximum of its kind's measured cost
-against the 250 ms target; the first unit of a call always starts. A resumed
-mark's fence read is a prerequisite, not a unit. The gate is acquired with the
-existing futures mutex without a timer; a call whose gate wait consumed its
-target yields without work after acquisition.
+against the 250 ms target. First-unit rule: once the gate is held the first
+unit of a call always starts, even when the gate wait consumed the target, so
+a call under sustained turn contention still progresses; its own hold is then
+that one bounded unit (the 1 s call bound applies to the hold, not the wait).
+A resumed mark's fence read is a prerequisite, not a unit. The gate is
+acquired with the existing futures mutex without a timer. Reports carry
+`work_units` and `zero_work_calls` (consecutive calls that started no unit) so
+a host can back off. A restarted session is retried after the current
+discovery page (rotated to the back), and a second restart within one call
+skips it for that call, so one churning session never stalls a pass. A
+session stopped part-way by the `max_objects` budget makes its pass end with
+`has_more`. Dropping a call mid-flight restores the dirty hints it took.
 
 ### Epoch/fence safety across yields
 
 A request with stale `expected_root_epoch` still returns the existing conflict
 before destructive work. `Restarted` describes a stale private cursor only when
 the request itself carries a valid current epoch. Before resuming, authenticate
-the session fence, relevant head/pins and mark epoch. A commit, writer change, retirement, pin/staging change, close or revoke
-that invalidates the mark discards the affected speculative cursor state before
-any new release. Conservatively restarting a whole mark on an unexplained
-global epoch change is allowed. Never rebase an old live set onto a new fence
+the session fence and that session's lease set. A commit, writer change,
+retirement, pin/staging/catalog change or dependency index write changes the
+session's fence; a reader open/close/revoke on that session changes its lease
+set; either discards that session's speculative mark (Restarted) before any new
+release. Changes on other sessions never restart it, and a root-epoch change
+alone is not a restart cause: close, renew and revoke only remove protection,
+and lease roots registered after the mark are filtered out of every release
+batch before its apply. The former pre-release epoch conflict inside a call is
+removed for the same reason. A page conflict under an unchanged fence (a
+physical repack/compaction that rejected a continuation) restarts the
+session's mark instead of skipping it. Never rebase an old live set onto a new fence
 without revalidation. After the collector's own acknowledged generation/epoch
 change, update its cursor to that exact result; acknowledge no outside change
 as its own. Storage continuations remain bound to their original fence: after

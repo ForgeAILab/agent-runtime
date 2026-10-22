@@ -70,6 +70,16 @@ packed adapter's whole-session index build on first touch, no FromIndex or
 storage-reconnect interleavings, and the full-matrix C context. Evidence and
 the exact NOT MET list: `/Volumes/Data/tmp/refactor/rt-p4/report.md`.
 
+Review fix round (`/Volumes/Data/tmp/refactor/rt-p4-review/report.md`): the
+first-unit rule (a held gate always runs one unit; `zero_work_calls`
+reported), restart only on the session's own fence or lease-set change with
+restarted sessions rotated behind the pass, per-session over-capacity skip
+(`over_capacity_sessions`, in-unit cap check), engine rejection of `Fits` over
+`max_units`, receipts with `rewritten_units` checked by conformance, bounded
+retired purge/base repack in the packed adapter, member continuations bound to
+the session's own pack version, `has_more` after a partial release, cancel-safe
+hints and one shared apply helper. Evidence: `/Volumes/Data/tmp/refactor/rt-p4/fix-report.md`.
+
 ## 5. Combined Validation and Release Handoff
 
 - [ ] 5.1 Run every existing core journal, testkit protected/ordinary/storage/collection/broken-adapter, packed configuration and runtime session-journal equivalence/import/crash suite without weakening cases.
