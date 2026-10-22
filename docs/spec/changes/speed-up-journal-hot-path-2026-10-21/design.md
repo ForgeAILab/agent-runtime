@@ -492,6 +492,19 @@ at every acknowledged batch: split before crossing thresholds for too many
 packs; do not acknowledge an over-threshold pack and promise a later repair.
 Retired-session full purge can span batches while its dirty marker remains.
 
+Implementation calibration (P4 receipt, same defaults in every paired run):
+32 dirty-session ids per discovery page; at most 256 ids per trace batch,
+member page and pin page; one catalog lookup per chain step, at most 256 per
+unit; one dependency target per unit; one release batch per session of up to
+20,000 ids (one apply per session keeps physical receipts equal to the
+unbounded collector), split by storage preflight; the packed adapter splits a
+release that touches more than 32 sealed packs. Instead of fixed 64-edge
+steps, every unit reserves a decaying maximum of its kind's measured cost
+against the 250 ms target; the first unit of a call always starts. A resumed
+mark's fence read is a prerequisite, not a unit. The gate is acquired with the
+existing futures mutex without a timer; a call whose gate wait consumed its
+target yields without work after acquisition.
+
 ### Epoch/fence safety across yields
 
 A request with stale `expected_root_epoch` still returns the existing conflict

@@ -49,14 +49,26 @@ phase acceptance does not imply Forge D10 adoption readiness.
 
 ## 4. P4 Bounded Collection Calls
 
-- [ ] 4.1 Finalize listed breaking request/report/progress/storage contracts and migration helpers; retain max_objects release semantics and explicit unsupported capability refusal.
+- [x] 4.1 Finalize listed breaking request/report/progress/storage contracts and migration helpers; retain max_objects release semantics and explicit unsupported capability refusal.
 - [ ] 4.2 Implement a charged engine-local cursor and budget checks for discovery, proof/cold mark, inventory, dependencies, release, S5, purge and S2, with bounded iterative work/drop and fair quiescent progress.
 - [ ] 4.3 Implement fence/scope-bound metadata/pin/catalog/member/maintenance pages and incremental opaque-metadata decoding in volatile/packed storage; reject whole-result-then-slice implementations.
 - [ ] 4.4 Add bounded read-only apply preflight, no-effect split requests and complete atomic collection batches; preserve threshold purge, shared holders, replay window and exact physical-copy receipts.
-- [ ] 4.5 Authenticate epoch/fence/authority across every yield/await; discard stale marks, update only acknowledged collector-owned progress, and keep durable/local dirty state until the session and its maintenance finish.
+- [x] 4.5 Authenticate epoch/fence/authority across every yield/await; discard stale marks, update only acknowledged collector-owned progress, and keep durable/local dirty state until the session and its maintenance finish.
 - [ ] 4.6 Add one-work-unit yields at every state boundary; interleave roots/pins/staging/close/revoke/retirement/dependencies, lost acknowledgements, restarts and session/domain failures; prove stale-page/fence, unbounded-page and partial-apply adapters fail.
 - [ ] 4.7 Test huge no-garbage marks, pin/catalog chains, dirty/unreadable-session fairness, cursor cap, zero releases, all sharing/repack modes and deferred body/operation maintenance.
 - [ ] 4.8 Run P4 full matrix/isolated C and 100-dirty-session acceptance; require every call and hold <1 s, target <250 ms, terminating equivalent drains and ≤15% full-drain time/pack-write overhead.
+
+### P4 Receipt (partial)
+
+Implemented on `feat/hotpath-p4`: 4.1 and 4.5 complete; 4.2, 4.3, 4.4, 4.6,
+4.7 and 4.8 partial. Open items: whole-record metadata reads (no chunked
+metadata pages or incremental opaque decoding), catalog point lookups instead
+of catalog pages, no separate maintenance pages, S5/purge/S2 bounded only as
+part of one atomic apply (release splitting bounds the packs a release
+touches; retired forced purge and base repack are counted, not split), the
+packed adapter's whole-session index build on first touch, no FromIndex or
+storage-reconnect interleavings, and the full-matrix C context. Evidence and
+the exact NOT MET list: `/Volumes/Data/tmp/refactor/rt-p4/report.md`.
 
 ## 5. Combined Validation and Release Handoff
 
