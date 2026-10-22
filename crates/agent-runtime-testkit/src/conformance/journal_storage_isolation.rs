@@ -152,7 +152,7 @@ async fn collect(f: &SessionJournalCollectionFixture) -> JournalGcReport {
         let more = report.has_more;
         match &mut total {
             None => total = Some(report),
-            Some(total) => accumulate(total, report),
+            Some(total) => total.accumulate(report),
         }
         if !more {
             return total.unwrap();

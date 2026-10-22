@@ -683,6 +683,24 @@ pub struct JournalGcReport {
     pub work_units: u64,
 }
 
+impl JournalGcReport {
+    /// Host-drain migration helper: adds one bounded call's per-call counts,
+    /// receipts and unreadable sessions (kept sorted and unique) to a running
+    /// total. Progress and continuation come from the latest call; the root
+    /// epoch stays the first call's mark.
+    pub fn accumulate(&mut self, next: JournalGcReport) {
+        self.examined += next.examined;
+        self.deleted += next.deleted;
+        self.reclaimed_bytes += next.reclaimed_bytes;
+        self.work_units += next.work_units;
+        self.unreadable_sessions.extend(next.unreadable_sessions);
+        self.unreadable_sessions.sort();
+        self.unreadable_sessions.dedup();
+        self.progress = next.progress;
+        self.has_more = next.has_more;
+    }
+}
+
 /// Final planned request, with independent persistent ordered message/tool refs.
 /// Settings are a RequestSettings object containing a ProviderRequest with
 /// empty messages/tools; reconstruction fills those lists without replanning.

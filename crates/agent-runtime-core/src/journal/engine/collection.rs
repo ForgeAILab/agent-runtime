@@ -52,7 +52,7 @@ const UNIT_KINDS: usize = 9;
 
 #[derive(Debug, Default)]
 pub(super) struct CollectionState {
-    cursor: Option<CollectionCursor>,
+    pub(super) cursor: Option<CollectionCursor>,
     pub(super) cap: usize,
 }
 impl CollectionState {
@@ -72,7 +72,7 @@ impl CollectionState {
 }
 
 #[derive(Debug)]
-struct CollectionCursor {
+pub(super) struct CollectionCursor {
     // Engine root epoch the speculative mark is valid for.
     epoch: u64,
     // Last session finished in this pass.
@@ -80,6 +80,9 @@ struct CollectionCursor {
     queue: VecDeque<SessionId>,
     mark: Option<SessionMark>,
     costs: [Duration; UNIT_KINDS],
+    // Sessions skipped by a failure earlier in this pass; their retained
+    // hints do not by themselves request another pass.
+    failed: BTreeSet<SessionId>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +209,13 @@ impl Call {
     }
 }
 
+// Reserve a decaying maximum of a unit kind's observed cost, so one cheap
+// unit does not hide the cost of an occasional large one of the same kind.
+fn observe(costs: &mut [Duration; UNIT_KINDS], kind: Unit, elapsed: Duration) {
+    let slot = &mut costs[kind as usize];
+    *slot = elapsed.max(*slot * 3 / 4);
+}
+
 enum Step {
     Continue,
     Yield,
@@ -297,6 +307,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 queue: VecDeque::new(),
                 mark: None,
                 costs: [Duration::ZERO; UNIT_KINDS],
+                failed: BTreeSet::new(),
             });
             if cursor.epoch != request.expected_root_epoch {
                 // An unexplained epoch change: conservatively restart the
@@ -339,13 +350,17 @@ impl<S: JournalStorage> JournalEngine<S> {
                 match &result {
                     Ok(true) => {
                         report.progress = Some(JournalGcProgress::Complete);
-                        report.has_more = dirty.iter().any(|s| !failures.skipped.contains(s));
+                        report.has_more = dirty
+                            .iter()
+                            .any(|s| !failures.skipped.contains(s) && !cursor.failed.contains(s));
                         // A completed pass keeps only its epoch and measured unit costs.
                         cursor.after = None;
                         cursor.queue.clear();
                         cursor.mark = None;
+                        cursor.failed.clear();
                     }
                     Ok(false) => {
+                        cursor.failed.extend(failures.skipped.iter().cloned());
                         report.progress = Some(if call.restarted {
                             JournalGcProgress::Restarted
                         } else {
@@ -381,15 +396,14 @@ impl<S: JournalStorage> JournalEngine<S> {
     ) -> Result<bool, RuntimeError> {
         crate::journal_profile_scope!("rt.controls.collect_sessions", {
             // A resumed mark is authenticated against the stored fence first.
+            // This prerequisite read is not a unit of new progress, so a
+            // one-unit budget still advances; the gate wait already passed the
+            // time check.
             if cursor.mark.is_some() {
-                if !call.admit(Unit::Load, &cursor.costs) {
-                    return Ok(false);
-                }
                 let session = cursor.mark.as_ref().expect("mark").session.clone();
                 let started = Instant::now();
-                call.units += 1;
                 let loaded = self.storage.load(&self.domain, &session).await;
-                cursor.costs[Unit::Load as usize] = started.elapsed();
+                observe(&mut cursor.costs, Unit::Load, started.elapsed());
                 match failures.isolate(&session, loaded)? {
                     Some(stored) => {
                         let fence = stored
@@ -458,7 +472,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .storage
                 .dirty_sessions(&self.domain, cursor.after.as_ref(), DISCOVERY_PAGE)
                 .await?;
-            cursor.costs[Unit::Discover as usize] = started.elapsed();
+            observe(&mut cursor.costs, Unit::Discover, started.elapsed());
             if page.len() > DISCOVERY_PAGE {
                 return Err(contract_violation());
             }
@@ -521,7 +535,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             Ok(mark)
         }
         .await;
-        cursor.costs[Unit::Load as usize] = started.elapsed();
+        observe(&mut cursor.costs, Unit::Load, started.elapsed());
         match failures.isolate(&session, read)? {
             Some(mark) => cursor.mark = Some(mark),
             None => cursor.after = Some(session),
@@ -583,7 +597,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             Phase::Dependencies => self.dependency_unit(cursor, failures).await,
             Phase::Release => self.release_unit(request, cursor, call, report).await,
         };
-        cursor.costs[kind as usize] = started.elapsed();
+        observe(&mut cursor.costs, kind, started.elapsed());
         match result {
             Err(error) if error.metadata.get("journal_collection_contract").is_some() => Err(error),
             result => {

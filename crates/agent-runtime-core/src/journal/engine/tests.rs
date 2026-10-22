@@ -3057,5 +3057,7 @@ async fn r3_a_stale_dependent_candidate_write_cannot_lose_retirement_authorizati
     );
 }
 
+#[path = "collection_bounded_tests.rs"]
+mod collection_bounded;
 #[path = "collection_isolation_tests.rs"]
 mod collection_isolation;

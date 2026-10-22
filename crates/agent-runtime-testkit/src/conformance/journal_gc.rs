@@ -168,7 +168,7 @@ impl SessionJournalCollectionFixture {
             total = Some(match total {
                 None => report,
                 Some(mut total) => {
-                    accumulate(&mut total, report);
+                    total.accumulate(report);
                     total
                 }
             });
@@ -1464,7 +1464,7 @@ where
     let mut report = journal.collect(mark).await.unwrap();
     if report.has_more {
         // A bounded call may yield; the host drain finishes the same pass.
-        accumulate(&mut report, fixture.collect().await);
+        report.accumulate(fixture.collect().await);
     }
     assert_eq!(report.deleted, 1);
     assert_eq!(report.reclaimed_bytes, staged_bytes);
@@ -1611,7 +1611,7 @@ where
         if step == 2 {
             let mut swept = journal.collect(pending_mark.take().unwrap()).await.unwrap();
             if swept.has_more {
-                accumulate(&mut swept, fixture.collect().await);
+                swept.accumulate(fixture.collect().await);
             }
             assert!(
                 swept.deleted > 0,
@@ -1773,19 +1773,6 @@ where
         assert_eq!(materialized.history, snapshot.history);
     }
     journal.close(reader).await.unwrap();
-}
-
-/// Adds one bounded call's per-call counts to a host drain total.
-pub fn accumulate(total: &mut JournalGcReport, report: JournalGcReport) {
-    total.examined += report.examined;
-    total.deleted += report.deleted;
-    total.reclaimed_bytes += report.reclaimed_bytes;
-    total.work_units += report.work_units;
-    let mut unreadable: BTreeSet<_> = total.unreadable_sessions.drain(..).collect();
-    unreadable.extend(report.unreadable_sessions);
-    total.unreadable_sessions = unreadable.into_iter().collect();
-    total.progress = report.progress;
-    total.has_more = report.has_more;
 }
 
 async fn check_mark(
