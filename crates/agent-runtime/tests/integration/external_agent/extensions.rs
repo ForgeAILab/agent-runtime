@@ -152,6 +152,9 @@ async fn advisor_reads_backend_observations_and_dispatch_position_only_during_ex
 #[tokio::test]
 async fn backend_tool_transcript_observations_survive_restart_without_backend_execution() {
     let backend = ScriptedBackend::new(vec![vec![
+        ExternalAgentEvent::Text {
+            text: "before native tool".into(),
+        },
         ExternalAgentEvent::ToolInvoked {
             id: "native-call".into(),
             name: "NativeRead".into(),
@@ -182,8 +185,10 @@ async fn backend_tool_transcript_observations_survive_restart_without_backend_ex
     let retained = snapshot.extension_state["agent-runtime.transcript.observations"].clone();
     let events = retained.value["events"].as_array().unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["history_index"], 1);
+    assert_eq!(events[0]["history_index"], 2);
     assert_eq!(events[0]["event"]["payload"]["id"], "native-call");
+    assert_eq!(snapshot.history[1].joined_text(), "before native tool");
+    assert_eq!(snapshot.history[2].joined_text(), "final retained answer");
     let id = session.id().clone();
     session.shutdown().await.unwrap();
     drop(session);
@@ -203,6 +208,137 @@ async fn backend_tool_transcript_observations_survive_restart_without_backend_ex
     assert_eq!(restored.history(), snapshot.history);
     assert_eq!(backend.requests.lock().unwrap().len(), 1);
     assert!(provider.requests().is_empty());
+}
+
+#[derive(Debug)]
+struct FailingExternalAcceptance {
+    inner: Arc<Stores>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl CheckpointStore for FailingExternalAcceptance {
+    async fn load_latest(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<agent_runtime::core::checkpoint::TurnCheckpoint>, RuntimeError> {
+        self.inner.load_latest(session).await
+    }
+
+    async fn save(
+        &self,
+        checkpoint: &agent_runtime::core::checkpoint::TurnCheckpoint,
+    ) -> Result<(), RuntimeError> {
+        if matches!(checkpoint.state, TurnState::ExternalToolCall { .. }) {
+            self.entered.notify_one();
+            self.release.notified().await;
+            return Err(RuntimeError::conflict(
+                "scripted external acceptance failure",
+            ));
+        }
+        CheckpointStore::save(self.inner.as_ref(), checkpoint).await
+    }
+}
+
+#[tokio::test]
+async fn native_prefix_during_failed_dispatch_acceptance_keeps_order_and_valid_anchors() {
+    for original_prefix in [false, true] {
+        let release = Arc::new(Notify::new());
+        let entered = Arc::new(Notify::new());
+        let mut steps = Vec::new();
+        if original_prefix {
+            steps.push(text("before dispatch"));
+        }
+        steps.extend([
+            DispatchStep::Start("count", json!({})),
+            DispatchStep::Wait(entered.clone()),
+            text("during acceptance"),
+            DispatchStep::Event(ExternalAgentEvent::ToolInvoked {
+                id: "native-during".into(),
+                name: "NativeRead".into(),
+                detail: json!({}),
+            }),
+            DispatchStep::Signal(release.clone()),
+            DispatchStep::Join(0),
+            completed(),
+        ]);
+        let backend = ScriptedBackend::steps(steps);
+        let stores = Arc::new(Stores::default());
+        let checkpoints = Arc::new(FailingExternalAcceptance {
+            inner: stores.clone(),
+            entered,
+            release,
+        });
+        let tool = CountingTool::new("count");
+        let provider = Arc::new(FakeProvider::text_reply("unused"));
+        let runtime = builder(provider.clone(), stores.clone())
+            .checkpoint_store(checkpoints)
+            .external_agent(backend.clone())
+            .tool(tool.clone())
+            .build()
+            .unwrap();
+        let session = runtime.start_session(StartSession::new()).await.unwrap();
+        session
+            .run(UserInput::text("dispatch and observe"))
+            .await
+            .unwrap();
+        let history = session.history();
+        assert_eq!(
+            history
+                .iter()
+                .flat_map(|message| message.tool_calls())
+                .count(),
+            0
+        );
+        let expected = if original_prefix {
+            vec![
+                "dispatch and observe",
+                "before dispatch",
+                "during acceptance",
+            ]
+        } else {
+            vec!["dispatch and observe", "during acceptance"]
+        };
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| message.joined_text())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(tool.calls.lock().unwrap().is_empty());
+        assert!(stores.events(session.id()).iter().any(|event| matches!(
+            event.payload,
+            RuntimeEvent::TurnCompleted {
+                visible_output: true,
+                ..
+            }
+        )));
+        let snapshot = session.snapshot();
+        for event in
+            snapshot.extension_state["agent-runtime.transcript.observations"].value["events"]
+                .as_array()
+                .unwrap()
+        {
+            assert!(event["history_index"].as_u64().unwrap() <= history.len() as u64);
+        }
+        let id = session.id().clone();
+        session.shutdown().await.unwrap();
+        drop(session);
+        drop(runtime);
+        let restarted = builder(provider, stores.restarted())
+            .external_agent(backend.clone())
+            .tool(tool)
+            .build()
+            .unwrap();
+        let restored = restarted
+            .start_session(StartSession::resume(id))
+            .await
+            .unwrap();
+        assert_eq!(restored.history(), history);
+        assert_eq!(backend.requests.lock().unwrap().len(), 1);
+    }
 }
 
 async fn bounded_observations(details: Vec<Value>) -> BackendToolObservations {

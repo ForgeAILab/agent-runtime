@@ -279,13 +279,34 @@ impl EventEmitter {
     }
 
     #[cfg(feature = "external-agent")]
-    pub(crate) fn restore_external_presentation(&self, events: Vec<EventEnvelope>) {
+    pub(crate) fn rollback_external_presentation(
+        &self,
+        events: Vec<EventEnvelope>,
+        history_index: usize,
+        has_prefix: bool,
+    ) -> bool {
         let mut pending = self
             .pending_presentation
             .lock()
             .expect("pending presentation poisoned");
+        let observed_after = pending
+            .retained
+            .events
+            .iter()
+            .any(|observation| observation.history_index > history_index);
+        // A native tool observed during the save makes preceding prose a
+        // retained boundary even if the runtime-dispatched call is rolled back.
+        if has_prefix && observed_after {
+            return true;
+        }
+        for observation in &mut pending.retained.events {
+            if observation.history_index > history_index {
+                observation.history_index -= 1;
+            }
+        }
         pending.external.extend(events);
         pending.external.sort_by_key(|event| event.seq);
+        false
     }
 
     pub(crate) fn presentation_snapshot(

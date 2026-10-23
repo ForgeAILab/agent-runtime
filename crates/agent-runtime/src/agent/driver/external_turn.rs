@@ -406,9 +406,9 @@ impl<'a> ExternalTurnMachine<'a> {
             emitter.emit(turn.clone(), RuntimeEvent::Usage { record });
         }
 
-        // Only a completed turn contributes an assistant message. A failed or
-        // cancelled turn leaves no partial answer in history claiming to be
-        // the agent's response.
+        // A successful turn commits the remaining answer. Prefixes preceding
+        // observed native tools or dispatched rounds were already committed
+        // at those boundaries; unfinished trailing text remains speculative.
         let visible_output = {
             let mut output = output.lock().expect("external output poisoned");
             let visible_output = output.committed_visible || (completed && !output.text.is_empty());
@@ -524,10 +524,11 @@ impl TurnMachine<'_> {
         };
         let prefix = parts.clone();
         parts.push(ContentPart::ToolCall(call.clone()));
-        let pending_presentation = {
+        let (history_index, pending_presentation) = {
             let mut state = self.state.lock().expect("session state poisoned");
+            let history_index = state.history.len();
             state.history.push(Message::assistant(parts));
-            self.emitter.take_external_presentation()
+            (history_index, self.emitter.take_external_presentation())
         };
         if let Err(error) = self
             .transition(TurnState::ExternalToolCall {
@@ -537,27 +538,41 @@ impl TurnMachine<'_> {
             })
             .await
         {
-            {
+            let (keep_prefix, later_visible) = {
                 let mut state = self.state.lock().expect("session state poisoned");
-                state.history.pop();
-                self.emitter
-                    .restore_external_presentation(pending_presentation);
-            }
-            let mut output = output.lock().expect("external output poisoned");
-            for part in prefix {
-                match part {
-                    ContentPart::Text { mut text } => {
-                        text.push_str(&output.text);
-                        output.text = text;
-                    }
-                    ContentPart::Reasoning { mut text, .. } => {
-                        text.push_str(&output.reasoning);
-                        output.reasoning = text;
-                    }
-                    _ => {}
+                let keep_prefix = self.emitter.rollback_external_presentation(
+                    pending_presentation,
+                    history_index,
+                    !prefix.is_empty(),
+                );
+                if keep_prefix {
+                    state.history[history_index] = Message::assistant(prefix.clone());
+                } else {
+                    state.history.remove(history_index);
                 }
+                let later_visible = state.history[history_index..].iter().any(|message| {
+                    message.role == agent_runtime_core::content::Role::Assistant
+                        && !message.joined_text().is_empty()
+                });
+                (keep_prefix, later_visible)
+            };
+            let mut output = output.lock().expect("external output poisoned");
+            if !keep_prefix {
+                for part in prefix {
+                    match part {
+                        ContentPart::Text { mut text } => {
+                            text.push_str(&output.text);
+                            output.text = text;
+                        }
+                        ContentPart::Reasoning { mut text, .. } => {
+                            text.push_str(&output.reasoning);
+                            output.reasoning = text;
+                        }
+                        _ => {}
+                    }
+                }
+                output.committed_visible = prior_visible || later_visible;
             }
-            output.committed_visible = prior_visible;
             return Err(error);
         }
         self.external_call
@@ -662,6 +677,24 @@ fn cancelled_finish(cancel: &Cancellation) -> TurnFinish {
     }
 }
 
+fn commit_native_tool_prefix(
+    output: &Mutex<ExternalOutput>,
+    execution: &crate::runtime::state::SessionExecutionContext,
+    state: &Mutex<crate::runtime::state::SessionState>,
+    emitter: &crate::runtime::emitter::EventEmitter,
+) -> usize {
+    let parts = output
+        .lock()
+        .expect("external output poisoned")
+        .take_parts(execution);
+    let mut state = state.lock().expect("session state poisoned");
+    if !parts.is_empty() {
+        state.history.push(Message::assistant(parts));
+    }
+    emitter.commit_external_presentation();
+    state.history.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn observe(
     event: Option<Result<ExternalAgentEvent, RuntimeError>>,
@@ -734,7 +767,7 @@ fn observe(
                     detail: detail.clone(),
                     kind: BackendToolObservationKind::Invocation,
                 });
-            let history_index = state.lock().expect("session state poisoned").history.len();
+            let history_index = commit_native_tool_prefix(output, execution, state, emitter);
             emitter.emit_retained(
                 turn.clone(),
                 RuntimeEvent::ExternalToolInvoked { id, name, detail },
@@ -755,7 +788,7 @@ fn observe(
                     kind: BackendToolObservationKind::Outcome { ok },
                 });
             }
-            let history_index = state.lock().expect("session state poisoned").history.len();
+            let history_index = commit_native_tool_prefix(output, execution, state, emitter);
             emitter.emit_retained(
                 turn.clone(),
                 RuntimeEvent::ExternalToolCompleted { id, ok, detail },

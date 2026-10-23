@@ -150,7 +150,7 @@ fn session_id(value: &str) -> ExternalSessionId {
 }
 
 #[tokio::test]
-async fn an_external_turn_streams_its_work_and_commits_one_assistant_message() {
+async fn an_external_turn_streams_its_work_and_preserves_native_tool_boundaries() {
     let backend = ScriptedBackend::new(vec![vec![
         ExternalAgentEvent::SessionStarted {
             session: session_id("thread-1"),
@@ -239,18 +239,19 @@ async fn an_external_turn_streams_its_work_and_commits_one_assistant_message() {
         }
     )));
 
-    // Exactly one assistant message, carrying the accumulated text.
+    // Native tool observations separate the preceding prose from the final reply.
     let snapshot = session.snapshot();
     let assistant: Vec<_> = snapshot
         .history
         .iter()
         .filter(|message| matches!(message.role, agent_runtime_core::content::Role::Assistant))
         .collect();
-    assert_eq!(assistant.len(), 1);
+    assert_eq!(assistant.len(), 2);
     assert!(assistant[0].content.iter().any(|part| matches!(
         part,
-        ContentPart::Text { text } if text == "reading the file — the version is 3"
+        ContentPart::Text { text } if text == "reading the file"
     )));
+    assert_eq!(assistant[1].joined_text(), " — the version is 3");
 
     // Usage is attributed to the external agent, not to a provider attempt.
     let records = snapshot.usage.records();
