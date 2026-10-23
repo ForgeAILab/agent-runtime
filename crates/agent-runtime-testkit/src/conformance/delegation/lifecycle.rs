@@ -169,6 +169,52 @@ pub async fn assert_native_durable_child_rebinds_after_restart_like_legacy() {
     assert_eq!(outcomes[1], outcomes[0]);
 }
 
+/// A reply too long for a delivery excerpt is stored as a parent-owned copy
+/// that names the child it came from, since no lineage does.
+pub async fn assert_long_child_reply_is_stored_with_its_child() {
+    let (_runtime, parent) = parent_session(true).await;
+    let reply = "finding\n".repeat(400);
+    let store = Arc::new(DelegationArtifactStore::default());
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![vec![ScriptedStream::new(vec![
+            ProviderStreamEvent::TextDelta {
+                text: reply.clone(),
+            },
+            usage_event(8, 2),
+            ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])]])
+        .with_artifact_store(store.clone()),
+    );
+    let coordinator =
+        DelegationCoordinator::new(&parent, factory, DelegationConfig::default()).unwrap();
+    let child = match coordinator
+        .spawn(child_spec("write a long reply"))
+        .await
+        .unwrap()
+    {
+        SpawnOutcome::Spawned { child, .. } => child,
+        other => panic!("expected a spawned child, got {other:?}"),
+    };
+    let ChildTaskOutcome::Completed { result, .. } =
+        coordinator.wait_task_outcome(&child).await.unwrap()
+    else {
+        panic!("expected a completed reply");
+    };
+    assert_eq!(result.text, reply);
+    let stored = result.reply.as_deref().expect("a stored reply copy");
+    assert_eq!(stored.provenance.session, *parent.id());
+    assert_eq!(
+        stored.provenance.purpose,
+        agent_runtime::delegation::CHILD_REPLY_ARTIFACT_PURPOSE
+    );
+    assert_eq!(stored.provenance.child.as_ref(), Some(&child));
+    assert!(stored.provenance.derived_from.is_none());
+    coordinator.flush().await.unwrap();
+    parent.shutdown().await.unwrap();
+}
+
 /// A child-produced artifact is copied explicitly into parent ownership,
 /// retains source lineage, and remains recoverable only under the new owner.
 pub async fn assert_child_artifact_result_transfers_to_parent() {

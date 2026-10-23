@@ -33,6 +33,11 @@ async fn native_durable_child_rebinds_after_restart_like_legacy() {
 }
 
 #[tokio::test]
+async fn long_child_replies_are_stored_with_their_child() {
+    delegation::assert_long_child_reply_is_stored_with_its_child().await;
+}
+
+#[tokio::test]
 async fn child_artifact_results_are_transferred_into_parent_ownership() {
     delegation::assert_child_artifact_result_transfers_to_parent().await;
 }
