@@ -9,6 +9,9 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Added
 
+- `ArtifactProvenance::child` optionally names the delegated child behind a
+  parent-owned artifact; stored child replies set it. Records without it load
+  unchanged, and it is omitted when absent.
 - Read-only child history snapshots and subscriptions expose committed messages,
   pending presentation, retained backend observations, and a live-event watermark
   without running a dormant child or acknowledging its result.
