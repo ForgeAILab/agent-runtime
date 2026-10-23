@@ -21,4 +21,5 @@ completed_at:
 
 - [x] 3.1 Runtime gate: fmt, Clippy `--all-features -D warnings`,
   `cargo test --workspace --all-features`.
-- [ ] 3.2 Smith pins the change and lists replies by child.
+- [x] 3.2 Smith pins the change and lists replies by child (Smith
+  `fix/delegation-guidance-2026-10-23`).
