@@ -81,6 +81,8 @@ impl WorkingSetPolicy {
 #[derive(Debug)]
 pub struct RuntimeBuilder {
     provider: Option<Arc<dyn Provider>>,
+    fallback_routes: Vec<crate::runtime::ModelRoute>,
+    first_response_timeout_ms: Option<u64>,
     tools: Vec<Arc<dyn Tool>>,
     approval: Option<Arc<dyn ApprovalPolicy>>,
     workspace: Option<Arc<dyn Workspace>>,
@@ -141,6 +143,18 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
+    /// Adds ordered, preflighted model bindings for ordinary turn fallback.
+    /// The optional startup budget includes all retries of one model request.
+    pub fn model_fallbacks(
+        mut self,
+        routes: Vec<crate::runtime::ModelRoute>,
+        first_response_timeout_ms: Option<u64>,
+    ) -> Self {
+        self.fallback_routes = routes;
+        self.first_response_timeout_ms = first_response_timeout_ms;
+        self
+    }
+
     /// A builder targeting `model`.
     pub fn new(model: ModelId) -> Self {
         Self {
@@ -151,6 +165,8 @@ impl RuntimeBuilder {
             #[cfg(feature = "external-agent")]
             external_excluded_tools: Vec::new(),
             provider: None,
+            fallback_routes: Vec::new(),
+            first_response_timeout_ms: None,
             tools: Vec::new(),
             approval: None,
             workspace: None,
@@ -770,6 +786,49 @@ impl RuntimeBuilder {
     /// same reasoning that already makes a missing model profile a build
     /// failure above, not a guessed context window.
     pub fn build(mut self) -> Result<Runtime, RuntimeError> {
+        if self.first_response_timeout_ms == Some(0)
+            || self
+                .fallback_routes
+                .iter()
+                .any(|route| route.first_response_timeout_ms == Some(0))
+        {
+            return Err(RuntimeError::config(
+                "first-response timeout must be positive",
+            ));
+        }
+        if self
+            .first_response_timeout_ms
+            .into_iter()
+            .chain(
+                self.fallback_routes
+                    .iter()
+                    .filter_map(|route| route.first_response_timeout_ms),
+            )
+            .any(|ms| {
+                tokio::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(ms))
+                    .is_none()
+            })
+        {
+            return Err(RuntimeError::config(
+                "first-response timeout cannot be represented",
+            ));
+        }
+        #[cfg(feature = "external-agent")]
+        if self.external_agent.is_some() && !self.fallback_routes.is_empty() {
+            return Err(RuntimeError::config(
+                "external-agent turns do not support model fallback",
+            ));
+        }
+        let mut bindings = std::collections::BTreeSet::new();
+        if let Some(profile) = &self.model_profile {
+            bindings.insert((profile.provider.clone(), profile.model.to_string()));
+        }
+        for route in &self.fallback_routes {
+            if !bindings.insert((route.provider().to_owned(), route.model().to_string())) {
+                return Err(RuntimeError::config("duplicate model fallback binding"));
+            }
+        }
         if self
             .harness
             .contains_component_id(SEMANTIC_SUMMARY_COMPONENT_ID)
@@ -837,6 +896,13 @@ impl RuntimeBuilder {
                 "model profile `{}` does not match RuntimeBuilder target model `{}`",
                 profile.model, self.config.model
             )));
+        }
+        if self.fallback_routes.iter().any(|route| {
+            route.provider() == profile.provider.as_str() && route.model() == &profile.model
+        }) {
+            return Err(RuntimeError::config(
+                "duplicate primary model fallback binding",
+            ));
         }
 
         let context_policy = self.context_policy.take().unwrap_or_else(|| {
@@ -1076,7 +1142,8 @@ impl RuntimeBuilder {
             live_abilities,
             self.manifest_window,
         )
-        .with_history_lcm(self.lcm.clone());
+        .with_history_lcm(self.lcm.clone())
+        .with_model_fallback(self.fallback_routes, self.first_response_timeout_ms);
         #[cfg(feature = "external-agent")]
         let driver = driver.with_external_agent(
             self.external_agent,

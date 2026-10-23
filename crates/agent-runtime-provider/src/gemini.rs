@@ -979,6 +979,7 @@ fn sanitize_transport_error(
     credentials: &RequestCredentials,
 ) -> ProviderError {
     let message = match error.kind {
+        ProviderErrorKind::Unavailable => "Gemini provider route unavailable",
         ProviderErrorKind::Network => "Gemini provider network failure",
         ProviderErrorKind::Timeout => "Gemini provider deadline elapsed",
         ProviderErrorKind::RateLimited => "Gemini provider rate limit exceeded",
@@ -1925,6 +1926,15 @@ async fn take_terminal(
 
 #[async_trait]
 impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
+    fn pre_output_replay_safe(&self, request: &ProviderRequest) -> bool {
+        request.hosted_tools.iter().all(|tool| {
+            matches!(
+                tool,
+                agent_runtime_core::provider::HostedTool::WebSearch { .. }
+            )
+        })
+    }
+
     fn describe(&self) -> Vec<ModelDescriptor> {
         vec![ModelDescriptor {
             id: self.config.model.clone(),

@@ -1531,6 +1531,9 @@ pub enum FinishReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
+    /// A configured route's local provider or credential source is unavailable.
+    /// This is distinct from a remote authentication rejection.
+    Unavailable,
     /// A network/transport failure.
     Network,
     /// A timeout.
@@ -1665,6 +1668,7 @@ impl From<ProviderError> for RuntimeError {
             ProviderErrorKind::Auth => FailureClass::Auth { stage },
             ProviderErrorKind::Cancelled => FailureClass::Cancelled { stage },
             ProviderErrorKind::Unsupported
+            | ProviderErrorKind::Unavailable
             | ProviderErrorKind::BadRequest
             | ProviderErrorKind::CacheExpired => FailureClass::RequestRejected { stage },
         };
@@ -1843,6 +1847,9 @@ impl RateLimitSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
+    /// Meaningful model activity buffered by a normalization layer. This is
+    /// never a transport heartbeat or usage observation and carries no content.
+    ResponseProgress,
     /// A provider-hosted web search and its public sources.
     HostedSearch {
         /// The page action, or `None` for a plain search.
@@ -2034,6 +2041,25 @@ pub trait Provider: Send + Sync + fmt::Debug {
 
     /// The capabilities of `model`, if this provider serves it.
     fn capabilities(&self, model: &ModelId) -> Option<Capabilities>;
+
+    /// Whether an attempt may be cancelled and replayed before meaningful
+    /// response progress, including after stream acceptance. Unknown adapters
+    /// fail closed. Providers with hosted side effects must prove that those
+    /// effects cannot have started or are safely deduplicated.
+    fn pre_output_replay_safe(&self, _request: &ProviderRequest) -> bool {
+        false
+    }
+
+    /// Completes local setup or host interaction before first-response timing.
+    /// This hook must not dispatch a model request. The canonical loop bounds
+    /// it by cancellation and the original turn deadline.
+    async fn prepare_request(
+        &self,
+        _request: &ProviderRequest,
+        _ctx: &ProviderCallContext,
+    ) -> std::result::Result<(), ProviderError> {
+        Ok(())
+    }
 
     /// Whether request projection must omit assistant messages emptied by
     /// removing foreign reasoning, because the wire requires content.

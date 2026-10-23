@@ -27,6 +27,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::RegistrySnapshotSealed { .. } => "registry_snapshot_sealed",
         RuntimeEvent::ScopedViewDerived { .. } => "scoped_view_derived",
         RuntimeEvent::ModelProfileResolved { .. } => "model_profile_resolved",
+        RuntimeEvent::ModelFallback { .. } => "model_fallback",
         RuntimeEvent::CapabilityRetrievalPerformed { .. } => "capability_retrieval_performed",
         RuntimeEvent::CapabilitiesActivated { .. } => "capabilities_activated",
         RuntimeEvent::ContextPlanned { .. } => "context_planned",
@@ -98,6 +99,19 @@ pub fn log_line(env: &EventEnvelope) -> String {
 
 fn summary(payload: &RuntimeEvent) -> String {
     match payload {
+        RuntimeEvent::ModelFallback {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            reason,
+            elapsed_ms,
+            ..
+        } => {
+            format!(
+                "model_fallback from={from_provider}/{from_model} to={to_provider}/{to_model} reason={reason:?} elapsed_ms={elapsed_ms}"
+            )
+        }
         RuntimeEvent::RegistrySnapshotSealed { snapshot, entries } => {
             format!("registry_snapshot_sealed snapshot={snapshot} entries={entries}")
         }

@@ -6,14 +6,14 @@ pub(super) enum BeforeProviderOutcome {
     Block(RuntimeError),
 }
 
-impl<'a> TurnMachine<'a> {
+impl TurnMachine {
     pub(super) fn resolve_acceptance(&self, result: Result<(), RuntimeError>) {
         if let Some(acceptance) = &self.acceptance {
             acceptance.resolve(result);
         }
     }
 
-    pub(super) fn new(driver: &'a Driver, context: TurnMachineContext) -> Self {
+    pub(super) fn new(driver: &Driver, context: TurnMachineContext) -> Self {
         let TurnMachineContext {
             state,
             execution,
@@ -26,7 +26,10 @@ impl<'a> TurnMachine<'a> {
             acceptance,
         } = context;
         Self {
-            driver,
+            driver: driver.clone(),
+            fallback_index: 0,
+            fallback_failures: Vec::new(),
+            model_route_error: None,
             state,
             execution,
             emitter,
@@ -45,7 +48,7 @@ impl<'a> TurnMachine<'a> {
     }
 
     pub(super) fn from_checkpoint(
-        driver: &'a Driver,
+        driver: &Driver,
         context: TurnMachineContext,
         checkpoint: TurnCheckpoint,
     ) -> Self {
@@ -62,7 +65,10 @@ impl<'a> TurnMachine<'a> {
         } = context;
         debug_assert_eq!(turn_id, checkpoint.turn);
         Self {
-            driver,
+            driver: driver.clone(),
+            fallback_index: 0,
+            fallback_failures: Vec::new(),
+            model_route_error: None,
             state,
             execution,
             emitter,
@@ -78,11 +84,31 @@ impl<'a> TurnMachine<'a> {
             #[cfg(feature = "external-agent")]
             external_call: None,
         }
+        .restore_checkpoint_model()
     }
 
     fn capture_snapshot(&self, include_manifests: bool) -> SessionSnapshot {
         let state = self.state.lock().expect("session state poisoned");
         let mut extension_state = self.execution.snapshot_extension_state_with_staged();
+        extension_state.remove(super::fallback::ROUTE_STATE_NAMESPACE);
+        if self.fallback_index > 0 {
+            let profile = self.driver.planner(&self.execution).profile();
+            extension_state.insert(
+                super::fallback::ROUTE_STATE_NAMESPACE.to_owned(),
+                VersionedSessionState::new(
+                    RegistryRevision::new("model-route-1"),
+                    serde_json::json!({
+                        "turn": self.turn_id,
+                        "index": self.fallback_index,
+                        "provider": profile.provider,
+                        "model": profile.model,
+                        "profile": profile.fingerprint(),
+                        "failures": self.fallback_failures,
+                    }),
+                )
+                .redaction_safe(),
+            );
+        }
         extension_state.insert(
             crate::runtime::transcript::OBSERVATIONS_NAMESPACE.to_owned(),
             self.emitter.history_observation_state(),
@@ -264,7 +290,7 @@ impl<'a> TurnMachine<'a> {
         } else {
             1
         };
-        let checkpoint = TurnCheckpoint::accepted(
+        let mut checkpoint = TurnCheckpoint::accepted(
             self.turn_id.clone(),
             input,
             self.checkpoint_snapshot()?,
@@ -274,6 +300,11 @@ impl<'a> TurnMachine<'a> {
             self.emitter.next_sequence(),
             self.driver.clock.now(),
         )?;
+        if !self.driver.fallback_routes.is_empty() {
+            checkpoint.transition_revision =
+                agent_runtime_core::checkpoint::MODEL_FALLBACK_TURN_TRANSITION_REVISION;
+            checkpoint.validate()?;
+        }
         if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
@@ -310,7 +341,7 @@ impl<'a> TurnMachine<'a> {
         } else {
             1
         };
-        let checkpoint = TurnCheckpoint::internal_accepted(
+        let mut checkpoint = TurnCheckpoint::internal_accepted(
             self.turn_id.clone(),
             input,
             self.checkpoint_snapshot()?,
@@ -320,6 +351,11 @@ impl<'a> TurnMachine<'a> {
             self.emitter.next_sequence(),
             self.driver.clock.now(),
         )?;
+        if !self.driver.fallback_routes.is_empty() {
+            checkpoint.transition_revision =
+                agent_runtime_core::checkpoint::MODEL_FALLBACK_TURN_TRANSITION_REVISION;
+            checkpoint.validate()?;
+        }
         if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
@@ -1011,9 +1047,9 @@ impl<'a> TurnMachine<'a> {
     }
 }
 
-impl<'a> TurnMachine<'a> {
+impl TurnMachine {
     pub(super) async fn run(mut self, input: UserInput) {
-        let driver = self.driver;
+        let driver = self.driver.clone();
         let state = self.state.clone();
         let execution = self.execution.clone();
         let emitter = self.emitter.clone();
@@ -1022,6 +1058,7 @@ impl<'a> TurnMachine<'a> {
         let turn_id = self.turn_id.clone();
         let turn = Some(turn_id.clone());
         emitter.emit(turn.clone(), RuntimeEvent::TurnStarted);
+        self.emit_primary_model();
 
         // A queued turn may have been interrupted before it reached the
         // serving boundary. It still receives an attributed terminal event,
@@ -1066,7 +1103,7 @@ impl<'a> TurnMachine<'a> {
     }
 
     pub(super) async fn run_internal(mut self, input: InternalTurnInput) {
-        let driver = self.driver;
+        let driver = self.driver.clone();
         let state = self.state.clone();
         let execution = self.execution.clone();
         let emitter = self.emitter.clone();
@@ -1075,6 +1112,7 @@ impl<'a> TurnMachine<'a> {
         let turn_id = self.turn_id.clone();
         let turn = Some(turn_id.clone());
         emitter.emit(turn.clone(), RuntimeEvent::TurnStarted);
+        self.emit_primary_model();
         emitter.emit(
             turn.clone(),
             RuntimeEvent::InternalTurnStarted {
@@ -1130,7 +1168,6 @@ impl<'a> TurnMachine<'a> {
         initial_step: u32,
         initial_visible_output: bool,
     ) {
-        let driver = self.driver;
         let state = self.state.clone();
         let execution = self.execution.clone();
         let emitter = self.emitter.clone();
@@ -1143,6 +1180,7 @@ impl<'a> TurnMachine<'a> {
         // TurnCompleted so hosts can spot reasoning-only completions.
         let mut visible_output = initial_visible_output;
         loop {
+            let driver = self.driver.clone();
             if turn_cancel.is_cancelled() {
                 self.complete_cancelled(visible_output).await;
                 return;
@@ -1249,6 +1287,19 @@ impl<'a> TurnMachine<'a> {
                         .await;
                         return;
                     }
+                    if self.fallback_index > 0
+                        && matches!(
+                            &err,
+                            RequestBuildError::Planner(_) | RequestBuildError::Incompatible(_)
+                        )
+                        && self.advance_model(
+                            agent_runtime_core::event::ModelFallbackReason::Incompatible,
+                            0,
+                            "candidate context or input modalities cannot represent the pending request",
+                        )
+                    {
+                        continue;
+                    }
                     // Planning failed before any network I/O — that is the
                     // point of preflight enforcement, so report the budget
                     // category rather than letting an oversized request go.
@@ -1265,7 +1316,7 @@ impl<'a> TurnMachine<'a> {
                     emitter.emit(
                         turn.clone(),
                         RuntimeEvent::Error {
-                            error: err.into_runtime_error(),
+                            error: self.model_fallback_error(err.into_runtime_error()),
                         },
                     );
                     self.complete(TurnFinish::Failed, visible_output).await;
@@ -1276,11 +1327,21 @@ impl<'a> TurnMachine<'a> {
             let planned_with_tools = !planned_request.request.tools.is_empty();
             let mut request = planned_request.request;
             if let Err(err) = driver.validate_and_downgrade(&mut request, &emitter, &turn) {
+                if self.fallback_index > 0
+                    && self.advance_model(
+                        agent_runtime_core::event::ModelFallbackReason::Incompatible,
+                        0,
+                        "candidate capabilities cannot represent the pending request",
+                    )
+                {
+                    continue;
+                }
                 emitter.emit(
                     turn.clone(),
                     RuntimeEvent::Error {
-                        error: RuntimeError::from(err)
-                            .with_failure_stage(FailureStage::PreProvider),
+                        error: self.model_fallback_error(
+                            RuntimeError::from(err).with_failure_stage(FailureStage::PreProvider),
+                        ),
                     },
                 );
                 self.complete(TurnFinish::Failed, visible_output).await;
@@ -1298,7 +1359,7 @@ impl<'a> TurnMachine<'a> {
                 // planning. Retire both the comparison predecessor and the
                 // maintenance seam; a stale committed plan must never be
                 // reused by a later turn or synthetic cache operation.
-                execution.planner.retire_cache_baseline();
+                driver.planner(&execution).retire_cache_baseline();
             }
             let advertised_tools = request
                 .tools
@@ -1327,7 +1388,7 @@ impl<'a> TurnMachine<'a> {
                 .cache_plan
                 .as_ref()
                 .filter(|_| !cache_downgraded)
-                .map(|_| (&execution.planner, &planned_request.plan));
+                .map(|_| (driver.planner(&execution), &planned_request.plan));
             let outcome = driver
                 .run_provider(
                     request,
@@ -1344,6 +1405,35 @@ impl<'a> TurnMachine<'a> {
                 .await;
 
             match outcome {
+                ProviderTurnOutcome::Fallback {
+                    error,
+                    reason,
+                    elapsed_ms,
+                } => {
+                    if self.advance_model(reason, elapsed_ms, &error.message) {
+                        continue;
+                    }
+                    let mut error = error;
+                    error.message = format!(
+                        "model fallback exhausted: {}",
+                        self.fallback_failures.join("; ")
+                    );
+                    let kind = error.kind;
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::Error {
+                            error: RuntimeError::from(error)
+                                .with_failure_stage(FailureStage::Provider),
+                        },
+                    );
+                    self.complete_with_provider_error(
+                        TurnFinish::Failed,
+                        visible_output,
+                        Some(kind),
+                    )
+                    .await;
+                    return;
+                }
                 ProviderTurnOutcome::InputBudgetExceeded { requested, limit } => {
                     emitter.emit(
                         turn.clone(),
@@ -1424,7 +1514,7 @@ impl<'a> TurnMachine<'a> {
                     // reaches dispatch or history, so the call and the result
                     // the host returns for it agree on one unique id.
                     reassign_colliding_tool_call_ids(&self.state, &mut tool_calls);
-                    let producer = execution.planner.reasoning_producer();
+                    let producer = driver.planner(&execution).reasoning_producer();
                     for part in &mut reasoning {
                         if let ContentPart::Reasoning {
                             producer: recorded, ..

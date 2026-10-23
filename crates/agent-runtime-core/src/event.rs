@@ -263,6 +263,22 @@ pub enum CacheOperationOutcome {
     Suspended,
 }
 
+/// Why the canonical provider loop advanced to another configured model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFallbackReason {
+    /// The route's local provider or credential source could not be acquired.
+    Unavailable,
+    /// The candidate did not start responding within its startup budget.
+    FirstResponseTimeout,
+    /// Its credential's usage window is exhausted.
+    QuotaExhausted,
+    /// Its bounded transient retries failed.
+    TransientFailure,
+    /// The candidate cannot serve the current request.
+    Incompatible,
+}
+
 /// Why compaction ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -962,6 +978,27 @@ pub enum RuntimeEvent {
         model: ModelId,
         /// The resolved profile's fingerprint.
         profile: Fingerprint,
+    },
+    /// The pending request moved to another configured provider/model.
+    ModelFallback {
+        /// The outgoing provider configuration identity.
+        from_provider: String,
+        /// The outgoing model id.
+        from_model: ModelId,
+        /// The incoming provider configuration identity.
+        to_provider: String,
+        /// The incoming model id.
+        to_model: ModelId,
+        /// Zero-based position including the primary at zero.
+        candidate_index: usize,
+        /// Primary plus all configured alternatives.
+        total_candidates: usize,
+        /// The bounded reason for advancing.
+        reason: ModelFallbackReason,
+        /// Time spent in the outgoing candidate's response/retry budget.
+        elapsed_ms: u64,
+        /// Its configured startup budget, when one exists.
+        first_response_timeout_ms: Option<u64>,
     },
     /// Capability retrieval ran and produced ranked candidates.
     CapabilityRetrievalPerformed {

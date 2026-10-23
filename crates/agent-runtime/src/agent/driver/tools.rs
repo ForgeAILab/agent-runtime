@@ -1,7 +1,7 @@
 use super::turn::wait_for_interaction_deadline;
 use super::*;
 
-impl<'a> TurnMachine<'a> {
+impl TurnMachine {
     pub(super) async fn prepare_tool_batch(
         &mut self,
         calls: &[ToolCall],

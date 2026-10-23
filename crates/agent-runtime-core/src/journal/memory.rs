@@ -869,7 +869,7 @@ impl InMemorySessionJournal {
         next: &ReferencedTurnCheckpoint,
     ) -> Result<(), RuntimeError> {
         if next.schema_version != JOURNAL_SCHEMA_VERSION
-            || next.transition_revision != crate::checkpoint::TURN_TRANSITION_REVISION
+            || !crate::checkpoint::supports_turn_transition_revision(next.transition_revision)
         {
             return Err(conflict());
         }
@@ -880,6 +880,8 @@ impl InMemorySessionJournal {
         let previous_sequence = previous.watermark.checkpoint_sequence;
         if sequence < previous_sequence
             || (sequence == previous_sequence && next != previous)
+            || (next.turn == previous.turn
+                && next.transition_revision != previous.transition_revision)
             || (next.turn == previous.turn && next.state_revision < previous.state_revision)
             || (next.turn == previous.turn
                 && next.state_revision == previous.state_revision

@@ -42,7 +42,7 @@ use crate::tool::{PreparedToolCall, ToolOutcome};
 /// a schema bump and changing its execution or encoding requires a revision bump.
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
-/// The direct turn-machine transition-table revision.
+/// The default direct turn-machine transition-table revision.
 ///
 /// A runtime MUST reject a checkpoint with a transition revision it cannot
 /// execute equivalently. Silent best-effort recovery could repeat a provider
@@ -54,6 +54,18 @@ pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 /// behavior, this addition preserves their execution and encoding; a change to
 /// either requires a revision bump.
 pub const TURN_TRANSITION_REVISION: u32 = 4;
+
+/// Opt-in per-turn table permitting a safely failed model request to replan
+/// at the same tool step. Revision 4's states and fingerprints remain frozen.
+pub const MODEL_FALLBACK_TURN_TRANSITION_REVISION: u32 = 5;
+
+/// Whether this build can execute the specified per-turn transition table.
+pub const fn supports_turn_transition_revision(revision: u32) -> bool {
+    matches!(
+        revision,
+        TURN_TRANSITION_REVISION | MODEL_FALLBACK_TURN_TRANSITION_REVISION
+    )
+}
 
 const MAX_CACHE_CHECKPOINT_OPERATION_BYTES: usize = 256;
 const MAX_CACHE_CHECKPOINT_METRICS: usize = 64;

@@ -9,6 +9,42 @@ use agent_runtime_core::store::Secret;
 use agent_runtime_testkit::conformance::{event_schema, runtime as rt};
 use agent_runtime_testkit::{RecordingObserver, ReplayTransport, consumers, scenarios};
 
+#[tokio::test]
+async fn smith_model_fallback_is_canonical_and_roundtrips() {
+    use agent_runtime::provider::fake::ScriptedStream;
+    let primary = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![ProviderStreamEvent::Error {
+            error: ProviderError::new(ProviderErrorKind::LimitExhausted, "quota exhausted"),
+        }])],
+    ));
+    let secondary = Arc::new(scenarios::fake_text("fallback answer"));
+    let mut secondary_profile = scenarios::fake_model_profile();
+    secondary_profile.provider = "backup".to_owned();
+    secondary_profile.model = ModelId::new("backup-model");
+    let backup = RuntimeBuilder::new(secondary_profile.model.clone())
+        .provider(secondary.clone())
+        .model_profile(secondary_profile)
+        .build()
+        .unwrap();
+    let observer = RecordingObserver::shared();
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider(primary)
+        .model_profile(scenarios::fake_model_profile())
+        .observer(observer.clone())
+        .model_fallbacks(vec![backup.model_route(None)], None)
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("hello")).await.unwrap();
+    let events = observer.events();
+    assert!(events.iter().any(|event| matches!(&event.payload, RuntimeEvent::ModelFallback { to_provider, .. } if to_provider == "backup")));
+    assert_eq!(secondary.requests().len(), 1);
+    rt::assert_terminates(&observer.payloads());
+    event_schema::assert_versioned_and_roundtrips(&events);
+}
+
 #[test]
 fn smith_can_compose_the_native_gemini_facade_types() {
     let mut config = GeminiInteractionsConfig::new(

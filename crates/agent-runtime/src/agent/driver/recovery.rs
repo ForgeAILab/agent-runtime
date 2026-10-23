@@ -19,7 +19,7 @@ where
     Box::pin(make())
 }
 
-impl<'a> TurnMachine<'a> {
+impl TurnMachine {
     /// Finalizes one validated non-terminal checkpoint from a turn that is
     /// no longer running as an explicit `Failed` terminal.
     ///
@@ -207,6 +207,24 @@ impl<'a> TurnMachine<'a> {
                 self.turn_id.clone(),
                 checkpoint.active_history_start,
                 self.driver.clock.now(),
+            );
+        }
+
+        if let Some(error) = self.model_route_error.take() {
+            self.emitter
+                .emit(Some(self.turn_id.clone()), RuntimeEvent::Error { error });
+            boxed(|| self.complete(TurnFinish::Failed, checkpoint.visible_output)).await;
+            return;
+        }
+        if self.fallback_index > 0 {
+            let profile = self.driver.planner(&self.execution).profile();
+            self.emitter.emit(
+                Some(self.turn_id.clone()),
+                RuntimeEvent::ModelProfileResolved {
+                    provider: profile.provider.clone(),
+                    model: profile.model.clone(),
+                    profile: profile.fingerprint(),
+                },
             );
         }
 

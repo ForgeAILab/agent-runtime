@@ -26,6 +26,7 @@ use agent_runtime_testkit::{
 
 fn kind(event: &ProviderStreamEvent) -> &'static str {
     match event {
+        ProviderStreamEvent::ResponseProgress => "progress",
         ProviderStreamEvent::HostedSearch { .. } => "hosted_search",
         ProviderStreamEvent::TextDelta { .. } => "text",
         ProviderStreamEvent::ReasoningDelta { .. } => "reasoning",

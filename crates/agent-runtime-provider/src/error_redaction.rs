@@ -141,6 +141,7 @@ pub(crate) fn carry_auth_reason(
 /// Rebuilds a transport failure from its class and checked diagnostic metadata.
 pub(crate) fn sanitize(error: ProviderError, credentials: &RequestCredentials) -> ProviderError {
     let message = match error.kind {
+        ProviderErrorKind::Unavailable => "provider route unavailable",
         ProviderErrorKind::Network => "provider network failure",
         ProviderErrorKind::Timeout => "provider deadline elapsed",
         ProviderErrorKind::RateLimited => "provider rate limit exceeded",

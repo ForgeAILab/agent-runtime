@@ -267,6 +267,7 @@ fn map_confidence(confidence: SizerConfidence) -> EstimationConfidence {
 /// Keep typed origins until the historical Config/nonretryable host projection.
 enum RequestBuildError {
     Planner(ContextError),
+    Incompatible(&'static str),
     Harness(Box<RuntimeError>),
 }
 
@@ -280,13 +281,16 @@ impl RequestBuildError {
     fn report(&self) -> Option<&BudgetReport> {
         match self {
             Self::Planner(error) => error.report.as_deref(),
-            Self::Harness(_) => None,
+            Self::Incompatible(_) | Self::Harness(_) => None,
         }
     }
 
     fn into_runtime_error(self) -> RuntimeError {
         let stage = FailureStage::PreProvider;
         match self {
+            Self::Incompatible(message) => {
+                RuntimeError::config(message).with_class(FailureClass::RequestRejected { stage })
+            }
             Self::Planner(error) => {
                 let class = match error.kind {
                     ContextErrorKind::BudgetExceeded => match error.report.as_deref() {
@@ -394,6 +398,11 @@ fn validate_contributed_fragment(fragment: &ContextFragment) -> Result<(), Reque
 
 /// The outcome of one provider request (all its attempts).
 enum ProviderTurnOutcome {
+    Fallback {
+        error: ProviderError,
+        reason: agent_runtime_core::event::ModelFallbackReason,
+        elapsed_ms: u64,
+    },
     Success {
         attempt: agent_runtime_core::ids::AttemptId,
         attempt_index: u32,
@@ -511,6 +520,9 @@ pub struct Driver {
     clock: Arc<dyn Clock>,
     config: Arc<LoopConfig>,
     planner_template: Arc<RunPlanner>,
+    fallback_routes: Arc<Vec<crate::runtime::ModelRoute>>,
+    first_response_timeout_ms: Option<u64>,
+    route_planner: Option<Arc<RunPlanner>>,
     session_store: Option<Arc<dyn SessionStore>>,
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     interaction_broker: Arc<dyn InteractionBroker>,
@@ -533,6 +545,28 @@ pub struct Driver {
 }
 
 impl Driver {
+    pub(crate) fn model_route(&self, timeout: Option<u64>) -> crate::runtime::ModelRoute {
+        crate::runtime::ModelRoute {
+            provider: self.provider.clone(),
+            planner: self.planner_template.clone(),
+            config: self.config.clone(),
+            first_response_timeout_ms: timeout,
+        }
+    }
+
+    pub(crate) fn with_model_fallback(
+        mut self,
+        routes: Vec<crate::runtime::ModelRoute>,
+        timeout: Option<u64>,
+    ) -> Self {
+        self.first_response_timeout_ms = (!routes.is_empty()).then_some(timeout).flatten();
+        self.fallback_routes = Arc::new(routes);
+        self
+    }
+
+    fn planner<'a>(&'a self, execution: &'a SessionExecutionContext) -> &'a RunPlanner {
+        self.route_planner.as_deref().unwrap_or(&execution.planner)
+    }
     pub(crate) fn without_persistence(mut self) -> Self {
         self.session_store = None;
         self.checkpoint_store = None;
@@ -605,6 +639,9 @@ impl Driver {
             clock,
             config,
             planner_template: planner,
+            fallback_routes: Arc::default(),
+            first_response_timeout_ms: None,
+            route_planner: None,
             session_store,
             checkpoint_store,
             interaction_broker,
@@ -1078,8 +1115,11 @@ impl Driver {
 /// The immutable [`Driver`] owns shared mechanisms. Every mutable turn value
 /// lives here and every durable boundary advances the versioned
 /// [`TurnState`] transition table.
-struct TurnMachine<'a> {
-    driver: &'a Driver,
+struct TurnMachine {
+    driver: Driver,
+    fallback_index: usize,
+    fallback_failures: Vec<String>,
+    model_route_error: Option<RuntimeError>,
     state: Arc<Mutex<SessionState>>,
     execution: Arc<SessionExecutionContext>,
     emitter: Arc<EventEmitter>,
@@ -1117,6 +1157,7 @@ struct TurnMachineContext {
 mod external_bridge;
 #[cfg(feature = "external-agent")]
 mod external_turn;
+mod fallback;
 mod provider;
 mod recovery;
 mod tool_output;

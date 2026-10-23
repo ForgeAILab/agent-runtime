@@ -271,7 +271,7 @@ async fn materialized_transitions_keep_schema3_and_reference_successors_validate
     other_schema.schema_version = 4;
     assert!(current.validate_successor(&other_schema).is_err());
     let mut unsupported = legacy;
-    unsupported.transition_revision = 5;
+    unsupported.transition_revision = 6;
     assert!(read_checkpoint_json(&serde_json::to_vec(&unsupported).unwrap()).is_err());
 }
 
@@ -393,7 +393,7 @@ async fn published_corruption_missing_closure_and_bad_boundary_evidence_fail_clo
         .object(unsupported.head.checkpoint.as_ref().unwrap())
         .decode(JournalObjectKind::Checkpoint)
         .unwrap();
-    refs.transition_revision = 5;
+    refs.transition_revision = 6;
     unsupported.head.checkpoint = Some(unsupported.replace(JournalObjectKind::Checkpoint, &refs));
     unsupported.repair_batch_refs();
     cases.push(unsupported);

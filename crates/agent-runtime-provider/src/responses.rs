@@ -969,6 +969,7 @@ fn sanitize_transport_error(
     credentials: &RequestCredentials,
 ) -> ProviderError {
     let message = match error.kind {
+        ProviderErrorKind::Unavailable => "Responses provider route unavailable",
         ProviderErrorKind::Network => "Responses provider network failure",
         ProviderErrorKind::Timeout => "Responses provider deadline elapsed",
         ProviderErrorKind::RateLimited => "Responses provider rate limit exceeded",
@@ -2057,6 +2058,15 @@ async fn take_terminal(
 
 #[async_trait]
 impl<T: HttpTransport> Provider for ResponsesProvider<T> {
+    fn pre_output_replay_safe(&self, request: &ProviderRequest) -> bool {
+        request.hosted_tools.iter().all(|tool| {
+            matches!(
+                tool,
+                agent_runtime_core::provider::HostedTool::WebSearch { .. }
+            )
+        })
+    }
+
     fn describe(&self) -> Vec<ModelDescriptor> {
         vec![ModelDescriptor {
             id: self.config.model.clone(),

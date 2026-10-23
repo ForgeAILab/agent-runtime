@@ -43,16 +43,16 @@ use super::{TurnMachine, TurnMachineContext, discard_reason_for_finish};
 const EXTERNAL_AGENT_USAGE_PURPOSE: &str = "agent.external";
 
 /// One turn executed by an installed agent.
-pub(super) struct ExternalTurnMachine<'a> {
-    machine: TurnMachine<'a>,
+pub(super) struct ExternalTurnMachine {
+    machine: TurnMachine,
     backend: SharedExternalAgentBackend,
 }
 
-impl<'a> ExternalTurnMachine<'a> {
+impl ExternalTurnMachine {
     /// Wraps the ordinary turn context so identity, admission, cancellation,
     /// and persistence stay shared with the direct path.
     pub(super) fn new(
-        driver: &'a super::Driver,
+        driver: &super::Driver,
         context: TurnMachineContext,
         backend: SharedExternalAgentBackend,
     ) -> Self {
@@ -80,7 +80,7 @@ impl<'a> ExternalTurnMachine<'a> {
 
     /// Runs the turn to completion.
     pub(super) async fn run(mut self, input: UserInput) {
-        let driver = self.machine.driver;
+        let driver = self.machine.driver.clone();
         let state = self.machine.state.clone();
         let execution = self.machine.execution.clone();
         let emitter = self.machine.emitter.clone();
@@ -141,7 +141,7 @@ impl<'a> ExternalTurnMachine<'a> {
     /// Accepts exact protected internal input before external I/O, preserving
     /// the admission hook that consumes child outcomes at this barrier.
     pub(super) async fn run_internal(mut self, input: InternalTurnInput) {
-        let driver = self.machine.driver;
+        let driver = self.machine.driver.clone();
         let turn = Some(self.machine.turn_id.clone());
         self.machine
             .emitter
@@ -200,7 +200,7 @@ impl<'a> ExternalTurnMachine<'a> {
 
     /// Shared external execution after the appropriate acceptance barrier.
     async fn run_backend(mut self, input: UserInput, turn_deadline: Deadline) {
-        let driver = self.machine.driver;
+        let driver = self.machine.driver.clone();
         let state = self.machine.state.clone();
         let execution = self.machine.execution.clone();
         let emitter = self.machine.emitter.clone();
@@ -210,7 +210,7 @@ impl<'a> ExternalTurnMachine<'a> {
         #[cfg(feature = "external-agent-bridge")]
         let mut bridge_server = if driver.external_capabilities.runtime_tools {
             match ExternalToolBridgeServer::start(
-                driver,
+                &driver,
                 state.clone(),
                 execution.clone(),
                 emitter.clone(),
@@ -498,7 +498,7 @@ pub(super) struct DispatchedRound {
     pub(super) turn_cancel: Cancellation,
 }
 
-impl TurnMachine<'_> {
+impl TurnMachine {
     pub(super) async fn accept_dispatched_round(
         &mut self,
         call: &ToolCall,

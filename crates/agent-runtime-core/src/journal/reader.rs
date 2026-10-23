@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::checkpoint::{
-    CHECKPOINT_SCHEMA_VERSION, TURN_TRANSITION_REVISION, TurnCheckpoint, TurnState,
+    CHECKPOINT_SCHEMA_VERSION, TurnCheckpoint, TurnState, supports_turn_transition_revision,
 };
 use crate::content::{InternalTurnInput, Message};
 use crate::error::RuntimeError;
@@ -767,7 +767,7 @@ impl<'a> JournalReader<'a> {
         let id = head.checkpoint.as_ref().ok_or_else(conflict)?;
         let refs: ReferencedTurnCheckpoint = self.object(id, JournalObjectKind::Checkpoint).await?;
         if refs.schema_version != JOURNAL_SCHEMA_VERSION
-            || refs.transition_revision != TURN_TRANSITION_REVISION
+            || !supports_turn_transition_revision(refs.transition_revision)
             || refs.session != head.session
             || refs.snapshot != head.snapshot
         {
