@@ -23,6 +23,8 @@ contain breaking changes and are coordinated with consumer proposals.
   calls and sibling calls from the discarded response are never dispatched.
 - Child transcripts retain native backend tool and hosted-search observations
   in canonical message order across protected resume and failed-save rollback.
+- The lockfile uses `tokio` 1.53.3, whose `AsyncFd` constructors no longer
+  violate I/O safety (RUSTSEC-2026-0386).
 - The lockfile uses patched TLS certificate validation and trust-root packages:
   `rustls-webpki` 0.103.16, `webpki-root-certs` 1.0.10, and `webpki-roots` 1.0.10
   (RUSTSEC-2026-0381, RUSTSEC-2026-0382, and RUSTSEC-2026-0383).
