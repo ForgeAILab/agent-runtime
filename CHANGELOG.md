@@ -7,6 +7,20 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- Read-only child history snapshots and subscriptions expose committed messages,
+  pending presentation, retained backend observations, and a live-event watermark
+  without running a dormant child or acknowledging its result.
+
+### Fixed
+
+- Malformed or truncated tool arguments can receive bounded correction attempts
+  with input-budget, cancellation, deadline, and provider-cache checks. Invalid
+  calls and sibling calls from the discarded response are never dispatched.
+- Child transcripts retain native backend tool and hosted-search observations
+  in canonical message order across protected resume and failed-save rollback.
+
 ## [0.9.0] - 2026-10-20
 
 ### Breaking

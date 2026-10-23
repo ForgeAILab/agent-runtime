@@ -1738,6 +1738,9 @@ impl Runtime {
             self.shared.event_buffer,
             identity.event_seq,
         ));
+        emitter.restore_history_observations(crate::runtime::transcript::RetainedHistoryObservations::load(
+            &extension_state, resumed, &session_id, state.history.len(),
+        )?);
         let execution = Arc::new(
             self.shared
                 .driver

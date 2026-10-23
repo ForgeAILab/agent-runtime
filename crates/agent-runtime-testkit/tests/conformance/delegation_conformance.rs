@@ -3,6 +3,21 @@
 use agent_runtime_testkit::conformance::delegation;
 
 #[tokio::test]
+async fn child_history_late_read_is_immutable_and_preserves_completion() {
+    delegation::assert_child_history_late_read_is_immutable_and_preserves_completion().await;
+}
+
+#[tokio::test]
+async fn child_history_late_subscription_keeps_speculative_prefix() {
+    delegation::assert_child_history_late_subscription_keeps_speculative_prefix().await;
+}
+
+#[tokio::test]
+async fn child_history_dormant_reads_are_provider_free() {
+    delegation::assert_child_history_dormant_reads_are_provider_free().await;
+}
+
+#[tokio::test]
 async fn spawn_lifecycle_is_ordered_and_carries_the_final_result() {
     delegation::assert_spawn_lifecycle_and_result().await;
 }

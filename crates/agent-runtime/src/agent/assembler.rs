@@ -23,6 +23,12 @@ struct Slot {
     arguments: String,
 }
 
+/// Internal classification: only model-authored JSON syntax admits correction.
+pub(crate) struct AssemblyError {
+    pub(crate) error: ProviderError,
+    pub(crate) correction: Option<String>,
+}
+
 /// Accumulates tool-call fragments keyed by their stream index.
 #[derive(Debug, Default)]
 pub struct ToolCallAssembler {
@@ -53,23 +59,49 @@ impl ToolCallAssembler {
     /// minted deterministically; malformed JSON arguments produce a structured
     /// [`ProviderErrorKind::MalformedStream`] error.
     pub fn finish(self, minter: &IdMinter) -> Result<Vec<ToolCall>, ProviderError> {
-        let mut calls = Vec::new();
-        for (index, slot) in self.slots {
-            if slot.name.is_empty() {
-                return Err(ProviderError::new(
+        self.finish_with_correction(minter)
+            .map_err(|error| error.error)
+    }
+
+    pub(crate) fn finish_with_correction(
+        self,
+        minter: &IdMinter,
+    ) -> Result<Vec<ToolCall>, AssemblyError> {
+        // Structural errors anywhere in the batch must not be hidden behind a
+        // syntax error in an earlier slot.
+        if let Some((index, _)) = self.slots.iter().find(|(_, slot)| slot.name.is_empty()) {
+            return Err(AssemblyError {
+                error: ProviderError::new(
                     ProviderErrorKind::MalformedStream,
                     format!("tool call at index {index} has no name"),
-                ));
-            }
+                ),
+                correction: None,
+            });
+        }
+        let mut calls = Vec::new();
+        for (index, slot) in self.slots {
             let trimmed = slot.arguments.trim();
             let arguments: Value = if trimmed.is_empty() {
                 Value::Object(Default::default())
             } else {
                 serde_json::from_str(trimmed).map_err(|e| {
-                    ProviderError::new(
-                        ProviderErrorKind::MalformedStream,
-                        format!("tool call `{}` has malformed arguments: {e}", slot.name),
-                    )
+                    AssemblyError {
+                        error: ProviderError::new(
+                            ProviderErrorKind::MalformedStream,
+                            format!("tool call at index {index} has malformed arguments: {e}"),
+                        ),
+                        // No raw argument text or model-supplied names: even a
+                        // parser diagnostic can echo an offending value.
+                        correction: Some(format!(
+                            "Your previous response contained invalid JSON arguments for tool \
+                             call at index {index} (line {}, column {}). None of that response's \
+                             tool calls were executed. Try again with complete, valid JSON \
+                             arguments. Split large commands or file contents into smaller \
+                             tool calls so the arguments fit within the output limit.",
+                            e.line(),
+                            e.column(),
+                        )),
+                    }
                 })?
             };
             let id = slot

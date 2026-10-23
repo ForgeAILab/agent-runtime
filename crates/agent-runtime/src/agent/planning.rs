@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-use agent_runtime_context::budget::{ContextError, ContextPolicy};
+use agent_runtime_context::budget::{ContextBudget, ContextError, ContextPolicy};
 use agent_runtime_context::cache::{CachePlan, ProviderCacheCapability};
 use agent_runtime_context::compaction::{
     CompactionOutcome, LosslessSummaryProducer as ContextLosslessSummaryProducer,
@@ -41,7 +41,9 @@ use agent_runtime_core::manifest::{
     LosslessSummaryProducer, LosslessSummaryRecord, ModelResolution, PolicyRevisions, RunManifest,
     SegmentId, SegmentSensitivity, SummaryCoverage,
 };
-use agent_runtime_core::provider::{CacheEndpointIdentity, HostedTool, ToolSchema};
+use agent_runtime_core::provider::{
+    CacheEndpointIdentity, HostedTool, ProviderRequest, ToolSchema,
+};
 use agent_runtime_core::store::VersionedSessionState;
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
@@ -177,6 +179,27 @@ impl RunPlanner {
     /// The frozen model profile this session plans against.
     pub fn profile(&self) -> &ResolvedModelProfile {
         &self.profile
+    }
+
+    /// Admits a temporary correction against the same frozen input limits and
+    /// wire sizer as the original request, without rewriting its context plan.
+    pub(crate) fn correction_budget(&self, request: &ProviderRequest) -> (u32, u32) {
+        let budget = ContextBudget::from_limits(&self.profile.limits, &self.policy);
+        let input_budget = self
+            .input_cap
+            .map_or(budget.input_budget, |cap| cap.min(budget.input_budget));
+        let tokens = request
+            .messages
+            .iter()
+            .map(|message| self.sizer.size_message(message))
+            .chain(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| self.sizer.size_tool_schema(tool)),
+            )
+            .fold(0u32, u32::saturating_add);
+        (tokens, input_budget)
     }
 
     pub(crate) fn reasoning_producer(&self) -> ReasoningProducer {
