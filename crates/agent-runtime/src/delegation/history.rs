@@ -168,15 +168,27 @@ impl DelegationCoordinator {
                 "child history snapshot belongs to another session",
             ));
         }
-        let snapshot = match (checkpoint.map(|checkpoint| checkpoint.snapshot), stored) {
-            (Some(checkpoint), Some(stored)) => Some(
-                if stored.identity.event_seq >= checkpoint.identity.event_seq {
-                    stored
-                } else {
-                    checkpoint
-                },
-            ),
-            (checkpoint, stored) => checkpoint.or(stored),
+        let snapshot = match (checkpoint, stored) {
+            (Some(checkpoint), Some(mut stored))
+                if matches!(checkpoint.state, TurnState::Terminal { .. }) =>
+            {
+                crate::runtime::engine::merge_terminal_checkpoint_snapshot(
+                    &mut stored,
+                    &checkpoint.snapshot,
+                    self.inner
+                        .parent
+                        .inner()
+                        .shared
+                        .driver
+                        .semantic_summary_revision()
+                        .is_some(),
+                )?;
+                Some(stored)
+            }
+            // Protected nonterminal/cache checkpoints own their exact history.
+            // Ordinary snapshots can lag or omit sensitive transcript state.
+            (Some(checkpoint), _) => Some(checkpoint.snapshot),
+            (None, stored) => stored,
         };
         let (history, next_event_sequence, retained_events, unavailable_reason) = match snapshot {
             Some(snapshot) => {

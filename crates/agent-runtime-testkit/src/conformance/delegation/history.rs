@@ -1,5 +1,25 @@
 use super::*;
 
+#[derive(Debug, Default)]
+struct RedactingOrdinaryStore(crate::InMemorySessionStore);
+
+#[async_trait]
+impl SessionStore for RedactingOrdinaryStore {
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        self.0.load(id).await
+    }
+
+    async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+        let mut redacted = snapshot.clone();
+        redacted.extension_state.retain(|namespace, state| {
+            state.sensitivity == agent_runtime_core::store::SessionStateSensitivity::RedactionSafe
+                || namespace == CHILD_CATALOG_NAMESPACE
+                || namespace == agent_runtime::delegation::CHILD_OUTCOME_CURSOR_NAMESPACE
+        });
+        self.0.save(&redacted).await
+    }
+}
+
 pub async fn assert_child_history_late_read_is_immutable_and_preserves_completion() {
     let (_runtime, parent) = parent_session(true).await;
     let mut call = tool_call_fragments(
@@ -132,17 +152,23 @@ pub async fn assert_child_history_late_subscription_keeps_speculative_prefix() {
 }
 
 pub async fn assert_child_history_dormant_reads_are_provider_free() {
-    for native in [false, true] {
-        let parent_id = SessionId::new(format!("history-parent-{native}"));
-        let (sessions, checkpoints): (Arc<dyn SessionStore>, Arc<dyn CheckpointStore>) = if native {
-            let stores = NativeDurableStores::new(&format!("history-{native}"));
-            (stores.clone(), stores)
-        } else {
-            (
-                Arc::new(crate::InMemorySessionStore::new()),
-                Arc::new(crate::InMemoryCheckpointStore::new()),
-            )
-        };
+    for mode in ["legacy", "native", "redacted"] {
+        let parent_id = SessionId::new(format!("history-parent-{mode}"));
+        let (sessions, checkpoints): (Arc<dyn SessionStore>, Arc<dyn CheckpointStore>) =
+            if mode == "native" {
+                let stores = NativeDurableStores::new(&format!("history-{mode}"));
+                (stores.clone(), stores)
+            } else if mode == "redacted" {
+                (
+                    Arc::new(RedactingOrdinaryStore::default()),
+                    Arc::new(crate::InMemoryCheckpointStore::new()),
+                )
+            } else {
+                (
+                    Arc::new(crate::InMemorySessionStore::new()),
+                    Arc::new(crate::InMemoryCheckpointStore::new()),
+                )
+            };
         let mut script = text_child_script("retained answer");
         script[0].events.insert(
             0,
@@ -176,6 +202,25 @@ pub async fn assert_child_history_dormant_reads_are_provider_free() {
         let ready = coordinator.wait_ready_task_outcomes().await.unwrap();
         let live = coordinator.child_history(&child).await.unwrap();
         assert_eq!(live.retained_events.len(), 1);
+        if mode == "redacted" {
+            let ordinary = sessions.load(&live.status.session).await.unwrap().unwrap();
+            assert!(
+                !ordinary
+                    .extension_state
+                    .contains_key("agent-runtime.transcript.observations")
+            );
+            let protected = checkpoints
+                .load_latest(&live.status.session)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                protected
+                    .snapshot
+                    .extension_state
+                    .contains_key("agent-runtime.transcript.observations")
+            );
+        }
         handle.shutdown().await.unwrap();
         coordinator.flush().await.unwrap();
         parent.shutdown().await.unwrap();
