@@ -9,6 +9,9 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Added
 
+- `ArtifactProvenance::child` optionally names the delegated child behind a
+  parent-owned artifact; stored child replies set it. Records without it load
+  unchanged, and it is omitted when absent.
 - Explicit host-triggered retirement and logical collection in the volatile
   `InMemorySessionJournal`, with revision-bound retention authorization, durable
   migration/fork/child and historical pins, transactional root/pin epochs,
