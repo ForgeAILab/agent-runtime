@@ -311,6 +311,10 @@ impl SessionHandle {
             .inner
             .execution
             .snapshot_extension_state_for_journal(false);
+        extensions.insert(
+            super::super::transcript::OBSERVATIONS_NAMESPACE.to_owned(),
+            Arc::new(self.inner.emitter.history_observation_state()),
+        );
         if let Some(cache) = self.inner.shared.cache.persisted_session(&self.inner.id) {
             extensions.insert(
                 crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),
@@ -341,6 +345,10 @@ impl SessionHandle {
             agent_runtime_core::journal::profile::enter_sync("rt.runtime.public_snapshot");
         let state = self.inner.state.lock().expect("session state poisoned");
         let mut extension_state = self.inner.execution.snapshot_extension_state();
+        extension_state.insert(
+            super::super::transcript::OBSERVATIONS_NAMESPACE.to_owned(),
+            self.inner.emitter.history_observation_state(),
+        );
         if let Some(cache) = self.inner.shared.cache.persisted_session(&self.inner.id) {
             extension_state.insert(
                 crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),

@@ -854,9 +854,9 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_provider(
         &self,
-        request: ProviderRequest,
+        mut request: ProviderRequest,
         request_id: &RequestId,
-        cache: Option<&ProviderCacheProjection>,
+        mut cache: Option<&ProviderCacheProjection>,
         provider_plan: Option<(&RunPlanner, &ContextPlan)>,
         emitter: &EventEmitter,
         minter: &IdMinter,
@@ -867,6 +867,8 @@ impl Driver {
     ) -> ProviderTurnOutcome {
         let mut attempt_index: u32 = 0;
         let mut credential_recovery_used = false;
+        let original_message_count = request.messages.len();
+        let planner = provider_plan.map_or(self.planner_template.as_ref(), |(planner, _)| planner);
         // The plan becomes a provider-cache predecessor only after an adapter
         // accepts the normalized request and returns a stream. Adapter-local
         // payload validation may fail synchronously before any provider I/O;
@@ -874,6 +876,15 @@ impl Driver {
         // provider never received. Retries share this one-shot boundary.
         let mut provider_plan = provider_plan;
         loop {
+            if turn_cancel.is_cancelled() {
+                return ProviderTurnOutcome::Cancelled;
+            }
+            if turn_deadline.is_expired(self.clock.as_ref()) {
+                return ProviderTurnOutcome::LimitReached {
+                    limit: LimitKind::Time,
+                    provider_error_kind: None,
+                };
+            }
             let attempt_id = minter.attempt();
             emitter.emit(
                 turn.clone(),
@@ -1041,13 +1052,19 @@ impl Driver {
                                 response_progress = true;
                                 hosted_searches = hosted_searches.saturating_add(1);
                                 emit_coalesced(coalescer.drain());
-                                emitter.emit(
+                                let history_index = state
+                                    .lock()
+                                    .expect("session state poisoned")
+                                    .history()
+                                    .len();
+                                emitter.emit_retained(
                                     turn.clone(),
                                     RuntimeEvent::HostedSearch {
                                         action,
                                         query,
                                         sources,
                                     },
+                                    history_index,
                                 );
                             }
                             ProviderStreamEvent::Usage { delta } => {
@@ -1153,10 +1170,32 @@ impl Driver {
                 );
             }
             let mut tool_calls = Vec::new();
-            if error.is_none() {
-                match assembler.finish(minter) {
+            let mut correction = None;
+            // Filtered, errored and cancelled output is never correctable.
+            // Length-truncated arguments can be retried as smaller calls;
+            // an exhausted correction still reports the output limit.
+            let terminal_finish = provider_finish.is_some_and(|finish| {
+                !matches!(
+                    finish,
+                    FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Length
+                )
+            });
+            if error.is_none()
+                && provider_finish == Some(FinishReason::Stop)
+                && !assembler.is_empty()
+            {
+                error = Some(ProviderError::new(
+                    ProviderErrorKind::MalformedStream,
+                    "provider finish reason did not match its streamed tool calls",
+                ));
+            }
+            if error.is_none() && !terminal_finish {
+                match assembler.finish_with_correction(minter) {
                     Ok(calls) => {
-                        if let Some(validation_error) = calls
+                        if provider_finish == Some(FinishReason::Length) {
+                            // No call from an output-limited response executes.
+                            tool_calls = calls;
+                        } else if let Some(validation_error) = calls
                             .iter()
                             .find_map(|call| self.registry.validate_call(call).err())
                         {
@@ -1165,7 +1204,12 @@ impl Driver {
                             tool_calls = calls;
                         }
                     }
-                    Err(assembly_error) => error = Some(assembly_error),
+                    Err(assembly_error) => {
+                        correction = assembly_error.correction;
+                        if correction.is_some() || provider_finish != Some(FinishReason::Length) {
+                            error = Some(assembly_error.error);
+                        }
+                    }
                 }
             }
 
@@ -1388,6 +1432,19 @@ impl Driver {
             }
 
             if let Some(perr) = error {
+                let mut correction_request = correction.map(|feedback| {
+                    let mut corrected = request.clone();
+                    corrected.messages.truncate(original_message_count);
+                    corrected.messages.push(Message::user(feedback));
+                    corrected.cache_identity = None;
+                    corrected.cache_boundary = None;
+                    corrected
+                });
+                let correction_over_budget = correction_request
+                    .as_ref()
+                    .map(|corrected| planner.correction_budget(corrected))
+                    .filter(|(requested, limit)| requested > limit);
+                let argument_correction = correction_request.is_some();
                 let credential_recovery = !credential_recovery_used
                     && !accepted_semantic_event
                     && perr.credential_recovery
@@ -1398,12 +1455,19 @@ impl Driver {
                 // into ordinary retry loops.
                 let ordinary_retryable =
                     perr.kind != ProviderErrorKind::Auth && is_retryable(&perr);
-                let retryable = credential_recovery || ordinary_retryable;
+                let retryable = credential_recovery
+                    || ordinary_retryable
+                    || (argument_correction && correction_over_budget.is_none());
                 let retry_budget_available = self.config.retry.allows_retry(attempt_index);
                 let ordinary_retry_delay_ms = (ordinary_retryable && retry_budget_available)
                     .then(|| self.config.retry.backoff_ms(attempt_index, &perr));
                 let remaining_before_retry = turn_deadline.remaining_millis(self.clock.as_ref());
-                let retry_delay_ms = if credential_recovery && retry_budget_available {
+                let retry_delay_ms = if argument_correction {
+                    (retry_budget_available
+                        && correction_over_budget.is_none()
+                        && remaining_before_retry.is_none_or(|remaining| remaining > 0))
+                    .then_some(0)
+                } else if credential_recovery && retry_budget_available {
                     // Credential renewal already had an immediate replay
                     // contract before retry metadata existed. Keep that
                     // behavior unchanged and report the admitted zero delay.
@@ -1429,7 +1493,11 @@ impl Driver {
                         attempt: attempt_id,
                         index: Some(attempt_index),
                         max_attempts: Some(self.config.retry.max_attempts),
-                        finish: FinishReason::Error,
+                        finish: if argument_correction && finish == FinishReason::Length {
+                            FinishReason::Length
+                        } else {
+                            FinishReason::Error
+                        },
                         retryable,
                         error: Some(perr.clone()),
                         retry_delay_ms,
@@ -1439,6 +1507,12 @@ impl Driver {
                     return ProviderTurnOutcome::Cancelled;
                 }
                 if let Some(delay) = retry_delay_ms {
+                    if let Some(corrected) = correction_request.take() {
+                        request = corrected;
+                        cache = None;
+                        provider_plan = None;
+                        planner.retire_cache_baseline();
+                    }
                     if credential_recovery {
                         credential_recovery_used = true;
                     }
@@ -1456,6 +1530,21 @@ impl Driver {
                     }
                     attempt_index += 1;
                     continue;
+                }
+                if let Some((requested, limit)) = correction_over_budget {
+                    return ProviderTurnOutcome::InputBudgetExceeded { requested, limit };
+                }
+                if argument_correction && turn_deadline.is_expired(self.clock.as_ref()) {
+                    return ProviderTurnOutcome::LimitReached {
+                        limit: LimitKind::Time,
+                        provider_error_kind: None,
+                    };
+                }
+                if argument_correction && finish == FinishReason::Length {
+                    return ProviderTurnOutcome::LimitReached {
+                        limit: LimitKind::Output,
+                        provider_error_kind: None,
+                    };
                 }
                 if retry_refused_by_deadline {
                     // Preserve the existing turn-deadline behavior: the

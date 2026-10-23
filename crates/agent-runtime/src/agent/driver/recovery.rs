@@ -899,29 +899,6 @@ impl<'a> TurnMachine<'a> {
             .await;
             return;
         }
-        // ModelResponseReady is durable before these two observer events.
-        // A host truncates the journal at the checkpoint's next-sequence
-        // watermark before recovery, so this is the one canonical commit of
-        // the already assembled attempt and never another provider call.
-        self.emitter.emit(
-            Some(self.turn_id.clone()),
-            RuntimeEvent::ProviderAttemptOutputCommitted {
-                request: request_id.clone(),
-                attempt: response.attempt.clone(),
-            },
-        );
-        self.emitter.emit(
-            Some(self.turn_id.clone()),
-            RuntimeEvent::ProviderAttemptFinished {
-                attempt: response.attempt.clone(),
-                index: None,
-                max_attempts: None,
-                finish: response.finish,
-                retryable: false,
-                error: None,
-                retry_delay_ms: None,
-            },
-        );
         if matches!(
             disposition,
             ResponseDisposition::Complete | ResponseDisposition::Continue
@@ -946,6 +923,30 @@ impl<'a> TurnMachine<'a> {
                     .append_history([Message::assistant(parts)]);
             }
         }
+
+        // ModelResponseReady is durable before these two observer events.
+        // A host truncates the journal at the checkpoint's next-sequence
+        // watermark before recovery, so this is the one canonical commit of
+        // the already assembled attempt and never another provider call.
+        self.emitter.emit(
+            Some(self.turn_id.clone()),
+            RuntimeEvent::ProviderAttemptOutputCommitted {
+                request: request_id.clone(),
+                attempt: response.attempt.clone(),
+            },
+        );
+        self.emitter.emit(
+            Some(self.turn_id.clone()),
+            RuntimeEvent::ProviderAttemptFinished {
+                attempt: response.attempt.clone(),
+                index: None,
+                max_attempts: None,
+                finish: response.finish,
+                retryable: false,
+                error: None,
+                retry_delay_ms: None,
+            },
+        );
 
         match disposition {
             ResponseDisposition::Complete => match self.continue_after_complete(step).await {

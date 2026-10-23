@@ -823,6 +823,18 @@ impl SessionState {
         self.history = history;
     }
 
+    #[cfg(any(test, feature = "external-agent"))]
+    pub(crate) fn replace_history_at(&mut self, index: usize, message: Message) {
+        self.history_changed(index);
+        self.history[index] = message;
+    }
+
+    #[cfg(any(test, feature = "external-agent"))]
+    pub(crate) fn remove_history_at(&mut self, index: usize) -> Message {
+        self.history_changed(index);
+        self.history.remove(index)
+    }
+
     pub(crate) fn record_usage(&mut self, value: agent_runtime_core::usage::UsageRecord) {
         self.usage_changed(self.usage.records().len());
         self.usage.record(value);

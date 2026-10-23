@@ -188,7 +188,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::*;
-    use agent_runtime_core::content::Message;
+    use agent_runtime_core::content::{ContentPart, Message};
     use agent_runtime_core::ids::TurnId;
     use agent_runtime_core::journal::JournalWriterAssembler;
     use agent_runtime_core::manifest::{CapabilityResolution, ModelResolution, RunManifest};
@@ -462,6 +462,29 @@ mod tests {
                 .collect(),
         );
         oracle.check(&mut live, &mut replaced, &extensions, 4, true);
+        assert_eq!(live.incremental_captures, 2);
+    }
+
+    #[test]
+    fn indexed_history_rollback_keeps_later_messages_in_incremental_capture() {
+        let mut live = LiveSnapshot::default();
+        live.enable();
+        let mut oracle = Oracle::new();
+        let extensions = boundary();
+        let mut state = SessionState::with_history(vec![
+            Message::user("go"),
+            Message::assistant(vec![ContentPart::text("pending dispatch")]),
+            Message::assistant(vec![ContentPart::text("later native prefix")]),
+        ]);
+        oracle.check(&mut live, &mut state, &extensions, 0, true);
+        state.replace_history_at(
+            1,
+            Message::assistant(vec![ContentPart::text("kept prefix")]),
+        );
+        oracle.check(&mut live, &mut state, &extensions, 1, true);
+        state.remove_history_at(1);
+        oracle.check(&mut live, &mut state, &extensions, 2, true);
+        assert_eq!(state.history()[1].joined_text(), "later native prefix");
         assert_eq!(live.incremental_captures, 2);
     }
 
