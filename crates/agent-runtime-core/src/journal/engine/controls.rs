@@ -33,6 +33,8 @@ impl CollectionFailures {
                 let conflict = error.kind == ErrorKind::Conflict
                     || matches!(error.class, FailureClass::StateConflict { .. });
                 if !conflict
+                    || error.metadata.get("journal_collection_incomplete_members")
+                        == Some(&MetaValue::Bool(true))
                     || error.metadata.get("journal_invalid_state") == Some(&MetaValue::Bool(true))
                 {
                     self.unreadable.insert(session.clone());

@@ -47,6 +47,16 @@ impl ClosureEvidence {
     pub(super) fn is_membership_only(&self) -> bool {
         self.root.is_none() && self.active.is_empty()
     }
+    #[cfg(test)]
+    pub(super) fn replace_member_for_test(
+        &mut self,
+        removed: &JournalObjectId,
+        added: JournalObjectId,
+    ) {
+        assert!(self.members.contains_key(removed));
+        self.members.remove(removed);
+        self.members.insert(added, 1);
+    }
     /// Whether both proofs share one immutable member set.
     pub(super) fn shares_members(&self, other: &Self) -> bool {
         self.members.ptr_eq(&other.members)

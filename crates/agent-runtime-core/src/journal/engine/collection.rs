@@ -95,12 +95,36 @@ impl CollectionState {
             peak_skip_charge: 0,
         }
     }
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn charge(&self) -> usize {
         self.cursor
             .as_ref()
             .and_then(|cursor| cursor.mark.as_ref())
             .map_or(0, SessionMark::charge)
+    }
+}
+
+#[cfg(test)]
+impl CollectionState {
+    pub(super) fn phase_for_test(&self) -> Option<&'static str> {
+        self.cursor
+            .as_ref()?
+            .mark
+            .as_ref()
+            .map(|mark| match mark.phase {
+                Phase::Pins => "pins",
+                Phase::Trace => "trace",
+                Phase::Leases => "leases",
+                Phase::Inventory => "inventory",
+                Phase::Dependencies => "dependencies",
+                Phase::Release => "release",
+            })
+    }
+    pub(super) fn shared_layers_for_test(&self) -> &[Arc<ReachableLayer>] {
+        self.cursor
+            .as_ref()
+            .and_then(|cursor| cursor.mark.as_ref())
+            .map_or(&[], |mark| mark.shared.layers.as_slice())
     }
 }
 
@@ -265,17 +289,19 @@ impl SessionMark {
     }
     // Collector workspace retains references. The writer's extend_layer can
     // coalesce member layers through COW, allocating a new full member set.
-    fn share_layer(&mut self, layer: Arc<ReachableLayer>) {
-        if self.shared.layers.iter().any(|held| {
-            Arc::ptr_eq(held, &layer)
+    fn shares_layer(&self, layer: &Arc<ReachableLayer>) -> bool {
+        self.shared.layers.iter().any(|held| {
+            Arc::ptr_eq(held, layer)
                 || match (held.as_ref(), layer.as_ref()) {
                     (ReachableLayer::Evidence(a), ReachableLayer::Evidence(b)) => Arc::ptr_eq(a, b),
                     _ => false,
                 }
-        }) {
-            return;
+        })
+    }
+    fn share_layer(&mut self, layer: Arc<ReachableLayer>) {
+        if !self.shares_layer(&layer) {
+            self.shared.layers.push(layer);
         }
-        self.shared.layers.push(layer);
     }
     fn live_count(&self) -> usize {
         self.visited.len()
@@ -345,6 +371,14 @@ enum Step {
 
 fn unsupported() -> RuntimeError {
     RuntimeError::unsupported_capability(UnsupportedCapability::JournalCollection)
+}
+
+fn incomplete_members() -> RuntimeError {
+    let mut error = conflict();
+    error
+        .metadata
+        .insert("journal_collection_incomplete_members", true);
+    error
 }
 
 // A plain state conflict from a fence-bound page under an unchanged fence:
@@ -571,26 +605,21 @@ impl<S: JournalStorage> JournalEngine<S> {
                             .as_ref()
                             .map_or(JournalFence::default(), JournalSessionRecord::fence);
                         let mark = cursor.mark.as_ref().expect("mark");
-                        // Only this session's own changes invalidate its mark:
-                        // a write (fence) or a lease opened/closed since its
-                        // lease roots were taken. Added leases are also
-                        // filtered before every apply; a closed one would only
-                        // keep garbage until the next pass.
-                        let (leases_changed, epoch) = {
+                        // The fence and working proof authenticate a resumed mark.
+                        // Lease additions are checked before apply; removals only
+                        // leave conservative protection until the next pass.
+                        let (working_changed, epoch) = {
                             let local = self.local.lock()?;
-                            let leases_changed = mark
-                                .leases
-                                .as_ref()
-                                .is_some_and(|taken| Self::lease_ids(&local, &session) != *taken);
                             let working_changed = local
                                 .sessions
                                 .get(&session)
+                                .filter(|record| record.active_writer.is_some())
                                 .and_then(|record| record.exact.as_ref())
                                 .map(Arc::as_ptr)
                                 != mark.working.as_ref().map(std::sync::Weak::as_ptr);
-                            (leases_changed || working_changed, local.root_epoch)
+                            (working_changed, local.root_epoch)
                         };
-                        if fence != mark.fence || leases_changed {
+                        if fence != mark.fence || working_changed {
                             diag(
                                 if fence != mark.fence {
                                     "rt.gc.restart.fence"
@@ -617,7 +646,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             }
             loop {
                 if let Some(mark) = cursor.mark.as_mut() {
-                    if !self.refresh_mark_epoch(mark)? {
+                    if !self.refresh_mark_epoch(mark, false)? {
                         let session = mark.session.clone();
                         cursor.mark = None;
                         Self::restart(cursor, call, failures, session);
@@ -718,14 +747,14 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         let started = Instant::now();
         call.units += 1;
-        let (epoch, leases, working) = {
+        let (epoch, working) = {
             let local = self.local.lock()?;
             (
                 local.root_epoch,
-                Self::lease_ids(&local, &session),
                 local
                     .sessions
                     .get(&session)
+                    .filter(|r| r.active_writer.is_some())
                     .and_then(|r| r.exact.as_ref())
                     .map(Arc::downgrade),
             )
@@ -735,7 +764,6 @@ impl<S: JournalStorage> JournalEngine<S> {
             let mut mark = SessionMark::new(session.clone(), stored);
             mark.working = working;
             mark.epoch = epoch;
-            mark.leases = Some(leases);
             if let Some(stored) = &mark.stored {
                 let metadata: Metadata = decode(&stored.engine)?;
                 if let Some(head) = &stored.head {
@@ -846,10 +874,9 @@ impl<S: JournalStorage> JournalEngine<S> {
         if !call.admit(kind, &cursor.costs) {
             return Ok(Step::Yield);
         }
-        // No epoch check here: close, renew and revocation (the only changes
-        // possible under the held gate) only remove protection, any write to
-        // this session fails the batch's fence, and the lease filter runs
-        // before every apply.
+        // Per-step working-proof checks run above; lease additions are checked
+        // after preflight, before apply. Close and revocation only remove
+        // lease protection. Storage still checks the complete session fence.
         let started = Instant::now();
         call.units += 1;
         let session = cursor.mark.as_ref().expect("mark").session.clone();
@@ -1128,6 +1155,20 @@ impl<S: JournalStorage> JournalEngine<S> {
         if bodies.len() != ids.len() {
             return Err(conflict());
         }
+        if bodies.iter().any(Option::is_none) {
+            // A missing body can race another engine's write. Only classify
+            // it as invalid membership after authenticating the same fence.
+            let fence = cursor.mark.as_ref().expect("mark").fence;
+            let stored = self.storage.load(&self.domain, &session).await?;
+            let current = stored
+                .as_ref()
+                .map_or(JournalFence::default(), JournalSessionRecord::fence);
+            return Err(if current == fence {
+                incomplete_members()
+            } else {
+                conflict()
+            });
+        }
         let mut objects = BTreeMap::new();
         for (id, body) in ids.into_iter().zip(bodies) {
             objects.insert(id, body.ok_or_else(conflict)?);
@@ -1187,18 +1228,32 @@ impl<S: JournalStorage> JournalEngine<S> {
         Ok(())
     }
 
-    // Global epoch changes are examined, but only this session's changed
-    // protection discards work. Other sessions cannot invalidate its proof.
-    fn refresh_mark_epoch(&self, mark: &mut SessionMark) -> Result<bool, RuntimeError> {
+    // Only working-proof changes invalidate intermediate work. Added leases
+    // with new protection require inventory at pre-apply. Renew rotates a
+    // handle but retains its layers; removed leases are conservative.
+    fn refresh_mark_epoch(
+        &self,
+        mark: &mut SessionMark,
+        pre_apply: bool,
+    ) -> Result<bool, RuntimeError> {
         let local = self.local.lock()?;
-        if local.root_epoch != mark.epoch {
-            let changed = mark
-                .leases
-                .as_ref()
-                .is_some_and(|taken| Self::lease_ids(&local, &mark.session) != *taken)
+        if local.root_epoch != mark.epoch || pre_apply {
+            let changed = pre_apply
+                && mark.leases.as_ref().is_some_and(|taken| {
+                    local.leases.iter().any(|(id, lease)| {
+                        lease.session == mark.session
+                            && !taken.contains(id)
+                            && lease
+                                .reachable
+                                .layers
+                                .iter()
+                                .any(|layer| !mark.shares_layer(layer))
+                    })
+                })
                 || local
                     .sessions
                     .get(&mark.session)
+                    .filter(|r| r.active_writer.is_some())
                     .and_then(|r| r.exact.as_ref())
                     .map(Arc::as_ptr)
                     != mark.working.as_ref().map(std::sync::Weak::as_ptr);
@@ -1252,12 +1307,18 @@ impl<S: JournalStorage> JournalEngine<S> {
         } else {
             return Ok(false);
         };
+        let local = self.local.lock()?;
         let mut memo = self.memo.lock().map_err(|_| host_failure())?;
-        let Some(entry) = memo.get(&mark.session, root) else {
+        let Some(entry) = memo.peek(&mark.session, root) else {
             return Ok(false);
         };
         if !entry.closure.is_head_root(root) {
             memo.remove_root(&mark.session, root);
+            return Ok(false);
+        }
+        // Memo summaries are an optimization. Stored authority metadata was
+        // checked by the caller; an unresolved cached summary takes cold tracing.
+        if entry.dependencies.unresolved {
             return Ok(false);
         }
         let bytes = entry
@@ -1268,17 +1329,21 @@ impl<S: JournalStorage> JournalEngine<S> {
                 (entry.dependencies.sessions.len() + entry.dependencies.catalog_sessions.len() + 4)
                     * ID_CHARGE,
             );
-        let Some(retention) = memo.retain_collection_proof(bytes) else {
+        let Some(retention) = memo.retain_collection_proof(bytes, |session, root| {
+            local
+                .sessions
+                .get(session)
+                .and_then(|r| r.current.as_ref())
+                .is_some_and(|(id, _)| id == root)
+        }) else {
             return Ok(false);
         };
+        drop(local);
         let closure = entry.closure.clone();
         let dependencies = entry.dependencies.clone();
-        if dependencies.unresolved {
-            return Err(unsupported());
-        }
         mark.dependencies
             .extend(dependencies.sessions.iter().cloned());
-        mark.shared.push_evidence(closure.clone());
+        mark.share_layer(Arc::new(ReachableLayer::Evidence(closure.clone())));
         diag("rt.gc.proof.roots", 1, bytes as u64);
         diag(
             "rt.gc.proof.retained",
@@ -1366,6 +1431,7 @@ impl<S: JournalStorage> JournalEngine<S> {
         report: &mut JournalGcReport,
     ) -> Result<(), RuntimeError> {
         let mark = cursor.mark.as_mut().expect("mark");
+        debug_assert_eq!(mark.shared.layers.len(), mark.shared_members.len());
         if mark.members_started && mark.member_after.is_none() {
             if mark.live_members != mark.live_count()
                 || mark
@@ -1377,11 +1443,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             {
                 // This is a failed live-subset check, not a rejected physical
                 // continuation. Retrying the same mark cannot repair it.
-                let mut error = conflict();
-                error
-                    .metadata
-                    .insert("journal_collection_incomplete_members", true);
-                return Err(error);
+                return Err(incomplete_members());
             }
             mark.dep_queue = std::mem::take(&mut mark.dependencies).into_iter().collect();
             mark.phase = Phase::Dependencies;
@@ -1398,6 +1460,7 @@ impl<S: JournalStorage> JournalEngine<S> {
             )
             .await?;
         let mark = cursor.mark.as_mut().expect("mark");
+        debug_assert_eq!(mark.shared.layers.len(), mark.shared_members.len());
         if let JournalCollectionItems::Members(ids) = page.items {
             report.examined += ids.len() as u64;
             for id in ids {
@@ -1539,7 +1602,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 _ => return Err(unsupported()),
             }
         };
-        if !self.refresh_mark_epoch(mark)? {
+        if !self.refresh_mark_epoch(mark, true)? {
             let mut error = conflict();
             error
                 .metadata

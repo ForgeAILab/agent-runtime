@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-22T14:32:43Z
+updated_at: 2026-10-23T22:36:31Z
 completed_at:
 ---
 
@@ -167,3 +167,18 @@ capture and each certified typed JSON composition with the complete path.
 Reachable sets fold above 16 layers and durable pins keep closure membership
 only. Results are in `/Volumes/Data/tmp/refactor/rt-p1b-fix/`. No measurement
 was rerun for these fixes.
+
+### P2 review repair (2026-10-23)
+
+- [x] 2.6 Fix reference-only proof layers, delayed/addition-only lease checks, non-destructive memo admission, renew identity/LRU feedback and unresolved-summary fallback; report incomplete membership through the existing unreadable list.
+- [x] 2.7 Add >16-root, lease churn/protection, failed reservation, evicted-renew convergence and reachable-body subset controls; retain existing assertions and document fixture edits.
+- [x] 2.8 Run the requested focused merge targets, both lint configurations, fourteen P4 controls, repair fail-without controls and one B/4000 sample per shape; publish `/Volumes/Data/tmp/refactor/rt-p2-fix/report.md`.
+
+Task 2.5 remains partial: this repair's quick sanity sample does not replace
+its previously outstanding full performance acceptance matrix.
+
+The single B/4000 plain/tool sanity capture preserves canonical state and drain
+receipts, but its overhead and maximum collect timings exceed the prior P2
+sample under the recorded higher host load. These comparisons are NOT MET; no
+additional sample or timing-driven code change followed. All requested
+correctness targets, both clippy configurations and 26 negative controls pass.

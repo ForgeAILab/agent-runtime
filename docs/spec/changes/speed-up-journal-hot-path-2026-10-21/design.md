@@ -301,9 +301,12 @@ Historical certificates establish the stronger pin history required by D-1;
 pin existence alone does not. Before each apply, the full session fence and
 root/pin epoch protect the authenticated live union. An epoch change while a
 metadata/preflight await is in flight rechecks the marked session's lease set
-and working-proof identity before mutation; affected protection discards the
-mark. On resume, one local snapshot authenticates those identities alongside
-the freshly loaded full fence before adopting the new epoch. Unrelated-session
+and active-writer working-proof identity before mutation. Lease ids are captured
+only when their layers join the mark. Only added leases with layers outside the
+marked union restart at pre-apply; removed leases retain conservative protection.
+Renewed handles with the same shared layers do not restart. On resume, the
+working-proof identity and freshly loaded full fence authenticate the mark
+before adopting the new epoch. Unrelated-session
 churn never restarts the mark, preserving P4's accepted restart rule. A collection may
 invalidate only affected historical proofs on acknowledged release and must
 trim released cache-only bodies; re-admission must still occur later.
@@ -322,7 +325,10 @@ revision behavior; proof reuse cannot hide unreadable authority metadata.
 with engine identity supplied by its memo reservation owner and explicit
 domain/session/root, current-or-certified-pin source, full fence and epoch.
 Temporary retention reserves a conservative proof/summary charge against the
-same configured memo budget, evicting LRU cache entries or declining reuse;
+same configured memo budget, preflighting eligible non-current LRU cache entries
+before eviction or declining reuse without eviction. Collector lookups leave LRU
+order unchanged. Unresolved cached summaries decline reuse before reservation,
+leaving stored metadata and the cold walker to decide collectability;
 RAII releases the reservation on completion, restart, skip, cancellation or
 cursor disposal. Producer memo admission includes outstanding reservations.
 The 16 MiB cursor cap charges handle/layer references and metadata, without
@@ -333,10 +339,15 @@ without using the writer's member-layer coalescing helper: COW coalescing would
 allocate a new member set in cursor workspace. Membership pages test each
 retained layer once per id and count it independently, preserving the full
 live-subset integrity check without materializing their union. A failed subset
-check silently skips the session with dirty state retained; it is distinct from
-a physical continuation conflict and cannot trigger an endless one-unit
-restart loop. The lease filter and atomic storage fence still guard every
-apply, and only acknowledged collector writes advance the cursor's fence.
+check reports the session in the existing sorted `unreadable_sessions` field
+with dirty state retained, skips it for this pass and does not set `has_more`
+by itself. It is distinct from a physical continuation conflict and cannot
+trigger an endless one-unit restart loop. The cold walker also reports missing bodies as incomplete
+membership after reloading and matching the mark's full fence; a concurrent
+fence change retains the restart path. This includes recreated historical pins
+whose bodies were already collected. The lease filter and atomic storage fence
+still guard every apply, and only acknowledged collector writes advance the
+cursor's fence.
 
 ### Acceptance, estimated effect and size
 
@@ -553,12 +564,14 @@ session stopped part-way by the `max_objects` budget makes its pass end with
 A request with stale `expected_root_epoch` still returns the existing conflict
 before destructive work. `Restarted` describes a stale private cursor only when
 the request itself carries a valid current epoch. Before resuming, authenticate
-the session fence and that session's lease set. A commit, writer change,
-retirement, pin/staging/catalog change or dependency index write changes the
-session's fence; a reader open/close/revoke on that session changes its lease
-set; either discards that session's speculative mark (Restarted) before any new
-release. Changes on other sessions never restart it, and a root-epoch change
-alone is not a restart cause: close, renew and revoke only remove protection,
+the session fence and active writer's working-proof identity. A commit, writer
+change, retirement, pin/staging/catalog change or dependency index write changes
+the session's fence; replacing or clearing working evidence also discards the
+speculative mark. Reader lease ids remain unset until the lease phase. Only an
+added lease with previously unmarked layers discards the mark, at pre-apply;
+closing a lease never restarts solely because its id disappeared. Changes on
+other sessions never restart it, and a root-epoch change alone is not a restart
+cause: close, renew and revoke only remove protection,
 and lease roots registered after the mark are filtered out of every release
 batch before its apply. The former pre-release epoch conflict inside a call is
 removed for the same reason. A page conflict under an unchanged fence (a

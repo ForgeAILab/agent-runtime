@@ -77,13 +77,33 @@ impl RootMemo {
         self.bytes
             .saturating_add(self.retained_proof_bytes.load(Ordering::Relaxed))
     }
-    pub(super) fn retain_collection_proof(&mut self, bytes: usize) -> Option<ProofRetention> {
-        if bytes > self.budget {
+    pub(super) fn retain_collection_proof(
+        &mut self,
+        bytes: usize,
+        is_current: impl Fn(&SessionId, &JournalObjectId) -> bool,
+    ) -> Option<ProofRetention> {
+        let available = self
+            .budget
+            .saturating_sub(self.retained_proof_bytes.load(Ordering::Relaxed));
+        if bytes > available {
             return None;
         }
-        while self.total_charge().saturating_add(bytes) > self.budget {
-            let oldest = self.oldest.clone()?;
-            self.remove(&oldest);
+        // Find enough eligible LRU entries before evicting any. Proof reuse
+        // must not displace current heads or empty the memo on a declined hit.
+        let mut victims = Vec::new();
+        let mut resident = self.bytes;
+        let mut next = self.oldest.as_ref();
+        while resident > available - bytes {
+            let key = next?;
+            let node = &self.entries[key];
+            if !is_current(&key.0, &key.1) {
+                resident = resident.saturating_sub(node.entry.bytes);
+                victims.push(key.clone());
+            }
+            next = node.newer.as_ref();
+        }
+        for key in victims {
+            self.remove(&key);
         }
         self.retained_proof_bytes
             .fetch_add(bytes, Ordering::Relaxed);
@@ -116,6 +136,16 @@ impl RootMemo {
     pub(super) fn entry_count_for_test(&self) -> usize {
         self.entries.len()
     }
+    #[cfg(test)]
+    pub(super) fn lru_order_for_test(&self) -> Vec<(SessionId, JournalObjectId)> {
+        let mut order = Vec::new();
+        let mut next = self.oldest.as_ref();
+        while let Some(key) = next {
+            order.push(key.clone());
+            next = self.entries[key].newer.as_ref();
+        }
+        order
+    }
     pub(super) fn new(budget: usize) -> Self {
         Self {
             budget,
@@ -125,6 +155,16 @@ impl RootMemo {
             oldest: None,
             newest: None,
         }
+    }
+    // Collector lookups must not promote historical roots ahead of writers.
+    pub(super) fn peek(
+        &self,
+        session: &SessionId,
+        root: &JournalObjectId,
+    ) -> Option<Arc<ValidatedRoot>> {
+        self.entries
+            .get(&(session.clone(), root.clone()))
+            .map(|node| node.entry.clone())
     }
     pub(super) fn get(
         &mut self,
@@ -486,7 +526,11 @@ impl<S: JournalStorage> JournalEngine<S> {
         state.objects = entry.objects.clone();
         let record = state.sessions.get_mut(session).ok_or_else(conflict)?;
         if record.current.as_ref().is_some_and(|(id, _)| id == root) {
-            record.exact = Some(entry.closure.clone());
+            // Hydration carries exact evidence only across an unchanged head.
+            // Rebuilding an evicted memo must preserve that working identity.
+            if record.exact.is_none() {
+                record.exact = Some(entry.closure.clone());
+            }
             match self.domain.role {
                 JournalRole::Protected => {
                     record.protected_snapshot = Some(entry.snapshot.clone());
@@ -745,6 +789,12 @@ mod tests {
         };
         memo.insert(&s, &roots[0], entry());
         memo.insert(&s, &roots[1], entry());
+        assert!(memo.peek(&s, &roots[0]).is_some());
+        assert_eq!(
+            memo.oldest.as_ref(),
+            Some(&(s.clone(), roots[0].clone())),
+            "collector lookup must not touch LRU order"
+        );
         assert!(memo.get(&s, &roots[0]).is_some());
         memo.insert(&s, &roots[2], entry());
         assert!(memo.get(&s, &roots[1]).is_none());
@@ -752,7 +802,7 @@ mod tests {
         assert_eq!(memo.bytes, 20);
         memo.remove_session(&s);
         assert_eq!(memo.bytes, 0);
-        let held = memo.retain_collection_proof(15).unwrap();
+        let held = memo.retain_collection_proof(15, |_, _| false).unwrap();
         assert_eq!(memo.total_charge(), 15);
         memo.insert(&s, &roots[0], entry());
         assert!(
@@ -762,7 +812,7 @@ mod tests {
         drop(held);
         memo.insert(&s, &roots[0], entry());
         assert_eq!(memo.total_charge(), 10);
-        let held = memo.retain_collection_proof(15).unwrap();
+        let held = memo.retain_collection_proof(15, |_, _| false).unwrap();
         assert!(
             memo.get(&s, &roots[0]).is_none(),
             "proof reservations evict LRU entries rather than exceed the budget"

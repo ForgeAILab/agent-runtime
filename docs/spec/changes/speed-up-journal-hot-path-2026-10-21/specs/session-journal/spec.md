@@ -130,6 +130,30 @@ part of the complete live union.
 - **THEN** existing session isolation, sorted unreadable ids, conservative dependency blocking and retry hints remain in force
 - **AND** cached graph evidence cannot turn unreadable authority into permission to release
 
+#### Scenario: Many certified roots share a bounded collector
+
+- **WHEN** more than sixteen certified roots are reused in one mark
+- **THEN** every proof layer retains its original immutable evidence without a copied member-set layer
+- **AND** cursor charge covers the layer references and proof handles while memo reservations cover proof retention
+
+#### Scenario: Reader and writer-renew churn during a mark
+
+- **WHEN** a reader opens or closes during Pins, Trace or Inventory, or a writer renews with an evicted memo for the same stored head
+- **THEN** unchanged working proof and already shared layers retain mark progress
+- **AND** added lease protection is checked at pre-apply and filtered before every destructive batch
+
+#### Scenario: Proof retention cannot fit
+
+- **WHEN** outstanding reservations or protected current-head entries prevent a proof reservation
+- **THEN** reuse declines before evicting any memo entry
+- **AND** collector lookups do not change LRU priority and unresolved cached summaries take the stored-metadata cold path
+
+#### Scenario: Live membership is incomplete
+
+- **WHEN** any independently counted shared live layer is not a subset of session membership
+- **THEN** collection releases no member from that session and reports its id in unreadable_sessions
+- **AND** the session remains dirty for a later host pass without requesting an endless current-pass retry
+
 ### Requirement: Writer initialization consumes an authority-checked validated view
 
 If the deferred optional P3 phase is built, the runtime SHALL use an available

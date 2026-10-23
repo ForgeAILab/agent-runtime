@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-22T14:32:43Z
+updated_at: 2026-10-23T22:36:31Z
 ---
 
 # Proposal: Speed up journal commit, collection and writer open
