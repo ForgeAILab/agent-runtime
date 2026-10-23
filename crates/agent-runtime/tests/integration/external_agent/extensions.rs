@@ -113,11 +113,23 @@ async fn advisor_reads_backend_observations_and_dispatch_position_only_during_ex
         reader.seen.lock().unwrap()[2],
         BackendToolObservations::default()
     );
-    let snapshot = serde_json::to_string(&session.snapshot()).unwrap();
-    assert!(!snapshot.contains("backend-only"));
+    let snapshot = session.snapshot();
+    let retained = snapshot
+        .extension_state
+        .get("agent-runtime.transcript.observations")
+        .unwrap();
+    assert_eq!(
+        retained.sensitivity,
+        agent_runtime::core::store::SessionStateSensitivity::Sensitive
+    );
+    assert_eq!(retained.value["events"].as_array().unwrap().len(), 2);
+    assert!(
+        serde_json::to_string(&retained)
+            .unwrap()
+            .contains("backend-only")
+    );
     for checkpoint in stores.history(session.id()) {
         let encoded = serde_json::to_string(&checkpoint).unwrap();
-        assert!(!encoded.contains("backend-only"));
         assert!(!encoded.contains("backend_tool_observations"));
     }
     // Existing observation events keep their established journal projection;
@@ -135,6 +147,62 @@ async fn advisor_reads_backend_observations_and_dispatch_position_only_during_ex
     );
     session.shutdown().await.unwrap();
     *reader.session.lock().unwrap() = None;
+}
+
+#[tokio::test]
+async fn backend_tool_transcript_observations_survive_restart_without_backend_execution() {
+    let backend = ScriptedBackend::new(vec![vec![
+        ExternalAgentEvent::ToolInvoked {
+            id: "native-call".into(),
+            name: "NativeRead".into(),
+            detail: json!({"path":"retained-path"}),
+        },
+        ExternalAgentEvent::ToolCompleted {
+            id: "native-call".into(),
+            ok: true,
+            detail: json!({"text":"retained-result"}),
+        },
+        ExternalAgentEvent::Text {
+            text: "final retained answer".into(),
+        },
+        ExternalAgentEvent::Completed,
+    ]]);
+    let stores = Arc::new(Stores::default());
+    let provider = Arc::new(FakeProvider::text_reply("must not execute"));
+    let runtime = builder(provider.clone(), stores.clone())
+        .external_agent(backend.clone())
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session
+        .run(UserInput::text("read externally"))
+        .await
+        .unwrap();
+    let snapshot = session.snapshot();
+    let retained = snapshot.extension_state["agent-runtime.transcript.observations"].clone();
+    let events = retained.value["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["history_index"], 1);
+    assert_eq!(events[0]["event"]["payload"]["id"], "native-call");
+    let id = session.id().clone();
+    session.shutdown().await.unwrap();
+    drop(session);
+    drop(runtime);
+    let restarted = builder(provider.clone(), stores.restarted())
+        .external_agent(backend.clone())
+        .build()
+        .unwrap();
+    let restored = restarted
+        .start_session(StartSession::resume(id))
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.snapshot().extension_state["agent-runtime.transcript.observations"],
+        retained
+    );
+    assert_eq!(restored.history(), snapshot.history);
+    assert_eq!(backend.requests.lock().unwrap().len(), 1);
+    assert!(provider.requests().is_empty());
 }
 
 async fn bounded_observations(details: Vec<Value>) -> BackendToolObservations {

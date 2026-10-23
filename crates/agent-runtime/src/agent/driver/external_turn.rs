@@ -354,7 +354,7 @@ impl<'a> ExternalTurnMachine<'a> {
                                 break;
                             }
                             event = stream.next(), if finish.is_none() => {
-                                finish = observe(event, &emitter, &turn, &output, &execution, &mut session, &mut usage_delta);
+                                finish = observe(event, &emitter, &turn, &output, &execution, &state, &mut session, &mut usage_delta);
                                 if finish.is_some() {
                                     dispatch.close();
                                     call_cancel.cancel(CancelReason::UserRequested);
@@ -364,7 +364,7 @@ impl<'a> ExternalTurnMachine<'a> {
                     }
                 }
                 event = stream.next() => {
-                    finish = observe(event, &emitter, &turn, &output, &execution, &mut session, &mut usage_delta);
+                    finish = observe(event, &emitter, &turn, &output, &execution, &state, &mut session, &mut usage_delta);
                 }
             }
         }
@@ -414,13 +414,11 @@ impl<'a> ExternalTurnMachine<'a> {
             let visible_output = output.committed_visible || (completed && !output.text.is_empty());
             if completed {
                 let parts = output.take_parts(&execution);
+                let mut state = state.lock().expect("session state poisoned");
                 if !parts.is_empty() {
-                    state
-                        .lock()
-                        .expect("session state poisoned")
-                        .history
-                        .push(Message::assistant(parts));
+                    state.history.push(Message::assistant(parts));
                 }
+                emitter.commit_external_presentation();
             }
             visible_output
         };
@@ -526,11 +524,11 @@ impl TurnMachine<'_> {
         };
         let prefix = parts.clone();
         parts.push(ContentPart::ToolCall(call.clone()));
-        self.state
-            .lock()
-            .expect("session state poisoned")
-            .history
-            .push(Message::assistant(parts));
+        let pending_presentation = {
+            let mut state = self.state.lock().expect("session state poisoned");
+            state.history.push(Message::assistant(parts));
+            self.emitter.take_external_presentation()
+        };
         if let Err(error) = self
             .transition(TurnState::ExternalToolCall {
                 request_id: request_id.clone(),
@@ -539,11 +537,12 @@ impl TurnMachine<'_> {
             })
             .await
         {
-            self.state
-                .lock()
-                .expect("session state poisoned")
-                .history
-                .pop();
+            {
+                let mut state = self.state.lock().expect("session state poisoned");
+                state.history.pop();
+                self.emitter
+                    .restore_external_presentation(pending_presentation);
+            }
             let mut output = output.lock().expect("external output poisoned");
             for part in prefix {
                 match part {
@@ -670,6 +669,7 @@ fn observe(
     turn: &Option<agent_runtime_core::ids::TurnId>,
     output: &Mutex<ExternalOutput>,
     execution: &crate::runtime::state::SessionExecutionContext,
+    state: &Mutex<crate::runtime::state::SessionState>,
     session: &mut Option<ExternalSessionId>,
     usage: &mut Option<agent_runtime_core::usage::UsageDelta>,
 ) -> Option<TurnFinish> {
@@ -734,9 +734,11 @@ fn observe(
                     detail: detail.clone(),
                     kind: BackendToolObservationKind::Invocation,
                 });
-            emitter.emit(
+            let history_index = state.lock().expect("session state poisoned").history.len();
+            emitter.emit_retained(
                 turn.clone(),
                 RuntimeEvent::ExternalToolInvoked { id, name, detail },
+                history_index,
             );
         }
         ExternalAgentEvent::ToolCompleted { id, ok, detail } => {
@@ -753,9 +755,11 @@ fn observe(
                     kind: BackendToolObservationKind::Outcome { ok },
                 });
             }
-            emitter.emit(
+            let history_index = state.lock().expect("session state poisoned").history.len();
+            emitter.emit_retained(
                 turn.clone(),
                 RuntimeEvent::ExternalToolCompleted { id, ok, detail },
+                history_index,
             );
         }
         ExternalAgentEvent::Diagnostic { message } => {

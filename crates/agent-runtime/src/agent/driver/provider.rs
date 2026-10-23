@@ -1045,13 +1045,16 @@ impl Driver {
                                 response_progress = true;
                                 hosted_searches = hosted_searches.saturating_add(1);
                                 emit_coalesced(coalescer.drain());
-                                emitter.emit(
+                                let history_index =
+                                    state.lock().expect("session state poisoned").history.len();
+                                emitter.emit_retained(
                                     turn.clone(),
                                     RuntimeEvent::HostedSearch {
                                         action,
                                         query,
                                         sources,
                                     },
+                                    history_index,
                                 );
                             }
                             ProviderStreamEvent::Usage { delta } => {

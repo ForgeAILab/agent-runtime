@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 
 use agent_runtime_core::clock::Clock;
 use agent_runtime_core::event::{EventEnvelope, RuntimeEvent};
-use agent_runtime_core::ids::{SessionId, TurnId};
+use agent_runtime_core::ids::{AttemptId, SessionId, TurnId};
 use agent_runtime_core::observer::EventObserver;
 
 use crate::ids::IdMinter;
@@ -40,6 +40,14 @@ enum CacheTailStatus {
 struct CacheEventState {
     active: Option<DeferredCacheEvents>,
     tail_status: BTreeMap<TurnId, CacheTailStatus>,
+}
+
+#[derive(Debug, Default)]
+struct PendingPresentation {
+    next_sequence: u64,
+    attempts: BTreeMap<AttemptId, Vec<EventEnvelope>>,
+    external: Vec<EventEnvelope>,
+    retained: super::transcript::RetainedHistoryObservations,
 }
 
 /// An RAII guard for one deferred cache-event batch.
@@ -113,6 +121,7 @@ pub struct EventEmitter {
     /// enter this queue: they are delivered synchronously by `emit` and are
     /// therefore never hidden behind, or discarded with, a cache batch.
     cache_events: Mutex<CacheEventState>,
+    pending_presentation: Mutex<PendingPresentation>,
 }
 
 impl EventEmitter {
@@ -135,6 +144,10 @@ impl EventEmitter {
             sender,
             observers,
             cache_events: Mutex::new(CacheEventState::default()),
+            pending_presentation: Mutex::new(PendingPresentation {
+                next_sequence: initial_seq,
+                ..PendingPresentation::default()
+            }),
         }
     }
 
@@ -154,6 +167,24 @@ impl EventEmitter {
     }
 
     fn emit_now(&self, turn: Option<TurnId>, payload: RuntimeEvent) {
+        self.emit_with_history_position(turn, payload, None);
+    }
+
+    pub(crate) fn emit_retained(
+        &self,
+        turn: Option<TurnId>,
+        payload: RuntimeEvent,
+        history_index: usize,
+    ) {
+        self.emit_with_history_position(turn, payload, Some(history_index));
+    }
+
+    fn emit_with_history_position(
+        &self,
+        turn: Option<TurnId>,
+        payload: RuntimeEvent,
+        history_index: Option<usize>,
+    ) {
         // Sequence allocation, observer delivery, and broadcast are one
         // publication transaction. In particular, returning from this
         // function is the host-visible delivery acknowledgement: a
@@ -172,11 +203,131 @@ impl EventEmitter {
             self.clock.now(),
             payload,
         );
+        {
+            let mut pending = self
+                .pending_presentation
+                .lock()
+                .expect("pending presentation poisoned");
+            pending.next_sequence = sequence + 1;
+            if let Some(history_index) = history_index {
+                pending
+                    .retained
+                    .events
+                    .push(super::transcript::ChildHistoryObservation {
+                        history_index,
+                        event: envelope.clone(),
+                    });
+            }
+            match &envelope.payload {
+                RuntimeEvent::ProviderAttemptStarted { attempt, .. }
+                | RuntimeEvent::TextDelta { attempt, .. }
+                | RuntimeEvent::ReasoningDelta { attempt, .. } => {
+                    pending
+                        .attempts
+                        .entry(attempt.clone())
+                        .or_default()
+                        .push(envelope.clone());
+                }
+                RuntimeEvent::ProviderAttemptOutputDiscarded { attempt, .. }
+                | RuntimeEvent::ProviderAttemptOutputCommitted { attempt, .. } => {
+                    pending.attempts.remove(attempt);
+                }
+                RuntimeEvent::ExternalText { .. } | RuntimeEvent::ExternalReasoning { .. } => {
+                    pending.external.push(envelope.clone())
+                }
+                RuntimeEvent::TurnCompleted { .. } => {
+                    pending.attempts.clear();
+                    pending.external.clear();
+                }
+                _ => {}
+            }
+        }
         for observer in self.observers.iter() {
             observer.observe(&envelope);
         }
         // Ignore the error when there are no live subscribers.
         let _ = self.sender.send(envelope);
+    }
+
+    /// Called under the session state lock when this attempt's message is appended.
+    pub(crate) fn commit_presentation(&self, attempt: &AttemptId) {
+        self.pending_presentation
+            .lock()
+            .expect("pending presentation poisoned")
+            .attempts
+            .remove(attempt);
+    }
+
+    #[cfg(feature = "external-agent")]
+    pub(crate) fn commit_external_presentation(&self) {
+        self.pending_presentation
+            .lock()
+            .expect("pending presentation poisoned")
+            .external
+            .clear();
+    }
+
+    #[cfg(feature = "external-agent")]
+    pub(crate) fn take_external_presentation(&self) -> Vec<EventEnvelope> {
+        std::mem::take(
+            &mut self
+                .pending_presentation
+                .lock()
+                .expect("pending presentation poisoned")
+                .external,
+        )
+    }
+
+    #[cfg(feature = "external-agent")]
+    pub(crate) fn restore_external_presentation(&self, events: Vec<EventEnvelope>) {
+        let mut pending = self
+            .pending_presentation
+            .lock()
+            .expect("pending presentation poisoned");
+        pending.external.extend(events);
+        pending.external.sort_by_key(|event| event.seq);
+    }
+
+    pub(crate) fn presentation_snapshot(
+        &self,
+    ) -> (
+        u64,
+        Vec<EventEnvelope>,
+        super::transcript::RetainedHistoryObservations,
+    ) {
+        let pending = self
+            .pending_presentation
+            .lock()
+            .expect("pending presentation poisoned");
+        let mut events = pending
+            .attempts
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        events.extend(pending.external.iter().cloned());
+        events.sort_by_key(|event| event.seq);
+        (pending.next_sequence, events, pending.retained.clone())
+    }
+
+    pub(crate) fn restore_history_observations(
+        &self,
+        observations: super::transcript::RetainedHistoryObservations,
+    ) {
+        self.pending_presentation
+            .lock()
+            .expect("pending presentation poisoned")
+            .retained = observations;
+    }
+
+    pub(crate) fn history_observation_state(
+        &self,
+    ) -> agent_runtime_core::store::VersionedSessionState {
+        self.pending_presentation
+            .lock()
+            .expect("pending presentation poisoned")
+            .retained
+            .state()
     }
 
     /// Establishes a cache checkpoint watermark after all prior synchronous
@@ -364,6 +515,71 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
     use std::sync::Weak;
+
+    #[tokio::test]
+    async fn presentation_seed_and_subscribed_tail_cover_each_fragment_once() {
+        use agent_runtime_core::ids::RequestId;
+        let emitter = EventEmitter::new(
+            SessionId::new("presentation-boundary"),
+            Arc::new(IdMinter::new()),
+            Arc::new(agent_runtime_core::clock::SystemClock),
+            Arc::from(Vec::<Arc<dyn EventObserver>>::new()),
+            32,
+            0,
+        );
+        let attempt = AttemptId::new("attempt-1");
+        let request = RequestId::new("request-1");
+        emitter.emit(
+            None,
+            RuntimeEvent::ProviderAttemptStarted {
+                request: request.clone(),
+                attempt: attempt.clone(),
+                index: 0,
+                model: "fake".into(),
+            },
+        );
+        let emit = |text: &str| {
+            emitter.emit(
+                None,
+                RuntimeEvent::TextDelta {
+                    request: request.clone(),
+                    attempt: attempt.clone(),
+                    text: text.into(),
+                },
+            )
+        };
+        emit("before subscription ");
+        let mut events = emitter.subscribe();
+        emit("during hydration ");
+        let (watermark, seed, _) = emitter.presentation_snapshot();
+        emit("after snapshot");
+        let mut observed = seed;
+        while let Some(event) = events.next().await {
+            let terminal = matches!(&event.payload, RuntimeEvent::TextDelta { text, .. } if text == "after snapshot");
+            if event.seq >= watermark {
+                observed.push(event);
+            }
+            if terminal {
+                break;
+            }
+        }
+        let text = observed
+            .iter()
+            .filter_map(|event| match &event.payload {
+                RuntimeEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "before subscription during hydration after snapshot");
+        emitter.commit_presentation(&attempt);
+        assert!(emitter.presentation_snapshot().1.is_empty());
+        emit("discarded");
+        emitter.emit(
+            None,
+            RuntimeEvent::ProviderAttemptOutputDiscarded { request, attempt },
+        );
+        assert!(emitter.presentation_snapshot().1.is_empty());
+    }
 
     #[derive(Debug, Default)]
     struct ReentrantSequenceObserver {

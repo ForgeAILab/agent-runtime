@@ -83,6 +83,10 @@ impl<'a> TurnMachine<'a> {
     fn capture_snapshot(&self, include_manifests: bool) -> SessionSnapshot {
         let state = self.state.lock().expect("session state poisoned");
         let mut extension_state = self.execution.snapshot_extension_state_with_staged();
+        extension_state.insert(
+            crate::runtime::transcript::OBSERVATIONS_NAMESPACE.to_owned(),
+            self.emitter.history_observation_state(),
+        );
         if let Some(cache) = self.driver.cache.persisted_session(self.emitter.session()) {
             extension_state.insert(
                 crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),
@@ -1467,26 +1471,7 @@ impl<'a> TurnMachine<'a> {
                         self.complete(TurnFinish::Failed, visible_output).await;
                         return;
                     }
-                    emitter.emit(
-                        turn.clone(),
-                        RuntimeEvent::ProviderAttemptOutputCommitted {
-                            request: request_id.clone(),
-                            attempt: attempt.clone(),
-                        },
-                    );
                     visible_output |= attempt_visible_output;
-                    emitter.emit(
-                        turn.clone(),
-                        RuntimeEvent::ProviderAttemptFinished {
-                            attempt,
-                            index: Some(attempt_index),
-                            max_attempts: Some(max_attempts),
-                            finish,
-                            retryable: false,
-                            error: None,
-                            retry_delay_ms: None,
-                        },
-                    );
 
                     let disposition = response_disposition(finish, &tool_calls);
 
@@ -1511,14 +1496,35 @@ impl<'a> TurnMachine<'a> {
                                 parts.push(ContentPart::ToolCall(call.clone()));
                             }
                         }
+                        let mut state = state.lock().expect("session state poisoned");
                         if !parts.is_empty() {
-                            state
-                                .lock()
-                                .expect("session state poisoned")
-                                .history
-                                .push(Message::assistant(parts));
+                            state.history.push(Message::assistant(parts));
                         }
+                        emitter.commit_presentation(&attempt);
+                    } else {
+                        let _state = state.lock().expect("session state poisoned");
+                        emitter.commit_presentation(&attempt);
                     }
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::ProviderAttemptOutputCommitted {
+                            request: request_id.clone(),
+                            attempt: attempt.clone(),
+                        },
+                    );
+
+                    emitter.emit(
+                        turn.clone(),
+                        RuntimeEvent::ProviderAttemptFinished {
+                            attempt: attempt.clone(),
+                            index: Some(attempt_index),
+                            max_attempts: Some(max_attempts),
+                            finish,
+                            retryable: false,
+                            error: None,
+                            retry_delay_ms: None,
+                        },
+                    );
 
                     match disposition {
                         ResponseDisposition::OutputLimit => {

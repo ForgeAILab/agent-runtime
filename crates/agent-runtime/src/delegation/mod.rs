@@ -114,11 +114,14 @@ pub const CHILD_REPLY_ARTIFACT_PURPOSE: &str = "delegation.child-reply";
 /// adapters, and policy composition — the coordinator then applies the
 /// spec's tool-view scope and strips delegation-management tools.
 mod coordinator;
+mod history;
 mod lifecycle;
 mod monitor;
 mod persistence;
 mod types;
 
+pub use crate::runtime::transcript::ChildHistoryObservation;
+pub use history::{ChildHistorySnapshot, ChildHistorySubscription};
 use monitor::*;
 use persistence::*;
 pub use types::{
