@@ -18,6 +18,7 @@ pub(crate) mod manifests;
 pub mod session;
 pub mod state;
 pub(crate) mod steer;
+pub(crate) mod transcript;
 
 pub use agent_runtime_core::steer::{
     SteerLimits, SteerReceipt, SteerRejection, SteerRejectionReason,

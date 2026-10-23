@@ -306,6 +306,10 @@ impl SessionHandle {
     pub fn snapshot(&self) -> SessionSnapshot {
         let state = self.inner.state.lock().expect("session state poisoned");
         let mut extension_state = self.inner.execution.snapshot_extension_state();
+        extension_state.insert(
+            super::super::transcript::OBSERVATIONS_NAMESPACE.to_owned(),
+            self.inner.emitter.history_observation_state(),
+        );
         if let Some(cache) = self.inner.shared.cache.persisted_session(&self.inner.id) {
             extension_state.insert(
                 crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),
