@@ -852,16 +852,22 @@ lease-restart descriptions; earlier owner decisions above remain verbatim.
 
 ## Owner decision addendum: third P2 review (2026-10-24)
 
-The proof cap now applies at reservation after authority, epoch and memo
-validation. Keep up to 32 reused proofs and cold-trace only excess roots;
+Already admitted roots reuse their proofs before the cap check. Other roots
+at the cap take cold tracing before admission locks, head decoding,
+authority/epoch checks or memo lookups. Keep up to 32 reused proofs and
+cold-trace only excess roots;
 an uncertified pin or memo miss does not discard admitted proofs. This
 supersedes the earlier whole-session cold-fallback description. Every retained
 root's complete closure must survive and receipts must match a cold drain.
 
 Inventory rejects every repeated full id, live or dead, within or across
 pages as a conflict under the existing per-mark retry bound, before release.
-Immutable proof-member indexes support exact compact seen bitmaps; remaining
-ids use a charged set, preserving the reference-only proof representation.
+Immutable proof-member indexes support exact compact seen bitmaps. Cold live
+ids mark existing visited/extra entries in place, preserving the original
+128-byte id plus 8-byte expected-kind cursor charge. Immutable member layers
+use charged entry identities without copying full ids; only dead ids need a
+charged full-id set. All duplicate tracking is freed at the end of inventory.
+Both inventory contract guards cover layer, count and seen-state lengths.
 The collector snapshots leased sessions once per call for memo protection.
 Collector-driven evictions emit `rt.memo.eviction` without LRU promotion;
 working-proof restarts use `rt.gc.restart.proof` in profile output.

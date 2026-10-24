@@ -150,6 +150,14 @@ impl CollectionState {
             .unwrap()
             .truncate_counts_after_page = true;
     }
+    pub(super) fn truncate_seen_for_test(&mut self, after_page: bool) {
+        let mark = self.cursor.as_mut().unwrap().mark.as_mut().unwrap();
+        if after_page {
+            mark.truncate_seen_after_page = true;
+        } else {
+            mark.shared_seen.clear();
+        }
+    }
     pub(super) fn marked_session_for_test(&self) -> Option<&SessionId> {
         self.cursor
             .as_ref()?
@@ -168,6 +176,20 @@ impl CollectionState {
             .keys()
             .cloned()
             .collect()
+    }
+    pub(super) fn inventory_sizes_for_test(&self) -> (usize, usize, usize) {
+        let mark = self.cursor.as_ref().unwrap().mark.as_ref().unwrap();
+        (mark.visited.len(), mark.visited_kinds, mark.garbage.len())
+    }
+    pub(super) fn inventory_tracking_charge_for_test(&self) -> usize {
+        let mark = self.cursor.as_ref().unwrap().mark.as_ref().unwrap();
+        mark.dead_seen.len() * ID_CHARGE
+            + mark.shared_seen.capacity() * std::mem::size_of::<LayerSeen>()
+            + mark
+                .shared_seen
+                .iter()
+                .map(LayerSeen::charge)
+                .sum::<usize>()
     }
 }
 
@@ -238,30 +260,49 @@ struct AuthenticatedClosure {
 }
 
 #[derive(Debug)]
+enum LayerSeen {
+    Evidence(Vec<u64>),
+    // The immutable layer keeps its BTreeSet entries at stable addresses.
+    // Track entry identities without cloning their full ids.
+    Members(BTreeSet<usize>),
+}
+impl LayerSeen {
+    fn charge(&self) -> usize {
+        match self {
+            Self::Evidence(bits) => bits.capacity() * std::mem::size_of::<u64>(),
+            Self::Members(entries) => entries.len() * 4 * std::mem::size_of::<usize>(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct SessionMark {
     session: SessionId,
     stored: Option<JournalSessionRecord>,
     fence: JournalFence,
     phase: Phase,
-    // Validated (id, expected kind) pairs; their ids are live.
+    // Validated (id, expected kind) pairs; their ids are live. After tracing,
+    // an empty kinds vector means this id has been inventoried. Clearing it
+    // retains its allocation, still accounted by visited_kinds.
     visited: BTreeMap<JournalObjectId, Vec<ExpectedObject>>,
     // Total expected kinds across `visited`, kept with every push so the
     // per-object cap check stays O(1) instead of walking the map.
     visited_kinds: usize,
     // Validated non-head pin roots and live lease roots.
-    extra: BTreeSet<JournalObjectId>,
+    extra: BTreeMap<JournalObjectId, bool>,
     // Immutable lease/proof layers stay shared across cursor yields.
     shared: ReachableSet,
     proofs: BTreeMap<JournalObjectId, AuthenticatedClosure>,
     certificates: BTreeMap<JournalObjectId, JournalPinId>,
     epoch: u64,
     shared_members: Vec<usize>,
-    // Exact duplicate tracking: one bit per immutable proof member, full ids
-    // only for the remaining inventory. Warm proofs stay shared, not copied.
-    shared_seen: Vec<Vec<u64>>,
-    members_seen: BTreeSet<JournalObjectId>,
+    // Live entries carry their own seen state; only dead ids need copies.
+    shared_seen: Vec<LayerSeen>,
+    dead_seen: BTreeSet<JournalObjectId>,
     #[cfg(test)]
     truncate_counts_after_page: bool,
+    #[cfg(test)]
+    truncate_seen_after_page: bool,
     frontier: Vec<Frontier>,
     dependencies: BTreeSet<SessionId>,
     pins_done: bool,
@@ -291,16 +332,18 @@ impl SessionMark {
             phase: Phase::Pins,
             visited: BTreeMap::new(),
             visited_kinds: 0,
-            extra: BTreeSet::new(),
+            extra: BTreeMap::new(),
             shared: ReachableSet::default(),
             proofs: BTreeMap::new(),
             certificates: BTreeMap::new(),
             epoch: 0,
             shared_members: Vec::new(),
             shared_seen: Vec::new(),
-            members_seen: BTreeSet::new(),
+            dead_seen: BTreeSet::new(),
             #[cfg(test)]
             truncate_counts_after_page: false,
+            #[cfg(test)]
+            truncate_seen_after_page: false,
             frontier: Vec::new(),
             dependencies: BTreeSet::new(),
             pins_done: false,
@@ -327,7 +370,7 @@ impl SessionMark {
             + self.frontier.len()
             + self.catalog.len()
             + self.garbage.len()
-            + self.members_seen.len()
+            + self.dead_seen.len()
             + self.dep_queue.len()
             + self.dependencies.len()
             + 2 * self.certificates.len()
@@ -338,11 +381,11 @@ impl SessionMark {
             + self.proofs.len() * (std::mem::size_of::<AuthenticatedClosure>() + 4 * ID_CHARGE)
             + self.shared.layers.len() * std::mem::size_of::<Arc<ReachableLayer>>()
             + self.shared_members.len() * std::mem::size_of::<usize>()
-            + self.shared_seen.capacity() * std::mem::size_of::<Vec<u64>>()
+            + self.shared_seen.capacity() * std::mem::size_of::<LayerSeen>()
             + self
                 .shared_seen
                 .iter()
-                .map(|bits| bits.capacity() * std::mem::size_of::<u64>())
+                .map(LayerSeen::charge)
                 .sum::<usize>()
     }
     // Collector workspace retains references. The writer's extend_layer can
@@ -365,7 +408,7 @@ impl SessionMark {
         self.visited.len()
             + self
                 .extra
-                .iter()
+                .keys()
                 .filter(|id| !self.visited.contains_key(*id))
                 .count()
     }
@@ -1190,7 +1233,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                     .get(id)
                     .is_none_or(|seen| !seen.contains(expected)),
                 Frontier::PinRoot(id) => {
-                    !mark.extra.contains(id)
+                    !mark.extra.contains_key(id)
                         && mark.visited.get(id).is_none_or(|seen| {
                             !seen.contains(&ExpectedObject::Leaf(ExpectedLeaf::Kind(
                                 JournalObjectKind::Head,
@@ -1287,7 +1330,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                         ));
                     } else {
                         validate_leaf(&object, kind).map_err(invalid_state)?;
-                        mark.extra.insert(id);
+                        mark.extra.insert(id, false);
                     }
                 }
             }
@@ -1337,6 +1380,10 @@ impl<S: JournalStorage> JournalEngine<S> {
         if mark.proofs.contains_key(root) {
             return Ok(true);
         }
+        // Keep admitted proofs; excess roots trace without admission work.
+        if mark.proofs.len() >= PROOF_REUSE_LIMIT {
+            return Ok(false);
+        }
         if self.local.lock()?.root_epoch != mark.epoch {
             return Ok(false);
         }
@@ -1375,10 +1422,6 @@ impl<S: JournalStorage> JournalEngine<S> {
         // Memo summaries are an optimization. Stored authority metadata was
         // checked by the caller; an unresolved cached summary takes cold tracing.
         if entry.dependencies.unresolved {
-            return Ok(false);
-        }
-        // Keep admitted proofs; only excess reusable roots take cold tracing.
-        if mark.proofs.len() >= PROOF_REUSE_LIMIT {
             return Ok(false);
         }
         let bytes = entry
@@ -1476,8 +1519,10 @@ impl<S: JournalStorage> JournalEngine<S> {
             .layers
             .iter()
             .map(|layer| match layer.as_ref() {
-                ReachableLayer::Evidence(proof) => vec![0; proof.len().div_ceil(64)],
-                ReachableLayer::Members(_) => Vec::new(),
+                ReachableLayer::Evidence(proof) => {
+                    LayerSeen::Evidence(vec![0; proof.len().div_ceil(64)])
+                }
+                ReachableLayer::Members(_) => LayerSeen::Members(BTreeSet::new()),
             })
             .collect();
         mark.phase = Phase::Inventory;
@@ -1493,7 +1538,9 @@ impl<S: JournalStorage> JournalEngine<S> {
         report: &mut JournalGcReport,
     ) -> Result<(), RuntimeError> {
         let mark = cursor.mark.as_mut().expect("mark");
-        if mark.shared.layers.len() != mark.shared_members.len() {
+        if mark.shared.layers.len() != mark.shared_members.len()
+            || mark.shared_seen.len() != mark.shared_members.len()
+        {
             return Err(contract_violation());
         }
         if mark.members_started && mark.member_after.is_none() {
@@ -1520,6 +1567,8 @@ impl<S: JournalStorage> JournalEngine<S> {
                 return Err(incomplete_members());
             }
             mark.dep_queue = std::mem::take(&mut mark.dependencies).into_iter().collect();
+            mark.dead_seen = BTreeSet::new();
+            mark.shared_seen = Vec::new();
             mark.phase = Phase::Dependencies;
             return Ok(());
         }
@@ -1538,17 +1587,35 @@ impl<S: JournalStorage> JournalEngine<S> {
         if std::mem::take(&mut mark.truncate_counts_after_page) {
             mark.shared_members.clear();
         }
-        if mark.shared.layers.len() != mark.shared_members.len() {
+        #[cfg(test)]
+        if std::mem::take(&mut mark.truncate_seen_after_page) {
+            mark.shared_seen.clear();
+        }
+        if mark.shared.layers.len() != mark.shared_members.len()
+            || mark.shared_seen.len() != mark.shared_members.len()
+        {
             return Err(contract_violation());
         }
         if let JournalCollectionItems::Members(ids) = page.items {
             report.examined += ids.len() as u64;
             for id in ids {
-                let mut live = mark.visited.contains_key(&id) || mark.extra.contains(&id);
+                let mut live = false;
+                if let Some(kinds) = mark.visited.get_mut(&id) {
+                    if kinds.is_empty() {
+                        return Err(conflict());
+                    }
+                    kinds.clear();
+                    live = true;
+                }
+                if let Some(seen) = mark.extra.get_mut(&id) {
+                    if std::mem::replace(seen, true) {
+                        return Err(conflict());
+                    }
+                    live = true;
+                }
                 if live {
                     mark.live_members += 1;
                 }
-                let mut in_proof = false;
                 for (index, (layer, members)) in mark
                     .shared
                     .layers
@@ -1559,8 +1626,11 @@ impl<S: JournalStorage> JournalEngine<S> {
                     let present = match layer.as_ref() {
                         ReachableLayer::Evidence(proof) => {
                             if let Some(member) = proof.member_index(&id) {
-                                in_proof = true;
-                                let word = &mut mark.shared_seen[index][member / 64];
+                                let LayerSeen::Evidence(bits) = &mut mark.shared_seen[index] else {
+                                    return Err(contract_violation());
+                                };
+                                let word =
+                                    bits.get_mut(member / 64).ok_or_else(contract_violation)?;
                                 let bit = 1 << (member % 64);
                                 if *word & bit != 0 {
                                     return Err(conflict());
@@ -1571,17 +1641,29 @@ impl<S: JournalStorage> JournalEngine<S> {
                                 false
                             }
                         }
-                        ReachableLayer::Members(ids) => ids.contains(&id),
+                        ReachableLayer::Members(ids) => {
+                            if let Some(entry) = ids.get(&id) {
+                                let LayerSeen::Members(seen) = &mut mark.shared_seen[index] else {
+                                    return Err(contract_violation());
+                                };
+                                if !seen.insert(entry as *const JournalObjectId as usize) {
+                                    return Err(conflict());
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
                     };
                     if present {
                         *members += 1;
                         live = true;
                     }
                 }
-                if !in_proof && !mark.members_seen.insert(id.clone()) {
-                    return Err(conflict());
-                }
                 if !live {
+                    if !mark.dead_seen.insert(id.clone()) {
+                        return Err(conflict());
+                    }
                     mark.garbage.push_back(id);
                 }
             }

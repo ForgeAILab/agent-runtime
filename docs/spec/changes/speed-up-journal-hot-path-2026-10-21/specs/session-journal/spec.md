@@ -135,7 +135,7 @@ part of the complete live union.
 - **WHEN** seventeen through thirty-two certified roots are reused in one mark
 - **THEN** every proof layer retains its original immutable evidence without a copied member-set layer
 - **AND** cursor charge covers the layer references and proof handles while memo reservations cover proof retention
-- **AND** the cap is checked after authority and memo validation, immediately before reservation; the first thirty-two proofs remain retained while only excess roots use cold tracing
+- **AND** after checking whether a root is already admitted, the cap declines any new root before admission locks, head decoding, authority/epoch validation or memo lookups/counters; the first thirty-two proofs remain retained while only excess roots use cold tracing
 
 #### Scenario: Reader and writer-renew churn during a mark
 
@@ -153,11 +153,18 @@ part of the complete live union.
 
 #### Scenario: Inventory layers or pages violate the counting contract
 
-- **WHEN** shared layer and count lengths differ
+- **WHEN** shared layer, count or seen-state lengths differ
 - **THEN** collection MUST return a contract error in debug and release builds before inventory zips can truncate
 - **WHEN** an inventory repeats any full membership id, live or dead, within or across pages
 - **THEN** collection MUST restart as a conflict under the per-mark retry bound, without unreadable reporting or releases
 - **AND** conformance MUST enforce unique full ids across pages while preserving storage-defined order
+
+#### Scenario: Cold inventory retains cursor capacity
+
+- **WHEN** cold tracing has populated the live entries and collection inventories membership
+- **THEN** duplicate detection MUST reuse those entries without a second full-id set for live members
+- **AND** the cold-live cursor charge remains 128 bytes per id plus 8 bytes per expected kind
+- **AND** remaining duplicate-tracking memory MUST be charged and freed before dependency or release work
 
 #### Scenario: Live membership is incomplete
 

@@ -228,6 +228,69 @@ async fn unavailable_and_evicted_proofs_keep_the_complete_typed_fallback() {
 }
 
 #[tokio::test]
+async fn cold_inventory_keeps_the_original_per_member_cursor_charge() {
+    let (_, engine, _) =
+        proof_fixture(JournalRole::Protected, JournalBodySharing::Global, 0, 70).await;
+    advance_to_phase(&engine, "inventory").await;
+    let baseline = {
+        let state = engine.collection.lock().unwrap();
+        let (members, kinds, garbage) = state.inventory_sizes_for_test();
+        assert!(members > 70);
+        assert_eq!(garbage, 0);
+        // 42c0bc3 charged 128 bytes per id plus 8 per expected kind.
+        let expected = members * 128 + kinds * 8;
+        assert_eq!(state.charge(), expected);
+        expected
+    };
+    for _ in 0..1_000 {
+        proof_call(&engine, one_proof_unit()).await;
+        let state = engine.collection.lock().unwrap();
+        let (_, _, garbage) = state.inventory_sizes_for_test();
+        match state.phase_for_test() {
+            Some("inventory") => assert_eq!(
+                state.charge(),
+                baseline + garbage * 256,
+                "live inventory ids must not add a second full-id charge"
+            ),
+            Some("dependencies") => {
+                assert!(garbage > 0);
+                assert_eq!(
+                    state.charge(),
+                    baseline + garbage * 128,
+                    "inventory duplicate tracking must be freed before dependencies"
+                );
+                return;
+            }
+            phase => panic!("unexpected inventory phase: {phase:?}"),
+        }
+    }
+    panic!("cold inventory did not finish");
+}
+
+#[tokio::test]
+async fn proof_inventory_tracking_is_freed_before_dependencies() {
+    let (_, engine, _) =
+        proof_fixture(JournalRole::Protected, JournalBodySharing::Global, MEMO, 70).await;
+    advance_to_phase(&engine, "inventory").await;
+    for _ in 0..1_000 {
+        let (before, tracking) = {
+            let state = engine.collection.lock().unwrap();
+            (state.charge(), state.inventory_tracking_charge_for_test())
+        };
+        proof_call(&engine, one_proof_unit()).await;
+        let state = engine.collection.lock().unwrap();
+        if state.phase_for_test() == Some("dependencies") {
+            assert!(tracking > 0);
+            assert_eq!(state.inventory_tracking_charge_for_test(), 0);
+            assert_eq!(state.charge(), before - tracking);
+            return;
+        }
+        assert_eq!(state.phase_for_test(), Some("inventory"));
+    }
+    panic!("proof inventory did not finish");
+}
+
+#[tokio::test]
 async fn certified_historical_pin_and_current_head_both_reuse_proofs() {
     let storage = Arc::new(LostAcknowledgement::default());
     let engine = proof_engine(&storage, JournalRole::Protected, MEMO);
@@ -1540,6 +1603,58 @@ async fn mismatched_layer_counts_after_a_page_are_a_contract_error() {
 }
 
 #[tokio::test]
+async fn mismatched_seen_layers_are_a_contract_error_at_every_inventory_guard() {
+    for location in ["finish", "start", "after_page"] {
+        let (storage, engine, head) =
+            proof_fixture(JournalRole::Protected, JournalBodySharing::Global, MEMO, 4).await;
+        advance_to_phase(&engine, "inventory").await;
+        let before = storage
+            .inner
+            .members(&engine.domain, &head.session)
+            .await
+            .unwrap();
+        if location == "finish" {
+            for _ in 0..before.len().div_ceil(8) {
+                proof_call(&engine, one_proof_unit()).await;
+            }
+        }
+        storage.calls.lock().unwrap().clear();
+        engine
+            .collection
+            .lock()
+            .unwrap()
+            .truncate_seen_for_test(location == "after_page");
+        let error = engine
+            .collect(
+                JournalGcRequest::new(engine.storage_id(), engine.root_epoch().unwrap(), u64::MAX)
+                    .with_budget(one_proof_unit()),
+            )
+            .await
+            .expect_err("seen-layer mismatch must be a contract error");
+        assert!(error.metadata.get("journal_collection_contract").is_some());
+        assert_eq!(
+            storage
+                .calls
+                .lock()
+                .unwrap()
+                .get(&("members", head.session.clone()))
+                .copied()
+                .unwrap_or(0),
+            usize::from(location == "after_page"),
+            "the post-page fault must follow exactly one completed page"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .members(&engine.domain, &head.session)
+                .await
+                .unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
 async fn duplicate_members_restart_then_skip_without_unreadable_reporting() {
     let (storage, engine, head) =
         proof_fixture(JournalRole::Protected, JournalBodySharing::Global, MEMO, 20).await;
@@ -1701,6 +1816,74 @@ async fn repeated_live_member_with_an_omitted_member_still_restarts() {
     assert!(proof_drain(&engine, one_proof_unit()).await.deleted > 0);
 }
 
+#[tokio::test]
+async fn repeated_cold_live_member_with_an_omitted_member_still_restarts() {
+    let (storage, engine, head) =
+        proof_fixture(JournalRole::Protected, JournalBodySharing::Global, MEMO, 20).await;
+    let entry = engine
+        .memoized_root(&head.session, &root_id(&head))
+        .unwrap()
+        .unwrap();
+    let mut live = entry.closure.iter().cloned();
+    *storage.replace_member.lock().unwrap() = Some((live.next().unwrap(), live.next().unwrap()));
+    engine.memo.lock().unwrap().remove_session(&head.session);
+    assert_duplicate_inventory_restarts(&storage, &engine, &head.session).await;
+    *storage.replace_member.lock().unwrap() = None;
+    assert!(proof_drain(&engine, one_proof_unit()).await.deleted > 0);
+}
+
+#[tokio::test]
+async fn repeated_member_layer_only_id_with_an_omission_still_restarts() {
+    let (storage, engine, head) =
+        proof_fixture(JournalRole::Protected, JournalBodySharing::Global, MEMO, 20).await;
+    let entry = engine
+        .memoized_root(&head.session, &root_id(&head))
+        .unwrap()
+        .unwrap();
+    let members = storage
+        .inner
+        .members(&engine.domain, &head.session)
+        .await
+        .unwrap();
+    let held_ids: Vec<_> = members
+        .into_iter()
+        .filter(|id| !entry.closure.contains(id))
+        .take(2)
+        .collect();
+    assert_eq!(held_ids.len(), 2);
+    let lease = engine
+        .open(&head.session, reader("member-layer"))
+        .await
+        .unwrap();
+    let handle = engine.local.token(&lease).unwrap().handle;
+    // Model a folded lease layer that retains bodies outside the current proof.
+    engine
+        .local
+        .lock()
+        .unwrap()
+        .leases
+        .get_mut(&handle)
+        .unwrap()
+        .reachable
+        .layers = vec![Arc::new(super::super::transition::ReachableLayer::Members(
+        held_ids.iter().cloned().collect(),
+    ))];
+    *storage.replace_member.lock().unwrap() = Some((held_ids[0].clone(), held_ids[1].clone()));
+    assert_duplicate_inventory_restarts(&storage, &engine, &head.session).await;
+    *storage.replace_member.lock().unwrap() = None;
+    assert!(proof_drain(&engine, one_proof_unit()).await.deleted > 0);
+    assert!(
+        storage
+            .inner
+            .objects(&engine.domain, &head.session, &held_ids)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_some)
+    );
+    engine.close(lease).await.unwrap();
+}
+
 async fn proof_cap_fixture(
     roots: usize,
     uncertified: bool,
@@ -1726,6 +1909,18 @@ async fn proof_cap_fixture(
     );
     let mut closures = Vec::new();
     let initial = previous.as_ref().unwrap().clone();
+    if uncertified {
+        previous = Some(
+            commit_proof_snapshot(
+                &engine,
+                &writer,
+                previous.as_ref(),
+                ext_snapshot(&session, "unpinned"),
+                "unpinned",
+            )
+            .await,
+        );
+    }
     for index in 0..roots {
         let name = format!("root-{index}");
         previous = Some(
@@ -1843,9 +2038,48 @@ async fn too_many_reused_proofs_trace_only_excess_roots_and_match_cold_receipts(
 }
 
 #[tokio::test]
+async fn proof_cap_release_preserves_pinned_bodies_without_shape_assertions() {
+    let limit = super::super::collection::PROOF_REUSE_LIMIT;
+    let (storage, engine, session, closures) = proof_cap_fixture(limit + 1, false).await;
+    let (cold_storage, cold, cold_session, cold_closures) =
+        proof_cap_fixture(limit + 1, false).await;
+    assert_eq!(closures, cold_closures);
+    cold.memo.lock().unwrap().remove_session(&cold_session);
+    let report = proof_drain(&engine, one_proof_unit()).await;
+    assert!(
+        report.deleted > 0,
+        "the cap body-survival check must release real garbage"
+    );
+    assert_proof_cap_bodies(&storage, &engine, &session, &closures).await;
+    let reference = proof_drain(&cold, one_proof_unit()).await;
+    assert_proof_cap_bodies(&cold_storage, &cold, &cold_session, &cold_closures).await;
+    assert_eq!(
+        (report.deleted, report.reclaimed_bytes),
+        (reference.deleted, reference.reclaimed_bytes)
+    );
+    assert_eq!(
+        storage
+            .inner
+            .members(&engine.domain, &session)
+            .await
+            .unwrap(),
+        cold_storage
+            .inner
+            .members(&cold.domain, &cold_session)
+            .await
+            .unwrap()
+    );
+    assert!(report.unreadable_sessions.is_empty());
+    assert!(report.over_capacity_sessions.is_empty());
+}
+
+#[tokio::test]
 async fn thirty_two_proofs_and_an_uncertified_pin_trace_only_the_extra_root() {
     let limit = super::super::collection::PROOF_REUSE_LIMIT;
     let (storage, engine, session, closures) = proof_cap_fixture(limit, true).await;
+    let (cold_storage, cold, cold_session, cold_closures) = proof_cap_fixture(limit, true).await;
+    assert_eq!(closures, cold_closures);
+    cold.memo.lock().unwrap().remove_session(&cold_session);
     advance_to_phase(&engine, "inventory").await;
     {
         let state = engine.collection.lock().unwrap();
@@ -1862,9 +2096,68 @@ async fn thirty_two_proofs_and_an_uncertified_pin_trace_only_the_extra_root() {
     }
     assert!(body_calls(&storage) > 0);
     let report = proof_drain(&engine, one_proof_unit()).await;
+    assert!(
+        report.deleted > 0,
+        "the uncertified-pin check must release real garbage"
+    );
     assert_proof_cap_bodies(&storage, &engine, &session, &closures).await;
+    let reference = proof_drain(&cold, one_proof_unit()).await;
+    assert_proof_cap_bodies(&cold_storage, &cold, &cold_session, &cold_closures).await;
+    assert_eq!(
+        (report.deleted, report.reclaimed_bytes),
+        (reference.deleted, reference.reclaimed_bytes)
+    );
+    assert_eq!(
+        storage
+            .inner
+            .members(&engine.domain, &session)
+            .await
+            .unwrap(),
+        cold_storage
+            .inner
+            .members(&cold.domain, &cold_session)
+            .await
+            .unwrap()
+    );
     assert!(report.unreadable_sessions.is_empty());
     assert!(report.over_capacity_sessions.is_empty());
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn proof_cap_declines_do_not_count_as_memo_hits() {
+    let limit = super::super::collection::PROOF_REUSE_LIMIT;
+    let (storage, engine, _, _) = proof_cap_fixture(limit + 1, false).await;
+    let observer = crate::journal::profile::Observer::default();
+    observer.run(advance_to_phase(&engine, "inventory")).await;
+    assert_eq!(
+        engine
+            .collection
+            .lock()
+            .unwrap()
+            .shared_layers_for_test()
+            .len(),
+        limit
+    );
+    assert!(body_calls(&storage) > 0);
+    let events = observer.drain().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.label == "rt.memo.hit")
+            .map(|event| event.units)
+            .sum::<u64>(),
+        limit as u64,
+        "declined proof-cap roots must not emit memo hits"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.label == "rt.memo.miss")
+            .map(|event| event.units)
+            .sum::<u64>(),
+        0
+    );
 }
 
 #[cfg(feature = "test-support")]

@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-24T05:05:00Z
+updated_at: 2026-10-24T05:40:28Z
 completed_at:
 ---
 
@@ -194,7 +194,7 @@ This repair does not complete the outstanding full phase/adoption gates.
 ### Third P2 review follow-ups (2026-10-24)
 
 - [x] 2.12 G1: prove every certified closure survives proof-cap fallback with cold receipt parity and a body-deletion control.
-- [x] 2.13 F1: cap admission after authority/memo validation, retain the first 32 proofs and trace only excess roots.
+- [x] 2.13 F1: retain the first 32 proofs and trace only excess roots (cap ordering updated by L2 below).
 - [x] 2.14 G2: independently exercise the post-page layer/count contract guard.
 - [x] 2.15 F3: restart on any repeated inventory id, including dead ids, within the persistent retry bound.
 - [x] 2.16 F4: snapshot leased sessions once per collect call for memo protection.
@@ -202,3 +202,11 @@ This repair does not complete the outstanding full phase/adoption gates.
 - [x] 2.18 F6: rename the working-proof restart profile label and update its consumers.
 - [x] 2.19 F2: document pass-only skip reporting and next-pass retry in owner decisions and JournalGcReport.
 - [x] 2.20 Add Unreleased changelog entries and run the requested follow-up verification/control gates.
+
+### Fourth P2 review follow-ups (2026-10-24)
+
+- [x] 2.21 M1: restore the original cold-live cursor charge with in-place duplicate detection, account remaining tracking and free it after inventory; preserve duplicate regressions and add charge/control evidence.
+- [x] 2.22 L1: cover shared seen state with both inventory contract guards and independently test/control each guard.
+- [x] 2.23 L2: decline excess roots immediately after the admitted-root lookup, before admission work or memo counters; test/control the counter boundary.
+- [x] 2.24 T1/T2: add a body-only T6 control against the current cap decision and real garbage/cold receipt parity for the 32-certified-plus-uncertified case.
+- [x] 2.25 Update Unreleased entries and run the requested offline follow-up checks; publish rt-followups2/report.md and byte-identical control restoration receipts.
