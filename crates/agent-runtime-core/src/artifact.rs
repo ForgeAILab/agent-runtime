@@ -13,7 +13,7 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{SessionId, ToolCallId, TurnId};
+use crate::ids::{ChildId, SessionId, ToolCallId, TurnId};
 
 /// Maximum number of bytes one standard artifact read may request.
 pub const MAX_ARTIFACT_READ_BYTES: u32 = 64 * 1024;
@@ -185,6 +185,11 @@ pub struct ArtifactProvenance {
     /// ownership boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<ArtifactLineage>,
+    /// Delegated child whose work produced this parent-owned artifact, when
+    /// no lineage names it: a child's stored reply is new parent content, not
+    /// a copy of a child artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<ChildId>,
 }
 
 impl ArtifactProvenance {
@@ -200,6 +205,7 @@ impl ArtifactProvenance {
                 .take(MAX_ARTIFACT_PURPOSE_CHARS)
                 .collect(),
             derived_from: None,
+            child: None,
         }
     }
 
@@ -218,6 +224,13 @@ impl ArtifactProvenance {
     /// Records the immutable source of an explicit ownership transfer.
     pub fn with_derived_from(mut self, source: ArtifactLineage) -> Self {
         self.derived_from = Some(source);
+        self
+    }
+
+    /// Attributes a parent-owned artifact to the delegated child that
+    /// produced it.
+    pub fn with_child(mut self, child: ChildId) -> Self {
+        self.child = Some(child);
         self
     }
 }
@@ -784,5 +797,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.bytes, b"child result bytes");
+    }
+
+    #[test]
+    fn child_attribution_is_optional_on_the_wire() {
+        let unattributed = ArtifactProvenance::new(SessionId::new("parent"), "tool-output");
+        let encoded = serde_json::to_value(&unattributed).unwrap();
+        assert!(encoded.get("child").is_none(), "{encoded}");
+        // Records written before attribution existed still load.
+        let older: ArtifactProvenance = serde_json::from_value(
+            serde_json::json!({"session": "parent", "purpose": "tool-output"}),
+        )
+        .unwrap();
+        assert_eq!(older, unattributed);
+
+        let attributed = unattributed.with_child(ChildId::new("child-1"));
+        let encoded = serde_json::to_value(&attributed).unwrap();
+        assert_eq!(encoded["child"], "child-1");
+        assert_eq!(
+            serde_json::from_value::<ArtifactProvenance>(encoded).unwrap(),
+            attributed
+        );
     }
 }

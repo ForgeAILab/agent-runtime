@@ -1671,8 +1671,10 @@ pub(super) async fn store_child_reply(
         return None;
     }
     let store = coordinator.factory.artifact_store()?;
+    // v2 since the reply names its child: a v1 record under the same key
+    // would carry different provenance and fail the store's idempotency check.
     let idempotency_key = Fingerprint::of_fields([
-        b"delegation-child-reply".as_slice(),
+        b"delegation-child-reply-v2".as_slice(),
         coordinator.parent.id().as_str().as_bytes(),
         child_session.as_str().as_bytes(),
         child.as_str().as_bytes(),
@@ -1687,7 +1689,8 @@ pub(super) async fn store_child_reply(
         provenance: ArtifactProvenance::new(
             coordinator.parent.id().clone(),
             CHILD_REPLY_ARTIFACT_PURPOSE,
-        ),
+        )
+        .with_child(child.clone()),
         idempotency_key: idempotency_key.as_str().to_owned(),
     };
     store
