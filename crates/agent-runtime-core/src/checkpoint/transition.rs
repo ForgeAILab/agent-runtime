@@ -5,11 +5,12 @@ impl TurnState {
         if !supports_turn_transition_revision(revision) {
             return false;
         }
-        if revision == MODEL_FALLBACK_TURN_TRANSITION_REVISION
-            && let (Self::CallingModel { step, .. }, Self::Planning { step: next_step }) =
+        if revision == MODEL_FALLBACK_TURN_TRANSITION_REVISION {
+            if let (Self::CallingModel { step, .. }, Self::Planning { step: next_step }) =
                 (self, next)
-        {
-            return step == next_step;
+            {
+                return step == next_step;
+            }
         }
         self.can_transition_to(next)
     }

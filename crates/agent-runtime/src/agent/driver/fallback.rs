@@ -239,10 +239,9 @@ mod tests {
         async fn save(&self, checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
             checkpoint.validate()?;
             let mut records = self.0.lock().unwrap();
-            if let Some(previous) = records.last()
-                && previous.session == checkpoint.session
-                && previous.turn == checkpoint.turn
-            {
+            if let Some(previous) = records.last().filter(|previous| {
+                previous.session == checkpoint.session && previous.turn == checkpoint.turn
+            }) {
                 if previous.state_revision > checkpoint.state_revision {
                     return Err(RuntimeError::conflict(
                         "checkpoint revision moved backwards",
