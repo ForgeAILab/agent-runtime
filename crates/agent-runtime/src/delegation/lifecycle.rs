@@ -163,6 +163,8 @@ impl DelegationCoordinator {
             entry.status.send_modify(|status| {
                 status.turns_used += 1;
                 status.state = ChildState::Running;
+                // The error described the task this one follows.
+                status.last_error = None;
                 status.updated_at = self.inner.parent.inner().shared.clock.now();
             });
             let status_tx = entry.status.clone();

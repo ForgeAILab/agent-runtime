@@ -11,7 +11,7 @@ enum RecoveredPublication {
     Completed {
         child: ChildId,
         protected_key: ChildOutcomeKey,
-        result: ChildTaskResult,
+        outcome: ChildTaskOutcome,
     },
 }
 
@@ -35,8 +35,8 @@ impl RecoveredPublication {
             Self::Completed {
                 child,
                 protected_key,
-                result,
-            } => publish_completed_outcome(&coordinator.inner, &child, protected_key, result),
+                outcome,
+            } => publish_turn_outcome(&coordinator.inner, &child, protected_key, outcome),
         }
     }
 }
@@ -378,13 +378,12 @@ impl DelegationCoordinator {
                     pending,
                 }))
             }
-            TurnFinish::Completed | TurnFinish::LimitReached { .. } => {
-                let text = last_assistant_text_from_history(&checkpoint.snapshot.history);
-                // If the parent outcome ledger crossed its barrier before a
-                // crash but the catalog projection lagged, reuse its exact
-                // artifact pairing instead of rebuilding a text-only result
-                // from the child checkpoint.
-                let persisted_result = self
+            TurnFinish::Completed => {
+                self.reconcile_completed_checkpoint(child, session, checkpoint)
+                    .await
+            }
+            TurnFinish::LimitReached { limit } => {
+                let recorded = self
                     .inner
                     .task_outcome_ledger
                     .lock()
@@ -393,99 +392,45 @@ impl DelegationCoordinator {
                         child.clone(),
                         TaskOutcomeKey::Completed(checkpoint.turn.clone()),
                     ))
-                    .and_then(|outcome| match outcome {
-                        ChildTaskOutcome::Completed { result, .. } => Some(result.clone()),
-                        ChildTaskOutcome::NeedsInput { .. } => None,
-                    })
-                    .map(|mut result| {
-                        // The terminal checkpoint is authoritative for the
-                        // canonical text; the protected ledger is
-                        // authoritative for transferred artifacts.
-                        result.text = text.clone();
-                        result
-                    });
-                let result = if let Some(mut result) = persisted_result {
-                    // The stored copy must match the authoritative text; the
-                    // keyed put returns the existing copy when it does.
-                    result.reply =
-                        store_child_reply(&self.inner, child, session, &checkpoint.turn, &text)
+                    .cloned();
+                let artifacts = match recorded {
+                    // A build before limit outcomes recorded this stopped
+                    // turn as completed, and that record was already
+                    // delivered under the turn's identity. Keep it: a second,
+                    // different outcome for one turn would fail the ledger's
+                    // duplicate check and strand the session.
+                    Some(ChildTaskOutcome::Completed { .. }) => {
+                        return self
+                            .reconcile_completed_checkpoint(child, session, checkpoint)
                             .await;
-                    result
-                } else {
-                    // The child checkpoint carries source references even if
-                    // the parent outcome ledger was lost. Repeating the
-                    // transfer is safe because its idempotency key is bound
-                    // to the exact child/session/turn/source identity.
-                    let sources = artifact_references_for_turn(
-                        &checkpoint.snapshot.extension_state,
-                        session,
-                        &checkpoint.turn,
-                    )?;
-                    let artifacts = transfer_artifact_references(
-                        &self.inner,
-                        child,
-                        session,
-                        &checkpoint.turn,
-                        sources,
-                    )
-                    .await?;
-                    let reply =
-                        store_child_reply(&self.inner, child, session, &checkpoint.turn, &text)
-                            .await;
-                    ChildTaskResult {
-                        turn: checkpoint.turn.clone(),
-                        text,
-                        artifacts,
-                        reply,
+                    }
+                    Some(ChildTaskOutcome::LimitReached { artifacts, .. }) => artifacts,
+                    _ => {
+                        let sources = artifact_references_for_turn(
+                            &checkpoint.snapshot.extension_state,
+                            session,
+                            &checkpoint.turn,
+                        )?;
+                        transfer_artifact_references(
+                            &self.inner,
+                            child,
+                            session,
+                            &checkpoint.turn,
+                            sources,
+                        )
+                        .await?
                     }
                 };
-                let result_for_retry = result.clone();
-                let Some((protected_key, result)) = stage_completed_outcome(
-                    &self.inner,
+                self.stage_recovered_turn_outcome(
                     child,
-                    checkpoint.turn.clone(),
-                    result.clone(),
-                )?
-                else {
-                    mark_recovered_completed_outcome(&self.inner, child, result);
-                    let protected_key = ChildOutcomeKey::new(
-                        child.clone(),
-                        ChildOutcomeIdentity::Completed(checkpoint.turn.clone()),
-                    );
-                    if self
-                        .inner
-                        .outcome_cursor
-                        .lock()
-                        .expect("child outcome cursor poisoned")
-                        .contains(&protected_key)
-                    {
-                        return Ok(None);
-                    }
-                    let result = self
-                        .inner
-                        .task_outcome_ledger
-                        .lock()
-                        .expect("child task outcome ledger poisoned")
-                        .get(&(
-                            child.clone(),
-                            TaskOutcomeKey::Completed(checkpoint.turn.clone()),
-                        ))
-                        .and_then(|outcome| match outcome {
-                            ChildTaskOutcome::Completed { result, .. } => Some(result.clone()),
-                            ChildTaskOutcome::NeedsInput { .. } => None,
-                        })
-                        .unwrap_or(result_for_retry);
-                    return Ok(Some(RecoveredPublication::Completed {
+                    &checkpoint.turn,
+                    ChildTaskOutcome::LimitReached {
                         child: child.clone(),
-                        protected_key,
-                        result,
-                    }));
-                };
-                Ok(Some(RecoveredPublication::Completed {
-                    child: child.clone(),
-                    protected_key,
-                    result,
-                }))
+                        turn: checkpoint.turn.clone(),
+                        limit,
+                        artifacts,
+                    },
+                )
             }
             TurnFinish::Cancelled { reason } => {
                 let _admission = self
@@ -538,6 +483,128 @@ impl DelegationCoordinator {
                 Ok(None)
             }
         }
+    }
+
+    /// Reduces a completed terminal child checkpoint into a protected
+    /// completed outcome carrying the child's final answer.
+    async fn reconcile_completed_checkpoint(
+        &self,
+        child: &ChildId,
+        session: &SessionId,
+        checkpoint: &TurnCheckpoint,
+    ) -> Result<Option<RecoveredPublication>, RuntimeError> {
+        let text = last_assistant_text_from_history(&checkpoint.snapshot.history);
+        // If the parent outcome ledger crossed its barrier before a
+        // crash but the catalog projection lagged, reuse its exact
+        // artifact pairing instead of rebuilding a text-only result
+        // from the child checkpoint.
+        let persisted_result = self
+            .inner
+            .task_outcome_ledger
+            .lock()
+            .expect("child task outcome ledger poisoned")
+            .get(&(
+                child.clone(),
+                TaskOutcomeKey::Completed(checkpoint.turn.clone()),
+            ))
+            .and_then(|outcome| match outcome {
+                ChildTaskOutcome::Completed { result, .. } => Some(result.clone()),
+                ChildTaskOutcome::NeedsInput { .. } | ChildTaskOutcome::LimitReached { .. } => None,
+            })
+            .map(|mut result| {
+                // The terminal checkpoint is authoritative for the
+                // canonical text; the protected ledger is
+                // authoritative for transferred artifacts.
+                result.text = text.clone();
+                result
+            });
+        let result = if let Some(mut result) = persisted_result {
+            // The stored copy must match the authoritative text; the
+            // keyed put returns the existing copy when it does.
+            result.reply =
+                store_child_reply(&self.inner, child, session, &checkpoint.turn, &text).await;
+            result
+        } else {
+            // The child checkpoint carries source references even if
+            // the parent outcome ledger was lost. Repeating the
+            // transfer is safe because its idempotency key is bound
+            // to the exact child/session/turn/source identity.
+            let sources = artifact_references_for_turn(
+                &checkpoint.snapshot.extension_state,
+                session,
+                &checkpoint.turn,
+            )?;
+            let artifacts = transfer_artifact_references(
+                &self.inner,
+                child,
+                session,
+                &checkpoint.turn,
+                sources,
+            )
+            .await?;
+            let reply =
+                store_child_reply(&self.inner, child, session, &checkpoint.turn, &text).await;
+            ChildTaskResult {
+                turn: checkpoint.turn.clone(),
+                text,
+                artifacts,
+                reply,
+            }
+        };
+        self.stage_recovered_turn_outcome(
+            child,
+            &checkpoint.turn,
+            ChildTaskOutcome::Completed {
+                child: child.clone(),
+                result,
+            },
+        )
+    }
+
+    /// Stages a turn-ending outcome reduced from a terminal checkpoint, or
+    /// recognizes one an earlier attempt already staged.
+    fn stage_recovered_turn_outcome(
+        &self,
+        child: &ChildId,
+        turn: &TurnId,
+        outcome: ChildTaskOutcome,
+    ) -> Result<Option<RecoveredPublication>, RuntimeError> {
+        let outcome_for_retry = outcome.clone();
+        let Some((protected_key, outcome)) =
+            stage_turn_outcome(&self.inner, child, turn.clone(), outcome.clone())?
+        else {
+            mark_recovered_turn_outcome(&self.inner, child, &outcome);
+            let protected_key =
+                ChildOutcomeKey::new(child.clone(), ChildOutcomeIdentity::Completed(turn.clone()));
+            if self
+                .inner
+                .outcome_cursor
+                .lock()
+                .expect("child outcome cursor poisoned")
+                .contains(&protected_key)
+            {
+                return Ok(None);
+            }
+            let outcome = self
+                .inner
+                .task_outcome_ledger
+                .lock()
+                .expect("child task outcome ledger poisoned")
+                .get(&(child.clone(), TaskOutcomeKey::Completed(turn.clone())))
+                .filter(|outcome| !matches!(outcome, ChildTaskOutcome::NeedsInput { .. }))
+                .cloned()
+                .unwrap_or(outcome_for_retry);
+            return Ok(Some(RecoveredPublication::Completed {
+                child: child.clone(),
+                protected_key,
+                outcome,
+            }));
+        };
+        Ok(Some(RecoveredPublication::Completed {
+            child: child.clone(),
+            protected_key,
+            outcome,
+        }))
     }
 
     /// Restores exact child task-information requests from protected terminal
@@ -1011,18 +1078,16 @@ fn mark_recovered_returned_input(coordinator: &Arc<CoordinatorInner>, child: &Ch
     });
 }
 
-fn mark_recovered_completed_outcome(
+fn mark_recovered_turn_outcome(
     coordinator: &Arc<CoordinatorInner>,
     child: &ChildId,
-    result: ChildTaskResult,
+    outcome: &ChildTaskOutcome,
 ) {
     update_status(coordinator, child, |status| {
-        status.state = ChildState::Idle;
-        status.last_result = Some(result.text);
         // Parent-owned artifact references live in the protected outcome
         // ledger. Keep the exact pairing when a terminal child checkpoint is
         // reconciled after the ledger was already committed.
-        status.last_artifacts = result.artifacts;
+        outcome.apply_to_status(status);
         status.updated_at = coordinator.parent.inner().shared.clock.now();
     });
 }
@@ -1368,13 +1433,24 @@ pub(super) async fn record_returned_input(
     Ok(())
 }
 
-fn stage_completed_outcome(
+/// Stages the outcome of a child turn that ended without returning a
+/// request: a completed answer, or a stop at a limit.
+fn stage_turn_outcome(
     coordinator: &Arc<CoordinatorInner>,
     child: &ChildId,
     turn: TurnId,
-    result: ChildTaskResult,
-) -> Result<Option<(ChildOutcomeKey, ChildTaskResult)>, RuntimeError> {
-    if result.turn != turn {
+    outcome: ChildTaskOutcome,
+) -> Result<Option<(ChildOutcomeKey, ChildTaskOutcome)>, RuntimeError> {
+    let outcome_turn = match &outcome {
+        ChildTaskOutcome::Completed { result, .. } => &result.turn,
+        ChildTaskOutcome::LimitReached { turn, .. } => turn,
+        ChildTaskOutcome::NeedsInput { .. } => {
+            return Err(RuntimeError::conflict(
+                "a returned child interaction is not a turn-ending outcome",
+            ));
+        }
+    };
+    if outcome_turn != &turn || outcome.child() != child {
         return Err(RuntimeError::conflict(
             "completed child outcome value is attributed to another turn",
         ));
@@ -1417,9 +1493,7 @@ fn stage_completed_outcome(
         .as_ref()
         .is_some_and(|status| status.state == ChildState::Running);
     let mut terminal = status.expect("child status was checked above");
-    terminal.state = ChildState::Idle;
-    terminal.last_result = Some(result.text.clone());
-    terminal.last_artifacts = result.artifacts.clone();
+    outcome.apply_to_status(&mut terminal);
     terminal.updated_at = coordinator.parent.inner().shared.clock.now();
     let ledger_key = (child.clone(), TaskOutcomeKey::Completed(turn.clone()));
     if let Some(existing) = coordinator
@@ -1429,12 +1503,7 @@ fn stage_completed_outcome(
         .get(&ledger_key)
         .cloned()
     {
-        if existing
-            == (ChildTaskOutcome::Completed {
-                child: child.clone(),
-                result: result.clone(),
-            })
-        {
+        if existing == outcome {
             // A restart may reconcile the same terminal checkpoint after the
             // parent outcome ledger was already committed.  This is an
             // idempotent no-op, not a conflicting duplicate.
@@ -1484,10 +1553,6 @@ fn stage_completed_outcome(
             entry.status.send_replace(terminal);
         }
     }
-    let outcome = ChildTaskOutcome::Completed {
-        child: child.clone(),
-        result: result.clone(),
-    };
     coordinator
         .task_outcome_ledger
         .lock()
@@ -1497,7 +1562,7 @@ fn stage_completed_outcome(
         .ready_task_outcomes
         .lock()
         .expect("ready child task outcomes poisoned")
-        .insert(key, outcome)
+        .insert(key, outcome.clone())
         .is_some()
     {
         return Err(RuntimeError::conflict(
@@ -1509,7 +1574,7 @@ fn stage_completed_outcome(
         .outcome_state_revision
         .fetch_add(1, Ordering::AcqRel);
 
-    Ok(Some((protected_key, result)))
+    Ok(Some((protected_key, outcome)))
 }
 
 /// Clears only the in-memory terminal status staged for a protected outcome
@@ -1558,11 +1623,11 @@ fn discard_pending_terminal_status(
     }
 }
 
-fn publish_completed_outcome(
+fn publish_turn_outcome(
     coordinator: &Arc<CoordinatorInner>,
     child: &ChildId,
     protected_key: ChildOutcomeKey,
-    result: ChildTaskResult,
+    outcome: ChildTaskOutcome,
 ) {
     let event = (|| -> Option<RuntimeEvent> {
         let _admission = coordinator
@@ -1603,10 +1668,17 @@ fn publish_completed_outcome(
             .lock()
             .expect("durable child outcomes poisoned")
             .insert(protected_key);
-        Some(RuntimeEvent::ChildCompleted {
-            child: child.clone(),
-            result: result.text,
-        })
+        match outcome {
+            ChildTaskOutcome::Completed { result, .. } => Some(RuntimeEvent::ChildCompleted {
+                child: child.clone(),
+                result: result.text,
+            }),
+            ChildTaskOutcome::LimitReached { limit, .. } => Some(RuntimeEvent::ChildLimitReached {
+                child: child.clone(),
+                limit,
+            }),
+            ChildTaskOutcome::NeedsInput { .. } => None,
+        }
     })();
     if let Some(event) = event {
         coordinator.parent.inner().emitter.emit(None, event);
@@ -1614,13 +1686,13 @@ fn publish_completed_outcome(
     }
 }
 
-pub(super) async fn record_completed_outcome(
+pub(super) async fn record_turn_outcome(
     coordinator: &Arc<CoordinatorInner>,
     child: &ChildId,
     turn: TurnId,
-    result: ChildTaskResult,
+    outcome: ChildTaskOutcome,
 ) -> Result<(), RuntimeError> {
-    let Some((protected_key, result)) = stage_completed_outcome(coordinator, child, turn, result)?
+    let Some((protected_key, outcome)) = stage_turn_outcome(coordinator, child, turn, outcome)?
     else {
         return Ok(());
     };
@@ -1631,8 +1703,28 @@ pub(super) async fn record_completed_outcome(
         discard_pending_terminal_status(coordinator, child, &protected_key);
         return Err(error);
     }
-    publish_completed_outcome(coordinator, child, protected_key, result);
+    publish_turn_outcome(coordinator, child, protected_key, outcome);
     Ok(())
+}
+
+/// Builds the outcome of a child task that stopped at `limit`, copying the
+/// artifacts its stopped turn produced exactly as a completed one would.
+pub(super) async fn transfer_limit_outcome(
+    coordinator: &Arc<CoordinatorInner>,
+    child: &ChildId,
+    handle: &SessionHandle,
+    turn: &TurnId,
+    limit: LimitKind,
+) -> Result<ChildTaskOutcome, RuntimeError> {
+    let sources = handle.artifacts_for_turn(turn);
+    let artifacts =
+        transfer_artifact_references(coordinator, child, handle.id(), turn, sources).await?;
+    Ok(ChildTaskOutcome::LimitReached {
+        child: child.clone(),
+        turn: turn.clone(),
+        limit,
+        artifacts,
+    })
 }
 
 pub(super) async fn transfer_completed_result(

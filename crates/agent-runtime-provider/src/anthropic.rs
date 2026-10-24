@@ -1431,6 +1431,15 @@ fn event_to_events(
 
 #[async_trait]
 impl<T: HttpTransport> Provider for AnthropicProvider<T> {
+    fn pre_output_replay_safe(&self, request: &ProviderRequest) -> bool {
+        request.hosted_tools.iter().all(|tool| {
+            matches!(
+                tool,
+                agent_runtime_core::provider::HostedTool::WebSearch { .. }
+            )
+        })
+    }
+
     fn requires_nonempty_assistant_content(&self) -> bool {
         true
     }

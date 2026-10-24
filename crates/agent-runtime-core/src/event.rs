@@ -135,7 +135,12 @@ use crate::usage::UsageRecord;
 /// vocabulary takes 16 and 15 is left meaning whichever of the two a reader
 /// already had. Both are additive, so a v15 envelope of either lineage still
 /// deserializes.
-pub const SCHEMA_VERSION: u32 = 16;
+///
+/// Bumped to 17 for [`RuntimeEvent::ChildLimitReached`]: a delegated child
+/// task that stops at a configured limit is reported as that, not as a
+/// completion carrying whatever the child last said. Additive, so a v16
+/// envelope still deserializes.
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Why a canonical persistent goal projection changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +170,18 @@ pub enum LimitKind {
     Time,
     /// The output size budget.
     Output,
+}
+
+impl LimitKind {
+    /// The limit's wire name, as it serializes.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderAttempts => "provider_attempts",
+            Self::ToolSteps => "tool_steps",
+            Self::Time => "time",
+            Self::Output => "output",
+        }
+    }
 }
 
 /// How a turn ended.
@@ -261,6 +278,22 @@ pub enum CacheOperationOutcome {
     Cancelled,
     Rejected,
     Suspended,
+}
+
+/// Why the canonical provider loop advanced to another configured model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFallbackReason {
+    /// The route's local provider or credential source could not be acquired.
+    Unavailable,
+    /// The candidate did not start responding within its startup budget.
+    FirstResponseTimeout,
+    /// Its credential's usage window is exhausted.
+    QuotaExhausted,
+    /// Its bounded transient retries failed.
+    TransientFailure,
+    /// The candidate cannot serve the current request.
+    Incompatible,
 }
 
 /// Why compaction ran.
@@ -963,6 +996,27 @@ pub enum RuntimeEvent {
         /// The resolved profile's fingerprint.
         profile: Fingerprint,
     },
+    /// The pending request moved to another configured provider/model.
+    ModelFallback {
+        /// The outgoing provider configuration identity.
+        from_provider: String,
+        /// The outgoing model id.
+        from_model: ModelId,
+        /// The incoming provider configuration identity.
+        to_provider: String,
+        /// The incoming model id.
+        to_model: ModelId,
+        /// Zero-based position including the primary at zero.
+        candidate_index: usize,
+        /// Primary plus all configured alternatives.
+        total_candidates: usize,
+        /// The bounded reason for advancing.
+        reason: ModelFallbackReason,
+        /// Time spent in the outgoing candidate's response/retry budget.
+        elapsed_ms: u64,
+        /// Its configured startup budget, when one exists.
+        first_response_timeout_ms: Option<u64>,
+    },
     /// Capability retrieval ran and produced ranked candidates.
     CapabilityRetrievalPerformed {
         /// The resolver implementation's revision.
@@ -1526,6 +1580,16 @@ pub enum RuntimeEvent {
         /// never drop a final result.
         result: String,
     },
+    /// A delegated child's task stopped at a configured limit before the
+    /// child gave a final answer. Not terminal: the child remains available
+    /// for follow-ups within its limits, and nothing from the stopped turn is
+    /// reported as its result.
+    ChildLimitReached {
+        /// The child id.
+        child: ChildId,
+        /// The limit that stopped the task.
+        limit: LimitKind,
+    },
     /// A delegated child stopped. Terminal: emitted exactly once per child.
     ChildStopped {
         /// The child id.
@@ -1687,6 +1751,28 @@ mod tests {
         assert_eq!(
             json["action"],
             serde_json::json!({"type":"open_page","url":"https://rust.test"})
+        );
+        assert_eq!(serde_json::from_value::<RuntimeEvent>(json).unwrap(), event);
+    }
+
+    #[test]
+    fn limit_kind_names_match_their_wire_form() {
+        for limit in [
+            LimitKind::ProviderAttempts,
+            LimitKind::ToolSteps,
+            LimitKind::Time,
+            LimitKind::Output,
+        ] {
+            assert_eq!(serde_json::to_value(limit).unwrap(), limit.as_str());
+        }
+        let event = RuntimeEvent::ChildLimitReached {
+            child: ChildId::new("child-1"),
+            limit: LimitKind::Output,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"event":"child_limit_reached","child":"child-1","limit":"output"})
         );
         assert_eq!(serde_json::from_value::<RuntimeEvent>(json).unwrap(), event);
     }

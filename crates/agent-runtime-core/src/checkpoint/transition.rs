@@ -1,7 +1,21 @@
 use super::*;
 
 impl TurnState {
-    /// Whether the direct transition table permits `self -> next`.
+    pub(super) fn can_transition_for_revision(&self, next: &Self, revision: u32) -> bool {
+        if !supports_turn_transition_revision(revision) {
+            return false;
+        }
+        if revision == MODEL_FALLBACK_TURN_TRANSITION_REVISION
+            && let (Self::CallingModel { step, .. }, Self::Planning { step: next_step }) =
+                (self, next)
+        {
+            return step == next_step;
+        }
+        self.can_transition_to(next)
+    }
+
+    /// Whether the frozen revision-4 table permits `self -> next`.
+    /// Checkpoint validation selects its own declared transition revision.
     ///
     /// Exact equality is always idempotent. A different payload within the
     /// same state is permitted only for pending approval edits and the growing

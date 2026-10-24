@@ -588,6 +588,15 @@ pub fn tool_call_fragments(
 
 #[async_trait]
 impl Provider for FakeProvider {
+    fn pre_output_replay_safe(&self, request: &ProviderRequest) -> bool {
+        request.hosted_tools.iter().all(|tool| {
+            matches!(
+                tool,
+                agent_runtime_core::provider::HostedTool::WebSearch { .. }
+            )
+        })
+    }
+
     fn describe(&self) -> Vec<ModelDescriptor> {
         vec![self.descriptor.clone()]
     }

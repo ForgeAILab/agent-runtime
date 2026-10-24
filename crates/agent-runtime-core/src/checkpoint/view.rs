@@ -49,6 +49,23 @@ impl JournalCheckpoint {
         next.validate()?;
         Ok(next)
     }
+    /// The same first checkpoint under another supported transition table.
+    /// A turn chooses its table at acceptance and can never change it later.
+    pub fn with_transition_revision(&self, revision: u32) -> Result<Self, RuntimeError> {
+        if self.state_revision != 0 {
+            return Err(RuntimeError::conflict(
+                "a turn cannot change its transition table in place",
+            ));
+        }
+        let mut metadata = (*self.metadata).clone();
+        metadata.transition_revision = revision;
+        let next = Self {
+            metadata: Arc::new(metadata),
+            snapshot: self.snapshot.clone(),
+        };
+        next.validate()?;
+        Ok(next)
+    }
     pub(crate) fn metadata_arc(&self) -> Arc<CheckpointMetadata> {
         self.metadata.clone()
     }
@@ -398,7 +415,10 @@ impl JournalCheckpoint {
                 "checkpoint successor regressed its event watermark",
             ));
         }
-        if !self.state.can_transition_to(&next.state) {
+        if !self
+            .state
+            .can_transition_for_revision(&next.state, self.transition_revision)
+        {
             return Err(RuntimeError::conflict(format!(
                 "invalid checkpoint successor from {} to {}",
                 state_name(&self.state),
@@ -469,7 +489,10 @@ impl JournalCheckpoint {
                 return Ok(self.clone());
             }
         }
-        if !self.state.can_transition_to(&next) {
+        if !self
+            .state
+            .can_transition_for_revision(&next, self.transition_revision)
+        {
             return Err(RuntimeError::conflict(format!(
                 "invalid turn transition from {} to {}",
                 state_name(&self.state),

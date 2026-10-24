@@ -855,6 +855,12 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Captures this composition's validated model services for an ordered
+    /// fallback chain. Session state and tool authority are never imported.
+    pub fn model_route(&self, first_response_timeout_ms: Option<u64>) -> super::ModelRoute {
+        self.shared.driver.model_route(first_response_timeout_ms)
+    }
+
     pub(crate) fn from_shared(shared: Arc<RuntimeShared>) -> Self {
         Self { shared }
     }

@@ -629,7 +629,8 @@ async fn unsupported_checkpoint_revisions_and_malformed_protected_markers_fail_b
     schema.schema_version += 1;
     bad.push(schema);
     let mut transition = legacy.clone();
-    transition.transition_revision += 1;
+    transition.transition_revision =
+        agent_runtime_core::checkpoint::MODEL_FALLBACK_TURN_TRANSITION_REVISION + 1;
     bad.push(transition);
     let mut malformed = legacy.clone();
     malformed.snapshot.extension_state.insert(

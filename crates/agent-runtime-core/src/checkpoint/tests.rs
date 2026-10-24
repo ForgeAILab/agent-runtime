@@ -59,6 +59,44 @@ fn calling(checkpoint: &TurnCheckpoint, request: &str) -> TurnCheckpoint {
         .unwrap()
 }
 
+#[test]
+fn model_replanning_requires_an_opt_in_transition_table() {
+    let legacy = calling(&planning(&accepted()), "request");
+    assert!(
+        legacy
+            .transition(TurnState::Planning { step: 0 }, snapshot(), 6, Timestamp(3))
+            .is_err()
+    );
+    let mut opted = accepted();
+    opted.transition_revision = MODEL_FALLBACK_TURN_TRANSITION_REVISION;
+    let calling = calling(&planning(&opted), "request");
+    let replanned = calling
+        .transition(TurnState::Planning { step: 0 }, snapshot(), 6, Timestamp(3))
+        .unwrap();
+    calling.validate_successor(&replanned).unwrap();
+    assert!(
+        calling
+            .transition(TurnState::Planning { step: 1 }, snapshot(), 6, Timestamp(3))
+            .is_err()
+    );
+    let ending = calling
+        .transition(
+            TurnState::Completing {
+                finish: TurnFinish::Failed,
+                visible_output: false,
+                provider_error_kind: None,
+            },
+            snapshot(),
+            6,
+            Timestamp(3),
+        )
+        .unwrap();
+    assert!(
+        legacy.validate_successor(&ending).is_err(),
+        "a turn cannot change its transition table in place"
+    );
+}
+
 fn assembled(text: &str, tool_calls: Vec<ToolCall>) -> AssembledModelResponse {
     AssembledModelResponse {
         attempt: AttemptId::new("attempt-1"),
@@ -1003,7 +1041,7 @@ fn schema_revision_and_watermarks_are_validated_exactly() {
     assert!(bad_schema.validate().is_err());
 
     let mut bad_transition = accepted.clone();
-    bad_transition.transition_revision = TURN_TRANSITION_REVISION + 1;
+    bad_transition.transition_revision = MODEL_FALLBACK_TURN_TRANSITION_REVISION + 1;
     assert!(bad_transition.validate().is_err());
 
     let mut zero_watermark = accepted.clone();
