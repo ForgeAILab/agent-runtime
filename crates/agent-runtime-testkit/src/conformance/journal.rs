@@ -1416,6 +1416,7 @@ where
             storage_id: journal.storage_id(),
             expected_root_epoch: 0,
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await;
     let lease = open_writer(
@@ -1608,6 +1609,7 @@ where
             storage_id: journal.storage_id(),
             expected_root_epoch: 0,
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await;
 
@@ -2487,6 +2489,7 @@ mod tests {
                     storage_id: fixture.journal.storage_id(),
                     expected_root_epoch: 0,
                     max_objects: 1,
+                    work_budget: Default::default(),
                 })
                 .await
                 .unwrap_err(),

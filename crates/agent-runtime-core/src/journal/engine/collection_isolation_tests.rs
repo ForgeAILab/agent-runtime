@@ -118,6 +118,7 @@ fn request(engine: &TestEngine) -> JournalGcRequest {
         storage_id: engine.storage_id(),
         expected_root_epoch: engine.root_epoch().unwrap(),
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     }
 }
 fn failures() -> Vec<RuntimeError> {
@@ -150,6 +151,15 @@ async fn session_failures_are_isolated_and_only_non_conflicts_are_reported() {
                 } else {
                     vec![SessionId::new("b")]
                 };
+                // A page conflict is a rejected continuation: the session's
+                // mark restarts once in the call, then it is skipped.
+                let loads = if matches!(method, "members" | "pins")
+                    && super::super::collection::page_restart(&error)
+                {
+                    2
+                } else {
+                    1
+                };
                 let (storage, engine) = setup(role);
                 let sessions = ["a", "b", "c"].map(SessionId::new);
                 let mut heads = Vec::new();
@@ -164,6 +174,11 @@ async fn session_failures_are_isolated_and_only_non_conflicts_are_reported() {
                         .unwrap(),
                     sessions
                 );
+                // This fault exercises cold body reads; a warm certified head
+                // intentionally does not call objects during collection.
+                if method == "objects" {
+                    engine.memo.lock().unwrap().remove_session(&sessions[1]);
+                }
                 let before = durable(&storage, &engine, &sessions[1]).await;
                 let before_bytes = engine.retained_bytes().await.unwrap();
                 *storage.failure.lock().unwrap() = Some((sessions[1].clone(), method, error));
@@ -178,7 +193,7 @@ async fn session_failures_are_isolated_and_only_non_conflicts_are_reported() {
                         .lock()
                         .unwrap()
                         .get(&("load", sessions[1].clone())),
-                    Some(&1)
+                    Some(&loads)
                 );
                 assert_eq!(durable(&storage, &engine, &sessions[1]).await, before);
                 assert!(collector.dirty.lock().unwrap().contains(&sessions[1]));
@@ -210,7 +225,7 @@ async fn session_failures_are_isolated_and_only_non_conflicts_are_reported() {
                         .lock()
                         .unwrap()
                         .get(&("load", sessions[1].clone())),
-                    Some(&1)
+                    Some(&loads)
                 );
                 assert_eq!(durable(&storage, &engine, &sessions[1]).await, before);
                 *storage.failure.lock().unwrap() = None;

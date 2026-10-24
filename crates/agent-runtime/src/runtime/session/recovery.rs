@@ -7,8 +7,9 @@ impl SessionHandle {
     /// terminal cache checkpoint then permits later direct turns.
     pub(crate) async fn recover_cache_checkpoint(
         &self,
-        mut checkpoint: TurnCheckpoint,
+        checkpoint: TurnCheckpoint,
     ) -> Result<(), RuntimeError> {
+        let mut checkpoint = JournalCheckpoint::from_checkpoint(checkpoint)?;
         let _cache_gate = self.inner.cache_gate.lock().await;
         let _turn_gate = self.inner.turn_gate.lock().await;
         checkpoint.validate()?;
@@ -66,11 +67,8 @@ impl SessionHandle {
                     true,
                 ),
                 TurnState::CacheOperationResultReady { operation, result } => {
-                    let usage = self.cache_usage_for_checkpoint(
-                        &checkpoint.snapshot.usage,
-                        &operation,
-                        &result,
-                    )?;
+                    let usage =
+                        self.cache_usage_for_snapshot(checkpoint.snapshot(), &operation, &result)?;
                     let result_value = self.cache_result_from_checkpoint(&operation, &result);
                     self.inner
                         .shared
@@ -116,11 +114,7 @@ impl SessionHandle {
             let record = self.append_recovered_cache_usage(&operation)?;
             Some(record)
         } else {
-            self.cache_usage_for_checkpoint(
-                &checkpoint.snapshot.usage,
-                &operation,
-                &result_checkpoint,
-            )?
+            self.cache_usage_for_snapshot(checkpoint.snapshot(), &operation, &result_checkpoint)?
         };
         let result_state = TurnState::CacheOperationResultReady {
             operation: operation.clone(),
@@ -185,9 +179,23 @@ impl SessionHandle {
         operation: &CacheOperationCheckpoint,
         result: &CacheOperationResultCheckpoint,
     ) -> Result<Option<UsageRecord>, RuntimeError> {
-        let matches = ledger
-            .records()
-            .iter()
+        self.cache_usage_for_records(ledger.records().iter(), operation, result)
+    }
+    pub(super) fn cache_usage_for_snapshot(
+        &self,
+        snapshot: &agent_runtime_core::journal::JournalSnapshotView,
+        operation: &CacheOperationCheckpoint,
+        result: &CacheOperationResultCheckpoint,
+    ) -> Result<Option<UsageRecord>, RuntimeError> {
+        self.cache_usage_for_records(snapshot.usage_records(), operation, result)
+    }
+    fn cache_usage_for_records<'a>(
+        &self,
+        records: impl Iterator<Item = &'a UsageRecord>,
+        operation: &CacheOperationCheckpoint,
+        result: &CacheOperationResultCheckpoint,
+    ) -> Result<Option<UsageRecord>, RuntimeError> {
+        let matches = records
             .filter(|record| {
                 record.source == UsageSource::ProviderAttempt
                     && record.provenance.request == operation.request
@@ -244,7 +252,7 @@ impl SessionHandle {
             delta: UsageDelta::new(),
         };
         let mut state = self.inner.state.lock().expect("session state poisoned");
-        if state.usage.records().iter().any(|existing| {
+        if state.usage().records().iter().any(|existing| {
             existing.source == record.source
                 && existing.provenance.request == record.provenance.request
                 && existing.provenance.attempt == record.provenance.attempt
@@ -253,7 +261,7 @@ impl SessionHandle {
                 "started cache checkpoint already has an attempted usage record",
             ));
         }
-        state.usage.record(record.clone());
+        state.record_usage(record.clone());
         Ok(record)
     }
 
@@ -364,7 +372,12 @@ impl SessionInner {
         if !self.execution.persistence.has_checkpoint_store() {
             return;
         }
-        let checkpoint = match self.execution.persistence.latest_checkpoint().await {
+        let checkpoint = match self
+            .execution
+            .persistence
+            .latest_checkpoint_predecessor()
+            .await
+        {
             Ok(Some(checkpoint)) => checkpoint,
             Ok(None) => return,
             Err(error) => {
@@ -375,9 +388,9 @@ impl SessionInner {
                 return;
             }
         };
-        if checkpoint.state.is_terminal()
+        if checkpoint.is_terminal()
             || matches!(
-                checkpoint.state,
+                checkpoint.state(),
                 TurnState::CacheOperationPrepared { .. }
                     | TurnState::CacheOperationStarted { .. }
                     | TurnState::CacheOperationResultReady { .. }
@@ -390,7 +403,7 @@ impl SessionInner {
             .lock()
             .expect("session turns poisoned")
             .cancellations
-            .contains_key(&checkpoint.turn);
+            .contains_key(checkpoint.turn());
         if live {
             return;
         }
@@ -403,7 +416,7 @@ impl SessionInner {
                 self.minter.clone(),
                 self.cancel.child(),
                 self.inbox.clone(),
-                checkpoint,
+                checkpoint.materialize(),
                 false,
             )
             .await;

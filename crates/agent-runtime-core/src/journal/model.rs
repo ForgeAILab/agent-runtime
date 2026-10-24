@@ -570,6 +570,10 @@ pub struct JournalCommit {
 }
 
 /// Host-triggered collector request. No default schedule or retention TTL.
+///
+/// Collection is bounded per call: a successful call may yield before it has
+/// examined every dirty session. Hosts loop while [`JournalGcReport::has_more`],
+/// refreshing `expected_root_epoch` from the engine before each request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalGcRequest {
     /// Explicit requested domain.
@@ -579,9 +583,77 @@ pub struct JournalGcRequest {
     /// Host-chosen upper bound on memberships released during this operation.
     /// Pack rewrites may also remove bodies released by earlier collections.
     pub max_objects: u64,
+    /// Cooperative per-call work budget. A missing serialized budget selects
+    /// the bounded defaults; a host may request less, never unbounded work.
+    #[serde(default)]
+    pub work_budget: JournalGcBudget,
+}
+
+impl JournalGcRequest {
+    /// Request with the default bounded work budget.
+    pub fn new(storage_id: JournalStorageId, expected_root_epoch: u64, max_objects: u64) -> Self {
+        Self {
+            storage_id,
+            expected_root_epoch,
+            max_objects,
+            work_budget: JournalGcBudget::default(),
+        }
+    }
+    /// Replaces the per-call work budget.
+    pub fn with_budget(mut self, work_budget: JournalGcBudget) -> Self {
+        self.work_budget = work_budget;
+        self
+    }
+}
+
+/// Cooperative bound on one collection call. Values above the runtime limits
+/// are clamped to them; zero selects the minimum positive bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JournalGcBudget {
+    /// Soft elapsed target from call entry, including gate wait, in milliseconds.
+    /// The runtime reserves the measured cost of the next unit before starting it.
+    pub target_millis: u64,
+    /// Bounded work units (discovery page, trace batch, page, dependency index,
+    /// release batch) this call may start.
+    pub max_work_units: u64,
+    /// Ids or records per discovery/trace/inventory/pin unit.
+    pub max_unit_items: u32,
+}
+
+impl JournalGcBudget {
+    /// Runtime default and maximum elapsed target.
+    pub const DEFAULT_TARGET_MILLIS: u64 = 250;
+    /// Runtime maximum ids or records per bounded unit.
+    pub const MAX_UNIT_ITEMS: u32 = 256;
+}
+
+impl Default for JournalGcBudget {
+    fn default() -> Self {
+        Self {
+            target_millis: Self::DEFAULT_TARGET_MILLIS,
+            max_work_units: u64::MAX,
+            max_unit_items: Self::MAX_UNIT_ITEMS,
+        }
+    }
+}
+
+/// Progress of the engine's private collection pass after one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalGcProgress {
+    /// The captured dirty pass finished. Concurrent work can require another pass.
+    Complete,
+    /// The call stopped at its budget; the private cursor resumes next call.
+    Yielded,
+    /// Stale speculative mark state was discarded during this call (a root,
+    /// pin, fence or epoch changed); nothing was released from the stale mark.
+    Restarted,
 }
 
 /// Metadata-only collection result; content IDs never enter default diagnostics.
+/// Counts, receipts and unreadable sessions describe this call only; a host
+/// drain accumulates them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalGcReport {
     /// Transactionally verified root/pin epoch.
@@ -595,10 +667,56 @@ pub struct JournalGcReport {
     pub reclaimed_bytes: u64,
     /// Sessions whose state could not be read or validated; hosts may log each once.
     /// Sorted and unique, without content/object ids. Only non-retryable,
-    /// non-conflict failures are reported. Dirty hints survive for the next call.
+    /// non-conflict failures and proven invalid state (including incomplete
+    /// live membership) are reported. Dirty hints survive for the next call.
     /// A source blocked by an unreadable dependency is included with that dependency.
+    /// A process-local lease over bodies already collected by another engine,
+    /// or a recreated historical pin with missing bodies, is reported on every
+    /// pass while it persists. Reporting does not repair cross-engine retention.
     #[serde(default)]
     pub unreadable_sessions: Vec<SessionId>,
+    /// Pass progress; `None` decodes historical reports (unknown progress).
+    #[serde(default)]
+    pub progress: Option<JournalGcProgress>,
+    /// Whether the host should call again to continue the current pass.
+    /// Historical reports decode as `false` (no continuation).
+    #[serde(default)]
+    pub has_more: bool,
+    /// Bounded work units started by this call.
+    #[serde(default)]
+    pub work_units: u64,
+    /// Consecutive calls, including this one, that started no work unit (for
+    /// example because the membership-release budget was already spent). A
+    /// host may back off while it grows; zero means this call progressed.
+    #[serde(default)]
+    pub zero_work_calls: u64,
+    /// Sessions whose mark exceeded the engine's cursor workspace cap in this
+    /// call. Each is skipped with its dirty state retained; sorted and unique.
+    #[serde(default)]
+    pub over_capacity_sessions: Vec<SessionId>,
+}
+
+impl JournalGcReport {
+    /// Host-drain migration helper: adds one bounded call's per-call counts,
+    /// receipts and unreadable sessions (kept sorted and unique) to a running
+    /// total. Progress and continuation come from the latest call; the root
+    /// epoch stays the first call's mark.
+    pub fn accumulate(&mut self, next: JournalGcReport) {
+        self.examined += next.examined;
+        self.deleted += next.deleted;
+        self.reclaimed_bytes += next.reclaimed_bytes;
+        self.work_units += next.work_units;
+        self.zero_work_calls = next.zero_work_calls;
+        self.unreadable_sessions.extend(next.unreadable_sessions);
+        self.unreadable_sessions.sort();
+        self.unreadable_sessions.dedup();
+        self.over_capacity_sessions
+            .extend(next.over_capacity_sessions);
+        self.over_capacity_sessions.sort();
+        self.over_capacity_sessions.dedup();
+        self.progress = next.progress;
+        self.has_more = next.has_more;
+    }
 }
 
 /// Final planned request, with independent persistent ordered message/tool refs.

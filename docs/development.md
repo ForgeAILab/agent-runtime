@@ -9,10 +9,10 @@ manifest MUST NOT require a sibling relative path to this repository.
 ```toml
 # In a consumer Cargo.toml — pin an exact release.
 [dependencies]
-agent-runtime = "=0.9.0"
+agent-runtime = "=0.10.0"
 
 # Or, before a registry release exists, pin an exact revision:
-# agent-runtime = { git = "https://example.invalid/agent-runtime", tag = "v0.9.0" }
+# agent-runtime = { git = "https://example.invalid/agent-runtime", tag = "v0.10.0" }
 ```
 
 ## Local cross-repository development (uncommitted override)
@@ -299,13 +299,68 @@ unsupported adapters. After explicit `enable_collection`, a host can mark an
 epoch and request bounded deletion:
 
 ```rust
-let request = JournalGcRequest {
-    storage_id: journal.storage_id(),
-    expected_root_epoch: journal.root_epoch()?,
-    max_objects: 1_000,
-};
-let report = journal.collect(request).await?;
+// Collection is bounded per call: loop while the engine reports more work,
+// refreshing the epoch before each request.
+let mut total: Option<JournalGcReport> = None;
+loop {
+    let request = JournalGcRequest::new(journal.storage_id(), journal.root_epoch()?, 1_000);
+    let report = journal.collect(request).await?;
+    let more = report.has_more;
+    match &mut total {
+        None => total = Some(report),
+        Some(total) => total.accumulate(report),
+    }
+    if !more {
+        break;
+    }
+}
 ```
+
+Each call holds the write gate for a cooperative budget (`JournalGcBudget`:
+250 ms soft elapsed target counted from call entry including gate wait,
+work-unit and per-unit item limits; hosts may request less, never more). Before
+each bounded unit the engine reserves a decaying maximum of that unit kind's
+measured cost; once the gate is held the first unit of a call always starts,
+even if the gate wait consumed the target, so a positive budget always
+progresses under turn contention (`work_units`; `zero_work_calls` counts
+consecutive calls that started nothing, for host back-off). Progress lives in an engine-local, disposable cursor shared
+by clones (discover 32 dirty sessions, load/authenticate, pin pages and
+catalog-chain steps, iterative typed-edge trace batches, lease roots, member
+inventory pages, one dependency index per unit, release batch). A session
+releases nothing until its whole live union is marked and its membership
+inventoried under one stored fence; a resumed call reloads the fence and
+restarts that session's mark (`JournalGcProgress::Restarted`) only when the
+session's own fence or lease set changed; changes on other sessions never
+restart it. Lease roots registered after the mark are removed from every
+release batch before its apply. A restarted session is retried behind the rest
+of the pass. The cursor's additional workspace is capped at 16 MiB, checked
+inside trace units; a session whose mark cannot fit is skipped for the pass
+with its dirty state and hint retained and listed in `over_capacity_sessions`,
+while other sessions keep progressing. A session stopped part-way by
+`max_objects` makes its pass end with `has_more`; a dropped call restores the
+hints it took.
+`max_objects` still bounds membership releases per call (0 marks and releases
+nothing). Counts, receipts and unreadable sessions are per call; an unreadable
+session is attempted at most once per call and does not by itself request
+another pass.
+
+Storage serves collection only through the bounded protocol:
+`collection_capability` (required declaration; `Unsupported` refuses
+collection and retains everything), fence-bound `collection_page` (members or
+pins; at most `max_items`; a continuation is bound to domain, session, full
+fence and page kind), a read-only `prepare_collection_apply` that may request a
+smaller release set (`Split`), and `apply_collection`, which applies the
+complete plan as one atomic fenced transaction. A preflight `Fits { units }`
+must not exceed the plan's `max_units` (the engine rejects it as a contract
+violation), and the receipt's `rewritten_units` must not exceed the declared
+units. A physical change without a fence change (repack, compaction) may
+reject a member continuation with a state conflict, which restarts that
+session's mark; it must never make a continuation skip an id. The packed
+reference pages members by (pack, slot) bound to the session's own pack
+version (other sessions' writes do not invalidate it), decoding at most one
+bounded pack per step, splits a release whose touched packs exceed 32, and
+bounds a retired session's forced purge and base repack to the remaining unit
+allowance (leftover purge keeps the session dirty).
 
 An intervening open, commit, renewal, close, host writer revocation, durable pin
 change, staging change or retirement invalidates that mark. A `StateConflict`

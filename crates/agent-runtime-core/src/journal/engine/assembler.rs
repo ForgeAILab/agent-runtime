@@ -12,6 +12,8 @@ impl ObjectAssembler {
         value: &T,
     ) -> Result<JournalObjectId, RuntimeError> {
         let object = JournalObject::encode(kind, value)?;
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event("rt.work.encoded_objects", 1, object.bytes.len() as u64);
         self.objects
             .entry(object.id.clone())
             .or_insert(object.bytes);
@@ -66,6 +68,8 @@ impl ObjectAssembler {
         &mut self,
         values: &[serde_json::Value],
     ) -> Result<JournalJsonArray, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.assembler.structured_sequence");
         if values.is_empty() {
             return Ok(JournalJsonArray {
                 len: 0,
@@ -334,6 +338,8 @@ impl ObjectAssembler {
         &mut self,
         manifest: &crate::store::TurnManifest,
     ) -> Result<JournalObjectId, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.assembler.manifest");
         let value = serde_json::to_value(manifest).map_err(|_| conflict())?;
         let value = self.json_value(&value)?;
         self.add(
@@ -356,175 +362,142 @@ impl ObjectAssembler {
         &mut self,
         snapshot: &SessionSnapshot,
         planned_step_count: u64,
-        previous: Option<&SessionSnapshot>,
-        previous_encoding: Option<&SnapshotEncodingCache>,
-        overrides: Option<&JournalTransitionDelta>,
+        _previous: Option<&SessionSnapshot>,
+        _previous_encoding: Option<&SnapshotEncodingCache>,
+        _overrides: Option<&JournalTransitionDelta>,
     ) -> Result<(JournalSnapshotRoots, SnapshotEncodingCache), RuntimeError> {
-        let previous = previous
-            .zip(previous_encoding)
-            .filter(|(previous, encoding)| {
-                previous.id == snapshot.id
-                    && encoding.history_ids.len() == previous.history.len()
-                    && encoding.usage_ids.len() == previous.usage.records().len()
-                    && encoding.manifest_ids.len() == previous.manifests.len()
-                    && encoding.extension_ids.len() == previous.extension_state.len()
-            });
+        self.snapshot_view(
+            &JournalSnapshotView::from_snapshot(snapshot.clone())?,
+            planned_step_count,
+            None,
+            None,
+        )
+    }
 
-        let (history_ids, history, history_chain) = match previous {
-            Some((previous, encoding)) if previous.history == snapshot.history => (
-                encoding.history_ids.clone(),
-                encoding.roots.history.clone(),
-                encoding.roots.history_chain.clone(),
-            ),
-            Some((previous, encoding))
-                if previous.history.len() <= snapshot.history.len()
-                    && previous.history == snapshot.history[..previous.history.len()] =>
-            {
-                let mut ids = encoding.history_ids.clone();
-                ids.extend(
-                    snapshot.history[previous.history.len()..]
-                        .iter()
-                        .map(|message| self.add(JournalObjectKind::Message, message))
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                let tree = self.sequence(ids.clone())?;
-                let chain = journal_history_chain(&ids);
-                (ids, tree, chain)
-            }
-            _ => {
-                let ids = snapshot
-                    .history
-                    .iter()
-                    .map(|message| self.add(JournalObjectKind::Message, message))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let tree = self.sequence(ids.clone())?;
-                let chain = journal_history_chain(&ids);
-                (ids, tree, chain)
-            }
-        };
-
-        let records = snapshot.usage.records();
-        let (usage_ids, usage) = match previous {
-            Some((previous, encoding)) if previous.usage.records() == records => {
-                (encoding.usage_ids.clone(), encoding.roots.usage.clone())
-            }
-            Some((previous, encoding))
-                if previous.usage.records().len() <= records.len()
-                    && previous.usage.records() == &records[..previous.usage.records().len()] =>
-            {
-                let mut ids = encoding.usage_ids.clone();
-                ids.extend(
-                    records[previous.usage.records().len()..]
-                        .iter()
-                        .map(|record| self.add(JournalObjectKind::UsageRecord, record))
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                let tree = self.sequence(ids.clone())?;
-                (ids, tree)
-            }
-            _ => {
-                let ids = records
-                    .iter()
-                    .map(|record| self.add(JournalObjectKind::UsageRecord, record))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let tree = self.sequence(ids.clone())?;
-                (ids, tree)
-            }
-        };
-
-        let overlap = if let Some((previous, _)) = previous {
-            let max = previous.manifests.len().min(snapshot.manifests.len());
-            (0..=max)
-                .rev()
-                .find(|overlap| {
-                    previous.manifests[previous.manifests.len() - overlap..]
-                        == snapshot.manifests[..*overlap]
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let mut manifest_ids = previous.map_or_else(Vec::new, |(previous, encoding)| {
-            encoding.manifest_ids[previous.manifests.len() - overlap..].to_vec()
-        });
-        let new_manifest_count = snapshot.manifests.len() - overlap;
-        if let Some(references) = overrides
-            .map(|delta| delta.manifest_references.as_slice())
-            .filter(|references| references.len() == new_manifest_count)
-        {
-            manifest_ids.extend_from_slice(references);
-        } else {
-            manifest_ids.extend(
-                snapshot.manifests[overlap..]
-                    .iter()
-                    .map(|manifest| self.manifest(manifest))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-        let manifests = previous
-            .filter(|(previous, _)| previous.manifests == snapshot.manifests)
-            .map_or_else(
-                || self.sequence(manifest_ids.clone()),
-                |(_, encoding)| Ok(encoding.roots.manifests.clone()),
+    pub(in crate::journal) fn snapshot_view(
+        &mut self,
+        snapshot: &JournalSnapshotView,
+        planned_step_count: u64,
+        previous: Option<(&JournalSnapshotView, &SnapshotEncodingCache)>,
+        delta: Option<&JournalTransitionDelta>,
+    ) -> Result<(JournalSnapshotRoots, SnapshotEncodingCache), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::journal::profile::enter_sync("rt.assembler.snapshot_cached");
+        use crate::journal::semantic::Sequence;
+        let history_start = previous.map_or(0, |(v, _)| v.history.len());
+        let usage_start = previous.map_or(0, |(v, _)| v.usage.len());
+        let mut history_ids =
+            previous.map_or_else(Sequence::default, |(_, c)| c.history_ids.clone());
+        let mut usage_ids = previous.map_or_else(Sequence::default, |(_, c)| c.usage_ids.clone());
+        let mut added_history = Vec::new();
+        for i in history_start..snapshot.history.len() {
+            let id = self.add(
+                JournalObjectKind::Message,
+                snapshot.history.get(i).ok_or_else(conflict)?,
             )?;
+            history_ids.push(id.clone())?;
+            added_history.push(id);
+        }
+        let mut added_usage = Vec::new();
+        for i in usage_start..snapshot.usage.len() {
+            let id = self.add(
+                JournalObjectKind::UsageRecord,
+                snapshot.usage.get(i).ok_or_else(conflict)?,
+            )?;
+            usage_ids.push(id.clone())?;
+            added_usage.push(id);
+        }
+        let (history_view, objects) = previous.map_or_else(
+            || JournalSequenceView::from_items(added_history.clone()),
+            |(_, c)| c.history_view.append(&added_history),
+        )?;
+        for object in objects {
+            self.objects.insert(object.id, object.bytes);
+        }
+        let (usage_view, objects) = previous.map_or_else(
+            || JournalSequenceView::from_items(added_usage.clone()),
+            |(_, c)| c.usage_view.append(&added_usage),
+        )?;
+        for object in objects {
+            self.objects.insert(object.id, object.bytes);
+        }
+        let history_chain = previous.map_or_else(
+            || journal_history_chain(&added_history),
+            |(_, c)| journal_history_chain_append(&c.roots.history_chain, &added_history),
+        );
+        let new_manifests = delta
+            .filter(|d| d.bootstrap.is_none() && previous.is_some())
+            .map(|d| d.manifests_append.len() + d.manifest_references.len());
+        let mut manifest_ids = previous
+            .filter(|_| new_manifests.is_some())
+            .map_or_else(Sequence::default, |(_, c)| c.manifest_ids.clone());
+        let count = new_manifests.unwrap_or(snapshot.manifests.len());
+        let retained = snapshot.manifests.len().saturating_sub(count);
+        let skipped = count.saturating_sub(snapshot.manifests.len());
+        if previous.is_some() && new_manifests.is_some() {
+            manifest_ids.truncate_front(retained)?;
+        }
+        for i in retained..snapshot.manifests.len() {
+            let reference = delta.and_then(|d| {
+                (skipped + i - retained)
+                    .checked_sub(d.manifests_append.len())
+                    .and_then(|index| d.manifest_references.get(index))
+            });
+            let id = match reference {
+                Some(id) => id.clone(),
+                None => self.manifest(snapshot.manifests.get(i).ok_or_else(conflict)?)?,
+            };
+            manifest_ids.push(id)?;
+        }
+        let manifests = if previous.is_some_and(|(v, _)| snapshot.manifests.same(&v.manifests)) {
+            previous.expect("present").1.roots.manifests.clone()
+        } else {
+            self.sequence(manifest_ids.iter().cloned().collect())?
+        };
         if planned_step_count < manifests.len {
             return Err(conflict());
         }
-
-        let mut extension_ids = BTreeMap::new();
-        for (key, value) in &snapshot.extension_state {
-            let id = match previous {
-                Some((previous, encoding))
-                    if previous
-                        .extension_state
-                        .get(key)
-                        .is_some_and(|previous| state_identical(previous, value)) =>
-                {
-                    encoding
-                        .extension_ids
-                        .get(key)
-                        .cloned()
-                        .ok_or_else(conflict)?
+        let mut extension_ids =
+            previous.map_or_else(BTreeMap::new, |(_, c)| c.extension_ids.clone());
+        if let Some(delta) = delta.filter(|d| d.bootstrap.is_none() && previous.is_some()) {
+            for key in delta
+                .extension_updates
+                .keys()
+                .chain(delta.extension_references.keys())
+            {
+                if let Some(value) = snapshot.extension_state.get(key) {
+                    let id = match delta.extension_references.get(key).and_then(Option::as_ref) {
+                        Some(id) => id.clone(),
+                        None => self.extension(key, value)?,
+                    };
+                    extension_ids.insert(key.clone(), id);
+                } else {
+                    extension_ids.remove(key);
                 }
-                _ if overrides
-                    .and_then(|delta| delta.extension_references.get(key))
-                    .and_then(Option::as_ref)
-                    .is_some() =>
-                {
-                    overrides
-                        .and_then(|delta| delta.extension_references.get(key))
-                        .and_then(Option::as_ref)
-                        .cloned()
-                        .ok_or_else(conflict)?
-                }
-                _ => self.extension(key, value)?,
-            };
-            extension_ids.insert(key.clone(), id);
+            }
+        } else {
+            extension_ids.clear();
+            for (key, value) in snapshot.extension_state.iter() {
+                extension_ids.insert(key.clone(), self.extension(key, value)?);
+            }
         }
-        let entries = extension_ids
-            .iter()
-            .map(|(key, value)| JournalMapEntry {
-                key: key.clone(),
-                value: value.clone(),
-            })
-            .collect();
-        let extensions = previous
-            .filter(|(previous, _)| {
-                previous.extension_state.len() == snapshot.extension_state.len()
-                    && previous
-                        .extension_state
-                        .iter()
-                        .zip(&snapshot.extension_state)
-                        .all(|((lk, lv), (rk, rv))| lk == rk && state_identical(lv, rv))
-            })
-            .map_or_else(
-                || self.map(entries),
-                |(_, encoding)| Ok(encoding.roots.extensions.clone()),
-            )?;
+        let extensions = if previous.is_some_and(|(_, c)| c.extension_ids == extension_ids) {
+            previous.expect("present").1.roots.extensions.clone()
+        } else {
+            self.map(
+                extension_ids
+                    .iter()
+                    .map(|(key, value)| JournalMapEntry {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+            )?
+        };
         let roots = JournalSnapshotRoots {
-            history,
+            history: history_view.sequence(),
             history_chain,
-            usage,
+            usage: usage_view.sequence(),
             extensions,
             manifests,
             planned_step_count,
@@ -539,6 +512,9 @@ impl ObjectAssembler {
                 usage_ids,
                 manifest_ids,
                 extension_ids,
+                history_view,
+                usage_view,
+                policy_revision: None,
             },
         ))
     }

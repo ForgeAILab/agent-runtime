@@ -1151,7 +1151,7 @@ impl<'a> TurnMachine<'a> {
             .state
             .lock()
             .expect("session state poisoned")
-            .history
+            .history()
             .len();
         self.execution
             .begin_turn(self.turn_id.clone(), history_start, self.driver.clock.now());

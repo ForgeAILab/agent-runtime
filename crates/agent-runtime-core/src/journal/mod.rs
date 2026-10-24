@@ -18,14 +18,24 @@ mod encoding;
 pub mod engine;
 mod memory;
 mod model;
+mod persistent;
 mod reader;
+mod semantic;
+mod writer;
+pub use writer::{
+    JournalJsonEncoding, JournalPreparationHints, JournalWriterAssembler, JournalWriterEncoding,
+};
+mod sequence_view;
 mod snapshot;
+pub use semantic::{JournalSnapshotMutation, JournalSnapshotView};
+pub use sequence_view::JournalSequenceView;
 pub mod storage;
 
 pub use encoding::*;
 pub use engine::JournalCommitFailurePoint;
 pub use engine::{
-    IdentityJournalProjection, JournalEngine, JournalEngineConfig, JournalProjectionPolicy,
+    IdentityJournalProjection, JournalDeltaProjection, JournalEngine, JournalEngineConfig,
+    JournalProjectionPolicy,
 };
 pub use memory::*;
 pub use model::*;
@@ -91,6 +101,18 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
         lease: &JournalLease,
         batch: JournalCommit,
     ) -> Result<JournalHead, RuntimeError>;
+    /// Optional canonical preparation evidence. These opaque hints bind typed
+    /// semantics to encoded ids; they never grant membership or write authority.
+    /// Wrappers default to the complete commit path unless explicitly forwarded.
+    #[doc(hidden)]
+    async fn commit_prepared(
+        &self,
+        lease: &JournalLease,
+        commit: JournalCommit,
+        _hints: JournalPreparationHints,
+    ) -> Result<JournalHead, RuntimeError> {
+        self.commit(lease, commit).await
+    }
     /// Renews the pin and writer fence, rejecting expired/revoked handles. Hosts
     /// choose durations; no library expiry silently grants execution authority.
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError>;
@@ -105,6 +127,7 @@ pub trait SessionJournal: Send + Sync + std::fmt::Debug {
     ) -> Result<JournalRetirement, RuntimeError>;
     /// Traces live/retained/staged/transfer roots and pins; deletion transactionally
     /// rechecks the mark epoch. Unsupported collection must retain everything.
+    /// One call may yield (`has_more`); hosts loop with a refreshed epoch.
     async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError>;
 }
 
@@ -127,3 +150,6 @@ pub trait JournalReadOperation: Send {
     async fn read(&mut self, object: &JournalObjectId) -> Result<Vec<u8>, RuntimeError>;
     async fn finish(&mut self) -> Result<bool, RuntimeError>;
 }
+
+#[cfg(feature = "test-support")]
+pub mod profile;

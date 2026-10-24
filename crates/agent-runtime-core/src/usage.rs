@@ -195,6 +195,12 @@ impl UsageLedger {
         self.records.push(record);
     }
 
+    /// Restores an uncommitted append boundary during Runtime rollback.
+    #[doc(hidden)]
+    pub fn truncate(&mut self, keep: usize) {
+        self.records.truncate(keep);
+    }
+
     /// All records in insertion order.
     pub fn records(&self) -> &[UsageRecord] {
         &self.records

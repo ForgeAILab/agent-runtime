@@ -105,7 +105,7 @@ impl DelegationCoordinator {
                 handle.inner().emitter.presentation_snapshot();
             let history = handle.inner().execution.shared_history(
                 handle.id(),
-                &state.history,
+                state.history(),
                 handle.inner().shared.lcm.as_ref(),
             );
             return Ok(ChildHistorySubscription {

@@ -7,6 +7,51 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-24
+
+### Breaking
+
+- Bounded collection calls (journal hot path P4). `JournalGcRequest` gains
+  `work_budget: JournalGcBudget` (serde default; use `JournalGcRequest::new`
+  / `with_budget`); `JournalGcReport` gains `progress: Option<JournalGcProgress>`,
+  `has_more` and `work_units` (serde defaults: historical reports decode as no
+  continuation and unknown progress). A successful `collect` may now yield
+  before visiting every dirty session: hosts loop while `has_more`, refreshing
+  `expected_root_epoch` before each call, and may sum reports with
+  `JournalGcReport::accumulate`. Counts, receipts and unreadable sessions are
+  per call. A stale `expected_root_epoch` still conflicts; `max_objects` still
+  bounds membership releases per call. Reports also carry
+  `zero_work_calls` and `over_capacity_sessions` (a session over the 16 MiB
+  cursor cap is skipped and reported instead of failing the call).
+- `JournalStorage::apply_collection` returns `JournalCollectionReceipt`
+  (`receipt` plus `rewritten_units`); a preflight `Fits { units }` above the
+  plan's `max_units` is rejected by the engine.
+- `JournalStorage` requires `collection_capability`, `collection_page`,
+  `prepare_collection_apply` and `apply_collection` with no default bodies.
+  New DTOs:
+  `JournalCollectionLimits`, `JournalCollectionPageKind`,
+  `JournalCollectionContinuation` (opaque, scope- and fence-bound),
+  `JournalCollectionPageRequest`, `JournalCollectionPage`,
+  `JournalCollectionItems`, `JournalCollectionPlan`,
+  `JournalCollectionPreflight`. `members`/`pins` remain for non-collection use;
+  collection no longer calls them. No journal object or checkpoint schema
+  changes; the packed reference adapter needs no metadata migration.
+- Storage conformance adds `bounded_collection_protocol` (fence-bound one-item
+  pages, stale-fence and cross-scope continuation rejection, no-effect
+  preflight, complete atomic apply, stale-plan rejection) with broken-adapter
+  controls for unbounded pages, stale pages, partial applies, under-reported
+  preflight units and dropped pin pages. Collection
+  conformance fixtures drain explicitly.
+
+- `runtime::SessionState` fields are private. Read them through `history()`,
+  `usage()` and `manifests()`; construct with `SessionState::with_history` or
+  `Default`. Runtime-owned mutation now records every changed suffix, so the
+  live journal snapshot view cannot reuse a stale prefix, and the public
+  `run_turn` no longer turns that view off.
+- The hidden internal `checkpoint::JournalCheckpoint` drops
+  `from_checkpoint_view`; its snapshot is read through `snapshot()` and
+  replaced only through the validating `with_snapshot`.
+
 ### Added
 
 - `ArtifactProvenance::child` optionally names the delegated child behind a
@@ -16,8 +61,22 @@ contain breaking changes and are coordinated with consumer proposals.
   pending presentation, retained backend observations, and a live-event watermark
   without running a dormant child or acknowledging its result.
 
+### Changed
+
+- Collection reuses authenticated closure proofs for current heads and certified
+  historical pins, avoiding repeated reads of unchanged closures.
+- Reused proofs are capped at 32 roots per session mark. Exceeding that cap
+  discards the reused proofs and falls back to complete cold tracing.
+
 ### Fixed
 
+- GC reports incomplete membership inventories in
+  `JournalGcReport.unreadable_sessions`, preserving durable state and dirty
+  hints for repair.
+- Collection bounds retries per session mark across calls: one restart is
+  allowed, and a second invalidation skips the session for the current pass
+  while retaining its dirty state.
+- Idle memo heads are evictable when the memo needs space.
 - Malformed or truncated tool arguments can receive bounded correction attempts
   with input-budget, cancellation, deadline, and provider-cache checks. Invalid
   calls and sibling calls from the discarded response are never dispatched.
@@ -28,6 +87,26 @@ contain breaking changes and are coordinated with consumer proposals.
 - The lockfile uses patched TLS certificate validation and trust-root packages:
   `rustls-webpki` 0.103.16, `webpki-root-certs` 1.0.10, and `webpki-roots` 1.0.10
   (RUSTSEC-2026-0381, RUSTSEC-2026-0382, and RUSTSEC-2026-0383).
+
+### Upgrade notes
+
+- Storage adapters and forwarding wrappers must implement or explicitly forward
+  all four new collection methods. Declare bounded support with
+  `JournalCollectionLimits`, provide fence-bound pages without materializing
+  the whole session, implement a read-only, no-effect preflight, and apply the
+  complete plan atomically within its unit bound. Return exact physical
+  receipts and `rewritten_units` in `JournalCollectionReceipt`. Adapters that
+  cannot meet this protocol must declare
+  `JournalCollectionCapability::Unsupported`; collection is refused and all
+  content is retained.
+
+### Known limitations
+
+Owner-accepted on 2026-10-23:
+
+- On the B/4000 benchmark, open/commit gate hold is ~1.4 s plain / ~1.7 s tool
+  against a target of <1 s. The writer-open view (P3) is planned for later.
+- B/100 tool overhead is ~60 ms against a ~50 ms target.
 
 ## [0.9.0] - 2026-10-20
 

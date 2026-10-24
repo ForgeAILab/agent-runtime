@@ -83,6 +83,7 @@ pub struct ActiveTurn {
 pub struct SessionExecutionContext {
     /// Persistence mode selected once before this live session was built.
     pub(crate) persistence: Arc<SessionPersistence>,
+    pub(crate) live_snapshot: Mutex<super::snapshot::LiveSnapshot>,
     history_generations: Mutex<super::history::HistoryGenerations>,
     /// Volatile backend observations, deliberately outside all snapshot state.
     #[cfg(feature = "external-agent")]
@@ -93,11 +94,11 @@ pub struct SessionExecutionContext {
     /// is enabled.
     pub(crate) abilities: Option<SessionAbilities>,
     /// Namespaced state for ordered harness components.
-    pub(crate) extension_state: Mutex<BTreeMap<String, VersionedSessionState>>,
+    pub(crate) extension_state: Mutex<super::extensions::ExtensionState>,
     /// Extension state staged for an in-flight internal acceptance checkpoint.
     /// Turn checkpoints include this overlay, while ordinary SessionStore
     /// snapshots intentionally exclude it until the acceptance hook commits.
-    staged_extension_state: Mutex<BTreeMap<String, VersionedSessionState>>,
+    staged_extension_state: Mutex<super::extensions::ExtensionState>,
     /// Per-session serialization boundary shared by every SessionStore save,
     /// including AgentDriver's terminal publication.
     pub(crate) persist_gate: Arc<AsyncMutex<()>>,
@@ -118,6 +119,10 @@ pub struct SessionExecutionContext {
     /// in-process registry prevents delegation from parsing model-facing
     /// marker text or lossy observability events.
     artifacts: Mutex<BTreeMap<TurnId, BTreeMap<ArtifactId, ArtifactRef>>>,
+    /// The persisted artifact-reference namespace for the current registry,
+    /// shared across journal captures until the next recorded artifact.
+    /// Locked only while `artifacts` is held.
+    artifacts_state: Mutex<Option<Arc<VersionedSessionState>>>,
     /// Injected content drained for an acceptance with an unresolved
     /// outcome, held for the host to restore on a reopened session.
     unresolved_injections: Mutex<Option<UnresolvedInjections>>,
@@ -158,10 +163,11 @@ impl SessionExecutionContext {
             #[cfg(feature = "external-agent")]
             backend_tool_observations: Mutex::new(Default::default()),
             planner,
+            live_snapshot: Mutex::new(Default::default()),
             history_generations: Mutex::new(super::history::HistoryGenerations::default()),
             abilities,
-            extension_state: Mutex::new(extension_state),
-            staged_extension_state: Mutex::new(BTreeMap::new()),
+            extension_state: Mutex::new(extension_state.into()),
+            staged_extension_state: Mutex::new(Default::default()),
             persist_gate: Arc::new(AsyncMutex::new(())),
             current_turn: Mutex::new(None),
             tool_result_commit_hooks: Mutex::new(ToolResultCommitHooks::default()),
@@ -169,6 +175,7 @@ impl SessionExecutionContext {
             interaction_disposition,
             returned_interaction: Mutex::new(returned_interaction),
             artifacts: Mutex::new(artifacts),
+            artifacts_state: Mutex::new(None),
             unresolved_injections: Mutex::new(None),
         })
     }
@@ -346,24 +353,41 @@ impl SessionExecutionContext {
     /// Captures exact extension state, including runtime-owned activation
     /// epochs that ordinary component state does not mutate directly.
     pub(crate) fn snapshot_extension_state(&self) -> BTreeMap<String, VersionedSessionState> {
-        let mut state = self
+        self.snapshot_extension_state_inner(true)
+    }
+    fn snapshot_extension_state_inner(
+        &self,
+        include_previous: bool,
+    ) -> BTreeMap<String, VersionedSessionState> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.snapshot_extension_state");
+        let state = self
             .extension_state
             .lock()
             .expect("session extension state poisoned")
-            .clone();
+            .iter()
+            .filter(|(key, _)| key.as_str() != PREVIOUS_CACHE_STATE_NAMESPACE)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        self.snapshot_generated_state(state, include_previous, true)
+    }
+    fn snapshot_generated_state(
+        &self,
+        mut state: BTreeMap<String, VersionedSessionState>,
+        include_previous: bool,
+        include_artifacts: bool,
+    ) -> BTreeMap<String, VersionedSessionState> {
         if let Some(abilities) = &self.abilities {
             state.insert(
                 ACTIVATION_STATE_NAMESPACE.to_owned(),
                 abilities.persisted_state(),
             );
         }
-        if let Some(cache) = self.planner.persisted_previous_cache() {
-            state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
-        } else {
-            // Retirement is a durable state transition. Do not let a stale
-            // baseline survive in the copied extension map and reappear after
-            // a later snapshot/restart.
-            state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
+        if include_previous {
+            if let Some(cache) = self.planner.persisted_previous_cache() {
+                state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
+            }
         }
         if let Some(request) = self.returned_interaction_value() {
             state.insert(
@@ -375,39 +399,78 @@ impl SessionExecutionContext {
                 ),
             );
         }
-        let artifacts = self.artifacts.lock().expect("session artifacts poisoned");
-        if artifacts.is_empty() {
-            state.remove(ARTIFACT_REFERENCES_STATE_NAMESPACE);
-        } else {
-            let turns = artifacts
-                .iter()
-                .map(|(turn, references)| (turn.clone(), references.values().cloned().collect()))
-                .collect();
-            state.insert(
-                ARTIFACT_REFERENCES_STATE_NAMESPACE.to_owned(),
-                VersionedSessionState::new(
-                    RegistryRevision::new(ARTIFACT_REFERENCES_STATE_REVISION),
-                    serde_json::to_value(PersistedArtifactReferences { turns })
-                        .expect("validated artifact references must serialize"),
-                ),
-            );
+        match self.artifacts_state().filter(|_| include_artifacts) {
+            Some(artifacts) => {
+                state.insert(
+                    ARTIFACT_REFERENCES_STATE_NAMESPACE.to_owned(),
+                    artifacts.as_ref().clone(),
+                );
+            }
+            None => {
+                state.remove(ARTIFACT_REFERENCES_STATE_NAMESPACE);
+            }
         }
         state
     }
 
-    /// Captures a turn checkpoint view, including extension state staged for
-    /// the turn's acceptance boundary.
-    pub(crate) fn snapshot_extension_state_with_staged(
+    /// The persisted artifact-reference namespace, rebuilt only after an
+    /// artifact is recorded, so journal captures share one immutable value.
+    fn artifacts_state(&self) -> Option<Arc<VersionedSessionState>> {
+        let artifacts = self.artifacts.lock().expect("session artifacts poisoned");
+        if artifacts.is_empty() {
+            return None;
+        }
+        let mut cached = self
+            .artifacts_state
+            .lock()
+            .expect("session artifact state poisoned");
+        if let Some(state) = cached.as_ref() {
+            return Some(state.clone());
+        }
+        let turns = artifacts
+            .iter()
+            .map(|(turn, references)| (turn.clone(), references.values().cloned().collect()))
+            .collect();
+        let state = Arc::new(VersionedSessionState::new(
+            RegistryRevision::new(ARTIFACT_REFERENCES_STATE_REVISION),
+            serde_json::to_value(PersistedArtifactReferences { turns })
+                .expect("validated artifact references must serialize"),
+        ));
+        *cached = Some(state.clone());
+        Some(state)
+    }
+
+    pub(crate) fn snapshot_extension_state_for_journal(
         &self,
-    ) -> BTreeMap<String, VersionedSessionState> {
-        let mut state = self.snapshot_extension_state();
+        include_staged: bool,
+    ) -> BTreeMap<String, Arc<VersionedSessionState>> {
+        let mut state = self
+            .extension_state
+            .lock()
+            .expect("session extension state poisoned")
+            .shared();
+        state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
+        state.remove(ARTIFACT_REFERENCES_STATE_NAMESPACE);
         state.extend(
-            self.staged_extension_state
-                .lock()
-                .expect("staged session extension state poisoned")
-                .clone(),
+            self.snapshot_generated_state(BTreeMap::new(), false, false)
+                .into_iter()
+                .map(|(key, value)| (key, Arc::new(value))),
         );
-        if self.planner.persisted_previous_cache().is_none() {
+        if let Some(artifacts) = self.artifacts_state() {
+            state.insert(ARTIFACT_REFERENCES_STATE_NAMESPACE.to_owned(), artifacts);
+        }
+        if let Some(cache) = self.planner.persisted_previous_cache_shared() {
+            state.insert(PREVIOUS_CACHE_STATE_NAMESPACE.to_owned(), cache);
+        }
+        if include_staged {
+            state.extend(
+                self.staged_extension_state
+                    .lock()
+                    .expect("staged session extension state poisoned")
+                    .shared(),
+            );
+        }
+        if !self.planner.has_previous_cache() {
             state.remove(PREVIOUS_CACHE_STATE_NAMESPACE);
         }
         state
@@ -434,7 +497,7 @@ impl SessionExecutionContext {
             .expect("session extension state poisoned");
         for namespace in namespaces {
             if let Some(state) = staged.remove(namespace) {
-                extension.insert(namespace.clone(), state);
+                extension.insert_shared(namespace.clone(), state);
             }
         }
     }
@@ -538,6 +601,10 @@ impl SessionExecutionContext {
             return Ok(());
         }
         turn_artifacts.insert(reference.id.clone(), reference);
+        *self
+            .artifacts_state
+            .lock()
+            .expect("session artifact state poisoned") = None;
         Ok(())
     }
 
@@ -657,14 +724,27 @@ fn take_returned_interaction_state(
 }
 
 /// The canonical mutable state of one session.
+///
+/// Fields are private: every Runtime mutation goes through a method that
+/// records the changed suffix, so the live journal snapshot view can never
+/// silently reuse a stale prefix. A replaced or swapped value carries a
+/// different instance token and forces a complete capture.
 #[derive(Debug, Default)]
 pub struct SessionState {
-    /// The canonical conversation history.
-    pub history: Vec<Message>,
-    /// The accumulated usage ledger.
-    pub usage: UsageLedger,
-    /// The ordered recent window of planned-step diagnostic manifests.
-    pub manifests: Vec<TurnManifest>,
+    history: Vec<Message>,
+    usage: UsageLedger,
+    manifests: Vec<TurnManifest>,
+    changes: StateChanges,
+    instance: Arc<()>,
+}
+
+/// Mutations recorded since the last live snapshot capture.
+#[derive(Debug, Default)]
+pub(crate) struct StateChanges {
+    pub(crate) history_from: Option<usize>,
+    pub(crate) usage_from: Option<usize>,
+    pub(crate) manifests_appended: usize,
+    pub(crate) manifests_replaced: bool,
 }
 
 impl SessionState {
@@ -672,9 +752,127 @@ impl SessionState {
     pub fn with_history(history: Vec<Message>) -> Self {
         Self {
             history,
-            usage: UsageLedger::new(),
-            manifests: Vec::new(),
+            ..Self::default()
         }
+    }
+
+    /// The canonical conversation history.
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
+    /// The accumulated usage ledger.
+    pub fn usage(&self) -> &UsageLedger {
+        &self.usage
+    }
+
+    /// The ordered recent window of planned-step diagnostic manifests.
+    pub fn manifests(&self) -> &[TurnManifest] {
+        &self.manifests
+    }
+
+    pub(crate) fn instance(&self) -> &Arc<()> {
+        &self.instance
+    }
+
+    pub(crate) fn take_changes(&mut self) -> StateChanges {
+        std::mem::take(&mut self.changes)
+    }
+
+    /// Re-records changes taken by a capture that failed before use.
+    pub(crate) fn restore_changes(&mut self, changes: StateChanges) {
+        if let Some(from) = changes.history_from {
+            self.history_changed(from);
+        }
+        if let Some(from) = changes.usage_from {
+            self.usage_changed(from);
+        }
+        self.changes.manifests_appended = self
+            .changes
+            .manifests_appended
+            .saturating_add(changes.manifests_appended);
+        self.changes.manifests_replaced |= changes.manifests_replaced;
+    }
+
+    fn history_changed(&mut self, from: usize) {
+        self.changes.history_from =
+            Some(self.changes.history_from.map_or(from, |old| old.min(from)));
+    }
+
+    fn usage_changed(&mut self, from: usize) {
+        self.changes.usage_from = Some(self.changes.usage_from.map_or(from, |old| old.min(from)));
+    }
+
+    pub(crate) fn append_history(&mut self, values: impl IntoIterator<Item = Message>) {
+        self.history_changed(self.history.len());
+        self.history.extend(values);
+    }
+
+    pub(crate) fn truncate_history(&mut self, keep: usize) {
+        self.history_changed(keep);
+        self.history.truncate(keep);
+    }
+
+    pub(crate) fn pop_history(&mut self) -> Option<Message> {
+        self.history_changed(self.history.len().saturating_sub(1));
+        self.history.pop()
+    }
+
+    pub(crate) fn replace_history(&mut self, history: Vec<Message>) {
+        self.history_changed(0);
+        self.history = history;
+    }
+
+    #[cfg(any(test, feature = "external-agent"))]
+    pub(crate) fn replace_history_at(&mut self, index: usize, message: Message) {
+        self.history_changed(index);
+        self.history[index] = message;
+    }
+
+    #[cfg(any(test, feature = "external-agent"))]
+    pub(crate) fn remove_history_at(&mut self, index: usize) -> Message {
+        self.history_changed(index);
+        self.history.remove(index)
+    }
+
+    pub(crate) fn record_usage(&mut self, value: agent_runtime_core::usage::UsageRecord) {
+        self.usage_changed(self.usage.records().len());
+        self.usage.record(value);
+    }
+
+    /// Rolls the ledger back to an uncommitted append boundary.
+    pub(crate) fn truncate_usage(&mut self, keep: usize) {
+        debug_assert!(
+            self.usage.records().len() >= keep,
+            "usage rollback boundary {keep} is beyond the ledger ({})",
+            self.usage.records().len()
+        );
+        self.usage_changed(keep);
+        self.usage.truncate(keep);
+    }
+
+    pub(crate) fn replace_usage(&mut self, usage: UsageLedger) {
+        self.usage_changed(0);
+        self.usage = usage;
+    }
+
+    /// Appends one manifest and evicts beyond the recent window.
+    pub(crate) fn push_manifest(&mut self, value: TurnManifest, window: std::num::NonZeroUsize) {
+        self.changes.manifests_appended = self.changes.manifests_appended.saturating_add(1);
+        self.manifests.push(value);
+        crate::runtime::manifests::trim(&mut self.manifests, window);
+    }
+
+    /// A raw history handle that bypasses recording, for tests that model a
+    /// buggy in-crate mutation.
+    #[cfg(test)]
+    pub(crate) fn history_mut_unrecorded(&mut self) -> &mut Vec<Message> {
+        &mut self.history
+    }
+
+    pub(crate) fn replace_manifests(&mut self, manifests: Vec<TurnManifest>) {
+        self.changes.manifests_replaced = true;
+        self.manifests = manifests;
     }
 }
 
@@ -703,6 +901,63 @@ mod tests {
             ProviderCacheCapability::none(RegistryRevision::new("state-test-cache-1"), "fake"),
             crate::agent::planning::RunRevisions::empty(),
         )
+    }
+
+    // Round-2 L3: the artifact-reference namespace keeps one shared value
+    // across journal captures until another artifact is recorded.
+    #[test]
+    fn artifact_namespace_is_shared_until_an_artifact_is_recorded() {
+        use agent_runtime_core::artifact::{
+            ArtifactDigest, ArtifactProvenance, ArtifactRetention, ArtifactSensitivity,
+        };
+        let session = SessionId::new("state-test");
+        let context = SessionExecutionContext::new(
+            &session,
+            planner(),
+            InteractionDisposition::DirectHost,
+            BTreeMap::new(),
+            None,
+        )
+        .expect("execution context builds");
+        let turn = TurnId::new("turn-1");
+        let artifact = |id: &str| ArtifactRef {
+            id: ArtifactId::new(id).unwrap(),
+            digest: ArtifactDigest::new("sha256", "0".repeat(64)).unwrap(),
+            media_type: "text/plain".to_owned(),
+            byte_length: 1,
+            sensitivity: ArtifactSensitivity::Sensitive,
+            retention: ArtifactRetention::Session,
+            provenance: ArtifactProvenance::new(session.clone(), "test"),
+        };
+        let namespace = |context: &SessionExecutionContext| {
+            context
+                .snapshot_extension_state_for_journal(false)
+                .get(ARTIFACT_REFERENCES_STATE_NAMESPACE)
+                .cloned()
+        };
+        assert!(namespace(&context).is_none());
+        context
+            .record_artifact(&session, &turn, artifact("a"))
+            .unwrap();
+        let first = namespace(&context).unwrap();
+        assert!(Arc::ptr_eq(&first, &namespace(&context).unwrap()));
+        // Re-recording the same reference changes nothing.
+        context
+            .record_artifact(&session, &turn, artifact("a"))
+            .unwrap();
+        context
+            .record_artifact(&session, &turn, artifact("b"))
+            .unwrap();
+        let second = namespace(&context).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_ne!(first.value, second.value);
+        assert!(Arc::ptr_eq(&second, &namespace(&context).unwrap()));
+        assert_eq!(
+            context
+                .snapshot_extension_state()
+                .get(ARTIFACT_REFERENCES_STATE_NAMESPACE),
+            Some(second.as_ref())
+        );
     }
 
     #[test]

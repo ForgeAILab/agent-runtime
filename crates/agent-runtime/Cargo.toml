@@ -33,6 +33,7 @@ sha2.workspace = true
 url = "2.5"
 
 [features]
+test-support = ["agent-runtime-core/test-support"]
 # The core loop, registry hub, ability catalog, provider mechanism, and
 # context engine are always present — that is the supported facade. `obs`
 # re-exports the optional sibling facade for one-stop consumption; leave it

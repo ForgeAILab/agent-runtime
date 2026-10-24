@@ -48,3 +48,16 @@ fn commit_failure(error: rusqlite::Error) -> RuntimeError {
     let error = sqlite_failure(error);
     if ambiguous { error.retryable() } else { error }
 }
+
+// Disabled expansions preserve the original body, including return/await boundaries.
+#[cfg(not(feature = "journal-profile"))]
+macro_rules! journal_profile_scope {
+    ($label:expr, $body:block) => {
+        $body
+    };
+}
+#[cfg(feature = "journal-profile")]
+macro_rules! journal_profile_scope {
+    ($label:expr, $body:block) => { agent_runtime_core::journal::profile::instrument($label, Box::pin(async $body)).await };
+}
+pub(crate) use journal_profile_scope;

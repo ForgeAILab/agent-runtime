@@ -312,6 +312,9 @@ pub(crate) fn validate_legacy_import_records(
     flat_summary: bool,
     lcm: Option<&LcmCoordinator>,
 ) -> Result<(), RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = agent_runtime_core::journal::profile::enter_sync("rt.runtime.import_validation");
+
     fn validate_strategy_namespaces(
         snapshot: &SessionSnapshot,
         flat_summary: bool,
@@ -1358,16 +1361,18 @@ impl Runtime {
         &self,
         request: StartSession,
     ) -> Result<SessionHandle, RuntimeError> {
-        if request.mode == StartSessionMode::Ephemeral {
-            let mut shared = (*self.shared).clone();
-            shared.driver = shared.driver.without_persistence();
-            shared.session_store = None;
-            shared.checkpoint_store = None;
-            return Self::from_shared(Arc::new(shared))
-                .start_session_with_parent(request, None, false)
-                .await;
-        }
-        self.start_session_with_parent(request, None, false).await
+        crate::journal_profile_scope!("rt.runtime.start_session", {
+            if request.mode == StartSessionMode::Ephemeral {
+                let mut shared = (*self.shared).clone();
+                shared.driver = shared.driver.without_persistence();
+                shared.session_store = None;
+                shared.checkpoint_store = None;
+                return Self::from_shared(Arc::new(shared))
+                    .start_session_with_parent(request, None, false)
+                    .await;
+            }
+            self.start_session_with_parent(request, None, false).await
+        })
     }
 
     /// Starts a delegated child session attributed to `parent`.
@@ -1452,6 +1457,8 @@ impl Runtime {
         // Boxed: this body is ~30 KB as a future, and every session start and
         // child spawn awaits it; inline, debug builds overflow 2 MiB stacks.
         let startup_result = Box::pin(async move {
+        #[cfg(feature = "test-support")]
+        let _profile_restore = agent_runtime_core::journal::profile::timer("rt.runtime.restore_context");
 
         // Resume only when the caller explicitly supplied the identity. A
         // freshly minted id must never silently load an older snapshot.
@@ -1679,9 +1686,9 @@ impl Runtime {
             (events, repaired)
         } else if let Some(coordinator) = self.shared.lcm.as_ref() {
             let initialized = coordinator
-                .claim_session(&session_id, &state.history, request.lcm_policy, false)
+                .claim_session(&session_id, state.history(), request.lcm_policy, false)
                 .await?;
-            state.history = initialized.history;
+            state.replace_history(initialized.history);
             if let Some(lcm_state) = initialized.state {
                 extension_state.insert(LCM_COMPONENT_ID.to_owned(), lcm_state);
             }
@@ -1708,9 +1715,9 @@ impl Runtime {
         if let Some(mut snapshot) = snapshot {
             initialize_boundary(&mut snapshot)?;
             trim(&mut snapshot.manifests, self.shared.manifest_window);
-            state.history = snapshot.history;
-            state.usage = snapshot.usage;
-            state.manifests = snapshot.manifests;
+            state.replace_history(snapshot.history);
+            state.replace_usage(snapshot.usage);
+            state.replace_manifests(snapshot.manifests);
             identity = snapshot.identity;
             extension_state = snapshot.extension_state;
         }
@@ -1739,7 +1746,7 @@ impl Runtime {
             identity.event_seq,
         ));
         emitter.restore_history_observations(crate::runtime::transcript::RetainedHistoryObservations::load(
-            &extension_state, resumed, &session_id, state.history.len(),
+            &extension_state, resumed, &session_id, state.history().len(),
         )?);
         let execution = Arc::new(
             self.shared
@@ -1768,6 +1775,7 @@ impl Runtime {
                 abilities.discard_uncommitted_activation();
             }
         }
+        execution.live_snapshot.lock().expect("live snapshot poisoned").enable();
         let persist_gate = execution.persist_gate();
 
         let inner = Arc::new(SessionInner {

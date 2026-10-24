@@ -48,7 +48,8 @@ impl<'a> TurnMachine<'a> {
         driver: &'a Driver,
         context: TurnMachineContext,
         checkpoint: TurnCheckpoint,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
+        let restored = agent_runtime_core::checkpoint::JournalCheckpoint::for_restore(checkpoint)?;
         let TurnMachineContext {
             state,
             execution,
@@ -60,8 +61,8 @@ impl<'a> TurnMachine<'a> {
             turn_id,
             acceptance: _,
         } = context;
-        debug_assert_eq!(turn_id, checkpoint.turn);
-        Self {
+        debug_assert_eq!(turn_id, restored.turn);
+        Ok(Self {
             driver,
             state,
             execution,
@@ -72,59 +73,55 @@ impl<'a> TurnMachine<'a> {
             steer_mailbox,
             turn_id,
             acceptance: None,
-            checkpoint: Some(checkpoint),
+            checkpoint: Some(restored),
             ordinary_lcm_intent_saved: false,
             ordinary_lcm_hard_admitted: false,
             #[cfg(feature = "external-agent")]
             external_call: None,
-        }
+        })
     }
 
-    fn capture_snapshot(&self, include_manifests: bool) -> SessionSnapshot {
-        let state = self.state.lock().expect("session state poisoned");
-        let mut extension_state = self.execution.snapshot_extension_state_with_staged();
-        extension_state.insert(
+    fn capture_view(
+        &self,
+        include_manifests: bool,
+    ) -> Result<agent_runtime_core::journal::JournalSnapshotView, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            agent_runtime_core::journal::profile::enter_sync("rt.runtime.capture_snapshot");
+        let mut state = self.state.lock().expect("session state poisoned");
+        let mut extensions = self.execution.snapshot_extension_state_for_journal(true);
+        extensions.insert(
             crate::runtime::transcript::OBSERVATIONS_NAMESPACE.to_owned(),
-            self.emitter.history_observation_state(),
+            Arc::new(self.emitter.history_observation_state()),
         );
         if let Some(cache) = self.driver.cache.persisted_session(self.emitter.session()) {
-            extension_state.insert(
+            extensions.insert(
                 crate::cache::CACHE_MECHANISM_STATE_NAMESPACE.to_owned(),
-                cache,
+                Arc::new(cache),
             );
         }
-        SessionSnapshot {
-            id: self.emitter.session().clone(),
-            history: state.history.clone(),
-            usage: state.usage.clone(),
-            manifests: if include_manifests {
-                crate::runtime::manifests::recent(&state.manifests, self.driver.manifest_window)
-            } else {
-                Vec::new()
-            },
-            identity: self.minter.snapshot(self.emitter.next_sequence()),
-            extension_state,
-            updated: self.driver.clock.now(),
-        }
+        self.execution
+            .live_snapshot
+            .lock()
+            .expect("live snapshot poisoned")
+            .capture(
+                self.emitter.session(),
+                &mut state,
+                extensions,
+                self.minter.snapshot(self.emitter.next_sequence()),
+                self.driver.clock.now(),
+                include_manifests,
+            )
     }
 
-    pub(super) fn snapshot(&self) -> SessionSnapshot {
-        self.capture_snapshot(true)
-    }
-
-    /// The acceptance checkpoint's snapshot: live history plus the turn's
-    /// staged messages, which enter live history only once it commits.
-    fn acceptance_snapshot(&self, staged: &[Message]) -> Result<SessionSnapshot, RuntimeError> {
-        let mut snapshot = self.capture_snapshot(false);
-        snapshot.history.extend(staged.iter().cloned());
-        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
-        Ok(snapshot)
-    }
-
-    fn checkpoint_snapshot(&self) -> Result<SessionSnapshot, RuntimeError> {
-        let mut snapshot = self.capture_snapshot(false);
-        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
-        Ok(snapshot)
+    fn acceptance_view(
+        &self,
+        staged: &[Message],
+    ) -> Result<agent_runtime_core::journal::JournalSnapshotView, RuntimeError> {
+        let view = self.capture_view(false)?;
+        let mut mutation = view.mutation();
+        mutation.append_history(staged.iter().cloned());
+        mutation.finish(view.identity().clone(), view.updated())
     }
 
     pub(super) fn emit_discarded_steers(
@@ -165,8 +162,8 @@ impl<'a> TurnMachine<'a> {
         }
         let history_len = {
             let mut state = self.state.lock().expect("session state poisoned");
-            let history_len = state.history.len();
-            state.history.extend(
+            let history_len = state.history().len();
+            state.append_history(
                 entries
                     .iter()
                     .map(|entry| entry.input.clone().into_message()),
@@ -177,8 +174,7 @@ impl<'a> TurnMachine<'a> {
             self.state
                 .lock()
                 .expect("session state poisoned")
-                .history
-                .truncate(history_len);
+                .truncate_history(history_len);
             self.emit_discarded_steers(entries, SteerDiscardReason::Failed);
             return Err(error);
         }
@@ -263,7 +259,7 @@ impl<'a> TurnMachine<'a> {
         let predecessor = if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
-                .latest_checkpoint()
+                .latest_checkpoint_predecessor()
                 .await
                 .map_err(NotCommitted)?
         } else {
@@ -271,8 +267,8 @@ impl<'a> TurnMachine<'a> {
         };
         let checkpoint_sequence = match &predecessor {
             None => 1,
-            Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
-                previous.watermark.checkpoint_sequence.saturating_add(1)
+            Some(previous) if previous.turn() != &self.turn_id && previous.is_terminal() => {
+                previous.sequence().saturating_add(1)
             }
             Some(_) => {
                 return Err(NotCommitted(RuntimeError::conflict(
@@ -280,10 +276,11 @@ impl<'a> TurnMachine<'a> {
                 )));
             }
         };
-        let checkpoint = TurnCheckpoint::accepted(
+        let view = self.acceptance_view(staged).map_err(NotCommitted)?;
+        let checkpoint = agent_runtime_core::checkpoint::JournalCheckpoint::accepted(
             self.turn_id.clone(),
             input,
-            self.acceptance_snapshot(staged).map_err(NotCommitted)?,
+            view,
             active_history_start,
             deadline,
             checkpoint_sequence,
@@ -294,7 +291,7 @@ impl<'a> TurnMachine<'a> {
         if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
-                .save_acceptance_checkpoint(&checkpoint, predecessor.as_ref())
+                .save_acceptance_checkpoint_view(&checkpoint, predecessor.as_ref())
                 .await?;
         }
         self.checkpoint = Some(checkpoint);
@@ -317,7 +314,7 @@ impl<'a> TurnMachine<'a> {
         let predecessor = if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
-                .latest_checkpoint()
+                .latest_checkpoint_predecessor()
                 .await
                 .map_err(NotCommitted)?
         } else {
@@ -325,8 +322,8 @@ impl<'a> TurnMachine<'a> {
         };
         let checkpoint_sequence = match &predecessor {
             None => 1,
-            Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
-                previous.watermark.checkpoint_sequence.saturating_add(1)
+            Some(previous) if previous.turn() != &self.turn_id && previous.is_terminal() => {
+                previous.sequence().saturating_add(1)
             }
             Some(_) => {
                 return Err(NotCommitted(RuntimeError::conflict(
@@ -334,10 +331,11 @@ impl<'a> TurnMachine<'a> {
                 )));
             }
         };
-        let checkpoint = TurnCheckpoint::internal_accepted(
+        let view = self.acceptance_view(staged).map_err(NotCommitted)?;
+        let checkpoint = agent_runtime_core::checkpoint::JournalCheckpoint::internal_accepted(
             self.turn_id.clone(),
             input,
-            self.acceptance_snapshot(staged).map_err(NotCommitted)?,
+            view,
             active_history_start,
             deadline,
             checkpoint_sequence,
@@ -348,7 +346,7 @@ impl<'a> TurnMachine<'a> {
         if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
-                .save_acceptance_checkpoint(&checkpoint, predecessor.as_ref())
+                .save_acceptance_checkpoint_view(&checkpoint, predecessor.as_ref())
                 .await?;
         }
         self.checkpoint = Some(checkpoint);
@@ -367,10 +365,15 @@ impl<'a> TurnMachine<'a> {
             ));
         }
         let checkpoint_sequence = if self.execution.persistence.has_checkpoint_store() {
-            match self.execution.persistence.latest_checkpoint().await? {
+            match self
+                .execution
+                .persistence
+                .latest_checkpoint_predecessor()
+                .await?
+            {
                 None => 1,
-                Some(previous) if previous.turn != self.turn_id && previous.state.is_terminal() => {
-                    previous.watermark.checkpoint_sequence.saturating_add(1)
+                Some(previous) if previous.turn() != &self.turn_id && previous.is_terminal() => {
+                    previous.sequence().saturating_add(1)
                 }
                 Some(_) => {
                     return Err(RuntimeError::conflict(
@@ -381,11 +384,12 @@ impl<'a> TurnMachine<'a> {
         } else {
             1
         };
-        let checkpoint = TurnCheckpoint::local_action(
+        let view = self.capture_view(false)?;
+        let checkpoint = agent_runtime_core::checkpoint::JournalCheckpoint::local_action(
             self.turn_id.clone(),
             request_id,
             call,
-            self.checkpoint_snapshot()?,
+            view,
             deadline,
             checkpoint_sequence,
             self.emitter.next_sequence(),
@@ -394,7 +398,7 @@ impl<'a> TurnMachine<'a> {
         if self.execution.persistence.has_checkpoint_store() {
             self.execution
                 .persistence
-                .save_checkpoint(&checkpoint)
+                .save_checkpoint_view(&checkpoint)
                 .await?;
         }
         self.checkpoint = Some(checkpoint);
@@ -402,33 +406,45 @@ impl<'a> TurnMachine<'a> {
     }
 
     pub(super) async fn transition(&mut self, state: TurnState) -> Result<(), RuntimeError> {
-        self.transition_with_snapshot(state, self.checkpoint_snapshot()?)
-            .await
+        let view = self.capture_view(false)?;
+        self.transition_with_view(state, view).await
     }
 
+    #[cfg(test)]
     pub(super) async fn transition_with_snapshot(
         &mut self,
         state: TurnState,
         mut snapshot: SessionSnapshot,
     ) -> Result<(), RuntimeError> {
+        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
+        let view = agent_runtime_core::journal::JournalSnapshotView::from_snapshot(snapshot)?;
+        self.transition_with_view(state, view).await
+    }
+
+    async fn transition_with_view(
+        &mut self,
+        state: TurnState,
+        view: agent_runtime_core::journal::JournalSnapshotView,
+    ) -> Result<(), RuntimeError> {
+        let snapshot = crate::runtime::manifests::normalize_checkpoint_view(&view)?;
         let current = self
             .checkpoint
             .as_ref()
             .ok_or_else(|| RuntimeError::internal("turn has no accepted checkpoint"))?;
-        let normalized = if current.snapshot.manifests.is_empty()
-            && current
-                .snapshot
-                .extension_state
-                .contains_key(crate::runtime::MANIFEST_BOUNDARY_NAMESPACE)
-        {
-            None
-        } else {
-            let mut normalized = current.clone();
-            crate::runtime::manifests::normalize_checkpoint_snapshot(&mut normalized.snapshot)?;
-            Some(normalized)
-        };
+        let normalized =
+            if current.snapshot().manifest_len() == 0
+                && current
+                    .snapshot()
+                    .extension(crate::runtime::MANIFEST_BOUNDARY_NAMESPACE)
+                    .is_some()
+            {
+                None
+            } else {
+                Some(current.with_snapshot(
+                    crate::runtime::manifests::normalize_checkpoint_view(current.snapshot())?,
+                )?)
+            };
         let current = normalized.as_ref().unwrap_or(current);
-        crate::runtime::manifests::normalize_checkpoint_snapshot(&mut snapshot)?;
         let visible_output = current.visible_output
             || matches!(
                 &state,
@@ -450,7 +466,10 @@ impl<'a> TurnMachine<'a> {
             return Ok(());
         }
         if self.execution.persistence.has_checkpoint_store() {
-            self.execution.persistence.save_checkpoint(&next).await?;
+            self.execution
+                .persistence
+                .save_checkpoint_view(&next)
+                .await?;
         }
         self.checkpoint = Some(next);
         Ok(())
@@ -487,12 +506,11 @@ impl<'a> TurnMachine<'a> {
         if self.ordinary_lcm_hard_admitted && self.execution.persistence.has_session_store() {
             let persist_gate = self.execution.persist_gate();
             let _persist_gate = persist_gate.lock().await;
-            if let Err(error) = self
-                .execution
-                .persistence
-                .save_snapshot(&self.snapshot())
-                .await
-            {
+            let saved = match self.capture_view(true) {
+                Ok(view) => self.execution.persistence.save_snapshot_view(&view).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = saved {
                 self.emit_non_durable_failure(error, visible_output);
                 return;
             }
@@ -534,12 +552,19 @@ impl<'a> TurnMachine<'a> {
         );
         let persist_gate = self.execution.persist_gate();
         let _persist_gate = persist_gate.lock().await;
-        let terminal_snapshot = self.snapshot();
+        let terminal_view = match self.capture_view(true) {
+            Ok(view) => view,
+            Err(error) => {
+                self.emitter
+                    .emit(Some(self.turn_id.clone()), RuntimeEvent::Error { error });
+                return;
+            }
+        };
         if self.execution.persistence.has_session_store() {
             if let Err(error) = self
                 .execution
                 .persistence
-                .save_snapshot(&terminal_snapshot)
+                .save_snapshot_view(&terminal_view)
                 .await
             {
                 // TurnCompleted was published exactly once in this process.
@@ -551,16 +576,25 @@ impl<'a> TurnMachine<'a> {
             }
         }
 
-        if let Err(error) = self
-            .transition_with_snapshot(
-                TurnState::Terminal {
-                    finish: finish.clone(),
-                    visible_output,
-                },
-                terminal_snapshot,
-            )
-            .await
-        {
+        let checkpoint_view = {
+            let mut mutation = terminal_view.mutation();
+            mutation.retain_manifests(0);
+            mutation.finish(terminal_view.identity().clone(), terminal_view.updated())
+        };
+        let transitioned = match checkpoint_view {
+            Ok(view) => {
+                self.transition_with_view(
+                    TurnState::Terminal {
+                        finish: finish.clone(),
+                        visible_output,
+                    },
+                    view,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = transitioned {
             self.emitter
                 .emit(Some(self.turn_id.clone()), RuntimeEvent::Error { error });
             return;
@@ -585,14 +619,14 @@ impl<'a> TurnMachine<'a> {
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
         let history = self.execution.shared_history(
             self.emitter.session(),
-            &self.state.lock().expect("session state poisoned").history,
+            self.state.lock().expect("session state poisoned").history(),
             self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
             self.state
                 .lock()
                 .expect("session state poisoned")
-                .usage
+                .usage()
                 .records()
                 .to_vec()
                 .into_boxed_slice(),
@@ -713,8 +747,7 @@ impl<'a> TurnMachine<'a> {
             self.state
                 .lock()
                 .expect("session state poisoned")
-                .usage
-                .record(record.clone());
+                .record_usage(record.clone());
             self.emitter
                 .emit(Some(self.turn_id.clone()), RuntimeEvent::Usage { record });
         }
@@ -734,7 +767,7 @@ impl<'a> TurnMachine<'a> {
             let _persist_gate = persist_gate.lock().await;
             self.execution
                 .persistence
-                .save_snapshot(&self.snapshot())
+                .save_snapshot_view(&self.capture_view(true)?)
                 .await?;
             self.ordinary_lcm_intent_saved = retry_admission;
             self.ordinary_lcm_hard_admitted = true;
@@ -770,14 +803,14 @@ impl<'a> TurnMachine<'a> {
             .ok_or_else(|| RuntimeError::internal("turn has no active deadline"))?;
         let history = self.execution.shared_history(
             self.emitter.session(),
-            &self.state.lock().expect("session state poisoned").history,
+            self.state.lock().expect("session state poisoned").history(),
             self.driver.history_lcm.as_ref(),
         );
         let usage: Arc<[UsageRecord]> = Arc::from(
             self.state
                 .lock()
                 .expect("session state poisoned")
-                .usage
+                .usage()
                 .records()
                 .to_vec()
                 .into_boxed_slice(),
@@ -854,8 +887,7 @@ impl<'a> TurnMachine<'a> {
             self.state
                 .lock()
                 .expect("session state poisoned")
-                .usage
-                .record(record.clone());
+                .record_usage(record.clone());
             self.emitter
                 .emit(Some(self.turn_id.clone()), RuntimeEvent::Usage { record });
         }
@@ -884,8 +916,7 @@ impl<'a> TurnMachine<'a> {
         self.state
             .lock()
             .expect("session state poisoned")
-            .history
-            .push(Message::tool_result(block.clone()));
+            .append_history([Message::tool_result(block.clone())]);
         completed.push(block.clone());
 
         let transition = self
@@ -903,8 +934,7 @@ impl<'a> TurnMachine<'a> {
                 .state
                 .lock()
                 .expect("session state poisoned")
-                .history
-                .pop();
+                .pop_history();
             debug_assert_eq!(removed, Some(Message::tool_result(block)));
             return Err(error);
         }
@@ -1067,7 +1097,11 @@ impl<'a> TurnMachine<'a> {
             None => Deadline::never(),
         };
         let accepted_input = input.clone();
-        let active_history_start = state.lock().expect("session state poisoned").history.len();
+        let active_history_start = state
+            .lock()
+            .expect("session state poisoned")
+            .history()
+            .len();
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
         // The input and the injections it drains stay staged until the
         // acceptance checkpoint commits (see `Driver::settle_failed_acceptance`).
@@ -1132,7 +1166,11 @@ impl<'a> TurnMachine<'a> {
             Some(ms) => Deadline::after(driver.clock.as_ref(), ms),
             None => Deadline::never(),
         };
-        let active_history_start = state.lock().expect("session state poisoned").history.len();
+        let active_history_start = state
+            .lock()
+            .expect("session state poisoned")
+            .history()
+            .len();
         execution.begin_internal_turn(
             turn_id,
             active_history_start,
@@ -1251,7 +1289,7 @@ impl<'a> TurnMachine<'a> {
 
             let history = execution.shared_history(
                 emitter.session(),
-                &state.lock().expect("session state poisoned").history,
+                state.lock().expect("session state poisoned").history(),
                 driver.history_lcm.as_ref(),
             );
             let mut planned_request = match driver
@@ -1546,7 +1584,7 @@ impl<'a> TurnMachine<'a> {
                         }
                         let mut state = state.lock().expect("session state poisoned");
                         if !parts.is_empty() {
-                            state.history.push(Message::assistant(parts));
+                            state.append_history([Message::assistant(parts)]);
                         }
                         emitter.commit_presentation(&attempt);
                     } else {
@@ -1770,7 +1808,7 @@ fn reassign_colliding_tool_call_ids(state: &Arc<Mutex<SessionState>>, tool_calls
     let mut used: std::collections::BTreeSet<String> = {
         let guard = state.lock().expect("session state poisoned");
         guard
-            .history
+            .history()
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
@@ -1811,10 +1849,7 @@ mod tool_call_id_collision_tests {
     }
 
     fn session_with(history: Vec<Message>) -> Arc<Mutex<SessionState>> {
-        Arc::new(Mutex::new(SessionState {
-            history,
-            ..SessionState::default()
-        }))
+        Arc::new(Mutex::new(SessionState::with_history(history)))
     }
 
     #[test]
@@ -1945,14 +1980,15 @@ mod manifest_tests {
                 acceptance: None,
             },
             checkpoint.clone(),
-        );
+        )
+        .unwrap();
         machine
             .transition_with_snapshot(planning.clone(), bounded.clone())
             .await
             .unwrap();
         assert_eq!(
-            machine.checkpoint.as_ref().unwrap(),
-            &checkpoint,
+            machine.checkpoint.as_ref().unwrap().materialize(),
+            checkpoint,
             "same revision keeps the original legacy payload"
         );
         bounded.extension_state.insert(
@@ -1966,7 +2002,7 @@ mod manifest_tests {
             .transition_with_snapshot(planning, bounded)
             .await
             .unwrap();
-        let refreshed = machine.checkpoint.as_ref().unwrap();
+        let refreshed = machine.checkpoint.as_ref().unwrap().materialize();
         assert_eq!(refreshed.state_revision, checkpoint.state_revision + 1);
         assert!(refreshed.snapshot.manifests.is_empty());
         assert_eq!(
@@ -1975,7 +2011,7 @@ mod manifest_tests {
                 .value["planned_steps"],
             5
         );
-        checkpoint.validate_successor(refreshed).unwrap();
+        checkpoint.validate_successor(&refreshed).unwrap();
         session.shutdown().await.unwrap();
     }
 }

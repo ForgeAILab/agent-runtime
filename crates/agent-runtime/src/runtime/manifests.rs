@@ -109,6 +109,7 @@ pub(crate) fn recent(manifests: &[TurnManifest], window: NonZeroUsize) -> Vec<Tu
 
 /// Normalize only runtime-produced successors/comparisons. Loaded records and
 /// generic serde readers retain the original diagnostic payload.
+#[cfg(test)]
 pub(crate) fn normalize_checkpoint_snapshot(
     snapshot: &mut SessionSnapshot,
 ) -> Result<(), RuntimeError> {
@@ -137,4 +138,23 @@ pub(crate) fn carry_compatible_diagnostics(
     initialize_boundary(protected)?;
     protected.manifests = recent(&ordinary.manifests, window);
     Ok(())
+}
+
+pub(crate) fn view_planned_steps(
+    view: &agent_runtime_core::journal::JournalSnapshotView,
+) -> Result<u64, RuntimeError> {
+    let count = u64::try_from(view.manifest_len())
+        .map_err(|_| RuntimeError::conflict("manifest count exceeds u64"))?;
+    Ok(planned_steps(view.extension(MANIFEST_BOUNDARY_NAMESPACE), &[])?.max(count))
+}
+pub(crate) fn normalize_checkpoint_view(
+    view: &agent_runtime_core::journal::JournalSnapshotView,
+) -> Result<agent_runtime_core::journal::JournalSnapshotView, RuntimeError> {
+    let mut mutation = view.mutation();
+    mutation.set_extension(
+        MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
+        Some(boundary_record(view_planned_steps(view)?)),
+    );
+    mutation.retain_manifests(0);
+    mutation.finish(view.identity().clone(), view.updated())
 }

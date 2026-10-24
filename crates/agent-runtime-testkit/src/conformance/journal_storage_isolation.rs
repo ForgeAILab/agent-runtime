@@ -78,6 +78,29 @@ impl<S: JournalStorage> JournalStorage for Unreadable<S> {
     ) -> Result<Vec<SessionId>, RuntimeError> {
         self.inner.dirty_sessions(d, a, n).await
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        self.inner.apply_collection(plan).await
+    }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.inner.apply(write).await
     }
@@ -113,15 +136,28 @@ async fn stage(f: &SessionJournalCollectionFixture, session: &SessionId, label: 
     journal.close(lease).await.unwrap();
 }
 async fn collect(f: &SessionJournalCollectionFixture) -> JournalGcReport {
-    f.backend
-        .journal
-        .collect(JournalGcRequest {
-            storage_id: f.backend.journal.storage_id(),
-            expected_root_epoch: f.host.root_epoch().await.unwrap(),
-            max_objects: u64::MAX,
-        })
-        .await
-        .expect("an unreadable session does not stop collection")
+    // A host drain over bounded calls; counts and unreadable sessions accumulate.
+    let mut total: Option<JournalGcReport> = None;
+    loop {
+        let report = f
+            .backend
+            .journal
+            .collect(JournalGcRequest::new(
+                f.backend.journal.storage_id(),
+                f.host.root_epoch().await.unwrap(),
+                u64::MAX,
+            ))
+            .await
+            .expect("an unreadable session does not stop collection");
+        let more = report.has_more;
+        match &mut total {
+            None => total = Some(report),
+            Some(total) => total.accumulate(report),
+        }
+        if !more {
+            return total.unwrap();
+        }
+    }
 }
 
 pub(super) async fn unreadable_session_does_not_stop_collection<S, F, Fut>(factory: &F)

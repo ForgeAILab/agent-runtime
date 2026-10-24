@@ -15,6 +15,21 @@ use super::*;
 pub trait JournalProjectionPolicy: Send + Sync + 'static {
     /// Produces the host-policy view that the ordinary store may encode.
     fn project(&self, snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError>;
+    /// Configuration revision for incremental equivalence. `None` always uses
+    /// complete projection. Change the revision before changing policy behavior.
+    fn revision(&self) -> Option<u64> {
+        None
+    }
+    /// Opt-in promise of equivalence to `project`, including repeated projection
+    /// of old positions. The base is the previously projected immutable view.
+    fn project_delta(
+        &self,
+        _base: &JournalSnapshotView,
+        _delta: &JournalTransitionDelta,
+        _revision: u64,
+    ) -> Result<JournalDeltaProjection, RuntimeError> {
+        Ok(JournalDeltaProjection::FullProjectionRequired)
+    }
 }
 
 impl<F> JournalProjectionPolicy for F
@@ -31,7 +46,27 @@ where
 pub struct IdentityJournalProjection;
 
 impl JournalProjectionPolicy for IdentityJournalProjection {
+    fn revision(&self) -> Option<u64> {
+        Some(1)
+    }
+    fn project_delta(
+        &self,
+        _base: &JournalSnapshotView,
+        delta: &JournalTransitionDelta,
+        _revision: u64,
+    ) -> Result<JournalDeltaProjection, RuntimeError> {
+        Ok(JournalDeltaProjection::Projected(Box::new(delta.clone())))
+    }
     fn project(&self, snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
         Ok(snapshot)
     }
+}
+
+/// A policy either projects only changed positions or requests complete replay.
+#[derive(Debug, Clone)]
+pub enum JournalDeltaProjection {
+    /// The policy depends on the complete candidate or its configuration changed.
+    FullProjectionRequired,
+    /// A delta equivalent to applying `project` to the reconstructed candidate.
+    Projected(Box<JournalTransitionDelta>),
 }

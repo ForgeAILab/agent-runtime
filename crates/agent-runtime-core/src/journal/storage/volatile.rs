@@ -190,6 +190,7 @@ impl VolatileJournalStorage {
             len: ids.len(),
             bytes,
             links: Default::default(),
+            cached_link_bytes: 0,
         })
     }
 }
@@ -452,7 +453,159 @@ impl JournalStorage for VolatileJournalStorage {
         state.layers = vec![Arc::new(state.entries())];
         Ok(())
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        JournalCollectionCapability::Bounded(VOLATILE_COLLECTION_LIMITS)
+    }
+    async fn collection_page(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        let state = self.lock()?;
+        let key = session_key(domain, session);
+        let fence = state
+            .records
+            .get(&key)
+            .map_or(JournalFence::default(), JournalSessionRecord::fence);
+        if fence != request.fence {
+            return Err(conflict());
+        }
+        let limit = request
+            .max_items
+            .min(VOLATILE_COLLECTION_LIMITS.max_page_items) as usize;
+        let after = request
+            .after
+            .as_ref()
+            .map(|after| after.position(domain, session, fence, request.kind))
+            .transpose()?;
+        match request.kind {
+            JournalCollectionPageKind::Members => {
+                let start = after
+                    .map(|position| {
+                        <[u8; 32]>::try_from(position)
+                            .map(JournalObjectId::from_bytes)
+                            .map_err(|_| conflict())
+                    })
+                    .transpose()?;
+                let mut ids = Vec::new();
+                let mut more = false;
+                if let Some(members) = state.members.get(&key) {
+                    let range = match &start {
+                        Some(start) => members.range::<JournalObjectId, _>((
+                            std::ops::Bound::Excluded(start),
+                            std::ops::Bound::Unbounded,
+                        )),
+                        None => members.range::<JournalObjectId, _>(..),
+                    };
+                    for id in range {
+                        if ids.len() == limit {
+                            more = true;
+                            break;
+                        }
+                        ids.push(id.clone());
+                    }
+                }
+                let next = (more && limit > 0).then(|| {
+                    JournalCollectionContinuation::new(
+                        domain,
+                        session,
+                        fence,
+                        request.kind,
+                        ids.last().expect("non-empty page").to_bytes().to_vec(),
+                    )
+                });
+                Ok(JournalCollectionPage {
+                    fence,
+                    bytes: ids.len() as u64 * 32,
+                    items: JournalCollectionItems::Members(ids),
+                    next,
+                })
+            }
+            JournalCollectionPageKind::Pins => {
+                let start = after
+                    .map(|position| {
+                        std::str::from_utf8(position)
+                            .map(JournalPinId::new)
+                            .map_err(|_| conflict())
+                    })
+                    .transpose()?;
+                let mut pins = Vec::new();
+                let mut more = false;
+                let lower = match &start {
+                    Some(pin) => std::ops::Bound::Excluded((key.clone(), pin.clone())),
+                    None => std::ops::Bound::Included((key.clone(), JournalPinId::new(""))),
+                };
+                for ((owner, _), pin) in state.pins.range((lower, std::ops::Bound::Unbounded)) {
+                    if owner != &key {
+                        break;
+                    }
+                    if pins.len() == limit {
+                        more = true;
+                        break;
+                    }
+                    pins.push(pin.clone());
+                }
+                let bytes = pins
+                    .iter()
+                    .map(|pin: &JournalPinRecord| {
+                        (pin.pin.as_str().len() + pin.roots.len() * 32 + pin.engine.bytes.len())
+                            as u64
+                    })
+                    .sum();
+                let next = (more && limit > 0).then(|| {
+                    JournalCollectionContinuation::new(
+                        domain,
+                        session,
+                        fence,
+                        request.kind,
+                        pins.last()
+                            .expect("non-empty page")
+                            .pin
+                            .as_str()
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                });
+                Ok(JournalCollectionPage {
+                    fence,
+                    bytes,
+                    items: JournalCollectionItems::Pins(pins),
+                    next,
+                })
+            }
+        }
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        if plan.write.kind != JournalWriteKind::Collect {
+            return Err(conflict());
+        }
+        // Volatile layers have no physical pack unit; one apply is one unit.
+        Ok(JournalCollectionPreflight::Fits { units: 1 })
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        if plan.write.kind != JournalWriteKind::Collect || plan.max_units == 0 {
+            return Err(conflict());
+        }
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
+    }
 }
+
+/// Volatile storage pages ids from its ordered in-memory sets.
+const VOLATILE_COLLECTION_LIMITS: JournalCollectionLimits = JournalCollectionLimits {
+    max_page_items: 4096,
+    max_unit_bytes: u64::MAX,
+    max_apply_units: u32::MAX,
+};
 
 #[cfg(test)]
 mod tests {

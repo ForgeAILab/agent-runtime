@@ -53,9 +53,9 @@ use agent_runtime_core::provider::{
 };
 use agent_runtime_core::provider_credential::ProviderCredentialRecovery;
 use agent_runtime_core::steer::{SteerDiscardReason, SteerLimits};
-use agent_runtime_core::store::{
-    SessionSnapshot, SessionStore, TurnManifest, VersionedSessionState,
-};
+#[cfg(test)]
+use agent_runtime_core::store::SessionSnapshot;
+use agent_runtime_core::store::{SessionStore, TurnManifest, VersionedSessionState};
 use agent_runtime_core::tool::ToolOutcome;
 use agent_runtime_core::usage::{Provenance, UsageDelta, UsageRecord, UsageSource};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
@@ -821,7 +821,7 @@ impl Driver {
             return;
         }
         let mut guard = state.lock().expect("session state poisoned");
-        guard.history.extend(messages);
+        guard.append_history(messages);
     }
 
     /// Takes the injected content a turn's acceptance boundary introduces.
@@ -840,8 +840,7 @@ impl Driver {
         state
             .lock()
             .expect("session state poisoned")
-            .history
-            .extend(staged);
+            .append_history(staged);
     }
 
     /// Settles a turn whose acceptance checkpoint failed and returns the
@@ -1062,7 +1061,8 @@ impl Driver {
         checkpoint: TurnCheckpoint,
     ) {
         let turn_id = checkpoint.turn.clone();
-        TurnMachine::from_checkpoint(
+        let failed = (emitter.clone(), turn_id.clone());
+        let machine = match TurnMachine::from_checkpoint(
             self,
             TurnMachineContext {
                 state,
@@ -1076,9 +1076,14 @@ impl Driver {
                 acceptance: None,
             },
             checkpoint,
-        )
-        .resume()
-        .await;
+        ) {
+            Ok(machine) => machine,
+            Err(error) => {
+                failed.0.emit(Some(failed.1), RuntimeEvent::Error { error });
+                return;
+            }
+        };
+        machine.resume().await;
     }
 
     /// External conversations cannot be re-entered mid-turn. Local actions and
@@ -1125,7 +1130,8 @@ impl Driver {
         activation_changed: bool,
     ) {
         let turn_id = checkpoint.turn.clone();
-        TurnMachine::from_checkpoint(
+        let failed = (emitter.clone(), turn_id.clone());
+        let machine = match TurnMachine::from_checkpoint(
             self,
             TurnMachineContext {
                 state,
@@ -1139,9 +1145,14 @@ impl Driver {
                 acceptance: None,
             },
             checkpoint,
-        )
-        .abandon(activation_changed)
-        .await;
+        ) {
+            Ok(machine) => machine,
+            Err(error) => {
+                failed.0.emit(Some(failed.1), RuntimeEvent::Error { error });
+                return;
+            }
+        };
+        machine.abandon(activation_changed).await;
     }
 }
 
@@ -1161,7 +1172,7 @@ struct TurnMachine<'a> {
     steer_mailbox: Option<Arc<SteerMailbox>>,
     turn_id: TurnId,
     acceptance: Option<Arc<TurnAcceptance>>,
-    checkpoint: Option<TurnCheckpoint>,
+    checkpoint: Option<agent_runtime_core::checkpoint::JournalCheckpoint>,
     /// An ordinary-only hard intent whose successor still needs publication.
     ordinary_lcm_intent_saved: bool,
     /// This turn crossed an ordinary hard-admission durability barrier.
