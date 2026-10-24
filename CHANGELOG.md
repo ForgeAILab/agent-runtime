@@ -7,8 +7,33 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Changed
+
+- Provider tool names carry no hash suffix: every byte outside
+  `[A-Za-z0-9_-]` becomes `_` and the name is cut to 64 bytes, so
+  `registry.activate` is sent as `registry_activate`. Models may answer with
+  either form. `ToolRegistry` rejects two tools that map to one provider name
+  (or an empty one) as a conflict, adapters reject such a request, and
+  `agent_runtime_core::tool::provider_tool_name` exposes the mapping. The
+  retriever revision is now `capability-retrieval.deterministic.v3`.
+- Working-proof restarts use the profile label `rt.gc.restart.proof`; bench
+  aggregation preserves the historical label separately for older captures.
+- GC report documentation clarifies that a retry-exhausted session is skipped
+  for the current pass, omitted from continuation and error lists, and retried
+  on the next pass with dirty state retained.
+
 ### Fixed
 
+- `registry.search` no longer hides matches. A query's words now match the
+  parts of a capability's name (`web search` finds `web_search`), results
+  without a domain filter alternate between domains instead of letting a large
+  skill set fill them, a domain filter that matches nothing answers from every
+  domain with a note, and matches that were found but not staged are listed
+  under `not_staged` with the reason.
+- A call to a tool the request did not offer is answered with the list of
+  tools it did offer.
+- Prompt pre-activation no longer binds a skill on one shared word; it needs
+  the skill's name, a host hint, or two matching terms.
 - Collection keeps its first 32 reused proofs and cold-traces only excess
   roots; uncertified pins and memo misses no longer discard admitted proofs.
   Excess roots skip proof admission and memo lookup counters while stale
@@ -22,14 +47,6 @@ contain breaking changes and are coordinated with consumer proposals.
   Layer/count guards also check shared seen state and return contract errors.
 - Collector-driven memo evictions emit `rt.memo.eviction` without changing
   LRU priority. Memo protection snapshots leased sessions once per collect call.
-
-### Changed
-
-- Working-proof restarts use the profile label `rt.gc.restart.proof`; bench
-  aggregation preserves the historical label separately for older captures.
-- GC report documentation clarifies that a retry-exhausted session is skipped
-  for the current pass, omitted from continuation and error lists, and retried
-  on the next pass with dirty state retained.
 
 ## [0.10.0] - 2026-10-24
 

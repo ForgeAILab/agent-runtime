@@ -189,3 +189,42 @@ async fn empty_pinned_builder_keeps_non_live_default_identical() {
     assert_eq!(provider.requests()[0].tools.len(), 1);
     assert_eq!(provider.requests()[0].tools[0].name, "echo");
 }
+
+#[tokio::test]
+async fn a_mistyped_tool_name_is_answered_with_the_offered_tools() {
+    let mut call = tool_call_fragments(0, "typo", "registry_activat", r#"{"ids":["tool:echo"]}"#);
+    call.push(ProviderStreamEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![
+            ScriptedStream::new(call),
+            ScriptedStream::new(vec![ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            }]),
+        ],
+    ));
+    let runtime = builder(provider, RecordingObserver::shared())
+        .build()
+        .unwrap();
+    let session = runtime.start_session(StartSession::new()).await.unwrap();
+    session.run(UserInput::text("zzzyyyxxx")).await.unwrap();
+    let result = session
+        .history()
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|part| match part {
+            ContentPart::ToolResult(result) if result.call_id == ToolCallId::new("typo") => {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(result.is_error);
+    let text = result.content[0].as_text().unwrap();
+    assert!(text.contains("`registry_activat`"), "{text}");
+    assert!(text.contains(CAPABILITY_ACTIVATE_TOOL_NAME), "{text}");
+    assert!(text.contains(CAPABILITY_SEARCH_TOOL_NAME), "{text}");
+}

@@ -1453,6 +1453,7 @@ impl<T: HttpTransport> Provider for AnthropicProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        super::tool_names::validate(&request)?;
         let tool_names = super::tool_names::ToolNames::new(&request);
         let payload = self.build_payload(&request)?;
         let body = serde_json::to_vec(&payload).map_err(|_| {
