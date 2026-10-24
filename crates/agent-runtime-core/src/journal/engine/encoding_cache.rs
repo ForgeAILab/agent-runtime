@@ -1,7 +1,7 @@
 use super::*;
 
 pub(in crate::journal) type ProjectedSnapshot = (
-    SessionSnapshot,
+    JournalSnapshotView,
     JournalSnapshotRoots,
     SnapshotEncodingCache,
     BTreeMap<JournalObjectId, Vec<u8>>,
@@ -11,9 +11,12 @@ pub(in crate::journal) type ProjectedSnapshot = (
 #[derive(Debug, Clone)]
 pub(in crate::journal) struct SnapshotEncodingCache {
     pub(in crate::journal) roots: JournalSnapshotRoots,
-    pub(in crate::journal) history_ids: Vec<JournalObjectId>,
-    pub(in crate::journal) usage_ids: Vec<JournalObjectId>,
-    pub(in crate::journal) manifest_ids: Vec<JournalObjectId>,
+    pub(in crate::journal) history_view: JournalSequenceView,
+    pub(in crate::journal) usage_view: JournalSequenceView,
+    pub(in crate::journal) policy_revision: Option<u64>,
+    pub(in crate::journal) history_ids: crate::journal::semantic::Sequence<JournalObjectId>,
+    pub(in crate::journal) usage_ids: crate::journal::semantic::Sequence<JournalObjectId>,
+    pub(in crate::journal) manifest_ids: crate::journal::semantic::Sequence<JournalObjectId>,
     pub(in crate::journal) extension_ids: BTreeMap<String, JournalObjectId>,
 }
 

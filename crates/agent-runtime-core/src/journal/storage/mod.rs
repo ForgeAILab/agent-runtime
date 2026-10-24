@@ -20,7 +20,9 @@ use crate::ids::SessionId;
 use async_trait::async_trait;
 use std::{fmt, sync::Arc};
 
+mod collection;
 mod volatile;
+pub use collection::*;
 pub use volatile::VolatileJournalStorage;
 
 /// Physical deduplication scope, independent of membership read isolation.
@@ -252,6 +254,35 @@ pub trait JournalStorage: Send + Sync + fmt::Debug + 'static {
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError>;
     /// Physical compaction only (repack, VACUUM). Never changes membership.
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError>;
+    /// Required declaration of the bounded collection protocol. Wrappers must
+    /// forward it explicitly; `Unsupported` makes the engine refuse collection
+    /// and retain all content.
+    fn collection_capability(&self) -> JournalCollectionCapability;
+    /// One bounded, fence-bound page (collection only). Must reject a stored
+    /// fence different from `request.fence` and any continuation from another
+    /// scope or fence, and return at most `request.max_items` items. It must
+    /// not materialize the whole session and slice it.
+    async fn collection_page(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError>;
+    /// Read-only, no-effect preflight of a collection apply: counts every
+    /// physical unit the apply would rewrite (packs losing members, threshold
+    /// purges, deferred purge, base repack, operation segments).
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError>;
+    /// Applies the complete plan as one atomic fenced transaction, with the
+    /// same acknowledgement/ambiguity contract and exact receipts as `apply`.
+    /// A plan that no longer fits `max_units` fails without effect. The
+    /// receipt reports the physical units actually rewritten.
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError>;
 }
 impl std::hash::Hash for JournalDomain {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

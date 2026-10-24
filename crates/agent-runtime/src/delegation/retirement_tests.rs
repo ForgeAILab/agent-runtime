@@ -140,6 +140,7 @@ impl Stores {
                     storage_id: journal.storage_id(),
                     expected_root_epoch: journal.root_epoch().unwrap(),
                     max_objects: u64::MAX,
+                    work_budget: Default::default(),
                 })
                 .await
                 .unwrap();

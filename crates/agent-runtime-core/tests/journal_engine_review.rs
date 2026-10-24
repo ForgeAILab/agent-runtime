@@ -344,6 +344,7 @@ async fn review_restart_retirement_checks_clean_stored_dependencies_and_pins() {
                 storage_id: first.storage_id(),
                 expected_root_epoch: first.root_epoch().unwrap(),
                 max_objects: u64::MAX,
+                work_budget: Default::default(),
             })
             .await
             .unwrap();
@@ -432,6 +433,7 @@ async fn review_restart_retirement_loads_a_clean_completed_fork_child() {
             storage_id: first.storage_id(),
             expected_root_epoch: first.root_epoch().unwrap(),
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await
         .unwrap();
@@ -520,6 +522,7 @@ async fn review_uncommitted_writers_do_not_extend_a_retained_readers_transfer_pi
             storage_id: fresh.storage_id(),
             expected_root_epoch: fresh.root_epoch().unwrap(),
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await
         .unwrap();
@@ -678,6 +681,33 @@ impl JournalStorage for ParkedApply {
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(domain).await
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        // Route through this wrapper's apply so its pause hook applies.
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
+    }
 }
 
 /// Revocation and close never wait for storage. A commit that already passed
@@ -791,6 +821,7 @@ async fn review_collection_replay_window_edges_conflict_without_applying() {
                 storage_id: id.clone(),
                 expected_root_epoch: engine.root_epoch().unwrap(),
                 max_objects: u64::MAX,
+                work_budget: Default::default(),
             })
             .await
             .unwrap();
@@ -853,6 +884,7 @@ async fn review_public_error_transcript() {
         storage_id: id.clone(),
         expected_root_epoch: epoch,
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     };
     t.push(outcome(journal.retire(&session, JournalRevision(1)).await));
     t.push(outcome(journal.collect(request(0)).await));
@@ -977,7 +1009,16 @@ async fn review_public_error_transcript() {
         .collect(request(journal.root_epoch().unwrap()))
         .await
         .unwrap();
-    t.push(format!("{report:?}"));
+    // The bounded collector's per-call work-unit diagnostic is implementation
+    // dependent; every original report field stays in the transcript.
+    assert!(report.work_units > 0);
+    t.push(format!(
+        "{:?}",
+        JournalGcReport {
+            work_units: 0,
+            ..report
+        }
+    ));
     let conflict = "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/\
                     invalid or incomplete published journal boundary"
         .to_string();
@@ -1026,7 +1067,7 @@ async fn review_public_error_transcript() {
         "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
         "Conflict/StateConflict { stage: PreProvider, component: Checkpoint }/false/session journal is retired".to_string(),
         conflict.clone(),
-        "JournalGcReport { root_epoch: 35, examined: 16, deleted: 2, reclaimed_bytes: 1445, unreadable_sessions: [] }".to_string(),
+        "JournalGcReport { root_epoch: 35, examined: 16, deleted: 2, reclaimed_bytes: 1445, unreadable_sessions: [], progress: Some(Complete), has_more: false, work_units: 0, zero_work_calls: 0, over_capacity_sessions: [] }".to_string(),
     ];
     assert_eq!(t, expected);
 }
@@ -1101,6 +1142,7 @@ async fn review_public_epoch_transcript() {
         storage_id: id.clone(),
         expected_root_epoch: epoch,
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     };
     let first = journal
         .collect(request(journal.root_epoch().unwrap()))

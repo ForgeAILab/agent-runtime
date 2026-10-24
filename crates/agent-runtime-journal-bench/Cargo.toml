@@ -7,6 +7,14 @@ license.workspace = true
 publish = false
 description = "Physical SQLite measurement harness; never a production dependency"
 
+[features]
+default = []
+journal-profile = ["agent-runtime-core/test-support", "agent-runtime/test-support"]
+
+[[test]]
+name = "hot_path"
+required-features = ["journal-profile"]
+
 [dependencies]
 agent-runtime-core.workspace = true
 agent-runtime.workspace = true
@@ -20,6 +28,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 libc = "0.2"
 
 [lints]

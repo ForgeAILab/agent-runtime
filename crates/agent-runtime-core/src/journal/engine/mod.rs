@@ -17,6 +17,8 @@ mod assembler;
 mod dependencies;
 mod draft;
 mod encoding_cache;
+mod evidence;
+use evidence::*;
 mod links;
 mod projection;
 mod staged;
@@ -25,7 +27,7 @@ pub(super) use dependencies::*;
 pub(super) use draft::*;
 pub(super) use encoding_cache::*;
 pub(super) use links::*;
-pub use projection::{IdentityJournalProjection, JournalProjectionPolicy};
+pub use projection::{IdentityJournalProjection, JournalDeltaProjection, JournalProjectionPolicy};
 pub(super) use staged::*;
 
 mod transition;
@@ -34,6 +36,7 @@ pub(super) use transition::{
     DurablePin, ObjectStore, ReachableSet, SessionRecord, State, Transition, host_failure,
     injected_failure,
 };
+mod collection;
 mod controls;
 mod memo;
 mod persistence;
@@ -78,6 +81,9 @@ pub struct JournalEngine<S: JournalStorage> {
     // opens, whose root changes do not set storage's collection_dirty flag.
     dirty: Arc<Mutex<BTreeSet<SessionId>>>,
     memo: Arc<Mutex<memo::RootMemo>>,
+    // Private disposable collection cursor shared by clones; touched only
+    // under the write gate.
+    collection: Arc<Mutex<collection::CollectionState>>,
 }
 impl<S: JournalStorage> Clone for JournalEngine<S> {
     fn clone(&self) -> Self {
@@ -88,6 +94,7 @@ impl<S: JournalStorage> Clone for JournalEngine<S> {
             gate: self.gate.clone(),
             dirty: self.dirty.clone(),
             memo: self.memo.clone(),
+            collection: self.collection.clone(),
         }
     }
 }
@@ -140,7 +147,40 @@ impl<S: JournalStorage> JournalEngine<S> {
             memo: Arc::new(Mutex::new(memo::RootMemo::new(
                 config.validated_root_memo_bytes,
             ))),
+            collection: Arc::new(Mutex::new(collection::CollectionState::new())),
         }
+    }
+    /// Estimated test-only retention, not allocator heap or process RSS.
+    #[cfg(feature = "test-support")]
+    pub fn profile_state(&self) -> Result<crate::journal::profile::EngineState, RuntimeError> {
+        let (memo_charge, memo_budget, memo_entries, details) = {
+            let memo = self.memo.lock().map_err(|_| host_failure())?;
+            (
+                memo.total_charge(),
+                memo.budget,
+                memo.profile_entries(),
+                memo.profile_details(),
+            )
+        };
+        let live_leases = self.local.lock()?.leases.len();
+        let local_dirty_sessions = self.dirty.lock().map_err(|_| host_failure())?.len();
+        Ok(crate::journal::profile::EngineState {
+            memo_charge,
+            memo_budget,
+            memo_entries,
+            max_object_store_layers: details.0,
+            memo_closure_members: details.1,
+            external_proof_references: details.2,
+            live_leases,
+            local_dirty_sessions,
+            cursor_charge: self.collection.lock().map_err(|_| host_failure())?.charge(),
+        })
+    }
+    /// Test-only override of the 16 MiB collection cursor workspace cap.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_collection_cursor_cap(&self, bytes: usize) -> Result<(), RuntimeError> {
+        self.collection.lock().map_err(|_| host_failure())?.cap = bytes;
+        Ok(())
     }
     /// Arms one deterministic commit cut; it is consumed when that step is reached.
     pub fn fail_next_commit_at(
@@ -170,14 +210,18 @@ impl<S: JournalStorage> JournalEngine<S> {
     /// Physical storage compaction; never changes logical membership or epochs.
     pub async fn compact(&self) -> Result<(), RuntimeError> {
         let _gate = self.write_gate().await;
+        #[cfg(feature = "test-support")]
+        let _profile_gate = crate::journal::profile::timer("rt.gate.hold");
         self.storage.compact(&self.domain).await
     }
     /// Takes the write gate after one unit of Tokio's cooperative budget, so a
     /// task looping over journal operations still yields to its executor and
     /// cannot keep a woken gate waiter parked behind it on the same worker.
     async fn write_gate(&self) -> futures_util::lock::MutexGuard<'_, ()> {
-        tokio::task::consume_budget().await;
-        self.gate.lock().await
+        crate::journal_profile_scope!("rt.gate.wait", {
+            tokio::task::consume_budget().await;
+            self.gate.lock().await
+        })
     }
     fn mark_dirty(&self, session: &SessionId) -> Result<(), RuntimeError> {
         self.dirty
@@ -198,91 +242,93 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         session: &SessionId,
         request: JournalOpen,
     ) -> Result<JournalLease, RuntimeError> {
-        let _gate = self.write_gate().await;
-        if request.intent == JournalOpenIntent::ExclusiveWriter
-            && self
-                .local
-                .lock()?
-                .sessions
-                .get(session)
-                .is_some_and(|s| s.active_writer.is_some())
-        {
-            return Err(conflict());
-        }
-        let (scratch, stored) = self.hydrate(session).await?;
-        let root = match &request.root {
-            JournalRootSelection::Latest => stored
-                .as_ref()
-                .and_then(|r| r.head.as_ref())
-                .map(|h| h.id.clone()),
-            JournalRootSelection::Retained { root } => Some(root.clone()),
-        };
-        let mut validated = None;
-        if let Some(root) = &root {
-            let catalog = self
-                .storage
-                .catalog(&self.domain, session, root)
-                .await?
-                .ok_or_else(conflict)?;
-            let deps = persistence::decode(&catalog.engine)?;
-            scratch
-                .lock()?
-                .sessions
-                .entry(session.clone())
-                .or_default()
-                .retained_heads
-                .insert(root.clone(), deps);
-            let mut entry = Box::pin(self.validated_root(&scratch, session, root)).await?;
-            if request.intent == JournalOpenIntent::ExclusiveWriter {
-                entry = self.writer_memo(session, root, entry)?;
-                self.seed_memo(&scratch, session, root, &entry)?;
+        crate::journal_profile_scope!("rt.mod.open", {
+            let _gate = self.write_gate().await;
+            #[cfg(feature = "test-support")]
+            let _profile_gate = crate::journal::profile::timer("rt.gate.hold");
+            if request.intent == JournalOpenIntent::ExclusiveWriter
+                && self
+                    .local
+                    .lock()?
+                    .sessions
+                    .get(session)
+                    .is_some_and(|s| s.active_writer.is_some())
+            {
+                return Err(conflict());
             }
-            validated = Some(ReachableSet {
-                layers: vec![entry.closure.clone()],
-            });
-        }
-        let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
-        let fenced_head = stored
-            .as_ref()
-            .and_then(|record| record.head.as_ref())
-            .map(|head| head.id.clone());
-        let before_pins = persistence::pin_records(&scratch, session, fenced_head.as_ref())?;
-        if writer {
-            self.freeze_writer_pins(&scratch, session, stored.as_ref())?;
-        }
-        let lease = scratch.open_validated(session, request, validated)?;
-        let dependencies = scratch
-            .lock()?
-            .leases
-            .get(&self.local.token(&lease)?.handle)
-            .ok_or_else(conflict)?
-            .dependencies
-            .sessions
-            .clone();
-        if self.retired_dependency(&dependencies).await? {
-            return Err(conflict());
-        }
-        if writer {
-            let mut write = self.write(
+            let (scratch, stored) = self.hydrate(session).await?;
+            let root = match &request.root {
+                JournalRootSelection::Latest => stored
+                    .as_ref()
+                    .and_then(|r| r.head.as_ref())
+                    .map(|h| h.id.clone()),
+                JournalRootSelection::Retained { root } => Some(root.clone()),
+            };
+            let mut validated = None;
+            if let Some(root) = &root {
+                let catalog = self
+                    .storage
+                    .catalog(&self.domain, session, root)
+                    .await?
+                    .ok_or_else(conflict)?;
+                let deps = persistence::decode(&catalog.engine)?;
+                scratch
+                    .lock()?
+                    .sessions
+                    .entry(session.clone())
+                    .or_default()
+                    .retained_heads
+                    .insert(root.clone(), deps);
+                let mut entry = Box::pin(self.validated_root(&scratch, session, root)).await?;
+                if request.intent == JournalOpenIntent::ExclusiveWriter {
+                    entry = self.writer_memo(session, root, entry)?;
+                    self.seed_memo(&scratch, session, root, &entry)?;
+                }
+                validated = Some(ReachableSet::from_evidence(entry.closure.clone()));
+            }
+            let writer = request.intent == JournalOpenIntent::ExclusiveWriter;
+            let fenced_head = stored
+                .as_ref()
+                .and_then(|record| record.head.as_ref())
+                .map(|head| head.id.clone());
+            let before_pins = persistence::pin_records(&scratch, session, fenced_head.as_ref())?;
+            if writer {
+                self.freeze_writer_pins(&scratch, session, stored.as_ref())?;
+            }
+            let lease = scratch.open_validated(session, request, validated)?;
+            let dependencies = scratch
+                .lock()?
+                .leases
+                .get(&self.local.token(&lease)?.handle)
+                .ok_or_else(conflict)?
+                .dependencies
+                .sessions
+                .clone();
+            if self.retired_dependency(&dependencies).await? {
+                return Err(conflict());
+            }
+            if writer {
+                let mut write = self.write(
+                    &scratch,
+                    session,
+                    stored.as_ref(),
+                    JournalWriteKind::OpenWriter,
+                )?;
+                write.pins =
+                    persistence::pin_changes(before_pins, &scratch, session, fenced_head.as_ref())?;
+                self.apply(write, session).await?;
+                self.publish_controls(&scratch, session)?;
+            }
+            self.publish(
                 &scratch,
                 session,
-                stored.as_ref(),
-                JournalWriteKind::OpenWriter,
+                Some(self.local.token(&lease)?.handle),
+                None,
+                true,
             )?;
-            write.pins =
-                persistence::pin_changes(before_pins, &scratch, session, fenced_head.as_ref())?;
-            self.apply(write, session).await?;
-            self.publish_controls(&scratch, session)?;
-        }
-        self.publish(
-            &scratch,
-            session,
-            Some(self.local.token(&lease)?.handle),
-            None,
-            true,
-        )?;
-        self.mark_dirty(session)?;
-        Ok(lease)
+            self.mark_dirty(session)?;
+            Ok(lease)
+        })
     }
     async fn read(
         &self,
@@ -311,53 +357,73 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         lease: &JournalLease,
         commit: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
-        Box::pin(self.commit_inner(lease, Box::new(commit))).await
+        crate::journal_profile_scope!("rt.mod.commit", {
+            Box::pin(self.commit_inner(lease, Box::new(commit), JournalPreparationHints::default()))
+                .await
+        })
+    }
+    async fn commit_prepared(
+        &self,
+        lease: &JournalLease,
+        commit: JournalCommit,
+        hints: JournalPreparationHints,
+    ) -> Result<JournalHead, RuntimeError> {
+        crate::journal_profile_scope!("rt.mod.commit", {
+            Box::pin(self.commit_inner(lease, Box::new(commit), hints)).await
+        })
     }
     async fn renew(&self, lease: &JournalLease) -> Result<JournalLease, RuntimeError> {
-        if lease.writer_epoch().is_some() {
-            let _gate = self.write_gate().await;
-            self.local.live_lease(&*self.local.lock()?, lease)?;
-            let (scratch, stored) = self.hydrate(lease.session()).await?;
-            if stored.as_ref().map(|r| r.writer_epoch) != lease.writer_epoch() {
-                return Err(conflict());
-            }
-            if let Some(object) = stored.as_ref().and_then(|r| r.head.as_ref()) {
-                let head: JournalHead = object.decode(JournalObjectKind::Head)?;
-                let entry =
-                    Box::pin(self.validated_root(&scratch, lease.session(), &object.id)).await?;
-                let mut state = scratch.lock()?;
-                let dependencies = state.sessions[lease.session()].dependencies.clone();
-                let record = state
-                    .leases
-                    .get_mut(&self.local.token(lease)?.handle)
-                    .ok_or_else(conflict)?;
-                if !record.reachable.contains(&object.id) {
-                    record.reachable.layers.push(entry.closure.clone());
+        crate::journal_profile_scope!("rt.mod.renew", {
+            if lease.writer_epoch().is_some() {
+                let _gate = self.write_gate().await;
+                #[cfg(feature = "test-support")]
+                let _profile_gate = crate::journal::profile::timer("rt.gate.hold");
+                self.local.live_lease(&*self.local.lock()?, lease)?;
+                let (scratch, stored) = self.hydrate(lease.session()).await?;
+                if stored.as_ref().map(|r| r.writer_epoch) != lease.writer_epoch() {
+                    return Err(conflict());
                 }
-                record.roots.extend([object.id.clone()].into());
-                record.dependencies.extend(&dependencies);
-                record.selected_head = Some(head);
+                if let Some(object) = stored.as_ref().and_then(|r| r.head.as_ref()) {
+                    let head: JournalHead = object.decode(JournalObjectKind::Head)?;
+                    let entry =
+                        Box::pin(self.validated_root(&scratch, lease.session(), &object.id))
+                            .await?;
+                    let mut state = scratch.lock()?;
+                    let dependencies = state.sessions[lease.session()].dependencies.clone();
+                    let record = state
+                        .leases
+                        .get_mut(&self.local.token(lease)?.handle)
+                        .ok_or_else(conflict)?;
+                    if !record.reachable.contains(&object.id) {
+                        record.reachable.push_evidence(entry.closure.clone());
+                    }
+                    record.roots.extend([object.id.clone()].into());
+                    record.dependencies.extend(&dependencies);
+                    record.selected_head = Some(head);
+                }
+                self.publish(
+                    &scratch,
+                    lease.session(),
+                    None,
+                    Some(self.local.token(lease)?.handle),
+                    false,
+                )?;
+                let result = self.local.renew(lease)?;
+                self.mark_dirty(lease.session())?;
+                Ok(result)
+            } else {
+                let result = self.local.renew(lease)?;
+                self.mark_dirty(lease.session())?;
+                Ok(result)
             }
-            self.publish(
-                &scratch,
-                lease.session(),
-                None,
-                Some(self.local.token(lease)?.handle),
-                false,
-            )?;
-            let result = self.local.renew(lease)?;
-            self.mark_dirty(lease.session())?;
-            Ok(result)
-        } else {
-            let result = self.local.renew(lease)?;
-            self.mark_dirty(lease.session())?;
-            Ok(result)
-        }
+        })
     }
     async fn close(&self, lease: JournalLease) -> Result<(), RuntimeError> {
-        let session = lease.session().clone();
-        self.local.close(lease)?;
-        self.mark_dirty(&session)
+        crate::journal_profile_scope!("rt.mod.close", {
+            let session = lease.session().clone();
+            self.local.close(lease)?;
+            self.mark_dirty(&session)
+        })
     }
     async fn retire(
         &self,
@@ -367,9 +433,14 @@ impl<S: JournalStorage> SessionJournal for JournalEngine<S> {
         Box::pin(self.retire_inner(session, expected)).await
     }
     async fn collect(&self, request: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
-        Box::pin(self.collect_inner(request)).await
+        crate::journal_profile_scope!("rt.mod.collect", {
+            Box::pin(self.collect_inner(request)).await
+        })
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod incremental_tests;

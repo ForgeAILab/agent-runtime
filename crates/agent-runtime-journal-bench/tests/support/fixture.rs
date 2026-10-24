@@ -132,6 +132,29 @@ impl JournalStorage for TracingStorage {
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(d).await
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        self.inner.apply_collection(plan).await
+    }
     async fn apply(&self, w: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         let d = trace_key(&w.domain);
         let session = w.session.clone();
@@ -414,14 +437,18 @@ impl Native {
         for journal in [&self.ordinary.inner, &self.protected.inner] {
             journal.enable_collection().unwrap();
             let before = self.storage.pack_write_bytes().unwrap();
-            journal
+            // Bounded calls (P4): one host collection drains the engine's pass.
+            while journal
                 .collect(JournalGcRequest {
                     storage_id: journal.storage_id(),
                     expected_root_epoch: journal.root_epoch().unwrap(),
                     max_objects: u64::MAX,
+                    work_budget: Default::default(),
                 })
                 .await
-                .unwrap();
+                .unwrap()
+                .has_more
+            {}
             let written = self.storage.pack_write_bytes().unwrap() - before;
             let mut stats = self.maintenance.lock().unwrap();
             stats.collection_calls += 1;
@@ -914,3 +941,8 @@ pub(crate) fn objects(
     }
     out
 }
+
+#[cfg(feature = "journal-profile")]
+#[allow(dead_code)]
+#[path = "hot_fixture.rs"]
+pub(crate) mod hot;

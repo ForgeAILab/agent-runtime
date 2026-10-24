@@ -214,3 +214,16 @@ pub mod prelude {
     };
     pub use crate::workspace::{DenyAllWorkspace, Workspace};
 }
+
+// Disabled expansions preserve the original body, including return/await boundaries.
+#[cfg(not(feature = "test-support"))]
+macro_rules! journal_profile_scope {
+    ($label:expr, $body:block) => {
+        $body
+    };
+}
+#[cfg(feature = "test-support")]
+macro_rules! journal_profile_scope {
+    ($label:expr, $body:block) => { $crate::journal::profile::instrument($label, Box::pin(async $body)).await };
+}
+pub(crate) use journal_profile_scope;

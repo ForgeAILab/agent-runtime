@@ -145,6 +145,7 @@ async fn snapshot_adapter_equals_legacy_materialization_and_preserves_store_barr
                 storage_id: JournalStorageId::new("fixture"),
                 expected_root_epoch: 1,
                 max_objects: 1,
+                work_budget: Default::default(),
             })
             .await
             .unwrap_err(),

@@ -112,7 +112,11 @@ impl<'a> ExternalTurnMachine<'a> {
             None => Deadline::never(),
         };
         let accepted_input = input.clone();
-        let active_history_start = state.lock().expect("session state poisoned").history.len();
+        let active_history_start = state
+            .lock()
+            .expect("session state poisoned")
+            .history()
+            .len();
         execution.begin_turn(turn_id.clone(), active_history_start, driver.clock.now());
         // The input and the injections it drains stay staged until the
         // acceptance checkpoint commits (see `Driver::settle_failed_acceptance`).
@@ -189,7 +193,7 @@ impl<'a> ExternalTurnMachine<'a> {
             .state
             .lock()
             .expect("session state poisoned")
-            .history
+            .history()
             .len();
         self.machine.execution.begin_internal_turn(
             self.machine.turn_id.clone(),
@@ -431,8 +435,7 @@ impl<'a> ExternalTurnMachine<'a> {
                 .state
                 .lock()
                 .expect("session state poisoned")
-                .usage
-                .record(record.clone());
+                .record_usage(record.clone());
             emitter.emit(turn.clone(), RuntimeEvent::Usage { record });
         }
 
@@ -446,7 +449,7 @@ impl<'a> ExternalTurnMachine<'a> {
                 let parts = output.take_parts(&execution);
                 let mut state = state.lock().expect("session state poisoned");
                 if !parts.is_empty() {
-                    state.history.push(Message::assistant(parts));
+                    state.append_history([Message::assistant(parts)]);
                 }
                 emitter.commit_external_presentation();
             }
@@ -556,8 +559,8 @@ impl TurnMachine<'_> {
         parts.push(ContentPart::ToolCall(call.clone()));
         let (history_index, pending_presentation) = {
             let mut state = self.state.lock().expect("session state poisoned");
-            let history_index = state.history.len();
-            state.history.push(Message::assistant(parts));
+            let history_index = state.history().len();
+            state.append_history([Message::assistant(parts)]);
             (history_index, self.emitter.take_external_presentation())
         };
         if let Err(error) = self
@@ -576,11 +579,11 @@ impl TurnMachine<'_> {
                     !prefix.is_empty(),
                 );
                 if keep_prefix {
-                    state.history[history_index] = Message::assistant(prefix.clone());
+                    state.replace_history_at(history_index, Message::assistant(prefix.clone()));
                 } else {
-                    state.history.remove(history_index);
+                    state.remove_history_at(history_index);
                 }
-                let later_visible = state.history[history_index..].iter().any(|message| {
+                let later_visible = state.history()[history_index..].iter().any(|message| {
                     message.role == agent_runtime_core::content::Role::Assistant
                         && !message.joined_text().is_empty()
                 });
@@ -664,7 +667,7 @@ impl TurnMachine<'_> {
                 .state
                 .lock()
                 .expect("session state poisoned")
-                .history
+                .history()
                 .iter()
                 .rev()
                 .flat_map(|message| &message.content)
@@ -719,10 +722,10 @@ fn commit_native_tool_prefix(
         .take_parts(execution);
     let mut state = state.lock().expect("session state poisoned");
     if !parts.is_empty() {
-        state.history.push(Message::assistant(parts));
+        state.append_history([Message::assistant(parts)]);
     }
     emitter.commit_external_presentation();
-    state.history.len()
+    state.history().len()
 }
 
 #[allow(clippy::too_many_arguments)]

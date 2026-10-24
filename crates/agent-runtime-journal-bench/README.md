@@ -155,3 +155,104 @@ with its full real engine metadata, not simulator stand-ins.
 The current physical tables and the ≤2.0× L2 gate decision are recorded in
 `docs/development.md` and design D8.4 of the storage-engine change. All format
 levers remain unbuilt because B/N=4000 meets the storage-only gate.
+
+## Hot-path profiling prerequisite
+
+`journal-profile` forwards the non-default core/runtime `test-support` features.
+Default builds expose no observer API and retain the original function bodies.
+The profile hooks use per-poll async context, explicitly inherited by spawned
+turn tasks, and isolated buffers. They never invoke a callback inside a journal
+operation. Output is buffered until the measured operation has returned.
+
+From the workspace root:
+
+```sh
+CARGO_TARGET_DIR=$PWD/target TMPDIR=/Volumes/Data/tmp CARGO_BUILD_JOBS=6 \
+JOURNAL_MEASUREMENT_DIR=/Volumes/Data/tmp/rt-journal-baseline \
+cargo test --offline -p agent-runtime-journal-bench --release \
+  --features journal-profile --test hot_path \
+  journal_hot_path_release_report -- --ignored --exact --nocapture
+```
+
+The ignored target rejects debug builds. Its defaults run five fresh paired
+observer-off/on A/B samples at N=100/1000/4000, then three C samples at
+N=1000/4000. A/B retain their two-turn scripts. Original C uses N/4 tool turns;
+`C-plain-supplement` uses N/2 plain turns. Both replace Runtime/writer each turn
+and retain the original 32-manifest window. Every terminal runs S2 and complete
+both-domain collection drains; shutdown drains are separate. The modeled
+packed adapter uses its original PerSession sharing, repacking and sealing
+lengths, with a 128 MiB estimated memo budget per engine. It is not Forge's
+sqlx/AEAD adapter or real legacy L2.
+
+`JOURNAL_PROFILE_CONTEXT=isolated` runs C without retained A/B holders in a
+separate invocation. Matrix context retains the first enabled sample's legacy
+row for each fixture/size/shape, preserving the matrix's earlier holders;
+repeated samples and observer-off controls do not multiply these holders.
+Selection controls are `JOURNAL_PROFILE_FIXTURES` (comma-separated names),
+`JOURNAL_PROFILE_SIZES`, `JOURNAL_PROFILE_AB_SAMPLES` and
+`JOURNAL_PROFILE_C_SAMPLES`. Reducing repeats is diagnostic coverage, not the
+five/three-replicate acceptance. `JOURNAL_PROFILE_DIAGNOSTICS=1` additionally
+measures a 4,000-message live graph with 100 dirty/unrelated sessions, zero
+release allowance, memo budgets 0/1/1024, identity policy and collection-off.
+The conservative policy removes an optional sensitive diagnostic; these frozen
+fixtures contain none, so identity/conservative bytes can coincide.
+
+`journal_hot_path_n100_smoke` checks native/legacy history and cache identity,
+plus exact observer-off/on snapshot/root parity for A/B plain/tool.
+`--test profile_parity` independently writes roots and legacy digest/write
+receipts using the original fixture driver, for comparison between feature-off
+and compiled-in observer-off builds. The async observer tests cover concurrent
+scopes and a spawned task on a two-thread Tokio runtime. Run
+`journal_profile_calibration` alone for the empty enabled/disabled timer,
+callback-consumption and buffered serialization controls. Never subtract these
+costs from reported results.
+
+Artifacts are `configuration.json`, `summary.json`, `summary.md`, raw
+`spans.jsonl`, operation samples in `operations.jsonl`, and paired calls/gate
+intervals in `collect.jsonl`. Span ids/parents and monotonic start offsets are
+local to one operation; case, boundary and turn identify that operation. Counts
+aggregate only within their exact parent span. No journal plaintext or full
+root ids are emitted. Source/fixture hashes, compiler revision and command
+receipts should accompany a frozen run.
+
+Aggregate completed runs with Python's standard library:
+
+```sh
+python3 crates/agent-runtime-journal-bench/scripts/summarize_hot_path.py \
+  /Volumes/Data/tmp/rt-journal-baseline --output /Volumes/Data/tmp/rt-journal-summary
+```
+
+The aggregator retains median, nearest-rank p95, minimum/maximum, all stages,
+fixture equality and observer overhead. C's additional end-to-end turn total
+includes the separately timed writer reopen. Full workload/drain totals remain
+charged; timing a cheap collection slice is never a completed-drain result.
+
+`rt.writer.preparation`, submission and candidate publication are disjoint
+from awaited engine commits. Manifest/request timers are nested; do not add
+them again to their parents. `rt.writer.previous_cache` labels the existing
+`extension_cached` builder, including other extensions. Prefix counters count
+successful unchanged-history comparisons; failed/fallback comparisons can do
+additional work. Validation byte counters count staged reader body bytes,
+not distinct physical bytes. Memo charge is the existing conservative estimate;
+allocator heap, exact deep Clone bytes, storage-cache heap and shared-proof
+heap remain unavailable with explicit reasons. v0.9.0 has no persistent semantic
+versions or resumable collection cursor: their metrics cannot demonstrate P1/P4
+behavior. Any missing metric or >2% observer overhead requires reporting and
+investigation before interpreting phase gains.
+
+
+Profiling revision `p0-v4` additionally meters physical pack payload/nonce bytes
+per operation and per collector call, records examined-member counts, and
+publishes disjoint `attribution_nanos` buckets. These buckets use a timestamp
+sweep over overlapping spans, prioritizing engine/collection work before writer
+and Runtime builders; their sum equals the operation wall time. Nested
+checkpoint fingerprinting is not added again to checkpoint validation.
+Checkpoint root-field counts describe considered schema fields, and serialized
+state fingerprint bytes describe bytes hashed, including repeated work.
+Cache gauges expose canonical body bytes and an estimated location index;
+these are separate from unavailable allocator heap. Object-store layer depth
+and external proof reference counts are exposed without changing memo policy.
+`JOURNAL_PROFILE_C_SIZES` and `JOURNAL_PROFILE_C_PLAIN_SIZES` can select the
+large growing variants independently. Source revisions must remain separate
+when comparing frozen runs; V3 diagnostics do not silently acquire V4's
+additional counters.

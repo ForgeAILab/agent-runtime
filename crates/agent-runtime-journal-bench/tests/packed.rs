@@ -134,6 +134,29 @@ impl JournalStorage for Reopen {
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.storage(false).compact(d).await
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.storage(false).collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.storage(false).collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.storage(false).prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        self.storage(false).apply_collection(plan).await
+    }
 }
 #[tokio::test]
 async fn packed_storage_conformance_with_connection_restart() {

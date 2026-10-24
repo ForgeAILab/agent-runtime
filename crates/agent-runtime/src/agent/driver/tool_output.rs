@@ -65,7 +65,7 @@ impl TurnMachine<'_> {
                 self.state
                     .lock()
                     .expect("session state poisoned")
-                    .usage
+                    .usage()
                     .records()
                     .to_vec()
                     .into_boxed_slice(),

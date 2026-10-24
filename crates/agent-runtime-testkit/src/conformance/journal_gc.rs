@@ -148,15 +148,51 @@ impl SessionJournalCollectionFixture {
             storage_id: self.backend.journal.storage_id(),
             expected_root_epoch: self.host.root_epoch().await.unwrap(),
             max_objects,
+            work_budget: Default::default(),
         }
     }
 
+    /// Drains collection: bounded calls repeat with a refreshed epoch while
+    /// the engine reports `has_more`. Counts and unreadable sessions of every
+    /// call are accumulated; `root_epoch` is the first call's mark.
     async fn collect(&self) -> JournalGcReport {
-        self.backend
-            .journal
-            .collect(self.mark(u64::MAX).await)
-            .await
-            .unwrap()
+        let mut total: Option<JournalGcReport> = None;
+        loop {
+            let report = self
+                .backend
+                .journal
+                .collect(self.mark(u64::MAX).await)
+                .await
+                .unwrap();
+            let more = report.has_more;
+            total = Some(match total {
+                None => report,
+                Some(mut total) => {
+                    total.accumulate(report);
+                    total
+                }
+            });
+            if !more {
+                return total.unwrap();
+            }
+        }
+    }
+
+    /// One host call honoring `max_objects`. A bounded call may yield before
+    /// releasing anything; repeat only such calls, so the returned report is
+    /// from the first call that deleted something or finished the pass.
+    async fn collect_call(&self, max_objects: u64) -> JournalGcReport {
+        loop {
+            let report = self
+                .backend
+                .journal
+                .collect(self.mark(max_objects).await)
+                .await
+                .unwrap();
+            if report.deleted > 0 || !report.has_more {
+                return report;
+            }
+        }
     }
 
     async fn release(&self, session: &SessionId, pin: &str) {
@@ -942,10 +978,10 @@ where
     journal.retire(&session, head.revision).await.unwrap();
     assert_conflict(journal.collect(before_retire).await.unwrap_err());
     let before = fixture.host.retained_bytes().await.unwrap();
-    let zero = journal.collect(fixture.mark(0).await).await.unwrap();
+    let zero = fixture.collect_call(0).await;
     assert_eq!((zero.deleted, zero.reclaimed_bytes), (0, 0));
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), before);
-    let one = journal.collect(fixture.mark(1).await).await.unwrap();
+    let one = fixture.collect_call(1).await;
     assert_eq!(one.deleted, 1);
     assert!(one.reclaimed_bytes > 0);
     fixture.collect().await;
@@ -985,7 +1021,7 @@ where
             }
             Err(error) => assert_conflict(error),
         }
-        let report = journal.collect(fixture.mark(1).await).await.unwrap();
+        let report = fixture.collect_call(1).await;
         if report.deleted == 0 {
             break;
         }
@@ -1330,7 +1366,7 @@ where
     journal.close(other_writer).await.unwrap();
 
     let before = fixture.host.retained_bytes().await.unwrap();
-    let report = journal.collect(fixture.mark(u64::MAX).await).await.unwrap();
+    let report = fixture.collect().await;
     assert_eq!(report.unreadable_sessions, vec![session.clone()]);
     assert_eq!(
         report.deleted, 1,
@@ -1425,7 +1461,11 @@ where
         fixture.host.root_epoch().await.unwrap(),
         mark.expected_root_epoch
     );
-    let report = journal.collect(mark).await.unwrap();
+    let mut report = journal.collect(mark).await.unwrap();
+    if report.has_more {
+        // A bounded call may yield; the host drain finishes the same pass.
+        report.accumulate(fixture.collect().await);
+    }
     assert_eq!(report.deleted, 1);
     assert_eq!(report.reclaimed_bytes, staged_bytes);
     assert_eq!(fixture.host.retained_bytes().await.unwrap(), 0);
@@ -1457,6 +1497,7 @@ where
                 storage_id: journal.storage_id(),
                 expected_root_epoch: 0,
                 max_objects: u64::MAX,
+                work_budget: Default::default(),
             })
             .await
             .unwrap_err();
@@ -1568,7 +1609,10 @@ where
     if step != 0 {
         pending_mark = Some(fixture.mark(u64::MAX).await);
         if step == 2 {
-            let swept = journal.collect(pending_mark.take().unwrap()).await.unwrap();
+            let mut swept = journal.collect(pending_mark.take().unwrap()).await.unwrap();
+            if swept.has_more {
+                swept.accumulate(fixture.collect().await);
+            }
             assert!(
                 swept.deleted > 0,
                 "after-delete rows must perform real deletion before the operation"

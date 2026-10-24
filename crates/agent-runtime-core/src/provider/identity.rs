@@ -253,6 +253,65 @@ pub struct CacheIdentityBuilder {
 }
 
 impl CacheIdentity {
+    pub(crate) fn journal_header(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let Self {
+            provider,
+            endpoint,
+            adapter_partition_revision,
+            model,
+            profile,
+            tokenizer_revision,
+            request_adapter_revision,
+            cache_control,
+            provider_key,
+            breakpoint_revision,
+            resource,
+            stable_prefix: _,
+            tools: _,
+            hosted_tools,
+            registry_snapshot,
+            scoped_view,
+            activation_revision,
+            harness_revision,
+            cache_policy_revision,
+            stable_history: _,
+            digest,
+        } = self;
+        let header = Self {
+            provider: provider.clone(),
+            endpoint: endpoint.clone(),
+            adapter_partition_revision: adapter_partition_revision.clone(),
+            model: model.clone(),
+            profile: profile.clone(),
+            tokenizer_revision: tokenizer_revision.clone(),
+            request_adapter_revision: request_adapter_revision.clone(),
+            cache_control: *cache_control,
+            provider_key: provider_key.clone(),
+            breakpoint_revision: breakpoint_revision.clone(),
+            resource: resource.clone(),
+            stable_prefix: Vec::new(),
+            tools: Vec::new(),
+            hosted_tools: hosted_tools.clone(),
+            registry_snapshot: registry_snapshot.clone(),
+            scoped_view: scoped_view.clone(),
+            activation_revision: activation_revision.clone(),
+            harness_revision: harness_revision.clone(),
+            cache_policy_revision: cache_policy_revision.clone(),
+            stable_history: Vec::new(),
+            digest: digest.clone(),
+        };
+        serde_json::to_value(header)
+    }
+    pub(crate) fn journal_projections(
+        &self,
+    ) -> (
+        &[CacheIdentityFragment],
+        &[CacheIdentityTool],
+        &[CacheIdentityFragment],
+    ) {
+        (&self.stable_prefix, &self.tools, &self.stable_history)
+    }
+
     /// Starts an exact cache identity builder.
     pub fn builder(
         provider: impl Into<String>,

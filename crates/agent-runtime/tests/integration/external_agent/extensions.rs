@@ -6,6 +6,7 @@ use agent_runtime::agent::external::{
 };
 use agent_runtime::core::checkpoint::{CheckpointStore, TurnState};
 use agent_runtime::core::ids::SessionId;
+use agent_runtime::core::store::SessionStore;
 use agent_runtime::prelude::{ActivationBudget, RegistryId, ScopeInputs, Skill};
 use agent_runtime::runtime::SessionHandle;
 
@@ -189,8 +190,19 @@ async fn backend_tool_transcript_observations_survive_restart_without_backend_ex
     assert_eq!(events[0]["event"]["payload"]["id"], "native-call");
     assert_eq!(snapshot.history[1].joined_text(), "before native tool");
     assert_eq!(snapshot.history[2].joined_text(), "final retained answer");
+    session.persist().await.unwrap();
+    let persisted = stores.load(session.id()).await.unwrap().unwrap();
+    assert_eq!(
+        persisted.extension_state["agent-runtime.transcript.observations"],
+        retained
+    );
     let id = session.id().clone();
     session.shutdown().await.unwrap();
+    let persisted = stores.load(&id).await.unwrap().unwrap();
+    assert_eq!(
+        persisted.extension_state["agent-runtime.transcript.observations"],
+        retained
+    );
     drop(session);
     drop(runtime);
     let restarted = builder(provider.clone(), stores.restarted())

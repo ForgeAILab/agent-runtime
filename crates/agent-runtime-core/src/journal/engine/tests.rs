@@ -51,9 +51,11 @@ struct LostAcknowledgement {
     lose: std::sync::atomic::AtomicBool,
     calls: Mutex<BTreeMap<(&'static str, SessionId), usize>>,
     pause_load: Mutex<Option<LoadPause>>,
+    pause_preflight: Mutex<Option<LoadPause>>,
     pin_writes: Mutex<Vec<(JournalWriteKind, usize)>>,
     failure: Mutex<Option<(SessionId, &'static str, RuntimeError)>>,
     hide_unreadable: std::sync::atomic::AtomicBool,
+    repeat_members: std::sync::atomic::AtomicBool,
 }
 impl LostAcknowledgement {
     fn fail(&self, name: &str, session: &SessionId) -> Result<(), RuntimeError> {
@@ -156,6 +158,63 @@ impl JournalStorage for LostAcknowledgement {
     }
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(d).await
+    }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        mut request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        // Collection pages carry the membership/pin fault points of the
+        // previous whole-session reads.
+        let name = match request.kind {
+            JournalCollectionPageKind::Pins => "pins",
+            _ => "members",
+        };
+        self.count(name, s);
+        self.fail(name, s)?;
+        let repeat = self
+            .repeat_members
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request.kind == JournalCollectionPageKind::Members
+            && request.max_items > 1;
+        if repeat {
+            request.max_items = request.max_items.saturating_sub(1).max(1);
+        }
+        let mut page = self.inner.collection_page(d, s, request).await?;
+        if repeat {
+            if let JournalCollectionItems::Members(ids) = &mut page.items {
+                if let Some(first) = ids.first().cloned() {
+                    ids.push(first);
+                }
+            }
+        }
+        Ok(page)
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        let prepared = self.inner.prepare_collection_apply(plan).await?;
+        let pause = self.pause_preflight.lock().unwrap().take();
+        if let Some((ready, resume)) = pause {
+            ready.send(()).unwrap();
+            resume.await.unwrap();
+        }
+        Ok(prepared)
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        // Route through this wrapper's apply so its fault/pause hooks apply.
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.count("apply", &write.session);
@@ -520,15 +579,23 @@ async fn host_controls_preserve_the_original_epoch_transcript() {
         storage_id: engine.storage_id(),
         expected_root_epoch: epoch,
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     };
+    // `work_units` is the bounded collector's per-call diagnostic (P4); the
+    // reference collector has no units. Every original field still matches.
+    let collected = engine
+        .collect(request(engine.root_epoch().unwrap()))
+        .await
+        .unwrap();
+    assert!(collected.work_units > 0);
     assert_eq!(
         original
             .collect(request(original.root_epoch().unwrap()))
             .unwrap(),
-        engine
-            .collect(request(engine.root_epoch().unwrap()))
-            .await
-            .unwrap()
+        JournalGcReport {
+            work_units: 0,
+            ..collected
+        }
     );
     check();
     original
@@ -548,14 +615,18 @@ async fn host_controls_preserve_the_original_epoch_transcript() {
         .unwrap();
     check();
     for _ in 0..2 {
+        let collected = engine
+            .collect(request(engine.root_epoch().unwrap()))
+            .await
+            .unwrap();
         assert_eq!(
             original
                 .collect(request(original.root_epoch().unwrap()))
                 .unwrap(),
-            engine
-                .collect(request(engine.root_epoch().unwrap()))
-                .await
-                .unwrap()
+            JournalGcReport {
+                work_units: 0,
+                ..collected
+            }
         );
         check();
     }
@@ -634,6 +705,7 @@ async fn sweep<S: JournalStorage>(engine: &JournalEngine<S>, max_objects: u64) -
             storage_id: engine.storage_id(),
             expected_root_epoch: engine.root_epoch().unwrap(),
             max_objects,
+            work_budget: Default::default(),
         })
         .await
         .unwrap()
@@ -686,14 +758,13 @@ async fn incremental_sweep_never_reads_ten_clean_sessions() {
         (("load", dirty.clone()), 1),
         (("pins", dirty.clone()), 1),
         (("members", dirty.clone()), 1),
-        (("objects", dirty.clone()), 2),
         (("apply", dirty), 1),
         (("dirty_sessions", SessionId::new("")), 2),
     ]
     .into();
     assert_eq!(
         calls, expected,
-        "clean sessions must receive no storage calls"
+        "clean sessions receive no storage calls and the warm dirty closure needs no body reads"
     );
     eprintln!("INCREMENTAL CALLS: {calls:?}; report: {report:?}");
     storage.calls.lock().unwrap().clear();
@@ -940,6 +1011,7 @@ async fn collection_rechecks_the_mark_after_awaited_storage_reads() {
         storage_id: engine.storage_id(),
         expected_root_epoch: engine.root_epoch().unwrap(),
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     };
     let (reached, ready) = tokio::sync::oneshot::channel();
     let (resume, wait) = tokio::sync::oneshot::channel();
@@ -954,26 +1026,24 @@ async fn collection_rechecks_the_mark_after_awaited_storage_reads() {
         .expect("close suspended")
         .unwrap();
     resume.send(()).unwrap();
-    let error = task.await.unwrap().unwrap_err();
-    assert!(matches!(
-        error.class,
-        crate::error::FailureClass::StateConflict {
-            stage: crate::error::FailureStage::PreProvider,
-            component: crate::error::FailureComponent::Checkpoint
-        }
-    ));
+    // Close only removes protection, so it never fails or discards the
+    // suspended call: the mark proceeds and the orphan is collected.
+    let mut report = task.await.unwrap().unwrap();
+    let mut deleted = report.deleted;
+    let mut reclaimed = report.reclaimed_bytes;
+    while report.has_more {
+        report = sweep(&engine, u64::MAX).await;
+        deleted += report.deleted;
+        reclaimed += report.reclaimed_bytes;
+    }
+    assert_eq!((deleted, reclaimed), (1, leaf.bytes.len() as u64));
     assert!(
         storage
             .inner
             .objects(&engine.domain, &session, std::slice::from_ref(&leaf.id))
             .await
             .unwrap()[0]
-            .is_some()
-    );
-    let retry = sweep(&engine, u64::MAX).await;
-    assert_eq!(
-        (retry.deleted, retry.reclaimed_bytes),
-        (1, leaf.bytes.len() as u64)
+            .is_none()
     );
 }
 
@@ -1000,6 +1070,7 @@ async fn engine_future_sizes_stay_bounded() {
         storage_id: engine.storage_id(),
         expected_root_epoch: 0,
         max_objects: 0,
+        work_budget: Default::default(),
     };
     let sizes = [
         ("open", boxed(&journal.open(&session, writer("x")))),
@@ -1010,7 +1081,11 @@ async fn engine_future_sizes_stay_bounded() {
         ("commit", boxed(&journal.commit(&lease, commit.clone()))),
         (
             "commit_inner",
-            std::mem::size_of_val(&engine.commit_inner(&lease, Box::new(commit))),
+            std::mem::size_of_val(&engine.commit_inner(
+                &lease,
+                Box::new(commit),
+                JournalPreparationHints::default(),
+            )),
         ),
         ("renew", boxed(&journal.renew(&lease))),
         (
@@ -1129,7 +1204,8 @@ async fn memoized_writer_open_renew_and_commit_read_no_storage_objects() {
                 .collect(JournalGcRequest {
                     storage_id: engine.storage_id(),
                     expected_root_epoch: engine.root_epoch().unwrap(),
-                    max_objects: u64::MAX
+                    max_objects: u64::MAX,
+                    work_budget: Default::default(),
                 })
                 .await
                 .unwrap()
@@ -2334,6 +2410,33 @@ impl JournalStorage for PausedApply {
     async fn compact(&self, d: &JournalDomain) -> Result<(), RuntimeError> {
         self.inner.compact(d).await
     }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        // Route through this wrapper's apply so its pause hook applies.
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
+    }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         let pause = {
             let mut slot = self.pause.lock().unwrap();
@@ -2727,6 +2830,7 @@ async fn r3_collection_stays_healthy_after_the_released_pin_race() {
             storage_id: collector.storage_id(),
             expected_root_epoch: collector.root_epoch().unwrap(),
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await;
     let (_, fresh) = two_engines(&storage, 0);
@@ -2735,6 +2839,7 @@ async fn r3_collection_stays_healthy_after_the_released_pin_race() {
             storage_id: fresh.storage_id(),
             expected_root_epoch: fresh.root_epoch().unwrap(),
             max_objects: u64::MAX,
+            work_budget: Default::default(),
         })
         .await;
     assert!(
@@ -2843,6 +2948,7 @@ fn collect_all(engine: &JournalEngine<PausedApply>) -> JournalGcRequest {
         storage_id: engine.storage_id(),
         expected_root_epoch: engine.root_epoch().unwrap(),
         max_objects: u64::MAX,
+        work_budget: Default::default(),
     }
 }
 
@@ -2982,5 +3088,72 @@ async fn r3_a_stale_dependent_candidate_write_cannot_lose_retirement_authorizati
     );
 }
 
+#[path = "collection_bounded_tests.rs"]
+mod collection_bounded;
 #[path = "collection_isolation_tests.rs"]
 mod collection_isolation;
+
+// Review L3: a revoke that runs while a commit awaits storage clears the
+// session's working views; the commit's publication must not restore them.
+#[tokio::test]
+async fn a_revoke_during_a_commit_apply_keeps_working_views_cleared() {
+    for budget in [0, JournalEngineConfig::default().validated_root_memo_bytes] {
+        let storage = Arc::new(PausedApply::default());
+        let (engine, _) = two_engines(&storage, budget);
+        let session = SessionId::new("revoke-during-apply");
+        let mut known = BTreeSet::new();
+        let lease = engine.open(&session, writer("w")).await.unwrap();
+        let first = engine
+            .commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    None,
+                    "one",
+                    ext_snapshot(&session, "a"),
+                    &mut known,
+                ),
+            )
+            .await
+            .unwrap();
+        let views = |engine: &JournalEngine<PausedApply>| {
+            let local = engine.local.lock().unwrap();
+            let record = local.sessions.get(&session).unwrap();
+            (
+                record.exact.is_some(),
+                record.protected_snapshot.is_some(),
+                record.protected_encoding.is_some(),
+            )
+        };
+        assert!(views(&engine).1, "precondition: a working view exists");
+        let (resume, paused) = storage.pause_next(JournalWriteKind::Commit);
+        let (committed, ()) = tokio::join!(
+            engine.commit(
+                &lease,
+                full_commit(
+                    &session,
+                    1,
+                    Some(&first),
+                    "two",
+                    ext_snapshot(&session, "b"),
+                    &mut known,
+                ),
+            ),
+            async {
+                paused.await.unwrap();
+                engine.revoke_writer(&session).unwrap();
+                resume.send(()).unwrap();
+            }
+        );
+        committed.unwrap();
+        assert_eq!(
+            views(&engine),
+            (false, false, false),
+            "budget {budget}: publication restored views a revoke cleared"
+        );
+    }
+}
+
+#[path = "collection_proof_tests.rs"]
+mod collection_proof;

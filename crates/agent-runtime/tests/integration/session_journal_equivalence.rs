@@ -3846,7 +3846,7 @@ async fn crash_matrix_barriers() -> Vec<CrashMatrixBarrier> {
         crate::external_agent::task_2_6_external_tool_call_trace().await,
         CrashMatrixProfile::External,
     );
-    let mut expected = [
+    let expected = [
         "accepted",
         "internal_accepted",
         "local_action_accepted",
@@ -3872,7 +3872,11 @@ async fn crash_matrix_barriers() -> Vec<CrashMatrixBarrier> {
     .into_iter()
     .collect::<BTreeSet<_>>();
     #[cfg(feature = "external-agent")]
-    expected.insert("external_tool_call");
+    let expected = {
+        let mut expected = expected;
+        expected.insert("external_tool_call");
+        expected
+    };
     assert_eq!(
         protected
             .keys()
