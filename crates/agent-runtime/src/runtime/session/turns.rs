@@ -234,20 +234,22 @@ impl SessionHandle {
     /// Attempts one LCM compaction at the current idle turn boundary.
     /// Returns lifecycle metadata and usage without exposing a summary body.
     pub async fn try_idle_compaction(&self) -> Result<IdleCompactionAdmission, RuntimeError> {
-        Ok(match Box::pin(self.run_idle_compaction()).await? {
-            IdleBoundaryAdmission::Accepted {
-                changed,
-                fallback_reason,
-                usage,
-                ..
-            } => IdleCompactionAdmission::Accepted {
-                changed,
-                fallback_reason,
-                usage,
+        Ok(
+            match Box::pin(self.run_idle_compaction(IdleAttempt::Interval)).await? {
+                IdleBoundaryAdmission::Accepted {
+                    changed,
+                    fallback_reason,
+                    usage,
+                    ..
+                } => IdleCompactionAdmission::Accepted {
+                    changed,
+                    fallback_reason,
+                    usage,
+                },
+                IdleBoundaryAdmission::Busy => IdleCompactionAdmission::Busy,
+                IdleBoundaryAdmission::Shutdown => IdleCompactionAdmission::Shutdown,
             },
-            IdleBoundaryAdmission::Busy => IdleCompactionAdmission::Busy,
-            IdleBoundaryAdmission::Shutdown => IdleCompactionAdmission::Shutdown,
-        })
+        )
     }
 
     /// Attempts one flat semantic compaction at the current idle turn boundary.
@@ -258,6 +260,27 @@ impl SessionHandle {
     /// each idle interval permits one attempt, including a model fallback.
     pub async fn try_idle_semantic_compaction(
         &self,
+    ) -> Result<SemanticIdleCompactionAdmission, RuntimeError> {
+        self.run_semantic_compaction(IdleAttempt::Interval).await
+    }
+
+    /// Attempts one flat semantic compaction at the current idle turn boundary
+    /// on an explicit host request, such as a user's manual compact command.
+    ///
+    /// Identical to [`Self::try_idle_semantic_compaction`] except that an
+    /// earlier attempt in the same idle interval does not refuse it, so a host
+    /// can retry after a failed or fallback summary without a new turn. Every
+    /// other admission, checkpoint, persistence and rollback rule still
+    /// applies, and the interval stays attempted for automatic callers.
+    pub async fn try_manual_semantic_compaction(
+        &self,
+    ) -> Result<SemanticIdleCompactionAdmission, RuntimeError> {
+        self.run_semantic_compaction(IdleAttempt::Manual).await
+    }
+
+    async fn run_semantic_compaction(
+        &self,
+        attempt: IdleAttempt,
     ) -> Result<SemanticIdleCompactionAdmission, RuntimeError> {
         if self
             .inner
@@ -270,7 +293,7 @@ impl SessionHandle {
                 "idle semantic compaction requires a configured flat summary component",
             ));
         }
-        Ok(match Box::pin(self.run_idle_compaction()).await? {
+        Ok(match Box::pin(self.run_idle_compaction(attempt)).await? {
             IdleBoundaryAdmission::Accepted {
                 summary,
                 semantic_fallback_reason,
@@ -286,7 +309,10 @@ impl SessionHandle {
         })
     }
 
-    async fn run_idle_compaction(&self) -> Result<IdleBoundaryAdmission, RuntimeError> {
+    async fn run_idle_compaction(
+        &self,
+        attempt: IdleAttempt,
+    ) -> Result<IdleBoundaryAdmission, RuntimeError> {
         // Claim both admission layers before publishing the idle attempt.  In
         // particular, do not release `admission_gate` and then await
         // `turn_gate`: a user can otherwise win admission in that gap and the
@@ -306,7 +332,8 @@ impl SessionHandle {
             }
             if self.inner.user_submission_pending.load(Ordering::Acquire) != 0
                 || turns.count != 0
-                || self.inner.idle_compaction_attempted.load(Ordering::Acquire)
+                || (attempt == IdleAttempt::Interval
+                    && self.inner.idle_compaction_attempted.load(Ordering::Acquire))
             {
                 return Ok(IdleBoundaryAdmission::Busy);
             }
@@ -1490,6 +1517,15 @@ impl Drop for IdleCompactionGuard {
             .idle_compaction_inflight
             .store(false, Ordering::Release);
     }
+}
+
+/// Whether an idle compaction honours the once-per-interval gate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdleAttempt {
+    /// Refused once the current idle interval has had an attempt.
+    Interval,
+    /// Host-requested; may repeat within an interval.
+    Manual,
 }
 
 #[allow(clippy::large_enum_variant)]
