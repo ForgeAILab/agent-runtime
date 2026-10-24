@@ -24,6 +24,7 @@ enum Defect {
     PartialCollectionApply,
     UnderReportedUnits,
     DroppedPinPage,
+    RepeatedMemberPage,
 }
 trait Fault: std::fmt::Debug + Send + Sync + 'static {
     const DEFECT: Defect;
@@ -35,7 +36,7 @@ macro_rules! faults {
         impl Fault for $name { const DEFECT: Defect = Defect::$name; }
     )*};
 }
-faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; UnboundedPage; StaleCollectionPage; PartialCollectionApply; UnderReportedUnits; DroppedPinPage; }
+faults! { TornTransaction; LostWrite; ReorderedCommit; StaleEpoch; StaleGeneration; SharedBodyDeleted; DeadBodyServed; CachedBodyWithoutMembership; PrefixLookup; MembersWithoutMembership; NonRetryableLostAck; UnboundedPage; StaleCollectionPage; PartialCollectionApply; UnderReportedUnits; DroppedPinPage; RepeatedMemberPage; }
 
 type CacheKey = (String, u8, SessionId, JournalObjectId);
 type AdmittedKey = (String, u8);
@@ -259,6 +260,18 @@ impl<F: Fault> JournalStorage for Broken<F> {
             // The only defect: continued pin pages lose their pins.
             let mut page = self.inner().collection_page(d, s, request).await?;
             page.items = JournalCollectionItems::Pins(vec![]);
+            return Ok(page);
+        }
+        if F::DEFECT == Defect::RepeatedMemberPage
+            && request.kind == JournalCollectionPageKind::Members
+        {
+            let continued = request.after.is_some();
+            let mut page = self.inner().collection_page(d, s, request).await?;
+            if continued {
+                if let JournalCollectionItems::Members(ids) = &mut page.items {
+                    ids[0] = self.inner().members(d, s).await?.into_iter().min().unwrap();
+                }
+            }
             return Ok(page);
         }
         self.inner().collection_page(d, s, request).await
@@ -564,6 +577,11 @@ async fn under_reported_preflight_units_fail_bounded_collection_protocol() {
 async fn dropped_pin_pages_fail_bounded_collection_protocol() {
     let message = rejects::<DroppedPinPage>("bounded_collection_protocol").await;
     assert!(message.contains("pin pages in pin order"));
+}
+#[tokio::test]
+async fn repeated_member_pages_fail_bounded_collection_protocol() {
+    let message = rejects::<RepeatedMemberPage>("bounded_collection_protocol").await;
+    assert!(message.contains("member pages must enumerate unique full ids"));
 }
 #[tokio::test]
 async fn non_retryable_lost_acknowledgement_fails_atomic_apply_cuts() {

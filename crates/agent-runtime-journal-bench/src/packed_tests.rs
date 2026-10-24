@@ -170,7 +170,15 @@ async fn busy_apply_is_retryable_without_durable_change_and_collection_aborts() 
         before,
         "no durable changes after reopening"
     );
-    let report = engine.collect(request(&engine)).await.unwrap();
+    let mut report = engine.collect(request(&engine)).await.unwrap();
+    // A work-budget yield can leave the second session for a later call.
+    for _ in 0..1000 {
+        if !report.has_more {
+            break;
+        }
+        report.accumulate(engine.collect(request(&engine)).await.unwrap());
+    }
+    assert!(!report.has_more, "the retry drain must terminate");
     assert!(report.unreadable_sessions.is_empty());
     assert_eq!(
         report.deleted, 2,

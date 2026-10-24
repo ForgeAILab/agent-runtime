@@ -100,7 +100,7 @@ part of the complete live union.
 
 #### Scenario: Current and certified historical roots are warm
 
-- **WHEN** collection authenticates the same current head and certified durable pins as its validated proofs
+- **WHEN** collection authenticates and retains current-head and certified-pin proofs within the memo budget and thirty-two-root cap
 - **THEN** those roots require zero old-body closure fetches and zero old-edge revalidation
 - **AND** collection results and receipts equal full tracing while satisfying bench.md P2 acceptance
 
@@ -132,21 +132,32 @@ part of the complete live union.
 
 #### Scenario: Many certified roots share a bounded collector
 
-- **WHEN** more than sixteen certified roots are reused in one mark
+- **WHEN** seventeen through thirty-two certified roots are reused in one mark
 - **THEN** every proof layer retains its original immutable evidence without a copied member-set layer
 - **AND** cursor charge covers the layer references and proof handles while memo reservations cover proof retention
+- **AND** encountering another root beyond thirty-two clears reused proof layers/reservations and cold-traces all those roots for the rest of the session
 
 #### Scenario: Reader and writer-renew churn during a mark
 
 - **WHEN** a reader opens or closes during Pins, Trace or Inventory, or a writer renews with an evicted memo for the same stored head
 - **THEN** unchanged working proof and already shared layers retain mark progress
-- **AND** added lease protection is checked at pre-apply and filtered before every destructive batch
+- **AND** added leases do not restart the mark; every current lease filters protected ids before each destructive batch
+- **AND** the full stored fence, working-proof identity and atomic storage fence checks remain in force
 
 #### Scenario: Proof retention cannot fit
 
-- **WHEN** outstanding reservations or protected current-head entries prevent a proof reservation
+- **WHEN** outstanding reservations or current-head entries protected by an active writer or open lease prevent a proof reservation
 - **THEN** reuse declines before evicting any memo entry
-- **AND** collector lookups do not change LRU priority and unresolved cached summaries take the stored-metadata cold path
+- **AND** idle current heads remain evictable; collector lookups emit memo hit/miss counters without changing LRU priority
+- **AND** unresolved cached summaries take the stored-metadata cold path
+
+#### Scenario: Inventory layers or pages violate the counting contract
+
+- **WHEN** shared layer and count lengths differ
+- **THEN** collection MUST return a contract error in debug and release builds before inventory zips can truncate
+- **WHEN** repeated membership ids make hits exceed a live layer's length
+- **THEN** collection MUST restart as a conflict under the per-mark retry bound, without unreadable reporting or releases
+- **AND** conformance MUST enforce unique full ids across pages while preserving storage-defined order
 
 #### Scenario: Live membership is incomplete
 
@@ -222,6 +233,12 @@ in bench.md P4 under the named fixture/storage conditions.
 - **WHEN** expected_root_epoch does not match the engine epoch
 - **THEN** the existing state-conflict result is retained without destructive work
 - **AND** Restarted progress applies only to a stale private cursor under an otherwise valid fresh request
+
+#### Scenario: Remaining restart causes persist across calls
+
+- **WHEN** fence, working-proof or page conflicts invalidate the same session mark chain repeatedly across calls
+- **THEN** collection MUST retry at most once in the current pass and skip after the second invalidation
+- **AND** dirty state survives while later sessions and discovery pages complete
 
 #### Scenario: Root ownership changes across a yield
 

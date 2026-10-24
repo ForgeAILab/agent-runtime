@@ -292,22 +292,26 @@ are resolved. Inventory remains bounded by P4's member pages.
 
 Warm proof acquisition is proportional to authenticated roots/pins and new or
 uncertified closure portions. Inventory/difference and live-membership checks
-remain O(M) for M session memberships; releasing R ids, catalog updates and
-storage purges still cost O(R) or storage-specific bounded pack work. Cold or
+remain O(M × L) for M session memberships and L shared layers. Reused proofs
+are capped at 32 per mark; encountering another root clears reused layers and
+reservations and sends every reused root through bounded cold tracing for the
+rest of that session. The six B/4000 roots and twenty-root sharing fixture stay
+inside the cap. Live lease layers remain separately protected. Releasing R ids,
+catalog updates and storage purges still cost O(R) or storage-specific bounded pack work. Cold or
 unprovable roots remain O(graph). No claim that warm collection is O(1).
 
 A matched monotonic current head continuously protects its exact closure.
 Historical certificates establish the stronger pin history required by D-1;
 pin existence alone does not. Before each apply, the full session fence and
 root/pin epoch protect the authenticated live union. An epoch change while a
-metadata/preflight await is in flight rechecks the marked session's lease set
-and active-writer working-proof identity before mutation. Lease ids are captured
-only when their layers join the mark. Only added leases with layers outside the
-marked union restart at pre-apply; removed leases retain conservative protection.
-Renewed handles with the same shared layers do not restart. On resume, the
-working-proof identity and freshly loaded full fence authenticate the mark
-before adopting the new epoch. Unrelated-session
-churn never restarts the mark, preserving P4's accepted restart rule. A collection may
+metadata/preflight await is in flight rechecks the active-writer working-proof
+identity before mutation. Added readers do not restart the mark: every release
+batch filters all ids held by current leases before storage preflight. Reader
+open is gated; renew preserves layers, and close/revoke remove protection only.
+Removed leases retain conservative marked protection until the next pass. On
+resume, the working-proof identity and freshly loaded full fence authenticate
+the mark before adopting the new epoch. Unrelated-session churn never restarts
+the mark, preserving P4's accepted restart rule. A collection may
 invalidate only affected historical proofs on acknowledged release and must
 trim released cache-only bodies; re-admission must still occur later.
 
@@ -325,9 +329,11 @@ revision behavior; proof reuse cannot hide unreadable authority metadata.
 with engine identity supplied by its memo reservation owner and explicit
 domain/session/root, current-or-certified-pin source, full fence and epoch.
 Temporary retention reserves a conservative proof/summary charge against the
-same configured memo budget, preflighting eligible non-current LRU cache entries
-before eviction or declining reuse without eviction. Collector lookups leave LRU
-order unchanged. Unresolved cached summaries decline reuse before reservation,
+same configured memo budget. Admission preflights LRU victims before eviction
+and protects current heads only for sessions with an active writer or an open
+lease. A declined reservation evicts nothing. Collector lookups leave LRU order
+unchanged while emitting `rt.memo.hit`/`rt.memo.miss`. Idle hydrated current heads
+remain evictable. Unresolved cached summaries decline reuse before reservation,
 leaving stored metadata and the cold walker to decide collectability;
 RAII releases the reservation on completion, restart, skip, cancellation or
 cursor disposal. Producer memo admission includes outstanding reservations.
@@ -338,15 +344,24 @@ The collector deduplicates and appends both member and evidence layer Arcs
 without using the writer's member-layer coalescing helper: COW coalescing would
 allocate a new member set in cursor workspace. Membership pages test each
 retained layer once per id and count it independently, preserving the full
-live-subset integrity check without materializing their union. A failed subset
-check reports the session in the existing sorted `unreadable_sessions` field
+live-subset integrity check without materializing their union. Layer/count
+length mismatch is a hard contract error in all builds, before any zip. Member
+pages enumerate each full id exactly once in the adapter's storage-defined
+order, including packed `(pack, slot)` order. Excess live-layer hit counts from
+repeated ids are conflicts that restart under the per-mark bound; conformance
+checks uniqueness across page boundaries. A failed subset check reports the session in the
+existing sorted `unreadable_sessions` field
 with dirty state retained, skips it for this pass and does not set `has_more`
 by itself. It is distinct from a physical continuation conflict and cannot
-trigger an endless one-unit restart loop. The cold walker also reports missing bodies as incomplete
-membership after reloading and matching the mark's full fence; a concurrent
+trigger an endless one-unit restart loop. The cold walker also reports missing
+bodies as incomplete membership after reloading and matching the mark's full fence; a concurrent
 fence change retains the restart path. This includes recreated historical pins
-whose bodies were already collected. The lease filter and atomic storage fence
-still guard every apply, and only acknowledged collector writes advance the
+whose bodies were already collected. A process-local lease over bodies another
+engine already collected, and a recreated historical pin with missing bodies,
+are reported on every host pass while they persist. They keep dirty state and
+block collection of that session; reporting does not repair cross-engine
+retention. The lease filter and atomic storage fence still guard every apply,
+and only acknowledged collector writes advance the
 cursor's fence.
 
 ### Acceptance, estimated effect and size
@@ -554,8 +569,11 @@ A resumed mark's fence read is a prerequisite, not a unit. The gate is
 acquired with the existing futures mutex without a timer. Reports carry
 `work_units` and `zero_work_calls` (consecutive calls that started no unit) so
 a host can back off. A restarted session is retried after the current
-discovery page (rotated to the back), and a second restart within one call
-skips it for that call, so one churning session never stalls a pass. A
+discovery page (rotated to the back). A mark chain may restart once across
+calls; its second invalidation skips the session for the rest of the pass with
+durable and local dirty state retained. The cursor retains this counter across
+replacement marks, so repeated fence/proof/page changes cannot starve later
+discovery pages. A new host pass gets a fresh retry budget. A
 session stopped part-way by the `max_objects` budget makes its pass end with
 `has_more`. Dropping a call mid-flight restores the dirty hints it took.
 
@@ -567,9 +585,9 @@ the request itself carries a valid current epoch. Before resuming, authenticate
 the session fence and active writer's working-proof identity. A commit, writer
 change, retirement, pin/staging/catalog change or dependency index write changes
 the session's fence; replacing or clearing working evidence also discards the
-speculative mark. Reader lease ids remain unset until the lease phase. Only an
-added lease with previously unmarked layers discards the mark, at pre-apply;
-closing a lease never restarts solely because its id disappeared. Changes on
+speculative mark. Reader layers join at the lease phase; later additions are
+protected by the release filter without discarding the mark. Closing a lease
+never restarts solely because its id disappeared. Changes on
 other sessions never restart it, and a root-epoch change alone is not a restart
 cause: close, renew and revoke only remove protection,
 and lease roots registered after the mark are filtered out of every release
@@ -820,3 +838,14 @@ recovery compatibility, and differential tests across the revision boundary.
 P1 retains the existing format and transition revision. Caching the exact
 existing fingerprint for an unchanged immutable state is format-preserving,
 but the first hash of each newly assembled request remains O(request bytes).
+
+
+## Owner decision addendum: second P2 review (2026-10-23)
+
+The maintainer explicitly replaces the prior added-lease pre-apply restart
+requirement: drop that restart and rely on the current-lease release filter.
+Keep full stored-fence, active-writer working-proof identity and atomic storage
+fence checks. Remaining restarts must be bounded per mark chain across calls;
+the implementation permits one retry, then skips the session for this pass
+with dirty state retained. This addendum supersedes conflicting earlier
+lease-restart descriptions; earlier owner decisions above remain verbatim.
