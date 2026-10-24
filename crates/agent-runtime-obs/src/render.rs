@@ -27,6 +27,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::RegistrySnapshotSealed { .. } => "registry_snapshot_sealed",
         RuntimeEvent::ScopedViewDerived { .. } => "scoped_view_derived",
         RuntimeEvent::ModelProfileResolved { .. } => "model_profile_resolved",
+        RuntimeEvent::ModelFallback { .. } => "model_fallback",
         RuntimeEvent::CapabilityRetrievalPerformed { .. } => "capability_retrieval_performed",
         RuntimeEvent::CapabilitiesActivated { .. } => "capabilities_activated",
         RuntimeEvent::ContextPlanned { .. } => "context_planned",
@@ -72,6 +73,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ChildProgress { .. } => "child_progress",
         RuntimeEvent::ChildNeedsInput { .. } => "child_needs_input",
         RuntimeEvent::ChildCompleted { .. } => "child_completed",
+        RuntimeEvent::ChildLimitReached { .. } => "child_limit_reached",
         RuntimeEvent::ChildStopped { .. } => "child_stopped",
         RuntimeEvent::ChildFailed { .. } => "child_failed",
         RuntimeEvent::SessionShutdown => "session_shutdown",
@@ -98,6 +100,19 @@ pub fn log_line(env: &EventEnvelope) -> String {
 
 fn summary(payload: &RuntimeEvent) -> String {
     match payload {
+        RuntimeEvent::ModelFallback {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            reason,
+            elapsed_ms,
+            ..
+        } => {
+            format!(
+                "model_fallback from={from_provider}/{from_model} to={to_provider}/{to_model} reason={reason:?} elapsed_ms={elapsed_ms}"
+            )
+        }
         RuntimeEvent::RegistrySnapshotSealed { snapshot, entries } => {
             format!("registry_snapshot_sealed snapshot={snapshot} entries={entries}")
         }
@@ -558,6 +573,9 @@ fn summary(payload: &RuntimeEvent) -> String {
         }
         RuntimeEvent::ChildCompleted { child, result } => {
             format!("child_completed child={child} {}", clip(result, 200))
+        }
+        RuntimeEvent::ChildLimitReached { child, limit } => {
+            format!("child_limit_reached child={child} limit={}", limit.as_str())
         }
         RuntimeEvent::ChildStopped { child, reason } => {
             format!("child_stopped child={child} reason={reason:?}")

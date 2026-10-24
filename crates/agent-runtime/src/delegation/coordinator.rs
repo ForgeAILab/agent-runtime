@@ -180,11 +180,7 @@ impl DelegationCoordinator {
                         "protected child outcome references an unknown child",
                     ));
                 }
-                let outcome_child = match &outcome {
-                    ChildTaskOutcome::Completed { child, .. }
-                    | ChildTaskOutcome::NeedsInput { child, .. } => child,
-                };
-                if key.child() != outcome_child {
+                if key.child() != outcome.child() {
                     return Err(RuntimeError::conflict(
                         "protected child outcome key does not match its outcome",
                     ));
@@ -551,16 +547,7 @@ impl DelegationCoordinator {
                 // than ordering by the opaque lexical id.
                 _ => 0,
             };
-            let current = match value {
-                ChildTaskOutcome::NeedsInput { request, .. } => ChildTaskOutcome::NeedsInput {
-                    child: child.clone(),
-                    request: request.clone(),
-                },
-                ChildTaskOutcome::Completed { result, .. } => ChildTaskOutcome::Completed {
-                    child: child.clone(),
-                    result: result.clone(),
-                },
-            };
+            let current = value.clone();
             if latest
                 .as_ref()
                 .is_none_or(|(latest_sequence, _)| sequence > *latest_sequence)
@@ -604,14 +591,7 @@ impl DelegationCoordinator {
         call: &ToolCallId,
         outcome: &ChildTaskOutcome,
     ) -> Result<(), RuntimeError> {
-        let (child, identity) = match outcome {
-            ChildTaskOutcome::Completed { child, result } => {
-                (child, TaskOutcomeKey::Completed(result.turn.clone()))
-            }
-            ChildTaskOutcome::NeedsInput { child, request } => {
-                (child, TaskOutcomeKey::NeedsInput(request.id().clone()))
-            }
-        };
+        let (child, identity) = (outcome.child(), outcome.identity());
         let key = ChildOutcomeKey::new(child.clone(), identity.clone());
         let map_key = (child.clone(), identity);
         let recorded = self
@@ -768,7 +748,8 @@ impl DelegationCoordinator {
         }
     }
 
-    /// Waits until the child completes normally or returns exact task input.
+    /// Waits until the child completes normally, stops at a limit, or returns
+    /// exact task input.
     ///
     /// Unlike [`Self::wait`], this has no snapshot timeout and returns a typed
     /// [`ChildTaskOutcome`]. An accepted [`Self::follow_up`] clears the prior
@@ -1080,6 +1061,13 @@ fn validate_outcome_key_value(
             RuntimeError::conflict("protected child outcome key does not match its completed turn"),
         ),
         (
+            ChildOutcomeIdentity::Completed(turn),
+            ChildTaskOutcome::LimitReached { turn: stopped, .. },
+        ) if stopped == turn => Ok(()),
+        (ChildOutcomeIdentity::Completed(_), ChildTaskOutcome::LimitReached { .. }) => Err(
+            RuntimeError::conflict("protected child outcome key does not match its stopped turn"),
+        ),
+        (
             ChildOutcomeIdentity::NeedsInput(request_id),
             ChildTaskOutcome::NeedsInput { request, .. },
         ) if request.id() == request_id => Ok(()),
@@ -1263,6 +1251,21 @@ fn child_completion_lines(
                 }
                 push_transferred_artifacts(&mut content, &result.artifacts, compact);
             }
+            ChildTaskOutcome::LimitReached {
+                child,
+                limit,
+                artifacts,
+                ..
+            } => {
+                content.push_str(&format!(
+                    "- child {child} stopped at {} before finishing its task. It gave no final \
+                     answer, and nothing it said in that task is a result. It is still available: \
+                     if it has turns left, a follow-up can continue the work (in smaller steps \
+                     if the limit was output), or read its transcript to see what it did.\n",
+                    child_limit_description(*limit)
+                ));
+                push_transferred_artifacts(&mut content, artifacts, compact);
+            }
             ChildTaskOutcome::NeedsInput { child, request } => {
                 content.push_str("- child ");
                 content.push_str(child.as_str());
@@ -1407,6 +1410,115 @@ mod tests {
                 },
             },
         )
+    }
+
+    fn limit_reached(child: &str, limit: LimitKind) -> (ChildOutcomeKey, ChildTaskOutcome) {
+        (
+            ChildOutcomeKey::new(
+                ChildId::new(child),
+                ChildOutcomeIdentity::Completed(TurnId::new("turn-1")),
+            ),
+            ChildTaskOutcome::LimitReached {
+                child: ChildId::new(child),
+                turn: TurnId::new("turn-1"),
+                limit,
+                artifacts: vec![artifact("artifact-copy", Some("artifact-source"))],
+            },
+        )
+    }
+
+    #[test]
+    fn a_limit_outcome_is_delivered_as_the_limit_not_as_a_completion() {
+        let content = child_completion_content(
+            &[limit_reached("child-1", LimitKind::Output)],
+            DEFAULT_CHILD_DELIVERY_INLINE_BYTES,
+        );
+        assert!(
+            content.contains("- child child-1 stopped at its output limit"),
+            "{content}"
+        );
+        assert!(content.contains("gave no final answer"), "{content}");
+        assert!(!content.contains("completed"), "{content}");
+        assert!(
+            content.contains("- artifact-copy (copy of child artifact artifact-source"),
+            "a stopped turn's artifacts are still handed over: {content}"
+        );
+
+        let compact =
+            child_completion_content(&[limit_reached("child-1", LimitKind::ToolSteps)], 0);
+        assert!(
+            compact.contains("stopped at its tool-step limit"),
+            "{compact}"
+        );
+    }
+
+    #[test]
+    fn a_limit_outcome_key_must_name_its_stopped_turn() {
+        let (key, outcome) = limit_reached("child-1", LimitKind::Time);
+        validate_outcome_key_value(&key, &outcome).unwrap();
+
+        let other_turn = ChildOutcomeKey::new(
+            ChildId::new("child-1"),
+            ChildOutcomeIdentity::Completed(TurnId::new("turn-2")),
+        );
+        assert!(validate_outcome_key_value(&other_turn, &outcome).is_err());
+        let request = ChildOutcomeKey::new(
+            ChildId::new("child-1"),
+            ChildOutcomeIdentity::NeedsInput(InteractionRequestId::new("request-1")),
+        );
+        let error = validate_outcome_key_value(&request, &outcome).unwrap_err();
+        assert!(error.message.contains("variant"));
+    }
+
+    #[test]
+    fn a_limit_outcome_leaves_an_idle_status_with_the_limit_and_no_result() {
+        let (_, outcome) = limit_reached("child-1", LimitKind::Output);
+        let mut status = ChildStatus {
+            child: ChildId::new("child-1"),
+            parent: SessionId::new("parent"),
+            session: SessionId::new("child-session"),
+            durability: ChildDurability::Ephemeral,
+            state: ChildState::Running,
+            workspace: WorkspacePolicy::ReadOnlyView,
+            turns_used: 2,
+            max_turns: 4,
+            tokens_used: 0,
+            last_result: Some("an earlier task's answer".to_owned()),
+            last_artifacts: Vec::new(),
+            updated_at: Timestamp::ZERO,
+            incompatibility: None,
+            last_error: None,
+        };
+        outcome.apply_to_status(&mut status);
+        assert_eq!(status.state, ChildState::Idle);
+        assert_eq!(status.last_result, None);
+        assert_eq!(status.last_artifacts.len(), 1);
+        let error = status.last_error.expect("the limit is named on the status");
+        assert_eq!(error.kind, ErrorKind::Limit);
+        assert!(error.message.contains("output limit"), "{}", error.message);
+        assert_eq!(
+            error.metadata,
+            agent_runtime_core::metadata::Metadata::new().with("limit", "output")
+        );
+    }
+
+    #[test]
+    fn a_limit_outcome_roundtrips_and_a_completed_one_keeps_its_shape() {
+        let (_, outcome) = limit_reached("child-1", LimitKind::ProviderAttempts);
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["LimitReached"]["limit"], "provider_attempts");
+        assert_eq!(json["LimitReached"]["turn"], "turn-1");
+        assert_eq!(
+            serde_json::from_value::<ChildTaskOutcome>(json).unwrap(),
+            outcome
+        );
+
+        let (_, completed) = completed("child-1", "answer".to_owned(), vec![], None);
+        let json = serde_json::to_value(&completed).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"Completed":{"child":"child-1","result":{"turn":"turn-1","text":"answer"}}})
+        );
     }
 
     #[test]

@@ -2148,10 +2148,7 @@ pub async fn assert_returned_input_reverse_arrival_is_canonical() {
     assert_eq!(
         automatic
             .iter()
-            .map(|outcome| match outcome {
-                ChildTaskOutcome::NeedsInput { child, .. }
-                | ChildTaskOutcome::Completed { child, .. } => child.as_str(),
-            })
+            .map(|outcome| outcome.child().as_str())
             .collect::<Vec<_>>(),
         [first_child.as_str(), second_child.as_str()]
     );

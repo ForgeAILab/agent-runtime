@@ -53,6 +53,21 @@ async fn foreign_artifact_results_fail_closed_without_completion_event() {
 }
 
 #[tokio::test]
+async fn a_limit_stopped_child_reports_the_limit_not_a_completion() {
+    delegation::assert_limit_stopped_child_reports_the_limit().await;
+}
+
+#[tokio::test]
+async fn a_limit_stopped_child_recovers_as_the_limit() {
+    delegation::assert_limit_stopped_child_recovers_as_the_limit().await;
+}
+
+#[tokio::test]
+async fn a_legacy_completed_record_of_a_limit_still_recovers() {
+    delegation::assert_legacy_completed_record_of_a_limit_still_recovers().await;
+}
+
+#[tokio::test]
 async fn a_reasoning_only_child_answer_survives_as_the_result() {
     delegation::assert_reasoning_only_result_survives().await;
 }

@@ -503,7 +503,10 @@ impl TurnCheckpoint {
                 return Ok(self.clone());
             }
         }
-        if !self.state.can_transition_to(&next) {
+        if !self
+            .state
+            .can_transition_for_revision(&next, self.transition_revision)
+        {
             return Err(RuntimeError::conflict(format!(
                 "invalid turn transition from {} to {}",
                 state_name(&self.state),
@@ -613,7 +616,10 @@ impl TurnCheckpoint {
                 "checkpoint successor regressed its event watermark",
             ));
         }
-        if !self.state.can_transition_to(&next.state) {
+        if !self
+            .state
+            .can_transition_for_revision(&next.state, self.transition_revision)
+        {
             return Err(RuntimeError::conflict(format!(
                 "invalid checkpoint successor from {} to {}",
                 state_name(&self.state),
@@ -785,10 +791,12 @@ impl CheckpointEvidence<'_> {
                 self.schema_version, CHECKPOINT_SCHEMA_VERSION
             )));
         }
-        if self.transition_revision != TURN_TRANSITION_REVISION {
+        if !supports_turn_transition_revision(self.transition_revision) {
             return Err(RuntimeError::conflict(format!(
-                "unsupported turn transition revision {}; expected {}",
-                self.transition_revision, TURN_TRANSITION_REVISION
+                "unsupported turn transition revision {}; expected {} or {}",
+                self.transition_revision,
+                TURN_TRANSITION_REVISION,
+                MODEL_FALLBACK_TURN_TRANSITION_REVISION
             )));
         }
         if self.watermark.checkpoint_sequence == 0 {

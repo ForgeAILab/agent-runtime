@@ -389,6 +389,20 @@ impl Driver {
         deadline: Deadline,
     ) -> Result<PlannedProviderRequest, RequestBuildError> {
         crate::journal_profile_scope!("rt.runtime.build_request", {
+            let planner = self.planner(execution);
+            if self.route_planner.is_some()
+                && !planner
+                    .profile()
+                    .input_modalities
+                    .contains(&agent_runtime_core::catalog::Modality::Image)
+                && history
+                    .iter()
+                    .any(|message| super::fallback::contains_images(&message.content))
+            {
+                return Err(RequestBuildError::Incompatible(
+                    "fallback model cannot accept the request's images",
+                ));
+            }
             debug_assert_eq!(
                 execution.active_history_start(turn_id),
                 Some(active_history_start),
@@ -402,7 +416,7 @@ impl Driver {
                 InteractionDisposition::ReturnToParent => true,
                 InteractionDisposition::Unavailable => false,
             };
-            let mut revisions = execution.planner.revisions().clone();
+            let mut revisions = planner.revisions().clone();
             revisions.harness_pipeline = self.harness.fingerprint().clone();
             let mut activation = Vec::new();
             let mut contributed = Vec::new();
@@ -562,7 +576,7 @@ impl Driver {
             let planned = if internal_input.is_some() {
                 let active_suffix_start = (projected_active_start < projected_history.len())
                     .then_some(projected_active_start);
-                execution.planner.plan_internal_turn_from(
+                planner.plan_internal_turn_from(
                     self.config.system_prompt.as_deref(),
                     projected_history,
                     history_offset,
@@ -574,7 +588,7 @@ impl Driver {
                     &activation,
                 )?
             } else if history_offset == 0 {
-                execution.planner.plan_activated_turn_from(
+                planner.plan_activated_turn_from(
                     self.config.system_prompt.as_deref(),
                     projected_history,
                     &schemas,
@@ -584,7 +598,7 @@ impl Driver {
                     &activation,
                 )?
             } else {
-                execution.planner.plan_projected_turn_from(
+                planner.plan_projected_turn_from(
                     self.config.system_prompt.as_deref(),
                     projected_history,
                     history_offset,
@@ -865,10 +879,22 @@ impl Driver {
         turn_deadline: Deadline,
         state: &Arc<Mutex<SessionState>>,
     ) -> ProviderTurnOutcome {
+        use super::fallback::{FirstResponseBudget, wait_budget};
+        use agent_runtime_core::event::ModelFallbackReason;
+        let fallback_enabled = !self.fallback_routes.is_empty();
+        let mut startup = FirstResponseBudget::new(self.clock.as_ref(), None);
+        let replay_safe = self.provider.pre_output_replay_safe(&request);
+        let mut request_progress = false;
+        let mut preparation_complete = false;
         let mut attempt_index: u32 = 0;
         let mut credential_recovery_used = false;
         let original_message_count = request.messages.len();
-        let planner = provider_plan.map_or(self.planner_template.as_ref(), |(planner, _)| planner);
+        let planner = provider_plan.map_or(
+            self.route_planner
+                .as_deref()
+                .unwrap_or(self.planner_template.as_ref()),
+            |(planner, _)| planner,
+        );
         // The plan becomes a provider-cache predecessor only after an adapter
         // accepts the normalized request and returns a stream. Adapter-local
         // payload validation may fail synchronously before any provider I/O;
@@ -900,6 +926,7 @@ impl Driver {
                 Some(ms) => turn_deadline.earliest(Deadline::after(self.clock.as_ref(), ms)),
                 None => turn_deadline,
             };
+            let attempt_cancel = turn_cancel.child();
             let ctx = ProviderCallContext {
                 // Stable for the life of the session, which is what a
                 // provider-side prefix cache has to be partitioned by.
@@ -908,7 +935,7 @@ impl Driver {
                 attempt_id: attempt_id.clone(),
                 cache_identity: cache.and_then(|projection| projection.cache_identity.clone()),
                 purpose: ProviderAttemptPurpose::Ordinary,
-                cancel: turn_cancel.child(),
+                cancel: attempt_cancel.clone(),
                 deadline: attempt_deadline,
             };
 
@@ -956,9 +983,53 @@ impl Driver {
                 }
             };
 
-            match self.provider.stream(request.clone(), ctx).await {
+            let mut startup_timeout = false;
+            let mut stream_accepted = false;
+            let prepared = if !preparation_complete {
+                let prepared = tokio::select! {
+                    biased;
+                    _ = turn_cancel.cancelled() => Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled")),
+                    _ = wait_budget(turn_deadline.remaining_millis(self.clock.as_ref())) => {
+                        attempt_cancel.cancel(CancelReason::Timeout);
+                        Err(ProviderError::new(ProviderErrorKind::Timeout, "turn deadline elapsed during provider preparation"))
+                    }
+                    result = self.provider.prepare_request(&request, &ctx) => result,
+                };
+                if prepared.is_ok() {
+                    preparation_complete = true;
+                    startup = FirstResponseBudget::new(
+                        self.clock.as_ref(),
+                        self.first_response_timeout_ms,
+                    );
+                }
+                prepared
+            } else {
+                Ok(())
+            };
+            let opened = if let Err(error) = prepared {
+                Err(error)
+            } else if !fallback_enabled {
+                self.provider.stream(request.clone(), ctx).await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = turn_cancel.cancelled() => Err(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled")),
+                    _ = wait_budget(turn_deadline.remaining_millis(self.clock.as_ref())) => {
+                        attempt_cancel.cancel(CancelReason::Timeout);
+                        Err(ProviderError::new(ProviderErrorKind::Timeout, "turn deadline elapsed"))
+                    }
+                    _ = wait_budget(startup.remaining(self.clock.as_ref())) => {
+                        startup_timeout = true;
+                        attempt_cancel.cancel(CancelReason::Timeout);
+                        Err(ProviderError::new(ProviderErrorKind::Timeout, "first-response timeout"))
+                    }
+                    result = self.provider.stream(request.clone(), ctx) => result,
+                }
+            };
+            match opened {
                 Err(perr) => error = Some(perr),
                 Ok(mut stream) => {
+                    stream_accepted = true;
                     if let Some((planner, plan)) = provider_plan.take() {
                         planner.commit_provider_plan(plan);
                     }
@@ -970,22 +1041,29 @@ impl Driver {
                         // window: on expiry it flushes and the loop returns to
                         // an ordinary await. `Next` is cancel-safe, so a
                         // timed-out poll consumes nothing.
-                        let next = match coalescer.pending_window_remaining_ms(self.clock.now()) {
-                            Some(remaining) => {
-                                let waited = tokio::time::timeout(
-                                    Duration::from_millis(remaining),
-                                    stream.next(),
-                                )
-                                .await;
-                                match waited {
-                                    Ok(next) => next,
-                                    Err(_) => {
-                                        emit_coalesced(coalescer.drain());
-                                        continue;
-                                    }
-                                }
+                        let next = tokio::select! {
+                            biased;
+                            _ = turn_cancel.cancelled(), if fallback_enabled => {
+                                attempt_cancel.cancel(CancelReason::UserRequested);
+                                error = Some(ProviderError::new(ProviderErrorKind::Cancelled, "cancelled"));
+                                break;
                             }
-                            None => stream.next().await,
+                            _ = wait_budget(turn_deadline.remaining_millis(self.clock.as_ref())), if fallback_enabled => {
+                                attempt_cancel.cancel(CancelReason::Timeout);
+                                error = Some(ProviderError::new(ProviderErrorKind::Timeout, "turn deadline elapsed"));
+                                break;
+                            }
+                            _ = wait_budget(startup.remaining(self.clock.as_ref())) => {
+                                startup_timeout = true;
+                                attempt_cancel.cancel(CancelReason::Timeout);
+                                error = Some(ProviderError::new(ProviderErrorKind::Timeout, "first-response timeout"));
+                                break;
+                            }
+                            _ = wait_budget(coalescer.pending_window_remaining_ms(self.clock.now())) => {
+                                emit_coalesced(coalescer.drain());
+                                continue;
+                            }
+                            next = stream.next() => next,
                         };
                         let Some(event) = next else { break };
                         if turn_cancel.is_cancelled() {
@@ -995,7 +1073,33 @@ impl Driver {
                             ));
                             break;
                         }
+                        let meaningful = match &event {
+                            ProviderStreamEvent::ResponseProgress => true,
+                            ProviderStreamEvent::TextDelta { text } => !text.is_empty(),
+                            ProviderStreamEvent::ReasoningDelta {
+                                text, signature, ..
+                            } => !text.is_empty() || signature.is_some(),
+                            ProviderStreamEvent::ToolCallDelta {
+                                id,
+                                name,
+                                arguments_fragment,
+                                ..
+                            } => id.is_some() || name.is_some() || !arguments_fragment.is_empty(),
+                            ProviderStreamEvent::HostedSearch { .. } => true,
+                            ProviderStreamEvent::Finish { reason } => {
+                                matches!(reason, FinishReason::Stop | FinishReason::ToolCalls)
+                            }
+                            _ => false,
+                        };
+                        if meaningful {
+                            request_progress = true;
+                            startup.disarm();
+                        }
                         match event {
+                            ProviderStreamEvent::ResponseProgress => {
+                                accepted_semantic_event = true;
+                                response_progress = true;
+                            }
                             ProviderStreamEvent::TextDelta { text: t } => {
                                 accepted_semantic_event = true;
                                 response_progress = true;
@@ -1238,7 +1342,7 @@ impl Driver {
                         | FinishReason::Error
                         | FinishReason::Cancelled
                 );
-            if !usage.is_empty() {
+            if !usage.is_empty() || fallback_enabled {
                 let record = UsageRecord {
                     source: UsageSource::ProviderAttempt,
                     provenance: Provenance {
@@ -1431,7 +1535,7 @@ impl Driver {
                 return ProviderTurnOutcome::Cancelled;
             }
 
-            if let Some(perr) = error {
+            if let Some(mut perr) = error {
                 let mut correction_request = correction.map(|feedback| {
                     let mut corrected = request.clone();
                     corrected.messages.truncate(original_message_count);
@@ -1462,7 +1566,7 @@ impl Driver {
                 let ordinary_retry_delay_ms = (ordinary_retryable && retry_budget_available)
                     .then(|| self.config.retry.backoff_ms(attempt_index, &perr));
                 let remaining_before_retry = turn_deadline.remaining_millis(self.clock.as_ref());
-                let retry_delay_ms = if argument_correction {
+                let mut retry_delay_ms = if argument_correction {
                     (retry_budget_available
                         && correction_over_budget.is_none()
                         && remaining_before_retry.is_none_or(|remaining| remaining > 0))
@@ -1477,6 +1581,28 @@ impl Driver {
                         remaining_before_retry.is_none_or(|remaining| remaining > *delay)
                     })
                 };
+                if let (Some(delay), Some(remaining)) =
+                    (retry_delay_ms, startup.remaining(self.clock.as_ref()))
+                {
+                    if delay >= remaining {
+                        retry_delay_ms = None;
+                        tokio::select! {
+                            biased;
+                            _ = turn_cancel.cancelled() => {}
+                            _ = wait_budget(turn_deadline.remaining_millis(self.clock.as_ref())) => {}
+                            _ = wait_budget(Some(remaining)) => { startup_timeout = true; }
+                        }
+                        if startup_timeout {
+                            perr = ProviderError::new(
+                                ProviderErrorKind::Timeout,
+                                "first-response timeout during retry backoff",
+                            );
+                        }
+                    }
+                }
+                if startup_timeout {
+                    retry_delay_ms = None;
+                }
                 let retry_refused_by_deadline = ordinary_retry_delay_ms.is_some()
                     && retry_delay_ms.is_none()
                     && !credential_recovery;
@@ -1506,6 +1632,28 @@ impl Driver {
                 if perr.kind == ProviderErrorKind::Cancelled {
                     return ProviderTurnOutcome::Cancelled;
                 }
+                if turn_cancel.is_cancelled() {
+                    return ProviderTurnOutcome::Cancelled;
+                }
+                if turn_deadline.is_expired(self.clock.as_ref()) {
+                    return ProviderTurnOutcome::LimitReached {
+                        limit: LimitKind::Time,
+                        provider_error_kind: None,
+                    };
+                }
+                let safe_to_advance = fallback_enabled
+                    && !request_progress
+                    && (replay_safe || (!stream_accepted && request.hosted_tools.is_empty()));
+                if startup_timeout {
+                    if safe_to_advance {
+                        return ProviderTurnOutcome::Fallback {
+                            error: perr,
+                            reason: ModelFallbackReason::FirstResponseTimeout,
+                            elapsed_ms: startup.elapsed(self.clock.as_ref()),
+                        };
+                    }
+                    return ProviderTurnOutcome::Failed(perr);
+                }
                 if let Some(delay) = retry_delay_ms {
                     if let Some(corrected) = correction_request.take() {
                         request = corrected;
@@ -1526,6 +1674,12 @@ impl Driver {
                                 return ProviderTurnOutcome::Cancelled;
                             }
                             _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                            _ = wait_budget(startup.remaining(self.clock.as_ref())) => {
+                                if safe_to_advance {
+                                    return ProviderTurnOutcome::Fallback { error: ProviderError::new(ProviderErrorKind::Timeout, "first-response timeout during retry backoff"), reason: ModelFallbackReason::FirstResponseTimeout, elapsed_ms: startup.elapsed(self.clock.as_ref()) };
+                                }
+                                return ProviderTurnOutcome::Failed(ProviderError::new(ProviderErrorKind::Timeout, "first-response timeout during retry backoff"));
+                            }
                         }
                     }
                     attempt_index += 1;
@@ -1563,6 +1717,28 @@ impl Driver {
                     return ProviderTurnOutcome::LimitReached {
                         limit: LimitKind::Time,
                         provider_error_kind: None,
+                    };
+                }
+                if safe_to_advance
+                    && matches!(
+                        perr.kind,
+                        ProviderErrorKind::Unavailable
+                            | ProviderErrorKind::LimitExhausted
+                            | ProviderErrorKind::Network
+                            | ProviderErrorKind::Timeout
+                            | ProviderErrorKind::Server
+                            | ProviderErrorKind::RateLimited
+                    )
+                {
+                    let reason = match perr.kind {
+                        ProviderErrorKind::Unavailable => ModelFallbackReason::Unavailable,
+                        ProviderErrorKind::LimitExhausted => ModelFallbackReason::QuotaExhausted,
+                        _ => ModelFallbackReason::TransientFailure,
+                    };
+                    return ProviderTurnOutcome::Fallback {
+                        error: perr,
+                        reason,
+                        elapsed_ms: startup.elapsed(self.clock.as_ref()),
                     };
                 }
                 if retryable {

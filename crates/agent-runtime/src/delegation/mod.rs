@@ -53,7 +53,9 @@ use agent_runtime_core::content::{
 };
 use agent_runtime_core::delegation::{ChildSpec, ToolViewScope, WorkspacePolicy};
 use agent_runtime_core::error::{ErrorKind, RuntimeError};
-use agent_runtime_core::event::{ChildPhase, ChildRecoveryState, RuntimeEvent, TurnFinish};
+use agent_runtime_core::event::{
+    ChildPhase, ChildRecoveryState, LimitKind, RuntimeEvent, TurnFinish,
+};
 use agent_runtime_core::grant::AuthorizationDecision;
 use agent_runtime_core::ids::{ChildId, SessionId, ToolCallId};
 use agent_runtime_core::ids::{InteractionRequestId, QuestionId, TurnId};
@@ -135,5 +137,5 @@ pub use types::{
 };
 use types::{
     ChildBinding, ChildEntry, CoordinatorInner, ProtectedChildOutcomeState, QueuedSpawn,
-    TaskOutcomeKey, checkpoint_can_resume,
+    TaskOutcomeKey, checkpoint_can_resume, child_limit_description,
 };

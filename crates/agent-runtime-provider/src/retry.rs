@@ -84,7 +84,10 @@ impl RetryPolicy {
 /// backoff elapsed, so every attempt spent on it is wasted. Recovering means
 /// changing the credential, which is a policy decision for the host.
 pub fn is_retryable(err: &ProviderError) -> bool {
-    if err.kind == ProviderErrorKind::LimitExhausted {
+    if matches!(
+        err.kind,
+        ProviderErrorKind::LimitExhausted | ProviderErrorKind::Unavailable
+    ) {
         return false;
     }
     if err.retryable {

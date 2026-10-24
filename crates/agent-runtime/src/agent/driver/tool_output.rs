@@ -18,7 +18,7 @@ impl ProcessedToolOutput {
     }
 }
 
-impl TurnMachine<'_> {
+impl TurnMachine {
     /// Processing is optional once a tool has settled; committing its result
     /// is not. Preserve the executor's outcome on interruption, just as a turn
     /// without processors does: a finished tool keeps its real result, while

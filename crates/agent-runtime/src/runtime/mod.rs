@@ -10,6 +10,7 @@ pub mod command;
 pub mod emitter;
 pub mod engine;
 mod extensions;
+mod fallback;
 pub(crate) mod fork;
 pub mod goal;
 pub(crate) mod history;
@@ -31,6 +32,7 @@ pub use command::{
 };
 pub use emitter::{EventEmitter, RuntimeEventStream};
 pub use engine::Runtime;
+pub use fallback::ModelRoute;
 pub use fork::{ForkLcm, ForkSeed, ForkSession};
 pub use goal::{GoalAdmissionGate, GoalController, GoalControllerConfig};
 pub use inject::{InjectedContent, UnresolvedInjections};

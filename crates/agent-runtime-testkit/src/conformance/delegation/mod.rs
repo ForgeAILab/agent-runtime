@@ -11,6 +11,7 @@ mod authorization;
 mod durable_recovery;
 mod history;
 mod lifecycle;
+mod limit_outcome;
 mod returned_input;
 mod tool_delivery;
 
@@ -18,5 +19,6 @@ pub use authorization::*;
 pub use durable_recovery::*;
 pub use history::*;
 pub use lifecycle::*;
+pub use limit_outcome::*;
 pub use returned_input::*;
 pub use tool_delivery::*;
