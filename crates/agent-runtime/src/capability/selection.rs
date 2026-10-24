@@ -728,7 +728,10 @@ mod tests {
         // Without the specialist agent, so the skill's only reason to be
         // rejected is the budget rather than redundant affordance coverage.
         let view = fixtures::research_view_without_agent();
-        let candidates = candidates_for(&view, "search the web and browse the results page");
+        let candidates = candidates_for(
+            &view,
+            "research: search the web and browse the results page",
+        );
         let skill_cost = view
             .get(&fixtures::search_skill_id())
             .expect("the skill is in view")
@@ -771,7 +774,7 @@ mod tests {
     #[test]
     fn without_an_explicit_share_skills_may_use_the_whole_context_budget() {
         let view = fixtures::research_view_without_agent();
-        let candidates = candidates_for(&view, "search the web");
+        let candidates = candidates_for(&view, "search the web for research");
         let plan = select(
             &view,
             &candidates,
@@ -793,7 +796,10 @@ mod tests {
     #[test]
     fn a_specialist_agent_can_replace_a_two_capability_bundle() {
         let view = fixtures::research_view();
-        let candidates = candidates_for(&view, "search the web and browse the results page");
+        let candidates = candidates_for(
+            &view,
+            "research: search the web and browse the results page",
+        );
 
         let plan = select(
             &view,
@@ -822,7 +828,10 @@ mod tests {
     #[test]
     fn without_the_agent_the_resolver_falls_back_to_the_skill_and_tool_bundle() {
         let view = fixtures::research_view_without_agent();
-        let candidates = candidates_for(&view, "search the web and browse the results page");
+        let candidates = candidates_for(
+            &view,
+            "research: search the web and browse the results page",
+        );
 
         let plan = select(
             &view,
@@ -844,7 +853,7 @@ mod tests {
     #[test]
     fn a_redundant_second_search_skill_is_rejected_not_activated() {
         let view = fixtures::redundant_search_skills_view();
-        let candidates = candidates_for(&view, "search the web");
+        let candidates = candidates_for(&view, "search the web for research");
 
         let plan = select(
             &view,
@@ -907,7 +916,7 @@ mod tests {
     #[test]
     fn cardinality_budget_bounds_the_number_of_bindings() {
         let view = fixtures::redundant_search_skills_view();
-        let candidates = candidates_for(&view, "search the web");
+        let candidates = candidates_for(&view, "search the web for research");
         let budgets = SelectionBudgets::new(u32::MAX, u32::MAX, u32::MAX, RiskLevel::High, 0);
 
         let plan = select(&view, &candidates, &budgets, &BTreeMap::new(), &[]);

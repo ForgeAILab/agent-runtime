@@ -780,7 +780,9 @@ async fn explicit_skill_instruction_budget_and_description_search_domain_filter(
         &RoutingQuery::derive("eigenvectors", Vec::<String>::new()),
     );
     assert_eq!(found.candidates.len(), 1);
-    let excluded = runtime
+    // A domain with no match answers from every domain instead of nothing,
+    // and the budget-rejected skill is reported rather than silently dropped.
+    let fallback = runtime
         .search_and_stage(
             &session,
             &ToolCallId::new("domain"),
@@ -789,8 +791,15 @@ async fn explicit_skill_instruction_budget_and_description_search_domain_filter(
             &None,
         )
         .unwrap();
-    assert_eq!(excluded.value["matched"], 0);
-    assert_eq!(excluded.value["by_domain"]["skill"], 1);
+    assert_eq!(fallback.value["by_domain"]["skill"], 1);
+    assert!(fallback.value.get("matched").is_none());
+    assert_eq!(fallback.value["cards"][0]["id"]["name"], "manual");
+    assert_eq!(fallback.value["staged"], serde_json::json!([]));
+    assert_eq!(fallback.value["not_staged"][0]["id"], "skill:manual");
+    assert_eq!(fallback.value["not_staged"][0]["reason"], "budget_exceeded");
+    let note = fallback.value["note"].as_str().unwrap();
+    assert!(note.contains("domain `tool`"), "{note}");
+    assert!(note.contains("registry.activate"), "{note}");
 }
 
 #[derive(Debug)]
@@ -971,4 +980,49 @@ async fn pinned_and_explicit_dependencies_choose_an_alternative_that_fits_remain
     let pinned = derive(&runtime, None, false).await.unwrap();
     assert!(pinned.active_ids().contains(&RegistryId::skill("small")));
     assert!(!pinned.active_ids().contains(&RegistryId::skill("manual")));
+}
+
+#[tokio::test]
+async fn search_reports_a_redundant_match_instead_of_dropping_it() {
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(NamedTool("web_fetch")),
+        Arc::new(NamedTool("web_search")),
+    ];
+    let overrides = tools
+        .iter()
+        .map(|tool| {
+            tool_ability(tool.clone())
+                .descriptor()
+                .with_affordances(["network-http"])
+        })
+        .collect();
+    let sealed = LiveAbilityRuntime::seal(
+        tools,
+        overrides,
+        Vec::new(),
+        Arc::new(CapabilityResolver::new()),
+        Arc::new(FailClosedPolicy),
+        ActivationContext::new(),
+        ScopeInputs::new(),
+        ActivationBudget::new(16_384, 8),
+    )
+    .unwrap();
+    let runtime = Arc::into_inner(sealed.runtime).unwrap();
+    let session = derive(&runtime, None, false).await.unwrap();
+    let found = runtime
+        .search_and_stage(
+            &session,
+            &ToolCallId::new("web"),
+            &serde_json::json!({"query":"web search fetch"}),
+            &test_emitter(),
+            &None,
+        )
+        .unwrap();
+    let staged = found.value["staged"].as_array().unwrap();
+    assert_eq!(staged.len(), 1, "{}", found.value);
+    let not_staged = found.value["not_staged"].as_array().unwrap();
+    assert_eq!(not_staged.len(), 1, "{}", found.value);
+    assert_eq!(not_staged[0]["reason"], "redundant");
+    assert_ne!(not_staged[0]["id"], staged[0]);
+    assert_eq!(found.value["cards"].as_array().unwrap().len(), 2);
 }
