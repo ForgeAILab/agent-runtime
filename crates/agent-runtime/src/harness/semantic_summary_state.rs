@@ -12,7 +12,7 @@ use agent_runtime_core::artifact::{
     ArtifactDigest, ArtifactId, ArtifactLineage, ArtifactProvenance, ArtifactRef,
     ArtifactRetention, ArtifactSensitivity,
 };
-use agent_runtime_core::ids::{SessionId, ToolCallId, TurnId};
+use agent_runtime_core::ids::{ChildId, SessionId, ToolCallId, TurnId};
 use agent_runtime_registry::{Fingerprint, RegistryRevision};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,6 +87,8 @@ struct ArtifactProvenanceWire {
     purpose: String,
     #[serde(default)]
     derived_from: Option<ArtifactLineageWire>,
+    #[serde(default)]
+    child: Option<ChildId>,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +126,7 @@ impl From<ArtifactProvenanceWire> for ArtifactProvenance {
             call: value.call,
             purpose: value.purpose,
             derived_from: value.derived_from.map(Into::into),
+            child: value.child,
         }
     }
 }
