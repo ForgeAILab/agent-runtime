@@ -13,6 +13,7 @@ async fn pages<S: JournalStorage>(
     let mut out = Vec::new();
     let mut after = None;
     let mut calls = 0;
+    let mut seen_members = BTreeSet::new();
     loop {
         calls += 1;
         assert!(calls < 10_000, "a page sequence must reach its end marker");
@@ -37,6 +38,14 @@ async fn pages<S: JournalStorage>(
             page.items.len() <= max_items as usize,
             "a page must not exceed max_items"
         );
+        if let JournalCollectionItems::Members(ids) = &page.items {
+            for id in ids {
+                assert!(
+                    seen_members.insert(id.clone()),
+                    "member pages must enumerate unique full ids"
+                );
+            }
+        }
         after = page.next;
         out.push(page.items);
         if after.is_none() {

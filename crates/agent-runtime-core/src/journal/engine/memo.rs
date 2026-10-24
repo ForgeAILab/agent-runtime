@@ -162,9 +162,21 @@ impl RootMemo {
         session: &SessionId,
         root: &JournalObjectId,
     ) -> Option<Arc<ValidatedRoot>> {
-        self.entries
+        let entry = self
+            .entries
             .get(&(session.clone(), root.clone()))
-            .map(|node| node.entry.clone())
+            .map(|node| node.entry.clone());
+        #[cfg(feature = "test-support")]
+        crate::journal::profile::event(
+            if entry.is_some() {
+                "rt.memo.hit"
+            } else {
+                "rt.memo.miss"
+            },
+            1,
+            0,
+        );
+        entry
     }
     pub(super) fn get(
         &mut self,

@@ -55,6 +55,7 @@ struct LostAcknowledgement {
     pin_writes: Mutex<Vec<(JournalWriteKind, usize)>>,
     failure: Mutex<Option<(SessionId, &'static str, RuntimeError)>>,
     hide_unreadable: std::sync::atomic::AtomicBool,
+    repeat_members: std::sync::atomic::AtomicBool,
 }
 impl LostAcknowledgement {
     fn fail(&self, name: &str, session: &SessionId) -> Result<(), RuntimeError> {
@@ -165,7 +166,7 @@ impl JournalStorage for LostAcknowledgement {
         &self,
         d: &JournalDomain,
         s: &SessionId,
-        request: JournalCollectionPageRequest,
+        mut request: JournalCollectionPageRequest,
     ) -> Result<JournalCollectionPage, RuntimeError> {
         // Collection pages carry the membership/pin fault points of the
         // previous whole-session reads.
@@ -175,7 +176,23 @@ impl JournalStorage for LostAcknowledgement {
         };
         self.count(name, s);
         self.fail(name, s)?;
-        self.inner.collection_page(d, s, request).await
+        let repeat = self
+            .repeat_members
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request.kind == JournalCollectionPageKind::Members
+            && request.max_items > 1;
+        if repeat {
+            request.max_items = request.max_items.saturating_sub(1).max(1);
+        }
+        let mut page = self.inner.collection_page(d, s, request).await?;
+        if repeat {
+            if let JournalCollectionItems::Members(ids) = &mut page.items {
+                if let Some(first) = ids.first().cloned() {
+                    ids.push(first);
+                }
+            }
+        }
+        Ok(page)
     }
     async fn prepare_collection_apply(
         &self,

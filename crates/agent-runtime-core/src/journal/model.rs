@@ -670,6 +670,9 @@ pub struct JournalGcReport {
     /// non-conflict failures and proven invalid state (including incomplete
     /// live membership) are reported. Dirty hints survive for the next call.
     /// A source blocked by an unreadable dependency is included with that dependency.
+    /// A process-local lease over bodies already collected by another engine,
+    /// or a recreated historical pin with missing bodies, is reported on every
+    /// pass while it persists. Reporting does not repair cross-engine retention.
     #[serde(default)]
     pub unreadable_sessions: Vec<SessionId>,
     /// Pass progress; `None` decodes historical reports (unknown progress).

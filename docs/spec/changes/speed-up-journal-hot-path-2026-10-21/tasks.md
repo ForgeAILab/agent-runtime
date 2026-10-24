@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-23T22:36:31Z
+updated_at: 2026-10-24T00:48:05Z
 completed_at:
 ---
 
@@ -182,3 +182,11 @@ receipts, but its overhead and maximum collect timings exceed the prior P2
 sample under the recorded higher host load. These comparisons are NOT MET; no
 additional sample or timing-driven code change followed. All requested
 correctness targets, both clippy configurations and 26 negative controls pass.
+
+### Second P2 review repair (2026-10-23)
+
+- [x] 2.9 Drop added-reader restarts, bound remaining restart chains across calls, restrict memo protection to live sessions, enforce inventory contracts, cap proof reuse and restore peek counters; document repeated cross-engine missing-body reporting.
+- [x] 2.10 Verify cold-reader progress, actual added-lease body survival, cross-call restart exhaustion, real memo predicates, release-build contracts, duplicate-page conflict/conformance and proof caps with fail-without controls.
+- [x] 2.11 Run the seven merge targets, both clippy modes, all 26 prior controls plus new controls, and matched B/4000 ABAB sanity against 0dc3ca8; publish rt-p2-fix2/report.md.
+
+This repair does not complete the outstanding full phase/adoption gates.
