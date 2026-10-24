@@ -12,11 +12,12 @@ impl LiveAbilityRuntime {
         scope_inputs: ScopeInputs,
         budget: ActivationBudget,
     ) -> Result<SealedLiveAbilities, RuntimeError> {
+        let protected = [CAPABILITY_SEARCH_TOOL_NAME, CAPABILITY_ACTIVATE_TOOL_NAME]
+            .map(agent_runtime_core::tool::provider_tool_name);
         if tools.iter().any(|tool| {
-            matches!(
-                tool.spec().name.as_str(),
-                CAPABILITY_SEARCH_TOOL_NAME | CAPABILITY_ACTIVATE_TOOL_NAME
-            )
+            protected.contains(&agent_runtime_core::tool::provider_tool_name(
+                &tool.spec().name,
+            ))
         }) {
             return Err(RuntimeError::conflict(
                 "registry.search and registry.activate are protected runtime ability names",

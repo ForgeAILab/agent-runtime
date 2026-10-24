@@ -1350,6 +1350,7 @@ impl<T: HttpTransport> Provider for OpenAiProvider<T> {
                 "hosted web search is unsupported by Chat Completions",
             ));
         }
+        super::tool_names::validate(&request)?;
         let tool_names = super::tool_names::ToolNames::new(&request);
         if request.model != self.config.model {
             return Err(ProviderError::new(

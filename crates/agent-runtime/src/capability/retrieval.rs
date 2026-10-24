@@ -28,7 +28,7 @@ use crate::capability::query::RoutingQuery;
 /// retriever produced a candidate, even when no embedding index is
 /// configured. Bump this if scoring changes in a way that could reorder
 /// results for the same inputs.
-pub const DETERMINISTIC_RETRIEVER_REVISION: &str = "capability-retrieval.deterministic.v2";
+pub const DETERMINISTIC_RETRIEVER_REVISION: &str = "capability-retrieval.deterministic.v3";
 
 const NAME_WEIGHT: u32 = 10;
 const AFFORDANCE_WEIGHT: u32 = 6;
@@ -80,6 +80,19 @@ impl MatchReasons {
             && self.affordances.is_empty()
             && self.modalities.is_empty()
             && self.dependencies.is_empty()
+    }
+
+    /// How many different words matched, across every field.
+    fn distinct_terms(&self) -> usize {
+        self.tags
+            .iter()
+            .chain(&self.keywords)
+            .map(String::as_str)
+            .chain(self.affordances.iter().map(Affordance::as_str))
+            .chain(self.modalities.iter().map(Modality::as_str))
+            .chain(self.dependencies.iter().map(|id| id.name.as_str()))
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     fn score(&self) -> u32 {
@@ -303,13 +316,42 @@ fn retrieve_mode(
                     })
                     .map(str::to_owned)
                     .collect();
-                matched.keywords.extend(
-                    terms
-                        .intersection(&words)
-                        .map(|term| format!("text:{term}")),
-                );
+                // A tool named `web_search` should answer "web search" as
+                // strongly as a curated keyword would. A term already matched
+                // as a curated keyword is not counted again, so hosts that
+                // derive keywords from names are not ranked twice over.
+                let name_parts: BTreeSet<String> = entry
+                    .id()
+                    .name
+                    .split(['_', '.', '-', '/'])
+                    .map(str::to_lowercase)
+                    .collect();
+                let mut extra = Vec::new();
+                for term in &terms {
+                    if !matched.name
+                        && name_parts.contains(term)
+                        && !matched.keywords.contains(term)
+                    {
+                        extra.push(format!("name:{term}"));
+                    } else if words.contains(term) {
+                        extra.push(format!("text:{term}"));
+                    }
+                }
+                matched.keywords.extend(extra);
             }
             if matched.is_empty() {
+                return None;
+            }
+            // Activation is monotonic, so a skill bound on one shared word
+            // holds its instruction budget for the whole session. Prompt
+            // routing needs the skill named, a host hint, or two distinct
+            // terms; explicit search still finds it on one.
+            if !descriptive
+                && entry.payload().kind() == &agent_runtime_ability::AbilityKind::Skill
+                && !matched.name
+                && matched.hints.is_empty()
+                && matched.distinct_terms() < 2
+            {
                 return None;
             }
             Some(RetrievedCandidate {
@@ -555,6 +597,85 @@ mod descriptive_tests {
                 .map(|c| c.descriptor.id().qualified())
                 .collect::<Vec<_>>(),
             ["tool:a-tool", "tool:z-tool", "skill:skill"]
+        );
+    }
+
+    fn ability(kind: AbilityKind, name: &str, summary: &str) -> AbilityDescriptor {
+        AbilityDescriptor::new(
+            kind,
+            name,
+            agent_runtime_registry::EntryProvenance::new(
+                agent_runtime_registry::RegistrySource::BuiltIn,
+                agent_runtime_registry::RegistryRevision::new("1"),
+            ),
+            name,
+            summary,
+            agent_runtime_registry::RegistryRevision::new("1"),
+        )
+    }
+
+    #[test]
+    fn explicit_search_scores_name_parts_like_keywords_once() {
+        let view = crate::capability::fixtures::seal_for_test(vec![
+            ability(AbilityKind::Tool, "web_search", "Search the web."),
+            ability(AbilityKind::Skill, "web-helper", "Helps.").with_keywords(["web"]),
+        ]);
+        let query = RoutingQuery::derive("web search", Vec::<String>::new());
+        let found = retrieve_descriptive(&view, &query, None);
+        let score = |name: &str| {
+            found
+                .candidates
+                .iter()
+                .find(|candidate| candidate.descriptor.id().name == name)
+                .map(|candidate| candidate.score)
+                .unwrap()
+        };
+        // Two name parts at keyword weight; neither counted again as text.
+        assert_eq!(score("web_search"), 2 * KEYWORD_WEIGHT);
+        // A curated keyword that is also a name part counts once as a keyword,
+        // plus its ordinary descriptive match in the title.
+        assert_eq!(score("web-helper"), KEYWORD_WEIGHT + 1);
+        // Prompt routing keeps metadata-only matching.
+        assert!(
+            retrieve(&view, &query, None)
+                .candidates
+                .iter()
+                .all(|candidate| candidate.descriptor.id().name != "web_search")
+        );
+    }
+
+    #[test]
+    fn prompt_routing_binds_a_skill_on_two_terms_or_its_name_but_not_one_word() {
+        let view = crate::capability::fixtures::seal_for_test(vec![
+            ability(AbilityKind::Skill, "product-help", "Product help.")
+                .with_keywords(["help", "product"]),
+            ability(AbilityKind::Tool, "assist", "Assists.").with_keywords(["help"]),
+        ]);
+        let names = |text: &str| {
+            retrieve(
+                &view,
+                &RoutingQuery::derive(text, Vec::<String>::new()),
+                None,
+            )
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.descriptor.id().name.clone())
+            .collect::<Vec<_>>()
+        };
+        // One shared word: the tool still matches, the skill does not.
+        assert_eq!(names("please help me"), ["assist"]);
+        assert!(names("help with the product").contains(&"product-help".to_owned()));
+        assert!(names("use product-help").contains(&"product-help".to_owned()));
+        // Explicit search still finds the skill on one word.
+        assert!(
+            retrieve_descriptive(
+                &view,
+                &RoutingQuery::derive("help", Vec::<String>::new()),
+                None
+            )
+            .candidates
+            .iter()
+            .any(|candidate| candidate.descriptor.id().name == "product-help")
         );
     }
 }
