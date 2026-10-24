@@ -16,6 +16,11 @@ contain breaking changes and are coordinated with consumer proposals.
   (or an empty one) as a conflict, adapters reject such a request, and
   `agent_runtime_core::tool::provider_tool_name` exposes the mapping. The
   retriever revision is now `capability-retrieval.deterministic.v3`.
+- Working-proof restarts use the profile label `rt.gc.restart.proof`; bench
+  aggregation preserves the historical label separately for older captures.
+- GC report documentation clarifies that a retry-exhausted session is skipped
+  for the current pass, omitted from continuation and error lists, and retried
+  on the next pass with dirty state retained.
 
 ### Fixed
 
@@ -29,6 +34,19 @@ contain breaking changes and are coordinated with consumer proposals.
   tools it did offer.
 - Prompt pre-activation no longer binds a skill on one shared word; it needs
   the skill's name, a host hint, or two matching terms.
+- Collection keeps its first 32 reused proofs and cold-traces only excess
+  roots; uncertified pins and memo misses no longer discard admitted proofs.
+  Excess roots skip proof admission and memo lookup counters while stale
+  non-head-root memo entries are still removed. Current-head identity is
+  validated on load even if an epoch change prevents its first proof reuse.
+- Repeated live or dead inventory ids restart collection under the existing
+  retry bound before any release batch can contain duplicate ids.
+- Inventory duplicate tracking reuses cold live entries and proof bitmaps
+  before tracking member-layer hits, preserving cursor capacity with held
+  leases; remaining tracking is charged and freed when inventory finishes.
+  Layer/count guards also check shared seen state and return contract errors.
+- Collector-driven memo evictions emit `rt.memo.eviction` without changing
+  LRU priority. Memo protection snapshots leased sessions once per collect call.
 
 ## [0.10.0] - 2026-10-24
 

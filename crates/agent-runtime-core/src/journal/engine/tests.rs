@@ -56,6 +56,9 @@ struct LostAcknowledgement {
     failure: Mutex<Option<(SessionId, &'static str, RuntimeError)>>,
     hide_unreadable: std::sync::atomic::AtomicBool,
     repeat_members: std::sync::atomic::AtomicBool,
+    repeat_member: Mutex<Option<JournalObjectId>>,
+    replace_member: Mutex<Option<(JournalObjectId, JournalObjectId)>>,
+    collection_releases: Mutex<Vec<Vec<JournalObjectId>>>,
 }
 impl LostAcknowledgement {
     fn fail(&self, name: &str, session: &SessionId) -> Result<(), RuntimeError> {
@@ -176,18 +179,29 @@ impl JournalStorage for LostAcknowledgement {
         };
         self.count(name, s);
         self.fail(name, s)?;
-        let repeat = self
+        let repeated = self.repeat_member.lock().unwrap().clone();
+        let repeat = (self
             .repeat_members
             .load(std::sync::atomic::Ordering::SeqCst)
+            || repeated.is_some())
             && request.kind == JournalCollectionPageKind::Members
             && request.max_items > 1;
         if repeat {
             request.max_items = request.max_items.saturating_sub(1).max(1);
         }
         let mut page = self.inner.collection_page(d, s, request).await?;
+        if let JournalCollectionItems::Members(ids) = &mut page.items {
+            if let Some((missing, duplicate)) = &*self.replace_member.lock().unwrap() {
+                for id in ids.iter_mut() {
+                    if id == missing {
+                        *id = duplicate.clone();
+                    }
+                }
+            }
+        }
         if repeat {
             if let JournalCollectionItems::Members(ids) = &mut page.items {
-                if let Some(first) = ids.first().cloned() {
+                if let Some(first) = repeated.or_else(|| ids.first().cloned()) {
                     ids.push(first);
                 }
             }
@@ -219,6 +233,10 @@ impl JournalStorage for LostAcknowledgement {
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.count("apply", &write.session);
         if write.kind == JournalWriteKind::Collect {
+            self.collection_releases
+                .lock()
+                .unwrap()
+                .push(write.release.clone());
             self.fail("apply", &write.session)?;
         }
         // Logical durable payload: raw ids, pin id, flag, metadata version and

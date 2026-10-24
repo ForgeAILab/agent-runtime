@@ -135,7 +135,13 @@ part of the complete live union.
 - **WHEN** seventeen through thirty-two certified roots are reused in one mark
 - **THEN** every proof layer retains its original immutable evidence without a copied member-set layer
 - **AND** cursor charge covers the layer references and proof handles while memo reservations cover proof retention
-- **AND** encountering another root beyond thirty-two clears reused proof layers/reservations and cold-traces all those roots for the rest of the session
+- **AND** after checking whether a root is already admitted, the cap declines any new root before proof-admission locks, authority/epoch validation or memo hit/miss lookups; stale non-head-root memo entries are still removed, and the first thirty-two proofs remain retained while only excess roots use cold tracing
+
+#### Scenario: Current head reuse declines across an epoch change
+
+- **WHEN** an epoch change during session loading declines the current head's first proof reuse and certified pins later fill the proof cap
+- **THEN** session loading MUST independently validate the current head's storage id, role, session and absence of retirement
+- **AND** neither the epoch decline nor the later cap decline can bypass that validation
 
 #### Scenario: Reader and writer-renew churn during a mark
 
@@ -153,11 +159,19 @@ part of the complete live union.
 
 #### Scenario: Inventory layers or pages violate the counting contract
 
-- **WHEN** shared layer and count lengths differ
+- **WHEN** shared layer, count or seen-state lengths differ
 - **THEN** collection MUST return a contract error in debug and release builds before inventory zips can truncate
-- **WHEN** repeated membership ids make hits exceed a live layer's length
+- **WHEN** an inventory repeats any full membership id, live or dead, within or across pages
 - **THEN** collection MUST restart as a conflict under the per-mark retry bound, without unreadable reporting or releases
 - **AND** conformance MUST enforce unique full ids across pages while preserving storage-defined order
+
+#### Scenario: Cold inventory retains cursor capacity
+
+- **WHEN** cold tracing has populated the live entries and collection inventories membership
+- **THEN** duplicate detection MUST reuse those entries without a second full-id set for live members
+- **AND** the cold-live cursor charge remains 128 bytes per id plus 8 bytes per expected kind
+- **AND** a held member-layer lease MUST NOT add duplicate entries for ids already covered by visited entries, extra roots, proof bitmaps or an earlier member-layer detector
+- **AND** remaining duplicate-tracking memory MUST be charged and freed before dependency or release work
 
 #### Scenario: Live membership is incomplete
 
@@ -239,6 +253,7 @@ in bench.md P4 under the named fixture/storage conditions.
 - **WHEN** fence, working-proof or page conflicts invalidate the same session mark chain repeatedly across calls
 - **THEN** collection MUST retry at most once in the current pass and skip after the second invalidation
 - **AND** dirty state survives while later sessions and discovery pages complete
+- **AND** a retry-exhausted skip does not itself set has_more or enter unreadable_sessions or over_capacity_sessions; the next pass attempts the session again
 
 #### Scenario: Root ownership changes across a yield
 

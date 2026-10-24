@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-24T00:48:05Z
+updated_at: 2026-10-24T06:13:00Z
 completed_at:
 ---
 
@@ -190,3 +190,39 @@ correctness targets, both clippy configurations and 26 negative controls pass.
 - [x] 2.11 Run the seven merge targets, both clippy modes, all 26 prior controls plus new controls, and matched B/4000 ABAB sanity against 0dc3ca8; publish rt-p2-fix2/report.md.
 
 This repair does not complete the outstanding full phase/adoption gates.
+
+### Third P2 review follow-ups (2026-10-24)
+
+- [x] 2.12 G1: prove every certified closure survives proof-cap fallback with cold receipt parity and a body-deletion control.
+- [x] 2.13 F1: retain the first 32 proofs and trace only excess roots (cap ordering updated by L2 below).
+- [x] 2.14 G2: independently exercise the post-page layer/count contract guard.
+- [x] 2.15 F3: restart on any repeated inventory id, including dead ids, within the persistent retry bound.
+- [x] 2.16 F4: snapshot leased sessions once per collect call for memo protection.
+- [x] 2.17 F5: count collector-driven memo evictions without changing LRU behavior.
+- [x] 2.18 F6: rename the working-proof restart profile label and update its consumers.
+- [x] 2.19 F2: document pass-only skip reporting and next-pass retry in owner decisions and JournalGcReport.
+- [x] 2.20 Add Unreleased changelog entries and run the requested follow-up verification/control gates.
+
+### Fourth P2 review follow-ups (2026-10-24)
+
+- [x] 2.21 M1: restore the original cold-live cursor charge with in-place duplicate detection, account remaining tracking and free it after inventory; preserve duplicate regressions and add charge/control evidence.
+- [x] 2.22 L1: cover shared seen state with both inventory contract guards and independently test/control each guard.
+- [x] 2.23 L2: decline excess roots immediately after the admitted-root lookup, before admission work or memo counters; test/control the counter boundary.
+- [x] 2.24 T1/T2: add a body-only T6 control against the current cap decision and real garbage/cold receipt parity for the 32-certified-plus-uncertified case.
+- [x] 2.25 Update Unreleased entries and run the requested offline follow-up checks; publish rt-followups2/report.md and byte-identical control restoration receipts.
+
+### Fifth P2 review follow-ups (2026-10-24)
+
+- [x] 2.26 LOW-1: track member-layer entries only when earlier detectors do not cover the id; verify cold held-lease and warm folded-lease cursor charge with a fail-without control.
+- [x] 2.27 LOW-2: validate current-head identity during session loading independently of epoch/cap declines; preserve stale memo cleanup past the cap and verify both with controls.
+- [x] 2.28 LOW-3: cover repeated non-head extra pin roots and independently disable the cold-live, member-layer and extra detectors in failing-test controls.
+
+LOW-1's replacement fixture uses public engine opens and commits, retaining a
+cold-opened reader and coalescing writer member layers across two commits.
+Both cold and warm charge cases pass. Restoring only the old LOW-1 inventory
+detector loop exits 101 at the charge assertion (15184 versus 14928 bytes);
+the control restores sources byte-for-byte.
+- [x] 2.29 Run the requested offline fmt, both clippy modes and five test commands; publish rt-followups3/report.md, progress notes and byte-identical control restoration receipts.
+
+The fixture repair and control receipts are in rt-followups3b/report.md.
+Round-3b final verification results supersede round 3's fixture failures.

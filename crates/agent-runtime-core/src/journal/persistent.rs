@@ -133,6 +133,22 @@ impl<K: Ord + Clone, V: Clone> Map<K, V> {
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
     }
+    /// Sorted position of an existing key, without walking its prefix.
+    pub(crate) fn index_of(&self, key: &K) -> Option<usize> {
+        let mut node = self.0.as_deref();
+        let mut before = 0;
+        while let Some(current) = node {
+            match key.cmp(&current.key) {
+                std::cmp::Ordering::Less => node = current.left.as_deref(),
+                std::cmp::Ordering::Equal => return Some(before + len(&current.left)),
+                std::cmp::Ordering::Greater => {
+                    before += 1 + len(&current.left);
+                    node = current.right.as_deref();
+                }
+            }
+        }
+        None
+    }
     pub(crate) fn insert(&mut self, key: K, value: V) {
         fn put<K: Ord + Clone, V: Clone>(
             node: &Option<Arc<Node<K, V>>>,
@@ -324,6 +340,10 @@ mod tests {
         }
         versions.push((map, oracle));
         for (map, oracle) in versions {
+            for (index, key) in oracle.keys().enumerate() {
+                assert_eq!(map.index_of(key), Some(index));
+            }
+            assert_eq!(map.index_of(&1000), None);
             assert_eq!(
                 map.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
                 oracle.into_iter().collect::<Vec<_>>()
