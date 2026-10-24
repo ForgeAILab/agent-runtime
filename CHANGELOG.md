@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-24
+
 ### Breaking
 
 - Bounded collection calls (journal hot path P4). `JournalGcRequest` gains
@@ -26,9 +28,7 @@ contain breaking changes and are coordinated with consumer proposals.
   plan's `max_units` is rejected by the engine.
 - `JournalStorage` requires `collection_capability`, `collection_page`,
   `prepare_collection_apply` and `apply_collection` with no default bodies.
-  Every adapter and wrapper must declare bounded support or
-  `JournalCollectionCapability::Unsupported` (collection refused, content
-  retained) and forward the methods explicitly. New DTOs:
+  New DTOs:
   `JournalCollectionLimits`, `JournalCollectionPageKind`,
   `JournalCollectionContinuation` (opaque, scope- and fence-bound),
   `JournalCollectionPageRequest`, `JournalCollectionPage`,
@@ -61,8 +61,22 @@ contain breaking changes and are coordinated with consumer proposals.
   pending presentation, retained backend observations, and a live-event watermark
   without running a dormant child or acknowledging its result.
 
+### Changed
+
+- Collection reuses authenticated closure proofs for current heads and certified
+  historical pins, avoiding repeated reads of unchanged closures.
+- Reused proofs are capped at 32 roots per session mark. Exceeding that cap
+  discards the reused proofs and falls back to complete cold tracing.
+
 ### Fixed
 
+- GC reports incomplete membership inventories in
+  `JournalGcReport.unreadable_sessions`, preserving durable state and dirty
+  hints for repair.
+- Collection bounds retries per session mark across calls: one restart is
+  allowed, and a second invalidation skips the session for the current pass
+  while retaining its dirty state.
+- Idle memo heads are evictable when the memo needs space.
 - Malformed or truncated tool arguments can receive bounded correction attempts
   with input-budget, cancellation, deadline, and provider-cache checks. Invalid
   calls and sibling calls from the discarded response are never dispatched.
@@ -73,6 +87,26 @@ contain breaking changes and are coordinated with consumer proposals.
 - The lockfile uses patched TLS certificate validation and trust-root packages:
   `rustls-webpki` 0.103.16, `webpki-root-certs` 1.0.10, and `webpki-roots` 1.0.10
   (RUSTSEC-2026-0381, RUSTSEC-2026-0382, and RUSTSEC-2026-0383).
+
+### Upgrade notes
+
+- Storage adapters and forwarding wrappers must implement or explicitly forward
+  all four new collection methods. Declare bounded support with
+  `JournalCollectionLimits`, provide fence-bound pages without materializing
+  the whole session, implement a read-only, no-effect preflight, and apply the
+  complete plan atomically within its unit bound. Return exact physical
+  receipts and `rewritten_units` in `JournalCollectionReceipt`. Adapters that
+  cannot meet this protocol must declare
+  `JournalCollectionCapability::Unsupported`; collection is refused and all
+  content is retained.
+
+### Known limitations
+
+Owner-accepted on 2026-10-23:
+
+- On the B/4000 benchmark, open/commit gate hold is ~1.4 s plain / ~1.7 s tool
+  against a target of <1 s. The writer-open view (P3) is planned for later.
+- B/100 tool overhead is ~60 ms against a ~50 ms target.
 
 ## [0.9.0] - 2026-10-20
 
