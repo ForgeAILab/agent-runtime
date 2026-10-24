@@ -251,6 +251,17 @@ impl RootMemo {
     pub(super) fn remove_root(&mut self, session: &SessionId, root: &JournalObjectId) {
         self.remove(&(session.clone(), root.clone()));
     }
+    // Cap declines still discard stale evidence, without a lookup counter or
+    // LRU promotion for roots that cannot be admitted by this mark.
+    pub(super) fn remove_non_head_root(&mut self, session: &SessionId, root: &JournalObjectId) {
+        if self
+            .entries
+            .get(&(session.clone(), root.clone()))
+            .is_some_and(|node| !node.entry.closure.is_head_root(root))
+        {
+            self.remove_root(session, root);
+        }
+    }
     fn unlink(&mut self, key: &Key) {
         let Some(node) = self.entries.get(key) else {
             return;

@@ -875,6 +875,18 @@ impl<S: JournalStorage> JournalEngine<S> {
             if let Some(stored) = &mark.stored {
                 let metadata: Metadata = decode(&stored.engine)?;
                 if let Some(head) = &stored.head {
+                    // Authenticate the current head even if reuse declines on
+                    // an epoch change here and later reaches the proof cap.
+                    let decoded: JournalHead = head
+                        .decode(JournalObjectKind::Head)
+                        .map_err(invalid_state)?;
+                    if decoded.storage_id != self.domain.storage_id
+                        || decoded.role != self.domain.role
+                        || decoded.session != session
+                        || decoded.retirement.is_some()
+                    {
+                        return Err(invalid_state(conflict()));
+                    }
                     if metadata.dependencies.unresolved {
                         return Err(unsupported());
                     }
@@ -1382,6 +1394,10 @@ impl<S: JournalStorage> JournalEngine<S> {
         }
         // Keep admitted proofs; excess roots trace without admission work.
         if mark.proofs.len() >= PROOF_REUSE_LIMIT {
+            self.memo
+                .lock()
+                .map_err(|_| host_failure())?
+                .remove_non_head_root(&mark.session, root);
             return Ok(false);
         }
         if self.local.lock()?.root_epoch != mark.epoch {
@@ -1390,20 +1406,6 @@ impl<S: JournalStorage> JournalEngine<S> {
         let authority = if mark.stored.as_ref().is_some_and(|record| {
             record.retirement.is_none() && record.head.as_ref().is_some_and(|h| &h.id == root)
         }) {
-            let head: JournalHead = mark
-                .stored
-                .as_ref()
-                .and_then(|r| r.head.as_ref())
-                .ok_or_else(conflict)?
-                .decode(JournalObjectKind::Head)
-                .map_err(invalid_state)?;
-            if head.storage_id != self.domain.storage_id
-                || head.role != self.domain.role
-                || head.session != mark.session
-                || head.retirement.is_some()
-            {
-                return Err(invalid_state(conflict()));
-            }
             AuthoritySource::Current
         } else if let Some(pin) = mark.certificates.get(root) {
             AuthoritySource::CertifiedPin(pin.clone())
@@ -1623,39 +1625,42 @@ impl<S: JournalStorage> JournalEngine<S> {
                     .zip(&mut mark.shared_members)
                     .enumerate()
                 {
-                    let present = match layer.as_ref() {
-                        ReachableLayer::Evidence(proof) => {
-                            if let Some(member) = proof.member_index(&id) {
-                                let LayerSeen::Evidence(bits) = &mut mark.shared_seen[index] else {
-                                    return Err(contract_violation());
-                                };
-                                let word =
-                                    bits.get_mut(member / 64).ok_or_else(contract_violation)?;
-                                let bit = 1 << (member % 64);
-                                if *word & bit != 0 {
-                                    return Err(conflict());
-                                }
-                                *word |= bit;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        ReachableLayer::Members(ids) => {
-                            if let Some(entry) = ids.get(&id) {
-                                let LayerSeen::Members(seen) = &mut mark.shared_seen[index] else {
-                                    return Err(contract_violation());
-                                };
-                                if !seen.insert(entry as *const JournalObjectId as usize) {
-                                    return Err(conflict());
-                                }
-                                true
-                            } else {
-                                false
-                            }
-                        }
+                    let ReachableLayer::Evidence(proof) = layer.as_ref() else {
+                        continue;
                     };
-                    if present {
+                    if let Some(member) = proof.member_index(&id) {
+                        let LayerSeen::Evidence(bits) = &mut mark.shared_seen[index] else {
+                            return Err(contract_violation());
+                        };
+                        let word = bits.get_mut(member / 64).ok_or_else(contract_violation)?;
+                        let bit = 1 << (member % 64);
+                        if *word & bit != 0 {
+                            return Err(conflict());
+                        }
+                        *word |= bit;
+                        *members += 1;
+                        live = true;
+                    }
+                }
+                // All in-place and bitmap detectors run before member layers,
+                // regardless of layer order. Only uncovered ids need entries.
+                for (index, (layer, members)) in mark
+                    .shared
+                    .layers
+                    .iter()
+                    .zip(&mut mark.shared_members)
+                    .enumerate()
+                {
+                    let ReachableLayer::Members(ids) = layer.as_ref() else {
+                        continue;
+                    };
+                    if let Some(entry) = ids.get(&id) {
+                        let LayerSeen::Members(seen) = &mut mark.shared_seen[index] else {
+                            return Err(contract_violation());
+                        };
+                        if !live && !seen.insert(entry as *const JournalObjectId as usize) {
+                            return Err(conflict());
+                        }
                         *members += 1;
                         live = true;
                     }

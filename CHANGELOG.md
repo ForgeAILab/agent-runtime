@@ -11,11 +11,14 @@ contain breaking changes and are coordinated with consumer proposals.
 
 - Collection keeps its first 32 reused proofs and cold-traces only excess
   roots; uncertified pins and memo misses no longer discard admitted proofs.
-  Excess roots skip admission locks, head decoding and memo lookups/counters.
+  Excess roots skip proof admission and memo lookup counters while stale
+  non-head-root memo entries are still removed. Current-head identity is
+  validated on load even if an epoch change prevents its first proof reuse.
 - Repeated live or dead inventory ids restart collection under the existing
   retry bound before any release batch can contain duplicate ids.
-- Inventory duplicate tracking reuses cold live entries, preserving cursor
-  capacity; remaining tracking is charged and freed when inventory finishes.
+- Inventory duplicate tracking reuses cold live entries and proof bitmaps
+  before tracking member-layer hits, preserving cursor capacity with held
+  leases; remaining tracking is charged and freed when inventory finishes.
   Layer/count guards also check shared seen state and return contract errors.
 - Collector-driven memo evictions emit `rt.memo.eviction` without changing
   LRU priority. Memo protection snapshots leased sessions once per collect call.

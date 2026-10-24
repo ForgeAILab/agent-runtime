@@ -853,8 +853,13 @@ lease-restart descriptions; earlier owner decisions above remain verbatim.
 ## Owner decision addendum: third P2 review (2026-10-24)
 
 Already admitted roots reuse their proofs before the cap check. Other roots
-at the cap take cold tracing before admission locks, head decoding,
-authority/epoch checks or memo lookups. Keep up to 32 reused proofs and
+at the cap take cold tracing before proof-admission locks, authority/epoch
+checks or memo hit/miss lookups. Stale non-head-root memo entries are still
+removed at the cap without emitting lookup counters or promoting LRU order.
+Session loading independently validates the current head's storage id, role,
+session and absence of retirement, even if an epoch change declines its
+first reuse and pins fill the cap before a second attempt.
+Keep up to 32 reused proofs and
 cold-trace only excess roots;
 an uncertified pin or memo miss does not discard admitted proofs. This
 supersedes the earlier whole-session cold-fallback description. Every retained
@@ -865,7 +870,11 @@ pages as a conflict under the existing per-mark retry bound, before release.
 Immutable proof-member indexes support exact compact seen bitmaps. Cold live
 ids mark existing visited/extra entries in place, preserving the original
 128-byte id plus 8-byte expected-kind cursor charge. Immutable member layers
-use charged entry identities without copying full ids; only dead ids need a
+use charged entry identities only for ids not already covered by visited or
+extra entries, any proof bitmap, or an earlier member layer. Proof bitmaps
+are checked before member layers regardless of layer order. This preserves
+cold-live charge with a held member-layer lease and avoids per-id tracking
+for a warm folded lease covered by a proof. Only dead ids need a
 charged full-id set. All duplicate tracking is freed at the end of inventory.
 Both inventory contract guards cover layer, count and seen-state lengths.
 The collector snapshots leased sessions once per call for memo protection.

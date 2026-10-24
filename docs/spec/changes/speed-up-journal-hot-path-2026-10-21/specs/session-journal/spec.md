@@ -135,7 +135,13 @@ part of the complete live union.
 - **WHEN** seventeen through thirty-two certified roots are reused in one mark
 - **THEN** every proof layer retains its original immutable evidence without a copied member-set layer
 - **AND** cursor charge covers the layer references and proof handles while memo reservations cover proof retention
-- **AND** after checking whether a root is already admitted, the cap declines any new root before admission locks, head decoding, authority/epoch validation or memo lookups/counters; the first thirty-two proofs remain retained while only excess roots use cold tracing
+- **AND** after checking whether a root is already admitted, the cap declines any new root before proof-admission locks, authority/epoch validation or memo hit/miss lookups; stale non-head-root memo entries are still removed, and the first thirty-two proofs remain retained while only excess roots use cold tracing
+
+#### Scenario: Current head reuse declines across an epoch change
+
+- **WHEN** an epoch change during session loading declines the current head's first proof reuse and certified pins later fill the proof cap
+- **THEN** session loading MUST independently validate the current head's storage id, role, session and absence of retirement
+- **AND** neither the epoch decline nor the later cap decline can bypass that validation
 
 #### Scenario: Reader and writer-renew churn during a mark
 
@@ -164,6 +170,7 @@ part of the complete live union.
 - **WHEN** cold tracing has populated the live entries and collection inventories membership
 - **THEN** duplicate detection MUST reuse those entries without a second full-id set for live members
 - **AND** the cold-live cursor charge remains 128 bytes per id plus 8 bytes per expected kind
+- **AND** a held member-layer lease MUST NOT add duplicate entries for ids already covered by visited entries, extra roots, proof bitmaps or an earlier member-layer detector
 - **AND** remaining duplicate-tracking memory MUST be charged and freed before dependency or release work
 
 #### Scenario: Live membership is incomplete
