@@ -73,6 +73,7 @@ pub fn event_type(payload: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ChildProgress { .. } => "child_progress",
         RuntimeEvent::ChildNeedsInput { .. } => "child_needs_input",
         RuntimeEvent::ChildCompleted { .. } => "child_completed",
+        RuntimeEvent::ChildLimitReached { .. } => "child_limit_reached",
         RuntimeEvent::ChildStopped { .. } => "child_stopped",
         RuntimeEvent::ChildFailed { .. } => "child_failed",
         RuntimeEvent::SessionShutdown => "session_shutdown",
@@ -572,6 +573,9 @@ fn summary(payload: &RuntimeEvent) -> String {
         }
         RuntimeEvent::ChildCompleted { child, result } => {
             format!("child_completed child={child} {}", clip(result, 200))
+        }
+        RuntimeEvent::ChildLimitReached { child, limit } => {
+            format!("child_limit_reached child={child} limit={}", limit.as_str())
         }
         RuntimeEvent::ChildStopped { child, reason } => {
             format!("child_stopped child={child} reason={reason:?}")

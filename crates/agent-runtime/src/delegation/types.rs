@@ -155,7 +155,9 @@ impl DelegationWaitOptions {
 /// Opaque stable identity for one protected child task outcome.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ChildOutcomeIdentity {
-    /// A normal completed child turn.
+    /// A child turn that ended without returning a request: it completed, or
+    /// it stopped at a limit. A turn has one terminal outcome, so its id
+    /// alone identifies that outcome.
     Completed(TurnId),
     /// A child turn returned a protected interaction request.
     NeedsInput(InteractionRequestId),
@@ -740,6 +742,25 @@ pub enum ChildTaskOutcome {
         /// Exact protected interaction request.
         request: InteractionRequest,
     },
+    /// The child's task stopped at a configured limit before the child gave
+    /// a final answer.
+    ///
+    /// Carries no text. The last thing the child said before the limit is a
+    /// preamble or a step, not an answer, and an output limit discards the
+    /// response that would have been one; reporting either as the task's
+    /// result is how a parent comes to believe unfinished work was done. The
+    /// child stays available for follow-ups within its limits.
+    LimitReached {
+        /// Stable child identity.
+        child: ChildId,
+        /// Exact terminal child turn that stopped.
+        turn: TurnId,
+        /// The limit that stopped it.
+        limit: LimitKind,
+        /// Parent-owned artifacts explicitly copied from the stopped turn.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<ArtifactRef>,
+    },
 }
 
 impl fmt::Debug for ChildTaskOutcome {
@@ -760,11 +781,67 @@ impl fmt::Debug for ChildTaskOutcome {
                 )
                 .field("sensitivity", &request.sensitivity())
                 .finish(),
+            Self::LimitReached {
+                child,
+                turn,
+                limit,
+                artifacts,
+            } => formatter
+                .debug_struct("ChildTaskOutcome::LimitReached")
+                .field("child", child)
+                .field("turn", turn)
+                .field("limit", limit)
+                .field("artifact_count", &artifacts.len())
+                .finish(),
         }
     }
 }
 
 impl ChildTaskOutcome {
+    /// The child this outcome belongs to.
+    pub fn child(&self) -> &ChildId {
+        match self {
+            Self::Completed { child, .. }
+            | Self::NeedsInput { child, .. }
+            | Self::LimitReached { child, .. } => child,
+        }
+    }
+
+    /// The protected identity of this outcome.
+    pub(super) fn identity(&self) -> ChildOutcomeIdentity {
+        match self {
+            Self::Completed { result, .. } => ChildOutcomeIdentity::Completed(result.turn.clone()),
+            Self::LimitReached { turn, .. } => ChildOutcomeIdentity::Completed(turn.clone()),
+            Self::NeedsInput { request, .. } => {
+                ChildOutcomeIdentity::NeedsInput(request.id().clone())
+            }
+        }
+    }
+
+    /// Projects a turn-ending outcome onto the child's status: idle, with
+    /// the answer (or no answer and the limit that stopped it) and the
+    /// artifacts it returned.
+    pub(super) fn apply_to_status(&self, status: &mut ChildStatus) {
+        status.state = ChildState::Idle;
+        match self {
+            Self::Completed { result, .. } => {
+                status.last_result = Some(result.text.clone());
+                status.last_artifacts = result.artifacts.clone();
+            }
+            Self::LimitReached {
+                limit, artifacts, ..
+            } => {
+                status.last_result = None;
+                status.last_artifacts = artifacts.clone();
+                status.last_error = Some(child_limit_error(*limit));
+            }
+            Self::NeedsInput { .. } => {
+                status.last_result = None;
+                status.last_artifacts.clear();
+            }
+        }
+    }
+
     /// Redaction-safe model delivery. Public questionnaires retain their
     /// prompts; sensitive questionnaires carry attribution and question ids
     /// only and must be rendered by the trusted root interaction host.
@@ -777,6 +854,31 @@ impl ChildTaskOutcome {
             request,
         ))
     }
+}
+
+/// What a parent is told about the limit that stopped a child's task.
+pub(super) fn child_limit_description(limit: LimitKind) -> &'static str {
+    match limit {
+        LimitKind::ProviderAttempts => {
+            "its provider attempt limit (the provider kept failing and retries ran out)"
+        }
+        LimitKind::ToolSteps => "its tool-step limit for one task",
+        LimitKind::Time => "its time limit for one task",
+        LimitKind::Output => "its output limit (its last response was too long and was discarded)",
+    }
+}
+
+/// The status error a limit-stopped task leaves, so a parent that polls
+/// status instead of reading the delivery still learns which limit fired.
+pub(super) fn child_limit_error(limit: LimitKind) -> RuntimeError {
+    RuntimeError::new(
+        ErrorKind::Limit,
+        format!(
+            "child task stopped at {} before giving a final answer",
+            child_limit_description(limit)
+        ),
+    )
+    .with_metadata(agent_runtime_core::metadata::Metadata::new().with("limit", limit.as_str()))
 }
 
 /// Bounded, sensitivity-aware projection of a delegated interaction.

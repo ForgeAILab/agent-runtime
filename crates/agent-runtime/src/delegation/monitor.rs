@@ -32,7 +32,7 @@ impl DelegationCoordinator {
                 (Some(TurnFinish::NeedsInput { .. }), _) => Err(RuntimeError::conflict(
                     "child completed with needs_input but its protected request was unavailable",
                 )),
-                (Some(TurnFinish::Completed | TurnFinish::LimitReached { .. }), None) => {
+                (Some(TurnFinish::Completed), None) => {
                     match transfer_completed_result(
                         &coordinator,
                         &child,
@@ -43,7 +43,25 @@ impl DelegationCoordinator {
                     .await
                     {
                         Ok(result) => {
-                            record_completed_outcome(&coordinator, &child, turn_id, result).await
+                            let outcome = ChildTaskOutcome::Completed {
+                                child: child.clone(),
+                                result,
+                            };
+                            record_turn_outcome(&coordinator, &child, turn_id, outcome).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                // The turn ended without an answer. Its last assistant
+                // message is whatever the child said before the limit (an
+                // output limit discards the response that ran over), so it
+                // is reported as the limit, never as a result.
+                (Some(TurnFinish::LimitReached { limit }), None) => {
+                    match transfer_limit_outcome(&coordinator, &child, &handle, &turn_id, limit)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            record_turn_outcome(&coordinator, &child, turn_id, outcome).await
                         }
                         Err(error) => Err(error),
                     }
@@ -126,7 +144,12 @@ impl DelegationCoordinator {
                     RuntimeEvent::TurnStarted => {
                         last_error = None;
                         update_status(&coordinator, &child, |status| {
-                            status.last_error = None;
+                            // This stream can lag the turn-completion cell. A
+                            // TurnStarted read after its turn already ended
+                            // at a limit must not erase the limit it left.
+                            if status.state == ChildState::Running {
+                                status.last_error = None;
+                            }
                         });
                     }
                     RuntimeEvent::Error { error } => {
