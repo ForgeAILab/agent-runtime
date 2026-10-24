@@ -2075,6 +2075,7 @@ impl<T: HttpTransport> Provider for ResponsesProvider<T> {
         request: ProviderRequest,
         ctx: ProviderCallContext,
     ) -> Result<ProviderStream, ProviderError> {
+        super::tool_names::validate(&request)?;
         let tool_names = super::tool_names::ToolNames::new(&request);
         // Validation and serialization are deliberately before credential
         // acquisition. Unsupported stateful/hosted overrides therefore cannot

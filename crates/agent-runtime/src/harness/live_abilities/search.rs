@@ -95,12 +95,30 @@ impl LiveAbilityRuntime {
         let mut retrieval = self
             .resolver
             .retrieve_descriptive(&session.descriptor_view, &query);
-        retrieval.candidates.retain(|candidate| {
-            !crate::hub::is_bootstrap(candidate.descriptor.id())
-                && args
-                    .domain
-                    .is_none_or(|domain| candidate.descriptor.id().domain.as_str() == domain)
-        });
+        retrieval
+            .candidates
+            .retain(|candidate| !crate::hub::is_bootstrap(candidate.descriptor.id()));
+        let mut notes = Vec::new();
+        let in_domain = |candidate: &crate::capability::RetrievedCandidate| {
+            args.domain
+                .is_none_or(|domain| candidate.descriptor.id().domain.as_str() == domain)
+        };
+        if retrieval.candidates.iter().any(in_domain) {
+            retrieval.candidates.retain(in_domain);
+            if args.domain.is_none() {
+                interleave_domains(&mut retrieval.candidates);
+            }
+        } else if let Some(domain) = args.domain {
+            // A guessed domain is a common miss (delegation is often a tool,
+            // not an agent entry); answering from every domain beats an empty
+            // result the model reads as "this capability does not exist".
+            interleave_domains(&mut retrieval.candidates);
+            if !retrieval.candidates.is_empty() {
+                notes.push(format!(
+                    "Nothing matched in domain `{domain}`; these matches come from every domain."
+                ));
+            }
+        }
         let plan = self.select_retrieved(
             &session.descriptor_view,
             &retrieval,
@@ -121,6 +139,7 @@ impl LiveAbilityRuntime {
         let mut cards = Vec::new();
         let mut staged_ids = Vec::new();
         let mut already_available = Vec::new();
+        let mut not_staged = Vec::new();
         for candidate in retrieval
             .candidates
             .iter()
@@ -136,6 +155,9 @@ impl LiveAbilityRuntime {
         for binding in &plan.bindings {
             let id = binding.descriptor.id();
             let Some(payload) = materialized.get(id).cloned() else {
+                cards.push(binding.descriptor.card().clone());
+                not_staged
+                    .push(serde_json::json!({"id":id.qualified(),"reason":"not_materialized"}));
                 continue;
             };
             cards.push(binding.descriptor.card().clone());
@@ -147,6 +169,39 @@ impl LiveAbilityRuntime {
             staged.insert(
                 id.clone(),
                 (binding.descriptor.content_revision().clone(), payload),
+            );
+        }
+        // The same window `select_retrieved` considered, so a candidate it
+        // rejected is never missed because a held pin sat ahead of it.
+        let considered = retrieval
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                !(self.pinned.contains(candidate.descriptor.id())
+                    && already_active.contains(candidate.descriptor.id()))
+            })
+            .take(max_results)
+            .collect::<Vec<_>>();
+        for rejected in &plan.rejected {
+            if held.contains(&rejected.id) {
+                continue;
+            }
+            let Some(candidate) = considered
+                .iter()
+                .find(|candidate| candidate.descriptor.id() == &rejected.id)
+            else {
+                continue;
+            };
+            cards.push(candidate.descriptor.card().clone());
+            not_staged.push(serde_json::json!({
+                "id": rejected.id.qualified(),
+                "reason": rejection_label(&rejected.reason),
+            }));
+        }
+        if !not_staged.is_empty() {
+            notes.push(
+                "Matches under not_staged were not staged; request one with registry.activate."
+                    .to_owned(),
             );
         }
         {
@@ -166,15 +221,55 @@ impl LiveAbilityRuntime {
             "already_available": already_available,
             "available_on": "next_provider_request"
         });
+        if !not_staged.is_empty() {
+            result["not_staged"] = serde_json::json!(not_staged);
+        }
         if retrieval.candidates.is_empty() {
             result["matched"] = serde_json::json!(0);
-            result["note"] = serde_json::json!(
-                "Nothing matched the query. Omit query to list everything available."
+            notes.push(
+                "Nothing matched the query. Omit query to list everything available.".to_owned(),
             );
+        }
+        if !notes.is_empty() {
+            result["note"] = serde_json::json!(notes.join(" "));
         }
         Ok(ToolOutcome::json(result))
     }
 }
+
+/// Orders candidates round-robin across domains, each domain in rank order,
+/// so a large skill set cannot push every matching tool past the result cut.
+fn interleave_domains(candidates: &mut Vec<crate::capability::RetrievedCandidate>) {
+    let mut queues: Vec<std::collections::VecDeque<_>> = Vec::new();
+    let mut domains: Vec<String> = Vec::new();
+    for candidate in candidates.drain(..) {
+        let domain = candidate.descriptor.id().domain.as_str();
+        match domains.iter().position(|seen| seen == domain) {
+            Some(index) => queues[index].push_back(candidate),
+            None => {
+                domains.push(domain.to_owned());
+                queues.push(std::collections::VecDeque::from([candidate]));
+            }
+        }
+    }
+    while queues.iter().any(|queue| !queue.is_empty()) {
+        for queue in &mut queues {
+            candidates.extend(queue.pop_front());
+        }
+    }
+}
+
+fn rejection_label(reason: &crate::capability::RejectionReason) -> &'static str {
+    use crate::capability::RejectionReason;
+    match reason {
+        RejectionReason::Conflict { .. } => "conflict",
+        RejectionReason::DependencyUnsatisfied { .. } => "dependency_unsatisfied",
+        RejectionReason::Redundant => "redundant",
+        RejectionReason::BudgetExceeded { .. } => "budget_exceeded",
+        RejectionReason::CardinalityExceeded => "cardinality_exceeded",
+    }
+}
+
 impl SessionAbilities {
     fn by_domain(&self) -> BTreeMap<String, usize> {
         let mut counts = BTreeMap::new();
@@ -259,12 +354,22 @@ impl LiveAbilityRuntime {
             let mut retrieval = self
                 .resolver
                 .retrieve_descriptive(&session.descriptor_view, &query);
-            retrieval.candidates.retain(|candidate| {
-                !crate::hub::is_bootstrap(candidate.descriptor.id())
-                    && args
-                        .domain
-                        .is_none_or(|domain| candidate.descriptor.id().domain.as_str() == domain)
-            });
+            retrieval
+                .candidates
+                .retain(|candidate| !crate::hub::is_bootstrap(candidate.descriptor.id()));
+            let in_domain = |candidate: &crate::capability::RetrievedCandidate| {
+                args.domain
+                    .is_none_or(|domain| candidate.descriptor.id().domain.as_str() == domain)
+            };
+            let fell_back = !retrieval.candidates.iter().any(in_domain);
+            if fell_back {
+                interleave_domains(&mut retrieval.candidates);
+            } else {
+                retrieval.candidates.retain(in_domain);
+                if args.domain.is_none() {
+                    interleave_domains(&mut retrieval.candidates);
+                }
+            }
             emit_retrieval(emitter, turn, &retrieval);
             let cards = retrieval
                 .candidates
@@ -279,10 +384,18 @@ impl LiveAbilityRuntime {
                 .filter(|candidate| candidate.descriptor.kind() == &AbilityKind::Tool)
                 .map(|candidate| candidate.descriptor.id().qualified())
                 .collect::<Vec<_>>();
-            return Ok(ToolOutcome::json(serde_json::json!({
+            let mut result = serde_json::json!({
                 "by_domain":session.by_domain(),"cards":cards,"staged":[],
                 "already_available":already_available,"available_on":"registry.activate"
-            })));
+            });
+            if let (true, Some(domain)) =
+                (fell_back && !retrieval.candidates.is_empty(), args.domain)
+            {
+                result["note"] = serde_json::json!(format!(
+                    "Nothing matched in domain `{domain}`; these matches come from every domain."
+                ));
+            }
+            return Ok(ToolOutcome::json(result));
         }
         let ids = arguments
             .get("ids")
@@ -549,4 +662,46 @@ pub(crate) fn emit_activation_epoch(
                 .collect(),
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::{MatchReasons, RetrievedCandidate, RetrieverSource};
+
+    fn candidate(kind: AbilityKind, name: &str, score: u32) -> RetrievedCandidate {
+        RetrievedCandidate {
+            descriptor: AbilityDescriptor::new(
+                kind,
+                name,
+                agent_runtime_registry::EntryProvenance::new(
+                    agent_runtime_registry::RegistrySource::BuiltIn,
+                    RegistryRevision::new("1"),
+                ),
+                name,
+                "",
+                RegistryRevision::new("1"),
+            ),
+            score,
+            source: RetrieverSource::Deterministic,
+            matched: MatchReasons::default(),
+        }
+    }
+
+    #[test]
+    fn domains_interleave_in_rank_order() {
+        let mut candidates = vec![
+            candidate(AbilityKind::Skill, "s1", 20),
+            candidate(AbilityKind::Skill, "s2", 19),
+            candidate(AbilityKind::Skill, "s3", 18),
+            candidate(AbilityKind::Tool, "t1", 9),
+            candidate(AbilityKind::Tool, "t2", 8),
+        ];
+        interleave_domains(&mut candidates);
+        let names = candidates
+            .iter()
+            .map(|candidate| candidate.descriptor.id().name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["s1", "t1", "s2", "t2", "s3"]);
+    }
 }

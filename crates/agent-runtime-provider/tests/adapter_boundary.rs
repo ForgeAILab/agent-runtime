@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use agent_runtime_core::cancel::Cancellation;
@@ -216,54 +215,54 @@ async fn responses_dotted_and_overlong_names_round_trip_across_adapter_boundarie
     dotted_and_overlong_names_round_trip_across_adapter_boundaries("responses").await;
 }
 
-async fn collision_disambiguation_is_deterministic_and_valid_names_are_unchanged(kind: &str) {
+async fn colliding_names_are_rejected_and_valid_names_are_unchanged(kind: &str) {
     let names = vec![
         "memory.search".into(),
-        "memory/search".into(),
-        "memory_search".into(),
         "valid-Tool_9".into(),
-        "x".repeat(64),
         "x".repeat(150),
-        format!("{}y", "x".repeat(149)),
     ];
     let (payload, _) = exchange(kind, tool_request(&names), model_call(kind, "unknown_tool")).await;
-    let wire = wire_names(kind, &payload);
-    assert_eq!(wire.iter().collect::<BTreeSet<_>>().len(), names.len());
-    assert!(wire.iter().all(|name| {
-        name.len() <= 64
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    }));
-    for i in [2, 3, 4] {
-        assert_eq!(wire[i], names[i]);
-    }
-    let reversed: Vec<_> = names.iter().rev().cloned().collect();
-    let (payload, _) = exchange(
-        kind,
-        tool_request(&reversed),
-        model_call(kind, "unknown_tool"),
-    )
-    .await;
     assert_eq!(
         wire_names(kind, &payload),
-        wire.into_iter().rev().collect::<Vec<_>>()
+        vec![
+            "memory_search".to_owned(),
+            "valid-Tool_9".into(),
+            "x".repeat(64)
+        ]
     );
+    for colliding in [
+        vec!["memory.search".to_owned(), "memory_search".into()],
+        vec!["x".repeat(64), "x".repeat(150)],
+    ] {
+        let capture = Capture {
+            body: String::new(),
+            error: None,
+            requests: Arc::default(),
+        };
+        let Err(error) = adapter(kind, capture.clone())
+            .stream(tool_request(&colliding), context())
+            .await
+        else {
+            panic!("{kind}: colliding tool names were sent");
+        };
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest, "{kind}");
+        assert!(capture.requests.lock().unwrap().is_empty(), "{kind}");
+    }
 }
 
 #[tokio::test]
-async fn anthropic_collision_disambiguation_is_deterministic_and_valid_names_are_unchanged() {
-    collision_disambiguation_is_deterministic_and_valid_names_are_unchanged("anthropic").await;
+async fn anthropic_colliding_names_are_rejected_and_valid_names_are_unchanged() {
+    colliding_names_are_rejected_and_valid_names_are_unchanged("anthropic").await;
 }
 
 #[tokio::test]
-async fn openai_collision_disambiguation_is_deterministic_and_valid_names_are_unchanged() {
-    collision_disambiguation_is_deterministic_and_valid_names_are_unchanged("openai").await;
+async fn openai_colliding_names_are_rejected_and_valid_names_are_unchanged() {
+    colliding_names_are_rejected_and_valid_names_are_unchanged("openai").await;
 }
 
 #[tokio::test]
-async fn responses_collision_disambiguation_is_deterministic_and_valid_names_are_unchanged() {
-    collision_disambiguation_is_deterministic_and_valid_names_are_unchanged("responses").await;
+async fn responses_colliding_names_are_rejected_and_valid_names_are_unchanged() {
+    colliding_names_are_rejected_and_valid_names_are_unchanged("responses").await;
 }
 
 async fn unknown_wire_name_passes_through_unchanged(kind: &str) {

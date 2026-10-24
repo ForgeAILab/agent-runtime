@@ -18,7 +18,7 @@ use agent_runtime_ability::{Registry, Sealed, ToolEntry};
 use agent_runtime_core::content::ToolCall;
 use agent_runtime_core::error::RuntimeError;
 use agent_runtime_core::provider::{ProviderError, ProviderErrorKind, ToolSchema};
-use agent_runtime_core::tool::{Tool, ToolSpec};
+use agent_runtime_core::tool::{Tool, ToolSpec, provider_tool_name};
 
 /// A mutable builder for a set of tools.
 #[derive(Debug, Default)]
@@ -27,6 +27,9 @@ pub struct ToolRegistry {
     // A name uniquely identifies the exact ToolEntry spec frozen at
     // registration. Never reread Tool::spec or compile at invocation time.
     validators: BTreeMap<String, Arc<jsonschema::Validator>>,
+    // Provider wire name -> registered name. Two tools a provider would see
+    // under one name are a conflict, the same as two tools with one name.
+    provider_names: BTreeMap<String, String>,
 }
 
 impl ToolRegistry {
@@ -36,13 +39,25 @@ impl ToolRegistry {
     }
 
     /// Registers a tool. Fails with a
-    /// [`agent_runtime_core::error::ErrorKind::Conflict`] error if the name is
-    /// already taken (the first registration wins) or a
-    /// [`agent_runtime_core::error::ErrorKind::Config`] error if the tool's
-    /// input schema is invalid.
+    /// [`agent_runtime_core::error::ErrorKind::Conflict`] error if the name, or
+    /// the provider name it maps to, is already taken (the first registration
+    /// wins) or a [`agent_runtime_core::error::ErrorKind::Config`] error if the
+    /// tool's name is empty or its input schema is invalid.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), RuntimeError> {
         let entry = ToolEntry::new(tool);
         let name = entry.spec().name.clone();
+        let provider_name = provider_tool_name(&name);
+        if provider_name.is_empty() {
+            return Err(RuntimeError::config("a tool has an empty name"));
+        }
+        match self.provider_names.get(&provider_name) {
+            Some(existing) if existing != &name => {
+                return Err(RuntimeError::conflict(format!(
+                    "tools `{existing}` and `{name}` share the provider name `{provider_name}`"
+                )));
+            }
+            _ => {}
+        }
         let validator = jsonschema::validator_for(&entry.spec().input_schema).map_err(|error| {
             RuntimeError::config(format!(
                 "tool `{name}` has an invalid input schema: {error}"
@@ -51,6 +66,7 @@ impl ToolRegistry {
         self.inner
             .register(entry)
             .map_err(|error| RuntimeError::conflict(error.to_string()))?;
+        self.provider_names.insert(provider_name, name.clone());
         self.validators.insert(name, Arc::new(validator));
         Ok(())
     }
@@ -276,6 +292,18 @@ mod tests {
         reg.register(Arc::new(Noop("read"))).unwrap();
         let err = reg.register(Arc::new(Noop("read"))).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
+    }
+
+    #[test]
+    fn names_sharing_a_provider_name_are_rejected() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Noop("memory.search"))).unwrap();
+        let err = reg.register(Arc::new(Noop("memory_search"))).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict);
+        assert!(err.message.contains("memory.search"), "{err}");
+        assert!(err.message.contains("memory_search"), "{err}");
+        let err = reg.register(Arc::new(Noop(""))).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Config);
     }
 
     #[test]
