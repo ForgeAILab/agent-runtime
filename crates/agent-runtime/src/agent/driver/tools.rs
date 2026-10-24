@@ -36,8 +36,9 @@ impl TurnMachine {
                 let block = crate::tool::executor::error_block(
                     call,
                     format!(
-                        "tool `{}` was not active in the frozen provider request",
-                        call.name
+                        "tool `{}` was not active in the frozen provider request; available tools: {}",
+                        call.name,
+                        advertised_tools.join(", ")
                     ),
                     self.driver.config.output_limit,
                 );

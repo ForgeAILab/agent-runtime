@@ -596,6 +596,28 @@ fn filesystem_resource(mount: &str, scope: &str) -> SecurityResource {
     SecurityResource::filesystem(mount, segments)
 }
 
+/// The longest tool name every supported provider accepts on the wire.
+pub const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 64;
+
+/// The name a provider sees for the canonical tool name `name`.
+///
+/// Every byte outside `[A-Za-z0-9_-]` becomes `_`, and the result is cut to
+/// [`MAX_PROVIDER_TOOL_NAME_BYTES`]. Nothing is appended: two tools that map to
+/// one provider name are a registration conflict, not something to
+/// disambiguate, because a model must be able to read and repeat the name.
+pub fn provider_tool_name(name: &str) -> String {
+    name.bytes()
+        .take(MAX_PROVIDER_TOOL_NAME_BYTES)
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+                char::from(byte)
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// A tool's advertised specification.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ToolSpec {
@@ -1390,6 +1412,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_tool_names_replace_invalid_bytes_and_truncate_without_suffixes() {
+        assert_eq!(provider_tool_name("read"), "read");
+        assert_eq!(provider_tool_name("web-fetch_2"), "web-fetch_2");
+        assert_eq!(provider_tool_name("registry.activate"), "registry_activate");
+        assert_eq!(provider_tool_name("é"), "__");
+        assert_eq!(provider_tool_name(""), "");
+        assert_eq!(
+            provider_tool_name(&"x".repeat(100)),
+            "x".repeat(MAX_PROVIDER_TOOL_NAME_BYTES)
+        );
+    }
 
     #[test]
     fn effects_classify_and_overlap() {
