@@ -141,12 +141,33 @@ impl CollectionState {
             .shared_members
             .clear();
     }
+    pub(super) fn truncate_counts_after_page_for_test(&mut self) {
+        self.cursor
+            .as_mut()
+            .unwrap()
+            .mark
+            .as_mut()
+            .unwrap()
+            .truncate_counts_after_page = true;
+    }
     pub(super) fn marked_session_for_test(&self) -> Option<&SessionId> {
         self.cursor
             .as_ref()?
             .mark
             .as_ref()
             .map(|mark| &mark.session)
+    }
+    pub(super) fn traced_ids_for_test(&self) -> BTreeSet<JournalObjectId> {
+        self.cursor
+            .as_ref()
+            .unwrap()
+            .mark
+            .as_ref()
+            .unwrap()
+            .visited
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 
@@ -232,10 +253,15 @@ struct SessionMark {
     // Immutable lease/proof layers stay shared across cursor yields.
     shared: ReachableSet,
     proofs: BTreeMap<JournalObjectId, AuthenticatedClosure>,
-    proof_reuse_disabled: bool,
     certificates: BTreeMap<JournalObjectId, JournalPinId>,
     epoch: u64,
     shared_members: Vec<usize>,
+    // Exact duplicate tracking: one bit per immutable proof member, full ids
+    // only for the remaining inventory. Warm proofs stay shared, not copied.
+    shared_seen: Vec<Vec<u64>>,
+    members_seen: BTreeSet<JournalObjectId>,
+    #[cfg(test)]
+    truncate_counts_after_page: bool,
     frontier: Vec<Frontier>,
     dependencies: BTreeSet<SessionId>,
     pins_done: bool,
@@ -268,10 +294,13 @@ impl SessionMark {
             extra: BTreeSet::new(),
             shared: ReachableSet::default(),
             proofs: BTreeMap::new(),
-            proof_reuse_disabled: false,
             certificates: BTreeMap::new(),
             epoch: 0,
             shared_members: Vec::new(),
+            shared_seen: Vec::new(),
+            members_seen: BTreeSet::new(),
+            #[cfg(test)]
+            truncate_counts_after_page: false,
             frontier: Vec::new(),
             dependencies: BTreeSet::new(),
             pins_done: false,
@@ -298,6 +327,7 @@ impl SessionMark {
             + self.frontier.len()
             + self.catalog.len()
             + self.garbage.len()
+            + self.members_seen.len()
             + self.dep_queue.len()
             + self.dependencies.len()
             + 2 * self.certificates.len()
@@ -308,6 +338,12 @@ impl SessionMark {
             + self.proofs.len() * (std::mem::size_of::<AuthenticatedClosure>() + 4 * ID_CHARGE)
             + self.shared.layers.len() * std::mem::size_of::<Arc<ReachableLayer>>()
             + self.shared_members.len() * std::mem::size_of::<usize>()
+            + self.shared_seen.capacity() * std::mem::size_of::<Vec<u64>>()
+            + self
+                .shared_seen
+                .iter()
+                .map(|bits| bits.capacity() * std::mem::size_of::<u64>())
+                .sum::<usize>()
     }
     // Collector workspace retains references. The writer's extend_layer can
     // coalesce member layers through COW, allocating a new full member set.
@@ -347,6 +383,7 @@ struct Call {
     restarted: bool,
     peak_skip_charge: usize,
     over_capacity: BTreeSet<SessionId>,
+    leased_sessions: BTreeSet<SessionId>,
 }
 impl Call {
     fn admit(&self, kind: Unit, costs: &[Duration; UNIT_KINDS]) -> bool {
@@ -460,15 +497,21 @@ impl<S: JournalStorage> JournalEngine<S> {
             if self.storage.collection_capability() == JournalCollectionCapability::Unsupported {
                 return Err(unsupported());
             }
-            if self
-                .local
-                .lock()?
-                .leases
-                .values()
-                .any(|lease| lease.dependencies.unresolved)
-            {
-                return Err(unsupported());
-            }
+            let leased_sessions = {
+                let local = self.local.lock()?;
+                if local
+                    .leases
+                    .values()
+                    .any(|lease| lease.dependencies.unresolved)
+                {
+                    return Err(unsupported());
+                }
+                local
+                    .leases
+                    .values()
+                    .map(|lease| lease.session.clone())
+                    .collect()
+            };
             let mut report = JournalGcReport {
                 root_epoch: request.expected_root_epoch,
                 examined: 0,
@@ -498,6 +541,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 restarted: false,
                 peak_skip_charge: 0,
                 over_capacity: BTreeSet::new(),
+                leased_sessions,
             };
             let cursor = kept.get_or_insert_with(|| CollectionCursor {
                 after: None,
@@ -645,7 +689,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                                 if fence != mark.fence {
                                     "rt.gc.restart.fence"
                                 } else {
-                                    "rt.gc.restart.lease"
+                                    "rt.gc.restart.proof"
                                 },
                                 1,
                                 0,
@@ -793,7 +837,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                     }
                     mark.dependencies.extend(metadata.dependencies.sessions);
                     let root = head.id.clone();
-                    if !self.reuse_proof(&mut mark, &root)? {
+                    if !self.reuse_proof(&mut mark, &root, &call.leased_sessions)? {
                         mark.frontier.push(Frontier::Edge(
                             root,
                             ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
@@ -1136,7 +1180,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 _ => None,
             };
             if let Some(root) = proof_root {
-                if self.reuse_proof(mark, root)? {
+                if self.reuse_proof(mark, root, &call.leased_sessions)? {
                     continue;
                 }
             }
@@ -1288,26 +1332,10 @@ impl<S: JournalStorage> JournalEngine<S> {
         &self,
         mark: &mut SessionMark,
         root: &JournalObjectId,
+        leased_sessions: &BTreeSet<SessionId>,
     ) -> Result<bool, RuntimeError> {
         if mark.proofs.contains_key(root) {
             return Ok(true);
-        }
-        if mark.proof_reuse_disabled {
-            return Ok(false);
-        }
-        if mark.proofs.len() >= PROOF_REUSE_LIMIT {
-            // Restart all reused roots through the bounded typed walker. No
-            // lease layers have joined yet, so these are only proof layers.
-            mark.proof_reuse_disabled = true;
-            for root in mark.proofs.keys() {
-                mark.frontier.push(Frontier::Edge(
-                    root.clone(),
-                    ExpectedObject::Leaf(ExpectedLeaf::Kind(JournalObjectKind::Head)),
-                ));
-            }
-            mark.proofs.clear();
-            mark.shared.layers.clear();
-            return Ok(false);
         }
         if self.local.lock()?.root_epoch != mark.epoch {
             return Ok(false);
@@ -1349,6 +1377,10 @@ impl<S: JournalStorage> JournalEngine<S> {
         if entry.dependencies.unresolved {
             return Ok(false);
         }
+        // Keep admitted proofs; only excess reusable roots take cold tracing.
+        if mark.proofs.len() >= PROOF_REUSE_LIMIT {
+            return Ok(false);
+        }
         let bytes = entry
             .closure
             .charge()
@@ -1362,8 +1394,7 @@ impl<S: JournalStorage> JournalEngine<S> {
                 .sessions
                 .get(session)
                 .filter(|record| {
-                    record.active_writer.is_some()
-                        || local.leases.values().any(|lease| &lease.session == session)
+                    record.active_writer.is_some() || leased_sessions.contains(session)
                 })
                 .and_then(|r| r.current.as_ref())
                 .is_some_and(|(id, _)| id == root)
@@ -1440,6 +1471,15 @@ impl<S: JournalStorage> JournalEngine<S> {
             }
         }
         mark.shared_members = vec![0; mark.shared.layers.len()];
+        mark.shared_seen = mark
+            .shared
+            .layers
+            .iter()
+            .map(|layer| match layer.as_ref() {
+                ReachableLayer::Evidence(proof) => vec![0; proof.len().div_ceil(64)],
+                ReachableLayer::Members(_) => Vec::new(),
+            })
+            .collect();
         mark.phase = Phase::Inventory;
         Ok(())
     }
@@ -1494,6 +1534,10 @@ impl<S: JournalStorage> JournalEngine<S> {
             )
             .await?;
         let mark = cursor.mark.as_mut().expect("mark");
+        #[cfg(test)]
+        if std::mem::take(&mut mark.truncate_counts_after_page) {
+            mark.shared_members.clear();
+        }
         if mark.shared.layers.len() != mark.shared_members.len() {
             return Err(contract_violation());
         }
@@ -1504,11 +1548,38 @@ impl<S: JournalStorage> JournalEngine<S> {
                 if live {
                     mark.live_members += 1;
                 }
-                for (layer, members) in mark.shared.layers.iter().zip(&mut mark.shared_members) {
-                    if layer.contains(&id) {
+                let mut in_proof = false;
+                for (index, (layer, members)) in mark
+                    .shared
+                    .layers
+                    .iter()
+                    .zip(&mut mark.shared_members)
+                    .enumerate()
+                {
+                    let present = match layer.as_ref() {
+                        ReachableLayer::Evidence(proof) => {
+                            if let Some(member) = proof.member_index(&id) {
+                                in_proof = true;
+                                let word = &mut mark.shared_seen[index][member / 64];
+                                let bit = 1 << (member % 64);
+                                if *word & bit != 0 {
+                                    return Err(conflict());
+                                }
+                                *word |= bit;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        ReachableLayer::Members(ids) => ids.contains(&id),
+                    };
+                    if present {
                         *members += 1;
                         live = true;
                     }
+                }
+                if !in_proof && !mark.members_seen.insert(id.clone()) {
+                    return Err(conflict());
                 }
                 if !live {
                     mark.garbage.push_back(id);

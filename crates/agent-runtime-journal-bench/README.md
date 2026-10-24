@@ -215,6 +215,14 @@ aggregate only within their exact parent span. No journal plaintext or full
 root ids are emitted. Source/fixture hashes, compiler revision and command
 receipts should accompany a frozen run.
 
+`rt.gc.restart.proof` counts resumed marks invalidated by a changed active
+writer working proof. It replaces `rt.gc.restart.lease`; added readers are
+protected by the release filter. The fixture records the new label in both
+stage summaries and per-call diagnostics. The aggregator exports restart and
+memo-eviction `*_count` metrics from event units, including collector-driven
+evictions. It retains the historical label as a separate counter, whose
+meaning must be interpreted against the captured source revision.
+
 Aggregate completed runs with Python's standard library:
 
 ```sh

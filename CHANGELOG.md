@@ -7,6 +7,23 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Fixed
+
+- Collection keeps its first 32 reused proofs and cold-traces only excess
+  roots; uncertified pins and memo misses no longer discard admitted proofs.
+- Repeated live or dead inventory ids restart collection under the existing
+  retry bound before any release batch can contain duplicate ids.
+- Collector-driven memo evictions emit `rt.memo.eviction` without changing
+  LRU priority. Memo protection snapshots leased sessions once per collect call.
+
+### Changed
+
+- Working-proof restarts use the profile label `rt.gc.restart.proof`; bench
+  aggregation preserves the historical label separately for older captures.
+- GC report documentation clarifies that a retry-exhausted session is skipped
+  for the current pass, omitted from continuation and error lists, and retried
+  on the next pass with dirty state retained.
+
 ## [0.10.0] - 2026-10-24
 
 ### Breaking

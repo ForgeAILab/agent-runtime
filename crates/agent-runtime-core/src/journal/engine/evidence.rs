@@ -30,6 +30,9 @@ impl ClosureEvidence {
     pub(in crate::journal) fn contains(&self, id: &JournalObjectId) -> bool {
         self.members.contains_key(id)
     }
+    pub(super) fn member_index(&self, id: &JournalObjectId) -> Option<usize> {
+        self.members.index_of(id)
+    }
     pub(in crate::journal) fn iter(&self) -> impl Iterator<Item = &JournalObjectId> {
         self.members.keys()
     }

@@ -135,7 +135,7 @@ part of the complete live union.
 - **WHEN** seventeen through thirty-two certified roots are reused in one mark
 - **THEN** every proof layer retains its original immutable evidence without a copied member-set layer
 - **AND** cursor charge covers the layer references and proof handles while memo reservations cover proof retention
-- **AND** encountering another root beyond thirty-two clears reused proof layers/reservations and cold-traces all those roots for the rest of the session
+- **AND** the cap is checked after authority and memo validation, immediately before reservation; the first thirty-two proofs remain retained while only excess roots use cold tracing
 
 #### Scenario: Reader and writer-renew churn during a mark
 
@@ -155,7 +155,7 @@ part of the complete live union.
 
 - **WHEN** shared layer and count lengths differ
 - **THEN** collection MUST return a contract error in debug and release builds before inventory zips can truncate
-- **WHEN** repeated membership ids make hits exceed a live layer's length
+- **WHEN** an inventory repeats any full membership id, live or dead, within or across pages
 - **THEN** collection MUST restart as a conflict under the per-mark retry bound, without unreadable reporting or releases
 - **AND** conformance MUST enforce unique full ids across pages while preserving storage-defined order
 
@@ -239,6 +239,7 @@ in bench.md P4 under the named fixture/storage conditions.
 - **WHEN** fence, working-proof or page conflicts invalidate the same session mark chain repeatedly across calls
 - **THEN** collection MUST retry at most once in the current pass and skip after the second invalidation
 - **AND** dirty state survives while later sessions and discovery pages complete
+- **AND** a retry-exhausted skip does not itself set has_more or enter unreadable_sessions or over_capacity_sessions; the next pass attempts the session again
 
 #### Scenario: Root ownership changes across a yield
 

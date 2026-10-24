@@ -849,3 +849,25 @@ fence checks. Remaining restarts must be bounded per mark chain across calls;
 the implementation permits one retry, then skips the session for this pass
 with dirty state retained. This addendum supersedes conflicting earlier
 lease-restart descriptions; earlier owner decisions above remain verbatim.
+
+## Owner decision addendum: third P2 review (2026-10-24)
+
+The proof cap now applies at reservation after authority, epoch and memo
+validation. Keep up to 32 reused proofs and cold-trace only excess roots;
+an uncertified pin or memo miss does not discard admitted proofs. This
+supersedes the earlier whole-session cold-fallback description. Every retained
+root's complete closure must survive and receipts must match a cold drain.
+
+Inventory rejects every repeated full id, live or dead, within or across
+pages as a conflict under the existing per-mark retry bound, before release.
+Immutable proof-member indexes support exact compact seen bitmaps; remaining
+ids use a charged set, preserving the reference-only proof representation.
+The collector snapshots leased sessions once per call for memo protection.
+Collector-driven evictions emit `rt.memo.eviction` without LRU promotion;
+working-proof restarts use `rt.gc.restart.proof` in profile output.
+
+A session invalidated again after its one retry is skipped for the rest of
+that pass. Its dirty state is retained, but the skip does not itself request
+`has_more` and is absent from both `unreadable_sessions` and
+`over_capacity_sessions`. A later collection pass attempts it again. This
+documents existing reporting behavior without adding a GC report field.

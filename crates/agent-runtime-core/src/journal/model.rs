@@ -654,6 +654,10 @@ pub enum JournalGcProgress {
 /// Metadata-only collection result; content IDs never enter default diagnostics.
 /// Counts, receipts and unreadable sessions describe this call only; a host
 /// drain accumulates them.
+/// A session invalidated again after its one retry is skipped for the rest of
+/// the pass with dirty state retained. That skip does not itself set `has_more`
+/// or appear in `unreadable_sessions` or `over_capacity_sessions`. The next
+/// collection pass attempts the session again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalGcReport {
     /// Transactionally verified root/pin epoch.

@@ -103,6 +103,8 @@ impl RootMemo {
             next = node.newer.as_ref();
         }
         for key in victims {
+            #[cfg(feature = "test-support")]
+            crate::journal::profile::event("rt.memo.eviction", 1, 0);
             self.remove(&key);
         }
         self.retained_proof_bytes

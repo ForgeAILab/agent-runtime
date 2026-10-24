@@ -20,10 +20,19 @@ def stage(op, label):
     return op['stages'].get(label, {}).get('nanos', 0) / 1e6
 
 
+def collection_counters(operations):
+    # Preserve the old label separately: its meaning depends on source revision.
+    labels = ('rt.gc.restart.fence', 'rt.gc.restart.proof', 'rt.gc.restart.epoch',
+              'rt.gc.restart.page', 'rt.gc.restart.lease', 'rt.memo.eviction')
+    return {label + '_count': sum(op['stages'].get(label, {}).get('units', 0)
+                                 for op in operations) for label in labels}
+
+
 def measurements(case):
     operations = case['operations']
     turn = next(op for op in reversed(operations) if op['boundary'] == 'turn')
     result = {label: value['nanos'] / 1e6 for label, value in turn['stages'].items()}
+    result.update(collection_counters(operations))
     result['last_turn'] = turn['wall_nanos'] / 1e6
     for boundary in ('seed_bootstrap', 'initial_open', 'cold_root', 'warm_root',
                      'cold_resume', 'warm_resume', 'first_import', 'shutdown_drain',

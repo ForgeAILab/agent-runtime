@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-22T00:49:18Z
-updated_at: 2026-10-24T00:48:05Z
+updated_at: 2026-10-24T05:05:00Z
 completed_at:
 ---
 
@@ -190,3 +190,15 @@ correctness targets, both clippy configurations and 26 negative controls pass.
 - [x] 2.11 Run the seven merge targets, both clippy modes, all 26 prior controls plus new controls, and matched B/4000 ABAB sanity against 0dc3ca8; publish rt-p2-fix2/report.md.
 
 This repair does not complete the outstanding full phase/adoption gates.
+
+### Third P2 review follow-ups (2026-10-24)
+
+- [x] 2.12 G1: prove every certified closure survives proof-cap fallback with cold receipt parity and a body-deletion control.
+- [x] 2.13 F1: cap admission after authority/memo validation, retain the first 32 proofs and trace only excess roots.
+- [x] 2.14 G2: independently exercise the post-page layer/count contract guard.
+- [x] 2.15 F3: restart on any repeated inventory id, including dead ids, within the persistent retry bound.
+- [x] 2.16 F4: snapshot leased sessions once per collect call for memo protection.
+- [x] 2.17 F5: count collector-driven memo evictions without changing LRU behavior.
+- [x] 2.18 F6: rename the working-proof restart profile label and update its consumers.
+- [x] 2.19 F2: document pass-only skip reporting and next-pass retry in owner decisions and JournalGcReport.
+- [x] 2.20 Add Unreleased changelog entries and run the requested follow-up verification/control gates.
