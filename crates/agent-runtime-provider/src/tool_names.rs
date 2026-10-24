@@ -1,25 +1,16 @@
-//! Private provider-boundary aliases; canonical runtime data is never mutated.
+//! Private provider-boundary names; canonical runtime data is never mutated.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use agent_runtime_core::content::ContentPart;
 use agent_runtime_core::provider::{
-    ProviderRequest, ProviderStream, ProviderStreamEvent, ToolChoice,
+    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, ProviderStreamEvent,
+    ToolChoice,
 };
-use agent_runtime_registry::Fingerprint;
+use agent_runtime_core::tool::provider_tool_name;
 use async_stream::stream;
 use futures_util::StreamExt;
-
-const MAX_NAME_BYTES: usize = 64;
-
-fn valid(name: &str) -> bool {
-    !name.is_empty() && name.len() <= MAX_NAME_BYTES && name.bytes().all(allowed)
-}
-
-fn allowed(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
-}
 
 #[derive(Default)]
 pub(crate) struct ToolNames {
@@ -27,76 +18,67 @@ pub(crate) struct ToolNames {
     to_canonical: BTreeMap<String, String>,
 }
 
+/// Rejects a request whose tools would reach the provider under one name.
+///
+/// The wire name is readable and has no disambiguating suffix, so a collision
+/// cannot be repaired here; it is a registration mistake to report.
+pub(crate) fn validate(request: &ProviderRequest) -> Result<(), ProviderError> {
+    let mut seen = BTreeMap::<String, &str>::new();
+    for tool in &request.tools {
+        let wire = provider_tool_name(&tool.name);
+        if wire.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                "a tool has an empty name",
+            ));
+        }
+        if let Some(other) = seen.insert(wire.clone(), &tool.name) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::BadRequest,
+                format!(
+                    "tools `{other}` and `{}` share the provider name `{wire}`",
+                    tool.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl ToolNames {
     pub(crate) fn new(request: &ProviderRequest) -> Self {
         let mut names = Self::default();
-        // Registered names own the namespace. History growth must not disturb
-        // their aliases (and therefore the provider's cached tool prefix).
-        names.allocate(request.tools.iter().map(|tool| tool.name.clone()).collect());
-        let mut historical = BTreeSet::new();
+        // Registered names own the reverse mapping, so growing history can
+        // never change which tool a model call resolves to.
+        for tool in &request.tools {
+            names.insert(&tool.name, true);
+        }
         for message in &request.messages {
             for part in &message.content {
                 match part {
-                    ContentPart::ToolCall(call) => {
-                        historical.insert(call.name.clone());
-                    }
-                    ContentPart::ToolResult(result) => {
-                        historical.insert(result.name.clone());
-                    }
+                    ContentPart::ToolCall(call) => names.insert(&call.name, false),
+                    ContentPart::ToolResult(result) => names.insert(&result.name, false),
                     _ => {}
                 }
             }
         }
         if let ToolChoice::Named(name) = &request.tool_choice {
-            historical.insert(name.clone());
+            names.insert(name, false);
         }
-        names.allocate(historical);
         names
     }
 
-    fn allocate(&mut self, names: BTreeSet<String>) {
-        // Reserve all valid names before generating any aliases.
-        for name in names.iter().filter(|name| valid(name)) {
-            if !self.to_wire.contains_key(name) && !self.to_canonical.contains_key(name) {
-                self.insert(name.clone(), name.clone());
-            }
+    fn insert(&mut self, canonical: &str, registered: bool) {
+        if self.to_wire.contains_key(canonical) {
+            return;
         }
-        for name in names {
-            if self.to_wire.contains_key(&name) {
-                continue;
-            }
-            let mut prefix: String = name
-                .bytes()
-                .map(|byte| if allowed(byte) { byte as char } else { '_' })
-                .collect();
-            if prefix.is_empty() {
-                prefix.push_str("tool");
-            }
-            let fingerprint = Fingerprint::of(&name);
-            let mut disambiguator = 0u64;
-            loop {
-                let suffix = if disambiguator == 0 {
-                    format!("_{}", fingerprint.as_str())
-                } else {
-                    format!("_{}_{disambiguator}", fingerprint.as_str())
-                };
-                let candidate = format!(
-                    "{}{}",
-                    &prefix[..prefix.len().min(MAX_NAME_BYTES - suffix.len())],
-                    suffix
-                );
-                if !self.to_canonical.contains_key(&candidate) {
-                    self.insert(name, candidate);
-                    break;
-                }
-                disambiguator += 1;
-            }
+        let wire = provider_tool_name(canonical);
+        if registered {
+            self.to_canonical
+                .entry(wire.clone())
+                .or_insert_with(|| canonical.to_owned());
         }
-    }
-
-    fn insert(&mut self, canonical: String, wire: String) {
-        self.to_canonical.insert(wire.clone(), canonical.clone());
-        self.to_wire.insert(canonical, wire);
+        self.to_wire.insert(canonical.to_owned(), wire);
     }
 
     fn wire<'a>(&'a self, name: &'a str) -> &'a str {
@@ -181,78 +163,69 @@ impl ToolNames {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_runtime_core::content::{Message, ToolCall};
+    use agent_runtime_core::ids::ToolCallId;
     use agent_runtime_core::provider::{ModelId, ToolSchema};
     use serde_json::json;
 
-    #[test]
-    fn generated_alias_collision_with_valid_name_is_disambiguated_deterministically() {
-        let canonical = "memory.search";
-        let reserved = format!("memory_search_{}", Fingerprint::of(canonical).as_str());
+    fn request(names: &[&str]) -> ProviderRequest {
         let mut request = ProviderRequest::new(ModelId::new("model"), vec![]);
-        request.tools = [canonical, reserved.as_str()]
-            .into_iter()
+        request.tools = names
+            .iter()
             .map(|name| ToolSchema {
-                name: name.into(),
+                name: (*name).into(),
                 description: String::new(),
                 input_schema: json!({}),
             })
             .collect();
-        let names = ToolNames::new(&request);
-        assert_eq!(names.wire(&reserved), reserved);
-        assert_ne!(names.wire(canonical), reserved);
-        assert!(valid(names.wire(canonical)));
-        assert_eq!(names.canonical(names.wire(canonical).into()), canonical);
-        request.tools.reverse();
+        request
+    }
+
+    #[test]
+    fn wire_names_are_readable_and_carry_no_suffix() {
+        let names = ToolNames::new(&request(&["registry.activate", "read"]));
+        assert_eq!(names.wire("registry.activate"), "registry_activate");
+        assert_eq!(names.wire("read"), "read");
         assert_eq!(
-            ToolNames::new(&request).wire(canonical),
-            names.wire(canonical)
+            names.canonical("registry_activate".into()),
+            "registry.activate"
+        );
+        // A model that repeats the dotted name from prose still reaches the tool.
+        assert_eq!(
+            names.canonical("registry.activate".into()),
+            "registry.activate"
         );
     }
 
     #[test]
-    fn growing_history_does_not_change_registered_wire_names() {
-        let mut request = ProviderRequest::new(ModelId::new("model"), vec![]);
-        request.tools.push(ToolSchema {
-            name: "memory.search".into(),
-            description: String::new(),
-            input_schema: json!({}),
-        });
-        let names = ToolNames::new(&request);
-        let wire = names.wire("memory.search").to_owned();
-        request
-            .messages
-            .push(agent_runtime_core::content::Message::assistant(vec![
-                ContentPart::ToolCall(agent_runtime_core::content::ToolCall {
-                    id: agent_runtime_core::ids::ToolCallId::new("c1"),
-                    name: wire.clone(),
-                    arguments: json!({}),
-                }),
-            ]));
-        let later = ToolNames::new(&request);
-        assert_eq!(later.wire("memory.search"), wire);
-        assert_ne!(later.wire(&wire), wire);
+    fn tools_sharing_a_provider_name_are_rejected() {
+        let error = validate(&request(&["memory.search", "memory_search"])).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert!(error.message.contains("memory.search"), "{error}");
+        assert!(error.message.contains("memory_search"), "{error}");
+        assert!(validate(&request(&[""])).is_err());
+        let long = "x".repeat(100);
+        let longer = format!("{long}y");
+        assert!(validate(&request(&[&long, &longer])).is_err());
+        assert!(validate(&request(&["memory.search", "read"])).is_ok());
     }
 
     #[test]
-    fn empty_unicode_and_overlong_names_are_bounded_and_distinct() {
-        let mut request = ProviderRequest::new(ModelId::new("model"), vec![]);
-        let names = [
-            String::new(),
-            "记忆.搜索".into(),
-            "x".repeat(500),
-            "-".into(),
-        ];
-        request.tools = names
-            .iter()
-            .map(|name| ToolSchema {
-                name: name.clone(),
-                description: String::new(),
-                input_schema: json!({}),
-            })
-            .collect();
-        let mapping = ToolNames::new(&request);
-        let wires: BTreeSet<_> = names.iter().map(|name| mapping.wire(name)).collect();
-        assert_eq!(wires.len(), names.len());
-        assert!(wires.into_iter().all(valid));
+    fn growing_history_does_not_change_registered_wire_names() {
+        let mut request = request(&["memory_search"]);
+        let before = ToolNames::new(&request).wire("memory_search").to_owned();
+        // A historical call from a tool that no longer exists maps to the
+        // same provider name but must not take over the reverse mapping.
+        request
+            .messages
+            .push(Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                id: ToolCallId::new("c1"),
+                name: "memory.search".into(),
+                arguments: json!({}),
+            })]));
+        let later = ToolNames::new(&request);
+        assert_eq!(later.wire("memory_search"), before);
+        assert_eq!(later.wire("memory.search"), before);
+        assert_eq!(later.canonical(before), "memory_search");
     }
 }

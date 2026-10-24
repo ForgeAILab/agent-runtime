@@ -880,6 +880,50 @@ fn both_bootstrap_names_are_protected_and_marker_tools_are_permission_free() {
     }
 }
 
+#[derive(Debug)]
+struct NamedTool(&'static str);
+#[async_trait::async_trait]
+impl agent_runtime_core::tool::LegacyTool for NamedTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        "named"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn effects(&self) -> agent_runtime_core::tool::ToolEffects {
+        agent_runtime_core::tool::ToolEffects::new(vec![])
+    }
+    async fn invoke_legacy(
+        &self,
+        _arguments: serde_json::Value,
+        _ctx: &agent_runtime_core::tool::InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        Ok(ToolOutcome::text("ok"))
+    }
+}
+
+#[test]
+fn a_host_tool_cannot_take_a_bootstrap_provider_name() {
+    for name in ["registry_search", "registry_activate"] {
+        let error = LiveAbilityRuntime::seal(
+            vec![Arc::new(NamedTool(name)) as Arc<dyn Tool>],
+            Vec::new(),
+            Vec::new(),
+            Arc::new(CapabilityResolver::new()),
+            Arc::new(FailClosedPolicy),
+            ActivationContext::new(),
+            ScopeInputs::new(),
+            ActivationBudget::new(16_384, 8),
+        )
+        .err()
+        .unwrap();
+        assert!(error.message.contains("protected"), "{name}: {error}");
+    }
+}
+
 #[tokio::test]
 async fn pinned_and_explicit_dependencies_choose_an_alternative_that_fits_remaining_tokens() {
     use agent_runtime_ability::descriptor::DependencyRequirement;
