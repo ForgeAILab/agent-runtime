@@ -1657,6 +1657,37 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn manual_compaction_repeats_within_an_attempted_idle_interval() {
+            let coordinator = Arc::new(pressure_coordinator(100_000_000));
+            let runtime = runtime_with_coordinator(coordinator);
+            let session = runtime
+                .start_session(StartSession::new().with_history(history(6)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                session.try_idle_semantic_compaction().await.unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted {
+                    summary: Some(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                session.try_idle_semantic_compaction().await.unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Busy
+            ));
+            assert!(matches!(
+                session.try_manual_semantic_compaction().await.unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted { .. }
+            ));
+            // The manual attempt leaves the interval attempted.
+            assert!(matches!(
+                session.try_idle_semantic_compaction().await.unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Busy
+            ));
+            session.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
         async fn protected_summary_state_restores_only_at_a_matching_idle_boundary() {
             let coordinator = Arc::new(pressure_coordinator(100_000_000));
             let runtime = runtime_with_coordinator(coordinator);
@@ -1931,6 +1962,59 @@ mod tests {
             assert!(matches!(
                 session.try_idle_semantic_compaction().await.unwrap(),
                 crate::runtime::SemanticIdleCompactionAdmission::Busy
+            ));
+            // An explicit retry reaches the summary model again.
+            assert!(matches!(
+                session.try_manual_semantic_compaction().await.unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted {
+                    summary: None,
+                    fallback_reason: Some(reason),
+                    ..
+                } if reason == "summary_model_unavailable"
+            ));
+            session.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn manual_compaction_is_refused_while_another_is_in_flight() {
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let coordinator = Arc::new(
+                SemanticSummaryCoordinator::new(
+                    Arc::new(MemoryArtifacts::default()),
+                    Arc::new(BlockingSummary {
+                        started: started.clone(),
+                        release: release.clone(),
+                    }),
+                    SemanticSummaryPolicy {
+                        min_turns: 4,
+                        retain_turns: 2,
+                        input_budget_tokens: 100_000,
+                        ..SemanticSummaryPolicy::new(RegistryRevision::new("policy-v1"))
+                    },
+                )
+                .unwrap(),
+            );
+            let runtime = runtime_with_coordinator(coordinator);
+            let session = runtime
+                .start_session(StartSession::new().with_history(history(6)))
+                .await
+                .unwrap();
+            let idle_session = session.clone();
+            let idle =
+                tokio::spawn(async move { idle_session.try_idle_semantic_compaction().await });
+            started.notified().await;
+            assert!(matches!(
+                session.try_manual_semantic_compaction().await.unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Busy
+            ));
+            release.notify_one();
+            assert!(matches!(
+                idle.await.unwrap().unwrap(),
+                crate::runtime::SemanticIdleCompactionAdmission::Accepted {
+                    summary: Some(_),
+                    ..
+                }
             ));
             session.shutdown().await.unwrap();
         }
