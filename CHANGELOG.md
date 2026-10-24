@@ -9,6 +9,11 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Added
 
+- `SessionHandle::try_manual_semantic_compaction` runs flat semantic
+  compaction for an explicit host request even when the current idle interval
+  already had an attempt, so a host can retry a failed or fallback summary
+  without a new turn. Every other idle admission rule still applies, and the
+  interval stays attempted for `try_idle_semantic_compaction`.
 - Ordered request-level model fallback. `RuntimeBuilder` accepts preflighted
   `ModelRoute` snapshots and an optional first-response timeout that spans
   open, empty streams, retries and backoff and disarms on meaningful progress.
