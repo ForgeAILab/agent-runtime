@@ -7,6 +7,23 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-25
+
+### Breaking
+
+- A delegated child task that stops at a limit is no longer reported as a
+  completion carrying the child's last message (after an output limit, an
+  earlier preamble). It is recorded as
+  `ChildTaskOutcome::LimitReached { child, turn, limit, artifacts }`, emitted
+  as `RuntimeEvent::ChildLimitReached`, and delivered as "stopped at its …
+  limit"; the child stays idle with `last_error` naming the limit and accepts
+  follow-ups. Event schema version 17. Exhaustive matches on either enum must
+  handle the new variant. Recovery keeps an outcome an older build recorded
+  for such a turn. Checkpoint constants are unchanged.
+- `ToolRegistry` rejects two tools whose provider names collide (see Changed),
+  so a registry that relied on hash suffixes to keep such names apart now
+  fails to build.
+
 ### Added
 
 - `SessionHandle::try_manual_semantic_compaction` runs flat semantic
@@ -45,15 +62,6 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ### Fixed
 
-- A delegated child task that stops at a limit is no longer reported as a
-  completion carrying the child's last message (after an output limit, an
-  earlier preamble). It is recorded as
-  `ChildTaskOutcome::LimitReached { child, turn, limit, artifacts }`, emitted
-  as `RuntimeEvent::ChildLimitReached`, and delivered as "stopped at its …
-  limit"; the child stays idle with `last_error` naming the limit and accepts
-  follow-ups. Event schema version 17. **Breaking** for exhaustive matches on
-  either enum. Recovery keeps an outcome an older build recorded for such a
-  turn. Checkpoint constants are unchanged.
 - `registry.search` no longer hides matches. A query's words now match the
   parts of a capability's name (`web search` finds `web_search`), results
   without a domain filter alternate between domains instead of letting a large
