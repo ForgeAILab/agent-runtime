@@ -7,6 +7,8 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-26
+
 ### Added
 
 - `RuntimeBuilder::read_only_tool_names` lets a child factory name the tools
