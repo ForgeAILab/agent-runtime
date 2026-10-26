@@ -30,6 +30,7 @@ them for execution.
 - **WHEN** the stream completes the call
 - **THEN** the runtime assembles and validates one typed tool request
 - **AND** malformed or incomplete arguments produce a structured provider error
+  and may receive bounded model correction without executing the failed call
 
 ### Requirement: Attempt-visible retries
 
@@ -1305,3 +1306,82 @@ output SHALL be unchanged.
 - **THEN** it returns `https://releases.rs/` from one GET
 - **AND** a relative `Location` or a `200` answer returns nothing
 - **AND** a lookup outside the pinned origin is refused
+
+### Requirement: Anthropic thinking block-binding control
+
+The Anthropic adapter SHALL let a host set a thinking block-binding behavior,
+`error` or `drop_block`, which is unset by default. When it is set and a
+request carries a thinking configuration, the adapter SHALL send it as
+`thinking.block_binding.prefix_mismatch_behavior` and SHALL include
+`thinking-binding-controls-2026-08-01` in the request's `anthropic-beta`
+header. The adapter SHALL send at most one `anthropic-beta` header, merging
+every beta value it adds or the host supplies, without duplicates. When the
+behavior is unset, or the request carries no thinking configuration, the
+request MUST be byte-identical to one built without this control.
+
+#### Scenario: Unset behavior changes nothing
+- **WHEN** a host builds a request with thinking configured and no block-binding behavior
+- **THEN** the request body and headers are identical to those built before this control existed
+
+#### Scenario: Drop-block with adaptive thinking
+- **WHEN** a host sets `drop_block` and the request uses adaptive thinking with an effort
+- **THEN** the body carries `thinking: {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}`
+- **AND** the `anthropic-beta` header contains `thinking-binding-controls-2026-08-01`
+
+#### Scenario: No thinking configuration
+- **WHEN** a host sets `drop_block` and the request carries no thinking configuration
+- **THEN** the body has no `thinking` field and no binding beta is added
+
+#### Scenario: Beta values are merged
+- **WHEN** the host also supplies an `anthropic-beta` extra header and interleaved thinking is enabled
+- **THEN** the request carries a single `anthropic-beta` header listing each beta value once
+
+### Requirement: Malformed tool arguments receive bounded model correction
+
+The canonical provider loop SHALL distinguish model-generated invalid JSON from
+structural and transport failures. On a completed or output-truncated response it SHALL admit a
+correction within the existing provider-attempt, input-budget, cancellation, and
+deadline limits. The model SHALL receive bounded feedback asking for complete
+JSON and smaller calls. Feedback MUST NOT quote raw arguments or untrusted names.
+
+#### Scenario: Corrected tool call succeeds
+
+- **GIVEN** a completed response contains malformed tool JSON
+- **WHEN** capacity remains for correction
+- **THEN** the failed output is discarded and its usage remains recorded
+- **AND** the next attempt includes a bounded model-visible correction
+- **AND** only the successful replacement enters history and executes
+
+#### Scenario: Repeated syntax failures exhaust attempts
+
+- **WHEN** each admitted attempt produces invalid tool JSON
+- **THEN** correction stops at the configured total-attempt ceiling
+- **AND** no malformed or sibling call executes or produces an orphan result
+- **AND** feedback is replaced rather than accumulated
+
+#### Scenario: Correction is not admitted
+
+- **WHEN** input size, cancellation, the deadline, or attempt capacity prevents
+  another request
+- **THEN** no correction request starts
+- **AND** the turn reports the corresponding budget failure, terminal limit, or cancellation
+
+#### Scenario: Failed response has structural errors
+
+- **WHEN** a response omits a tool name or reports a malformed provider stream
+- **THEN** it remains a terminal provider failure without argument correction
+
+#### Scenario: Provider explicitly truncates a response
+
+- **GIVEN** an output-length finish accompanies incomplete tool JSON
+- **WHEN** the runtime classifies the response
+- **THEN** it admits bounded correction asking the model for smaller calls
+- **AND** no failed call executes or enters history
+- **AND** exhausted correction reports the output limit instead of a parsing error
+
+#### Scenario: Correction changes the planned request
+
+- **WHEN** a correction request is admitted
+- **THEN** it is sized with the frozen sizer and input cap
+- **AND** it carries no stale explicit cache identity or boundary
+- **AND** the original immutable cache baseline is retired
