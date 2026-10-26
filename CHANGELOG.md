@@ -7,6 +7,35 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+### Added
+
+- `RuntimeBuilder::read_only_tool_names` lets a child factory name the tools
+  it reviewed for a read-only child view. Both read-only filters (a read-only
+  tool scope and the read-only workspace view) keep a named tool whose
+  permissions go beyond filesystem reads, such as a network fetch or a
+  host-defined artifact reader, as long as none of them is `fs.write`,
+  `fs.create`, `fs.delete`, `host.fs.write`, `external.write`, or
+  `process.spawn`. Unnamed tools keep the filesystem-read filter.
+- `provider::citation`: a `CitationResolver` trait and, with
+  `reqwest-transport`, `GroundingRedirectResolver`.
+  `GeminiInteractionsProvider::with_citation_resolver` resolves grounding
+  redirect citations to the pages they name before rendering: at most 64
+  unique redirects per response, 8 in flight, 3 s in total, stopped by
+  cancellation or the request deadline; an unresolved redirect is kept.
+- `ReqwestTransport::redirect_location` reads a redirect's `Location` with one
+  GET that neither follows it nor reads a body, under the transport's
+  destination policy and origin pin.
+
+### Changed
+
+- Hosted-search citations link each source once per assistant message, not
+  once per text block, in the Anthropic, Responses, and Gemini adapters.
+- `artifact.read` returns a text artifact's page as text when an edge splits a
+  UTF-8 character: the partial character is left out and `offset` and
+  `next_offset` report the bytes returned, so following `next_offset` reads
+  every character once. Text is decided by the artifact's media type
+  (`text/*`, JSON, XML); other media and invalid UTF-8 stay byte arrays.
+
 ## [0.11.0] - 2026-10-25
 
 ### Breaking
