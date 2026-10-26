@@ -268,6 +268,44 @@ impl ReqwestTransport {
     }
 }
 
+impl ReqwestTransport {
+    /// Asks `url` where it redirects, with one GET that neither follows the
+    /// redirect nor reads a body. `None` when the answer is not a redirect to
+    /// an absolute HTTP(S) URL without userinfo. The same destination policy
+    /// and origin pinning as [`HttpTransport::post_response`] apply.
+    pub async fn redirect_location(&self, url: &str) -> Result<Option<String>, ProviderError> {
+        let (url, host, addresses) = self.validated_target(url).await?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addresses)
+            .build()
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::Network,
+                    "provider HTTP client setup failed",
+                )
+            })?;
+        let response = client.get(url).send().await.map_err(map_reqwest_error)?;
+        if !response.status().is_redirection() {
+            return Ok(None);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Url::parse(value).ok())
+            .filter(|target| {
+                matches!(target.scheme(), "https" | "http")
+                    && target.username().is_empty()
+                    && target.password().is_none()
+                    && target.host().is_some()
+            });
+        Ok(location.map(String::from))
+    }
+}
+
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn post_stream(&self, request: HttpRequest) -> Result<ByteStream, ProviderError> {
@@ -813,6 +851,66 @@ mod tests {
                 .validated_target("http://localhost/v1")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_read_from_its_location_without_following_it() {
+        /// Answers each connection with `response` and records the request line.
+        fn serve(response: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+            use std::io::{BufRead, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 2 {
+                    line.clear();
+                }
+                (&stream).write_all(response.as_bytes()).unwrap();
+                request_line
+            });
+            (port, handle)
+        }
+
+        for (response, expected) in [
+            (
+                "HTTP/1.1 302 Found\r\nLocation: https://releases.rs/\r\nContent-Length: 0\r\n\r\n",
+                Some("https://releases.rs/"),
+            ),
+            (
+                "HTTP/1.1 302 Found\r\nLocation: /relative\r\nContent-Length: 0\r\n\r\n",
+                None,
+            ),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", None),
+        ] {
+            let (port, server) = serve(response);
+            let origin = format!("http://127.0.0.1:{port}");
+            let transport = ReqwestTransport::new(DestinationPolicy::Loopback)
+                .with_origin(&origin)
+                .unwrap();
+            let location = transport
+                .redirect_location(&format!("{origin}/grounding-api-redirect/AUZ1"))
+                .await
+                .unwrap();
+            assert_eq!(location.as_deref(), expected);
+            assert_eq!(
+                server.join().unwrap().trim_end(),
+                "GET /grounding-api-redirect/AUZ1 HTTP/1.1"
+            );
+        }
+        let pinned = ReqwestTransport::new(DestinationPolicy::Loopback)
+            .with_origin("http://127.0.0.1:1")
+            .unwrap();
+        assert!(
+            pinned
+                .redirect_location("http://127.0.0.1:2/elsewhere")
+                .await
+                .is_err(),
+            "the origin pin applies to lookups too"
         );
     }
 

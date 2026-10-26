@@ -36,6 +36,7 @@
 
 pub mod anthropic;
 pub mod catalog;
+pub mod citation;
 #[cfg(feature = "command-provider")]
 pub mod command;
 mod error_redaction;

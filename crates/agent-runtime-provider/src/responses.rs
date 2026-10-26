@@ -1119,6 +1119,8 @@ struct StreamState {
     reasoning: BTreeMap<u32, ReasoningSlot>,
     text: BTreeMap<(u32, u32), String>,
     emitted_text: std::collections::BTreeSet<u32>,
+    /// Hosted-search sources an earlier output item of this response linked.
+    linked_sources: std::collections::BTreeSet<String>,
     searches: std::collections::BTreeSet<u32>,
     reported_searches: Option<u64>,
     pending_terminal: Option<PendingTerminal>,
@@ -1454,7 +1456,10 @@ fn flush_reasoning_signatures(state: &mut StreamState, out: &mut Vec<ProviderStr
     }
 }
 
-fn rendered_output_text(item: &Value) -> Result<String, ProviderError> {
+fn rendered_output_text(
+    item: &Value,
+    linked: &mut std::collections::BTreeSet<String>,
+) -> Result<String, ProviderError> {
     let mut rendered = String::new();
     for part in item
         .get("content")
@@ -1486,7 +1491,7 @@ fn rendered_output_text(item: &Value) -> Result<String, ProviderError> {
                 ))
             })
             .collect();
-        rendered.push_str(&super::hosted::render(&text, citations));
+        rendered.push_str(&super::hosted::render(&text, citations, linked));
     }
     Ok(rendered)
 }
@@ -1642,7 +1647,7 @@ fn handle_output_item_done(
                 }
             }
             if state.buffer_text && state.emitted_text.insert(output_index) {
-                let text = rendered_output_text(item)?;
+                let text = rendered_output_text(item, &mut state.linked_sources)?;
                 if !text.is_empty() {
                     out.push(ProviderStreamEvent::TextDelta { text });
                 }
@@ -3434,10 +3439,8 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(
-                text,
-                "Rust [Rust](https://rust.test) works.More [rust.test](https://rust.test)."
-            );
+            // A source already linked in this message is not linked again.
+            assert_eq!(text, "Rust [Rust](https://rust.test) works.More.");
             let mut usage = UsageDelta::new();
             for event in &events {
                 if let ProviderStreamEvent::Usage { delta } = event {
