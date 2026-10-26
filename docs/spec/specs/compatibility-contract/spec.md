@@ -182,3 +182,97 @@ fabricate an attempt total, delay, or admitted retry.
 - **WHEN** the candidate runtime adds the optional fields
 - **THEN** the consumer is updated in the coordinated compatibility change
 - **AND** a failing consumer gate blocks publication of the compatible revision
+
+### Requirement: Bounded manifests preserve readers and require retention gates
+
+Current readers SHALL accept legacy snapshots with absent or unbounded
+manifests and legacy checkpoints containing manifest lists. Existing public
+manifest vectors, store traits, and checkpoint schema/transition versions MUST
+remain supported. All consumer gates MUST prove equivalent execution recovery
+and explicitly accept recent-window retention; readable serde alone MUST NOT
+be presented as old-binary execution or lifetime archival compatibility.
+
+#### Scenario: Legacy snapshot omitted manifests
+
+- **WHEN** a current reader loads the snapshot
+- **THEN** manifests default to empty and existing history, usage, identities, and extensions remain readable
+- **AND** no missing manifest is reconstructed or inferred as a missing turn
+
+#### Scenario: Smith reads snapshot manifests directly
+
+- **WHEN** Smith's fixture inspects snapshot.manifests after an over-window run
+- **THEN** its existing Vec surface still compiles and yields the same ordered suffix as recent_manifests
+- **AND** the compatible release is blocked if its required archival/retention behavior is not satisfied
+
+#### Scenario: Legacy binary cannot overlay a new checkpoint
+
+- **WHEN** downgrade testing shows an older binary rejects a manifest-free checkpoint paired with retained ordinary diagnostics
+- **THEN** the release documents that execution downgrade limitation
+- **AND** supported consumers pin the gated candidate revision without relaxing checkpoint validation
+
+### Requirement: Failure metadata is backward-readable and consumer-gated
+
+Failure classification and provider timing/recovery additions SHALL default
+when missing and omit unknown values on serialization. Current readers MUST
+read legacy errors, and unknown or malformed diagnostic evidence MUST NOT make
+an enclosing error record unreadable or grant retry authority. All supported
+consumer suites MUST pass; any required Rust literal or destructuring updates
+MUST be coordinated before a compatible release is published.
+
+#### Scenario: Legacy error journal is loaded
+
+- **WHEN** a current reader loads an Error event without the new fields
+- **THEN** kind, message, retryability, and metadata remain readable
+- **AND** class is Unclassified and timing/recovery evidence is absent
+
+#### Scenario: Future or malformed diagnostic evidence is lenient
+
+- **WHEN** a reader encounters an unknown reason tag, a class payload it cannot decode, an unknown closed recovery value, or a timing value that is not a non-negative integer in otherwise valid error JSON
+- **THEN** it uses Unclassified for an undecodable class, `Unknown` for a future stage/component name, and absence for undecodable optional timing/recovery evidence
+- **AND** the enclosing RuntimeError, Error or ChildFailed event, and child failure record remain readable
+- **AND** separately valid evidence fields remain readable
+- **AND** it does not invent a retry schedule
+
+#### Scenario: A consumer uses a Rust struct literal
+
+- **WHEN** adding failure metadata makes a supported consumer's RuntimeError literal fail compilation
+- **THEN** the candidate is blocked until that consumer's documented source update passes its gate
+- **AND** JSON compatibility alone is insufficient to publish a compatible release
+
+### Requirement: Journal migration is backward-readable and coordinated
+
+The first released U9 version SHALL read valid v3 checkpoints and v3-era unversioned snapshots for its entire release lifetime, including unfinished turns. Native version-4 import SHALL preserve exact execution/recovery semantics and keep source-compatible existing store methods. A coordinated pre-1.0 persisted-contract release MUST pass Smith, Nyx and Open Forge gates against an immutable landed tag or exact revision; readable JSON alone MUST NOT imply old-binary execution compatibility.
+
+#### Scenario: Host adopts no native journal
+
+- **WHEN** a host upgrades to the release containing only the journal contracts and readers
+- **THEN** every checkpoint and snapshot it writes is byte-identical to what the previous release wrote, with checkpoint schema 3
+- **AND** the previous release can read them, so the host can roll back without an export
+
+#### Scenario: Stored v3 session is mid-turn
+
+- **WHEN** the new runtime imports a supported v3 CallingModel, pending approval or committed outcome boundary
+- **THEN** it publishes an exact reference boundary under an import writer fence without provider/tool I/O
+- **AND** crash retry resumes the authoritative legacy or native boundary without repeating committed work
+
+#### Scenario: Consumer has no durable store
+
+- **WHEN** Nyx starts ephemeral history with journals configured
+- **THEN** the seeded history and subscribe-before-send behavior remain
+- **AND** no journal discovery, load, write, claim or durable collection occurs
+
+#### Scenario: One actual consumer store rejects schema 4
+
+- **WHEN** a release candidate passes neutral runtime tests but a supported product store rejects its schema
+- **THEN** compatible release eligibility is blocked pending coordinated store migration
+- **AND** consumers do not pin a moving branch or unlanded local override
+
+### Requirement: Engine extraction is source-compatible
+
+Extracting the journal engine SHALL NOT change or remove any public item of `SessionJournal`, `SessionStore`, `CheckpointStore`, the journal DTOs, `JournalReader`, `JournalProjectionPolicy`, `IdentityJournalProjection`, `JournalCommitFailurePoint` or `InMemorySessionJournal` (`protected`, `ordinary`, `fail_next_commit_at`, `revoke_writer`, `enable_collection`, `root_epoch`, `authorize_retirement`, `pin_transfer`, `retain_root`, `release_pin`, `stage_leaves`, `compact`, `object_count`, `object_bytes`). Testkit fixtures and `assert_*` functions SHALL keep their signatures and behavior. New items MUST be additive and listed in the CHANGELOG.
+
+#### Scenario: A consumer built against the previous release recompiles
+
+- **WHEN** a host or test that uses `InMemorySessionJournal` and the testkit journal fixtures is rebuilt against this change
+- **THEN** it compiles without source edits
+- **AND** its journal tests observe the same results
