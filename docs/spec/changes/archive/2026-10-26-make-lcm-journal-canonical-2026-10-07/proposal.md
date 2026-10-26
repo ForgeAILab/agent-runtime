@@ -1,7 +1,9 @@
 ---
 created_at: 2026-10-07T00:00:00Z
-updated_at: 2026-10-07T00:00:00Z
+updated_at: 2026-10-26T07:08:41Z
 ---
+
+> Dropped 2026-10-26 by the owner: Smith doesn't need LCM; not implemented; specs not merged.
 
 # Proposal: LCM timeline as the canonical content journal (U10)
 
