@@ -34,6 +34,7 @@ use agent_runtime_core::provider_credential::{
 use agent_runtime_core::store::Secret;
 use agent_runtime_core::usage::{CounterKind, UsageDelta};
 
+use super::citation::{CitationResolver, GEMINI_GROUNDING_REDIRECT_PREFIX};
 use super::error_redaction::{self, RequestCredentials};
 use super::ratelimit;
 use super::transport::{HttpRequest, HttpTransport};
@@ -44,6 +45,12 @@ pub const GEMINI_INTERACTIONS_PATH: &str = "interactions";
 pub const DEFAULT_CREDENTIAL_MINIMUM_VALIDITY_MS: u64 = 30_000;
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Total time one response may spend resolving its citation redirects.
+pub const CITATION_RESOLUTION_BUDGET: Duration = Duration::from_secs(3);
+/// Unique citation redirects one response resolves; later ones are kept.
+const MAX_RESOLVED_CITATIONS: usize = 64;
+/// Citation lookups in flight at once.
+const CITATION_LOOKUP_CONCURRENCY: usize = 8;
 const MAX_MESSAGES: usize = 2_048;
 const MAX_CONTENT_PARTS: usize = 8_192;
 const MAX_TEXT_CHARS: usize = 2 * 1024 * 1024;
@@ -156,6 +163,7 @@ pub struct GeminiInteractionsProvider<T: HttpTransport> {
     credential_target: ProviderCredentialTarget,
     credential_minimum_validity_ms: u64,
     clock: Arc<dyn Clock>,
+    citation_resolver: Option<Arc<dyn CitationResolver>>,
 }
 
 impl<T: HttpTransport> fmt::Debug for GeminiInteractionsProvider<T> {
@@ -216,6 +224,7 @@ impl<T: HttpTransport> GeminiInteractionsProvider<T> {
             credential_target,
             credential_minimum_validity_ms: DEFAULT_CREDENTIAL_MINIMUM_VALIDITY_MS,
             clock: Arc::new(SystemClock),
+            citation_resolver: None,
         })
     }
 
@@ -229,6 +238,16 @@ impl<T: HttpTransport> GeminiInteractionsProvider<T> {
     /// attempt.
     pub fn with_credential_minimum_validity_ms(mut self, minimum_validity_ms: u64) -> Self {
         self.credential_minimum_validity_ms = minimum_validity_ms;
+        self
+    }
+
+    /// Resolves grounding redirect citations to their pages before rendering.
+    ///
+    /// Each unique redirect is looked up once per response, a few at a time,
+    /// within [`CITATION_RESOLUTION_BUDGET`] in total. A redirect that does
+    /// not resolve in time is kept.
+    pub fn with_citation_resolver(mut self, resolver: Arc<dyn CitationResolver>) -> Self {
+        self.citation_resolver = Some(resolver);
         self
     }
 
@@ -1235,6 +1254,91 @@ struct StreamState {
     /// The most recent function call id in stream order, recorded on each
     /// built-in step so replay can restore Gemini's original step order.
     last_function_call: Option<String>,
+    /// Grounding redirects resolved to the pages they name.
+    redirects: BTreeMap<String, String>,
+    /// Sources an earlier text block of this response already linked.
+    linked_sources: BTreeSet<String>,
+}
+
+/// Every grounding redirect the finished interaction cites, in order, at
+/// most [`MAX_RESOLVED_CITATIONS`].
+fn grounding_redirects(state: &StreamState, interaction: &WireInteraction) -> BTreeSet<String> {
+    fn collect(value: &Value, urls: &mut BTreeSet<String>) {
+        match value {
+            Value::String(text) if text.starts_with(GEMINI_GROUNDING_REDIRECT_PREFIX) => {
+                if urls.len() < MAX_RESOLVED_CITATIONS {
+                    urls.insert(text.clone());
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect(item, urls)),
+            Value::Object(fields) => fields.values().for_each(|field| collect(field, urls)),
+            _ => {}
+        }
+    }
+    let mut urls = BTreeSet::new();
+    state
+        .grounding
+        .values()
+        .chain(std::iter::once(&interaction.grounding))
+        .chain(&interaction.candidates)
+        .chain(
+            state
+                .text
+                .values()
+                .flatten()
+                .flat_map(|block| &block.annotations),
+        )
+        .for_each(|value| collect(value, &mut urls));
+    urls
+}
+
+/// Resolves `urls` a few at a time until all answer, the budget runs out,
+/// the request is cancelled, or its deadline passes. Unresolved URLs are
+/// absent from the map and keep their redirect.
+async fn resolve_redirects(
+    resolver: &dyn CitationResolver,
+    urls: BTreeSet<String>,
+    cancel: &Cancellation,
+    deadline: Deadline,
+    clock: &dyn Clock,
+) -> BTreeMap<String, String> {
+    let mut resolved = BTreeMap::new();
+    let lookups = futures_util::stream::iter(urls)
+        .map(|url| async move {
+            let target = resolver.resolve(&url).await;
+            (url, target)
+        })
+        .buffer_unordered(CITATION_LOOKUP_CONCURRENCY);
+    tokio::pin!(lookups);
+    let budget = tokio::time::sleep(CITATION_RESOLUTION_BUDGET);
+    tokio::pin!(budget);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = wait_for_deadline(deadline, clock) => break,
+            _ = &mut budget => break,
+            next = lookups.next() => match next {
+                Some((url, Some(target))) => {
+                    resolved.insert(url, target);
+                }
+                Some((_, None)) => {}
+                None => break,
+            },
+        }
+    }
+    resolved
+}
+
+/// `source` with a resolved redirect replaced by the page it names.
+fn resolved_source(
+    redirects: &BTreeMap<String, String>,
+    mut source: agent_runtime_core::provider::HostedSource,
+) -> agent_runtime_core::provider::HostedSource {
+    if let Some(target) = redirects.get(&source.url) {
+        source.url = target.clone();
+    }
+    source
 }
 
 fn decode_event(data: &str) -> Result<WireEvent, ProviderError> {
@@ -1395,7 +1499,8 @@ fn finish_hosted_output(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|chunk| super::hosted::source(&chunk["web"], "uri")),
+                .filter_map(|chunk| super::hosted::source(&chunk["web"], "uri"))
+                .map(|source| resolved_source(&state.redirects, source)),
         );
     }
     for (index, blocks) in std::mem::take(&mut state.text) {
@@ -1403,12 +1508,16 @@ fn finish_hosted_output(
         for (block_index, SearchTextBlock { text, annotations }) in blocks.into_iter().enumerate() {
             let mut citations = annotation_citations(&annotations);
             citations.extend(grounding_citations(grounding, block_index));
+            let citations = citations
+                .into_iter()
+                .map(|(end, source)| (end, resolved_source(&state.redirects, source)))
+                .collect::<Vec<_>>();
             state
                 .search_sources
                 .extend(citations.iter().map(|(_, source)| source.clone()));
             if !text.is_empty() {
                 out.push(ProviderStreamEvent::TextDelta {
-                    text: super::hosted::render(&text, citations),
+                    text: super::hosted::render(&text, citations, &mut state.linked_sources),
                 });
             }
         }
@@ -2016,6 +2125,7 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
         let credential_target = self.credential_target.clone();
         let rejected_revision = lease.revision().clone();
         let buffer_text = !request.hosted_tools.is_empty();
+        let citation_resolver = self.citation_resolver.clone();
         let out = stream! {
             // Emitted first so a consumer sees the limit state that governed
             // this attempt before any of its output.
@@ -2123,6 +2233,16 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
                             return;
                         }
                     };
+                    if let (Some(resolver), WireEvent::InteractionCompleted { interaction }) =
+                        (citation_resolver.as_deref(), &event)
+                    {
+                        let urls = grounding_redirects(&state, interaction);
+                        if state.buffer_text && !urls.is_empty() {
+                            state.redirects = resolve_redirects(
+                                resolver, urls, &cancel, deadline, clock.as_ref(),
+                            ).await;
+                        }
+                    }
                     let mut events = Vec::new();
                     if let Err(error) = event_to_events(event, &mut state, &mut events) {
                         yield ProviderStreamEvent::Error { error };
@@ -2168,6 +2288,16 @@ impl<T: HttpTransport> Provider for GeminiInteractionsProvider<T> {
                             return;
                         }
                     };
+                    if let (Some(resolver), WireEvent::InteractionCompleted { interaction }) =
+                        (citation_resolver.as_deref(), &event)
+                    {
+                        let urls = grounding_redirects(&state, interaction);
+                        if state.buffer_text && !urls.is_empty() {
+                            state.redirects = resolve_redirects(
+                                resolver, urls, &cancel, deadline, clock.as_ref(),
+                            ).await;
+                        }
+                    }
                     let mut events = Vec::new();
                     if let Err(error) = event_to_events(event, &mut state, &mut events) {
                         yield ProviderStreamEvent::Error { error };
@@ -3977,5 +4107,88 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "Rust [Rust](https://rust.test) works.")));
         assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::HostedSearch { action: None, query: Some(query), sources } if query == "rust docs" && sources[0].title.as_deref() == Some("Rust"))));
         assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::Usage { delta } if delta.get(CounterKind::WebSearchRequests) == 1)));
+    }
+
+    /// Resolves the redirects it was given and records every lookup.
+    #[derive(Debug, Default)]
+    struct FixtureResolver {
+        targets: BTreeMap<String, String>,
+        lookups: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CitationResolver for FixtureResolver {
+        async fn resolve(&self, url: &str) -> Option<String> {
+            self.lookups.lock().unwrap().push(url.to_owned());
+            self.targets.get(url).cloned()
+        }
+    }
+
+    #[tokio::test]
+    async fn grounding_redirects_resolve_and_each_page_is_linked_once() {
+        use agent_runtime_core::provider::HostedTool;
+        let redirect = |id: &str| format!("{GEMINI_GROUNDING_REDIRECT_PREFIX}{id}");
+        let (first, second, failing) = (redirect("AUZ1"), redirect("AUZ2"), redirect("AUZ3"));
+        let resolver = Arc::new(FixtureResolver {
+            targets: [
+                (first.clone(), "https://releases.rs/".to_owned()),
+                (second.clone(), "https://releases.rs/".to_owned()),
+            ]
+            .into(),
+            ..FixtureResolver::default()
+        });
+        let cite = |end: usize, url: &str, title: &str| json!({"type":"url_citation","start_index":0,"end_index":end,"url":url,"title":title});
+        let frames = [
+            json!({"event_type":"step.start","index":0,"step":{"type":"model_output","content":[{"type":"text","text":"Rust 1.91 shipped."}]}}),
+            json!({"event_type":"step.delta","index":0,"delta":{"type":"text_annotation_delta","annotations":[cite(18, &first, "releases.rs")]}}),
+            json!({"event_type":"step.stop","index":0}),
+            json!({"event_type":"step.start","index":1,"step":{"type":"model_output","content":[{"type":"text","text":"It adds a lint."}]}}),
+            json!({"event_type":"step.delta","index":1,"delta":{"type":"text_annotation_delta","annotations":[cite(15, &second, "releases.rs"), cite(15, &failing, "blog.example")]}}),
+            json!({"event_type":"step.stop","index":1}),
+            json!({"event_type":"interaction.completed","interaction":{"status":"completed"}}),
+        ];
+        let body = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let provider = GeminiInteractionsProvider::new(ReplayTransport::new([body]), config())
+            .unwrap()
+            .with_citation_resolver(resolver.clone());
+        let request =
+            ProviderRequest::new(ModelId::new("gemini-test"), vec![Message::user("search")])
+                .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: None }]);
+        let events = collect(provider.stream(request, ctx()).await.unwrap()).await;
+        let texts = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "Rust 1.91 shipped. [releases.rs](https://releases.rs/)".to_owned(),
+                format!("It adds a lint. [blog.example]({failing})"),
+            ]
+        );
+        let sources = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderStreamEvent::HostedSearch { sources, .. } => Some(sources.clone()),
+                _ => None,
+            })
+            .expect("a hosted search event");
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://releases.rs/", failing.as_str()]
+        );
+        let mut lookups = resolver.lookups.lock().unwrap().clone();
+        lookups.sort();
+        assert_eq!(lookups, [first, second, failing], "each redirect once");
     }
 }

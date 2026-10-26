@@ -370,6 +370,7 @@ pub struct ScriptedChildFactory {
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     policy_salt: String,
     policy_fingerprint_failures: AtomicUsize,
+    read_only_tool_names: Vec<String>,
 }
 
 impl ScriptedChildFactory {
@@ -385,12 +386,19 @@ impl ScriptedChildFactory {
             checkpoint_store: None,
             policy_salt: "test-child-policy-v1".to_owned(),
             policy_fingerprint_failures: AtomicUsize::new(0),
+            read_only_tool_names: Vec::new(),
         }
     }
 
     /// Registers `tools` on every child builder.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Names tools every child builder reviews as safe for a read-only view.
+    pub fn with_read_only_tool_names(mut self, names: &[&str]) -> Self {
+        self.read_only_tool_names = names.iter().map(|name| (*name).to_owned()).collect();
         self
     }
 
@@ -460,7 +468,8 @@ impl ChildRuntimeFactory for ScriptedChildFactory {
         let mut builder = RuntimeBuilder::new(ModelId::new("fake"))
             .provider(provider)
             .model_profile(profile())
-            .event_buffer(self.event_buffer);
+            .event_buffer(self.event_buffer)
+            .read_only_tool_names(self.read_only_tool_names.clone());
         for tool in &self.tools {
             builder = builder.tool(tool.clone());
         }

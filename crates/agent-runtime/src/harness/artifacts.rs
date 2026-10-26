@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use agent_runtime_core::artifact::{
-    ArtifactError, ArtifactId, ArtifactProvenance, ArtifactRead, ArtifactRetention,
+    ArtifactChunk, ArtifactError, ArtifactId, ArtifactProvenance, ArtifactRead, ArtifactRetention,
     ArtifactSensitivity, ArtifactStore, ArtifactWrite, MAX_ARTIFACT_READ_BYTES,
 };
 use agent_runtime_core::content::ContentPart;
@@ -166,21 +166,24 @@ impl Tool for ArtifactReadTool {
             .validate_for(&request)
             .map_err(|error| RuntimeError::internal(error.to_string()))?;
 
-        let encoding;
-        let content = match String::from_utf8(chunk.bytes.clone()) {
-            Ok(text) => {
-                encoding = "utf8";
-                Value::String(text)
-            }
-            Err(_) => {
-                encoding = "bytes";
-                Value::Array(chunk.bytes.iter().copied().map(Value::from).collect())
-            }
+        let (offset, next_offset, content) = match text_page(&chunk) {
+            Some(page) => page,
+            None => (
+                chunk.offset,
+                chunk.next_offset,
+                Err(Value::Array(
+                    chunk.bytes.iter().copied().map(Value::from).collect(),
+                )),
+            ),
+        };
+        let (encoding, content) = match content {
+            Ok(text) => ("utf8", Value::String(text)),
+            Err(bytes) => ("bytes", bytes),
         };
         let value = json!({
             "artifact": chunk.reference.id.as_str(),
-            "offset": chunk.offset,
-            "next_offset": chunk.next_offset,
+            "offset": offset,
+            "next_offset": next_offset,
             "encoding": encoding,
             "content": content,
         });
@@ -190,6 +193,63 @@ impl Tool for ArtifactReadTool {
             is_error: false,
         })
     }
+}
+
+/// Whether `media_type` names text, which is read as UTF-8.
+fn is_text_media_type(media_type: &str) -> bool {
+    let essence = media_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence.starts_with("text/")
+        || essence == "application/json"
+        || essence.ends_with("+json")
+        || essence == "application/xml"
+        || essence.ends_with("+xml")
+}
+
+/// The page as text, with a character split by either edge left out:
+/// `(offset, next_offset, text)` for the bytes actually returned, so
+/// following `next_offset` reads every character once. `None` keeps the page
+/// as bytes: binary media, text that is not UTF-8 inside the page, or a page
+/// too short to hold one whole character.
+fn text_page(chunk: &ArtifactChunk) -> Option<(u64, Option<u64>, Result<String, Value>)> {
+    if !is_text_media_type(&chunk.reference.media_type) {
+        return None;
+    }
+    let bytes = &chunk.bytes;
+    // A page that starts inside a character starts with its continuation bytes.
+    let lead = if chunk.offset == 0 {
+        0
+    } else {
+        bytes
+            .iter()
+            .take(3)
+            .take_while(|byte| (0x80..0xC0).contains(*byte))
+            .count()
+    };
+    let (text, trimmed) = match std::str::from_utf8(&bytes[lead..]) {
+        Ok(text) => (text, false),
+        // Only an incomplete character at the end is an edge; anything else
+        // is not UTF-8.
+        Err(error) if error.error_len().is_none() => (
+            std::str::from_utf8(&bytes[lead..lead + error.valid_up_to()]).ok()?,
+            true,
+        ),
+        Err(_) => return None,
+    };
+    if text.is_empty() && !bytes.is_empty() {
+        return None;
+    }
+    let offset = chunk.offset + lead as u64;
+    let next_offset = if trimmed {
+        Some(offset + text.len() as u64)
+    } else {
+        chunk.next_offset
+    };
+    Some((offset, next_offset, Ok(text.to_owned())))
 }
 
 fn artifact_runtime_error(error: ArtifactError) -> RuntimeError {
@@ -491,6 +551,52 @@ mod tests {
                 .await,
             Err(ArtifactError::AccessDenied)
         ));
+    }
+
+    fn page(media_type: &str, bytes: &[u8], offset: u64, next: Option<u64>) -> ArtifactChunk {
+        ArtifactChunk {
+            reference: ArtifactRef {
+                id: ArtifactId::new("artifact-page").unwrap(),
+                digest: ArtifactDigest::new("sha256", format!("{:064x}", 1)).unwrap(),
+                media_type: media_type.into(),
+                byte_length: 4_000,
+                sensitivity: ArtifactSensitivity::Sensitive,
+                retention: ArtifactRetention::Session,
+                provenance: ArtifactProvenance::new(SessionId::new("session-1"), "tool-output"),
+            },
+            bytes: bytes.to_vec(),
+            offset,
+            next_offset: next,
+        }
+    }
+
+    #[test]
+    fn text_pages_leave_out_characters_split_by_an_edge() {
+        let text = "é".repeat(2_000);
+        let bytes = text.as_bytes();
+        let json = "application/vnd.agent-runtime.tool-outcome+json";
+        // The last byte starts a character the next page holds.
+        let (offset, next, content) =
+            text_page(&page(json, &bytes[..2_047], 0, Some(2_047))).unwrap();
+        assert_eq!((offset, next), (0, Some(2_046)));
+        assert_eq!(content.unwrap(), "é".repeat(1_023));
+        // A page requested one byte into a character starts at the next one.
+        let (offset, next, content) = text_page(&page(
+            "text/plain; charset=utf-8",
+            &bytes[1..2_049],
+            1,
+            Some(2_049),
+        ))
+        .unwrap();
+        assert_eq!((offset, next), (2, Some(2_048)));
+        assert_eq!(content.unwrap(), "é".repeat(1_023));
+        // Too short for one whole character, so reading still progresses.
+        assert!(text_page(&page(json, &bytes[..1], 0, Some(1))).is_none());
+        // Binary media and text that is not UTF-8 stay bytes.
+        assert!(text_page(&page("image/png", b"plain", 0, None)).is_none());
+        assert!(text_page(&page("text/plain", &[0xFF, 0xFE, 0x41], 0, None)).is_none());
+        let (_, next, content) = text_page(&page(json, b"whole", 0, None)).unwrap();
+        assert_eq!((next, content.unwrap()), (None, "whole".to_owned()));
     }
 
     #[test]

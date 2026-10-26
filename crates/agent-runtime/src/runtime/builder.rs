@@ -118,6 +118,7 @@ pub struct RuntimeBuilder {
     interaction_broker: Arc<dyn InteractionBroker>,
     allow_child_interaction: bool,
     return_child_interactions_to_parent: bool,
+    read_only_tool_names: std::collections::BTreeSet<String>,
     live_ability_routing: bool,
     abilities: Vec<Arc<dyn Ability>>,
     tool_descriptor_overrides: Vec<AbilityDescriptor>,
@@ -203,6 +204,7 @@ impl RuntimeBuilder {
             interaction_broker: Arc::new(UnavailableInteractionBroker),
             allow_child_interaction: false,
             return_child_interactions_to_parent: false,
+            read_only_tool_names: std::collections::BTreeSet::new(),
             live_ability_routing: false,
             abilities: Vec::new(),
             tool_descriptor_overrides: Vec::new(),
@@ -745,6 +747,23 @@ impl RuntimeBuilder {
     pub(crate) fn return_child_interactions_to_parent(&mut self) {
         self.return_child_interactions_to_parent = true;
         self.allow_child_interaction = false;
+    }
+
+    /// Names tools the host has reviewed as safe for a read-only child view.
+    ///
+    /// A child factory sets this when it has already applied its own
+    /// read-only posture. The coordinator's read-only filter then keeps a
+    /// named tool even when its permissions go beyond filesystem reads (a
+    /// network fetch, a host-defined artifact read), as long as none of them
+    /// writes or spawns a process. Unnamed tools keep the default filter.
+    pub fn read_only_tool_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.read_only_tool_names = names.into_iter().collect();
+        self
+    }
+
+    /// The host-reviewed names [`Self::read_only_tool_names`] recorded.
+    pub(crate) fn reviewed_read_only_tool_names(&self) -> &std::collections::BTreeSet<String> {
+        &self.read_only_tool_names
     }
 
     /// Retains only the registered tools `keep` accepts. Used by the

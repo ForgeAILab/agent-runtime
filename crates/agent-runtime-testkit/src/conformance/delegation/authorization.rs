@@ -230,6 +230,103 @@ pub async fn assert_scoped_view_excludes_write_and_delegation_tools() {
         "the child view must retain only scoped read tools"
     );
 }
+/// A tool the host reviewed by name stays in a read-only child view when it
+/// reads beyond the filesystem (a fetch, a host-defined artifact reader), in
+/// both a read-only scope and a read-only workspace. Unnamed tools keep the
+/// filesystem-read filter, and a named tool that writes is still refused.
+pub async fn assert_reviewed_read_only_tools_reach_a_read_only_child() {
+    /// An echo with a chosen name and permission bound.
+    #[derive(Debug)]
+    struct BoundedEcho {
+        name: &'static str,
+        bound: Vec<Permission>,
+    }
+
+    #[async_trait]
+    impl Tool for BoundedEcho {
+        fn spec(&self) -> ToolSpec {
+            let mut spec = Tool::spec(&EchoTool);
+            spec.name = self.name.to_owned();
+            spec.permission_upper_bound = self.bound.iter().cloned().collect();
+            spec
+        }
+
+        async fn invoke(
+            &self,
+            prepared: PreparedToolCall,
+            _ctx: &InvocationContext,
+        ) -> Result<ToolOutcome, RuntimeError> {
+            Ok(ToolOutcome::json(prepared.arguments().clone()))
+        }
+    }
+
+    let bounded = |name, bound| Arc::new(BoundedEcho { name, bound }) as Arc<dyn Tool>;
+    let (_runtime, parent) = parent_session(true).await;
+    let factory = Arc::new(
+        ScriptedChildFactory::new(vec![
+            text_child_script("read-only scope"),
+            text_child_script("read-only workspace"),
+        ])
+        .with_tools(vec![
+            Arc::new(EchoTool),
+            bounded("fetch", vec![Permission::NetHttp, Permission::DataEgress]),
+            bounded("artifact.read", vec![Permission::other("artifact.read")]),
+            bounded("unreviewed_fetch", vec![Permission::NetHttp]),
+            bounded(
+                "reviewed_create",
+                vec![Permission::FsRead, Permission::FsCreate],
+            ),
+            bounded("reviewed_spawn", vec![Permission::ProcessSpawn]),
+            Arc::new(WriteTool::new("/ws/out")),
+            Arc::new(crate::tools::named_echo("delegate_task")),
+        ])
+        .with_read_only_tool_names(&[
+            "fetch",
+            "artifact.read",
+            "reviewed_create",
+            "reviewed_spawn",
+            "write",
+            "delegate_task",
+        ]),
+    );
+    let coordinator = DelegationCoordinator::new(
+        &parent,
+        factory.clone(),
+        DelegationConfig {
+            delegation_tool_names: vec!["delegate_task".to_string()],
+            ..DelegationConfig::default()
+        },
+    )
+    .unwrap();
+
+    let mut scoped = child_spec("read-only scope");
+    scoped.tools = ToolViewScope::ReadOnly;
+    let mut viewed = child_spec("read-only workspace");
+    viewed.tools = ToolViewScope::All;
+    viewed.workspace = WorkspacePolicy::ReadOnlyView;
+    for (index, spec) in [scoped, viewed].into_iter().enumerate() {
+        let child = match coordinator.spawn(spec).await.unwrap() {
+            SpawnOutcome::Spawned { child, .. } => child,
+            other => panic!("expected a spawned child, got {other:?}"),
+        };
+        assert_eq!(
+            coordinator.wait(&child).await.unwrap().state,
+            ChildState::Idle
+        );
+        let requests = factory.provider(index).requests();
+        let names = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            ["artifact.read", "echo", "fetch"].into(),
+            "child {index} keeps reads and reviewed non-writing tools only"
+        );
+    }
+}
+
 /// Durable child ids are parent-scoped and policy changes fail closed without
 /// consuming a replacement provider/script.
 pub async fn assert_durable_child_ownership_and_policy_fail_closed() {

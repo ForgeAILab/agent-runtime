@@ -41,17 +41,22 @@ pub(crate) fn char_offset(text: &str, index: usize) -> usize {
         .map_or(text.len(), |(offset, _)| offset)
 }
 
-/// Appends each URL once per text block at its first cited span.
+/// Appends each URL at its first cited span, once per assistant message.
 ///
-/// Offsets are byte boundaries in the original text. Stable sorting preserves
+/// `linked` holds the URLs earlier text blocks of the same message already
+/// cited; a source cited again in a later block is not linked again. Offsets
+/// are byte boundaries in the original text. Stable sorting preserves
 /// provider order for multiple sources attached to the same span.
-pub(crate) fn render(text: &str, mut citations: Vec<(usize, HostedSource)>) -> String {
+pub(crate) fn render(
+    text: &str,
+    mut citations: Vec<(usize, HostedSource)>,
+    linked: &mut BTreeSet<String>,
+) -> String {
     citations.sort_by_key(|(end, _)| *end);
-    let mut seen = BTreeSet::new();
     let mut rendered = String::new();
     let mut cursor = 0;
     for (end, source) in citations {
-        if end > text.len() || !text.is_char_boundary(end) || !seen.insert(source.url.clone()) {
+        if end > text.len() || !text.is_char_boundary(end) || !linked.insert(source.url.clone()) {
             continue;
         }
         let url = source
@@ -100,6 +105,7 @@ mod tests {
         let rendered = render(
             text,
             vec![(text.len(), source.clone()), (text.len(), source)],
+            &mut BTreeSet::new(),
         );
         assert_eq!(rendered, text);
         assert_eq!(
@@ -131,6 +137,7 @@ mod tests {
                     },
                 ),
             ],
+            &mut BTreeSet::new(),
         );
         assert_eq!(
             rendered,
@@ -148,7 +155,10 @@ mod tests {
             "See https://example.com/a (b).",
             "See [source](https://example.com/a%20%28b%29).",
         ] {
-            assert_eq!(render(text, vec![(3, source.clone())]), text);
+            assert_eq!(
+                render(text, vec![(3, source.clone())], &mut BTreeSet::new()),
+                text
+            );
         }
     }
 
@@ -163,8 +173,33 @@ mod tests {
             url: "https://b.test".into(),
         };
         assert_eq!(
-            render("éabc", vec![(4, a.clone()), (2, b), (5, a)]),
+            render(
+                "éabc",
+                vec![(4, a.clone()), (2, b), (5, a)],
+                &mut BTreeSet::new()
+            ),
             "é [B](https://b.test)ab [example.com](https://example.com/a)c"
+        );
+    }
+
+    #[test]
+    fn a_source_is_linked_once_per_message_across_blocks() {
+        let page = HostedSource {
+            title: Some("releases.rs".into()),
+            url: "https://releases.rs/".into(),
+        };
+        let other = HostedSource {
+            title: None,
+            url: "https://blog.rust-lang.org/".into(),
+        };
+        let mut linked = BTreeSet::new();
+        assert_eq!(
+            render("First.", vec![(6, page.clone())], &mut linked),
+            "First. [releases.rs](https://releases.rs/)"
+        );
+        assert_eq!(
+            render("Second.", vec![(7, page), (7, other)], &mut linked),
+            "Second. [blog.rust-lang.org](https://blog.rust-lang.org/)"
         );
     }
 }

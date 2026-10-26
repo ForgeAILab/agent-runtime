@@ -1029,6 +1029,32 @@ pub(super) fn tool_is_read_only(tool: &Arc<dyn agent_runtime_core::tool::Tool>) 
     })
 }
 
+/// Whether a read-only child view keeps `tool`: it only reads, or the host
+/// reviewed it by name and none of its permissions writes or spawns. The
+/// write guard holds even for a named tool, so a mistaken list cannot hand a
+/// read-only child a write.
+pub(super) fn read_only_view_keeps(
+    tool: &Arc<dyn agent_runtime_core::tool::Tool>,
+    reviewed: &std::collections::BTreeSet<String>,
+) -> bool {
+    if tool_is_read_only(tool) {
+        return true;
+    }
+    let spec = tool.spec();
+    reviewed.contains(&spec.name)
+        && !spec.permission_upper_bound.iter().any(|permission| {
+            matches!(
+                permission,
+                Permission::FsWrite
+                    | Permission::FsCreate
+                    | Permission::FsDelete
+                    | Permission::HostFsWrite
+                    | Permission::ExternalWrite
+                    | Permission::ProcessSpawn
+            )
+        })
+}
+
 pub(super) fn update_status(
     coordinator: &Arc<CoordinatorInner>,
     child: &ChildId,

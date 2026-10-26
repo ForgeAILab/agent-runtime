@@ -1118,6 +1118,8 @@ struct StreamState {
     pending_finish: Option<FinishReason>,
     /// Initial tool input waits until block stop; any JSON delta supersedes it.
     initial_inputs: BTreeMap<u32, Value>,
+    /// Hosted-search sources an earlier text block of this message linked.
+    linked_sources: std::collections::BTreeSet<String>,
 }
 
 fn emit_initial_input(index: u32, input: Value, out: &mut Vec<ProviderStreamEvent>) {
@@ -1139,7 +1141,7 @@ fn finish_text(state: &mut StreamState, index: u32, out: &mut Vec<ProviderStream
     if let Some(SearchTextBlock { text, citations }) = state.text.remove(&index) {
         if !text.is_empty() {
             out.push(ProviderStreamEvent::TextDelta {
-                text: super::hosted::render(&text, citations),
+                text: super::hosted::render(&text, citations, &mut state.linked_sources),
             });
         }
     }
@@ -3599,7 +3601,11 @@ mod tests {
         let citation = json!({"type":"web_search_result_location", "url":"https://rust.test", "cited_text":"a passage from the source document"});
         let (end, source) = text_citation("An answer.", &citation).unwrap();
         assert_eq!(
-            super::super::hosted::render("An answer.", vec![(end, source)]),
+            super::super::hosted::render(
+                "An answer.",
+                vec![(end, source)],
+                &mut std::collections::BTreeSet::new()
+            ),
             "An answer. [rust.test](https://rust.test)"
         );
     }

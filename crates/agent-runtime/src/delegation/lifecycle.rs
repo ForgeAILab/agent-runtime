@@ -1132,12 +1132,14 @@ impl DelegationCoordinator {
 
         // Apply the spec's scope. A read-only workspace posture also forces
         // the read-only tool filter, so a child that must not mutate cannot
-        // hold write-capable tools regardless of the requested scope.
+        // hold write-capable tools regardless of the requested scope. Tools
+        // the factory reviewed by name stay when they cannot write.
         let read_only_posture = spec.workspace == WorkspacePolicy::ReadOnlyView;
+        let reviewed = builder.reviewed_read_only_tool_names().clone();
         match &spec.tools {
             ToolViewScope::All => {}
             ToolViewScope::ReadOnly => {
-                builder.scope_tools(tool_is_read_only);
+                builder.scope_tools(|tool| read_only_view_keeps(tool, &reviewed));
             }
             ToolViewScope::Named { names } => {
                 let names = names.clone();
@@ -1148,7 +1150,7 @@ impl DelegationCoordinator {
             }
         }
         if read_only_posture {
-            builder.scope_tools(tool_is_read_only);
+            builder.scope_tools(|tool| read_only_view_keeps(tool, &reviewed));
         }
 
         // Child interactions are never presented directly through the root

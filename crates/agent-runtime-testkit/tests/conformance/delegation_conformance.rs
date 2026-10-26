@@ -118,6 +118,11 @@ async fn scoped_views_exclude_write_and_delegation_tools() {
 }
 
 #[tokio::test]
+async fn reviewed_read_only_tools_reach_a_read_only_child() {
+    delegation::assert_reviewed_read_only_tools_reach_a_read_only_child().await;
+}
+
+#[tokio::test]
 async fn follow_ups_reuse_the_child_and_the_turn_cap_is_enforced() {
     delegation::assert_follow_up_and_turn_limit().await;
 }
