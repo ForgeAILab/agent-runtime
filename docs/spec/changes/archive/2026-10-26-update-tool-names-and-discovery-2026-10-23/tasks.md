@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-23T23:30:00Z
-updated_at: 2026-10-23T23:30:00Z
-completed_at:
+updated_at: 2026-10-26T05:08:48Z
+completed_at: 2026-10-26T05:08:48Z
 ---
 
 ## 1. Provider tool names
@@ -42,3 +42,10 @@ completed_at:
 - [x] 4.1 `cargo fmt --all --check`
 - [x] 4.2 `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [x] 4.3 `cargo test --workspace --all-features`
+
+## Completion evidence (2026-10-26)
+
+[PR #74](https://github.com/ForgeAILab/agent-runtime/pull/74) merged as `d5ec422`. Release
+[PR #78](https://github.com/ForgeAILab/agent-runtime/pull/78) merged as `9cdb356`, and the
+[v0.11.0 tag](https://github.com/ForgeAILab/agent-runtime/tree/v0.11.0) records the suffix-free provider tool names,
+the collision rejection, and the `registry.search` fixes in its CHANGELOG.

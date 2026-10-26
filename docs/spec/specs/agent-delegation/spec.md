@@ -441,3 +441,74 @@ SHALL fail without effect.
 - **GIVEN** a ready outcome
 - **WHEN** a host acknowledges it against a turn that is not serving
 - **THEN** the call fails and the outcome stays ready
+
+### Requirement: Limit-stopped child tasks
+
+When a delegated child's turn ends at a configured limit, Runtime SHALL record
+a distinct limit outcome that names the limit. It MUST NOT be a completed
+outcome and MUST NOT carry the child's last assistant message as a result.
+The child SHALL remain available for follow-ups within its limits. Its status
+SHALL carry no last result and a limit error naming the limit until its next
+task starts. The parent stream SHALL receive a child-limit-reached event
+instead of a completed event. Automatic child-completion delivery SHALL say
+which limit stopped the task. Artifacts produced by the stopped turn SHALL
+transfer to the parent as they do for a completed task. Recovery from a
+limit-stopped terminal checkpoint SHALL produce the same outcome. It MUST keep
+an outcome already recorded for that turn by an earlier build.
+
+#### Scenario: Output limit after a preamble
+
+- **GIVEN** a child says "One quick check, then I'll write the document",
+  runs a tool, and its next response runs over the output limit
+- **WHEN** the turn ends
+- **THEN** the child's outcome is a limit outcome naming the output limit
+- **AND** neither the outcome nor the parent stream reports a completion or
+  the preamble
+- **AND** the child is idle with a limit error and accepts a follow-up
+
+#### Scenario: Limit outcome recovers after a failed parent save
+
+- **GIVEN** a child task stopped at a limit and the parent's outcome save
+  failed
+- **WHEN** the coordinator recovers the terminal checkpoint
+- **THEN** it records the same limit outcome once and publishes one limit
+  event
+
+#### Scenario: Earlier build recorded the limit as a completion
+
+- **GIVEN** a parent ledger recorded a limit-stopped turn as completed
+- **WHEN** an upgraded coordinator recovers that child
+- **THEN** recovery succeeds and the recorded outcome stands
+
+### Requirement: Host-reviewed tools stay in read-only child views
+
+A child factory SHALL be able to name, on the builder it returns, the tools it
+reviewed for a read-only child view. When a child's tool scope is read-only or
+its workspace is the read-only view, the coordinator SHALL keep a tool that
+only reads the filesystem, clock or random source, and SHALL also keep a named
+tool whose permission upper bound includes none of `fs.write`, `fs.create`,
+`fs.delete`, `host.fs.write`, `external.write`, or `process.spawn`. A named tool
+whose bound includes any of those MUST NOT be kept. Delegation-management
+tools MUST NOT reach a child view even when named.
+
+#### Scenario: A reviewed network read reaches a read-only child
+
+- **GIVEN** a factory that names `fetch` (bound `net.http`, `data.egress`)
+  and `artifact.read` (a host-defined permission)
+- **WHEN** a child is spawned with a read-only tool scope, and another with
+  scope `all` in the read-only workspace view
+- **THEN** both children's views hold `fetch`, `artifact.read` and the
+  filesystem read tools
+
+#### Scenario: An unnamed network tool stays out
+
+- **GIVEN** the same factory and a tool `unreviewed_fetch` it does not name
+- **WHEN** a read-only child is spawned
+- **THEN** the child's view does not hold `unreviewed_fetch`
+
+#### Scenario: A named tool that writes stays out
+
+- **GIVEN** a factory that names tools bound by `fs.create`,
+  `process.spawn`, and a workspace write, and the host's delegation tool
+- **WHEN** a read-only child is spawned
+- **THEN** the child's view holds none of them

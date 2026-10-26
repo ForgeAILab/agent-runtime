@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-24T12:00:00Z
-updated_at: 2026-10-24T10:34:37Z
+updated_at: 2026-10-26T05:08:53Z
 completed_at: 2026-10-24T10:34:37Z
 ---
 
@@ -21,3 +21,10 @@ completed_at: 2026-10-24T10:34:37Z
 - [x] 2.1 Unit: delivery text, key validation, status projection, serde shape.
 - [x] 2.2 Conformance: live limit outcome and follow-up, recovery after a failed
   outcome save, legacy completed record still recovers.
+
+## Completion evidence (2026-10-26)
+
+[PR #76](https://github.com/ForgeAILab/agent-runtime/pull/76) merged as `b00024a`. Release
+[PR #78](https://github.com/ForgeAILab/agent-runtime/pull/78) merged as `9cdb356`, and the
+[v0.11.0 tag](https://github.com/ForgeAILab/agent-runtime/tree/v0.11.0) records `ChildTaskOutcome::LimitReached` and
+event schema 17 in its CHANGELOG.

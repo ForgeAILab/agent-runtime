@@ -1114,16 +1114,20 @@ without detached I/O or hidden retries.
 
 ### Requirement: Canonical tool names at provider boundaries
 
-Anthropic Messages, OpenAI-compatible Chat Completions and Responses adapters SHALL use one shared deterministic bidirectional tool-name mapping with an ASCII
-letter/digit/underscore/hyphen wire alphabet and a 1–64 character bound. They
-MUST translate definitions, named choices and historical calls/results to the
-same wire names and translate model call names back before emitting events.
-Runtime requests, history, events and manifests MUST retain canonical identities.
+Anthropic Messages, OpenAI-compatible Chat Completions and Responses adapters SHALL use one shared deterministic tool-name mapping with an ASCII
+letter/digit/underscore/hyphen wire alphabet and a 1–64 byte bound. The wire
+name SHALL be the canonical name with every byte outside that alphabet
+replaced by `_`, truncated to 64 bytes, and MUST NOT carry a generated suffix.
+Adapters MUST translate definitions, named choices and historical
+calls/results to the same wire names and translate model call names back
+before emitting events. Runtime requests, history, events and manifests MUST
+retain canonical identities. An adapter MUST reject a request whose tools share
+a wire name.
 
 #### Scenario: Dotted and over-long names round-trip
 
 - **WHEN** a request registers a dotted or over-long canonical tool name
-- **THEN** its definition and named choice use a bounded provider-safe name
+- **THEN** its definition and named choice use the replaced and truncated name
 - **AND** a model call using that name emits the canonical name
 - **AND** replay of its call/result uses the same wire identity
 
@@ -1132,13 +1136,17 @@ Runtime requests, history, events and manifests MUST retain canonical identities
 - **WHEN** a tool name already meets the wire policy
 - **THEN** its wire name is identical to the canonical name
 
-#### Scenario: Collision disambiguation is deterministic
+#### Scenario: Colliding tools are rejected
 
-- **WHEN** distinct canonical names sanitize or truncate to the same prefix
-- **THEN** deterministic suffixes distinguish them, including collisions with
-  already valid registered names or generated suffixes
-- **AND** reordering the same tool set produces the same mapping
-- **AND** growing history does not change registered tool wire names
+- **WHEN** two tools in one request map to the same wire name
+- **THEN** the adapter rejects the request before any I/O, naming both tools
+- **AND** growing history never changes a registered tool's wire name
+
+#### Scenario: Model output may use the canonical name
+
+- **WHEN** a model emits a registered tool's canonical name instead of its wire
+  name
+- **THEN** the adapter emits that canonical name unchanged
 
 #### Scenario: Unknown model tool remains unknown
 
@@ -1237,3 +1245,63 @@ admitted; retryability alone MUST NOT be presented as proof of a retry.
 - **THEN** its event carries a zero-millisecond admitted delay
 - **AND** the replacement keeps the existing new-attempt identity and attempt
   budget behavior
+
+### Requirement: Safe request-level model fallback
+The shared runtime SHALL apply ordered, preflighted fallback bindings before meaningful response progress on typed quota exhaustion, exhausted transient failures, or a configured first-response budget. It SHALL replan the pending request under the new model's limits without replaying completed tools or resetting turn limits. Unknown replay safety and provider-hosted side effects MUST prevent unsafe automatic replay.
+
+#### Scenario: Startup budget spans retries and empty streams
+- **WHEN** a candidate has not produced meaningful progress before its startup budget expires
+- **THEN** its attempt is cancelled and retired before a safe next binding is dispatched
+- **AND** empty deltas, headers, usage observations, and retries cannot restart the budget
+
+#### Scenario: Output already started
+- **WHEN** meaningful text, reasoning, or tool activity starts
+- **THEN** the startup timer is disarmed and later stalls cannot trigger cross-model replay
+
+#### Scenario: Request continuation
+- **WHEN** a provider request following completed tools advances to a compatible model
+- **THEN** canonical tool results are preserved and each completed tool executes only once
+
+### Requirement: Hosted citations link each source once per message
+
+A hosted-search adapter SHALL link a cited source at most once per assistant
+message: a source linked in an earlier text block of the same message SHALL
+NOT be linked again in a later block, in addition to the existing rule that a
+block already containing the URL gets no link.
+
+#### Scenario: A page cited in two blocks
+
+- **GIVEN** a response whose two text blocks both cite `https://releases.rs/`
+- **WHEN** the adapter renders the citations
+- **THEN** only the first block carries a link to `https://releases.rs/`
+
+### Requirement: Gemini grounding redirects resolve through a host resolver
+
+The Gemini Interactions adapter SHALL, when a host installed a citation
+resolver on it, resolve each unique grounding redirect a hosted-search
+response cites at the end of that response and before rendering, at most
+64 per response with at most 8 in flight and 3 seconds in total, stopping on
+cancellation or the request deadline. Rendered citations and hosted-search
+sources SHALL carry the resolved page URL; a redirect the resolver does not
+resolve in time SHALL be kept unchanged. The runtime's resolver SHALL issue one
+GET per redirect, only to the grounding redirect origin, without following the
+redirect, reading a body, or sending a credential, and SHALL accept only an
+absolute HTTP(S) `Location` without userinfo. Without a resolver the adapter's
+output SHALL be unchanged.
+
+#### Scenario: Redirects resolve to one page
+
+- **GIVEN** two grounding redirects that both resolve to
+  `https://releases.rs/` and a third the resolver cannot resolve
+- **WHEN** a response citing all three in two text blocks is rendered
+- **THEN** `https://releases.rs/` is linked once, the third keeps its redirect
+  link, and the hosted-search sources list each page once
+- **AND** each redirect was looked up once
+
+#### Scenario: A lookup reads only the redirect
+
+- **GIVEN** a server answering `302` with `Location: https://releases.rs/`
+- **WHEN** the transport looks up a redirect on that origin
+- **THEN** it returns `https://releases.rs/` from one GET
+- **AND** a relative `Location` or a `200` answer returns nothing
+- **AND** a lookup outside the pinned origin is refused
