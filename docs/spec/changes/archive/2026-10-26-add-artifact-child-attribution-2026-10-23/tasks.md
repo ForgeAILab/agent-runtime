@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-23T22:20:00Z
-updated_at: 2026-10-23T22:20:00Z
-completed_at:
+updated_at: 2026-10-26T05:08:30Z
+completed_at: 2026-10-26T05:08:30Z
 ---
 
 ## 1. Implementation
@@ -23,3 +23,10 @@ completed_at:
   `cargo test --workspace --all-features`.
 - [x] 3.2 Smith pins the change and lists replies by child (Smith
   `fix/delegation-guidance-2026-10-23`).
+
+## Completion evidence (2026-10-26)
+
+[PR #72](https://github.com/ForgeAILab/agent-runtime/pull/72) merged as `5cb4cc5`. Release
+[PR #73](https://github.com/ForgeAILab/agent-runtime/pull/73) merged as `c036af7`, and the
+[v0.10.0 tag](https://github.com/ForgeAILab/agent-runtime/tree/v0.10.0) records `ArtifactProvenance::child` in its
+CHANGELOG.
