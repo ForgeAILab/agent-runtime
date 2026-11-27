@@ -38,11 +38,13 @@ use serde::{Deserialize, Serialize};
 
 use agent_runtime_core::artifact::ArtifactRef;
 use agent_runtime_core::content::{ContentPart, Message, Role};
+use agent_runtime_core::ids::ToolCallId;
 use agent_runtime_registry::{Fingerprint, RegistryRevision, TrustClass};
 
 use crate::budget::{BudgetReport, ContextBudget};
 use crate::fragment::{
-    ContextFragment, FragmentContent, FragmentId, FragmentKind, Requirement, Sensitivity,
+    ContextFragment, ContextLane, ConversationGroupId, FragmentContent, FragmentId, FragmentKind,
+    Requirement, Sensitivity,
 };
 use crate::planner::{Compactor, validate_pairing};
 use crate::sizing::{DEFAULT_CHARS_PER_TOKEN, RequestSizer};
@@ -990,6 +992,32 @@ fn fallback_token_estimate(fragment: &ContextFragment) -> u32 {
         .unwrap_or_else(|| (text_len(fragment) as u32).div_ceil(DEFAULT_CHARS_PER_TOKEN))
 }
 
+fn is_unsigned_reasoning(part: &ContentPart) -> bool {
+    matches!(
+        part,
+        ContentPart::Reasoning {
+            signature: None,
+            ..
+        }
+    )
+}
+
+fn can_truncate_fragment(fragment: &ContextFragment, max_chars: usize) -> bool {
+    match &fragment.content {
+        FragmentContent::Text(text) => text.chars().count() > max_chars,
+        FragmentContent::Message(message) => message.content.iter().any(|part| {
+            match part {
+            ContentPart::Text { text } => text.chars().count() > max_chars,
+            ContentPart::ToolResult(block) => block.content.iter().any(|inner| {
+                matches!(inner, ContentPart::Text { text } if text.chars().count() > max_chars)
+            }),
+            _ => false,
+        }
+        }),
+        FragmentContent::Tool(_) => false,
+    }
+}
+
 fn truncate_fragment(fragment: &mut ContextFragment, max_chars: usize) {
     const MARKER: &str = "... [truncated by compaction]";
     /// Truncates `text` to at most `max_chars` characters *including* the
@@ -1013,9 +1041,7 @@ fn truncate_fragment(fragment: &mut ContextFragment, max_chars: usize) {
         FragmentContent::Message(message) => {
             for part in &mut message.content {
                 match part {
-                    ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
-                        truncate_text(text, max_chars)
-                    }
+                    ContentPart::Text { text } => truncate_text(text, max_chars),
                     ContentPart::ToolResult(block) => {
                         for inner in &mut block.content {
                             if let ContentPart::Text { text } = inner {
@@ -1031,12 +1057,13 @@ fn truncate_fragment(fragment: &mut ContextFragment, max_chars: usize) {
     }
 }
 
-/// Stage 0: strips unsigned [`ContentPart::Reasoning`] parts from message
-/// fragments that precede the last `Role::User` message fragment. Signed
-/// blocks are provider-required continuation content and remain exact.
-/// Reasoning in messages at or after the last user message is never touched.
-/// The fragment itself always survives, so a required fragment or a
-/// tool-call/result pairing cannot be lost here.
+/// Stage 0: strips unsigned [`ContentPart::Reasoning`] parts from optional
+/// message fragments that either precede the last `Role::User` message
+/// fragment or strictly precede a later fragment in
+/// [`ContextLane::Conversation`], provided at least one other part remains so
+/// no empty message is produced. Signed blocks are provider-required
+/// continuation content and remain exact. The fragment itself always survives,
+/// so a required fragment or a tool-call/result pairing cannot be lost here.
 fn stage_strip_prior_reasoning(
     fragments: &mut [ContextFragment],
     size_of: &dyn Fn(&ContextFragment) -> u32,
@@ -1046,8 +1073,10 @@ fn stage_strip_prior_reasoning(
     let last_user = fragments.iter().rposition(
         |f| matches!(&f.content, FragmentContent::Message(message) if message.role == Role::User),
     );
-    let Some(last_user) = last_user else { return };
-    for index in 0..last_user {
+    let last_conversation = fragments
+        .iter()
+        .rposition(|f| f.position.lane == ContextLane::Conversation);
+    for index in 0..fragments.len() {
         if total_tokens_with(fragments, size_of) <= target {
             return;
         }
@@ -1055,21 +1084,25 @@ fn stage_strip_prior_reasoning(
         if fragment.is_required() {
             continue;
         }
+        let eligible = last_user.is_some_and(|lu| index < lu)
+            || (fragment.position.lane == ContextLane::Conversation
+                && last_conversation.is_some_and(|lc| index < lc));
+        if !eligible {
+            continue;
+        }
         let FragmentContent::Message(message) = &mut fragment.content else {
             continue;
         };
-        let parts_before = message.content.len();
-        message.content.retain(|part| {
-            !matches!(
-                part,
-                ContentPart::Reasoning {
-                    signature: None,
-                    ..
-                }
-            )
-        });
-        if message.content.len() < parts_before {
-            outcome.bounded.push(fragment.id.clone());
+        let has_unsigned = message.content.iter().any(is_unsigned_reasoning);
+        let has_other_part = message
+            .content
+            .iter()
+            .any(|part| !is_unsigned_reasoning(part));
+        if has_unsigned && has_other_part {
+            message.content.retain(|part| !is_unsigned_reasoning(part));
+            if !outcome.bounded.contains(&fragment.id) {
+                outcome.bounded.push(fragment.id.clone());
+            }
         }
     }
 }
@@ -1107,10 +1140,11 @@ fn stage_evict(
 }
 
 /// Stages 2 and 3: truncates the largest optional fragment of `kind` whose
-/// text exceeds `max_chars`, largest first, until the target is met or no
-/// candidate remains. Used for both "bound oversized tool results"
-/// ([`FragmentKind::ToolResult`]) and "elide reproducible detail"
-/// ([`FragmentKind::History`]).
+/// truncatable text exceeds `max_chars`, largest first, until the target is
+/// met or no candidate remains. A paired fragment is eligible only when every
+/// fragment sharing any of its `pairing_ids()` is also [`Requirement::Optional`].
+/// Used for both "bound oversized tool results" ([`FragmentKind::ToolResult`])
+/// and "elide reproducible detail" ([`FragmentKind::History`]).
 fn truncate_oversized(
     fragments: &mut [ContextFragment],
     size_of: &dyn Fn(&ContextFragment) -> u32,
@@ -1119,6 +1153,13 @@ fn truncate_oversized(
     max_chars: usize,
     kind: FragmentKind,
 ) {
+    // Any pairing id attached to a Required fragment blocks independent
+    // bounding/elision of every fragment paired with that call id.
+    let required_pairings: BTreeSet<ToolCallId> = fragments
+        .iter()
+        .filter(|f| f.is_required())
+        .flat_map(ContextFragment::pairing_ids)
+        .collect();
     // Each fragment is bounded at most once per call. A multi-part message can
     // still exceed `max_chars` in total after every one of its parts has been
     // truncated to fit, so "is it still over the bound" is not on its own a
@@ -1134,9 +1175,11 @@ fn truncate_oversized(
             .filter(|f| {
                 f.requirement == Requirement::Optional
                     && f.kind == kind
-                    && f.pairing_ids().is_empty()
+                    && f.pairing_ids()
+                        .iter()
+                        .all(|id| !required_pairings.contains(id))
                     && !(kind == FragmentKind::History && contains_signed_reasoning(f))
-                    && text_len(f) > max_chars
+                    && can_truncate_fragment(f, max_chars)
                     && !bounded.contains(&f.id)
             })
             .max_by_key(|f| size_of(f));
@@ -1144,7 +1187,9 @@ fn truncate_oversized(
             Some(fragment) => {
                 truncate_fragment(fragment, max_chars);
                 bounded.insert(fragment.id.clone());
-                outcome.bounded.push(fragment.id.clone());
+                if !outcome.bounded.contains(&fragment.id) {
+                    outcome.bounded.push(fragment.id.clone());
+                }
             }
             None => return,
         }
@@ -1202,14 +1247,95 @@ fn stage_elide(
     );
 }
 
+/// Stage 4 (hard-budget rescue only): iteratively evicts the oldest complete
+/// optional conversation group until the sized total fits `target` (the hard
+/// `input_budget`) or no evictable group remains.
+///
+/// A conversation group is evictable only when:
+/// - every fragment in the group is [`Requirement::Optional`] and never
+///   [`FragmentKind::UserInput`], and
+/// - every fragment in `fragments` sharing any `pairing_ids()` with the group
+///   also belongs to that same group (preserving atomic tool-call/result
+///   closure).
+fn stage_evict_conversation_groups(
+    fragments: &mut Vec<ContextFragment>,
+    size_of: &dyn Fn(&ContextFragment) -> u32,
+    target: u32,
+    outcome: &mut CompactionOutcome,
+) {
+    loop {
+        if total_tokens_with(fragments.as_slice(), size_of) <= target {
+            return;
+        }
+
+        let mut groups: BTreeMap<ConversationGroupId, BTreeSet<usize>> = BTreeMap::new();
+        let mut pairing_members: BTreeMap<ToolCallId, BTreeSet<usize>> = BTreeMap::new();
+        for (index, fragment) in fragments.iter().enumerate() {
+            if let Some(group) = &fragment.conversation_group {
+                groups.entry(group.clone()).or_default().insert(index);
+            }
+            for call_id in fragment.pairing_ids() {
+                pairing_members.entry(call_id).or_default().insert(index);
+            }
+        }
+
+        let victim_indices = groups
+            .values()
+            .filter(|members| {
+                members.iter().all(|&idx| {
+                    let fragment = &fragments[idx];
+                    fragment.requirement == Requirement::Optional
+                        && fragment.kind != FragmentKind::UserInput
+                }) && members.iter().all(|&idx| {
+                    fragments[idx].pairing_ids().iter().all(|call_id| {
+                        pairing_members
+                            .get(call_id)
+                            .is_some_and(|peers| peers.iter().all(|peer| members.contains(peer)))
+                    })
+                })
+            })
+            .filter_map(|members| {
+                let oldest_index = members
+                    .iter()
+                    .copied()
+                    .min_by(|&a, &b| fragments[a].sort_key().cmp(&fragments[b].sort_key()))?;
+                Some((oldest_index, members))
+            })
+            .min_by(|(a_idx, _), (b_idx, _)| {
+                fragments[*a_idx]
+                    .sort_key()
+                    .cmp(&fragments[*b_idx].sort_key())
+            })
+            .map(|(_, members)| members.clone());
+
+        let Some(victim_indices) = victim_indices else {
+            return;
+        };
+
+        let mut evicted_ids = Vec::with_capacity(victim_indices.len());
+        let mut evicted_set = BTreeSet::new();
+        let mut retained = Vec::with_capacity(fragments.len().saturating_sub(victim_indices.len()));
+        for (index, fragment) in fragments.drain(..).enumerate() {
+            if victim_indices.contains(&index) {
+                evicted_set.insert(fragment.id.clone());
+                evicted_ids.push(fragment.id);
+            } else {
+                retained.push(fragment);
+            }
+        }
+        *fragments = retained;
+        outcome.bounded.retain(|id| !evicted_set.contains(id));
+        outcome.evicted.extend(evicted_ids);
+    }
+}
+
 /// Runs the structural compaction stages (0 through 3), in order, toward
-/// `target`,
-/// then validates the result via [`validate_compacted`].
-fn compact_pipeline(
+/// `target`.
+fn run_structural_stages(
     fragments: &[ContextFragment],
     size_of: &dyn Fn(&ContextFragment) -> u32,
     target: u32,
-) -> Result<(Vec<ContextFragment>, CompactionOutcome), CompactionError> {
+) -> (Vec<ContextFragment>, CompactionOutcome) {
     let mut candidate = fragments.to_vec();
     let mut outcome = CompactionOutcome::default();
 
@@ -1229,6 +1355,17 @@ fn compact_pipeline(
         &mut outcome,
         DEFAULT_BOUND_CHARS,
     );
+    (candidate, outcome)
+}
+
+/// Runs the structural compaction stages (0 through 3), in order, toward
+/// `target`, then validates the result via [`validate_compacted`].
+fn compact_pipeline(
+    fragments: &[ContextFragment],
+    size_of: &dyn Fn(&ContextFragment) -> u32,
+    target: u32,
+) -> Result<(Vec<ContextFragment>, CompactionOutcome), CompactionError> {
+    let (candidate, outcome) = run_structural_stages(fragments, size_of, target);
     validate_compacted(fragments, &candidate, &outcome)?;
     Ok((candidate, outcome))
 }
@@ -1284,6 +1421,29 @@ impl StructuralCompactor {
             outcome,
         })
     }
+
+    fn compact_for_budget(
+        &self,
+        fragments: &[ContextFragment],
+        budget: &ContextBudget,
+        size_of: &dyn Fn(&ContextFragment) -> u32,
+    ) -> Result<Option<CompactionResult>, CompactionError> {
+        let target = self.policy.low_watermark.min(budget.input_budget);
+        let (mut candidate, mut outcome) = run_structural_stages(fragments, size_of, target);
+        if total_tokens_with(&candidate, size_of) > budget.input_budget {
+            stage_evict_conversation_groups(
+                &mut candidate,
+                size_of,
+                budget.input_budget,
+                &mut outcome,
+            );
+        }
+        validate_compacted(fragments, &candidate, &outcome)?;
+        Ok(Some(CompactionResult {
+            fragments: candidate,
+            outcome,
+        }))
+    }
 }
 
 impl Compactor for StructuralCompactor {
@@ -1293,9 +1453,18 @@ impl Compactor for StructuralCompactor {
         _report: &BudgetReport,
         budget: &ContextBudget,
     ) -> Result<Option<CompactionResult>, CompactionError> {
-        let target = self.policy.low_watermark.min(budget.input_budget);
-        let (fragments, outcome) = compact_pipeline(fragments, &fallback_token_estimate, target)?;
-        Ok(Some(CompactionResult { fragments, outcome }))
+        self.compact_for_budget(fragments, budget, &fallback_token_estimate)
+    }
+
+    fn compact_with_sizer(
+        &self,
+        fragments: &[ContextFragment],
+        _report: &BudgetReport,
+        budget: &ContextBudget,
+        sizer: &dyn RequestSizer,
+    ) -> Result<Option<CompactionResult>, CompactionError> {
+        let size_of = |fragment: &ContextFragment| sizer.size_fragment(fragment);
+        self.compact_for_budget(fragments, budget, &size_of)
     }
 }
 
@@ -2161,5 +2330,485 @@ mod tests {
         };
         assert_eq!(message.content, vec![tool_call]);
         assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
+    }
+
+    #[test]
+    fn stage_0_strips_intra_turn_unsigned_reasoning_only_when_other_parts_remain() {
+        let sizer = CharRatioSizer::default();
+        let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 150, 80);
+        let compactor = StructuralCompactor::new(policy);
+
+        let user = ContextFragment::new(
+            "history:0",
+            FragmentKind::UserInput,
+            FragmentSource::History,
+            RegistryRevision::new("h0"),
+            FragmentContent::Message(Message::user("solve the bug")),
+        )
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            0,
+        ));
+        let call_id = ToolCallId::new("call-1");
+        let tool_call = ContentPart::ToolCall(ToolCall {
+            id: call_id.clone(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "lib.rs"}),
+        });
+        let old_call = ContextFragment::new(
+            "history:1",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("h1"),
+            FragmentContent::Message(Message::assistant(vec![
+                reasoning_part(&"r".repeat(2_000)),
+                tool_call.clone(),
+            ])),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            1,
+        ))
+        .paired_with(call_id.clone());
+        let old_result = ContextFragment::new(
+            "history:2",
+            FragmentKind::ToolResult,
+            FragmentSource::Tool,
+            RegistryRevision::new("h2"),
+            FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                call_id,
+                name: "read".into(),
+                content: vec![ContentPart::text("ok")],
+                is_error: false,
+            })),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            2,
+        ))
+        .paired_with(ToolCallId::new("call-1"));
+        let unsigned_only = ContextFragment::new(
+            "history:3",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("h3"),
+            FragmentContent::Message(Message::assistant(vec![reasoning_part(
+                "only unsigned thought",
+            )])),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            3,
+        ));
+        let trailing_assistant = ContextFragment::new(
+            "history:4",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("h4"),
+            FragmentContent::Message(Message::assistant(vec![
+                reasoning_part("latest reasoning"),
+                ContentPart::text("still working"),
+            ])),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            4,
+        ));
+
+        let fragments = vec![
+            user,
+            old_call,
+            old_result,
+            unsigned_only.clone(),
+            trailing_assistant.clone(),
+        ];
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
+
+        let stripped = result
+            .fragments
+            .iter()
+            .find(|f| f.id == FragmentId::new("history:1"))
+            .expect("old call survives");
+        let FragmentContent::Message(msg) = &stripped.content else {
+            panic!("message expected");
+        };
+        assert_eq!(msg.content, vec![tool_call]);
+
+        // Unsigned-only message must not become an empty message.
+        let kept_unsigned_only = result
+            .fragments
+            .iter()
+            .find(|f| f.id == FragmentId::new("history:3"))
+            .expect("unsigned-only fragment survives");
+        assert_eq!(kept_unsigned_only, &unsigned_only);
+
+        // Trailing conversation fragment keeps its reasoning.
+        let kept_trailing = result
+            .fragments
+            .iter()
+            .find(|f| f.id == FragmentId::new("history:4"))
+            .expect("trailing assistant survives");
+        assert_eq!(kept_trailing, &trailing_assistant);
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
+    }
+
+    #[test]
+    fn optional_paired_tool_result_and_assistant_text_are_bounded_without_touching_tool_calls() {
+        let sizer = CharRatioSizer::default();
+        let policy = CompactionPolicy::new(RegistryRevision::new("p1"), 250, 120);
+        let compactor = StructuralCompactor::new(policy);
+
+        let call_id = ToolCallId::new("call-opt-1");
+        let tool_call = ContentPart::ToolCall(ToolCall {
+            id: call_id.clone(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        });
+        let call_fragment = ContextFragment::new(
+            "call",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("h1"),
+            FragmentContent::Message(Message::assistant(vec![
+                ContentPart::text("n".repeat(1_200)),
+                tool_call.clone(),
+            ])),
+        )
+        .optional()
+        .paired_with(call_id.clone());
+
+        let result_fragment = ContextFragment::new(
+            "result",
+            FragmentKind::ToolResult,
+            FragmentSource::Tool,
+            RegistryRevision::new("r1"),
+            FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                call_id: call_id.clone(),
+                name: "read".into(),
+                content: vec![ContentPart::text("o".repeat(2_400))],
+                is_error: false,
+            })),
+        )
+        .optional()
+        .paired_with(call_id);
+
+        let fragments = vec![
+            required_system("sys", "be helpful"),
+            call_fragment,
+            result_fragment,
+        ];
+        let result = compactor.maybe_compact(&fragments, &sizer).unwrap();
+
+        assert!(result.outcome.bounded.contains(&FragmentId::new("result")));
+        assert!(result.outcome.bounded.contains(&FragmentId::new("call")));
+
+        let bounded_call = result
+            .fragments
+            .iter()
+            .find(|f| f.id == FragmentId::new("call"))
+            .expect("call survives");
+        let FragmentContent::Message(call_msg) = &bounded_call.content else {
+            panic!("message expected");
+        };
+        assert!(call_msg.content.contains(&tool_call));
+        let ContentPart::Text { text } = &call_msg.content[0] else {
+            panic!("text part expected");
+        };
+        assert!(text.chars().count() <= DEFAULT_BOUND_CHARS);
+
+        let bounded_result = result
+            .fragments
+            .iter()
+            .find(|f| f.id == FragmentId::new("result"))
+            .expect("result survives");
+        let FragmentContent::Message(res_msg) = &bounded_result.content else {
+            panic!("message expected");
+        };
+        let ContentPart::ToolResult(block) = &res_msg.content[0] else {
+            panic!("tool result block expected");
+        };
+        let ContentPart::Text { text } = &block.content[0] else {
+            panic!("tool result text expected");
+        };
+        assert!(text.chars().count() <= DEFAULT_BOUND_CHARS);
+        assert!(validate_compacted(&fragments, &result.fragments, &result.outcome).is_ok());
+    }
+
+    #[test]
+    fn hard_budget_stage_4_evicts_oldest_optional_conversation_group_atomically_using_exact_sizer()
+    {
+        let sizer = CharRatioSizer::default();
+        // Profile gives input_budget = 300 tokens (context 350 - output_reserve 50).
+        let profile = test_profile(350, 350, 50);
+        let ctx_policy = ContextPolicy::new(RegistryRevision::new("policy-1"), 50, 0);
+        let compaction_policy = CompactionPolicy::new(RegistryRevision::new("cp-1"), 200, 150);
+        let compactor = StructuralCompactor::new(compaction_policy);
+        let planner = ContextPlanner::new(&profile, &sizer, ctx_policy).with_compactor(&compactor);
+
+        let user = ContextFragment::new(
+            "history:0",
+            FragmentKind::UserInput,
+            FragmentSource::History,
+            RegistryRevision::new("h0"),
+            FragmentContent::Message(Message::user("refactor the workspace")),
+        )
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            0,
+        ))
+        .in_conversation_group(crate::fragment::ConversationGroupId::new("turn:0"));
+
+        // Old parallel exchange whose ToolCall.arguments alone exceed budget.
+        let c1a = ToolCallId::new("c1a");
+        let c1b = ToolCallId::new("c1b");
+        let ex1_call = ContextFragment::new(
+            "history:1",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("h1"),
+            FragmentContent::Message(Message::assistant(vec![
+                ContentPart::ToolCall(ToolCall {
+                    id: c1a.clone(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"body": "a".repeat(1_200)}),
+                }),
+                ContentPart::ToolCall(ToolCall {
+                    id: c1b.clone(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"body": "b".repeat(1_200)}),
+                }),
+            ])),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            1,
+        ))
+        .in_conversation_group(crate::fragment::ConversationGroupId::new(
+            "turn:0:exchange:1",
+        ))
+        .paired_with_many([c1a.clone(), c1b.clone()]);
+        let ex1_res_a = ContextFragment::new(
+            "history:2",
+            FragmentKind::ToolResult,
+            FragmentSource::Tool,
+            RegistryRevision::new("h2"),
+            FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                call_id: c1a.clone(),
+                name: "write_file".into(),
+                content: vec![ContentPart::text("written a")],
+                is_error: false,
+            })),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            2,
+        ))
+        .in_conversation_group(crate::fragment::ConversationGroupId::new(
+            "turn:0:exchange:1",
+        ))
+        .paired_with(c1a);
+        let ex1_res_b = ContextFragment::new(
+            "history:3",
+            FragmentKind::ToolResult,
+            FragmentSource::Tool,
+            RegistryRevision::new("h3"),
+            FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                call_id: c1b.clone(),
+                name: "write_file".into(),
+                content: vec![ContentPart::text("written b")],
+                is_error: false,
+            })),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            3,
+        ))
+        .in_conversation_group(crate::fragment::ConversationGroupId::new(
+            "turn:0:exchange:1",
+        ))
+        .paired_with(c1b);
+
+        // Newer optional exchange that still fits once ex1 is evicted.
+        let c2 = ToolCallId::new("c2");
+        let ex2_call = ContextFragment::new(
+            "history:4",
+            FragmentKind::History,
+            FragmentSource::History,
+            RegistryRevision::new("h4"),
+            FragmentContent::Message(Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                id: c2.clone(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "lib.rs"}),
+            })])),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            4,
+        ))
+        .in_conversation_group(crate::fragment::ConversationGroupId::new(
+            "turn:0:exchange:4",
+        ))
+        .paired_with(c2.clone());
+        let ex2_res = ContextFragment::new(
+            "history:5",
+            FragmentKind::ToolResult,
+            FragmentSource::Tool,
+            RegistryRevision::new("h5"),
+            FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                call_id: c2.clone(),
+                name: "read_file".into(),
+                content: vec![ContentPart::text("ok")],
+                is_error: false,
+            })),
+        )
+        .optional()
+        .with_position(crate::fragment::ContextPosition::new(
+            crate::fragment::ContextLane::Conversation,
+            5,
+        ))
+        .in_conversation_group(crate::fragment::ConversationGroupId::new(
+            "turn:0:exchange:4",
+        ))
+        .paired_with(c2);
+
+        let fragments = vec![
+            required_system("sys", "be helpful"),
+            user,
+            ex1_call,
+            ex1_res_a,
+            ex1_res_b,
+            ex2_call,
+            ex2_res,
+        ];
+
+        // `maybe_compact` stays on Stages 0-3 and does NOT evict conversation groups.
+        let soft = compactor.maybe_compact(&fragments, &sizer).unwrap();
+        assert!(soft.outcome.evicted.is_empty());
+
+        // Hard-budget planning rescues via Stage 4 atomic group eviction.
+        let plan = planner
+            .plan(fragments)
+            .expect("hard-budget Stage 4 evicts oldest optional exchange group");
+        assert!(plan.input_tokens() <= 300);
+        let outcome = plan.compaction_outcome();
+        assert_eq!(
+            outcome.evicted,
+            vec![
+                FragmentId::new("history:1"),
+                FragmentId::new("history:2"),
+                FragmentId::new("history:3"),
+            ]
+        );
+        // UserInput and newer optional exchange survive intact.
+        let kept_ids: BTreeSet<&str> = plan
+            .segments()
+            .iter()
+            .map(|s| s.fragment.as_str())
+            .collect();
+        assert!(kept_ids.contains("history:0"));
+        assert!(kept_ids.contains("history:4"));
+        assert!(kept_ids.contains("history:5"));
+        assert!(!kept_ids.contains("history:1"));
+        assert!(!kept_ids.contains("history:2"));
+        assert!(!kept_ids.contains("history:3"));
+    }
+
+    #[test]
+    fn compact_with_sizer_accounts_for_message_and_tool_framing_overhead() {
+        // Build many small paired exchanges whose raw text is tiny (~120 tokens
+        // under fallback_token_estimate) but whose CharRatioSizer framing cost
+        // (4 tokens/msg + 6 tokens/call-or-result = 20 framing tokens per exchange)
+        // exceeds the hard input budget of 250 tokens.
+        let sizer = CharRatioSizer::default();
+        let profile = test_profile(300, 300, 50); // input_budget = 250
+        let ctx_policy = ContextPolicy::new(RegistryRevision::new("policy-1"), 50, 0);
+        let compaction_policy = CompactionPolicy::new(RegistryRevision::new("cp-1"), 200, 200);
+        let compactor = StructuralCompactor::new(compaction_policy);
+        let planner = ContextPlanner::new(&profile, &sizer, ctx_policy).with_compactor(&compactor);
+
+        let mut fragments = vec![
+            required_system("sys", "ok"),
+            ContextFragment::new(
+                "history:0",
+                FragmentKind::UserInput,
+                FragmentSource::History,
+                RegistryRevision::new("h0"),
+                FragmentContent::Message(Message::user("go")),
+            )
+            .with_position(crate::fragment::ContextPosition::new(
+                crate::fragment::ContextLane::Conversation,
+                0,
+            ))
+            .in_conversation_group(ConversationGroupId::new("turn:0")),
+        ];
+        // 15 optional exchanges: raw text is ~2 tokens each (~30 tokens total),
+        // far below 250 under fallback_token_estimate, yet ~24+ tokens each
+        // (>360 tokens total) under CharRatioSizer framing.
+        for step in 0..15u64 {
+            let cid = ToolCallId::new(format!("f-{step}"));
+            let group = ConversationGroupId::new(format!("turn:0:exchange:{}", step * 2 + 1));
+            fragments.push(
+                ContextFragment::new(
+                    format!("history:{}", step * 2 + 1),
+                    FragmentKind::History,
+                    FragmentSource::History,
+                    RegistryRevision::new(format!("c{step}")),
+                    FragmentContent::Message(Message::assistant(vec![ContentPart::ToolCall(
+                        ToolCall {
+                            id: cid.clone(),
+                            name: "t".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                    )])),
+                )
+                .optional()
+                .with_position(crate::fragment::ContextPosition::new(
+                    crate::fragment::ContextLane::Conversation,
+                    step * 2 + 1,
+                ))
+                .in_conversation_group(group.clone())
+                .paired_with(cid.clone()),
+            );
+            fragments.push(
+                ContextFragment::new(
+                    format!("history:{}", step * 2 + 2),
+                    FragmentKind::ToolResult,
+                    FragmentSource::Tool,
+                    RegistryRevision::new(format!("r{step}")),
+                    FragmentContent::Message(Message::tool_result(ToolResultBlock {
+                        call_id: cid.clone(),
+                        name: "t".into(),
+                        content: vec![ContentPart::text("ok")],
+                        is_error: false,
+                    })),
+                )
+                .optional()
+                .with_position(crate::fragment::ContextPosition::new(
+                    crate::fragment::ContextLane::Conversation,
+                    step * 2 + 2,
+                ))
+                .in_conversation_group(group)
+                .paired_with(cid),
+            );
+        }
+
+        // Verify fallback_token_estimate would have underestimated below 250!
+        assert!(total_tokens_with(&fragments, &fallback_token_estimate) < 250);
+        // Verify exact CharRatioSizer exceeds 250!
+        assert!(total_input_tokens(&fragments, &sizer) > 250);
+
+        let plan = planner
+            .plan(fragments)
+            .expect("compact_with_sizer must size framing accurately and fit input_budget");
+        assert!(plan.input_tokens() <= 250);
+        assert!(!plan.compaction_outcome().evicted.is_empty());
     }
 }

@@ -58,6 +58,21 @@ pub trait Compactor: Send + Sync + fmt::Debug {
         report: &BudgetReport,
         budget: &ContextBudget,
     ) -> Result<Option<CompactionResult>, CompactionError>;
+
+    /// Attempts to bring `fragments` under `budget`, measuring candidate sizes
+    /// with the planner's exact [`RequestSizer`].
+    ///
+    /// Defaults to [`Compactor::compact`] so existing implementations keep
+    /// working unchanged.
+    fn compact_with_sizer(
+        &self,
+        fragments: &[ContextFragment],
+        report: &BudgetReport,
+        budget: &ContextBudget,
+        _sizer: &dyn RequestSizer,
+    ) -> Result<Option<CompactionResult>, CompactionError> {
+        self.compact(fragments, report, budget)
+    }
 }
 
 /// Compiles versioned fragments into one immutable [`ContextPlan`].
@@ -476,7 +491,7 @@ impl<'a> ContextPlanner<'a> {
             if recoverable && !compaction_attempted {
                 if let Some(compactor) = self.compactor {
                     let reduced = compactor
-                        .compact(&fragments, &report, &self.budget)
+                        .compact_with_sizer(&fragments, &report, &self.budget, self.sizer)
                         .map_err(|err| ContextError::compaction(err.to_string()))?;
                     if let Some(result) = reduced {
                         validate_compacted(&fragments, &result.fragments, &result.outcome)

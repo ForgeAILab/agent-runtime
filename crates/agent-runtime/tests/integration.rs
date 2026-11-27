@@ -18,6 +18,8 @@ mod failed_tool_step_pairing;
 mod fetch_tool_integration;
 #[path = "integration/interrupted_turn_admission.rs"]
 mod interrupted_turn_admission;
+#[path = "integration/intra_turn_compaction.rs"]
+mod intra_turn_compaction;
 #[path = "integration/invalid_tool_arguments.rs"]
 mod invalid_tool_arguments;
 #[path = "integration/lcm_expansion.rs"]

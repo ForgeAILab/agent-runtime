@@ -17,7 +17,7 @@
 //! fails at build time, because guessing a window is exactly how uncounted
 //! context reaches a provider.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use agent_runtime_context::budget::{ContextBudget, ContextError, ContextPolicy};
@@ -63,6 +63,9 @@ pub const CACHE_POLICY_KEY: &str = "cache_policy";
 /// baseline across process resume.
 pub(crate) const PREVIOUS_CACHE_STATE_NAMESPACE: &str = "runtime.core.previous_cache";
 const PREVIOUS_CACHE_STATE_REVISION: &str = "previous-cache-state-1";
+/// Number of most-recent completed intra-turn tool exchanges kept
+/// `Requirement::Required` while an active turn is still in flight.
+const RECENT_INTRA_TURN_EXCHANGES_TO_KEEP_REQUIRED: usize = 2;
 
 /// Result of validating a persisted cache baseline against this planner.
 ///
@@ -612,7 +615,34 @@ impl RunPlanner {
         active_turn_start: Option<usize>,
     ) -> Vec<ContextFragment> {
         let mut fragments = Vec::new();
-        let conversation_pairings = conversation_pairings(history);
+        let exchanges = extract_tool_exchanges(history);
+        let conversation_pairings = conversation_pairings_from(history, &exchanges);
+
+        let mut older_intra_turn_exchange_group: BTreeMap<usize, ConversationGroupId> =
+            BTreeMap::new();
+        if let Some(turn_start) = active_turn_start {
+            let completed_intra_turn: Vec<&ExtractedToolExchange> = exchanges
+                .iter()
+                .filter(|extracted| {
+                    extracted.assistant_index > turn_start && extracted.is_complete()
+                })
+                .collect();
+            let optional_count = completed_intra_turn
+                .len()
+                .saturating_sub(RECENT_INTRA_TURN_EXCHANGES_TO_KEEP_REQUIRED);
+            let abs_turn_start = history_index_offset.saturating_add(turn_start);
+            for extracted in &completed_intra_turn[..optional_count] {
+                let abs_assistant_index =
+                    history_index_offset.saturating_add(extracted.assistant_index);
+                let group = ConversationGroupId::new(format!(
+                    "turn:{abs_turn_start}:exchange:{abs_assistant_index}"
+                ));
+                older_intra_turn_exchange_group.insert(extracted.assistant_index, group.clone());
+                for &result_index in &extracted.result_indices {
+                    older_intra_turn_exchange_group.insert(result_index, group.clone());
+                }
+            }
+        }
 
         if let Some(prompt) = system_prompt {
             fragments.push(ContextFragment::new(
@@ -665,15 +695,27 @@ impl RunPlanner {
                 group_start = Some(absolute_index);
             }
             // History is optional so compaction has something it is allowed to
-            // work with. The complete suffix beginning at the most recent user
-            // message remains required while the turn is active.
+            // work with. Within an active turn, the accepted user input, any
+            // mid-turn user steers, the most recent `K` completed tool
+            // exchanges, and any trailing/in-flight messages stay required;
+            // older completed intra-turn exchanges become optional atomic
+            // exchange groups while remaining `CacheClass::Ephemeral`.
             let is_current_input = Some(index) == active_turn_start;
             let is_active_continuation = active_turn_start.is_some_and(|current| index >= current);
+            let older_intra_turn_group = older_intra_turn_exchange_group.get(&index);
             let kind = match message.role {
                 Role::Tool => FragmentKind::ToolResult,
                 Role::User if is_current_input => FragmentKind::UserInput,
                 _ => FragmentKind::History,
             };
+            let conversation_group = older_intra_turn_group.cloned().unwrap_or_else(|| {
+                ConversationGroupId::new(format!(
+                    "turn:{}",
+                    group_start
+                        .map(|start| start.to_string())
+                        .unwrap_or_else(|| "preamble".to_owned())
+                ))
+            });
             let revision = RegistryRevision::from_content(message.joined_text());
             let fragment = ContextFragment::new(
                 format!("history:{absolute_index}"),
@@ -687,12 +729,7 @@ impl RunPlanner {
                 ContextLane::Conversation,
                 absolute_index as u64,
             ))
-            .in_conversation_group(ConversationGroupId::new(format!(
-                "turn:{}",
-                group_start
-                    .map(|start| start.to_string())
-                    .unwrap_or_else(|| "preamble".to_owned())
-            )))
+            .in_conversation_group(conversation_group)
             .paired_with_many(conversation_pairings[index].iter().cloned())
             // Committed history is immutable and append-only, which is
             // exactly what a prefix cache reuses. The active turn is the
@@ -703,7 +740,8 @@ impl RunPlanner {
             } else {
                 CacheClass::Stable
             });
-            fragments.push(if is_active_continuation {
+            let keep_required = is_active_continuation && older_intra_turn_group.is_none();
+            fragments.push(if keep_required {
                 fragment
             } else {
                 fragment.optional()
@@ -818,6 +856,35 @@ struct ExtractedToolExchange {
     result_indices: Vec<usize>,
 }
 
+impl ExtractedToolExchange {
+    /// Whether every tool call in the assistant message has a matching tool
+    /// result in `results` and every tool result in `results` belongs to this
+    /// exchange's `call_ids`.
+    fn is_complete(&self) -> bool {
+        if self.exchange.call_ids.is_empty() || self.result_indices.is_empty() {
+            return false;
+        }
+        let mut answered = BTreeSet::new();
+        for message in &self.exchange.results {
+            let mut has_result = false;
+            for call_id in message.content.iter().filter_map(tool_result_call_id) {
+                has_result = true;
+                if !self.exchange.call_ids.contains(call_id) {
+                    return false;
+                }
+                answered.insert(call_id);
+            }
+            if !has_result {
+                return false;
+            }
+        }
+        self.exchange
+            .call_ids
+            .iter()
+            .all(|call_id| answered.contains(call_id))
+    }
+}
+
 /// Extracts each assistant tool-call message and its contiguous result
 /// messages as one multi-call exchange. An incomplete exchange is retained:
 /// the context planner will then reject its missing call/result pairing
@@ -866,7 +933,10 @@ fn extract_tool_exchanges(history: &[Message]) -> Vec<ExtractedToolExchange> {
 /// Every effective call/result pairing attached to each message. Orphan tool
 /// results are retained so validation fails closed; assistant multi-call
 /// messages are populated from their extracted [`ToolExchange`].
-fn conversation_pairings(history: &[Message]) -> Vec<BTreeSet<ToolCallId>> {
+fn conversation_pairings_from(
+    history: &[Message],
+    exchanges: &[ExtractedToolExchange],
+) -> Vec<BTreeSet<ToolCallId>> {
     let mut pairings = vec![BTreeSet::new(); history.len()];
     for (index, message) in history.iter().enumerate() {
         pairings[index].extend(
@@ -877,11 +947,11 @@ fn conversation_pairings(history: &[Message]) -> Vec<BTreeSet<ToolCallId>> {
                 .cloned(),
         );
     }
-    for extracted in extract_tool_exchanges(history) {
+    for extracted in exchanges {
         pairings[extracted.assistant_index].extend(extracted.exchange.call_ids.iter().cloned());
-        for (index, message) in extracted
+        for (&index, message) in extracted
             .result_indices
-            .into_iter()
+            .iter()
             .zip(extracted.exchange.results.iter())
         {
             pairings[index].extend(
@@ -2024,5 +2094,221 @@ mod tests {
             serde_json::from_str(&json).expect("lossless record deserializes");
         assert_eq!(restored, record);
         assert_eq!(restored.fingerprint(), record.fingerprint());
+    }
+
+    #[test]
+    fn single_turn_multi_step_loop_compacts_older_exchanges_while_preserving_steer_and_tail() {
+        let mut history = vec![Message::user("implement the feature")];
+        for step in 0..10usize {
+            if step == 4 {
+                history.push(Message::user("mid-turn steer: also handle edge case X"));
+            }
+            let call_id = ToolCallId::new(format!("call-{step}"));
+            history.push(Message::assistant(vec![
+                ContentPart::Reasoning {
+                    text: format!("step-{step}-thinking: {}", "t".repeat(1_200)),
+                    redacted: false,
+                    signature: None,
+                    producer: None,
+                },
+                ContentPart::ToolCall(ToolCall {
+                    id: call_id.clone(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"step": step}),
+                }),
+            ]));
+            history.push(Message::tool_result(ToolResultBlock {
+                call_id,
+                name: "read".into(),
+                content: vec![ContentPart::text(format!(
+                    "step-{step}-output: {}",
+                    "o".repeat(1_600)
+                ))],
+                is_error: false,
+            }));
+        }
+        let original_history = history.clone();
+
+        // Tight budget: fits required UserInput + steer + last 2 exchanges + bounded older exchanges,
+        // but far smaller than the uncompacted ~10-step reasoning + tool outputs.
+        let compacting_planner = RunPlanner::new(
+            profile(3_200),
+            "fake",
+            Arc::new(CharRatioSizer::default()),
+            ContextPolicy::new(RegistryRevision::new("ctx-1"), 200, 0),
+            Some(StructuralCompactor::new(CompactionPolicy::new(
+                RegistryRevision::new("compact-intra-1"),
+                2_400,
+                2_000,
+            ))),
+            ProviderCacheCapability::none(RegistryRevision::new("cache-1"), "fake"),
+            RunRevisions::empty(),
+        );
+
+        let fragments =
+            compacting_planner.fragments(Some("system"), &history, 0, &[], &[], Some(0));
+        let by_id = |id: &str| {
+            fragments
+                .iter()
+                .find(|f| f.id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing fragment {id}"))
+        };
+
+        // UserInput and mid-turn steer remain Required.
+        assert!(by_id("history:0").is_required());
+        assert_eq!(by_id("history:0").kind, FragmentKind::UserInput);
+        // Step 0..3 -> indices 1..=8 (4 exchanges), steer is at index 9.
+        assert!(by_id("history:9").is_required());
+        // Older completed exchanges (first 8 of 10) are Optional, Ephemeral, in own exchange groups.
+        assert!(!by_id("history:1").is_required());
+        assert!(!by_id("history:2").is_required());
+        assert_eq!(by_id("history:1").cache_class, CacheClass::Ephemeral);
+        assert_eq!(by_id("history:2").cache_class, CacheClass::Ephemeral);
+        assert_eq!(
+            by_id("history:1").conversation_group,
+            Some(ConversationGroupId::new("turn:0:exchange:1"))
+        );
+        assert_eq!(
+            by_id("history:2").conversation_group,
+            Some(ConversationGroupId::new("turn:0:exchange:1"))
+        );
+        // Last 2 exchanges (steps 8 and 9 -> indices 18,19 and 20,21) remain Required.
+        for idx in [18, 19, 20, 21] {
+            let frag = by_id(&format!("history:{idx}"));
+            assert!(
+                frag.is_required(),
+                "recent exchange history:{idx} must be Required"
+            );
+        }
+
+        let planned = compacting_planner
+            .plan_activated_turn_from(
+                Some("system"),
+                &history,
+                &[],
+                &[],
+                0,
+                compacting_planner.revisions(),
+                &[],
+            )
+            .expect("intra-turn compaction should bring 10-step single turn within budget");
+
+        assert!(planned.plan.input_tokens() <= 3_000);
+        assert!(!planned.plan.compaction_outcome().bounded.is_empty());
+        assert!(planned.plan.compaction_outcome().evicted.is_empty());
+
+        // UserInput, mid-turn steer, and the last 2 exchanges remain verbatim.
+        let planned_messages = planned.plan.messages();
+        assert!(planned_messages.contains(&original_history[0]));
+        assert!(planned_messages.contains(&original_history[9]));
+        for idx in [18, 19, 20, 21] {
+            assert!(
+                planned_messages.contains(&original_history[idx]),
+                "recent exchange message {idx} must survive verbatim"
+            );
+        }
+        // Canonical history passed in was never mutated.
+        assert_eq!(history, original_history);
+    }
+
+    #[test]
+    fn single_turn_tool_call_argument_overflow_evicts_oldest_parallel_exchange_atomically() {
+        let mut history = vec![Message::user("write several large files")];
+
+        // Exchange 0: parallel tool calls with huge ToolCall.arguments.
+        let c0a = ToolCallId::new("c0a");
+        let c0b = ToolCallId::new("c0b");
+        history.push(Message::assistant(vec![
+            ContentPart::ToolCall(ToolCall {
+                id: c0a.clone(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "a.rs", "body": "a".repeat(2_000)}),
+            }),
+            ContentPart::ToolCall(ToolCall {
+                id: c0b.clone(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "b.rs", "body": "b".repeat(2_000)}),
+            }),
+        ]));
+        history.push(Message::tool_result(ToolResultBlock {
+            call_id: c0a,
+            name: "write_file".into(),
+            content: vec![ContentPart::text("ok a")],
+            is_error: false,
+        }));
+        history.push(Message::tool_result(ToolResultBlock {
+            call_id: c0b,
+            name: "write_file".into(),
+            content: vec![ContentPart::text("ok b")],
+            is_error: false,
+        }));
+
+        // Exchanges 1..=3: compact exchanges (1 older optional, 2 recent required).
+        for step in 1..=3usize {
+            let cid = ToolCallId::new(format!("c{step}"));
+            history.push(Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                id: cid.clone(),
+                name: "read".into(),
+                arguments: serde_json::json!({"step": step}),
+            })]));
+            history.push(Message::tool_result(ToolResultBlock {
+                call_id: cid,
+                name: "read".into(),
+                content: vec![ContentPart::text("small")],
+                is_error: false,
+            }));
+        }
+
+        // Budget easily fits UserInput + exchanges 1..=3, cannot fit exchange 0's 4000-char args.
+        let compacting_planner = RunPlanner::new(
+            profile(600),
+            "fake",
+            Arc::new(CharRatioSizer::default()),
+            ContextPolicy::new(RegistryRevision::new("ctx-1"), 100, 0),
+            Some(StructuralCompactor::new(CompactionPolicy::new(
+                RegistryRevision::new("compact-evict-1"),
+                400,
+                300,
+            ))),
+            ProviderCacheCapability::none(RegistryRevision::new("cache-1"), "fake"),
+            RunRevisions::empty(),
+        );
+
+        let planned = compacting_planner
+            .plan_activated_turn_from(
+                Some("system"),
+                &history,
+                &[],
+                &[],
+                0,
+                compacting_planner.revisions(),
+                &[],
+            )
+            .expect("Stage 4 should evict the oldest parallel exchange atomically");
+
+        assert!(planned.plan.input_tokens() <= 500);
+        let evicted = &planned.plan.compaction_outcome().evicted;
+        assert_eq!(
+            evicted,
+            &vec![
+                agent_runtime_context::FragmentId::new("history:1"),
+                agent_runtime_context::FragmentId::new("history:2"),
+                agent_runtime_context::FragmentId::new("history:3"),
+            ]
+        );
+        // UserInput and exchanges 1..=3 survive intact.
+        let segments: BTreeSet<&str> = planned
+            .plan
+            .segments()
+            .iter()
+            .map(|s| s.fragment.as_str())
+            .collect();
+        assert!(segments.contains("history:0"));
+        assert!(segments.contains("history:4"));
+        assert!(segments.contains("history:5"));
+        assert!(segments.contains("history:6"));
+        assert!(segments.contains("history:7"));
+        assert!(segments.contains("history:8"));
+        assert!(segments.contains("history:9"));
     }
 }
