@@ -7,6 +7,27 @@ contain breaking changes and are coordinated with consumer proposals.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-27
+
+### Added
+
+- Intra-turn compaction for long active tool loops: `RunPlanner::fragments`
+  now marks older completed intra-turn tool exchanges (before the newest two
+  completed exchanges) as `Optional` with per-exchange atomic
+  `ConversationGroupId`s while keeping `UserInput`, mid-turn user steers, and
+  the newest two exchanges `Required`.
+- `Compactor::compact_with_sizer` defaulted method (used by `ContextPlanner`)
+  and `StructuralCompactor` override so hard-budget compaction sizes framing
+  and message overhead with the exact `RequestSizer`.
+
+### Changed
+
+- `StructuralCompactor` Stage 0 now strips stale unsigned reasoning on
+  `Optional` intra-turn messages when another part remains, Stages 2–3 bound
+  and elide paired `Optional` `ToolResult` / `History` text when all pairing
+  peers are `Optional`, and hard-budget compaction adds a Stage 4 atomic
+  oldest-group eviction fallback if Stages 0–3 still exceed `input_budget`.
+
 ## [0.12.0] - 2026-10-26
 
 ### Added
